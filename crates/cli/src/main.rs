@@ -1,8 +1,7 @@
 use clap::{Args, Parser, Subcommand};
-use common::{DeployRequest, DeployResponse, ErrorBody, InvokeRequest};
+use common::{DeployBinding, DeployConfig, DeployRequest, DeployResponse, ErrorBody};
 use std::env;
-use std::fs;
-use std::io::{self, Write};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
 #[command(name = "grugd")]
@@ -26,11 +25,26 @@ struct DeployCmd {
     name: String,
 
     file: String,
+
+    #[arg(long = "kv-binding")]
+    kv_bindings: Vec<String>,
 }
 
 #[derive(Args)]
 struct InvokeCmd {
     name: String,
+
+    #[arg(long, default_value = "GET")]
+    method: String,
+
+    #[arg(long, default_value = "/")]
+    path: String,
+
+    #[arg(long = "header")]
+    headers: Vec<String>,
+
+    #[arg(long = "body-file")]
+    body_file: Option<String>,
 }
 
 #[tokio::main]
@@ -47,13 +61,22 @@ async fn main() -> Result<(), String> {
 }
 
 async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> Result<(), String> {
-    let source = fs::read_to_string(&command.file)
+    let source = tokio::fs::read_to_string(&command.file)
+        .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
+    let config = DeployConfig {
+        bindings: command
+            .kv_bindings
+            .into_iter()
+            .map(|binding| DeployBinding::Kv { binding })
+            .collect(),
+    };
     let response = client
         .post(format!("{server}/deploy"))
         .json(&DeployRequest {
             name: command.name,
             source,
+            config,
         })
         .send()
         .await
@@ -68,22 +91,39 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
 }
 
 async fn invoke(client: &reqwest::Client, server: &str, command: InvokeCmd) -> Result<(), String> {
+    let method = reqwest::Method::from_bytes(command.method.to_uppercase().as_bytes())
+        .map_err(|error| format!("invalid HTTP method {}: {error}", command.method))?;
+    let headers = parse_headers(&command.headers)?;
+    let body = read_request_body(command.body_file.as_deref()).await?;
+    let path = normalize_path(&command.path);
+    let url = format!(
+        "{}/invoke/{}{}",
+        server.trim_end_matches('/'),
+        command.name,
+        path
+    );
+
     let response = client
-        .post(format!("{server}/invoke"))
-        .json(&InvokeRequest {
-            worker_name: command.name,
-        })
+        .request(method, url)
+        .headers(headers)
+        .body(body)
         .send()
         .await
         .map_err(|error| error.to_string())?;
 
-    let body = decode_bytes(response).await?;
-    io::stdout()
-        .write_all(&body)
-        .map_err(|error| error.to_string())?;
-    if !body.ends_with(b"\n") {
-        println!();
+    if !response.status().is_success() {
+        return Err(decode_error_response(response).await?);
     }
+
+    let mut response = response;
+    let mut stdout = io::stdout();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        stdout
+            .write_all(&chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    stdout.flush().await.map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -106,7 +146,7 @@ async fn decode_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).map_err(|error| error.to_string())
 }
 
-async fn decode_bytes(response: reqwest::Response) -> Result<Vec<u8>, String> {
+async fn decode_error_response(response: reqwest::Response) -> Result<String, String> {
     let status = response.status();
     let body = response.bytes().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
@@ -120,7 +160,56 @@ async fn decode_bytes(response: reqwest::Response) -> Result<Vec<u8>, String> {
         ));
     }
 
-    Ok(body.to_vec())
+    Ok(format!(
+        "{} {}",
+        status.as_u16(),
+        String::from_utf8_lossy(&body)
+    ))
+}
+
+fn parse_headers(values: &[String]) -> Result<reqwest::header::HeaderMap, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for value in values {
+        let (name, header_value) = value
+            .split_once(':')
+            .ok_or_else(|| format!("invalid header {value:?}, expected `Name: value`"))?;
+        let name = reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|error| format!("invalid header name {name:?}: {error}"))?;
+        let header_value = reqwest::header::HeaderValue::from_str(header_value.trim())
+            .map_err(|error| format!("invalid header value for {name}: {error}"))?;
+        headers.append(name, header_value);
+    }
+
+    Ok(headers)
+}
+
+async fn read_request_body(path: Option<&str>) -> Result<Vec<u8>, String> {
+    match path {
+        None => Ok(Vec::new()),
+        Some("-") => {
+            let mut stdin = io::stdin();
+            let mut body = Vec::new();
+            stdin
+                .read_to_end(&mut body)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(body)
+        }
+        Some(path) => tokio::fs::read(path)
+            .await
+            .map_err(|error| format!("failed to read {path}: {error}")),
+    }
+}
+
+fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 fn default_server() -> String {

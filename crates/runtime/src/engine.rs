@@ -1,6 +1,6 @@
 use crate::assets::{
-    execute_worker_js, install_worker_js, BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER,
-    WORKER_SPECIFIER,
+    abort_worker_js, execute_worker_js, install_worker_js, BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER,
+    INSTALL_SPECIFIER, WORKER_SPECIFIER,
 };
 use crate::ops::runtime_extension;
 use common::{PlatformError, Result, WorkerInvocation};
@@ -50,15 +50,40 @@ pub fn new_runtime_from_snapshot(startup_snapshot: &'static [u8]) -> Result<JsRu
 pub fn dispatch_worker_request(
     runtime: &mut JsRuntime,
     request_id: &str,
+    completion_token: &str,
+    worker_name: &str,
+    kv_bindings: &[String],
     request: WorkerInvocation,
 ) -> Result<()> {
     let request_json = serde_json::to_string(&request)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let worker_name_json = serde_json::to_string(worker_name)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let kv_bindings_json = serde_json::to_string(kv_bindings)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
     let request_id_json = serde_json::to_string(request_id)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let entry_code = execute_worker_js(&request_id_json, &request_json);
+    let completion_token_json = serde_json::to_string(completion_token)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let entry_code = execute_worker_js(
+        &worker_name_json,
+        &kv_bindings_json,
+        &request_id_json,
+        &completion_token_json,
+        &request_json,
+    );
     runtime
         .execute_script("<grugd:invoke>", entry_code)
+        .map_err(runtime_error)?;
+    Ok(())
+}
+
+pub fn abort_worker_request(runtime: &mut JsRuntime, request_id: &str) -> Result<()> {
+    let request_id_json = serde_json::to_string(request_id)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let entry_code = abort_worker_js(&request_id_json);
+    runtime
+        .execute_script("<grugd:abort>", entry_code)
         .map_err(runtime_error)?;
     Ok(())
 }

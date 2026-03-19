@@ -103,7 +103,7 @@ Request flow:
 * axum for HTTP
 * deno_core for V8 embedding
 * minimal Deno web APIs for `Request` and `Response`
-* libsql Rust client for Turso
+* Turso Rust client
 
 ## Database schema
 
@@ -364,7 +364,7 @@ A deployment should only become active if validation succeeds.
 Use environment variables like:
 
 ```bash
-export TURSO_DATABASE_URL="libsql://your-db.turso.io"
+export TURSO_DATABASE_URL="file:./grugd-kv.db"
 export TURSO_AUTH_TOKEN="your-token"
 export RUST_LOG="info"
 ```
@@ -552,7 +552,7 @@ The whole point is:
 ## Short implementation brief
 
 ```text
-Build a tiny workers platform in Rust with axum, deno_core, and Turso/libsql.
+Build a tiny workers platform in Rust with axum, deno_core, and Turso.
 
 Workers are single JS files that look like:
 
@@ -590,4 +590,3 @@ Ship a working local MVP, schema setup, sample worker, and curl-based README ins
 ## License
 
 Choose whatever you want for the repo. MIT or Apache-2.0 would both be fine for a starter project.
-

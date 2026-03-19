@@ -9,6 +9,7 @@ axum.workspace = true
 common = { path = "../common" }
 runtime = { path = "../runtime" }
 tokio.workspace = true
+tokio-stream = "0.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

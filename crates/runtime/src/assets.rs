@@ -6,13 +6,27 @@ pub const BOOTSTRAP_JS: &str = include_str!("../js/bootstrap.js");
 
 const INSTALL_WORKER_TEMPLATE: &str = include_str!("../js/install_worker.js");
 const EXECUTE_WORKER_TEMPLATE: &str = include_str!("../js/execute_worker.js");
+const ABORT_WORKER_TEMPLATE: &str = include_str!("../js/abort_worker.js");
 
 pub fn install_worker_js() -> String {
     INSTALL_WORKER_TEMPLATE.replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER)
 }
 
-pub fn execute_worker_js(request_id: &str, request_json: &str) -> String {
+pub fn execute_worker_js(
+    worker_name: &str,
+    kv_bindings_json: &str,
+    request_id: &str,
+    completion_token: &str,
+    request_json: &str,
+) -> String {
     EXECUTE_WORKER_TEMPLATE
+        .replace("__WORKER_NAME__", worker_name)
+        .replace("__KV_BINDINGS_JSON__", kv_bindings_json)
         .replace("__REQUEST_ID__", request_id)
+        .replace("__COMPLETION_TOKEN__", completion_token)
         .replace("__REQUEST_JSON__", request_json)
+}
+
+pub fn abort_worker_js(request_id: &str) -> String {
+    ABORT_WORKER_TEMPLATE.replace("__REQUEST_ID__", request_id)
 }

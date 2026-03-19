@@ -73,6 +73,20 @@ impl ErrorBody {
 pub struct DeployRequest {
     pub name: String,
     pub source: String,
+    #[serde(default)]
+    pub config: DeployConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployConfig {
+    #[serde(default)]
+    pub bindings: Vec<DeployBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DeployBinding {
+    Kv { binding: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

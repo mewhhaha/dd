@@ -6,6 +6,7 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -77,8 +78,13 @@ export default {
             worker_source: r#"
 export default {
   async fetch() {
-    const started = Date.now();
-    while (Date.now() - started < 5) {}
+    let acc = 0;
+    for (let i = 0; i < 2_000_000; i += 1) {
+      acc ^= i;
+    }
+    if (acc === -1) {
+      return new Response("never");
+    }
     return new Response("ok");
   },
 };
@@ -123,6 +129,8 @@ export default {
 
     for config in configs {
         println!("== {} ==", config.name);
+        let db_path = format!("/tmp/grugd-bench-{}-{}.db", config.name, Uuid::new_v4());
+        std::env::set_var("TURSO_DATABASE_URL", format!("file:{db_path}"));
         let service = RuntimeService::start_with_config(config.runtime)
             .await
             .map_err(|error| error.to_string())?;
