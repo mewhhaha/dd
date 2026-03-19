@@ -1,0 +1,17 @@
+[package]
+name = "runtime"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+deno_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serial_test = "3"
