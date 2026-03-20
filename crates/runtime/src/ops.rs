@@ -1,4 +1,4 @@
-use crate::cache::{CacheRequest, CacheResponse, CacheStore};
+use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvStore};
 use deno_core::OpState;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ pub enum IsolateEventPayload {
     WaitUntilDone(String),
     ResponseStart(String),
     ResponseChunk(String),
+    CacheRevalidate(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -57,6 +58,8 @@ struct CacheRequestPayload {
     method: String,
     url: String,
     headers: Vec<(String, String)>,
+    #[serde(default)]
+    bypass_stale: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +77,8 @@ struct CachePutPayload {
 struct CacheMatchResult {
     ok: bool,
     found: bool,
+    stale: bool,
+    should_revalidate: bool,
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -220,6 +225,8 @@ async fn op_cache_match(
             return CacheMatchResult {
                 ok: false,
                 found: false,
+                stale: false,
+                should_revalidate: false,
                 status: 0,
                 headers: Vec::new(),
                 body: Vec::new(),
@@ -230,17 +237,41 @@ async fn op_cache_match(
 
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.get(&request).await {
-        Ok(Some(response)) => CacheMatchResult {
+        Ok(CacheLookup::Fresh(response)) => CacheMatchResult {
             ok: true,
             found: true,
+            stale: false,
+            should_revalidate: false,
             status: response.status,
             headers: response.headers,
             body: response.body,
             error: String::new(),
         },
-        Ok(None) => CacheMatchResult {
+        Ok(CacheLookup::StaleWhileRevalidate(response)) => CacheMatchResult {
+            ok: true,
+            found: true,
+            stale: true,
+            should_revalidate: true,
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+            error: String::new(),
+        },
+        Ok(CacheLookup::StaleIfError(response)) => CacheMatchResult {
+            ok: true,
+            found: true,
+            stale: true,
+            should_revalidate: false,
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+            error: String::new(),
+        },
+        Ok(CacheLookup::Miss) => CacheMatchResult {
             ok: true,
             found: false,
+            stale: false,
+            should_revalidate: false,
             status: 0,
             headers: Vec::new(),
             body: Vec::new(),
@@ -249,6 +280,8 @@ async fn op_cache_match(
         Err(error) => CacheMatchResult {
             ok: false,
             found: false,
+            stale: false,
+            should_revalidate: false,
             status: 0,
             headers: Vec::new(),
             body: Vec::new(),
@@ -338,6 +371,12 @@ fn op_emit_response_chunk(state: &mut OpState, #[string] payload: String) {
     let _ = sender.0.send(IsolateEventPayload::ResponseChunk(payload));
 }
 
+#[deno_core::op2(fast)]
+fn op_emit_cache_revalidate(state: &mut OpState, #[string] payload: String) {
+    let sender = state.borrow::<IsolateEventSender>().clone();
+    let _ = sender.0.send(IsolateEventPayload::CacheRevalidate(payload));
+}
+
 deno_core::extension!(
     grugd_runtime_ops,
     ops = [
@@ -353,7 +392,8 @@ deno_core::extension!(
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,
-        op_emit_response_chunk
+        op_emit_response_chunk,
+        op_emit_cache_revalidate
     ]
 );
 
@@ -384,6 +424,7 @@ fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest>
         method: payload.method,
         url: payload.url,
         headers: payload.headers,
+        bypass_stale: payload.bypass_stale,
     })
 }
 
@@ -397,6 +438,7 @@ fn decode_cache_put_payload(payload: String) -> common::Result<(CacheRequest, Ca
             method: payload.method,
             url: payload.url,
             headers: payload.request_headers,
+            bypass_stale: false,
         },
         CacheResponse {
             status: payload.response_status,

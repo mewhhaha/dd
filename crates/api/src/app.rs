@@ -8,7 +8,7 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     let app = axum::Router::new()
         .route("/deploy", axum::routing::post(deploy_worker))
         .route("/invoke", axum::routing::any(invoke_worker))
-        .route("/invoke/*path", axum::routing::any(invoke_worker))
+        .route("/invoke/{*path}", axum::routing::any(invoke_worker))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)

@@ -7,8 +7,9 @@ use axum::response::IntoResponse;
 use axum::Json;
 use common::{
     DeployBinding, DeployRequest, DeployResponse, ErrorBody, ErrorKind, PlatformError,
-    WorkerInvocation,
+    WorkerInvocation, WorkerOutput,
 };
+use runtime::{CacheLookup, CacheRequest, CacheResponse};
 use std::collections::HashSet;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -66,8 +67,55 @@ pub async fn invoke_worker(
         request_id: Uuid::new_v4().to_string(),
     };
 
-    let output = state.runtime.invoke_stream(worker_name, invocation).await?;
-    build_worker_stream_response(output)
+    if !is_cacheable_request(&invocation) {
+        let output = state.runtime.invoke_stream(worker_name, invocation).await?;
+        return build_worker_stream_response(output);
+    }
+
+    let cache_request = build_edge_cache_request(&worker_name, &invocation);
+    match state.runtime.cache_match(cache_request.clone()).await? {
+        CacheLookup::Fresh(response) => return build_cached_response(response, "HIT"),
+        CacheLookup::StaleWhileRevalidate(response) => {
+            maybe_spawn_edge_revalidation(
+                state.clone(),
+                worker_name.clone(),
+                invocation.clone(),
+                cache_request.clone(),
+            )
+            .await;
+            return build_cached_response(response, "STALE");
+        }
+        CacheLookup::StaleIfError(response) => {
+            let origin = state.runtime.invoke(worker_name, invocation).await;
+            return match origin {
+                Ok(output) => {
+                    if output.status >= 500 {
+                        let mut fallback = build_cached_response(response, "STALE-IF-ERROR")?;
+                        fallback.headers_mut().append(
+                            HeaderName::from_static("x-grugd-cache-fallback"),
+                            HeaderValue::from_static("origin-status"),
+                        );
+                        return Ok(fallback);
+                    }
+                    store_worker_output_in_cache(&state, &cache_request, &output).await;
+                    build_worker_buffered_response(output, "MISS")
+                }
+                Err(_error) => {
+                    let mut response = build_cached_response(response, "STALE-IF-ERROR")?;
+                    response.headers_mut().append(
+                        HeaderName::from_static("x-grugd-cache-fallback"),
+                        HeaderValue::from_static("origin-error"),
+                    );
+                    Ok(response)
+                }
+            };
+        }
+        CacheLookup::Miss => {}
+    }
+
+    let output = state.runtime.invoke(worker_name, invocation).await?;
+    store_worker_output_in_cache(&state, &cache_request, &output).await;
+    build_worker_buffered_response(output, "MISS")
 }
 
 fn parse_invoke_request_uri(
@@ -154,6 +202,150 @@ fn build_worker_stream_response(
     }
 
     Ok(response)
+}
+
+fn is_cacheable_request(invocation: &WorkerInvocation) -> bool {
+    invocation.method.eq_ignore_ascii_case("GET") && invocation.body.is_empty()
+}
+
+fn build_edge_cache_request(worker_name: &str, invocation: &WorkerInvocation) -> CacheRequest {
+    CacheRequest {
+        cache_name: format!("edge:{worker_name}"),
+        method: invocation.method.clone(),
+        url: invocation.url.clone(),
+        headers: invocation.headers.clone(),
+        bypass_stale: false,
+    }
+}
+
+fn build_cached_response(
+    cache_response: CacheResponse,
+    cache_status: &str,
+) -> ApiResult<Response<Body>> {
+    build_buffered_response(
+        cache_response.status,
+        cache_response.headers,
+        cache_response.body,
+        cache_status,
+    )
+}
+
+fn build_worker_buffered_response(
+    output: WorkerOutput,
+    cache_status: &str,
+) -> ApiResult<Response<Body>> {
+    build_buffered_response(output.status, output.headers, output.body, cache_status)
+}
+
+fn build_buffered_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    cache_status: &str,
+) -> ApiResult<Response<Body>> {
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from(body))
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().append(name, value);
+        }
+    }
+
+    response.headers_mut().insert(
+        HeaderName::from_static("x-grugd-cache"),
+        HeaderValue::from_str(cache_status)
+            .map_err(|error| PlatformError::internal(error.to_string()))?,
+    );
+    Ok(response)
+}
+
+async fn store_worker_output_in_cache(
+    state: &AppState,
+    request: &CacheRequest,
+    output: &WorkerOutput,
+) {
+    let _ = state
+        .runtime
+        .cache_put(
+            request.clone(),
+            CacheResponse {
+                status: output.status,
+                headers: output.headers.clone(),
+                body: output.body.clone(),
+            },
+        )
+        .await;
+}
+
+async fn maybe_spawn_edge_revalidation(
+    state: AppState,
+    worker_name: String,
+    mut invocation: WorkerInvocation,
+    cache_request: CacheRequest,
+) {
+    let key = edge_revalidation_key(&worker_name, &cache_request);
+    {
+        let mut inflight = state.edge_revalidations.lock().await;
+        if !inflight.insert(key.clone()) {
+            return;
+        }
+    }
+
+    invocation.request_id = format!("edge-revalidate-{}", Uuid::new_v4());
+    if !invocation
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("x-grugd-cache-bypass-stale"))
+    {
+        invocation
+            .headers
+            .push(("x-grugd-cache-bypass-stale".to_string(), "1".to_string()));
+    }
+
+    tokio::spawn(async move {
+        let origin = state.runtime.invoke(worker_name, invocation).await;
+        if let Ok(output) = origin {
+            let _ = state
+                .runtime
+                .cache_put(
+                    cache_request,
+                    CacheResponse {
+                        status: output.status,
+                        headers: output.headers,
+                        body: output.body,
+                    },
+                )
+                .await;
+        }
+        let mut inflight = state.edge_revalidations.lock().await;
+        inflight.remove(&key);
+    });
+}
+
+fn edge_revalidation_key(worker_name: &str, cache_request: &CacheRequest) -> String {
+    let mut headers: Vec<(String, String)> = cache_request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    headers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let header_key = headers
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!(
+        "{worker_name}:{}:{}:{}:{header_key}",
+        cache_request.cache_name,
+        cache_request.method.to_ascii_uppercase(),
+        cache_request.url
+    )
 }
 
 impl From<PlatformError> for ApiError {

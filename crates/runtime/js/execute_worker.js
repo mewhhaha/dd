@@ -60,6 +60,15 @@
     }
   };
   globalThis.__grugd_sync_time_boundary = syncFrozenTime;
+  globalThis.__grugd_cache_bypass_stale = Array.isArray(input.headers)
+    && input.headers.some(([name, value]) => {
+      const key = String(name || "").toLowerCase();
+      if (key !== "x-grugd-cache-bypass-stale") {
+        return false;
+      }
+      const normalized = String(value || "").toLowerCase();
+      return normalized === "1" || normalized === "true" || normalized === "yes";
+    });
 
   const toUtf8Bytes = (value) => {
     if (value == null) {

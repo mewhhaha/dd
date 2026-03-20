@@ -36,6 +36,7 @@ pub struct CacheRequest {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
+    pub bypass_stale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,14 @@ pub struct CacheResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CacheLookup {
+    Fresh(CacheResponse),
+    StaleWhileRevalidate(CacheResponse),
+    StaleIfError(CacheResponse),
+    Miss,
 }
 
 #[derive(Clone)]
@@ -78,6 +87,8 @@ struct CacheControl {
     private: bool,
     max_age: Option<u64>,
     s_maxage: Option<u64>,
+    stale_while_revalidate: Option<u64>,
+    stale_if_error: Option<u64>,
 }
 
 impl CacheStore {
@@ -92,14 +103,14 @@ impl CacheStore {
         Self::from_local_path(config, local_path, blob_store).await
     }
 
-    pub async fn get(&self, request: &CacheRequest) -> Result<Option<CacheResponse>> {
+    pub async fn get(&self, request: &CacheRequest) -> Result<CacheLookup> {
         let Some(method) = normalize_cache_method(&request.method) else {
-            return Ok(None);
+            return Ok(CacheLookup::Miss);
         };
         let request_headers = to_header_map(&request.headers);
         let request_control = parse_cache_control(header_value(&request_headers, "cache-control"));
         if request_control.no_store || request_control.no_cache {
-            return Ok(None);
+            return Ok(CacheLookup::Miss);
         }
 
         let cache_name = normalize_cache_name(&request.cache_name);
@@ -119,19 +130,10 @@ impl CacheStore {
         let mut expired = Vec::new();
         let mut stale = Vec::new();
         let mut selected_id = String::new();
-        let mut response = None;
+        let mut lookup = CacheLookup::Miss;
 
         while let Some(row) = rows.next().await.map_err(cache_error)? {
             let record = row_to_record(&row)?;
-            if record.expires_at_ms <= now_ms {
-                expired.push(CacheDeleteCandidate {
-                    id: record.id,
-                    body_storage: record.body_storage,
-                    body_ref: record.body_ref,
-                });
-                continue;
-            }
-
             let vary_headers: Vec<String> = match serde_json::from_str(&record.vary_headers_json) {
                 Ok(value) => value,
                 Err(_) => {
@@ -205,12 +207,49 @@ impl CacheStore {
                 continue;
             };
 
-            selected_id = record.id;
-            response = Some(CacheResponse {
+            let response = CacheResponse {
                 status: record.status as u16,
                 headers,
                 body,
-            });
+            };
+            let response_headers = to_header_map(&response.headers);
+            let response_control =
+                parse_cache_control(header_value(&response_headers, "cache-control"));
+            let swr_until_ms = record.expires_at_ms.saturating_add(
+                (response_control.stale_while_revalidate.unwrap_or(0) as i64) * 1000,
+            );
+            let sie_until_ms = record
+                .expires_at_ms
+                .saturating_add((response_control.stale_if_error.unwrap_or(0) as i64) * 1000);
+            let max_stale_until_ms = swr_until_ms.max(sie_until_ms);
+
+            if now_ms <= record.expires_at_ms {
+                selected_id = record.id;
+                lookup = CacheLookup::Fresh(response);
+                break;
+            }
+
+            if now_ms > max_stale_until_ms {
+                expired.push(CacheDeleteCandidate {
+                    id: record.id,
+                    body_storage: record.body_storage,
+                    body_ref: record.body_ref,
+                });
+                continue;
+            }
+
+            if request.bypass_stale {
+                continue;
+            }
+
+            selected_id = record.id;
+            if now_ms <= swr_until_ms && response_control.stale_while_revalidate.unwrap_or(0) > 0 {
+                lookup = CacheLookup::StaleWhileRevalidate(response);
+            } else if now_ms <= sie_until_ms && response_control.stale_if_error.unwrap_or(0) > 0 {
+                lookup = CacheLookup::StaleIfError(response);
+            } else {
+                continue;
+            }
             break;
         }
         drop(rows);
@@ -222,18 +261,18 @@ impl CacheStore {
             self.remove_records(&conn, &stale).await?;
         }
 
-        if response.is_some() {
+        if !selected_id.is_empty() {
             conn.execute(
                 "UPDATE worker_cache_entries
-                 SET last_access_seq = ?1, updated_at_ms = ?2
+                 SET last_access_seq = ?1
                  WHERE id = ?3",
-                (self.next_access_seq(), now_ms, selected_id),
+                (self.next_access_seq(), selected_id),
             )
             .await
             .map_err(cache_error)?;
         }
 
-        Ok(response)
+        Ok(lookup)
     }
 
     pub async fn put(&self, request: &CacheRequest, response: CacheResponse) -> Result<bool> {
@@ -727,6 +766,14 @@ fn parse_cache_control(value: &str) -> CacheControl {
         }
         if let Some(value) = directive.strip_prefix("max-age=") {
             control.max_age = parse_u64_token(value);
+            continue;
+        }
+        if let Some(value) = directive.strip_prefix("stale-while-revalidate=") {
+            control.stale_while_revalidate = parse_u64_token(value);
+            continue;
+        }
+        if let Some(value) = directive.strip_prefix("stale-if-error=") {
+            control.stale_if_error = parse_u64_token(value);
         }
     }
 
@@ -848,7 +895,7 @@ fn cache_error(error: impl std::fmt::Display) -> PlatformError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheConfig, CacheRequest, CacheResponse, CacheStore};
+    use super::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
     use crate::blob::local_blob_store_for_tests;
     use common::Result;
     use std::time::Duration;
@@ -871,6 +918,7 @@ mod tests {
             method: "GET".to_string(),
             url: format!("http://worker{path}"),
             headers: Vec::new(),
+            bypass_stale: false,
         }
     }
 
@@ -893,8 +941,11 @@ mod tests {
         .await;
         let req = request("/x");
         assert!(store.put(&req, response("one")).await?);
-        let hit = store.get(&req).await?.expect("cache should hit");
-        assert_eq!(hit.body, b"one");
+        let hit = store.get(&req).await?;
+        match hit {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"one"),
+            other => panic!("expected fresh hit, got {:?}", other),
+        }
         Ok(())
     }
 
@@ -927,8 +978,14 @@ mod tests {
 
         assert!(store.put(&req_a, res_a).await?);
         assert!(store.put(&req_b, res_b).await?);
-        assert_eq!(store.get(&req_a).await?.expect("en").body, b"hello");
-        assert_eq!(store.get(&req_b).await?.expect("fr").body, b"salut");
+        match store.get(&req_a).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"hello"),
+            other => panic!("expected fresh en hit, got {:?}", other),
+        }
+        match store.get(&req_b).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"salut"),
+            other => panic!("expected fresh fr hit, got {:?}", other),
+        }
         Ok(())
     }
 
@@ -950,9 +1007,15 @@ mod tests {
         let _ = store.get(&req_b).await?;
         assert!(store.put(&req_c, response("c")).await?);
 
-        assert!(store.get(&req_a).await?.is_none());
-        assert_eq!(store.get(&req_b).await?.expect("b").body, b"b");
-        assert_eq!(store.get(&req_c).await?.expect("c").body, b"c");
+        assert!(matches!(store.get(&req_a).await?, CacheLookup::Miss));
+        match store.get(&req_b).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"b"),
+            other => panic!("expected fresh b hit, got {:?}", other),
+        }
+        match store.get(&req_c).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"c"),
+            other => panic!("expected fresh c hit, got {:?}", other),
+        }
         Ok(())
     }
 
@@ -974,8 +1037,92 @@ mod tests {
         };
 
         assert!(store.put(&req, response).await?);
-        let hit = store.get(&req).await?.expect("hit");
-        assert_eq!(hit.body.len(), 1024);
+        match store.get(&req).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body.len(), 1024),
+            other => panic!("expected blob fresh hit, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_while_revalidate_lookup_serves_stale() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/swr");
+        let response = CacheResponse {
+            status: 200,
+            headers: vec![(
+                "cache-control".to_string(),
+                "max-age=1, stale-while-revalidate=30".to_string(),
+            )],
+            body: b"stale".to_vec(),
+        };
+
+        assert!(store.put(&req, response).await?);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(matches!(
+            store.get(&req).await?,
+            CacheLookup::StaleWhileRevalidate(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_lookup_serves_stale() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/sie");
+        let response = CacheResponse {
+            status: 200,
+            headers: vec![(
+                "cache-control".to_string(),
+                "max-age=1, stale-if-error=30".to_string(),
+            )],
+            body: b"stale".to_vec(),
+        };
+
+        assert!(store.put(&req, response).await?);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(matches!(
+            store.get(&req).await?,
+            CacheLookup::StaleIfError(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bypass_stale_skips_stale_windows() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let mut req = request("/bypass");
+        let response = CacheResponse {
+            status: 200,
+            headers: vec![(
+                "cache-control".to_string(),
+                "max-age=1, stale-while-revalidate=30, stale-if-error=30".to_string(),
+            )],
+            body: b"stale".to_vec(),
+        };
+
+        assert!(store.put(&req, response).await?);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        req.bypass_stale = true;
+        assert!(matches!(store.get(&req).await?, CacheLookup::Miss));
         Ok(())
     }
 }

@@ -568,13 +568,15 @@ class Cache {
   async match(request, options = {}) {
     const _ = options;
     const normalizedRequest = request instanceof Request ? request : new Request(request);
+    const requestHeaders = Array.from(normalizedRequest.headers.entries());
     const result = await runtimeOp(
       "op_cache_match",
       JSON.stringify({
         cache_name: this.name,
         method: normalizedRequest.method,
         url: normalizedRequest.url,
-        headers: Array.from(normalizedRequest.headers.entries()),
+        headers: requestHeaders,
+        bypass_stale: Boolean(globalThis.__grugd_cache_bypass_stale),
       }),
     );
     await syncFrozenTimeBoundary();
@@ -584,6 +586,19 @@ class Cache {
     }
     if (!(result && typeof result === "object" && result.found === true)) {
       return undefined;
+    }
+
+    if (result.should_revalidate === true) {
+      runtimeOp(
+        "op_emit_cache_revalidate",
+        JSON.stringify({
+          cache_name: this.name,
+          method: normalizedRequest.method,
+          url: normalizedRequest.url,
+          headers: requestHeaders,
+        }),
+      );
+      await syncFrozenTimeBoundary();
     }
 
     return new Response(new Uint8Array(result.body ?? []), {

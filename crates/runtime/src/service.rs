@@ -1,4 +1,4 @@
-use crate::cache::{CacheConfig, CacheStore};
+use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
     new_runtime_from_snapshot, pump_event_loop_once, validate_worker,
@@ -69,6 +69,7 @@ pub struct WorkerStreamOutput {
 pub struct RuntimeService {
     sender: mpsc::Sender<RuntimeCommand>,
     cancel_sender: mpsc::UnboundedSender<RuntimeCommand>,
+    cache_store: CacheStore,
 }
 
 enum RuntimeCommand {
@@ -107,6 +108,8 @@ struct WorkerManager {
     workers: HashMap<String, WorkerEntry>,
     pre_canceled: HashMap<String, HashSet<String>>,
     stream_registrations: HashMap<String, StreamRegistration>,
+    revalidation_keys: HashSet<String>,
+    revalidation_requests: HashMap<String, String>,
     next_generation: u64,
     next_isolate_id: u64,
 }
@@ -250,6 +253,11 @@ enum RuntimeEvent {
         completion_token: String,
         chunk: Vec<u8>,
     },
+    CacheRevalidate {
+        worker_name: String,
+        generation: u64,
+        payload: String,
+    },
     IsolateFailed {
         worker_name: String,
         generation: u64,
@@ -288,6 +296,15 @@ struct ResponseChunkPayload {
     request_id: String,
     completion_token: String,
     chunk: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct CacheRevalidatePayload {
+    cache_name: String,
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
 }
 
 impl RuntimeService {
@@ -343,12 +360,13 @@ impl RuntimeService {
             cancel_receiver,
             bootstrap_snapshot,
             kv_store,
-            cache_store,
+            cache_store.clone(),
             config,
         )?;
         Ok(Self {
             sender,
             cancel_sender,
+            cache_store,
         })
     }
 
@@ -463,6 +481,14 @@ impl RuntimeService {
         }
         reply_rx.await.ok().flatten()
     }
+
+    pub async fn cache_match(&self, request: CacheRequest) -> Result<CacheLookup> {
+        self.cache_store.get(&request).await
+    }
+
+    pub async fn cache_put(&self, request: CacheRequest, response: CacheResponse) -> Result<bool> {
+        self.cache_store.put(&request, response).await
+    }
 }
 
 impl WorkerManager {
@@ -480,6 +506,8 @@ impl WorkerManager {
             workers: HashMap::new(),
             pre_canceled: HashMap::new(),
             stream_registrations: HashMap::new(),
+            revalidation_keys: HashSet::new(),
+            revalidation_requests: HashMap::new(),
             next_generation: 1,
             next_isolate_id: 1,
         }
@@ -592,6 +620,13 @@ impl WorkerManager {
                 chunk,
             } => {
                 self.handle_response_chunk(&worker_name, &request_id, &completion_token, chunk);
+            }
+            RuntimeEvent::CacheRevalidate {
+                worker_name,
+                generation,
+                payload,
+            } => {
+                self.schedule_cache_revalidate(&worker_name, generation, &payload, event_tx);
             }
             RuntimeEvent::IsolateFailed {
                 worker_name,
@@ -736,6 +771,7 @@ impl WorkerManager {
         let mut touched_generations = Vec::new();
         let mut abort_commands = Vec::new();
         let mut matched = false;
+        let mut cleared_request_ids = Vec::new();
 
         if let Some(entry) = self.workers.get_mut(&worker_name) {
             for (generation, pool) in &mut entry.pools {
@@ -747,6 +783,7 @@ impl WorkerManager {
                     .position(|pending| pending.runtime_request_id == runtime_request_id)
                 {
                     if let Some(pending) = pool.queue.remove(idx) {
+                        cleared_request_ids.push(pending.runtime_request_id.clone());
                         let _ = pending
                             .reply
                             .send(Err(PlatformError::runtime("request was aborted")));
@@ -773,6 +810,10 @@ impl WorkerManager {
             }
         }
 
+        for request_id in cleared_request_ids {
+            self.clear_revalidation_for_request(&request_id);
+        }
+
         for (generation, isolate_id, sender) in abort_commands {
             if sender
                 .send(IsolateCommand::Abort {
@@ -781,7 +822,8 @@ impl WorkerManager {
                 .is_err()
             {
                 let failed = self.remove_isolate_by_id(&worker_name, generation, isolate_id);
-                for reply in failed {
+                for (request_id, reply) in failed {
+                    self.clear_revalidation_for_request(&request_id);
                     let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
                 }
             }
@@ -862,6 +904,7 @@ impl WorkerManager {
             };
 
             let runtime_request_id = pending_invoke.runtime_request_id.clone();
+            let mut pending_reply = Some(pending_invoke.reply);
             let completion_token = Uuid::new_v4().to_string();
             if let Some(registration) = self.stream_registrations.get_mut(&runtime_request_id) {
                 if registration.worker_name == worker_name {
@@ -898,7 +941,9 @@ impl WorkerManager {
                         PendingReply {
                             completion_token,
                             canceled: false,
-                            reply: pending_invoke.reply,
+                            reply: pending_reply
+                                .take()
+                                .expect("pending reply must exist before dispatch"),
                         },
                     );
                 }
@@ -906,7 +951,12 @@ impl WorkerManager {
 
             if send_failed {
                 let failed = self.remove_isolate(worker_name, generation, isolate_idx);
-                for reply in failed {
+                self.clear_revalidation_for_request(&runtime_request_id);
+                if let Some(reply) = pending_reply.take() {
+                    let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
+                }
+                for (request_id, reply) in failed {
+                    self.clear_revalidation_for_request(&request_id);
                     let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
                 }
                 self.fail_stream_registration(
@@ -965,6 +1015,7 @@ impl WorkerManager {
         let stream_result = result.clone();
         let mut reply = None;
         let mut canceled = false;
+        let mut clear_revalidation = false;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool
                 .isolates
@@ -1003,10 +1054,14 @@ impl WorkerManager {
                             .pending_wait_until
                             .insert(request_id.to_string(), completion_token.to_string());
                     }
+                    clear_revalidation = true;
                     reply = Some(pending.reply);
                 }
             }
             pool.log_stats("complete");
+        }
+        if clear_revalidation {
+            self.clear_revalidation_for_request(request_id);
         }
 
         if !canceled {
@@ -1033,7 +1088,8 @@ impl WorkerManager {
         error: PlatformError,
     ) {
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
-        for reply in failed {
+        for (request_id, reply) in failed {
+            self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
         }
         self.fail_all_streams_for_worker(worker_name, error);
@@ -1114,6 +1170,82 @@ impl WorkerManager {
             return;
         }
         let _ = registration.body_sender.send(Ok(chunk));
+    }
+
+    fn schedule_cache_revalidate(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        payload: &str,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let Some(entry) = self.workers.get(worker_name) else {
+            return;
+        };
+        if entry.current_generation != generation {
+            return;
+        }
+
+        let request = match decode_cache_revalidate_payload(payload) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(
+                    worker = %worker_name,
+                    generation,
+                    error = %error,
+                    "ignoring invalid cache revalidate payload"
+                );
+                return;
+            }
+        };
+
+        let method = request.method.trim().to_ascii_uppercase();
+        if method != "GET" {
+            return;
+        }
+
+        let key = cache_revalidation_key(worker_name, generation, &request);
+        if !self.revalidation_keys.insert(key.clone()) {
+            return;
+        }
+
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let request_id = format!("cache-revalidate-{runtime_request_id}");
+        let mut headers = request.headers.clone();
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-grugd-cache-bypass-stale"))
+        {
+            headers.push(("x-grugd-cache-bypass-stale".to_string(), "1".to_string()));
+        }
+
+        let invocation = WorkerInvocation {
+            method,
+            url: request.url,
+            headers,
+            body: Vec::new(),
+            request_id,
+        };
+        let (reply, _receiver) = oneshot::channel();
+        let warn_thresholds = self.config.queue_warn_thresholds.clone();
+        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
+            pool.queue.push_back(PendingInvoke {
+                runtime_request_id: runtime_request_id.clone(),
+                request: invocation,
+                reply,
+            });
+            pool.update_queue_warning(&warn_thresholds);
+            self.revalidation_requests.insert(runtime_request_id, key);
+            self.dispatch_pool(worker_name, generation, event_tx);
+        } else {
+            self.revalidation_keys.remove(&key);
+        }
+    }
+
+    fn clear_revalidation_for_request(&mut self, request_id: &str) {
+        if let Some(key) = self.revalidation_requests.remove(request_id) {
+            self.revalidation_keys.remove(&key);
+        }
     }
 
     fn fail_stream_registration(
@@ -1206,15 +1338,15 @@ impl WorkerManager {
         worker_name: &str,
         generation: u64,
         isolate_idx: usize,
-    ) -> Vec<oneshot::Sender<Result<WorkerOutput>>> {
+    ) -> Vec<(String, oneshot::Sender<Result<WorkerOutput>>)> {
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if isolate_idx < pool.isolates.len() {
                 let isolate = pool.isolates.swap_remove(isolate_idx);
                 let _ = isolate.sender.send(IsolateCommand::Shutdown);
                 return isolate
                     .pending_replies
-                    .into_values()
-                    .map(|pending| pending.reply)
+                    .into_iter()
+                    .map(|(request_id, pending)| (request_id, pending.reply))
                     .collect();
             }
         }
@@ -1226,7 +1358,7 @@ impl WorkerManager {
         worker_name: &str,
         generation: u64,
         isolate_id: u64,
-    ) -> Vec<oneshot::Sender<Result<WorkerOutput>>> {
+    ) -> Vec<(String, oneshot::Sender<Result<WorkerOutput>>)> {
         let isolate_idx = self
             .workers
             .get(worker_name)
@@ -1291,7 +1423,8 @@ impl WorkerManager {
 
         for isolate in removed {
             let _ = isolate.sender.send(IsolateCommand::Shutdown);
-            for pending in isolate.pending_replies.into_values() {
+            for (request_id, pending) in isolate.pending_replies {
+                self.clear_revalidation_for_request(&request_id);
                 let _ = pending
                     .reply
                     .send(Err(PlatformError::internal("isolate scaled down")));
@@ -1300,29 +1433,38 @@ impl WorkerManager {
     }
 
     fn cleanup_drained_generations_for(&mut self, worker_name: &str) {
-        let Some(entry) = self.workers.get_mut(worker_name) else {
-            return;
-        };
-        let current_generation = entry.current_generation;
-        let drained: Vec<u64> = entry
-            .pools
-            .iter()
-            .filter(|(generation, pool)| **generation != current_generation && pool.is_drained())
-            .map(|(generation, _)| *generation)
-            .collect();
+        let mut clear_request_ids = Vec::new();
+        {
+            let Some(entry) = self.workers.get_mut(worker_name) else {
+                return;
+            };
+            let current_generation = entry.current_generation;
+            let drained: Vec<u64> = entry
+                .pools
+                .iter()
+                .filter(|(generation, pool)| {
+                    **generation != current_generation && pool.is_drained()
+                })
+                .map(|(generation, _)| *generation)
+                .collect();
 
-        for generation in drained {
-            if let Some(pool) = entry.pools.remove(&generation) {
-                for isolate in pool.isolates {
-                    let _ = isolate.sender.send(IsolateCommand::Shutdown);
-                    for pending in isolate.pending_replies.into_values() {
-                        let _ = pending
-                            .reply
-                            .send(Err(PlatformError::internal("worker generation retired")));
+            for generation in drained {
+                if let Some(pool) = entry.pools.remove(&generation) {
+                    for isolate in pool.isolates {
+                        let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                        for (request_id, pending) in isolate.pending_replies {
+                            clear_request_ids.push(request_id);
+                            let _ = pending
+                                .reply
+                                .send(Err(PlatformError::internal("worker generation retired")));
+                        }
                     }
+                    info!(worker = %pool.worker_name, generation, "retired worker generation");
                 }
-                info!(worker = %pool.worker_name, generation, "retired worker generation");
             }
+        }
+        for request_id in clear_request_ids {
+            self.clear_revalidation_for_request(&request_id);
         }
     }
 
@@ -1339,17 +1481,22 @@ impl WorkerManager {
     }
 
     fn shutdown_all(&mut self) {
+        let mut clear_request_ids = Vec::new();
         for entry in self.workers.values_mut() {
             for pool in entry.pools.values_mut() {
                 for isolate in pool.isolates.drain(..) {
                     let _ = isolate.sender.send(IsolateCommand::Shutdown);
-                    for pending in isolate.pending_replies.into_values() {
+                    for (request_id, pending) in isolate.pending_replies {
+                        clear_request_ids.push(request_id);
                         let _ = pending
                             .reply
                             .send(Err(PlatformError::internal("runtime shutting down")));
                     }
                 }
             }
+        }
+        for request_id in clear_request_ids {
+            self.clear_revalidation_for_request(&request_id);
         }
         for (_, mut registration) in std::mem::take(&mut self.stream_registrations) {
             let error = PlatformError::internal("runtime shutting down");
@@ -1652,6 +1799,13 @@ fn spawn_isolate_thread(
                                         }
                                     }
                                 }
+                                IsolateEventPayload::CacheRevalidate(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::CacheRevalidate {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        payload,
+                                    });
+                                }
                             }
                         }
                         Some(command) = command_rx.recv() => {
@@ -1788,6 +1942,48 @@ fn decode_response_chunk_payload(payload: &str) -> Result<(String, String, Vec<u
         PlatformError::runtime(format!("invalid response chunk payload: {error}"))
     })?;
     Ok((chunk.request_id, chunk.completion_token, chunk.chunk))
+}
+
+fn decode_cache_revalidate_payload(payload: &str) -> Result<CacheRevalidatePayload> {
+    let request: CacheRevalidatePayload = serde_json::from_str(payload).map_err(|error| {
+        PlatformError::runtime(format!("invalid cache revalidate payload: {error}"))
+    })?;
+    if request.cache_name.trim().is_empty() {
+        return Err(PlatformError::runtime(
+            "cache revalidate payload is missing cache_name",
+        ));
+    }
+    if request.method.trim().is_empty() {
+        return Err(PlatformError::runtime(
+            "cache revalidate payload is missing method",
+        ));
+    }
+    if request.url.trim().is_empty() {
+        return Err(PlatformError::runtime(
+            "cache revalidate payload is missing url",
+        ));
+    }
+    Ok(request)
+}
+
+fn cache_revalidation_key(
+    worker_name: &str,
+    generation: u64,
+    payload: &CacheRevalidatePayload,
+) -> String {
+    let mut headers: Vec<(String, String)> = payload
+        .headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    headers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let header_key = serde_json::to_string(&headers).unwrap_or_default();
+    format!(
+        "{worker_name}:{generation}:{}:{}:{}:{header_key}",
+        payload.cache_name.trim(),
+        payload.method.trim().to_ascii_uppercase(),
+        payload.url.trim()
+    )
 }
 
 #[cfg(test)]
