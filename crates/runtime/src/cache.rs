@@ -94,9 +94,9 @@ struct CacheControl {
 
 impl CacheStore {
     pub async fn from_env(config: CacheConfig) -> Result<Self> {
-        let store_dir = env::var("GRUGD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
-        let database_url = env::var("TURSO_DATABASE_URL")
-            .unwrap_or_else(|_| format!("file:{store_dir}/grugd-kv.db"));
+        let store_dir = env::var("DD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
+        let database_url =
+            env::var("TURSO_DATABASE_URL").unwrap_or_else(|_| format!("file:{store_dir}/dd-kv.db"));
         let local_path = database_url
             .strip_prefix("file:")
             .unwrap_or(&database_url)
@@ -136,20 +136,21 @@ impl CacheStore {
         let mut lookup = CacheLookup::Miss;
 
         while let Some(row) = rows.next().await.map_err(cache_error)? {
-            let record = row_to_record(&row)?;
-            let vary_headers: Vec<String> = match crate::json::from_str(&record.vary_headers_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    stale.push(CacheDeleteCandidate {
-                        id: record.id,
-                        body_storage: record.body_storage,
-                        body_ref: record.body_ref,
-                    });
-                    continue;
-                }
-            };
+            let mut record = row_to_record(&row)?;
+            let vary_headers: Vec<String> =
+                match crate::json::from_string(std::mem::take(&mut record.vary_headers_json)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stale.push(CacheDeleteCandidate {
+                            id: record.id,
+                            body_storage: record.body_storage,
+                            body_ref: record.body_ref,
+                        });
+                        continue;
+                    }
+                };
             let stored_vary_values: Vec<String> =
-                match crate::json::from_str(&record.vary_values_json) {
+                match crate::json::from_string(std::mem::take(&mut record.vary_values_json)) {
                     Ok(value) => value,
                     Err(_) => {
                         stale.push(CacheDeleteCandidate {
@@ -165,17 +166,18 @@ impl CacheStore {
                 continue;
             }
 
-            let headers: Vec<(String, String)> = match crate::json::from_str(&record.headers_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    stale.push(CacheDeleteCandidate {
-                        id: record.id,
-                        body_storage: record.body_storage,
-                        body_ref: record.body_ref,
-                    });
-                    continue;
-                }
-            };
+            let headers: Vec<(String, String)> =
+                match crate::json::from_string(std::mem::take(&mut record.headers_json)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stale.push(CacheDeleteCandidate {
+                            id: record.id,
+                            body_storage: record.body_storage,
+                            body_ref: record.body_ref,
+                        });
+                        continue;
+                    }
+                };
 
             let body = if record.body_storage == "inline" {
                 match hex_to_bytes(&record.body_inline_hex) {
@@ -406,20 +408,21 @@ impl CacheStore {
             .await?;
 
         let mut to_delete = Vec::new();
-        for record in records {
-            let vary_headers: Vec<String> = match crate::json::from_str(&record.vary_headers_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    to_delete.push(CacheDeleteCandidate {
-                        id: record.id,
-                        body_storage: record.body_storage,
-                        body_ref: record.body_ref,
-                    });
-                    continue;
-                }
-            };
+        for mut record in records {
+            let vary_headers: Vec<String> =
+                match crate::json::from_string(std::mem::take(&mut record.vary_headers_json)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        to_delete.push(CacheDeleteCandidate {
+                            id: record.id,
+                            body_storage: record.body_storage,
+                            body_ref: record.body_ref,
+                        });
+                        continue;
+                    }
+                };
             let stored_vary_values: Vec<String> =
-                match crate::json::from_str(&record.vary_values_json) {
+                match crate::json::from_string(std::mem::take(&mut record.vary_values_json)) {
                     Ok(value) => value,
                     Err(_) => {
                         to_delete.push(CacheDeleteCandidate {
@@ -916,8 +919,8 @@ mod tests {
     use uuid::Uuid;
 
     async fn test_store(config: CacheConfig) -> CacheStore {
-        let database_path = format!("/tmp/grugd-cache-test-{}.db", Uuid::new_v4());
-        let blob_dir = format!("/tmp/grugd-cache-blob-test-{}", Uuid::new_v4());
+        let database_path = format!("/tmp/dd-cache-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-blob-test-{}", Uuid::new_v4());
         let blob_store = local_blob_store_for_tests(&blob_dir)
             .await
             .expect("blob store");
