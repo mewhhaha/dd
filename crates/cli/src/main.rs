@@ -4,8 +4,8 @@ use std::env;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
-#[command(name = "grugd")]
-#[command(about = "CLI for the grugd worker platform")]
+#[command(name = "dd")]
+#[command(about = "CLI for the dd worker platform")]
 struct Cli {
     #[arg(long, global = true, default_value_t = default_server())]
     server: String,
@@ -210,7 +210,7 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn default_server() -> String {
-    env::var("GRUGD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
+    env::var("DD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
 }
 
 fn parse_json_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {

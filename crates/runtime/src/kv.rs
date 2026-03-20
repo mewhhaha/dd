@@ -20,9 +20,9 @@ pub struct KvEntry {
 
 impl KvStore {
     pub async fn from_env() -> Result<Self> {
-        let store_dir = env::var("GRUGD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
-        let database_url = env::var("TURSO_DATABASE_URL")
-            .unwrap_or_else(|_| format!("file:{store_dir}/grugd-kv.db"));
+        let store_dir = env::var("DD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
+        let database_url =
+            env::var("TURSO_DATABASE_URL").unwrap_or_else(|_| format!("file:{store_dir}/dd-kv.db"));
         let local_path = database_url
             .strip_prefix("file:")
             .unwrap_or(&database_url)

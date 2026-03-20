@@ -6,7 +6,7 @@ function htmlPage() {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>grugd swr demo</title>
+    <title>dd swr demo</title>
     <style>
       body {
         margin: 0;
@@ -32,7 +32,7 @@ function htmlPage() {
   </head>
   <body>
     <div class="card">
-      <h1>grugd SWR demo</h1>
+      <h1>dd SWR demo</h1>
       <p>This page loads <code>/app.js</code> with <code>stale-while-revalidate</code>.</p>
       <p>Reload after a few seconds and watch the rendered version update.</p>
       <p id="status">Loading…</p>

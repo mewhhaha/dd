@@ -41,10 +41,10 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
     let fmt_layer = tracing_subscriber::fmt::layer();
     let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
-        .or_else(|| env::var("GRUGD_OTEL_ENDPOINT").ok())
+        .or_else(|| env::var("DD_OTEL_ENDPOINT").ok())
         .filter(|value| !value.trim().is_empty());
     let resource = Resource::new(vec![
-        KeyValue::new("service.name", "grugd-api"),
+        KeyValue::new("service.name", "dd-api"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
     ]);
     let mut provider_builder = OTelTracerProvider::builder().with_resource(resource);
@@ -62,7 +62,7 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
     }
 
     let provider = provider_builder.build();
-    let tracer = provider.tracer("grugd");
+    let tracer = provider.tracer("dd");
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)

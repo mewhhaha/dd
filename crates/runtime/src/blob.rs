@@ -26,18 +26,16 @@ pub struct S3BlobStore {
 
 impl BlobStore {
     pub async fn from_env() -> Result<Self> {
-        let backend = env::var("GRUGD_BLOB_BACKEND").unwrap_or_else(|_| "local".to_string());
+        let backend = env::var("DD_BLOB_BACKEND").unwrap_or_else(|_| "local".to_string());
         match backend.trim().to_ascii_lowercase().as_str() {
             "" | "local" => {
-                let store_dir =
-                    env::var("GRUGD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
-                let root =
-                    env::var("GRUGD_BLOB_DIR").unwrap_or_else(|_| format!("{store_dir}/blobs"));
+                let store_dir = env::var("DD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
+                let root = env::var("DD_BLOB_DIR").unwrap_or_else(|_| format!("{store_dir}/blobs"));
                 Ok(Self::Local(LocalBlobStore::new(root.into()).await?))
             }
             "s3" => Ok(Self::S3(S3BlobStore::from_env())),
             other => Err(PlatformError::runtime(format!(
-                "blob error: unsupported GRUGD_BLOB_BACKEND value `{other}`"
+                "blob error: unsupported DD_BLOB_BACKEND value `{other}`"
             ))),
         }
     }
@@ -100,9 +98,9 @@ impl LocalBlobStore {
 
 impl S3BlobStore {
     fn from_env() -> Self {
-        let bucket = env::var("GRUGD_BLOB_S3_BUCKET").unwrap_or_default();
-        let endpoint = env::var("GRUGD_BLOB_S3_ENDPOINT").ok();
-        let prefix = env::var("GRUGD_BLOB_S3_PREFIX").unwrap_or_else(|_| "cache/".to_string());
+        let bucket = env::var("DD_BLOB_S3_BUCKET").unwrap_or_default();
+        let endpoint = env::var("DD_BLOB_S3_ENDPOINT").ok();
+        let prefix = env::var("DD_BLOB_S3_PREFIX").unwrap_or_else(|_| "cache/".to_string());
         Self {
             bucket,
             endpoint,

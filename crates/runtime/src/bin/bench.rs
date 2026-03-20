@@ -194,7 +194,7 @@ export default {
         },
     ];
 
-    println!("# grugd runtime benchmark");
+    println!("# dd runtime benchmark");
     println!(
         "# note: this benchmark measures runtime service behavior directly (no API/HTTP network overhead)."
     );
@@ -280,8 +280,8 @@ async fn start_service_with_paths(
 
 fn configure_runtime_env(db_path: &Path, store_dir: &Path) {
     std::env::set_var("TURSO_DATABASE_URL", format!("file:{}", db_path.display()));
-    std::env::set_var("GRUGD_STORE_DIR", store_dir.display().to_string());
-    std::env::set_var("GRUGD_WORKER_STORE", "1");
+    std::env::set_var("DD_STORE_DIR", store_dir.display().to_string());
+    std::env::set_var("DD_WORKER_STORE", "1");
 }
 
 struct BenchPaths {
@@ -291,10 +291,10 @@ struct BenchPaths {
 }
 
 fn bench_paths(tag: &str) -> BenchPaths {
-    let root = PathBuf::from(format!("/tmp/grugd-bench-{tag}-{}", Uuid::new_v4()));
+    let root = PathBuf::from(format!("/tmp/dd-bench-{tag}-{}", Uuid::new_v4()));
     BenchPaths {
         root: root.clone(),
-        db_path: root.join("grugd-kv.db"),
+        db_path: root.join("dd-kv.db"),
         store_dir: root.join("store"),
     }
 }

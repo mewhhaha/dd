@@ -364,7 +364,7 @@ A deployment should only become active if validation succeeds.
 Use environment variables like:
 
 ```bash
-export TURSO_DATABASE_URL="file:./grugd-kv.db"
+export TURSO_DATABASE_URL="file:./dd-kv.db"
 export TURSO_AUTH_TOKEN="your-token"
 export RUST_LOG="info"
 ```
