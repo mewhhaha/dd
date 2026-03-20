@@ -53,6 +53,7 @@ pub fn dispatch_worker_request(
     completion_token: &str,
     worker_name: &str,
     kv_bindings: &[String],
+    has_request_body_stream: bool,
     request: WorkerInvocation,
 ) -> Result<()> {
     let request_json = crate::json::to_string(&request)
@@ -70,10 +71,11 @@ pub fn dispatch_worker_request(
         &kv_bindings_json,
         &request_id_json,
         &completion_token_json,
+        has_request_body_stream,
         &request_json,
     );
     runtime
-        .execute_script("<grugd:invoke>", entry_code)
+        .execute_script("<dd:invoke>", entry_code)
         .map_err(runtime_error)?;
     Ok(())
 }
@@ -83,7 +85,7 @@ pub fn abort_worker_request(runtime: &mut JsRuntime, request_id: &str) -> Result
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let entry_code = abort_worker_js(&request_id_json);
     runtime
-        .execute_script("<grugd:abort>", entry_code)
+        .execute_script("<dd:abort>", entry_code)
         .map_err(runtime_error)?;
     Ok(())
 }

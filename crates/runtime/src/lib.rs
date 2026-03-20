@@ -8,4 +8,6 @@ mod ops;
 mod service;
 
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
-pub use service::{RuntimeConfig, RuntimeService, WorkerStats, WorkerStreamOutput};
+pub use service::{
+    InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService, WorkerStats, WorkerStreamOutput,
+};

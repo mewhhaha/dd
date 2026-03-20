@@ -1,6 +1,6 @@
-pub const WORKER_SPECIFIER: &str = "file:///grugd/worker.js";
-pub const BOOTSTRAP_SPECIFIER: &str = "file:///grugd/bootstrap.js";
-pub const INSTALL_SPECIFIER: &str = "file:///grugd/install.js";
+pub const WORKER_SPECIFIER: &str = "file:///dd/worker.js";
+pub const BOOTSTRAP_SPECIFIER: &str = "file:///dd/bootstrap.js";
+pub const INSTALL_SPECIFIER: &str = "file:///dd/install.js";
 
 pub const BOOTSTRAP_JS: &str = include_str!("../js/bootstrap.js");
 
@@ -17,6 +17,7 @@ pub fn execute_worker_js(
     kv_bindings_json: &str,
     request_id: &str,
     completion_token: &str,
+    has_request_body_stream: bool,
     request_json: &str,
 ) -> String {
     EXECUTE_WORKER_TEMPLATE
@@ -24,6 +25,14 @@ pub fn execute_worker_js(
         .replace("__KV_BINDINGS_JSON__", kv_bindings_json)
         .replace("__REQUEST_ID__", request_id)
         .replace("__COMPLETION_TOKEN__", completion_token)
+        .replace(
+            "__HAS_REQUEST_BODY_STREAM__",
+            if has_request_body_stream {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("__REQUEST_JSON__", request_json)
 }
 

@@ -3,9 +3,13 @@ use crate::kv::{KvEntry, KvStore};
 use deno_core::OpState;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 #[derive(Clone)]
 pub struct IsolateEventSender(pub tokio::sync::mpsc::UnboundedSender<IsolateEventPayload>);
@@ -17,6 +21,39 @@ pub enum IsolateEventPayload {
     ResponseStart(String),
     ResponseChunk(String),
     CacheRevalidate(String),
+}
+
+pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
+pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
+
+#[derive(Default)]
+pub struct RequestBodyStreams {
+    streams: HashMap<String, Arc<RequestBodyStream>>,
+}
+
+struct RequestBodyStream {
+    receiver: Mutex<RequestBodyReceiver>,
+    canceled: AtomicBool,
+    canceled_notify: Notify,
+}
+
+impl RequestBodyStream {
+    fn new(receiver: RequestBodyReceiver) -> Self {
+        Self {
+            receiver: Mutex::new(receiver),
+            canceled: AtomicBool::new(false),
+            canceled_notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.canceled.store(true, Ordering::SeqCst);
+        self.canceled_notify.notify_waiters();
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +127,19 @@ struct CacheDeleteResult {
     ok: bool,
     deleted: bool,
     error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RequestBodyReadResult {
+    ok: bool,
+    done: bool,
+    chunk: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionRequestId {
+    request_id: String,
 }
 
 static PROCESS_MONO_START: OnceLock<Instant> = OnceLock::new();
@@ -347,8 +397,92 @@ async fn op_cache_delete(
     }
 }
 
+#[deno_core::op2]
+#[serde]
+async fn op_request_body_read(
+    state: Rc<RefCell<OpState>>,
+    #[string] request_id: String,
+) -> RequestBodyReadResult {
+    let stream = {
+        let state_ref = state.borrow();
+        state_ref
+            .borrow::<RequestBodyStreams>()
+            .streams
+            .get(&request_id)
+            .cloned()
+    };
+    let Some(stream) = stream else {
+        return RequestBodyReadResult {
+            ok: true,
+            done: true,
+            chunk: Vec::new(),
+            error: String::new(),
+        };
+    };
+
+    if stream.is_canceled() {
+        return RequestBodyReadResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "request body stream canceled".to_string(),
+        };
+    }
+
+    let canceled = stream.canceled_notify.notified();
+    tokio::pin!(canceled);
+    let mut receiver = stream.receiver.lock().await;
+    tokio::select! {
+        chunk = receiver.recv() => {
+            match chunk {
+                Some(Ok(bytes)) => RequestBodyReadResult {
+                    ok: true,
+                    done: false,
+                    chunk: bytes,
+                    error: String::new(),
+                },
+                Some(Err(error)) => {
+                    clear_request_body_stream_entry(&state, &request_id);
+                    RequestBodyReadResult {
+                        ok: false,
+                        done: true,
+                        chunk: Vec::new(),
+                        error,
+                    }
+                }
+                None => {
+                    clear_request_body_stream_entry(&state, &request_id);
+                    RequestBodyReadResult {
+                        ok: true,
+                        done: true,
+                        chunk: Vec::new(),
+                        error: String::new(),
+                    }
+                }
+            }
+        }
+        _ = &mut canceled => {
+            clear_request_body_stream_entry(&state, &request_id);
+            RequestBodyReadResult {
+                ok: false,
+                done: true,
+                chunk: Vec::new(),
+                error: "request body stream canceled".to_string(),
+            }
+        }
+    }
+}
+
+#[deno_core::op2(fast)]
+fn op_request_body_cancel(state: &mut OpState, #[string] request_id: String) {
+    cancel_request_body_stream(state, &request_id);
+}
+
 #[deno_core::op2(fast)]
 fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
+    if let Some(request_id) = completion_request_id(&payload) {
+        clear_request_body_stream(state, &request_id);
+    }
     let sender = state.borrow::<IsolateEventSender>().clone();
     let _ = sender.0.send(IsolateEventPayload::Completion(payload));
 }
@@ -378,7 +512,7 @@ fn op_emit_cache_revalidate(state: &mut OpState, #[string] payload: String) {
 }
 
 deno_core::extension!(
-    grugd_runtime_ops,
+    dd_runtime_ops,
     ops = [
         op_sleep,
         op_time_boundary_now,
@@ -389,6 +523,8 @@ deno_core::extension!(
         op_cache_match,
         op_cache_put,
         op_cache_delete,
+        op_request_body_read,
+        op_request_body_cancel,
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,
@@ -398,7 +534,52 @@ deno_core::extension!(
 );
 
 pub fn runtime_extension() -> deno_core::Extension {
-    grugd_runtime_ops::init()
+    dd_runtime_ops::init()
+}
+
+pub fn register_request_body_stream(
+    state: &mut OpState,
+    request_id: String,
+    receiver: RequestBodyReceiver,
+) {
+    state
+        .borrow_mut::<RequestBodyStreams>()
+        .streams
+        .insert(request_id, Arc::new(RequestBodyStream::new(receiver)));
+}
+
+pub fn cancel_request_body_stream(state: &mut OpState, request_id: &str) {
+    if let Some(stream) = state.borrow::<RequestBodyStreams>().streams.get(request_id) {
+        stream.cancel();
+    }
+}
+
+pub fn clear_request_body_stream(state: &mut OpState, request_id: &str) {
+    if let Some(stream) = state
+        .borrow_mut::<RequestBodyStreams>()
+        .streams
+        .remove(request_id)
+    {
+        stream.cancel();
+    }
+}
+
+fn clear_request_body_stream_entry(state: &Rc<RefCell<OpState>>, request_id: &str) {
+    if let Some(stream) = state
+        .borrow_mut()
+        .borrow_mut::<RequestBodyStreams>()
+        .streams
+        .remove(request_id)
+    {
+        stream.cancel();
+    }
+}
+
+fn completion_request_id(payload: &str) -> Option<String> {
+    let mut bytes = payload.as_bytes().to_vec();
+    simd_json::serde::from_slice::<CompletionRequestId>(&mut bytes)
+        .ok()
+        .map(|value| value.request_id)
 }
 
 fn wall_ms() -> u64 {
@@ -416,7 +597,7 @@ fn to_list_item(entry: KvEntry) -> KvListItem {
 }
 
 fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest> {
-    let payload: CacheRequestPayload = crate::json::from_str(&payload).map_err(|error| {
+    let payload: CacheRequestPayload = crate::json::from_string(payload).map_err(|error| {
         common::PlatformError::runtime(format!("invalid cache payload: {error}"))
     })?;
     Ok(CacheRequest {
@@ -429,7 +610,7 @@ fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest>
 }
 
 fn decode_cache_put_payload(payload: String) -> common::Result<(CacheRequest, CacheResponse)> {
-    let payload: CachePutPayload = crate::json::from_str(&payload).map_err(|error| {
+    let payload: CachePutPayload = crate::json::from_string(payload).map_err(|error| {
         common::PlatformError::runtime(format!("invalid cache put payload: {error}"))
     })?;
     Ok((

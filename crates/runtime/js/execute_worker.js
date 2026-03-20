@@ -3,13 +3,14 @@
   const completionToken = __COMPLETION_TOKEN__;
   const workerName = __WORKER_NAME__;
   const kvBindingsConfig = __KV_BINDINGS_JSON__;
-  const worker = globalThis.__grugd_worker;
+  const hasRequestBodyStream = __HAS_REQUEST_BODY_STREAM__;
+  const worker = globalThis.__dd_worker;
 
   if (worker === undefined) {
     throw new Error("Worker is not installed");
   }
 
-  const inflightRequests = globalThis.__grugd_inflight_requests ??= new Map();
+  const inflightRequests = globalThis.__dd_inflight_requests ??= new Map();
   const input = __REQUEST_JSON__;
   const controller = new AbortController();
   const waitUntilPromises = [];
@@ -55,15 +56,15 @@
   const syncFrozenTime = async () => {
     const value = await callOp("op_time_boundary_now");
     const boundary = normalizeBoundaryValue(value);
-    if (boundary && typeof globalThis.__grugd_set_time === "function") {
-      globalThis.__grugd_set_time(boundary.nowMs, boundary.perfMs);
+    if (boundary && typeof globalThis.__dd_set_time === "function") {
+      globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
     }
   };
-  globalThis.__grugd_sync_time_boundary = syncFrozenTime;
-  globalThis.__grugd_cache_bypass_stale = Array.isArray(input.headers)
+  globalThis.__dd_sync_time_boundary = syncFrozenTime;
+  globalThis.__dd_cache_bypass_stale = Array.isArray(input.headers)
     && input.headers.some(([name, value]) => {
       const key = String(name || "").toLowerCase();
-      if (key !== "x-grugd-cache-bypass-stale") {
+      if (key !== "x-dd-cache-bypass-stale") {
         return false;
       }
       const normalized = String(value || "").toLowerCase();
@@ -84,6 +85,71 @@
       return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
     }
     return new TextEncoder().encode(String(value));
+  };
+
+  const createRequestBodyStream = () => {
+    let released = false;
+    let done = false;
+
+    const read = async () => {
+      if (released) {
+        throw new TypeError("Reader has been released");
+      }
+      if (done) {
+        return { value: undefined, done: true };
+      }
+
+      const payload = await callOp("op_request_body_read", requestId);
+      await syncFrozenTime();
+      if (!payload || typeof payload !== "object") {
+        done = true;
+        return { value: undefined, done: true };
+      }
+      if (payload.ok === false) {
+        done = true;
+        throw new Error(String(payload.error ?? "request body stream failed"));
+      }
+      if (payload.done === true) {
+        done = true;
+        return { value: undefined, done: true };
+      }
+      return {
+        value: new Uint8Array(Array.isArray(payload.chunk) ? payload.chunk : []),
+        done: false,
+      };
+    };
+
+    return {
+      getReader() {
+        return {
+          read,
+          releaseLock() {
+            released = true;
+          },
+          async cancel() {
+            done = true;
+            await callOp("op_request_body_cancel", requestId);
+            await syncFrozenTime();
+            return undefined;
+          },
+        };
+      },
+      [Symbol.asyncIterator]() {
+        const reader = this.getReader();
+        return {
+          next: () => reader.read(),
+          return: async () => {
+            if (typeof reader.cancel === "function") {
+              await reader.cancel();
+            }
+            if (typeof reader.releaseLock === "function") {
+              reader.releaseLock();
+            }
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
   };
 
   const createKvBinding = (bindingName) => ({
@@ -266,10 +332,15 @@
   (async () => {
     try {
       await syncFrozenTime();
+      const requestBody = hasRequestBodyStream
+        ? createRequestBodyStream()
+        : input.body?.length
+          ? new Uint8Array(input.body)
+          : undefined;
       const request = new Request(input.url, {
         method: input.method,
         headers: input.headers,
-        body: input.body?.length ? new Uint8Array(input.body) : undefined,
+        body: requestBody,
         signal: controller.signal,
       });
       const env = buildEnv();

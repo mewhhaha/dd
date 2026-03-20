@@ -125,6 +125,9 @@ function normalizeBody(body) {
   if (body == null) {
     return null;
   }
+  if (isReadableStreamLike(body)) {
+    return body;
+  }
   if (typeof body === "string") {
     return encodeUtf8(body);
   }
@@ -328,6 +331,10 @@ class Request {
 
   async arrayBuffer() {
     this.bodyUsed = true;
+    if (isReadableStreamLike(this._body)) {
+      const body = await readStreamBytes(this._body);
+      return body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+    }
     const body = this._body ?? new Uint8Array();
     return body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
   }
@@ -348,6 +355,10 @@ class Request {
       body: this._body ? new Uint8Array(this._body) : undefined,
       signal: this.signal,
     });
+  }
+
+  get body() {
+    return isReadableStreamLike(this._body) ? this._body : null;
   }
 }
 
@@ -548,15 +559,15 @@ function normalizeTimeBoundaryValue(value) {
 }
 
 async function syncFrozenTimeBoundary() {
-  if (typeof globalThis.__grugd_sync_time_boundary === "function") {
-    await globalThis.__grugd_sync_time_boundary();
+  if (typeof globalThis.__dd_sync_time_boundary === "function") {
+    await globalThis.__dd_sync_time_boundary();
     return;
   }
 
   const boundaryRaw = await runtimeOp("op_time_boundary_now");
   const boundary = normalizeTimeBoundaryValue(boundaryRaw);
-  if (boundary && typeof globalThis.__grugd_set_time === "function") {
-    globalThis.__grugd_set_time(boundary.nowMs, boundary.perfMs);
+  if (boundary && typeof globalThis.__dd_set_time === "function") {
+    globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
   }
 }
 
@@ -576,7 +587,7 @@ class Cache {
         method: normalizedRequest.method,
         url: normalizedRequest.url,
         headers: requestHeaders,
-        bypass_stale: Boolean(globalThis.__grugd_cache_bypass_stale),
+        bypass_stale: Boolean(globalThis.__dd_cache_bypass_stale),
       }),
     );
     await syncFrozenTimeBoundary();
@@ -685,4 +696,4 @@ if (globalThis.ReadableStream === undefined) {
   define("ReadableStream", ReadableStream);
 }
 define("caches", new CacheStorage());
-define("__grugd_set_time", setFrozenTime);
+define("__dd_set_time", setFrozenTime);

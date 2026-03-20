@@ -4,7 +4,10 @@ use crate::engine::{
     new_runtime_from_snapshot, pump_event_loop_once, validate_worker,
 };
 use crate::kv::KvStore;
-use crate::ops::{IsolateEventPayload, IsolateEventSender};
+use crate::ops::{
+    cancel_request_body_stream, clear_request_body_stream, register_request_body_stream,
+    IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
+};
 use common::{DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
 use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
@@ -71,6 +74,8 @@ pub struct WorkerStreamOutput {
     pub body: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
 }
 
+pub type InvokeRequestBodyReceiver = mpsc::Receiver<std::result::Result<Vec<u8>, String>>;
+
 #[derive(Clone)]
 pub struct RuntimeService {
     sender: mpsc::Sender<RuntimeCommand>,
@@ -83,12 +88,14 @@ enum RuntimeCommand {
         worker_name: String,
         source: String,
         config: DeployConfig,
+        persist: bool,
         reply: oneshot::Sender<Result<String>>,
     },
     Invoke {
         worker_name: String,
         runtime_request_id: String,
         request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
         reply: oneshot::Sender<Result<WorkerOutput>>,
     },
     RegisterStream {
@@ -156,6 +163,7 @@ struct PoolStats {
 struct PendingInvoke {
     runtime_request_id: String,
     request: WorkerInvocation,
+    request_body: Option<InvokeRequestBodyReceiver>,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     enqueued_at: Instant,
 }
@@ -186,6 +194,7 @@ enum IsolateCommand {
         worker_name: String,
         kv_bindings: Vec<String>,
         request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
     },
     Abort {
         runtime_request_id: String,
@@ -402,12 +411,24 @@ impl RuntimeService {
         source: String,
         config: DeployConfig,
     ) -> Result<String> {
+        self.deploy_with_config_internal(worker_name, source, config, true)
+            .await
+    }
+
+    async fn deploy_with_config_internal(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+        persist: bool,
+    ) -> Result<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::Deploy {
                 worker_name,
                 source,
                 config,
+                persist,
                 reply: reply_tx,
             })
             .await
@@ -454,7 +475,7 @@ impl RuntimeService {
                     continue;
                 }
             };
-            let stored: StoredWorkerDeployment = match crate::json::from_str(&body) {
+            let stored: StoredWorkerDeployment = match crate::json::from_string(body) {
                 Ok(stored) => stored,
                 Err(error) => {
                     warn!(path = %path.display(), error = %error, "skipping invalid worker store file");
@@ -463,7 +484,12 @@ impl RuntimeService {
             };
 
             match self
-                .deploy_with_config(stored.name.clone(), stored.source, stored.config)
+                .deploy_with_config_internal(
+                    stored.name.clone(),
+                    stored.source,
+                    stored.config,
+                    false,
+                )
                 .await
             {
                 Ok(deployment_id) => {
@@ -496,6 +522,16 @@ impl RuntimeService {
         worker_name: String,
         request: WorkerInvocation,
     ) -> Result<WorkerOutput> {
+        self.invoke_with_request_body(worker_name, request, None)
+            .await
+    }
+
+    pub async fn invoke_with_request_body(
+        &self,
+        worker_name: String,
+        request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
+    ) -> Result<WorkerOutput> {
         let runtime_request_id = Uuid::new_v4().to_string();
         let invoke_span = tracing::info_span!(
             "runtime.invoke",
@@ -519,6 +555,7 @@ impl RuntimeService {
                 worker_name,
                 runtime_request_id,
                 request,
+                request_body,
                 reply: reply_tx,
             })
             .await
@@ -533,6 +570,16 @@ impl RuntimeService {
         &self,
         worker_name: String,
         request: WorkerInvocation,
+    ) -> Result<WorkerStreamOutput> {
+        self.invoke_stream_with_request_body(worker_name, request, None)
+            .await
+    }
+
+    pub async fn invoke_stream_with_request_body(
+        &self,
+        worker_name: String,
+        request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
     ) -> Result<WorkerStreamOutput> {
         let runtime_request_id = Uuid::new_v4().to_string();
         let stream_span = tracing::info_span!(
@@ -567,6 +614,7 @@ impl RuntimeService {
                 worker_name,
                 runtime_request_id,
                 request,
+                request_body,
                 reply: reply_tx,
             })
             .await
@@ -655,18 +703,27 @@ impl WorkerManager {
                 worker_name,
                 source,
                 config,
+                persist,
                 reply,
             } => {
-                let result = self.deploy(worker_name, source, config).await;
+                let result = self.deploy(worker_name, source, config, persist).await;
                 let _ = reply.send(result);
             }
             RuntimeCommand::Invoke {
                 worker_name,
                 runtime_request_id,
                 request,
+                request_body,
                 reply,
             } => {
-                self.enqueue_invoke(worker_name, runtime_request_id, request, reply, event_tx);
+                self.enqueue_invoke(
+                    worker_name,
+                    runtime_request_id,
+                    request,
+                    request_body,
+                    reply,
+                    event_tx,
+                );
             }
             RuntimeCommand::RegisterStream {
                 worker_name,
@@ -758,7 +815,7 @@ impl WorkerManager {
                 generation,
                 payload,
             } => {
-                self.schedule_cache_revalidate(&worker_name, generation, &payload, event_tx);
+                self.schedule_cache_revalidate(&worker_name, generation, payload, event_tx);
             }
             RuntimeEvent::IsolateFailed {
                 worker_name,
@@ -778,6 +835,7 @@ impl WorkerManager {
         worker_name: String,
         source: String,
         config: DeployConfig,
+        persist: bool,
     ) -> Result<String> {
         let worker_name = worker_name.trim().to_string();
         if worker_name.is_empty() {
@@ -790,7 +848,9 @@ impl WorkerManager {
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
-        persist_worker_deployment(&worker_name, &source, &config, &deployment_id).await?;
+        if persist {
+            persist_worker_deployment(&worker_name, &source, &config, &deployment_id).await?;
+        }
 
         let pool = WorkerPool {
             worker_name: worker_name.clone(),
@@ -843,6 +903,7 @@ impl WorkerManager {
         worker_name: String,
         runtime_request_id: String,
         request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
         reply: oneshot::Sender<Result<WorkerOutput>>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
@@ -877,6 +938,7 @@ impl WorkerManager {
             pool.queue.push_back(PendingInvoke {
                 runtime_request_id,
                 request,
+                request_body,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -1079,6 +1141,7 @@ impl WorkerManager {
                     worker_name: worker_name.to_string(),
                     kv_bindings,
                     request: pending_invoke.request,
+                    request_body: pending_invoke.request_body,
                 };
 
                 if isolate.sender.send(command).is_err() {
@@ -1354,7 +1417,7 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         generation: u64,
-        payload: &str,
+        payload: String,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let Some(entry) = self.workers.get(worker_name) else {
@@ -1406,9 +1469,9 @@ impl WorkerManager {
         let mut headers = request.headers.clone();
         if !headers
             .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("x-grugd-cache-bypass-stale"))
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-dd-cache-bypass-stale"))
         {
-            headers.push(("x-grugd-cache-bypass-stale".to_string(), "1".to_string()));
+            headers.push(("x-dd-cache-bypass-stale".to_string(), "1".to_string()));
         }
 
         let invocation = WorkerInvocation {
@@ -1424,6 +1487,7 @@ impl WorkerManager {
             pool.queue.push_back(PendingInvoke {
                 runtime_request_id: runtime_request_id.clone(),
                 request: invocation,
+                request_body: None,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -1811,7 +1875,7 @@ fn spawn_runtime_thread(
     config: RuntimeConfig,
 ) -> Result<()> {
     thread::Builder::new()
-        .name("grugd-runtime".to_string())
+        .name("dd-runtime".to_string())
         .spawn(move || {
             let runtime = Builder::new_current_thread()
                 .enable_all()
@@ -1864,7 +1928,7 @@ fn spawn_isolate_thread(
 ) -> Result<IsolateHandle> {
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
-    let thread_name = format!("grugd-isolate-{worker_name}-{generation}-{isolate_id}");
+    let thread_name = format!("dd-isolate-{worker_name}-{generation}-{isolate_id}");
 
     thread::Builder::new()
         .name(thread_name)
@@ -1894,6 +1958,7 @@ fn spawn_isolate_thread(
                     op_state.put(IsolateEventSender(event_payload_tx));
                     op_state.put(kv_store.clone());
                     op_state.put(cache_store.clone());
+                    op_state.put(RequestBodyStreams::default());
                 }
                 let _ = init_tx.send(Ok(()));
 
@@ -1905,7 +1970,7 @@ fn spawn_isolate_thread(
                         Some(payload) = event_payload_rx.recv() => {
                             match payload {
                                 IsolateEventPayload::Completion(payload) => {
-                                    match decode_completion_payload(&payload) {
+                                    match decode_completion_payload(payload) {
                                         Ok((request_id, completion_token, wait_until_count, result)) => {
                                             let _ = event_tx.send(RuntimeEvent::RequestFinished {
                                                 worker_name: worker_name.clone(),
@@ -1929,7 +1994,7 @@ fn spawn_isolate_thread(
                                     }
                                 }
                                 IsolateEventPayload::WaitUntilDone(payload) => {
-                                    match decode_wait_until_payload(&payload) {
+                                    match decode_wait_until_payload(payload) {
                                         Ok((request_id, completion_token)) => {
                                             let _ = event_tx.send(RuntimeEvent::WaitUntilFinished {
                                                 worker_name: worker_name.clone(),
@@ -1951,7 +2016,7 @@ fn spawn_isolate_thread(
                                     }
                                 }
                                 IsolateEventPayload::ResponseStart(payload) => {
-                                    match decode_response_start_payload(&payload) {
+                                    match decode_response_start_payload(payload) {
                                         Ok((request_id, completion_token, status, headers)) => {
                                             let _ = event_tx.send(RuntimeEvent::ResponseStart {
                                                 worker_name: worker_name.clone(),
@@ -1973,7 +2038,7 @@ fn spawn_isolate_thread(
                                     }
                                 }
                                 IsolateEventPayload::ResponseChunk(payload) => {
-                                    match decode_response_chunk_payload(&payload) {
+                                    match decode_response_chunk_payload(payload) {
                                         Ok((request_id, completion_token, chunk)) => {
                                             let _ = event_tx.send(RuntimeEvent::ResponseChunk {
                                                 worker_name: worker_name.clone(),
@@ -2010,8 +2075,19 @@ fn spawn_isolate_thread(
                                     worker_name: worker_name_for_env,
                                     kv_bindings,
                                     request,
+                                    request_body,
                                 } => {
                                     let request_id = request.request_id.clone();
+                                    let has_request_body_stream = request_body.is_some();
+                                    if let Some(request_body) = request_body {
+                                        let op_state = js_runtime.op_state();
+                                        let mut op_state = op_state.borrow_mut();
+                                        register_request_body_stream(
+                                            &mut op_state,
+                                            runtime_request_id.clone(),
+                                            request_body,
+                                        );
+                                    }
                                     let execute_span = tracing::info_span!(
                                         "runtime.isolate.execute",
                                         worker.name = %worker_name,
@@ -2032,6 +2108,7 @@ fn spawn_isolate_thread(
                                         &completion_token,
                                         &worker_name_for_env,
                                         &kv_bindings,
+                                        has_request_body_stream,
                                         request,
                                     ) {
                                         tracing::warn!(
@@ -2056,6 +2133,12 @@ fn spawn_isolate_thread(
                                     }
                                 }
                                 IsolateCommand::Abort { runtime_request_id } => {
+                                    {
+                                        let op_state = js_runtime.op_state();
+                                        let mut op_state = op_state.borrow_mut();
+                                        cancel_request_body_stream(&mut op_state, &runtime_request_id);
+                                        clear_request_body_stream(&mut op_state, &runtime_request_id);
+                                    }
                                     if let Err(error) =
                                         abort_worker_request(&mut js_runtime, &runtime_request_id)
                                     {
@@ -2160,7 +2243,7 @@ fn worker_store_enabled() -> bool {
     if cfg!(test) {
         return false;
     }
-    env::var("GRUGD_WORKER_STORE")
+    env::var("DD_WORKER_STORE")
         .map(|value| {
             let normalized = value.trim().to_ascii_lowercase();
             !(normalized == "0" || normalized == "false" || normalized == "off")
@@ -2169,7 +2252,7 @@ fn worker_store_enabled() -> bool {
 }
 
 fn worker_store_dir() -> PathBuf {
-    env::var("GRUGD_STORE_DIR")
+    env::var("DD_STORE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./store"))
 }
@@ -2201,9 +2284,9 @@ fn epoch_ms_i64() -> Result<i64> {
 }
 
 fn decode_completion_payload(
-    payload: &str,
+    payload: String,
 ) -> Result<(String, String, usize, Result<WorkerOutput>)> {
-    let completion: CompletionPayload = crate::json::from_str(payload)
+    let completion: CompletionPayload = crate::json::from_string(payload)
         .map_err(|error| PlatformError::runtime(format!("invalid completion payload: {error}")))?;
     if completion.ok {
         let output = completion
@@ -2228,16 +2311,16 @@ fn decode_completion_payload(
     }
 }
 
-fn decode_wait_until_payload(payload: &str) -> Result<(String, String)> {
-    let done: WaitUntilPayload = crate::json::from_str(payload)
+fn decode_wait_until_payload(payload: String) -> Result<(String, String)> {
+    let done: WaitUntilPayload = crate::json::from_string(payload)
         .map_err(|error| PlatformError::runtime(format!("invalid waitUntil payload: {error}")))?;
     Ok((done.request_id, done.completion_token))
 }
 
 fn decode_response_start_payload(
-    payload: &str,
+    payload: String,
 ) -> Result<(String, String, u16, Vec<(String, String)>)> {
-    let start: ResponseStartPayload = crate::json::from_str(payload).map_err(|error| {
+    let start: ResponseStartPayload = crate::json::from_string(payload).map_err(|error| {
         PlatformError::runtime(format!("invalid response start payload: {error}"))
     })?;
     Ok((
@@ -2248,15 +2331,15 @@ fn decode_response_start_payload(
     ))
 }
 
-fn decode_response_chunk_payload(payload: &str) -> Result<(String, String, Vec<u8>)> {
-    let chunk: ResponseChunkPayload = crate::json::from_str(payload).map_err(|error| {
+fn decode_response_chunk_payload(payload: String) -> Result<(String, String, Vec<u8>)> {
+    let chunk: ResponseChunkPayload = crate::json::from_string(payload).map_err(|error| {
         PlatformError::runtime(format!("invalid response chunk payload: {error}"))
     })?;
     Ok((chunk.request_id, chunk.completion_token, chunk.chunk))
 }
 
-fn decode_cache_revalidate_payload(payload: &str) -> Result<CacheRevalidatePayload> {
-    let request: CacheRevalidatePayload = crate::json::from_str(payload).map_err(|error| {
+fn decode_cache_revalidate_payload(payload: String) -> Result<CacheRevalidatePayload> {
+    let request: CacheRevalidatePayload = crate::json::from_string(payload).map_err(|error| {
         PlatformError::runtime(format!("invalid cache revalidate payload: {error}"))
     })?;
     if request.cache_name.trim().is_empty() {
@@ -2339,6 +2422,7 @@ mod tests {
     use common::WorkerInvocation;
     use serial_test::serial;
     use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
     use uuid::Uuid;
 
@@ -2491,8 +2575,33 @@ export default {{
         )
     }
 
+    fn streaming_request_body_worker() -> String {
+        r#"
+export default {
+  async fetch(request) {
+    const reader = request.body?.getReader?.();
+    if (!reader) {
+      return new Response("no-body");
+    }
+    let output = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      for (const byte of value) {
+        output += String.fromCharCode(byte);
+      }
+    }
+    return new Response(output);
+  },
+};
+"#
+        .to_string()
+    }
+
     async fn test_service(config: RuntimeConfig) -> RuntimeService {
-        let db_path = format!("/tmp/grugd-test-{}.db", Uuid::new_v4());
+        let db_path = format!("/tmp/dd-test-{}.db", Uuid::new_v4());
         std::env::set_var("TURSO_DATABASE_URL", format!("file:{db_path}"));
         RuntimeService::start_with_config(config)
             .await
@@ -2937,6 +3046,57 @@ export default {
             body.extend(chunk.expect("chunk should be ok"));
         }
         assert_eq!(String::from_utf8(body).expect("utf8"), "hello");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy(
+                "streaming-body".to_string(),
+                streaming_request_body_worker(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let (tx, rx) = mpsc::channel(4);
+        let mut request = test_invocation();
+        request.method = "POST".to_string();
+        request.request_id = "streaming-body-request".to_string();
+
+        let invoke_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .invoke_with_request_body("streaming-body".to_string(), request, Some(rx))
+                    .await
+            })
+        };
+
+        tx.send(Ok(b"hel".to_vec()))
+            .await
+            .expect("first body chunk should send");
+        tx.send(Ok(b"lo".to_vec()))
+            .await
+            .expect("second body chunk should send");
+        drop(tx);
+
+        let output = invoke_task
+            .await
+            .expect("join")
+            .expect("invoke should succeed");
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "hello");
     }
 
     #[tokio::test]

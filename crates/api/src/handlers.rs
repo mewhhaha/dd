@@ -1,7 +1,7 @@
 use crate::state::AppState;
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{HeaderName, HeaderValue};
+use axum::http::header::{HeaderName, HeaderValue, CONTENT_LENGTH};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -14,6 +14,9 @@ use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::TraceContextExt;
 use runtime::{CacheLookup, CacheRequest, CacheResponse};
 use std::collections::HashSet;
+use std::env;
+use std::sync::OnceLock;
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -22,6 +25,13 @@ use uuid::Uuid;
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
 
 pub struct ApiError(pub PlatformError);
+
+const DEFAULT_MAX_INVOKE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
+const HEADER_CACHE: &str = "x-dd-cache";
+const HEADER_CACHE_FALLBACK: &str = "x-dd-cache-fallback";
+const HEADER_CACHE_BYPASS_STALE: &str = "x-dd-cache-bypass-stale";
+const HEADER_TRACE_ID: &str = "x-dd-trace-id";
 
 pub async fn deploy_worker(
     State(state): State<AppState>,
@@ -65,9 +75,14 @@ pub async fn invoke_worker(
     set_span_parent_from_http_headers(&invoke_span, &parts.headers);
     let _invoke_guard = invoke_span.enter();
 
-    let body = to_bytes(body, usize::MAX).await.map_err(|error| {
-        PlatformError::internal(format!("failed to read request body: {error}"))
-    })?;
+    let max_body_bytes = max_invoke_body_bytes();
+    if request_content_length(&parts.headers).is_some_and(|value| value > max_body_bytes as u64) {
+        return Err(PlatformError::bad_request(format!(
+            "request body too large (max {max_body_bytes} bytes)"
+        ))
+        .into());
+    }
+    let request_body_stream = build_request_body_stream(body, max_body_bytes);
 
     let mut headers = Vec::with_capacity(parts.headers.len());
     for (name, value) in &parts.headers {
@@ -83,13 +98,16 @@ pub async fn invoke_worker(
         method,
         url,
         headers,
-        body: body.to_vec(),
+        body: Vec::new(),
         request_id: request_id.clone(),
     };
     tracing::info!(request_id = %request_id, "invoke request accepted");
 
     if !is_cacheable_request(&invocation) {
-        let output = state.runtime.invoke_stream(worker_name, invocation).await?;
+        let output = state
+            .runtime
+            .invoke_stream_with_request_body(worker_name, invocation, Some(request_body_stream))
+            .await?;
         let mut response = build_worker_stream_response(output)?;
         annotate_response_with_trace_id(&mut response);
         return Ok(response);
@@ -117,7 +135,10 @@ pub async fn invoke_worker(
             return build_cached_response(response, "STALE");
         }
         CacheLookup::StaleIfError(response) => {
-            let origin = state.runtime.invoke(worker_name, invocation).await;
+            let origin = state
+                .runtime
+                .invoke_with_request_body(worker_name, invocation, Some(request_body_stream))
+                .await;
             return match origin {
                 Ok(output) => {
                     if output.status >= 500 {
@@ -129,7 +150,7 @@ pub async fn invoke_worker(
                         );
                         let mut fallback = build_cached_response(response, "STALE-IF-ERROR")?;
                         fallback.headers_mut().append(
-                            HeaderName::from_static("x-grugd-cache-fallback"),
+                            HeaderName::from_static(HEADER_CACHE_FALLBACK),
                             HeaderValue::from_static("origin-status"),
                         );
                         return Ok(fallback);
@@ -146,7 +167,7 @@ pub async fn invoke_worker(
                     );
                     let mut response = build_cached_response(response, "STALE-IF-ERROR")?;
                     response.headers_mut().append(
-                        HeaderName::from_static("x-grugd-cache-fallback"),
+                        HeaderName::from_static(HEADER_CACHE_FALLBACK),
                         HeaderValue::from_static("origin-error"),
                     );
                     Ok(response)
@@ -156,7 +177,10 @@ pub async fn invoke_worker(
         CacheLookup::Miss => {}
     }
 
-    let output = state.runtime.invoke(worker_name, invocation).await?;
+    let output = state
+        .runtime
+        .invoke_with_request_body(worker_name, invocation, Some(request_body_stream))
+        .await?;
     store_worker_output_in_cache(&state, &cache_request, &output).await;
     tracing::info!(request_id = %request_id, cache_status = "MISS", "origin miss stored");
     build_worker_buffered_response(output, "MISS")
@@ -197,6 +221,56 @@ fn parse_invoke_request_uri(
     let url = format!("http://worker{}{}", url_path, query_suffix);
 
     Ok((worker_name.to_string(), url))
+}
+
+fn build_request_body_stream(body: Body, max_bytes: usize) -> runtime::InvokeRequestBodyReceiver {
+    let (tx, rx) = mpsc::channel(REQUEST_BODY_STREAM_CAPACITY);
+    tokio::spawn(async move {
+        let mut stream = body.into_data_stream();
+        let mut total = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(format!("failed to read request body: {error}")))
+                        .await;
+                    return;
+                }
+            };
+            total = total.saturating_add(chunk.len());
+            if total > max_bytes {
+                let _ = tx
+                    .send(Err(format!(
+                        "request body too large (max {max_bytes} bytes)"
+                    )))
+                    .await;
+                return;
+            }
+            if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+fn request_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn max_invoke_body_bytes() -> usize {
+    static MAX_BODY_BYTES: OnceLock<usize> = OnceLock::new();
+    *MAX_BODY_BYTES.get_or_init(|| {
+        env::var("DD_MAX_INVOKE_BODY_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_INVOKE_BODY_BYTES)
+    })
 }
 
 fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformError> {
@@ -250,7 +324,22 @@ fn build_worker_stream_response(
 }
 
 fn is_cacheable_request(invocation: &WorkerInvocation) -> bool {
-    invocation.method.eq_ignore_ascii_case("GET") && invocation.body.is_empty()
+    if !invocation.method.eq_ignore_ascii_case("GET") {
+        return false;
+    }
+    !invocation.headers.iter().any(|(name, value)| {
+        if name.eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<u64>()
+                .map(|size| size > 0)
+                .unwrap_or(true);
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return !value.trim().is_empty();
+        }
+        false
+    })
 }
 
 fn build_edge_cache_request(worker_name: &str, invocation: &WorkerInvocation) -> CacheRequest {
@@ -303,7 +392,7 @@ fn build_buffered_response(
     }
 
     response.headers_mut().insert(
-        HeaderName::from_static("x-grugd-cache"),
+        HeaderName::from_static(HEADER_CACHE),
         HeaderValue::from_str(cache_status)
             .map_err(|error| PlatformError::internal(error.to_string()))?,
     );
@@ -347,11 +436,11 @@ async fn maybe_spawn_edge_revalidation(
     if !invocation
         .headers
         .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("x-grugd-cache-bypass-stale"))
+        .any(|(name, _)| name.eq_ignore_ascii_case(HEADER_CACHE_BYPASS_STALE))
     {
         invocation
             .headers
-            .push(("x-grugd-cache-bypass-stale".to_string(), "1".to_string()));
+            .push((HEADER_CACHE_BYPASS_STALE.to_string(), "1".to_string()));
     }
 
     tokio::spawn(async move {
@@ -421,7 +510,7 @@ fn annotate_response_with_trace_id(response: &mut Response<Body>) {
     if let Ok(value) = HeaderValue::from_str(&span_context.trace_id().to_string()) {
         response
             .headers_mut()
-            .insert(HeaderName::from_static("x-grugd-trace-id"), value);
+            .insert(HeaderName::from_static(HEADER_TRACE_ID), value);
     }
 }
 

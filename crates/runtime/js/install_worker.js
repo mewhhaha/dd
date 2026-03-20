@@ -12,5 +12,5 @@ if (typeof worker.fetch !== "function") {
   throw new Error("Default export must define fetch(request, env, ctx)");
 }
 
-globalThis.__grugd_worker = worker;
+globalThis.__dd_worker = worker;
 export const ok = true;

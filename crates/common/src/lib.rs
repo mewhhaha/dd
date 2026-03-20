@@ -97,11 +97,6 @@ pub struct DeployResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InvokeRequest {
-    pub worker_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInvocation {
     pub method: String,
     pub url: String,
