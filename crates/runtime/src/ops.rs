@@ -1,6 +1,7 @@
+use crate::cache::{CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvStore};
 use deno_core::OpState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -47,6 +48,42 @@ struct KvOpResult {
 struct KvListResult {
     ok: bool,
     entries: Vec<KvListItem>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheRequestPayload {
+    cache_name: String,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CachePutPayload {
+    cache_name: String,
+    method: String,
+    url: String,
+    request_headers: Vec<(String, String)>,
+    response_status: u16,
+    response_headers: Vec<(String, String)>,
+    response_body: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheMatchResult {
+    ok: bool,
+    found: bool,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CacheDeleteResult {
+    ok: bool,
+    deleted: bool,
     error: String,
 }
 
@@ -171,6 +208,112 @@ async fn op_kv_list(
     }
 }
 
+#[deno_core::op2]
+#[serde]
+async fn op_cache_match(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> CacheMatchResult {
+    let request = match decode_cache_request_payload(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return CacheMatchResult {
+                ok: false,
+                found: false,
+                status: 0,
+                headers: Vec::new(),
+                body: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let store = state.borrow().borrow::<CacheStore>().clone();
+    match store.get(&request).await {
+        Ok(Some(response)) => CacheMatchResult {
+            ok: true,
+            found: true,
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+            error: String::new(),
+        },
+        Ok(None) => CacheMatchResult {
+            ok: true,
+            found: false,
+            status: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: String::new(),
+        },
+        Err(error) => CacheMatchResult {
+            ok: false,
+            found: false,
+            status: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_cache_put(state: Rc<RefCell<OpState>>, #[string] payload: String) -> KvOpResult {
+    let (request, response) = match decode_cache_put_payload(payload) {
+        Ok(values) => values,
+        Err(error) => {
+            return KvOpResult {
+                ok: false,
+                error: error.to_string(),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<CacheStore>().clone();
+    match store.put(&request, response).await {
+        Ok(_) => KvOpResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => KvOpResult {
+            ok: false,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_cache_delete(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> CacheDeleteResult {
+    let request = match decode_cache_request_payload(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return CacheDeleteResult {
+                ok: false,
+                deleted: false,
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let store = state.borrow().borrow::<CacheStore>().clone();
+    match store.delete(&request).await {
+        Ok(deleted) => CacheDeleteResult {
+            ok: true,
+            deleted,
+            error: String::new(),
+        },
+        Err(error) => CacheDeleteResult {
+            ok: false,
+            deleted: false,
+            error: error.to_string(),
+        },
+    }
+}
+
 #[deno_core::op2(fast)]
 fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
     let sender = state.borrow::<IsolateEventSender>().clone();
@@ -204,6 +347,9 @@ deno_core::extension!(
         op_kv_set,
         op_kv_delete,
         op_kv_list,
+        op_cache_match,
+        op_cache_put,
+        op_cache_delete,
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,
@@ -227,4 +373,35 @@ fn to_list_item(entry: KvEntry) -> KvListItem {
         key: entry.key,
         value: entry.value,
     }
+}
+
+fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest> {
+    let payload: CacheRequestPayload = serde_json::from_str(&payload).map_err(|error| {
+        common::PlatformError::runtime(format!("invalid cache payload: {error}"))
+    })?;
+    Ok(CacheRequest {
+        cache_name: payload.cache_name,
+        method: payload.method,
+        url: payload.url,
+        headers: payload.headers,
+    })
+}
+
+fn decode_cache_put_payload(payload: String) -> common::Result<(CacheRequest, CacheResponse)> {
+    let payload: CachePutPayload = serde_json::from_str(&payload).map_err(|error| {
+        common::PlatformError::runtime(format!("invalid cache put payload: {error}"))
+    })?;
+    Ok((
+        CacheRequest {
+            cache_name: payload.cache_name,
+            method: payload.method,
+            url: payload.url,
+            headers: payload.request_headers,
+        },
+        CacheResponse {
+            status: payload.response_status,
+            headers: payload.response_headers,
+            body: payload.response_body,
+        },
+    ))
 }

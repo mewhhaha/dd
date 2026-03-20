@@ -15,6 +15,8 @@ This MVP supports:
 - isolate reuse (module/global state is preserved for warm isolates)
 - `ctx.waitUntil()` with a 30s cap
 - optional Turso KV bindings injected in `env`
+- global in-process Cache API (`caches.default` + `caches.open(name)`) shared across workers
+- cache index persisted in Turso; large cache bodies spill to blob storage (local FS now, S3-like backend hook ready)
 
 Workers are single JavaScript modules that export a default object with `fetch(request, env, ctx)`.
 
@@ -30,7 +32,11 @@ Optional settings:
 export BIND_ADDR="127.0.0.1:3000"
 export RUST_LOG="info"
 export TURSO_DATABASE_URL="file:./grugd-kv.db"
+export GRUGD_BLOB_BACKEND="local"
+export GRUGD_BLOB_DIR="/tmp/grugd-cache/blobs"
 ```
+
+`GRUGD_BLOB_BACKEND=s3` is reserved for the upcoming S3-compatible implementation.
 
 ## Run
 
@@ -64,10 +70,57 @@ Current baseline results are in `BENCHMARKS.md`.
 - unlimited per-worker FIFO queue
 - up to 4 inflight requests per isolate by default
 - dropped invokes are canceled and signaled via `ctx.signal`
+- cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure
+- cache metadata lives in Turso; inline bodies <= 64KiB, larger bodies use blob storage refs
 
-## Example worker
+## Example workers
 
-See `examples/hello.js`.
+- `examples/hello.js` - smallest possible worker
+- `examples/router.js` - tiny GET/POST router
+- `examples/cache.js` - cache-aside with `caches.default`
+- `examples/named-cache.js` - cache-aside with `await caches.open("name")`
+- `examples/cache-vary.js` - cache variants with `Vary: accept-language`
+- `examples/cache-delete.js` - cache invalidation with `cache.delete`
+- `examples/stream.js` - `ReadableStream` response chunks
+- `examples/kv.js` - KV binding reads/writes (`env.MY_KV`)
+- `examples/kv-counter.js` - tiny counter API (`/value`, `/inc`, `/reset`)
+- `examples/wait-until.js` - respond now, finish async work in `ctx.waitUntil`
+- `examples/wait-until-kv.js` - `waitUntil` background write into KV
+
+Try them quickly:
+
+```bash
+cargo run -p cli -- deploy hello examples/hello.js
+cargo run -p cli -- deploy router examples/router.js
+cargo run -p cli -- deploy cache examples/cache.js
+cargo run -p cli -- deploy named-cache examples/named-cache.js
+cargo run -p cli -- deploy cache-vary examples/cache-vary.js
+cargo run -p cli -- deploy cache-delete examples/cache-delete.js
+cargo run -p cli -- deploy stream examples/stream.js
+cargo run -p cli -- deploy kv examples/kv.js --kv-binding MY_KV
+cargo run -p cli -- deploy kv-counter examples/kv-counter.js --kv-binding MY_KV
+cargo run -p cli -- deploy bg examples/wait-until.js
+cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
+```
+
+Invoke examples:
+
+```bash
+cargo run -p cli -- invoke router --method GET --path /health
+printf "ping" | cargo run -p cli -- invoke router --method POST --path /echo --header "content-type: text/plain" --body-file -
+cargo run -p cli -- invoke cache-vary --method GET --path /greet --header "accept-language: fr"
+cargo run -p cli -- invoke stream --method GET --path /
+cargo run -p cli -- invoke kv-counter --method POST --path /inc
+cargo run -p cli -- invoke kv-counter --method GET --path /value
+printf "req-123" | xargs -I{} cargo run -p cli -- invoke bg-kv --method GET --path / --header "x-request-id: {}"
+```
+
+Named cache example inside workers:
+
+```js
+const apiCache = await caches.open("api-v1");
+await apiCache.put(new Request("http://cache/key"), response.clone());
+```
 
 ## Deploy
 

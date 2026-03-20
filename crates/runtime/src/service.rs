@@ -1,3 +1,4 @@
+use crate::cache::{CacheConfig, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
     new_runtime_from_snapshot, pump_event_loop_once, validate_worker,
@@ -23,6 +24,9 @@ pub struct RuntimeConfig {
     pub idle_ttl: Duration,
     pub scale_tick: Duration,
     pub queue_warn_thresholds: Vec<usize>,
+    pub cache_max_entries: usize,
+    pub cache_max_bytes: usize,
+    pub cache_default_ttl: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -34,6 +38,9 @@ impl Default for RuntimeConfig {
             idle_ttl: Duration::from_secs(30),
             scale_tick: Duration::from_secs(1),
             queue_warn_thresholds: vec![10, 100, 1000],
+            cache_max_entries: 2048,
+            cache_max_bytes: 64 * 1024 * 1024,
+            cache_default_ttl: Duration::from_secs(60),
         }
     }
 }
@@ -86,7 +93,6 @@ enum RuntimeCommand {
         worker_name: String,
         runtime_request_id: String,
     },
-    #[cfg(test)]
     Stats {
         worker_name: String,
         reply: oneshot::Sender<Option<WorkerStats>>,
@@ -97,6 +103,7 @@ struct WorkerManager {
     config: RuntimeConfig,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
+    cache_store: CacheStore,
     workers: HashMap<String, WorkerEntry>,
     pre_canceled: HashMap<String, HashSet<String>>,
     stream_registrations: HashMap<String, StreamRegistration>,
@@ -304,9 +311,31 @@ impl RuntimeService {
                 "min_isolates cannot exceed max_isolates",
             ));
         }
+        if config.cache_max_entries == 0 {
+            return Err(PlatformError::internal(
+                "cache_max_entries must be greater than 0",
+            ));
+        }
+        if config.cache_max_bytes == 0 {
+            return Err(PlatformError::internal(
+                "cache_max_bytes must be greater than 0",
+            ));
+        }
+        if config.cache_default_ttl.is_zero() {
+            return Err(PlatformError::internal(
+                "cache_default_ttl must be greater than 0",
+            ));
+        }
 
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
         let kv_store = KvStore::from_env().await?;
+        let cache_store = CacheStore::from_env(CacheConfig {
+            max_entries: config.cache_max_entries,
+            max_bytes: config.cache_max_bytes,
+            default_ttl: config.cache_default_ttl,
+            ..CacheConfig::default()
+        })
+        .await?;
         let (sender, receiver) = mpsc::channel(256);
         let (cancel_sender, cancel_receiver) = mpsc::unbounded_channel();
         spawn_runtime_thread(
@@ -314,6 +343,7 @@ impl RuntimeService {
             cancel_receiver,
             bootstrap_snapshot,
             kv_store,
+            cache_store,
             config,
         )?;
         Ok(Self {
@@ -418,8 +448,7 @@ impl RuntimeService {
         ready
     }
 
-    #[cfg(test)]
-    async fn stats(&self, worker_name: String) -> Option<WorkerStats> {
+    pub async fn stats(&self, worker_name: String) -> Option<WorkerStats> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .sender
@@ -437,11 +466,17 @@ impl RuntimeService {
 }
 
 impl WorkerManager {
-    fn new(bootstrap_snapshot: &'static [u8], kv_store: KvStore, config: RuntimeConfig) -> Self {
+    fn new(
+        bootstrap_snapshot: &'static [u8],
+        kv_store: KvStore,
+        cache_store: CacheStore,
+        config: RuntimeConfig,
+    ) -> Self {
         Self {
             config,
             bootstrap_snapshot,
             kv_store,
+            cache_store,
             workers: HashMap::new(),
             pre_canceled: HashMap::new(),
             stream_registrations: HashMap::new(),
@@ -486,7 +521,6 @@ impl WorkerManager {
             } => {
                 self.cancel_invoke(worker_name, runtime_request_id, event_tx);
             }
-            #[cfg(test)]
             RuntimeCommand::Stats { worker_name, reply } => {
                 let _ = reply.send(self.worker_stats(&worker_name));
             }
@@ -898,9 +932,11 @@ impl WorkerManager {
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
+        let cache_store = self.cache_store.clone();
         let isolate = spawn_isolate_thread(
             snapshot,
             kv_store,
+            cache_store,
             worker_name.to_string(),
             generation,
             isolate_id,
@@ -1290,7 +1326,6 @@ impl WorkerManager {
         }
     }
 
-    #[cfg(test)]
     fn worker_stats(&self, worker_name: &str) -> Option<WorkerStats> {
         let entry = self.workers.get(worker_name)?;
         let pool = entry.pools.get(&entry.current_generation)?;
@@ -1431,6 +1466,7 @@ fn spawn_runtime_thread(
     mut cancel_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
+    cache_store: CacheStore,
     config: RuntimeConfig,
 ) -> Result<()> {
     thread::Builder::new()
@@ -1443,7 +1479,8 @@ fn spawn_runtime_thread(
 
             runtime.block_on(async move {
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-                let mut manager = WorkerManager::new(bootstrap_snapshot, kv_store, config.clone());
+                let mut manager =
+                    WorkerManager::new(bootstrap_snapshot, kv_store, cache_store, config.clone());
                 let mut ticker = tokio::time::interval(config.scale_tick);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1478,6 +1515,7 @@ fn spawn_runtime_thread(
 fn spawn_isolate_thread(
     snapshot: &'static [u8],
     kv_store: KvStore,
+    cache_store: CacheStore,
     worker_name: String,
     generation: u64,
     isolate_id: u64,
@@ -1514,6 +1552,7 @@ fn spawn_isolate_thread(
                     let mut op_state = op_state.borrow_mut();
                     op_state.put(IsolateEventSender(event_payload_tx));
                     op_state.put(kv_store.clone());
+                    op_state.put(cache_store.clone());
                 }
                 let _ = init_tx.send(Ok(()));
 
@@ -1770,6 +1809,16 @@ mod tests {
         }
     }
 
+    fn test_invocation_with_path(path: &str, request_id: &str) -> WorkerInvocation {
+        WorkerInvocation {
+            method: "GET".to_string(),
+            url: format!("http://worker{path}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: request_id.to_string(),
+        }
+    }
+
     fn counter_worker() -> String {
         r#"
 let counter = 0;
@@ -1873,6 +1922,32 @@ export default {
         .to_string()
     }
 
+    fn cache_worker(cache_name: &str, label: &str) -> String {
+        format!(
+            r#"
+let count = 0;
+
+export default {{
+  async fetch() {{
+    const cache = await caches.open("{cache_name}");
+    const key = new Request("http://cache/item", {{ method: "GET" }});
+    const hit = await cache.match(key);
+    if (hit) {{
+      return hit;
+    }}
+
+    count += 1;
+    const response = new Response("{label}:" + String(count), {{
+      headers: [["cache-control", "public, max-age=60"]],
+    }});
+    await cache.put(key, response.clone());
+    return response;
+  }},
+}};
+"#
+        )
+    }
+
     async fn test_service(config: RuntimeConfig) -> RuntimeService {
         let db_path = format!("/tmp/grugd-test-{}.db", Uuid::new_v4());
         std::env::set_var("TURSO_DATABASE_URL", format!("file:{db_path}"));
@@ -1891,6 +1966,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -1922,6 +1998,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -1962,6 +2039,7 @@ export default {
             idle_ttl: Duration::from_millis(200),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2008,6 +2086,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2044,6 +2123,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2098,6 +2178,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2138,6 +2219,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2205,6 +2287,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2239,6 +2322,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2270,6 +2354,7 @@ export default {
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
             queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
         })
         .await;
 
@@ -2309,5 +2394,94 @@ export default {
             body.extend(chunk.expect("chunk should be ok"));
         }
         assert_eq!(String::from_utf8(body).expect("utf8"), "hello");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cache_default_reuses_response() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy("cache".to_string(), cache_worker("default", "cache"))
+            .await
+            .expect("deploy should succeed");
+
+        let one = service
+            .invoke(
+                "cache".to_string(),
+                test_invocation_with_path("/", "cache-one"),
+            )
+            .await
+            .expect("first invoke should succeed");
+        let two = service
+            .invoke(
+                "cache".to_string(),
+                test_invocation_with_path("/", "cache-two"),
+            )
+            .await
+            .expect("second invoke should succeed");
+
+        assert_eq!(String::from_utf8(one.body).expect("utf8"), "cache:1");
+        assert_eq!(String::from_utf8(two.body).expect("utf8"), "cache:1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn named_caches_share_global_capacity_budget() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            cache_max_entries: 1,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy("worker-a".to_string(), cache_worker("cache-a", "A"))
+            .await
+            .expect("deploy a should succeed");
+        service
+            .deploy("worker-b".to_string(), cache_worker("cache-b", "B"))
+            .await
+            .expect("deploy b should succeed");
+
+        let a1 = service
+            .invoke(
+                "worker-a".to_string(),
+                test_invocation_with_path("/", "a-1"),
+            )
+            .await
+            .expect("a1 should succeed");
+        let b1 = service
+            .invoke(
+                "worker-b".to_string(),
+                test_invocation_with_path("/", "b-1"),
+            )
+            .await
+            .expect("b1 should succeed");
+        let a2 = service
+            .invoke(
+                "worker-a".to_string(),
+                test_invocation_with_path("/", "a-2"),
+            )
+            .await
+            .expect("a2 should succeed");
+
+        assert_eq!(String::from_utf8(a1.body).expect("utf8"), "A:1");
+        assert_eq!(String::from_utf8(b1.body).expect("utf8"), "B:1");
+        assert_eq!(String::from_utf8(a2.body).expect("utf8"), "A:2");
     }
 }

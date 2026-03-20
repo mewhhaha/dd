@@ -518,13 +518,156 @@ class URL {
   }
 }
 
+function runtimeOp(name, ...args) {
+  const op = Deno?.core?.ops?.[name];
+  if (typeof op !== "function") {
+    return undefined;
+  }
+  return op(...args);
+}
+
+function normalizeTimeBoundaryValue(value) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "number") {
+    return { nowMs: value, perfMs: value };
+  }
+  if (Array.isArray(value)) {
+    const [nowMs, perfMs = nowMs] = value;
+    return { nowMs, perfMs };
+  }
+  if (typeof value === "object") {
+    const nowMs =
+      value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
+    const perfMs =
+      value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
+    return { nowMs, perfMs };
+  }
+  return null;
+}
+
+async function syncFrozenTimeBoundary() {
+  if (typeof globalThis.__grugd_sync_time_boundary === "function") {
+    await globalThis.__grugd_sync_time_boundary();
+    return;
+  }
+
+  const boundaryRaw = await runtimeOp("op_time_boundary_now");
+  const boundary = normalizeTimeBoundaryValue(boundaryRaw);
+  if (boundary && typeof globalThis.__grugd_set_time === "function") {
+    globalThis.__grugd_set_time(boundary.nowMs, boundary.perfMs);
+  }
+}
+
+class Cache {
+  constructor(name = "default") {
+    this.name = String(name || "default");
+  }
+
+  async match(request, options = {}) {
+    const _ = options;
+    const normalizedRequest = request instanceof Request ? request : new Request(request);
+    const result = await runtimeOp(
+      "op_cache_match",
+      JSON.stringify({
+        cache_name: this.name,
+        method: normalizedRequest.method,
+        url: normalizedRequest.url,
+        headers: Array.from(normalizedRequest.headers.entries()),
+      }),
+    );
+    await syncFrozenTimeBoundary();
+
+    if (result && typeof result === "object" && result.ok === false) {
+      throw new Error(String(result.error ?? "cache match failed"));
+    }
+    if (!(result && typeof result === "object" && result.found === true)) {
+      return undefined;
+    }
+
+    return new Response(new Uint8Array(result.body ?? []), {
+      status: Number(result.status ?? 200),
+      headers: Array.isArray(result.headers) ? result.headers : [],
+    });
+  }
+
+  async put(request, response) {
+    const normalizedRequest = request instanceof Request ? request : new Request(request);
+    if (!(response instanceof Response)) {
+      throw new TypeError("cache.put expects a Response");
+    }
+    const body = Array.from(new Uint8Array(await response.arrayBuffer()));
+    const result = await runtimeOp(
+      "op_cache_put",
+      JSON.stringify({
+        cache_name: this.name,
+        method: normalizedRequest.method,
+        url: normalizedRequest.url,
+        request_headers: Array.from(normalizedRequest.headers.entries()),
+        response_status: response.status,
+        response_headers: Array.from(response.headers.entries()),
+        response_body: body,
+      }),
+    );
+    await syncFrozenTimeBoundary();
+    if (result && typeof result === "object" && result.ok === false) {
+      throw new Error(String(result.error ?? "cache put failed"));
+    }
+  }
+
+  async delete(request, options = {}) {
+    const _ = options;
+    const normalizedRequest = request instanceof Request ? request : new Request(request);
+    const result = await runtimeOp(
+      "op_cache_delete",
+      JSON.stringify({
+        cache_name: this.name,
+        method: normalizedRequest.method,
+        url: normalizedRequest.url,
+        headers: Array.from(normalizedRequest.headers.entries()),
+      }),
+    );
+    await syncFrozenTimeBoundary();
+    if (result && typeof result === "object" && result.ok === false) {
+      throw new Error(String(result.error ?? "cache delete failed"));
+    }
+    return Boolean(result?.deleted);
+  }
+}
+
+class CacheStorage {
+  constructor() {
+    this.default = new Cache("default");
+    this._named = new Map();
+    this._named.set("default", this.default);
+  }
+
+  async open(name) {
+    const normalized = String(name ?? "").trim();
+    if (!normalized) {
+      throw new TypeError("caches.open(name) requires a non-empty cache name");
+    }
+    const existing = this._named.get(normalized);
+    if (existing) {
+      return existing;
+    }
+    const cache = new Cache(normalized);
+    this._named.set(normalized, cache);
+    return cache;
+  }
+}
+
 ensureAbortGlobals();
 ensureFrozenTimeGlobals();
 define("Headers", Headers);
 define("Request", Request);
 define("Response", Response);
 define("URL", URL);
+define("Cache", Cache);
+define("CacheStorage", CacheStorage);
 if (globalThis.ReadableStream === undefined) {
   define("ReadableStream", ReadableStream);
 }
+define("caches", new CacheStorage());
 define("__grugd_set_time", setFrozenTime);

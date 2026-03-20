@@ -59,6 +59,7 @@
       globalThis.__grugd_set_time(boundary.nowMs, boundary.perfMs);
     }
   };
+  globalThis.__grugd_sync_time_boundary = syncFrozenTime;
 
   const toUtf8Bytes = (value) => {
     if (value == null) {
