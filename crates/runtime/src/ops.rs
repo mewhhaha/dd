@@ -416,7 +416,7 @@ fn to_list_item(entry: KvEntry) -> KvListItem {
 }
 
 fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest> {
-    let payload: CacheRequestPayload = serde_json::from_str(&payload).map_err(|error| {
+    let payload: CacheRequestPayload = crate::json::from_str(&payload).map_err(|error| {
         common::PlatformError::runtime(format!("invalid cache payload: {error}"))
     })?;
     Ok(CacheRequest {
@@ -429,7 +429,7 @@ fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest>
 }
 
 fn decode_cache_put_payload(payload: String) -> common::Result<(CacheRequest, CacheResponse)> {
-    let payload: CachePutPayload = serde_json::from_str(&payload).map_err(|error| {
+    let payload: CachePutPayload = crate::json::from_str(&payload).map_err(|error| {
         common::PlatformError::runtime(format!("invalid cache put payload: {error}"))
     })?;
     Ok((

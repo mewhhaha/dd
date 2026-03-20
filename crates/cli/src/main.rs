@@ -83,10 +83,7 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
         .map_err(|error| error.to_string())?;
 
     let deployment: DeployResponse = decode_json(response).await?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&deployment).map_err(|error| error.to_string())?
-    );
+    println!("{}", to_json_string(&deployment)?);
     Ok(())
 }
 
@@ -133,7 +130,7 @@ async fn decode_json<T: serde::de::DeserializeOwned>(
     let status = response.status();
     let body = response.bytes().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
-        if let Ok(error) = serde_json::from_slice::<ErrorBody>(&body) {
+        if let Ok(error) = parse_json_bytes::<ErrorBody>(&body) {
             return Err(format!("{} {}", status.as_u16(), error.error));
         }
         return Err(format!(
@@ -143,14 +140,14 @@ async fn decode_json<T: serde::de::DeserializeOwned>(
         ));
     }
 
-    serde_json::from_slice(&body).map_err(|error| error.to_string())
+    parse_json_bytes(&body)
 }
 
 async fn decode_error_response(response: reqwest::Response) -> Result<String, String> {
     let status = response.status();
     let body = response.bytes().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
-        if let Ok(error) = serde_json::from_slice::<ErrorBody>(&body) {
+        if let Ok(error) = parse_json_bytes::<ErrorBody>(&body) {
             return Err(format!("{} {}", status.as_u16(), error.error));
         }
         return Err(format!(
@@ -214,4 +211,13 @@ fn normalize_path(path: &str) -> String {
 
 fn default_server() -> String {
     env::var("GRUGD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
+}
+
+fn parse_json_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let mut input = bytes.to_vec();
+    simd_json::serde::from_slice(&mut input).map_err(|error| error.to_string())
+}
+
+fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
+    simd_json::serde::to_string(value).map_err(|error| error.to_string())
 }

@@ -9,5 +9,5 @@ clap.workspace = true
 common = { path = "../common" }
 reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+simd-json.workspace = true
 tokio.workspace = true

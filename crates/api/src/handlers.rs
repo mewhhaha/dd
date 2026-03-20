@@ -2,16 +2,21 @@ use crate::state::AppState;
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
 use axum::http::header::{HeaderName, HeaderValue};
-use axum::http::{Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use common::{
     DeployBinding, DeployRequest, DeployResponse, ErrorBody, ErrorKind, PlatformError,
     WorkerInvocation, WorkerOutput,
 };
+use opentelemetry::global;
+use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::trace::TraceContextExt;
 use runtime::{CacheLookup, CacheRequest, CacheResponse};
 use std::collections::HashSet;
 use tokio_stream::StreamExt;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -23,6 +28,8 @@ pub async fn deploy_worker(
     Json(payload): Json<DeployRequest>,
 ) -> ApiResult<Json<DeployResponse>> {
     let name = payload.name.trim();
+    let span = tracing::info_span!("http.deploy", worker.name = %name);
+    let _guard = span.enter();
     if name.is_empty() {
         return Err(PlatformError::bad_request("Worker name must not be empty").into());
     }
@@ -32,6 +39,7 @@ pub async fn deploy_worker(
         .runtime
         .deploy_with_config(name.to_string(), payload.source, payload.config)
         .await?;
+    tracing::info!(deployment_id = %deployment_id, "worker deployed");
 
     Ok(Json(DeployResponse {
         ok: true,
@@ -47,6 +55,16 @@ pub async fn invoke_worker(
     let (parts, body) = request.into_parts();
     let (worker_name, url) =
         parse_invoke_request_uri(parts.uri.path(), parts.uri.path_and_query())?;
+    let method = parts.method.as_str().to_string();
+    let invoke_span = tracing::info_span!(
+        "http.invoke",
+        worker.name = %worker_name,
+        http.method = %method,
+        http.route = %parts.uri.path()
+    );
+    set_span_parent_from_http_headers(&invoke_span, &parts.headers);
+    let _invoke_guard = invoke_span.enter();
+
     let body = to_bytes(body, usize::MAX).await.map_err(|error| {
         PlatformError::internal(format!("failed to read request body: {error}"))
     })?;
@@ -58,24 +76,37 @@ pub async fn invoke_worker(
         })?;
         headers.push((name.as_str().to_string(), value.to_string()));
     }
+    inject_current_trace_context(&mut headers);
+    let request_id = Uuid::new_v4().to_string();
 
     let invocation = WorkerInvocation {
-        method: parts.method.as_str().to_string(),
+        method,
         url,
         headers,
         body: body.to_vec(),
-        request_id: Uuid::new_v4().to_string(),
+        request_id: request_id.clone(),
     };
+    tracing::info!(request_id = %request_id, "invoke request accepted");
 
     if !is_cacheable_request(&invocation) {
         let output = state.runtime.invoke_stream(worker_name, invocation).await?;
-        return build_worker_stream_response(output);
+        let mut response = build_worker_stream_response(output)?;
+        annotate_response_with_trace_id(&mut response);
+        return Ok(response);
     }
 
     let cache_request = build_edge_cache_request(&worker_name, &invocation);
     match state.runtime.cache_match(cache_request.clone()).await? {
-        CacheLookup::Fresh(response) => return build_cached_response(response, "HIT"),
+        CacheLookup::Fresh(response) => {
+            tracing::info!(request_id = %request_id, cache_status = "HIT", "edge cache hit");
+            return build_cached_response(response, "HIT");
+        }
         CacheLookup::StaleWhileRevalidate(response) => {
+            tracing::info!(
+                request_id = %request_id,
+                cache_status = "STALE",
+                "edge cache stale hit, scheduling revalidation"
+            );
             maybe_spawn_edge_revalidation(
                 state.clone(),
                 worker_name.clone(),
@@ -90,6 +121,12 @@ pub async fn invoke_worker(
             return match origin {
                 Ok(output) => {
                     if output.status >= 500 {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            status = output.status,
+                            cache_status = "STALE-IF-ERROR",
+                            "origin returned 5xx, serving stale"
+                        );
                         let mut fallback = build_cached_response(response, "STALE-IF-ERROR")?;
                         fallback.headers_mut().append(
                             HeaderName::from_static("x-grugd-cache-fallback"),
@@ -98,9 +135,15 @@ pub async fn invoke_worker(
                         return Ok(fallback);
                     }
                     store_worker_output_in_cache(&state, &cache_request, &output).await;
+                    tracing::info!(request_id = %request_id, cache_status = "MISS", "cache refreshed from origin");
                     build_worker_buffered_response(output, "MISS")
                 }
                 Err(_error) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        cache_status = "STALE-IF-ERROR",
+                        "origin failed, serving stale"
+                    );
                     let mut response = build_cached_response(response, "STALE-IF-ERROR")?;
                     response.headers_mut().append(
                         HeaderName::from_static("x-grugd-cache-fallback"),
@@ -115,6 +158,7 @@ pub async fn invoke_worker(
 
     let output = state.runtime.invoke(worker_name, invocation).await?;
     store_worker_output_in_cache(&state, &cache_request, &output).await;
+    tracing::info!(request_id = %request_id, cache_status = "MISS", "origin miss stored");
     build_worker_buffered_response(output, "MISS")
 }
 
@@ -200,6 +244,7 @@ fn build_worker_stream_response(
             response.headers_mut().append(name, value);
         }
     }
+    annotate_response_with_trace_id(&mut response);
 
     Ok(response)
 }
@@ -262,6 +307,7 @@ fn build_buffered_response(
         HeaderValue::from_str(cache_status)
             .map_err(|error| PlatformError::internal(error.to_string()))?,
     );
+    annotate_response_with_trace_id(&mut response);
     Ok(response)
 }
 
@@ -348,6 +394,65 @@ fn edge_revalidation_key(worker_name: &str, cache_request: &CacheRequest) -> Str
     )
 }
 
+fn set_span_parent_from_http_headers(span: &Span, headers: &HeaderMap) {
+    global::get_text_map_propagator(|propagator| {
+        let parent = propagator.extract(&HttpHeaderExtractor(headers));
+        if parent.span().span_context().is_valid() {
+            span.set_parent(parent);
+        }
+    });
+}
+
+fn inject_current_trace_context(headers: &mut Vec<(String, String)>) {
+    let context = Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        let mut injector = InvocationHeaderInjector(headers);
+        propagator.inject_context(&context, &mut injector);
+    });
+}
+
+fn annotate_response_with_trace_id(response: &mut Response<Body>) {
+    let context = Span::current().context();
+    let span = context.span();
+    let span_context = span.span_context();
+    if !span_context.is_valid() {
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(&span_context.trace_id().to_string()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-grugd-trace-id"), value);
+    }
+}
+
+struct HttpHeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HttpHeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|name| name.as_str()).collect()
+    }
+}
+
+struct InvocationHeaderInjector<'a>(&'a mut Vec<(String, String)>);
+
+impl Injector for InvocationHeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let Some(existing) = self
+            .0
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        {
+            existing.1 = value;
+            return;
+        }
+        self.0.push((key.to_string(), value));
+    }
+}
+
 impl From<PlatformError> for ApiError {
     fn from(value: PlatformError) -> Self {
         Self(value)
@@ -362,7 +467,9 @@ impl IntoResponse for ApiError {
             ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (status, Json(ErrorBody::from_error(&self.0))).into_response()
+        let mut response = (status, Json(ErrorBody::from_error(&self.0))).into_response();
+        annotate_response_with_trace_id(&mut response);
+        response
     }
 }
 

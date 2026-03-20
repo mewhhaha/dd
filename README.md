@@ -31,12 +31,17 @@ Optional settings:
 ```bash
 export BIND_ADDR="127.0.0.1:3000"
 export RUST_LOG="info"
-export TURSO_DATABASE_URL="file:./grugd-kv.db"
+export GRUGD_STORE_DIR="./store"
+export TURSO_DATABASE_URL="file:./store/grugd-kv.db"
 export GRUGD_BLOB_BACKEND="local"
-export GRUGD_BLOB_DIR="/tmp/grugd-cache/blobs"
+export GRUGD_BLOB_DIR="./store/blobs"
+export GRUGD_WORKER_STORE="1"
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:4317"
 ```
 
 `GRUGD_BLOB_BACKEND=s3` is reserved for the upcoming S3-compatible implementation.
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `GRUGD_OTEL_ENDPOINT`) enables OTLP span export.
+`GRUGD_WORKER_STORE=0` disables file-based worker persistence/restore.
 
 ## Run
 
@@ -51,7 +56,7 @@ cargo run -p cli -- deploy hello examples/hello.js
 cargo run -p cli -- invoke hello --method POST --path /echo --header "content-type: text/plain" --body-file -
 ```
 
-Workers live in memory, so restarting the server clears them.
+Worker source/config is persisted under `./store/workers` by default and restored at startup.
 
 ## Benchmark
 
@@ -72,6 +77,9 @@ Current baseline results are in `BENCHMARKS.md`.
 - dropped invokes are canceled and signaled via `ctx.signal`
 - cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure
 - cache metadata lives in Turso; inline bodies <= 64KiB, larger bodies use blob storage refs
+- local defaults persist into `./store` (`workers`, `grugd-kv.db`, `blobs`)
+- W3C `traceparent` is extracted/injected on invoke requests
+- responses include `x-grugd-trace-id` for quick correlation
 
 ## Example workers
 

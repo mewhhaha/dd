@@ -55,15 +55,15 @@ pub fn dispatch_worker_request(
     kv_bindings: &[String],
     request: WorkerInvocation,
 ) -> Result<()> {
-    let request_json = serde_json::to_string(&request)
+    let request_json = crate::json::to_string(&request)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let worker_name_json = serde_json::to_string(worker_name)
+    let worker_name_json = crate::json::to_string(worker_name)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let kv_bindings_json = serde_json::to_string(kv_bindings)
+    let kv_bindings_json = crate::json::to_string(kv_bindings)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let request_id_json = serde_json::to_string(request_id)
+    let request_id_json = crate::json::to_string(request_id)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let completion_token_json = serde_json::to_string(completion_token)
+    let completion_token_json = crate::json::to_string(completion_token)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let entry_code = execute_worker_js(
         &worker_name_json,
@@ -79,7 +79,7 @@ pub fn dispatch_worker_request(
 }
 
 pub fn abort_worker_request(runtime: &mut JsRuntime, request_id: &str) -> Result<()> {
-    let request_id_json = serde_json::to_string(request_id)
+    let request_id_json = crate::json::to_string(request_id)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let entry_code = abort_worker_js(&request_id_json);
     runtime

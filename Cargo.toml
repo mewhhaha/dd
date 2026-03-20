@@ -16,11 +16,15 @@ version = "0.1.0"
 axum = { version = "0.8", features = ["json"] }
 deno_core = "0.386"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+simd-json = { version = "0.14", features = ["serde_impl"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"] }
 uuid = { version = "1", features = ["serde", "v4"] }

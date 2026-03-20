@@ -2,6 +2,7 @@ use crate::blob::BlobStore;
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -93,12 +94,14 @@ struct CacheControl {
 
 impl CacheStore {
     pub async fn from_env(config: CacheConfig) -> Result<Self> {
-        let database_url =
-            env::var("TURSO_DATABASE_URL").unwrap_or_else(|_| "file:./grugd-kv.db".to_string());
+        let store_dir = env::var("GRUGD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
+        let database_url = env::var("TURSO_DATABASE_URL")
+            .unwrap_or_else(|_| format!("file:{store_dir}/grugd-kv.db"));
         let local_path = database_url
             .strip_prefix("file:")
             .unwrap_or(&database_url)
             .to_string();
+        ensure_parent_dir(&local_path)?;
         let blob_store = BlobStore::from_env().await?;
         Self::from_local_path(config, local_path, blob_store).await
     }
@@ -134,7 +137,7 @@ impl CacheStore {
 
         while let Some(row) = rows.next().await.map_err(cache_error)? {
             let record = row_to_record(&row)?;
-            let vary_headers: Vec<String> = match serde_json::from_str(&record.vary_headers_json) {
+            let vary_headers: Vec<String> = match crate::json::from_str(&record.vary_headers_json) {
                 Ok(value) => value,
                 Err(_) => {
                     stale.push(CacheDeleteCandidate {
@@ -146,7 +149,7 @@ impl CacheStore {
                 }
             };
             let stored_vary_values: Vec<String> =
-                match serde_json::from_str(&record.vary_values_json) {
+                match crate::json::from_str(&record.vary_values_json) {
                     Ok(value) => value,
                     Err(_) => {
                         stale.push(CacheDeleteCandidate {
@@ -162,7 +165,7 @@ impl CacheStore {
                 continue;
             }
 
-            let headers: Vec<(String, String)> = match serde_json::from_str(&record.headers_json) {
+            let headers: Vec<(String, String)> = match crate::json::from_str(&record.headers_json) {
                 Ok(value) => value,
                 Err(_) => {
                     stale.push(CacheDeleteCandidate {
@@ -319,11 +322,11 @@ impl CacheStore {
             return Ok(false);
         }
 
-        let vary_headers_json = serde_json::to_string(&vary_headers)
+        let vary_headers_json = crate::json::to_string(&vary_headers)
             .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
-        let vary_values_json = serde_json::to_string(&vary_values)
+        let vary_values_json = crate::json::to_string(&vary_values)
             .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
-        let headers_json = serde_json::to_string(&response.headers)
+        let headers_json = crate::json::to_string(&response.headers)
             .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
 
         let mut body_storage = "inline".to_string();
@@ -404,7 +407,7 @@ impl CacheStore {
 
         let mut to_delete = Vec::new();
         for record in records {
-            let vary_headers: Vec<String> = match serde_json::from_str(&record.vary_headers_json) {
+            let vary_headers: Vec<String> = match crate::json::from_str(&record.vary_headers_json) {
                 Ok(value) => value,
                 Err(_) => {
                     to_delete.push(CacheDeleteCandidate {
@@ -416,7 +419,7 @@ impl CacheStore {
                 }
             };
             let stored_vary_values: Vec<String> =
-                match serde_json::from_str(&record.vary_values_json) {
+                match crate::json::from_str(&record.vary_values_json) {
                     Ok(value) => value,
                     Err(_) => {
                         to_delete.push(CacheDeleteCandidate {
@@ -891,6 +894,17 @@ fn epoch_ms_i64() -> Result<i64> {
 
 fn cache_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(format!("cache error: {error}"))
+}
+
+fn ensure_parent_dir(path: &str) -> Result<()> {
+    let Some(parent) = Path::new(path).parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).map_err(cache_error)?;
+    Ok(())
 }
 
 #[cfg(test)]

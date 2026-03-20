@@ -29,8 +29,10 @@ impl BlobStore {
         let backend = env::var("GRUGD_BLOB_BACKEND").unwrap_or_else(|_| "local".to_string());
         match backend.trim().to_ascii_lowercase().as_str() {
             "" | "local" => {
-                let root = env::var("GRUGD_BLOB_DIR")
-                    .unwrap_or_else(|_| "/tmp/grugd-cache/blobs".to_string());
+                let store_dir =
+                    env::var("GRUGD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
+                let root =
+                    env::var("GRUGD_BLOB_DIR").unwrap_or_else(|_| format!("{store_dir}/blobs"));
                 Ok(Self::Local(LocalBlobStore::new(root.into()).await?))
             }
             "s3" => Ok(Self::S3(S3BlobStore::from_env())),

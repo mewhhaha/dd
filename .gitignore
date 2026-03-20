@@ -1,2 +1,5 @@
 target
 grugd.db
+store/
+grugd-kv.db
+grugd-kv.db-wal

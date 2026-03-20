@@ -1,5 +1,6 @@
 use common::{PlatformError, Result};
 use std::env;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,12 +20,14 @@ pub struct KvEntry {
 
 impl KvStore {
     pub async fn from_env() -> Result<Self> {
-        let database_url =
-            env::var("TURSO_DATABASE_URL").unwrap_or_else(|_| "file:./grugd-kv.db".to_string());
+        let store_dir = env::var("GRUGD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
+        let database_url = env::var("TURSO_DATABASE_URL")
+            .unwrap_or_else(|_| format!("file:{store_dir}/grugd-kv.db"));
         let local_path = database_url
             .strip_prefix("file:")
             .unwrap_or(&database_url)
             .to_string();
+        ensure_parent_dir(&local_path)?;
         let database = Builder::new_local(&local_path)
             .build()
             .await
@@ -182,4 +185,16 @@ fn epoch_ms_i64() -> Result<i64> {
 
 fn kv_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(format!("kv error: {error}"))
+}
+
+fn ensure_parent_dir(path: &str) -> Result<()> {
+    let Some(parent) = Path::new(path).parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)
+        .map_err(|error| PlatformError::runtime(format!("kv error: {error}")))?;
+    Ok(())
 }

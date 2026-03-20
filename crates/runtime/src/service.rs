@@ -6,14 +6,20 @@ use crate::engine::{
 use crate::kv::KvStore;
 use crate::ops::{IsolateEventPayload, IsolateEventSender};
 use common::{DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
-use serde::Deserialize;
+use opentelemetry::global;
+use opentelemetry::propagation::Extractor;
+use opentelemetry::trace::TraceContextExt;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -151,12 +157,16 @@ struct PendingInvoke {
     runtime_request_id: String,
     request: WorkerInvocation,
     reply: oneshot::Sender<Result<WorkerOutput>>,
+    enqueued_at: Instant,
 }
 
 struct PendingReply {
     completion_token: String,
     canceled: bool,
     reply: oneshot::Sender<Result<WorkerOutput>>,
+    traceparent: Option<String>,
+    user_request_id: String,
+    dispatched_at: Instant,
 }
 
 struct IsolateHandle {
@@ -307,6 +317,15 @@ struct CacheRevalidatePayload {
     headers: Vec<(String, String)>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredWorkerDeployment {
+    name: String,
+    source: String,
+    config: DeployConfig,
+    deployment_id: String,
+    updated_at_ms: i64,
+}
+
 impl RuntimeService {
     pub async fn start() -> Result<Self> {
         Self::start_with_config(RuntimeConfig::default()).await
@@ -363,11 +382,13 @@ impl RuntimeService {
             cache_store.clone(),
             config,
         )?;
-        Ok(Self {
+        let service = Self {
             sender,
             cancel_sender,
             cache_store,
-        })
+        };
+        service.restore_workers_from_store().await?;
+        Ok(service)
     }
 
     pub async fn deploy(&self, worker_name: String, source: String) -> Result<String> {
@@ -397,12 +418,96 @@ impl RuntimeService {
             .map_err(|_| PlatformError::internal("runtime deploy channel closed"))?
     }
 
+    async fn restore_workers_from_store(&self) -> Result<()> {
+        if !worker_store_enabled() {
+            return Ok(());
+        }
+
+        let workers_dir = worker_store_dir().join("workers");
+        let mut read_dir = match tokio::fs::read_dir(&workers_dir).await {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(PlatformError::internal(format!(
+                    "failed to read worker store {}: {error}",
+                    workers_dir.display()
+                )))
+            }
+        };
+
+        let mut restored = 0usize;
+        while let Some(entry) = read_dir.next_entry().await.map_err(|error| {
+            PlatformError::internal(format!(
+                "failed to read worker store entry in {}: {error}",
+                workers_dir.display()
+            ))
+        })? {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+
+            let body = match tokio::fs::read_to_string(&path).await {
+                Ok(body) => body,
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "skipping unreadable worker store file");
+                    continue;
+                }
+            };
+            let stored: StoredWorkerDeployment = match crate::json::from_str(&body) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "skipping invalid worker store file");
+                    continue;
+                }
+            };
+
+            match self
+                .deploy_with_config(stored.name.clone(), stored.source, stored.config)
+                .await
+            {
+                Ok(deployment_id) => {
+                    restored += 1;
+                    info!(
+                        worker = %stored.name,
+                        deployment_id = %deployment_id,
+                        "restored worker from local store"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        worker = %stored.name,
+                        path = %path.display(),
+                        error = %error,
+                        "failed to restore worker from local store"
+                    );
+                }
+            }
+        }
+
+        if restored > 0 {
+            info!(restored, "restored workers from local store");
+        }
+        Ok(())
+    }
+
     pub async fn invoke(
         &self,
         worker_name: String,
         request: WorkerInvocation,
     ) -> Result<WorkerOutput> {
         let runtime_request_id = Uuid::new_v4().to_string();
+        let invoke_span = tracing::info_span!(
+            "runtime.invoke",
+            worker.name = %worker_name,
+            runtime.request_id = %runtime_request_id,
+            request.id = %request.request_id
+        );
+        set_span_parent_from_traceparent(
+            &invoke_span,
+            traceparent_from_headers(&request.headers).as_deref(),
+        );
+        let _invoke_guard = invoke_span.enter();
         let mut cancel_guard = InvokeCancelGuard::new(
             self.cancel_sender.clone(),
             worker_name.clone(),
@@ -430,6 +535,17 @@ impl RuntimeService {
         request: WorkerInvocation,
     ) -> Result<WorkerStreamOutput> {
         let runtime_request_id = Uuid::new_v4().to_string();
+        let stream_span = tracing::info_span!(
+            "runtime.invoke_stream",
+            worker.name = %worker_name,
+            runtime.request_id = %runtime_request_id,
+            request.id = %request.request_id
+        );
+        set_span_parent_from_traceparent(
+            &stream_span,
+            traceparent_from_headers(&request.headers).as_deref(),
+        );
+        let _stream_guard = stream_span.enter();
         let mut cancel_guard = InvokeCancelGuard::new(
             self.cancel_sender.clone(),
             worker_name.clone(),
@@ -483,10 +599,26 @@ impl RuntimeService {
     }
 
     pub async fn cache_match(&self, request: CacheRequest) -> Result<CacheLookup> {
+        let span = tracing::info_span!(
+            "runtime.cache.match",
+            cache.name = %request.cache_name,
+            http.method = %request.method,
+            http.url = %request.url
+        );
+        let _guard = span.enter();
         self.cache_store.get(&request).await
     }
 
     pub async fn cache_put(&self, request: CacheRequest, response: CacheResponse) -> Result<bool> {
+        let span = tracing::info_span!(
+            "runtime.cache.put",
+            cache.name = %request.cache_name,
+            http.method = %request.method,
+            http.url = %request.url,
+            response.status = response.status as u64,
+            response.body_size = response.body.len() as u64
+        );
+        let _guard = span.enter();
         self.cache_store.put(&request, response).await
     }
 }
@@ -658,6 +790,7 @@ impl WorkerManager {
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
+        persist_worker_deployment(&worker_name, &source, &config, &deployment_id).await?;
 
         let pool = WorkerPool {
             worker_name: worker_name.clone(),
@@ -745,6 +878,7 @@ impl WorkerManager {
                 runtime_request_id,
                 request,
                 reply,
+                enqueued_at: Instant::now(),
             });
             pool.update_queue_warning(&warn_thresholds);
         } else {
@@ -903,7 +1037,22 @@ impl WorkerManager {
                 return;
             };
 
+            let queue_wait_ms = pending_invoke.enqueued_at.elapsed().as_millis() as u64;
             let runtime_request_id = pending_invoke.runtime_request_id.clone();
+            let user_request_id = pending_invoke.request.request_id.clone();
+            let traceparent = traceparent_from_headers(&pending_invoke.request.headers);
+            let span = tracing::info_span!(
+                "runtime.dispatch",
+                worker.name = %worker_name,
+                worker.generation = generation,
+                runtime.request_id = %runtime_request_id,
+                request.id = %user_request_id,
+                queue.wait_ms = queue_wait_ms
+            );
+            set_span_parent_from_traceparent(&span, traceparent.as_deref());
+            let _dispatch_guard = span.enter();
+            tracing::info!("dispatching request to isolate");
+
             let mut pending_reply = Some(pending_invoke.reply);
             let completion_token = Uuid::new_v4().to_string();
             if let Some(registration) = self.stream_registrations.get_mut(&runtime_request_id) {
@@ -944,6 +1093,9 @@ impl WorkerManager {
                             reply: pending_reply
                                 .take()
                                 .expect("pending reply must exist before dispatch"),
+                            traceparent: traceparent.clone(),
+                            user_request_id: user_request_id.clone(),
+                            dispatched_at: Instant::now(),
                         },
                     );
                 }
@@ -1016,6 +1168,9 @@ impl WorkerManager {
         let mut reply = None;
         let mut canceled = false;
         let mut clear_revalidation = false;
+        let mut completion_traceparent: Option<String> = None;
+        let mut user_request_id = String::new();
+        let mut execution_ms: Option<u64> = None;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool
                 .isolates
@@ -1055,6 +1210,9 @@ impl WorkerManager {
                             .insert(request_id.to_string(), completion_token.to_string());
                     }
                     clear_revalidation = true;
+                    completion_traceparent = pending.traceparent;
+                    user_request_id = pending.user_request_id;
+                    execution_ms = Some(pending.dispatched_at.elapsed().as_millis() as u64);
                     reply = Some(pending.reply);
                 }
             }
@@ -1063,11 +1221,31 @@ impl WorkerManager {
         if clear_revalidation {
             self.clear_revalidation_for_request(request_id);
         }
+        let result_status = match &result {
+            Ok(output) => output.status as i64,
+            Err(_) => -1,
+        };
+        let result_ok = result.is_ok();
+        let complete_span = tracing::info_span!(
+            "runtime.complete",
+            worker.name = %worker_name,
+            worker.generation = generation,
+            isolate.id = isolate_id,
+            runtime.request_id = %request_id,
+            request.id = %user_request_id,
+            request.ok = result_ok,
+            response.status = result_status,
+            request.execution_ms = execution_ms.unwrap_or_default(),
+            request.wait_until_count = wait_until_count as u64
+        );
+        set_span_parent_from_traceparent(&complete_span, completion_traceparent.as_deref());
+        let _complete_guard = complete_span.enter();
 
         if !canceled {
             if let Some(reply) = reply {
                 let _ = reply.send(result);
             }
+            tracing::info!("request completion delivered");
         } else {
             info!(
                 worker = %worker_name,
@@ -1203,9 +1381,23 @@ impl WorkerManager {
         if method != "GET" {
             return;
         }
+        let revalidate_span = tracing::info_span!(
+            "runtime.cache.revalidate_schedule",
+            worker.name = %worker_name,
+            worker.generation = generation,
+            cache.name = %request.cache_name,
+            http.method = %method,
+            http.url = %request.url
+        );
+        set_span_parent_from_traceparent(
+            &revalidate_span,
+            traceparent_from_headers(&request.headers).as_deref(),
+        );
+        let _revalidate_guard = revalidate_span.enter();
 
         let key = cache_revalidation_key(worker_name, generation, &request);
         if !self.revalidation_keys.insert(key.clone()) {
+            tracing::info!("skipping duplicate cache revalidation");
             return;
         }
 
@@ -1233,10 +1425,12 @@ impl WorkerManager {
                 runtime_request_id: runtime_request_id.clone(),
                 request: invocation,
                 reply,
+                enqueued_at: Instant::now(),
             });
             pool.update_queue_warning(&warn_thresholds);
             self.revalidation_requests.insert(runtime_request_id, key);
             self.dispatch_pool(worker_name, generation, event_tx);
+            tracing::info!("scheduled background cache revalidation");
         } else {
             self.revalidation_keys.remove(&key);
         }
@@ -1817,6 +2011,21 @@ fn spawn_isolate_thread(
                                     kv_bindings,
                                     request,
                                 } => {
+                                    let request_id = request.request_id.clone();
+                                    let execute_span = tracing::info_span!(
+                                        "runtime.isolate.execute",
+                                        worker.name = %worker_name,
+                                        worker.generation = generation,
+                                        isolate.id = isolate_id,
+                                        runtime.request_id = %runtime_request_id,
+                                        request.id = %request_id
+                                    );
+                                    set_span_parent_from_traceparent(
+                                        &execute_span,
+                                        traceparent_from_headers(&request.headers).as_deref(),
+                                    );
+                                    let _execute_guard = execute_span.enter();
+                                    let started_at = Instant::now();
                                     if let Err(error) = dispatch_worker_request(
                                         &mut js_runtime,
                                         &runtime_request_id,
@@ -1825,6 +2034,11 @@ fn spawn_isolate_thread(
                                         &kv_bindings,
                                         request,
                                     ) {
+                                        tracing::warn!(
+                                            dispatch_ms = started_at.elapsed().as_millis() as u64,
+                                            error = %error,
+                                            "failed to dispatch request into isolate"
+                                        );
                                         let _ = event_tx.send(RuntimeEvent::RequestFinished {
                                             worker_name: worker_name.clone(),
                                             generation,
@@ -1834,6 +2048,11 @@ fn spawn_isolate_thread(
                                             wait_until_count: 0,
                                             result: Err(error),
                                         });
+                                    } else {
+                                        tracing::info!(
+                                            dispatch_ms = started_at.elapsed().as_millis() as u64,
+                                            "request dispatched into isolate event loop"
+                                        );
                                     }
                                 }
                                 IsolateCommand::Abort { runtime_request_id } => {
@@ -1889,10 +2108,102 @@ fn spawn_isolate_thread(
     }
 }
 
+async fn persist_worker_deployment(
+    worker_name: &str,
+    source: &str,
+    config: &DeployConfig,
+    deployment_id: &str,
+) -> Result<()> {
+    if !worker_store_enabled() {
+        return Ok(());
+    }
+
+    let workers_dir = worker_store_dir().join("workers");
+    tokio::fs::create_dir_all(&workers_dir)
+        .await
+        .map_err(|error| {
+            PlatformError::internal(format!(
+                "failed to create worker store directory {}: {error}",
+                workers_dir.display()
+            ))
+        })?;
+    let final_path = worker_store_path(worker_name);
+    let temp_path = workers_dir.join(format!("{}.tmp", encoded_worker_name(worker_name)));
+    let payload = StoredWorkerDeployment {
+        name: worker_name.to_string(),
+        source: source.to_string(),
+        config: config.clone(),
+        deployment_id: deployment_id.to_string(),
+        updated_at_ms: epoch_ms_i64()?,
+    };
+    let body = crate::json::to_vec(&payload).map_err(|error| {
+        PlatformError::internal(format!("failed to serialize worker deployment: {error}"))
+    })?;
+    tokio::fs::write(&temp_path, body).await.map_err(|error| {
+        PlatformError::internal(format!(
+            "failed to write worker store file {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+    tokio::fs::rename(&temp_path, &final_path)
+        .await
+        .map_err(|error| {
+            PlatformError::internal(format!(
+                "failed to commit worker store file {}: {error}",
+                final_path.display()
+            ))
+        })?;
+    Ok(())
+}
+
+fn worker_store_enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    env::var("GRUGD_WORKER_STORE")
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !(normalized == "0" || normalized == "false" || normalized == "off")
+        })
+        .unwrap_or(true)
+}
+
+fn worker_store_dir() -> PathBuf {
+    env::var("GRUGD_STORE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./store"))
+}
+
+fn worker_store_path(worker_name: &str) -> PathBuf {
+    worker_store_dir()
+        .join("workers")
+        .join(format!("{}.json", encoded_worker_name(worker_name)))
+}
+
+fn encoded_worker_name(worker_name: &str) -> String {
+    let mut out = String::with_capacity(worker_name.len().saturating_mul(2).max(2));
+    for byte in worker_name.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    if out.is_empty() {
+        "00".to_string()
+    } else {
+        out
+    }
+}
+
+fn epoch_ms_i64() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| PlatformError::internal(format!("system clock error: {error}")))?;
+    Ok(duration.as_millis() as i64)
+}
+
 fn decode_completion_payload(
     payload: &str,
 ) -> Result<(String, String, usize, Result<WorkerOutput>)> {
-    let completion: CompletionPayload = serde_json::from_str(payload)
+    let completion: CompletionPayload = crate::json::from_str(payload)
         .map_err(|error| PlatformError::runtime(format!("invalid completion payload: {error}")))?;
     if completion.ok {
         let output = completion
@@ -1918,7 +2229,7 @@ fn decode_completion_payload(
 }
 
 fn decode_wait_until_payload(payload: &str) -> Result<(String, String)> {
-    let done: WaitUntilPayload = serde_json::from_str(payload)
+    let done: WaitUntilPayload = crate::json::from_str(payload)
         .map_err(|error| PlatformError::runtime(format!("invalid waitUntil payload: {error}")))?;
     Ok((done.request_id, done.completion_token))
 }
@@ -1926,7 +2237,7 @@ fn decode_wait_until_payload(payload: &str) -> Result<(String, String)> {
 fn decode_response_start_payload(
     payload: &str,
 ) -> Result<(String, String, u16, Vec<(String, String)>)> {
-    let start: ResponseStartPayload = serde_json::from_str(payload).map_err(|error| {
+    let start: ResponseStartPayload = crate::json::from_str(payload).map_err(|error| {
         PlatformError::runtime(format!("invalid response start payload: {error}"))
     })?;
     Ok((
@@ -1938,14 +2249,14 @@ fn decode_response_start_payload(
 }
 
 fn decode_response_chunk_payload(payload: &str) -> Result<(String, String, Vec<u8>)> {
-    let chunk: ResponseChunkPayload = serde_json::from_str(payload).map_err(|error| {
+    let chunk: ResponseChunkPayload = crate::json::from_str(payload).map_err(|error| {
         PlatformError::runtime(format!("invalid response chunk payload: {error}"))
     })?;
     Ok((chunk.request_id, chunk.completion_token, chunk.chunk))
 }
 
 fn decode_cache_revalidate_payload(payload: &str) -> Result<CacheRevalidatePayload> {
-    let request: CacheRevalidatePayload = serde_json::from_str(payload).map_err(|error| {
+    let request: CacheRevalidatePayload = crate::json::from_str(payload).map_err(|error| {
         PlatformError::runtime(format!("invalid cache revalidate payload: {error}"))
     })?;
     if request.cache_name.trim().is_empty() {
@@ -1977,13 +2288,49 @@ fn cache_revalidation_key(
         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
         .collect();
     headers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let header_key = serde_json::to_string(&headers).unwrap_or_default();
+    let header_key = crate::json::to_string(&headers).unwrap_or_default();
     format!(
         "{worker_name}:{generation}:{}:{}:{}:{header_key}",
         payload.cache_name.trim(),
         payload.method.trim().to_ascii_uppercase(),
         payload.url.trim()
     )
+}
+
+fn traceparent_from_headers(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
+        .map(|(_, value)| value.clone())
+}
+
+fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent: Option<&str>) {
+    let Some(traceparent) = traceparent.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    global::get_text_map_propagator(|propagator| {
+        let extractor = TraceparentExtractor(traceparent);
+        let parent = propagator.extract(&extractor);
+        if parent.span().span_context().is_valid() {
+            span.set_parent(parent);
+        }
+    });
+}
+
+struct TraceparentExtractor<'a>(&'a str);
+
+impl Extractor for TraceparentExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        if key.eq_ignore_ascii_case("traceparent") {
+            Some(self.0)
+        } else {
+            None
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent"]
+    }
 }
 
 #[cfg(test)]

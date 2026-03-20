@@ -1,6 +1,7 @@
 use common::WorkerInvocation;
 use runtime::{RuntimeConfig, RuntimeService};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -38,6 +39,12 @@ struct ScenarioResult {
 struct ColdStartResult {
     rounds: usize,
     deploy: Distribution,
+    first_invoke: Distribution,
+}
+
+struct RestoreStartResult {
+    rounds: usize,
+    startup: Distribution,
     first_invoke: Distribution,
 }
 
@@ -231,6 +238,11 @@ export default {
                 .map_err(|error| error.to_string())?;
             println!("{}", format_distribution_result("hot-start", 500, hot));
 
+            let restore = run_restore_from_disk(&config.runtime, 30)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("{}", format_restore_start_result(restore));
+
             let scale_service = start_service("scale-up", config.runtime.clone())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -246,9 +258,45 @@ export default {
 }
 
 async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<RuntimeService> {
-    let db_path = format!("/tmp/grugd-bench-{}-{}.db", tag, Uuid::new_v4());
-    std::env::set_var("TURSO_DATABASE_URL", format!("file:{db_path}"));
+    let paths = bench_paths(tag);
+    tokio::fs::create_dir_all(&paths.store_dir)
+        .await
+        .map_err(|error| common::PlatformError::internal(error.to_string()))?;
+    configure_runtime_env(&paths.db_path, &paths.store_dir);
     RuntimeService::start_with_config(runtime).await
+}
+
+async fn start_service_with_paths(
+    runtime: RuntimeConfig,
+    db_path: &Path,
+    store_dir: &Path,
+) -> common::Result<RuntimeService> {
+    tokio::fs::create_dir_all(store_dir)
+        .await
+        .map_err(|error| common::PlatformError::internal(error.to_string()))?;
+    configure_runtime_env(db_path, store_dir);
+    RuntimeService::start_with_config(runtime).await
+}
+
+fn configure_runtime_env(db_path: &Path, store_dir: &Path) {
+    std::env::set_var("TURSO_DATABASE_URL", format!("file:{}", db_path.display()));
+    std::env::set_var("GRUGD_STORE_DIR", store_dir.display().to_string());
+    std::env::set_var("GRUGD_WORKER_STORE", "1");
+}
+
+struct BenchPaths {
+    root: PathBuf,
+    db_path: PathBuf,
+    store_dir: PathBuf,
+}
+
+fn bench_paths(tag: &str) -> BenchPaths {
+    let root = PathBuf::from(format!("/tmp/grugd-bench-{tag}-{}", Uuid::new_v4()));
+    BenchPaths {
+        root: root.clone(),
+        db_path: root.join("grugd-kv.db"),
+        store_dir: root.join("store"),
+    }
 }
 
 async fn run_scenario(
@@ -365,6 +413,49 @@ export default {
     }
 
     Ok(summarize_distribution(&samples))
+}
+
+async fn run_restore_from_disk(
+    runtime: &RuntimeConfig,
+    rounds: usize,
+) -> common::Result<RestoreStartResult> {
+    let source = r#"
+export default {
+  async fetch() {
+    return new Response("ok");
+  },
+};
+"#;
+    let mut startup = Vec::with_capacity(rounds);
+    let mut first_invoke = Vec::with_capacity(rounds);
+
+    for idx in 0..rounds {
+        let paths = bench_paths("restore");
+        let worker_name = format!("restore-{idx}-{}", Uuid::new_v4());
+
+        let seed =
+            start_service_with_paths(runtime.clone(), &paths.db_path, &paths.store_dir).await?;
+        seed.deploy(worker_name.clone(), source.to_string()).await?;
+        drop(seed);
+
+        let startup_started = Instant::now();
+        let restored =
+            start_service_with_paths(runtime.clone(), &paths.db_path, &paths.store_dir).await?;
+        startup.push(startup_started.elapsed());
+
+        let invoke_started = Instant::now();
+        restored.invoke(worker_name, invocation("/", idx)).await?;
+        first_invoke.push(invoke_started.elapsed());
+        drop(restored);
+
+        let _ = tokio::fs::remove_dir_all(paths.root).await;
+    }
+
+    Ok(RestoreStartResult {
+        rounds,
+        startup: summarize_distribution(&startup),
+        first_invoke: summarize_distribution(&first_invoke),
+    })
 }
 
 async fn run_scale_up(
@@ -575,6 +666,22 @@ fn format_scale_up_result(result: ScaleUpResult) -> String {
         result.burst.p95_ms,
         result.burst.p99_ms,
         result.burst.throughput_rps,
+    );
+    out
+}
+
+fn format_restore_start_result(result: RestoreStartResult) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "restore-from-disk  rounds={} startup(mean/p95/p99)={:.2}/{:.2}/{:.2}ms first-invoke(mean/p95/p99)={:.2}/{:.2}/{:.2}ms",
+        result.rounds,
+        result.startup.mean_ms,
+        result.startup.p95_ms,
+        result.startup.p99_ms,
+        result.first_invoke.mean_ms,
+        result.first_invoke.p95_ms,
+        result.first_invoke.p99_ms,
     );
     out
 }
