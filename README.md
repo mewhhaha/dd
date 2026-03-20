@@ -1,4 +1,4 @@
-# grugd
+# dd
 
 A tiny workers platform built in Rust with Axum and autoscaling JavaScript isolates.
 
@@ -31,17 +31,19 @@ Optional settings:
 ```bash
 export BIND_ADDR="127.0.0.1:3000"
 export RUST_LOG="info"
-export GRUGD_STORE_DIR="./store"
-export TURSO_DATABASE_URL="file:./store/grugd-kv.db"
-export GRUGD_BLOB_BACKEND="local"
-export GRUGD_BLOB_DIR="./store/blobs"
-export GRUGD_WORKER_STORE="1"
+export DD_STORE_DIR="./store"
+export TURSO_DATABASE_URL="file:./store/dd-kv.db"
+export DD_BLOB_BACKEND="local"
+export DD_BLOB_DIR="./store/blobs"
+export DD_WORKER_STORE="1"
+export DD_MAX_INVOKE_BODY_BYTES="16777216"
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:4317"
 ```
 
-`GRUGD_BLOB_BACKEND=s3` is reserved for the upcoming S3-compatible implementation.
-`OTEL_EXPORTER_OTLP_ENDPOINT` (or `GRUGD_OTEL_ENDPOINT`) enables OTLP span export.
-`GRUGD_WORKER_STORE=0` disables file-based worker persistence/restore.
+`DD_BLOB_BACKEND=s3` is reserved for the upcoming S3-compatible implementation.
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `DD_OTEL_ENDPOINT`) enables OTLP span export.
+`DD_WORKER_STORE=0` disables file-based worker persistence/restore.
+`DD_MAX_INVOKE_BODY_BYTES` caps request body size accepted by `/invoke` (default: 16 MiB).
 
 ## Run
 
@@ -77,9 +79,9 @@ Current baseline results are in `BENCHMARKS.md`.
 - dropped invokes are canceled and signaled via `ctx.signal`
 - cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure
 - cache metadata lives in Turso; inline bodies <= 64KiB, larger bodies use blob storage refs
-- local defaults persist into `./store` (`workers`, `grugd-kv.db`, `blobs`)
+- local defaults persist into `./store` (`workers`, `dd-kv.db`, `blobs`)
 - W3C `traceparent` is extracted/injected on invoke requests
-- responses include `x-grugd-trace-id` for quick correlation
+- responses include `x-dd-trace-id` for quick correlation
 
 ## Example workers
 
@@ -94,6 +96,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/kv-counter.js` - tiny counter API (`/value`, `/inc`, `/reset`)
 - `examples/wait-until.js` - respond now, finish async work in `ctx.waitUntil`
 - `examples/wait-until-kv.js` - `waitUntil` background write into KV
+- `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
 
 Try them quickly:
 
@@ -109,6 +112,7 @@ cargo run -p cli -- deploy kv examples/kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy kv-counter examples/kv-counter.js --kv-binding MY_KV
 cargo run -p cli -- deploy bg examples/wait-until.js
 cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
+cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
 ```
 
 Invoke examples:
@@ -121,6 +125,8 @@ cargo run -p cli -- invoke stream --method GET --path /
 cargo run -p cli -- invoke kv-counter --method POST --path /inc
 cargo run -p cli -- invoke kv-counter --method GET --path /value
 printf "req-123" | xargs -I{} cargo run -p cli -- invoke bg-kv --method GET --path / --header "x-request-id: {}"
+cargo run -p cli -- invoke receipts --method POST --path /receipts --header "content-type: application/json" --body-file -
+cargo run -p cli -- invoke receipts --method GET --path /receipts
 ```
 
 Named cache example inside workers:
