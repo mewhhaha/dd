@@ -9,14 +9,6 @@ where
     from_slice(&mut bytes)
 }
 
-pub fn from_str<T>(input: &str) -> Result<T, simd_json::Error>
-where
-    T: DeserializeOwned,
-{
-    let mut bytes = input.as_bytes().to_vec();
-    from_slice(&mut bytes)
-}
-
 pub fn from_slice<T>(input: &mut [u8]) -> Result<T, simd_json::Error>
 where
     T: DeserializeOwned,
