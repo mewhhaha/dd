@@ -1,7 +1,10 @@
 use crate::actor::{ActorStateEntry, ActorStore};
+use crate::actor_rpc::{
+    decode_actor_invoke_response, encode_actor_invoke_request, ActorInvokeRequest,
+};
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvStore};
-use common::{Result, WorkerInvocation, WorkerOutput};
+use common::Result;
 use deno_core::OpState;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -29,11 +32,8 @@ pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
 pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
 
 pub struct ActorInvokeEvent {
-    pub worker_name: String,
-    pub binding: String,
-    pub key: String,
-    pub request: WorkerInvocation,
-    pub reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub request_frame: Vec<u8>,
+    pub reply: oneshot::Sender<Result<Vec<u8>>>,
 }
 
 #[derive(Default)]
@@ -750,22 +750,35 @@ async fn op_actor_invoke(
         };
     }
 
-    let request = WorkerInvocation {
-        method: payload.method,
-        url: payload.url,
-        headers: payload.headers,
-        body: payload.body,
-        request_id: payload.request_id,
+    let request_frame = match encode_actor_invoke_request(&ActorInvokeRequest {
+        worker_name: payload.worker_name,
+        binding: payload.binding,
+        key: payload.key,
+        request: common::WorkerInvocation {
+            method: payload.method,
+            url: payload.url,
+            headers: payload.headers,
+            body: payload.body,
+            request_id: payload.request_id,
+        },
+    }) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return ActorInvokeResult {
+                ok: false,
+                status: 500,
+                headers: Vec::new(),
+                body: Vec::new(),
+                error: format!("actor invoke encode failed: {error}"),
+            };
+        }
     };
     let (reply_tx, reply_rx) = oneshot::channel();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
         .send(IsolateEventPayload::ActorInvoke(ActorInvokeEvent {
-            worker_name: payload.worker_name,
-            binding: payload.binding,
-            key: payload.key,
-            request,
+            request_frame,
             reply: reply_tx,
         }))
         .is_err()
@@ -780,12 +793,21 @@ async fn op_actor_invoke(
     }
 
     match reply_rx.await {
-        Ok(Ok(output)) => ActorInvokeResult {
-            ok: true,
-            status: output.status,
-            headers: output.headers,
-            body: output.body,
-            error: String::new(),
+        Ok(Ok(frame)) => match decode_actor_invoke_response(&frame) {
+            Ok(output) => ActorInvokeResult {
+                ok: true,
+                status: output.status,
+                headers: output.headers,
+                body: output.body,
+                error: String::new(),
+            },
+            Err(error) => ActorInvokeResult {
+                ok: false,
+                status: 500,
+                headers: Vec::new(),
+                body: Vec::new(),
+                error: format!("actor invoke decode failed: {error}"),
+            },
         },
         Ok(Err(error)) => ActorInvokeResult {
             ok: false,

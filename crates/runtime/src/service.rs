@@ -1,4 +1,5 @@
 use crate::actor::ActorStore;
+use crate::actor_rpc::{decode_actor_invoke_request, encode_actor_invoke_response};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
@@ -1014,10 +1015,17 @@ impl WorkerManager {
         payload: ActorInvokeEvent,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
+        let decoded = match decode_actor_invoke_request(&payload.request_frame) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let _ = payload.reply.send(Err(error));
+                return;
+            }
+        };
         let runtime_request_id = Uuid::new_v4().to_string();
         let route = ActorRoute {
-            binding: payload.binding.trim().to_string(),
-            key: payload.key.trim().to_string(),
+            binding: decoded.binding.trim().to_string(),
+            key: decoded.key.trim().to_string(),
         };
         if route.binding.is_empty() || route.key.is_empty() {
             let _ = payload.reply.send(Err(PlatformError::bad_request(
@@ -1025,15 +1033,26 @@ impl WorkerManager {
             )));
             return;
         }
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.enqueue_invoke(
-            payload.worker_name,
+            decoded.worker_name,
             runtime_request_id,
-            payload.request,
+            decoded.request,
             None,
             Some(route),
-            payload.reply,
+            reply_tx,
             event_tx,
         );
+        tokio::spawn(async move {
+            let result = match reply_rx.await {
+                Ok(Ok(output)) => encode_actor_invoke_response(&output),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(PlatformError::internal(
+                    "actor invoke response channel closed",
+                )),
+            };
+            let _ = payload.reply.send(result);
+        });
     }
 
     fn cancel_invoke(

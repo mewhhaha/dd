@@ -8,6 +8,7 @@ version.workspace = true
 common = { path = "../common" }
 deno_core.workspace = true
 turso = "0.5.1"
+capnp = "0.20"
 serde.workspace = true
 simd-json.workspace = true
 tokio.workspace = true

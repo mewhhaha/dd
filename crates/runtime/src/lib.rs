@@ -1,4 +1,5 @@
 mod actor;
+mod actor_rpc;
 mod assets;
 mod blob;
 mod cache;
