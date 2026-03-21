@@ -15,7 +15,7 @@ This MVP supports:
 - isolate reuse (module/global state is preserved for warm isolates)
 - `ctx.waitUntil()` with a 30s cap
 - optional Turso KV bindings injected in `env`
-- optional actor namespace bindings with `ctx.actor(binding, key)`
+- optional actor namespace bindings in `env` (`idFromName()` + `get()`)
 - global in-process Cache API (`caches.default` + `caches.open(name)`) shared across workers
 - cache index persisted in Turso; large cache bodies spill to blob storage (local FS now, S3-like backend hook ready)
 
@@ -24,6 +24,7 @@ Workers are single JavaScript modules that export a default object with `fetch(r
 ## Prerequisites
 
 - Rust toolchain
+- Cap'n Proto compiler (`capnp`) available on `PATH`
 
 ## Environment
 
@@ -70,6 +71,12 @@ Run the runtime benchmark with:
 cargo run -p runtime --bin bench --release
 ```
 
+Run the actor storage sync-vs-async comparison benchmark with:
+
+```bash
+cargo run -p runtime --bin bench_actor_storage
+```
+
 Current baseline results are in `BENCHMARKS.md`.
 
 ## Runtime behavior defaults
@@ -81,6 +88,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - actor routing is opt-in; by default workers stay pooled
 - same actor key can run with multiple in-flight requests on its owner isolate
 - KV `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
+- actor storage is only available inside actor classes via `constructor(state, env)`
 - actor storage writes should use CAS (`expectedVersion`) to avoid lost updates
 - actor storage `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
 - structured values use V8 storage serialization (`forStorage: true`) and reject unsupported host/function types
@@ -96,6 +104,7 @@ Current baseline results are in `BENCHMARKS.md`.
 
 - `examples/hello.js` - smallest possible worker
 - `examples/router.js` - tiny GET/POST router
+- `examples/bundled-router/` - TypeScript router bundled with `pnpm` + `tsdown`
 - `examples/cache.js` - cache-aside with `caches.default`
 - `examples/named-cache.js` - cache-aside with `await caches.open("name")`
 - `examples/cache-vary.js` - cache variants with `Vary: accept-language`
@@ -105,7 +114,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/kv-counter.js` - tiny counter API (`/value`, `/inc`, `/reset`)
 - `examples/wait-until.js` - respond now, finish async work in `ctx.waitUntil`
 - `examples/wait-until-kv.js` - `waitUntil` background write into KV
-- `examples/actor.js` - actor key routing + per-user durable counter (`ctx.actor`)
+- `examples/actor.js` - class-based actor namespace (`env.USER_ACTOR.idFromName/get`)
 - `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
 
 Try them quickly:
@@ -122,8 +131,18 @@ cargo run -p cli -- deploy kv examples/kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy kv-counter examples/kv-counter.js --kv-binding MY_KV
 cargo run -p cli -- deploy bg examples/wait-until.js
 cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
-cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR
+cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR=UserActor
 cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
+```
+
+Build/deploy the bundled TypeScript router:
+
+```bash
+cd examples/bundled-router
+pnpm install
+pnpm run build
+cd ../..
+cargo run -p cli -- deploy bundled-router examples/bundled-router/dist/worker.js
 ```
 
 Invoke examples:
@@ -131,6 +150,7 @@ Invoke examples:
 ```bash
 cargo run -p cli -- invoke router --method GET --path /health
 printf "ping" | cargo run -p cli -- invoke router --method POST --path /echo --header "content-type: text/plain" --body-file -
+cargo run -p cli -- invoke bundled-router --method GET --path /health
 cargo run -p cli -- invoke cache-vary --method GET --path /greet --header "accept-language: fr"
 cargo run -p cli -- invoke stream --method GET --path /
 cargo run -p cli -- invoke kv-counter --method POST --path /inc

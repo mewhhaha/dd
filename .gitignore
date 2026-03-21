@@ -2,3 +2,4 @@ target
 store/
 dd-kv.db
 dd-kv.db-wal
+node_modules/

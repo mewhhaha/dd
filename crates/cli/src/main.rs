@@ -76,7 +76,8 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
         command
             .actor_bindings
             .into_iter()
-            .map(|binding| DeployBinding::Actor { binding }),
+            .map(parse_actor_binding)
+            .collect::<Result<Vec<_>, _>>()?,
     );
     let config = DeployConfig { bindings };
     let response = client
@@ -93,6 +94,26 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
     let deployment: DeployResponse = decode_json(response).await?;
     println!("{}", to_json_string(&deployment)?);
     Ok(())
+}
+
+fn parse_actor_binding(value: String) -> Result<DeployBinding, String> {
+    let trimmed = value.trim();
+    let Some((binding, class)) = trimmed.split_once('=') else {
+        return Err(format!(
+            "invalid actor binding {trimmed:?}, expected BINDING=ClassName"
+        ));
+    };
+    let binding = binding.trim();
+    let class = class.trim();
+    if binding.is_empty() || class.is_empty() {
+        return Err(format!(
+            "invalid actor binding {trimmed:?}, expected BINDING=ClassName"
+        ));
+    }
+    Ok(DeployBinding::Actor {
+        binding: binding.to_string(),
+        class: class.to_string(),
+    })
 }
 
 async fn invoke(client: &reqwest::Client, server: &str, command: InvokeCmd) -> Result<(), String> {

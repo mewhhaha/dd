@@ -277,12 +277,15 @@ fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformEr
     let mut seen = HashSet::new();
     for binding in bindings {
         match binding {
-            DeployBinding::Kv { binding } | DeployBinding::Actor { binding }
+            DeployBinding::Kv { binding } | DeployBinding::Actor { binding, .. }
                 if binding.trim().is_empty() =>
             {
                 return Err(PlatformError::bad_request("binding name must not be empty"));
             }
-            DeployBinding::Kv { binding } | DeployBinding::Actor { binding } => {
+            DeployBinding::Actor { class, .. } if class.trim().is_empty() => {
+                return Err(PlatformError::bad_request("actor class must not be empty"));
+            }
+            DeployBinding::Kv { binding } | DeployBinding::Actor { binding, .. } => {
                 let normalized = binding.trim().to_string();
                 if !seen.insert(normalized.clone()) {
                     return Err(PlatformError::bad_request(format!(
@@ -606,8 +609,18 @@ mod tests {
             },
             DeployBinding::Actor {
                 binding: "SHARED".to_string(),
+                class: "SharedActor".to_string(),
             },
         ];
+        assert!(validate_deploy_bindings(&bindings).is_err());
+    }
+
+    #[test]
+    fn empty_actor_class_is_rejected() {
+        let bindings = vec![DeployBinding::Actor {
+            binding: "MY_ACTOR".to_string(),
+            class: String::new(),
+        }];
         assert!(validate_deploy_bindings(&bindings).is_err());
     }
 }

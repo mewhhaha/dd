@@ -4,6 +4,7 @@
   const workerName = __WORKER_NAME__;
   const kvBindingsConfig = __KV_BINDINGS_JSON__;
   const actorBindingsConfig = __ACTOR_BINDINGS_JSON__;
+  const actorCallConfig = __ACTOR_CALL_JSON__;
   const hasRequestBodyStream = __HAS_REQUEST_BODY_STREAM__;
   const worker = globalThis.__dd_worker;
 
@@ -321,15 +322,134 @@
     };
   };
 
-  const createActorStorageBinding = (namespace, actorKey) => ({
+  const toArrayBytes = (value) => new Uint8Array(Array.isArray(value) ? value : []);
+
+  const isPlainObject = (value) => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+    const proto = Object.getPrototypeOf(value);
+    return proto === Object.prototype || proto === null;
+  };
+
+  const encodeRpcValue = async (value) => {
+    if (value instanceof Request) {
+      return {
+        __dd_rpc_type: "request",
+        url: String(value.url || ""),
+        method: String(value.method || "GET"),
+        headers: Array.from(value.headers.entries()),
+        body: Array.from(new Uint8Array(await value.arrayBuffer())),
+      };
+    }
+    if (value instanceof Response) {
+      return {
+        __dd_rpc_type: "response",
+        status: Number(value.status || 200),
+        headers: Array.from(value.headers.entries()),
+        body: Array.from(new Uint8Array(await value.arrayBuffer())),
+      };
+    }
+    if (Array.isArray(value)) {
+      const out = [];
+      for (const item of value) {
+        out.push(await encodeRpcValue(item));
+      }
+      return out;
+    }
+    if (value instanceof Map) {
+      const out = new Map();
+      for (const [key, item] of value.entries()) {
+        out.set(await encodeRpcValue(key), await encodeRpcValue(item));
+      }
+      return out;
+    }
+    if (value instanceof Set) {
+      const out = new Set();
+      for (const item of value.values()) {
+        out.add(await encodeRpcValue(item));
+      }
+      return out;
+    }
+    if (isPlainObject(value)) {
+      const out = {};
+      for (const [key, item] of Object.entries(value)) {
+        out[key] = await encodeRpcValue(item);
+      }
+      return out;
+    }
+    return value;
+  };
+
+  const decodeRpcValue = (value) => {
+    if (Array.isArray(value)) {
+      return value.map((item) => decodeRpcValue(item));
+    }
+    if (value instanceof Map) {
+      const out = new Map();
+      for (const [key, item] of value.entries()) {
+        out.set(decodeRpcValue(key), decodeRpcValue(item));
+      }
+      return out;
+    }
+    if (value instanceof Set) {
+      const out = new Set();
+      for (const item of value.values()) {
+        out.add(decodeRpcValue(item));
+      }
+      return out;
+    }
+    if (!isPlainObject(value)) {
+      return value;
+    }
+    if (value.__dd_rpc_type === "request") {
+      return new Request(String(value.url || "http://worker/"), {
+        method: String(value.method || "GET"),
+        headers: Array.isArray(value.headers) ? value.headers : [],
+        body: toArrayBytes(value.body),
+      });
+    }
+    if (value.__dd_rpc_type === "response") {
+      return new Response(toArrayBytes(value.body), {
+        status: Number(value.status || 200),
+        headers: Array.isArray(value.headers) ? value.headers : [],
+      });
+    }
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = decodeRpcValue(item);
+    }
+    return out;
+  };
+
+  const encodeRpcArgs = async (args) => {
+    const encoded = [];
+    for (const arg of args) {
+      encoded.push(await encodeRpcValue(arg));
+    }
+    return new Uint8Array(Deno.core.serialize(encoded));
+  };
+
+  const decodeRpcArgs = (bytes) => {
+    const decoded = Deno.core.deserialize(bytes);
+    return Array.isArray(decoded) ? decoded.map((value) => decodeRpcValue(value)) : [];
+  };
+
+  const encodeRpcResult = async (value) => {
+    const encoded = await encodeRpcValue(value);
+    return new Uint8Array(Deno.core.serialize(encoded));
+  };
+
+  const decodeRpcResult = (bytes) => decodeRpcValue(Deno.core.deserialize(bytes));
+
+  const createActorStorageBinding = (runtimeRequestId) => ({
     async get(key) {
       const result = await callOp(
         "op_actor_state_get_value",
-        JSON.stringify({
-          namespace,
-          actor_key: actorKey,
+        {
+          request_id: runtimeRequestId,
           key: String(key),
-        }),
+        },
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
@@ -339,7 +459,7 @@
         return null;
       }
       const encoding = String(result.encoding ?? "utf8");
-      const bytes = new Uint8Array(Array.isArray(result.value) ? result.value : []);
+      const bytes = toArrayBytes(result.value);
       if (encoding === "utf8") {
         return {
           value: Deno.core.decode(bytes),
@@ -348,16 +468,11 @@
         };
       }
       if (encoding === "v8sc") {
-        try {
-          const decoded = Deno.core.deserialize(bytes, { forStorage: true });
-          return {
-            value: decoded,
-            version: Number(result.version ?? -1),
-            encoding,
-          };
-        } catch (error) {
-          throw new Error(`actor storage get deserialize failed: ${String(error?.message ?? error)}`);
-        }
+        return {
+          value: Deno.core.deserialize(bytes, { forStorage: true }),
+          version: Number(result.version ?? -1),
+          encoding,
+        };
       }
       throw new Error(`actor storage get unsupported encoding: ${encoding}`);
     },
@@ -369,8 +484,7 @@
       if (typeof value === "string") {
         const result = await callOp(
           "op_actor_state_set",
-          namespace,
-          actorKey,
+          runtimeRequestId,
           String(key),
           value,
           expectedVersion,
@@ -385,23 +499,16 @@
           version: Number(result?.version ?? -1),
         };
       }
-      let encoded;
-      try {
-        encoded = Deno.core.serialize(value, { forStorage: true });
-      } catch (error) {
-        throw new Error(`actor storage put serialize failed: ${String(error?.message ?? error)}`);
-      }
-      const bytes = Array.from(new Uint8Array(encoded));
+      const encoded = new Uint8Array(Deno.core.serialize(value, { forStorage: true }));
       const result = await callOp(
         "op_actor_state_set_value",
-        JSON.stringify({
-          namespace,
-          actor_key: actorKey,
+        {
+          request_id: runtimeRequestId,
           key: String(key),
           encoding: "v8sc",
-          value: bytes,
+          value: Array.from(encoded),
           expected_version: expectedVersion,
-        }),
+        },
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
@@ -420,8 +527,7 @@
         : -1;
       const result = await callOp(
         "op_actor_state_delete",
-        namespace,
-        actorKey,
+        runtimeRequestId,
         String(key),
         expectedVersion,
       );
@@ -443,10 +549,11 @@
         : 100;
       const result = await callOp(
         "op_actor_state_list",
-        namespace,
-        actorKey,
-        prefix,
-        limit,
+        {
+          request_id: runtimeRequestId,
+          prefix,
+          limit,
+        },
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
@@ -456,37 +563,129 @@
     },
   });
 
-  const createActorBinding = (namespace, actorKey) => ({
-    storage: createActorStorageBinding(namespace, actorKey),
-    async fetch(inputValue, initValue = undefined) {
-      const request = await normalizeActorFetchInput(inputValue, initValue);
-      actorInvokeSeq += 1;
-      const result = await callOp(
-        "op_actor_invoke",
-        JSON.stringify({
-          worker_name: workerName,
-          binding: namespace,
-          key: actorKey,
-          method: request.method,
-          url: request.url,
-          headers: request.headers,
-          body: Array.from(request.body),
-          request_id: `${requestId}:actor:${actorInvokeSeq}`,
-        }),
-      );
-      await syncFrozenTime();
-      if (!result || typeof result !== "object" || result.ok === false) {
-        throw new Error(String(result?.error ?? "actor invoke failed"));
+  const createActorRuntimeState = (actorKey, runtimeRequestId) => ({
+    id: {
+      toString() {
+        return actorKey;
+      },
+    },
+    storage: createActorStorageBinding(runtimeRequestId),
+  });
+
+  const actorInstances = globalThis.__dd_actor_instances ??= new Map();
+
+  const actorMethodNameIsBlocked = (name) => (
+    !name
+    || name === "constructor"
+    || name === "fetch"
+    || name === "then"
+    || name.startsWith("__dd_")
+  );
+
+  const createActorStub = (namespace, actorKey) => {
+    const target = {
+      async fetch(inputValue, initValue = undefined) {
+        const request = await normalizeActorFetchInput(inputValue, initValue);
+        actorInvokeSeq += 1;
+        const result = await callOp(
+          "op_actor_invoke_fetch",
+          {
+            worker_name: workerName,
+            binding: namespace,
+            key: actorKey,
+            method: request.method,
+            url: request.url,
+            headers: request.headers,
+            body: Array.from(request.body),
+            request_id: `${requestId}:actor-fetch:${actorInvokeSeq}`,
+          },
+        );
+        await syncFrozenTime();
+        if (!result || typeof result !== "object" || result.ok === false) {
+          throw new Error(String(result?.error ?? "actor fetch invoke failed"));
+        }
+        return new Response(toArrayBytes(result.body), {
+          status: Number(result.status ?? 200),
+          headers: Array.isArray(result.headers) ? result.headers : [],
+        });
+      },
+    };
+
+    return new Proxy(target, {
+      get(currentTarget, prop, receiver) {
+        if (typeof prop === "symbol") {
+          return Reflect.get(currentTarget, prop, receiver);
+        }
+        const methodName = String(prop);
+        if (methodName in currentTarget) {
+          return Reflect.get(currentTarget, prop, receiver);
+        }
+        if (methodName === "then") {
+          return undefined;
+        }
+        if (actorMethodNameIsBlocked(methodName)) {
+          throw new Error(`actor method is blocked: ${methodName}`);
+        }
+        return async (...args) => {
+          actorInvokeSeq += 1;
+          const argsBytes = await encodeRpcArgs(args);
+          const result = await callOp(
+            "op_actor_invoke_method",
+            {
+              worker_name: workerName,
+              binding: namespace,
+              key: actorKey,
+              method_name: methodName,
+              args: Array.from(argsBytes),
+              request_id: `${requestId}:actor-method:${actorInvokeSeq}`,
+            },
+          );
+          await syncFrozenTime();
+          if (!result || typeof result !== "object" || result.ok === false) {
+            throw new Error(String(result?.error ?? `actor method invoke failed: ${methodName}`));
+          }
+          return decodeRpcResult(toArrayBytes(result.value));
+        };
+      },
+    });
+  };
+
+  const actorIdKey = (id) => {
+    if (typeof id === "string") {
+      return id;
+    }
+    if (id && typeof id === "object" && typeof id.__dd_actor_key === "string") {
+      return id.__dd_actor_key;
+    }
+    return "";
+  };
+
+  const createActorNamespace = (bindingName) => ({
+    idFromName(name) {
+      const key = String(name ?? "").trim();
+      if (!key) {
+        throw new Error("actor idFromName requires a non-empty name");
       }
-      return new Response(new Uint8Array(Array.isArray(result.body) ? result.body : []), {
-        status: Number(result.status ?? 200),
-        headers: Array.isArray(result.headers) ? result.headers : [],
-      });
+      return {
+        __dd_actor_key: key,
+        __dd_actor_binding: bindingName,
+        toString() {
+          return key;
+        },
+      };
+    },
+    get(id) {
+      const actorKey = actorIdKey(id).trim();
+      if (!actorKey) {
+        throw new Error("actor namespace get() requires a valid actor id");
+      }
+      return createActorStub(bindingName, actorKey);
     },
   });
 
   const buildEnv = () => {
     const env = {};
+    const actorBindingClasses = new Map();
     const kvBindings = Array.isArray(kvBindingsConfig)
       ? kvBindingsConfig
       : kvBindingsConfig && typeof kvBindingsConfig === "object"
@@ -508,32 +707,103 @@
       });
     }
 
-    const actorBindings = Array.isArray(actorBindingsConfig)
-      ? actorBindingsConfig
-      : actorBindingsConfig && typeof actorBindingsConfig === "object"
-        ? Object.entries(actorBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
-        : [];
-    const actorNamespaces = new Set();
-    for (const binding of actorBindings) {
-      const [envName, bindingName] = Array.isArray(binding)
-        ? binding
-        : [binding, binding];
-      if (typeof envName !== "string" || envName.length === 0) {
+    const actorBindings = Array.isArray(actorBindingsConfig) ? actorBindingsConfig : [];
+    for (const entry of actorBindings) {
+      let bindingName = "";
+      let className = "";
+      if (Array.isArray(entry) && entry.length >= 2) {
+        bindingName = String(entry[0] ?? "").trim();
+        className = String(entry[1] ?? "").trim();
+      } else if (entry && typeof entry === "object") {
+        bindingName = String(entry.binding ?? "").trim();
+        className = String(entry.class ?? entry.class_name ?? "").trim();
+      }
+      if (!bindingName || !className) {
         continue;
       }
-      if (typeof bindingName !== "string" || bindingName.length === 0) {
-        continue;
-      }
-      actorNamespaces.add(bindingName);
+      const envName = bindingName;
+      actorBindingClasses.set(bindingName, className);
       Object.defineProperty(env, envName, {
-        value: { __dd_actor_binding: bindingName },
+        value: createActorNamespace(bindingName),
         enumerable: true,
         configurable: true,
-        writable: false,
+        writable: true,
       });
     }
 
-    return { env, actorNamespaces };
+    return { env, actorBindingClasses };
+  };
+
+  const actorClassRegistry = globalThis.__dd_actor_classes ?? {};
+
+  const invokeActorClass = async (actorCall, request, env, actorBindingClasses) => {
+    if (!actorCall || typeof actorCall !== "object") {
+      throw new Error("actor invoke config is missing");
+    }
+    const binding = String(actorCall.binding ?? "").trim();
+    const actorKey = String(actorCall.key ?? "").trim();
+    if (!binding || !actorKey) {
+      throw new Error("actor invoke requires binding and key");
+    }
+    const className = actorBindingClasses.get(binding);
+    if (!className) {
+      throw new Error(`actor binding not declared for worker: ${binding}`);
+    }
+    const actorClass = actorClassRegistry[className];
+    if (typeof actorClass !== "function") {
+      throw new Error(`actor class export not found: ${className}`);
+    }
+
+    const cacheKey = `${binding}\u001f${actorKey}`;
+    let entry = actorInstances.get(cacheKey);
+    if (!entry) {
+      entry = {
+        instance: new actorClass(createActorRuntimeState(actorKey, requestId), env),
+      };
+      actorInstances.set(cacheKey, entry);
+    }
+
+    const scopedState = createActorRuntimeState(actorKey, requestId);
+    const receiver = new Proxy(entry.instance, {
+      get(target, prop, receiverValue) {
+        if (prop === "state") {
+          return scopedState;
+        }
+        return Reflect.get(target, prop, target);
+      },
+      set(target, prop, value, receiverValue) {
+        if (prop === "state") {
+          return true;
+        }
+        return Reflect.set(target, prop, value, target);
+      },
+    });
+
+    const kind = String(actorCall.kind ?? "");
+    if (kind === "fetch") {
+      if (typeof entry.instance.fetch !== "function") {
+        throw new Error(`actor class does not define fetch(): ${className}`);
+      }
+      return await entry.instance.fetch.call(receiver, request);
+    }
+    if (kind === "method") {
+      const methodName = String(actorCall.name ?? "").trim();
+      if (actorMethodNameIsBlocked(methodName)) {
+        throw new Error(`actor method is blocked: ${methodName}`);
+      }
+      const method = entry.instance[methodName];
+      if (typeof method !== "function") {
+        throw new Error(`actor method not found: ${methodName}`);
+      }
+      const args = decodeRpcArgs(toArrayBytes(actorCall.args));
+      const value = await method.apply(receiver, args);
+      const encoded = await encodeRpcResult(value);
+      return new Response(encoded, {
+        status: 200,
+        headers: [["content-type", "application/octet-stream"]],
+      });
+    }
+    throw new Error(`unsupported actor invoke kind: ${kind}`);
   };
 
   const emitWaitUntilDone = async (timedOut) => {
@@ -636,35 +906,12 @@
       });
       const envResult = buildEnv();
       const env = envResult.env;
-      const actorNamespaces = envResult.actorNamespaces;
+      const actorBindingClasses = envResult.actorBindingClasses;
       const ctx = {
         requestId: input.request_id,
         signal: controller.signal,
         waitUntil(promise) {
           return trackWaitUntil(promise);
-        },
-        actor(bindingRef, key) {
-          let namespace = null;
-          if (typeof bindingRef === "string") {
-            namespace = bindingRef;
-          } else if (
-            bindingRef
-            && typeof bindingRef === "object"
-            && typeof bindingRef.__dd_actor_binding === "string"
-          ) {
-            namespace = bindingRef.__dd_actor_binding;
-          }
-          if (typeof namespace !== "string" || namespace.length === 0) {
-            throw new Error("ctx.actor requires a declared actor binding");
-          }
-          if (!actorNamespaces.has(namespace)) {
-            throw new Error(`actor binding not declared for worker: ${namespace}`);
-          }
-          const actorKey = String(key ?? "").trim();
-          if (!actorKey) {
-            throw new Error("ctx.actor requires a non-empty key");
-          }
-          return createActorBinding(namespace, actorKey);
         },
         async sleep(millis) {
           await sleep(millis);
@@ -672,7 +919,9 @@
         },
       };
 
-      const response = await worker.fetch(request, env, ctx);
+      const response = actorCallConfig
+        ? await invokeActorClass(actorCallConfig, request, env, actorBindingClasses)
+        : await worker.fetch(request, env, ctx);
       await syncFrozenTime();
 
       if (!(response instanceof Response)) {

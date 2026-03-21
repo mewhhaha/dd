@@ -3,6 +3,7 @@ name = "runtime"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+build = "build.rs"
 
 [dependencies]
 common = { path = "../common" }
@@ -19,3 +20,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 serial_test = "3"
+
+[build-dependencies]
+capnpc = "0.20"

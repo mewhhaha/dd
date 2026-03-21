@@ -24,99 +24,81 @@ function userKey(url) {
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
-    if (!env.USER_ACTOR) {
-      return json({ ok: false, error: "missing actor binding: USER_ACTOR" }, 500);
-    }
+    const key = userKey(url);
+    const id = env.USER_ACTOR.idFromName(key);
+    const actor = env.USER_ACTOR.get(id);
 
     if (url.pathname === "/inc" && request.method === "POST") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const response = await actor.fetch(`/actor/inc?user=${encodeURIComponent(key)}`, {
-        method: "POST",
-      });
-      return response;
+      const value = await actor.increment(1);
+      return json({ ok: true, user: key, value });
     }
 
     if (url.pathname === "/value" && request.method === "GET") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const response = await actor.fetch(`/actor/value?user=${encodeURIComponent(key)}`);
-      return response;
+      const value = await actor.value();
+      return json({ ok: true, user: key, value });
     }
 
     if (url.pathname === "/profile" && request.method === "POST") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const response = await actor.fetch(`/actor/profile?user=${encodeURIComponent(key)}`, {
-        method: "POST",
-      });
-      return response;
-    }
-
-    if (url.pathname === "/profile" && request.method === "GET") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const response = await actor.fetch(`/actor/profile?user=${encodeURIComponent(key)}`);
-      return response;
-    }
-
-    if (url.pathname === "/actor/inc" && request.method === "POST") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const current = await actor.storage.get("count");
-      const currentValue = current ? Number(current.value) || 0 : 0;
-      const expectedVersion = current ? current.version : -1;
-      const write = await actor.storage.put("count", String(currentValue + 1), {
-        expectedVersion,
-      });
-      if (write.conflict) {
-        return json({ ok: false, error: "conflict", version: write.version }, 409);
-      }
-      return json({ ok: true, user: key, value: currentValue + 1, version: write.version });
-    }
-
-    if (url.pathname === "/actor/value" && request.method === "GET") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const current = await actor.storage.get("count");
-      return json({
-        ok: true,
-        user: key,
-        value: current ? Number(current.value) || 0 : 0,
-        version: current ? current.version : -1,
-      });
-    }
-
-    if (url.pathname === "/actor/profile" && request.method === "POST") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const write = await actor.storage.put("profile", {
+      const profile = await actor.updateProfile({
         user: key,
         createdAt: new Date("2026-01-02T03:04:05.000Z"),
         flags: new Set(["paid", "beta"]),
         prefs: new Map([["theme", "light"]]),
       });
-      if (write.conflict) {
-        return json({ ok: false, error: "conflict", version: write.version }, 409);
-      }
-      return json({ ok: true, user: key, version: write.version });
+      return json({ ok: true, user: key, profile });
     }
 
-    if (url.pathname === "/actor/profile" && request.method === "GET") {
-      const key = userKey(url);
-      const actor = ctx.actor(env.USER_ACTOR, key);
-      const current = await actor.storage.get("profile");
-      return json({
-        ok: true,
-        user: key,
-        value: current ? current.value : null,
-        version: current ? current.version : -1,
-        encoding: current ? current.encoding : "utf8",
-      });
+    if (url.pathname === "/profile" && request.method === "GET") {
+      const profile = await actor.profile();
+      return json({ ok: true, user: key, profile });
+    }
+
+    if (url.pathname === "/ping" && request.method === "GET") {
+      return actor.fetch("/actor/ping");
     }
 
     return json({ ok: false, error: "route not found" }, 404);
   },
 };
+
+export class UserActor {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/actor/ping") {
+      return new Response("pong");
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  async increment(by = 1) {
+    const current = await this.state.storage.get("count");
+    const currentValue = current ? Number(current.value) || 0 : 0;
+    const write = await this.state.storage.put("count", String(currentValue + Number(by || 0)));
+    if (write.conflict) {
+      throw new Error("conflict");
+    }
+    return currentValue + Number(by || 0);
+  }
+
+  async value() {
+    const current = await this.state.storage.get("count");
+    return current ? Number(current.value) || 0 : 0;
+  }
+
+  async updateProfile(profile) {
+    await this.state.storage.put("profile", profile);
+    const current = await this.state.storage.get("profile");
+    return current ? current.value : null;
+  }
+
+  async profile() {
+    const current = await this.state.storage.get("profile");
+    return current ? current.value : null;
+  }
+}

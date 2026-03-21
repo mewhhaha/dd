@@ -8,14 +8,17 @@ const INSTALL_WORKER_TEMPLATE: &str = include_str!("../js/install_worker.js");
 const EXECUTE_WORKER_TEMPLATE: &str = include_str!("../js/execute_worker.js");
 const ABORT_WORKER_TEMPLATE: &str = include_str!("../js/abort_worker.js");
 
-pub fn install_worker_js() -> String {
-    INSTALL_WORKER_TEMPLATE.replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER)
+pub fn install_worker_js(actor_classes_json: &str) -> String {
+    INSTALL_WORKER_TEMPLATE
+        .replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER)
+        .replace("__ACTOR_CLASSES_JSON__", actor_classes_json)
 }
 
 pub fn execute_worker_js(
     worker_name: &str,
     kv_bindings_json: &str,
     actor_bindings_json: &str,
+    actor_call_json: &str,
     request_id: &str,
     completion_token: &str,
     has_request_body_stream: bool,
@@ -25,6 +28,7 @@ pub fn execute_worker_js(
         .replace("__WORKER_NAME__", worker_name)
         .replace("__KV_BINDINGS_JSON__", kv_bindings_json)
         .replace("__ACTOR_BINDINGS_JSON__", actor_bindings_json)
+        .replace("__ACTOR_CALL_JSON__", actor_call_json)
         .replace("__REQUEST_ID__", request_id)
         .replace("__COMPLETION_TOKEN__", completion_token)
         .replace(

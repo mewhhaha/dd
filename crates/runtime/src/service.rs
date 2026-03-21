@@ -1,14 +1,17 @@
 use crate::actor::ActorStore;
-use crate::actor_rpc::{decode_actor_invoke_request, encode_actor_invoke_response};
+use crate::actor_rpc::{
+    decode_actor_invoke_request, encode_actor_invoke_response, ActorInvokeCall, ActorInvokeResponse,
+};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
-    new_runtime_from_snapshot, pump_event_loop_once, validate_worker,
+    new_runtime_from_snapshot, pump_event_loop_once, validate_worker, ExecuteActorCall,
 };
 use crate::kv::KvStore;
 use crate::ops::{
-    cancel_request_body_stream, clear_request_body_stream, register_request_body_stream,
-    ActorInvokeEvent, IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
+    cancel_request_body_stream, clear_request_body_stream, register_actor_request_scope,
+    register_request_body_stream, ActorInvokeEvent, IsolateEventPayload, IsolateEventSender,
+    RequestBodyStreams,
 };
 use common::{DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
 use opentelemetry::global;
@@ -150,7 +153,7 @@ struct WorkerPool {
     deployment_id: String,
     snapshot: &'static [u8],
     kv_bindings: Vec<String>,
-    actor_bindings: Vec<String>,
+    actor_bindings: Vec<(String, String)>,
     queue: VecDeque<PendingInvoke>,
     isolates: Vec<IsolateHandle>,
     actor_owners: HashMap<String, u64>,
@@ -171,6 +174,7 @@ struct PendingInvoke {
     request: WorkerInvocation,
     request_body: Option<InvokeRequestBodyReceiver>,
     actor_route: Option<ActorRoute>,
+    actor_call: Option<ActorExecutionCall>,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     enqueued_at: Instant,
 }
@@ -220,14 +224,30 @@ enum IsolateCommand {
         completion_token: String,
         worker_name: String,
         kv_bindings: Vec<String>,
-        actor_bindings: Vec<String>,
+        actor_bindings: Vec<(String, String)>,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
+        actor_call: Option<ActorExecutionCall>,
+        actor_route: Option<ActorRoute>,
     },
     Abort {
         runtime_request_id: String,
     },
     Shutdown,
+}
+
+#[derive(Clone)]
+enum ActorExecutionCall {
+    Fetch {
+        binding: String,
+        key: String,
+    },
+    Method {
+        binding: String,
+        key: String,
+        name: String,
+        args: Vec<u8>,
+    },
 }
 
 #[derive(Clone)]
@@ -755,6 +775,7 @@ impl WorkerManager {
                     request,
                     request_body,
                     None,
+                    None,
                     reply,
                     event_tx,
                 );
@@ -879,9 +900,15 @@ impl WorkerManager {
             return Err(PlatformError::bad_request("Worker name must not be empty"));
         }
         let bindings = extract_bindings(&config)?;
+        let actor_classes: Vec<String> = bindings
+            .actor
+            .iter()
+            .map(|(_, class)| class.clone())
+            .collect();
 
-        validate_worker(self.bootstrap_snapshot, &source).await?;
-        let worker_snapshot = build_worker_snapshot(self.bootstrap_snapshot, &source).await?;
+        validate_worker(self.bootstrap_snapshot, &source, &actor_classes).await?;
+        let worker_snapshot =
+            build_worker_snapshot(self.bootstrap_snapshot, &source, &actor_classes).await?;
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
@@ -945,6 +972,7 @@ impl WorkerManager {
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         actor_route: Option<ActorRoute>,
+        actor_call: Option<ActorExecutionCall>,
         reply: oneshot::Sender<Result<WorkerOutput>>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
@@ -980,7 +1008,7 @@ impl WorkerManager {
                 if !pool
                     .actor_bindings
                     .iter()
-                    .any(|binding| binding == &route.binding)
+                    .any(|(binding, _)| binding == &route.binding)
                 {
                     let error = PlatformError::bad_request(format!(
                         "unknown actor binding for worker {}: {}",
@@ -996,6 +1024,7 @@ impl WorkerManager {
                 request,
                 request_body,
                 actor_route,
+                actor_call,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -1022,6 +1051,35 @@ impl WorkerManager {
                 return;
             }
         };
+        let (request, actor_call) = match decoded.call {
+            ActorInvokeCall::Fetch(request) => (
+                request,
+                ActorExecutionCall::Fetch {
+                    binding: decoded.binding.clone(),
+                    key: decoded.key.clone(),
+                },
+            ),
+            ActorInvokeCall::Method {
+                name,
+                args,
+                request_id,
+            } => (
+                WorkerInvocation {
+                    method: "ACTOR-RPC".to_string(),
+                    url: format!("http://actor/__dd_rpc/{}", name),
+                    headers: Vec::new(),
+                    body: args.clone(),
+                    request_id,
+                },
+                ActorExecutionCall::Method {
+                    binding: decoded.binding.clone(),
+                    key: decoded.key.clone(),
+                    name,
+                    args,
+                },
+            ),
+        };
+        let is_method_call = matches!(actor_call, ActorExecutionCall::Method { .. });
         let runtime_request_id = Uuid::new_v4().to_string();
         let route = ActorRoute {
             binding: decoded.binding.trim().to_string(),
@@ -1037,21 +1095,39 @@ impl WorkerManager {
         self.enqueue_invoke(
             decoded.worker_name,
             runtime_request_id,
-            decoded.request,
+            request,
             None,
             Some(route),
+            Some(actor_call),
             reply_tx,
             event_tx,
         );
         tokio::spawn(async move {
             let result = match reply_rx.await {
-                Ok(Ok(output)) => encode_actor_invoke_response(&output),
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(PlatformError::internal(
-                    "actor invoke response channel closed",
+                Ok(Ok(output)) => {
+                    if is_method_call {
+                        encode_actor_invoke_response(&ActorInvokeResponse::Method {
+                            value: output.body,
+                        })
+                    } else {
+                        encode_actor_invoke_response(&ActorInvokeResponse::Fetch(output))
+                    }
+                }
+                Ok(Err(error)) => {
+                    encode_actor_invoke_response(&ActorInvokeResponse::Error(error.to_string()))
+                }
+                Err(_) => encode_actor_invoke_response(&ActorInvokeResponse::Error(
+                    "actor invoke response channel closed".to_string(),
                 )),
             };
-            let _ = payload.reply.send(result);
+            match result {
+                Ok(frame) => {
+                    let _ = payload.reply.send(Ok(frame));
+                }
+                Err(error) => {
+                    let _ = payload.reply.send(Err(error));
+                }
+            }
         });
     }
 
@@ -1248,6 +1324,8 @@ impl WorkerManager {
                     actor_bindings,
                     request: pending_invoke.request,
                     request_body: pending_invoke.request_body,
+                    actor_call: pending_invoke.actor_call,
+                    actor_route: pending_invoke.actor_route,
                 };
 
                 if isolate.sender.send(command).is_err() {
@@ -1601,6 +1679,7 @@ impl WorkerManager {
                 request: invocation,
                 request_body: None,
                 actor_route: None,
+                actor_call: None,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -1911,9 +1990,12 @@ fn select_dispatch_candidate(
         let actor_key = route.owner_key();
 
         if let Some(owner_id) = pool.actor_owners.get(&actor_key).copied() {
-            if let Some((idx, _)) = pool.isolates.iter().enumerate().find(|(_, isolate)| {
-                isolate.id == owner_id && isolate.inflight_count < max_inflight
-            }) {
+            if let Some((idx, _)) = pool
+                .isolates
+                .iter()
+                .enumerate()
+                .find(|(_, isolate)| isolate.id == owner_id)
+            {
                 return Some(DispatchCandidate {
                     queue_idx,
                     isolate_idx: idx,
@@ -1928,7 +2010,7 @@ fn select_dispatch_candidate(
             }
         }
 
-        if let Some(isolate_idx) = least_loaded_isolate_idx(&pool.isolates, max_inflight) {
+        if let Some(isolate_idx) = least_loaded_isolate_any_idx(&pool.isolates) {
             return Some(DispatchCandidate {
                 queue_idx,
                 isolate_idx,
@@ -1945,6 +2027,14 @@ fn least_loaded_isolate_idx(isolates: &[IsolateHandle], max_inflight: usize) -> 
         .iter()
         .enumerate()
         .filter(|(_, isolate)| isolate.inflight_count < max_inflight)
+        .min_by_key(|(_, isolate)| isolate.inflight_count)
+        .map(|(idx, _)| idx)
+}
+
+fn least_loaded_isolate_any_idx(isolates: &[IsolateHandle]) -> Option<usize> {
+    isolates
+        .iter()
+        .enumerate()
         .min_by_key(|(_, isolate)| isolate.inflight_count)
         .map(|(idx, _)| idx)
 }
@@ -2038,7 +2128,7 @@ impl WorkerPool {
 
 struct DeployBindings {
     kv: Vec<String>,
-    actor: Vec<String>,
+    actor: Vec<(String, String)>,
 }
 
 fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
@@ -2059,17 +2149,21 @@ fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
                 }
                 kv.push(name.to_string());
             }
-            DeployBinding::Actor { binding } => {
+            DeployBinding::Actor { binding, class } => {
                 let name = binding.trim();
+                let class_name = class.trim();
                 if name.is_empty() {
                     return Err(PlatformError::bad_request("binding name must not be empty"));
+                }
+                if class_name.is_empty() {
+                    return Err(PlatformError::bad_request("actor class must not be empty"));
                 }
                 if !seen.insert(name.to_string()) {
                     return Err(PlatformError::bad_request(format!(
                         "duplicate binding name: {name}"
                     )));
                 }
-                actor.push(name.to_string());
+                actor.push((name.to_string(), class_name.to_string()));
             }
         }
     }
@@ -2177,6 +2271,7 @@ fn spawn_isolate_thread(
                     op_state.put(actor_store.clone());
                     op_state.put(cache_store.clone());
                     op_state.put(RequestBodyStreams::default());
+                    op_state.put(crate::ops::ActorRequestScopes::default());
                 }
                 let _ = init_tx.send(Ok(()));
 
@@ -2298,6 +2393,8 @@ fn spawn_isolate_thread(
                                     actor_bindings,
                                     request,
                                     request_body,
+                                    actor_call,
+                                    actor_route,
                                 } => {
                                     let request_id = request.request_id.clone();
                                     let has_request_body_stream = request_body.is_some();
@@ -2308,6 +2405,16 @@ fn spawn_isolate_thread(
                                             &mut op_state,
                                             runtime_request_id.clone(),
                                             request_body,
+                                        );
+                                    }
+                                    if let Some(route) = actor_route.as_ref() {
+                                        let op_state = js_runtime.op_state();
+                                        let mut op_state = op_state.borrow_mut();
+                                        register_actor_request_scope(
+                                            &mut op_state,
+                                            runtime_request_id.clone(),
+                                            route.binding.clone(),
+                                            route.key.clone(),
                                         );
                                     }
                                     let execute_span = tracing::info_span!(
@@ -2324,6 +2431,23 @@ fn spawn_isolate_thread(
                                     );
                                     let _execute_guard = execute_span.enter();
                                     let started_at = Instant::now();
+                                    let dispatch_actor_call = actor_call.as_ref().map(|call| match call {
+                                        ActorExecutionCall::Fetch { binding, key } => ExecuteActorCall::Fetch {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                        },
+                                        ActorExecutionCall::Method {
+                                            binding,
+                                            key,
+                                            name,
+                                            args,
+                                        } => ExecuteActorCall::Method {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                            name: name.clone(),
+                                            args: args.clone(),
+                                        },
+                                    });
                                     if let Err(error) = dispatch_worker_request(
                                         &mut js_runtime,
                                         &runtime_request_id,
@@ -2332,6 +2456,7 @@ fn spawn_isolate_thread(
                                         &kv_bindings,
                                         &actor_bindings,
                                         has_request_body_stream,
+                                        dispatch_actor_call.as_ref(),
                                         request,
                                     ) {
                                         tracing::warn!(
@@ -2361,6 +2486,10 @@ fn spawn_isolate_thread(
                                         let mut op_state = op_state.borrow_mut();
                                         cancel_request_body_stream(&mut op_state, &runtime_request_id);
                                         clear_request_body_stream(&mut op_state, &runtime_request_id);
+                                        crate::ops::clear_actor_request_scope(
+                                            &mut op_state,
+                                            &runtime_request_id,
+                                        );
                                     }
                                     if let Err(error) =
                                         abort_worker_request(&mut js_runtime, &runtime_request_id)
@@ -2825,9 +2954,6 @@ export default {
 
     fn actor_worker() -> String {
         r#"
-let active = 0;
-let maxActive = 0;
-
 function asNumber(input, fallback = 0) {
   const parsed = Number(input);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -2854,101 +2980,132 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const key = queryParam(url.search, "key") ?? "default";
-    const actor = ctx.actor(env.MY_ACTOR, key);
-
-    if (url.pathname === "/actor/work") {
-      active += 1;
-      if (active > maxActive) {
-        maxActive = active;
-      }
-      await Deno.core.ops.op_sleep(25);
-      active -= 1;
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/actor/max") {
-      return new Response(String(maxActive));
-    }
+    const id = env.MY_ACTOR.idFromName(key);
+    const actor = env.MY_ACTOR.get(id);
 
     if (url.pathname === "/run") {
       return actor.fetch("/actor/work", { method: "POST" });
     }
 
     if (url.pathname === "/max") {
-      return actor.fetch("/actor/max");
+      return new Response(String(await actor.maxActive()));
     }
 
     if (url.pathname === "/seed") {
-      await actor.storage.put("count", "0");
+      await actor.seedCount();
       return new Response("ok");
     }
 
     if (url.pathname === "/value-roundtrip") {
-      const write = await actor.storage.put("profile", {
-        name: "alice",
-        createdAt: new Date("2026-01-02T03:04:05.000Z"),
-        flags: new Set(["a", "b"]),
-        scores: new Map([["p95", 21], ["p99", 32]]),
-        bytes: new Uint8Array([1, 2, 3, 4]),
-      });
-      if (write.conflict) {
-        return new Response("conflict", { status: 409 });
-      }
-      const loaded = await actor.storage.get("profile");
-      const value = loaded?.value;
-      const ok = Boolean(
-        value
-          && value.name === "alice"
-          && value.createdAt instanceof Date
-          && value.createdAt.toISOString() === "2026-01-02T03:04:05.000Z"
-          && value.flags instanceof Set
-          && value.flags.has("a")
-          && value.scores instanceof Map
-          && value.scores.get("p95") === 21
-          && value.bytes instanceof Uint8Array
-          && value.bytes.length === 4
-          && value.bytes[3] === 4,
-      );
+      const ok = await actor.valueRoundtrip();
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
     if (url.pathname === "/value-string-get-guard") {
-      await actor.storage.put("profile", {
-        nested: { ok: true },
-      });
-      const loaded = await actor.storage.get("profile");
-      const ok = Boolean(
-        loaded
-          && loaded.encoding === "v8sc"
-          && loaded.value
-          && loaded.value.nested
-          && loaded.value.nested.ok === true,
-      );
+      const ok = await actor.valueStringGetGuard();
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
     if (url.pathname === "/inc-cas") {
-      const current = await actor.storage.get("count");
-      const currentValue = current ? asNumber(current.value, 0) : 0;
-      const expectedVersion = current ? current.version : -1;
-      await Deno.core.ops.op_sleep(10);
-      const write = await actor.storage.put("count", String(currentValue + 1), {
-        expectedVersion,
-      });
-      if (write.conflict) {
+      const result = await actor.incCas();
+      if (result && result.conflict) {
         return new Response("conflict", { status: 409 });
       }
       return new Response("ok");
     }
 
     if (url.pathname === "/get") {
-      const current = await actor.storage.get("count");
-      return new Response(current ? String(current.value) : "0");
+      return new Response(String(await actor.getCount()));
     }
 
     return new Response("not found", { status: 404 });
   },
 };
+
+export class MyActor {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.active = 0;
+    this.max = 0;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/actor/work") {
+      this.active += 1;
+      if (this.active > this.max) {
+        this.max = this.active;
+      }
+      await Deno.core.ops.op_sleep(25);
+      this.active -= 1;
+      return new Response("ok");
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  async maxActive() {
+    return this.max;
+  }
+
+  async seedCount() {
+    await this.state.storage.put("count", "0");
+    return true;
+  }
+
+  async incCas() {
+    const current = await this.state.storage.get("count");
+    const currentValue = current ? asNumber(current.value, 0) : 0;
+    const expectedVersion = current ? current.version : -1;
+    await Deno.core.ops.op_sleep(10);
+    return this.state.storage.put("count", String(currentValue + 1), { expectedVersion });
+  }
+
+  async getCount() {
+    const current = await this.state.storage.get("count");
+    return current ? String(current.value) : "0";
+  }
+
+  async valueRoundtrip() {
+    const write = await this.state.storage.put("profile", {
+      name: "alice",
+      createdAt: new Date("2026-01-02T03:04:05.000Z"),
+      flags: new Set(["a", "b"]),
+      scores: new Map([["p95", 21], ["p99", 32]]),
+      bytes: new Uint8Array([1, 2, 3, 4]),
+    });
+    if (write.conflict) {
+      return false;
+    }
+    const loaded = await this.state.storage.get("profile");
+    const value = loaded?.value;
+    return Boolean(
+      value
+        && value.name === "alice"
+        && value.createdAt instanceof Date
+        && value.createdAt.toISOString() === "2026-01-02T03:04:05.000Z"
+        && value.flags instanceof Set
+        && value.flags.has("a")
+        && value.scores instanceof Map
+        && value.scores.get("p95") === 21
+        && value.bytes instanceof Uint8Array
+        && value.bytes.length === 4
+        && value.bytes[3] === 4,
+    );
+  }
+
+  async valueStringGetGuard() {
+    await this.state.storage.put("profile", { nested: { ok: true } });
+    const loaded = await this.state.storage.get("profile");
+    return Boolean(
+      loaded
+        && loaded.encoding === "v8sc"
+        && loaded.value
+        && loaded.value.nested
+        && loaded.value.nested.ok === true,
+    );
+  }
+}
 "#
         .to_string()
     }
@@ -3475,6 +3632,7 @@ export default {
                 DeployConfig {
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
+                        class: "MyActor".to_string(),
                     }],
                 },
             )
@@ -3532,6 +3690,7 @@ export default {
                 DeployConfig {
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
+                        class: "MyActor".to_string(),
                     }],
                 },
             )
@@ -3590,6 +3749,7 @@ export default {
                 DeployConfig {
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
+                        class: "MyActor".to_string(),
                     }],
                 },
             )

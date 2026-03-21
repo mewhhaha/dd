@@ -7,8 +7,24 @@ use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
     JsRuntime, JsRuntimeForSnapshot, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions,
 };
+use serde::Serialize;
 use std::ptr;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ExecuteActorCall {
+    Fetch {
+        binding: String,
+        key: String,
+    },
+    Method {
+        binding: String,
+        key: String,
+        name: String,
+        args: Vec<u8>,
+    },
+}
 
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
@@ -20,16 +36,23 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     Ok(Box::leak(snapshot))
 }
 
-pub async fn validate_worker(bootstrap_snapshot: &'static [u8], source: &str) -> Result<()> {
+pub async fn validate_worker(
+    bootstrap_snapshot: &'static [u8],
+    source: &str,
+    actor_classes: &[String],
+) -> Result<()> {
     let mut runtime = new_runtime(bootstrap_snapshot)?;
     evaluate_module(&mut runtime, WORKER_SPECIFIER, source, false).await?;
-    let install_code = install_worker_js();
+    let actor_classes_json = crate::json::to_string(actor_classes)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let install_code = install_worker_js(&actor_classes_json);
     evaluate_module(&mut runtime, INSTALL_SPECIFIER, &install_code, true).await
 }
 
 pub async fn build_worker_snapshot(
     bootstrap_snapshot: &'static [u8],
     source: &str,
+    actor_classes: &[String],
 ) -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: vec![runtime_extension()],
@@ -37,7 +60,9 @@ pub async fn build_worker_snapshot(
         ..Default::default()
     });
     evaluate_snapshot_module(&mut runtime, WORKER_SPECIFIER, source, false).await?;
-    let install_code = install_worker_js();
+    let actor_classes_json = crate::json::to_string(actor_classes)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let install_code = install_worker_js(&actor_classes_json);
     evaluate_snapshot_module(&mut runtime, INSTALL_SPECIFIER, &install_code, true).await?;
     let snapshot = runtime.snapshot();
     Ok(Box::leak(snapshot))
@@ -53,8 +78,9 @@ pub fn dispatch_worker_request(
     completion_token: &str,
     worker_name: &str,
     kv_bindings: &[String],
-    actor_bindings: &[String],
+    actor_bindings: &[(String, String)],
     has_request_body_stream: bool,
+    actor_call: Option<&ExecuteActorCall>,
     request: WorkerInvocation,
 ) -> Result<()> {
     let request_json = crate::json::to_string(&request)
@@ -65,6 +91,8 @@ pub fn dispatch_worker_request(
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let actor_bindings_json = crate::json::to_string(actor_bindings)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let actor_call_json = crate::json::to_string(&actor_call)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
     let request_id_json = crate::json::to_string(request_id)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let completion_token_json = crate::json::to_string(completion_token)
@@ -73,6 +101,7 @@ pub fn dispatch_worker_request(
         &worker_name_json,
         &kv_bindings_json,
         &actor_bindings_json,
+        &actor_call_json,
         &request_id_json,
         &completion_token_json,
         has_request_body_stream,
