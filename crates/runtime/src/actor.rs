@@ -1,5 +1,5 @@
 use common::{PlatformError, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +18,8 @@ pub struct ActorStore {
 
 #[derive(Debug, Clone)]
 pub struct ActorStateValue {
-    pub value: String,
+    pub value: Vec<u8>,
+    pub encoding: String,
     pub version: i64,
 }
 
@@ -62,7 +63,7 @@ impl ActorStore {
         let conn = self.connect(namespace, actor_key).await?;
         let mut rows = conn
             .query(
-                "SELECT value, version, deleted
+                "SELECT value_blob, encoding, value, version, deleted
                  FROM actor_state
                  WHERE entity_key = ?1 AND item_key = ?2",
                 (actor_key, key),
@@ -70,13 +71,20 @@ impl ActorStore {
             .await
             .map_err(actor_error)?;
         if let Some(row) = rows.next().await.map_err(actor_error)? {
-            let deleted: i64 = row.get::<i64>(2).map_err(actor_error)?;
+            let deleted: i64 = row.get::<i64>(4).map_err(actor_error)?;
             if deleted != 0 {
                 return Ok(None);
             }
-            let value: String = row.get::<String>(0).map_err(actor_error)?;
-            let version: i64 = row.get::<i64>(1).map_err(actor_error)?;
-            return Ok(Some(ActorStateValue { value, version }));
+            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(actor_error)?;
+            let encoding: String = row.get::<String>(1).map_err(actor_error)?;
+            let legacy_value: String = row.get::<String>(2).map_err(actor_error)?;
+            let version: i64 = row.get::<i64>(3).map_err(actor_error)?;
+            let value = value_blob.unwrap_or_else(|| legacy_value.into_bytes());
+            return Ok(Some(ActorStateValue {
+                value,
+                encoding: normalize_encoding(&encoding),
+                version,
+            }));
         }
         Ok(None)
     }
@@ -89,31 +97,86 @@ impl ActorStore {
         value: &str,
         expected_version: Option<i64>,
     ) -> Result<ActorWriteResult> {
+        self.put_value(
+            namespace,
+            actor_key,
+            key,
+            value.as_bytes(),
+            ENCODING_UTF8,
+            expected_version,
+        )
+        .await
+    }
+
+    pub async fn put_value(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        key: &str,
+        value: &[u8],
+        encoding: &str,
+        expected_version: Option<i64>,
+    ) -> Result<ActorWriteResult> {
+        if encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
+            return Err(PlatformError::bad_request(format!(
+                "unsupported actor storage encoding: {encoding}"
+            )));
+        }
         let conn = self.connect(namespace, actor_key).await?;
         let version = self.next_version();
         let now_ms = epoch_ms_i64()?;
+        let value_blob = value.to_vec();
+        let value_text = if encoding == ENCODING_UTF8 {
+            std::str::from_utf8(value)
+                .map_err(|error| {
+                    PlatformError::bad_request(format!("invalid utf8 value: {error}"))
+                })?
+                .to_string()
+        } else {
+            String::new()
+        };
+        let encoding = encoding.to_string();
 
         let affected = if let Some(expected_version) = expected_version {
             execute_with_retry(|| {
                 conn.execute(
                     "UPDATE actor_state
-                     SET value = ?1, deleted = 0, version = ?2, updated_at_ms = ?3
-                     WHERE entity_key = ?4 AND item_key = ?5 AND version = ?6",
-                    (value, version, now_ms, actor_key, key, expected_version),
+                     SET value = ?1, value_blob = ?2, encoding = ?3, deleted = 0, version = ?4, updated_at_ms = ?5
+                     WHERE entity_key = ?6 AND item_key = ?7 AND version = ?8",
+                    (
+                        value_text.as_str(),
+                        value_blob.as_slice(),
+                        encoding.as_str(),
+                        version,
+                        now_ms,
+                        actor_key,
+                        key,
+                        expected_version,
+                    ),
                 )
             })
             .await?
         } else {
             execute_with_retry(|| {
                 conn.execute(
-                    "INSERT INTO actor_state (entity_key, item_key, value, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, ?3, 0, ?4, ?5)
+                    "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                      ON CONFLICT(entity_key, item_key) DO UPDATE SET
                        value = excluded.value,
+                       value_blob = excluded.value_blob,
+                       encoding = excluded.encoding,
                        deleted = 0,
                        version = excluded.version,
                        updated_at_ms = excluded.updated_at_ms",
-                    (actor_key, key, value, version, now_ms),
+                    (
+                        actor_key,
+                        key,
+                        value_text.as_str(),
+                        value_blob.as_slice(),
+                        encoding.as_str(),
+                        version,
+                        now_ms,
+                    ),
                 )
             })
             .await?
@@ -146,28 +209,46 @@ impl ActorStore {
         let conn = self.connect(namespace, actor_key).await?;
         let version = self.next_version();
         let now_ms = epoch_ms_i64()?;
+        let empty_blob: &[u8] = &[];
 
         let affected = if let Some(expected_version) = expected_version {
             execute_with_retry(|| {
                 conn.execute(
                     "UPDATE actor_state
-                     SET value = '', deleted = 1, version = ?1, updated_at_ms = ?2
-                     WHERE entity_key = ?3 AND item_key = ?4 AND version = ?5",
-                    (version, now_ms, actor_key, key, expected_version),
+                     SET value = '', value_blob = ?1, encoding = ?2, deleted = 1, version = ?3, updated_at_ms = ?4
+                     WHERE entity_key = ?5 AND item_key = ?6 AND version = ?7",
+                    (
+                        empty_blob,
+                        ENCODING_UTF8,
+                        version,
+                        now_ms,
+                        actor_key,
+                        key,
+                        expected_version,
+                    ),
                 )
             })
             .await?
         } else {
             execute_with_retry(|| {
                 conn.execute(
-                    "INSERT INTO actor_state (entity_key, item_key, value, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, '', 1, ?3, ?4)
+                    "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                     VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
                      ON CONFLICT(entity_key, item_key) DO UPDATE SET
                        value = excluded.value,
+                       value_blob = excluded.value_blob,
+                       encoding = excluded.encoding,
                        deleted = 1,
                        version = excluded.version,
                        updated_at_ms = excluded.updated_at_ms",
-                    (actor_key, key, version, now_ms),
+                    (
+                        actor_key,
+                        key,
+                        empty_blob,
+                        ENCODING_UTF8,
+                        version,
+                        now_ms,
+                    ),
                 )
             })
             .await?
@@ -203,10 +284,10 @@ impl ActorStore {
             .query(
                 "SELECT item_key, value, version
                  FROM actor_state
-                 WHERE entity_key = ?1 AND deleted = 0 AND item_key LIKE ?2
+                 WHERE entity_key = ?1 AND deleted = 0 AND (encoding = ?2 OR encoding IS NULL) AND item_key LIKE ?3
                  ORDER BY item_key ASC
-                 LIMIT ?3",
-                (actor_key, pattern, limit as i64),
+                 LIMIT ?4",
+                (actor_key, ENCODING_UTF8, pattern, limit as i64),
             )
             .await
             .map_err(actor_error)?;
@@ -235,7 +316,9 @@ impl ActorStore {
         let shard = self.shard_for(actor_key);
         let db_key = format!("{namespace}:{shard}");
         if let Some(existing) = self.databases.lock().await.get(&db_key).cloned() {
-            return existing.connect().map_err(actor_error);
+            let conn = existing.connect().map_err(actor_error)?;
+            configure_connection(&conn).await?;
+            return Ok(conn);
         }
 
         let path = self.db_path(namespace, shard);
@@ -306,6 +389,8 @@ async fn ensure_schema(database: &Database) -> Result<()> {
           entity_key TEXT NOT NULL,
           item_key TEXT NOT NULL,
           value TEXT NOT NULL,
+          value_blob BLOB,
+          encoding TEXT NOT NULL DEFAULT 'utf8',
           deleted INTEGER NOT NULL DEFAULT 0,
           version INTEGER NOT NULL,
           updated_at_ms INTEGER NOT NULL,
@@ -315,6 +400,7 @@ async fn ensure_schema(database: &Database) -> Result<()> {
     )
     .await
     .map_err(actor_error)?;
+    ensure_compat_columns(&conn).await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_actor_state_lookup
          ON actor_state(entity_key, item_key)",
@@ -333,9 +419,35 @@ async fn ensure_schema(database: &Database) -> Result<()> {
 }
 
 async fn configure_connection(conn: &Connection) -> Result<()> {
-    conn.execute("PRAGMA busy_timeout = 5000", ())
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(actor_error)?;
+    Ok(())
+}
+
+async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
+    let mut rows = conn
+        .query("PRAGMA table_info(actor_state)", ())
         .await
         .map_err(actor_error)?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(actor_error)? {
+        let name: String = row.get::<String>(1).map_err(actor_error)?;
+        columns.insert(name);
+    }
+
+    if !columns.contains("value_blob") {
+        conn.execute("ALTER TABLE actor_state ADD COLUMN value_blob BLOB", ())
+            .await
+            .map_err(actor_error)?;
+    }
+    if !columns.contains("encoding") {
+        conn.execute(
+            "ALTER TABLE actor_state ADD COLUMN encoding TEXT NOT NULL DEFAULT 'utf8'",
+            (),
+        )
+        .await
+        .map_err(actor_error)?;
+    }
     Ok(())
 }
 
@@ -353,7 +465,8 @@ where
                 attempt += 1;
                 let message = error.to_string().to_ascii_lowercase();
                 let is_locked = message.contains("database is locked")
-                    || message.contains("database table is locked");
+                    || message.contains("database table is locked")
+                    || message.contains("database is busy");
                 if is_locked && attempt < MAX_ATTEMPTS {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
@@ -407,3 +520,14 @@ fn hex_encode(bytes: &[u8]) -> String {
         out
     }
 }
+
+fn normalize_encoding(raw: &str) -> String {
+    match raw {
+        ENCODING_UTF8 => ENCODING_UTF8.to_string(),
+        ENCODING_V8SC => ENCODING_V8SC.to_string(),
+        _ => ENCODING_UTF8.to_string(),
+    }
+}
+
+const ENCODING_UTF8: &str = "utf8";
+const ENCODING_V8SC: &str = "v8sc";

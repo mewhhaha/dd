@@ -1,10 +1,14 @@
 use common::{PlatformError, Result};
+use std::collections::HashSet;
 use std::env;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::{Builder, Connection, Database};
+
+const ENCODING_UTF8: &str = "utf8";
+const ENCODING_V8SC: &str = "v8sc";
 
 #[derive(Clone)]
 pub struct KvStore {
@@ -13,9 +17,16 @@ pub struct KvStore {
 }
 
 #[derive(Debug, Clone)]
+pub struct KvValue {
+    pub value: Vec<u8>,
+    pub encoding: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct KvEntry {
     pub key: String,
-    pub value: String,
+    pub value: Vec<u8>,
+    pub encoding: String,
 }
 
 impl KvStore {
@@ -41,22 +52,35 @@ impl KvStore {
         Ok(store)
     }
 
-    pub async fn get(&self, worker_name: &str, binding: &str, key: &str) -> Result<Option<String>> {
+    pub async fn get(
+        &self,
+        worker_name: &str,
+        binding: &str,
+        key: &str,
+    ) -> Result<Option<KvValue>> {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT value, deleted FROM worker_kv WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
+                "SELECT value_blob, encoding, value, deleted
+                 FROM worker_kv
+                 WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
                 (worker_name, binding, key),
             )
             .await
             .map_err(kv_error)?;
         if let Some(row) = rows.next().await.map_err(kv_error)? {
-            let deleted: i64 = row.get::<i64>(1).map_err(kv_error)?;
+            let deleted: i64 = row.get::<i64>(3).map_err(kv_error)?;
             if deleted != 0 {
                 return Ok(None);
             }
-            let value: String = row.get::<String>(0).map_err(kv_error)?;
-            return Ok(Some(value));
+            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(kv_error)?;
+            let encoding: String = row.get::<String>(1).map_err(kv_error)?;
+            let legacy_value: String = row.get::<String>(2).map_err(kv_error)?;
+            let value = value_blob.unwrap_or_else(|| legacy_value.into_bytes());
+            return Ok(Some(KvValue {
+                value,
+                encoding: normalize_encoding(&encoding),
+            }));
         }
         Ok(None)
     }
@@ -68,22 +92,63 @@ impl KvStore {
         key: &str,
         value: &str,
     ) -> Result<()> {
+        self.set_value(worker_name, binding, key, value.as_bytes(), ENCODING_UTF8)
+            .await
+    }
+
+    pub async fn set_value(
+        &self,
+        worker_name: &str,
+        binding: &str,
+        key: &str,
+        value: &[u8],
+        encoding: &str,
+    ) -> Result<()> {
+        if encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
+            return Err(PlatformError::bad_request(format!(
+                "unsupported kv encoding: {encoding}"
+            )));
+        }
+
         let conn = self.connect().await?;
         const MAX_VERSION_RETRIES: usize = 8;
+        let value_blob = value.to_vec();
+        let value_text = if encoding == ENCODING_UTF8 {
+            std::str::from_utf8(value)
+                .map_err(|error| {
+                    PlatformError::bad_request(format!("invalid utf8 value: {error}"))
+                })?
+                .to_string()
+        } else {
+            String::new()
+        };
+        let encoding = encoding.to_string();
+
         for _ in 0..MAX_VERSION_RETRIES {
             let version = self.next_version();
             let now_ms = epoch_ms_i64()?;
             let affected = execute_with_retry(|| {
                 conn.execute(
-                    "INSERT INTO worker_kv (worker_name, binding, key, value, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+                    "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)
                      ON CONFLICT(worker_name, binding, key) DO UPDATE SET
                        value = excluded.value,
+                       value_blob = excluded.value_blob,
+                       encoding = excluded.encoding,
                        deleted = 0,
                        version = excluded.version,
                        updated_at_ms = excluded.updated_at_ms
                      WHERE excluded.version > worker_kv.version",
-                    (worker_name, binding, key, value, version, now_ms),
+                    (
+                        worker_name,
+                        binding,
+                        key,
+                        value_text.as_str(),
+                        value_blob.as_slice(),
+                        encoding.as_str(),
+                        version,
+                        now_ms,
+                    ),
                 )
             })
             .await?;
@@ -103,17 +168,28 @@ impl KvStore {
         for _ in 0..MAX_VERSION_RETRIES {
             let version = self.next_version();
             let now_ms = epoch_ms_i64()?;
+            let empty_blob: &[u8] = &[];
             let affected = execute_with_retry(|| {
                 conn.execute(
-                    "INSERT INTO worker_kv (worker_name, binding, key, value, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, ?3, '', 1, ?4, ?5)
+                    "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                     VALUES (?1, ?2, ?3, '', ?4, ?5, 1, ?6, ?7)
                      ON CONFLICT(worker_name, binding, key) DO UPDATE SET
                        value = excluded.value,
+                       value_blob = excluded.value_blob,
+                       encoding = excluded.encoding,
                        deleted = 1,
                        version = excluded.version,
                        updated_at_ms = excluded.updated_at_ms
                      WHERE excluded.version > worker_kv.version",
-                    (worker_name, binding, key, version, now_ms),
+                    (
+                        worker_name,
+                        binding,
+                        key,
+                        empty_blob,
+                        ENCODING_UTF8,
+                        version,
+                        now_ms,
+                    ),
                 )
             })
             .await?;
@@ -138,7 +214,8 @@ impl KvStore {
         let pattern = format!("{prefix}%");
         let mut rows = conn
             .query(
-                "SELECT key, value FROM worker_kv
+                "SELECT key, value_blob, encoding, value
+                 FROM worker_kv
                  WHERE worker_name = ?1 AND binding = ?2 AND deleted = 0 AND key LIKE ?3
                  ORDER BY key ASC
                  LIMIT ?4",
@@ -150,8 +227,14 @@ impl KvStore {
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(kv_error)? {
             let key: String = row.get::<String>(0).map_err(kv_error)?;
-            let value: String = row.get::<String>(1).map_err(kv_error)?;
-            out.push(KvEntry { key, value });
+            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(1).map_err(kv_error)?;
+            let encoding: String = row.get::<String>(2).map_err(kv_error)?;
+            let legacy_value: String = row.get::<String>(3).map_err(kv_error)?;
+            out.push(KvEntry {
+                key,
+                value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
+                encoding: normalize_encoding(&encoding),
+            });
         }
         Ok(out)
     }
@@ -170,6 +253,8 @@ impl KvStore {
               binding TEXT NOT NULL,
               key TEXT NOT NULL,
               value TEXT NOT NULL,
+              value_blob BLOB,
+              encoding TEXT NOT NULL DEFAULT 'utf8',
               deleted INTEGER NOT NULL DEFAULT 0,
               version INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL,
@@ -179,6 +264,7 @@ impl KvStore {
         )
         .await
         .map_err(kv_error)?;
+        ensure_compat_columns(&conn).await?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_worker_kv_lookup ON worker_kv(worker_name, binding, key)",
             (),
@@ -242,6 +328,14 @@ impl KvStore {
     }
 }
 
+fn normalize_encoding(raw: &str) -> String {
+    match raw {
+        ENCODING_UTF8 => ENCODING_UTF8.to_string(),
+        ENCODING_V8SC => ENCODING_V8SC.to_string(),
+        _ => ENCODING_UTF8.to_string(),
+    }
+}
+
 fn epoch_ms_i64() -> Result<i64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -256,6 +350,33 @@ fn kv_error(error: impl std::fmt::Display) -> PlatformError {
 async fn configure_connection(conn: &Connection) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_millis(5000))
         .map_err(kv_error)?;
+    Ok(())
+}
+
+async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
+    let mut rows = conn
+        .query("PRAGMA table_info(worker_kv)", ())
+        .await
+        .map_err(kv_error)?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(kv_error)? {
+        let name: String = row.get::<String>(1).map_err(kv_error)?;
+        columns.insert(name);
+    }
+
+    if !columns.contains("value_blob") {
+        conn.execute("ALTER TABLE worker_kv ADD COLUMN value_blob BLOB", ())
+            .await
+            .map_err(kv_error)?;
+    }
+    if !columns.contains("encoding") {
+        conn.execute(
+            "ALTER TABLE worker_kv ADD COLUMN encoding TEXT NOT NULL DEFAULT 'utf8'",
+            (),
+        )
+        .await
+        .map_err(kv_error)?;
+    }
     Ok(())
 }
 
@@ -322,6 +443,11 @@ mod tests {
         std::env::temp_dir().join(format!("dd-kv-{name}-{}.db", Uuid::new_v4()))
     }
 
+    fn decode_utf8(value: KvValue) -> String {
+        assert_eq!(value.encoding, ENCODING_UTF8);
+        String::from_utf8(value.value).expect("utf8")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_set_writes_succeed() -> Result<()> {
         let path = temp_db_path("concurrent-set");
@@ -360,7 +486,7 @@ mod tests {
         let restored = test_store(&path).await?;
         restored.set("worker-a", "MY_KV", "k", "v3").await?;
         let value = restored.get("worker-a", "MY_KV", "k").await?;
-        assert_eq!(value, Some("v3".to_string()));
+        assert_eq!(value.map(decode_utf8), Some("v3".to_string()));
         Ok(())
     }
 
@@ -394,6 +520,23 @@ mod tests {
             value.is_some(),
             "key should be present after multi-store contention"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_value_roundtrips_structured_payload() -> Result<()> {
+        let path = temp_db_path("typed-roundtrip");
+        let store = test_store(&path).await?;
+        let payload = vec![1u8, 7, 9, 11];
+        store
+            .set_value("worker-a", "MY_KV", "typed", &payload, ENCODING_V8SC)
+            .await?;
+        let value = store
+            .get("worker-a", "MY_KV", "typed")
+            .await?
+            .expect("typed value should exist");
+        assert_eq!(value.encoding, ENCODING_V8SC);
+        assert_eq!(value.value, payload);
         Ok(())
     }
 }

@@ -80,7 +80,10 @@ Current baseline results are in `BENCHMARKS.md`.
 - up to 4 inflight requests per isolate by default
 - actor routing is opt-in; by default workers stay pooled
 - same actor key can run with multiple in-flight requests on its owner isolate
+- KV `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
 - actor storage writes should use CAS (`expectedVersion`) to avoid lost updates
+- actor storage `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
+- structured values use V8 storage serialization (`forStorage: true`) and reject unsupported host/function types
 - actor storage uses namespace shards (default 64 shards per namespace)
 - dropped invokes are canceled and signaled via `ctx.signal`
 - cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure

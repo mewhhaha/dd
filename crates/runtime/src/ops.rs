@@ -75,7 +75,8 @@ struct TimeBoundary {
 #[derive(Debug, Serialize)]
 struct KvListItem {
     key: String,
-    value: String,
+    value: Vec<u8>,
+    encoding: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +85,31 @@ struct KvGetResult {
     found: bool,
     value: String,
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KvGetValuePayload {
+    worker_name: String,
+    binding: String,
+    key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KvGetValueResult {
+    ok: bool,
+    found: bool,
+    value: Vec<u8>,
+    encoding: String,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KvSetValuePayload {
+    worker_name: String,
+    binding: String,
+    key: String,
+    encoding: String,
+    value: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,6 +210,33 @@ struct ActorStateGetResult {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ActorStateGetValuePayload {
+    namespace: String,
+    actor_key: String,
+    key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateGetValueResult {
+    ok: bool,
+    found: bool,
+    value: Vec<u8>,
+    encoding: String,
+    version: i64,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateSetValuePayload {
+    namespace: String,
+    actor_key: String,
+    key: String,
+    encoding: String,
+    value: Vec<u8>,
+    expected_version: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct ActorStateWriteResult {
     ok: bool,
@@ -235,12 +288,31 @@ async fn op_kv_get(
 ) -> KvGetResult {
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.get(&worker_name, &binding, &key).await {
-        Ok(Some(value)) => KvGetResult {
-            ok: true,
-            found: true,
-            value,
-            error: String::new(),
-        },
+        Ok(Some(value)) => {
+            if value.encoding != "utf8" {
+                return KvGetResult {
+                    ok: false,
+                    found: true,
+                    value: String::new(),
+                    error: "kv value is encoded as v8sc; use env.KV.get() for JS value decoding"
+                        .to_string(),
+                };
+            }
+            match String::from_utf8(value.value) {
+                Ok(decoded) => KvGetResult {
+                    ok: true,
+                    found: true,
+                    value: decoded,
+                    error: String::new(),
+                },
+                Err(error) => KvGetResult {
+                    ok: false,
+                    found: true,
+                    value: String::new(),
+                    error: format!("kv utf8 decode failed: {error}"),
+                },
+            }
+        }
         Ok(None) => KvGetResult {
             ok: true,
             found: false,
@@ -258,6 +330,53 @@ async fn op_kv_get(
 
 #[deno_core::op2]
 #[serde]
+async fn op_kv_get_value(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> KvGetValueResult {
+    let payload: KvGetValuePayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return KvGetValueResult {
+                ok: false,
+                found: false,
+                value: Vec::new(),
+                encoding: "utf8".to_string(),
+                error: format!("invalid kv get payload: {error}"),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<KvStore>().clone();
+    match store
+        .get(&payload.worker_name, &payload.binding, &payload.key)
+        .await
+    {
+        Ok(Some(value)) => KvGetValueResult {
+            ok: true,
+            found: true,
+            value: value.value,
+            encoding: value.encoding,
+            error: String::new(),
+        },
+        Ok(None) => KvGetValueResult {
+            ok: true,
+            found: false,
+            value: Vec::new(),
+            encoding: "utf8".to_string(),
+            error: String::new(),
+        },
+        Err(error) => KvGetValueResult {
+            ok: false,
+            found: false,
+            value: Vec::new(),
+            encoding: "utf8".to_string(),
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
 async fn op_kv_set(
     state: Rc<RefCell<OpState>>,
     #[string] worker_name: String,
@@ -267,6 +386,40 @@ async fn op_kv_set(
 ) -> KvOpResult {
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.set(&worker_name, &binding, &key, &value).await {
+        Ok(()) => KvOpResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => KvOpResult {
+            ok: false,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_kv_set_value(state: Rc<RefCell<OpState>>, #[string] payload: String) -> KvOpResult {
+    let payload: KvSetValuePayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return KvOpResult {
+                ok: false,
+                error: format!("invalid kv set payload: {error}"),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<KvStore>().clone();
+    match store
+        .set_value(
+            &payload.worker_name,
+            &payload.binding,
+            &payload.key,
+            &payload.value,
+            &payload.encoding,
+        )
+        .await
+    {
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
@@ -661,13 +814,34 @@ async fn op_actor_state_get(
 ) -> ActorStateGetResult {
     let store = state.borrow().borrow::<ActorStore>().clone();
     match store.get(&namespace, &actor_key, &key).await {
-        Ok(Some(value)) => ActorStateGetResult {
-            ok: true,
-            found: true,
-            value: value.value,
-            version: value.version,
-            error: String::new(),
-        },
+        Ok(Some(value)) => {
+            if value.encoding != "utf8" {
+                return ActorStateGetResult {
+                    ok: false,
+                    found: true,
+                    value: String::new(),
+                    version: value.version,
+                    error: "actor storage value is encoded as v8sc; use actor.storage.getValue()"
+                        .to_string(),
+                };
+            }
+            match String::from_utf8(value.value) {
+                Ok(decoded) => ActorStateGetResult {
+                    ok: true,
+                    found: true,
+                    value: decoded,
+                    version: value.version,
+                    error: String::new(),
+                },
+                Err(error) => ActorStateGetResult {
+                    ok: false,
+                    found: true,
+                    value: String::new(),
+                    version: value.version,
+                    error: format!("actor storage utf8 decode failed: {error}"),
+                },
+            }
+        }
         Ok(None) => ActorStateGetResult {
             ok: true,
             found: false,
@@ -679,6 +853,58 @@ async fn op_actor_state_get(
             ok: false,
             found: false,
             value: String::new(),
+            version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_get_value(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> ActorStateGetValueResult {
+    let payload: ActorStateGetValuePayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorStateGetValueResult {
+                ok: false,
+                found: false,
+                value: Vec::new(),
+                encoding: "utf8".to_string(),
+                version: -1,
+                error: format!("invalid actor state get value payload: {error}"),
+            };
+        }
+    };
+
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .get(&payload.namespace, &payload.actor_key, &payload.key)
+        .await
+    {
+        Ok(Some(value)) => ActorStateGetValueResult {
+            ok: true,
+            found: true,
+            value: value.value,
+            encoding: value.encoding,
+            version: value.version,
+            error: String::new(),
+        },
+        Ok(None) => ActorStateGetValueResult {
+            ok: true,
+            found: false,
+            value: Vec::new(),
+            encoding: "utf8".to_string(),
+            version: -1,
+            error: String::new(),
+        },
+        Err(error) => ActorStateGetValueResult {
+            ok: false,
+            found: false,
+            value: Vec::new(),
+            encoding: "utf8".to_string(),
             version: -1,
             error: error.to_string(),
         },
@@ -703,6 +929,55 @@ async fn op_actor_state_set(
     let store = state.borrow().borrow::<ActorStore>().clone();
     match store
         .put(&namespace, &actor_key, &key, &value, expected_version)
+        .await
+    {
+        Ok(result) => ActorStateWriteResult {
+            ok: true,
+            conflict: result.conflict,
+            version: result.version,
+            error: String::new(),
+        },
+        Err(error) => ActorStateWriteResult {
+            ok: false,
+            conflict: false,
+            version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_set_value(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> ActorStateWriteResult {
+    let payload: ActorStateSetValuePayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorStateWriteResult {
+                ok: false,
+                conflict: false,
+                version: -1,
+                error: format!("invalid actor state set value payload: {error}"),
+            };
+        }
+    };
+    let expected_version = if payload.expected_version < 0 {
+        None
+    } else {
+        Some(payload.expected_version)
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .put_value(
+            &payload.namespace,
+            &payload.actor_key,
+            &payload.key,
+            &payload.value,
+            &payload.encoding,
+            expected_version,
+        )
         .await
     {
         Ok(result) => ActorStateWriteResult {
@@ -828,7 +1103,9 @@ deno_core::extension!(
         op_sleep,
         op_time_boundary_now,
         op_kv_get,
+        op_kv_get_value,
         op_kv_set,
+        op_kv_set_value,
         op_kv_delete,
         op_kv_list,
         op_cache_match,
@@ -838,7 +1115,9 @@ deno_core::extension!(
         op_request_body_cancel,
         op_actor_invoke,
         op_actor_state_get,
+        op_actor_state_get_value,
         op_actor_state_set,
+        op_actor_state_set_value,
         op_actor_state_delete,
         op_actor_state_list,
         op_emit_completion,
@@ -909,6 +1188,7 @@ fn to_list_item(entry: KvEntry) -> KvListItem {
     KvListItem {
         key: entry.key,
         value: entry.value,
+        encoding: entry.encoding,
     }
 }
 

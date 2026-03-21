@@ -2864,6 +2864,50 @@ export default {
       return new Response("ok");
     }
 
+    if (url.pathname === "/value-roundtrip") {
+      const write = await actor.storage.put("profile", {
+        name: "alice",
+        createdAt: new Date("2026-01-02T03:04:05.000Z"),
+        flags: new Set(["a", "b"]),
+        scores: new Map([["p95", 21], ["p99", 32]]),
+        bytes: new Uint8Array([1, 2, 3, 4]),
+      });
+      if (write.conflict) {
+        return new Response("conflict", { status: 409 });
+      }
+      const loaded = await actor.storage.get("profile");
+      const value = loaded?.value;
+      const ok = Boolean(
+        value
+          && value.name === "alice"
+          && value.createdAt instanceof Date
+          && value.createdAt.toISOString() === "2026-01-02T03:04:05.000Z"
+          && value.flags instanceof Set
+          && value.flags.has("a")
+          && value.scores instanceof Map
+          && value.scores.get("p95") === 21
+          && value.bytes instanceof Uint8Array
+          && value.bytes.length === 4
+          && value.bytes[3] === 4,
+      );
+      return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
+    }
+
+    if (url.pathname === "/value-string-get-guard") {
+      await actor.storage.put("profile", {
+        nested: { ok: true },
+      });
+      const loaded = await actor.storage.get("profile");
+      const ok = Boolean(
+        loaded
+          && loaded.encoding === "v8sc"
+          && loaded.value
+          && loaded.value.nested
+          && loaded.value.nested.ok === true,
+      );
+      return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
+    }
+
     if (url.pathname === "/inc-cas") {
       const current = await actor.storage.get("count");
       const currentValue = current ? asNumber(current.value, 0) : 0;
@@ -3504,6 +3548,54 @@ export default {
         }
 
         assert!(conflicts > 0, "expected at least one CAS conflict");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_storage_structured_value_roundtrip_works() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let roundtrip = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/value-roundtrip?key=user-4", "value-roundtrip"),
+            )
+            .await
+            .expect("roundtrip invoke should succeed");
+        assert_eq!(roundtrip.status, 200);
+        assert_eq!(String::from_utf8(roundtrip.body).expect("utf8"), "ok");
+
+        let guard = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/value-string-get-guard?key=user-5", "value-guard"),
+            )
+            .await
+            .expect("guard invoke should succeed");
+        assert_eq!(guard.status, 200);
+        assert_eq!(String::from_utf8(guard.body).expect("utf8"), "ok");
     }
 
     #[tokio::test]

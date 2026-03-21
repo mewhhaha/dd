@@ -46,6 +46,22 @@ export default {
       return response;
     }
 
+    if (url.pathname === "/profile" && request.method === "POST") {
+      const key = userKey(url);
+      const actor = ctx.actor(env.USER_ACTOR, key);
+      const response = await actor.fetch(`/actor/profile?user=${encodeURIComponent(key)}`, {
+        method: "POST",
+      });
+      return response;
+    }
+
+    if (url.pathname === "/profile" && request.method === "GET") {
+      const key = userKey(url);
+      const actor = ctx.actor(env.USER_ACTOR, key);
+      const response = await actor.fetch(`/actor/profile?user=${encodeURIComponent(key)}`);
+      return response;
+    }
+
     if (url.pathname === "/actor/inc" && request.method === "POST") {
       const key = userKey(url);
       const actor = ctx.actor(env.USER_ACTOR, key);
@@ -70,6 +86,34 @@ export default {
         user: key,
         value: current ? Number(current.value) || 0 : 0,
         version: current ? current.version : -1,
+      });
+    }
+
+    if (url.pathname === "/actor/profile" && request.method === "POST") {
+      const key = userKey(url);
+      const actor = ctx.actor(env.USER_ACTOR, key);
+      const write = await actor.storage.put("profile", {
+        user: key,
+        createdAt: new Date("2026-01-02T03:04:05.000Z"),
+        flags: new Set(["paid", "beta"]),
+        prefs: new Map([["theme", "light"]]),
+      });
+      if (write.conflict) {
+        return json({ ok: false, error: "conflict", version: write.version }, 409);
+      }
+      return json({ ok: true, user: key, version: write.version });
+    }
+
+    if (url.pathname === "/actor/profile" && request.method === "GET") {
+      const key = userKey(url);
+      const actor = ctx.actor(env.USER_ACTOR, key);
+      const current = await actor.storage.get("profile");
+      return json({
+        ok: true,
+        user: key,
+        value: current ? current.value : null,
+        version: current ? current.version : -1,
+        encoding: current ? current.encoding : "utf8",
       });
     }
 

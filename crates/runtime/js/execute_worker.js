@@ -154,32 +154,73 @@
     };
   };
 
+  const decodeStoredValue = (encoding, rawValue, context) => {
+    const bytes = new Uint8Array(Array.isArray(rawValue) ? rawValue : []);
+    if (encoding === "utf8") {
+      return Deno.core.decode(bytes);
+    }
+    if (encoding === "v8sc") {
+      try {
+        return Deno.core.deserialize(bytes, { forStorage: true });
+      } catch (error) {
+        throw new Error(`${context} deserialize failed: ${String(error?.message ?? error)}`);
+      }
+    }
+    throw new Error(`${context} unsupported encoding: ${encoding}`);
+  };
+
   const createKvBinding = (bindingName) => ({
     async get(key, options = {}) {
       const _ = options;
-      const value = await callOp(
-        "op_kv_get",
-        workerName,
-        bindingName,
-        String(key),
+      const result = await callOp(
+        "op_kv_get_value",
+        JSON.stringify({
+          worker_name: workerName,
+          binding: bindingName,
+          key: String(key),
+        }),
       );
       await syncFrozenTime();
-      if (value && typeof value === "object" && value.ok === false) {
-        throw new Error(String(value.error ?? "kv get failed"));
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "kv get failed"));
       }
-      if (value && typeof value === "object" && value.found === true) {
-        return String(value.value ?? "");
+      if (result?.found !== true) {
+        return null;
       }
-      return null;
+      const encoding = String(result.encoding ?? "utf8");
+      return decodeStoredValue(encoding, result.value, "kv get");
     },
     async set(key, value, options = {}) {
       const _ = options;
+      if (typeof value === "string") {
+        const result = await callOp(
+          "op_kv_set",
+          workerName,
+          bindingName,
+          String(key),
+          value,
+        );
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "kv set failed"));
+        }
+        return;
+      }
+      let encoded;
+      try {
+        encoded = Deno.core.serialize(value, { forStorage: true });
+      } catch (error) {
+        throw new Error(`kv set serialize failed: ${String(error?.message ?? error)}`);
+      }
       const result = await callOp(
-        "op_kv_set",
-        workerName,
-        bindingName,
-        String(key),
-        String(value),
+        "op_kv_set_value",
+        JSON.stringify({
+          worker_name: workerName,
+          binding: bindingName,
+          key: String(key),
+          encoding: "v8sc",
+          value: Array.from(new Uint8Array(encoded)),
+        }),
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
@@ -216,8 +257,15 @@
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String(result.error ?? "kv list failed"));
       }
-      const entries = result?.entries;
-      return Array.isArray(entries) ? entries : [];
+      const entries = Array.isArray(result?.entries) ? result.entries : [];
+      return entries.map((entry) => {
+        const encoding = String(entry?.encoding ?? "utf8");
+        return {
+          key: String(entry?.key ?? ""),
+          value: decodeStoredValue(encoding, entry?.value, "kv list"),
+          encoding,
+        };
+      });
     },
   });
 
@@ -276,10 +324,12 @@
   const createActorStorageBinding = (namespace, actorKey) => ({
     async get(key) {
       const result = await callOp(
-        "op_actor_state_get",
-        namespace,
-        actorKey,
-        String(key),
+        "op_actor_state_get_value",
+        JSON.stringify({
+          namespace,
+          actor_key: actorKey,
+          key: String(key),
+        }),
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
@@ -288,23 +338,70 @@
       if (result?.found !== true) {
         return null;
       }
-      return {
-        value: String(result.value ?? ""),
-        version: Number(result.version ?? -1),
-      };
+      const encoding = String(result.encoding ?? "utf8");
+      const bytes = new Uint8Array(Array.isArray(result.value) ? result.value : []);
+      if (encoding === "utf8") {
+        return {
+          value: Deno.core.decode(bytes),
+          version: Number(result.version ?? -1),
+          encoding,
+        };
+      }
+      if (encoding === "v8sc") {
+        try {
+          const decoded = Deno.core.deserialize(bytes, { forStorage: true });
+          return {
+            value: decoded,
+            version: Number(result.version ?? -1),
+            encoding,
+          };
+        } catch (error) {
+          throw new Error(`actor storage get deserialize failed: ${String(error?.message ?? error)}`);
+        }
+      }
+      throw new Error(`actor storage get unsupported encoding: ${encoding}`);
     },
     async put(key, value, options = {}) {
       const expectedInput = options?.expectedVersion;
       const expectedVersion = Number.isFinite(Number(expectedInput))
         ? Math.trunc(Number(expectedInput))
         : -1;
+      if (typeof value === "string") {
+        const result = await callOp(
+          "op_actor_state_set",
+          namespace,
+          actorKey,
+          String(key),
+          value,
+          expectedVersion,
+        );
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "actor storage put failed"));
+        }
+        return {
+          ok: true,
+          conflict: result?.conflict === true,
+          version: Number(result?.version ?? -1),
+        };
+      }
+      let encoded;
+      try {
+        encoded = Deno.core.serialize(value, { forStorage: true });
+      } catch (error) {
+        throw new Error(`actor storage put serialize failed: ${String(error?.message ?? error)}`);
+      }
+      const bytes = Array.from(new Uint8Array(encoded));
       const result = await callOp(
-        "op_actor_state_set",
-        namespace,
-        actorKey,
-        String(key),
-        String(value),
-        expectedVersion,
+        "op_actor_state_set_value",
+        JSON.stringify({
+          namespace,
+          actor_key: actorKey,
+          key: String(key),
+          encoding: "v8sc",
+          value: bytes,
+          expected_version: expectedVersion,
+        }),
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
