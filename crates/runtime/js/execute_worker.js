@@ -3,6 +3,7 @@
   const completionToken = __COMPLETION_TOKEN__;
   const workerName = __WORKER_NAME__;
   const kvBindingsConfig = __KV_BINDINGS_JSON__;
+  const actorBindingsConfig = __ACTOR_BINDINGS_JSON__;
   const hasRequestBodyStream = __HAS_REQUEST_BODY_STREAM__;
   const worker = globalThis.__dd_worker;
 
@@ -15,6 +16,7 @@
   const controller = new AbortController();
   const waitUntilPromises = [];
   let waitUntilDoneSent = false;
+  let actorInvokeSeq = 0;
 
   inflightRequests.set(requestId, controller);
 
@@ -219,15 +221,182 @@
     },
   });
 
+  const toHeaderEntries = (headersInput) => {
+    if (!headersInput) {
+      return [];
+    }
+    try {
+      return Array.from(new Headers(headersInput).entries());
+    } catch {
+      return [];
+    }
+  };
+
+  const normalizeActorFetchInput = async (inputValue, initValue) => {
+    let method = "GET";
+    let url = "http://worker/";
+    let headers = [];
+    let body = new Uint8Array();
+
+    if (inputValue instanceof Request) {
+      method = String(inputValue.method || "GET").toUpperCase();
+      url = String(inputValue.url || "http://worker/");
+      headers = Array.from(inputValue.headers.entries());
+      body = new Uint8Array(await inputValue.arrayBuffer());
+    } else {
+      method = String(initValue?.method ?? "GET").toUpperCase();
+      const raw = String(inputValue ?? "/");
+      url = raw.startsWith("http://") || raw.startsWith("https://")
+        ? raw
+        : new URL(raw, "http://worker").toString();
+      headers = toHeaderEntries(initValue?.headers);
+      body = toUtf8Bytes(initValue?.body);
+    }
+
+    if (inputValue instanceof Request && initValue) {
+      if (initValue.method != null) {
+        method = String(initValue.method).toUpperCase();
+      }
+      if (initValue.headers != null) {
+        headers = toHeaderEntries(initValue.headers);
+      }
+      if (Object.prototype.hasOwnProperty.call(initValue, "body")) {
+        body = toUtf8Bytes(initValue.body);
+      }
+    }
+
+    return {
+      method,
+      url,
+      headers,
+      body,
+    };
+  };
+
+  const createActorStorageBinding = (namespace, actorKey) => ({
+    async get(key) {
+      const result = await callOp(
+        "op_actor_state_get",
+        namespace,
+        actorKey,
+        String(key),
+      );
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "actor storage get failed"));
+      }
+      if (result?.found !== true) {
+        return null;
+      }
+      return {
+        value: String(result.value ?? ""),
+        version: Number(result.version ?? -1),
+      };
+    },
+    async put(key, value, options = {}) {
+      const expectedInput = options?.expectedVersion;
+      const expectedVersion = Number.isFinite(Number(expectedInput))
+        ? Math.trunc(Number(expectedInput))
+        : -1;
+      const result = await callOp(
+        "op_actor_state_set",
+        namespace,
+        actorKey,
+        String(key),
+        String(value),
+        expectedVersion,
+      );
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "actor storage put failed"));
+      }
+      return {
+        ok: true,
+        conflict: result?.conflict === true,
+        version: Number(result?.version ?? -1),
+      };
+    },
+    async delete(key, options = {}) {
+      const expectedInput = options?.expectedVersion;
+      const expectedVersion = Number.isFinite(Number(expectedInput))
+        ? Math.trunc(Number(expectedInput))
+        : -1;
+      const result = await callOp(
+        "op_actor_state_delete",
+        namespace,
+        actorKey,
+        String(key),
+        expectedVersion,
+      );
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "actor storage delete failed"));
+      }
+      return {
+        ok: true,
+        conflict: result?.conflict === true,
+        version: Number(result?.version ?? -1),
+      };
+    },
+    async list(options = {}) {
+      const prefix = String(options?.prefix ?? "");
+      const limitInput = Number(options?.limit ?? 100);
+      const limit = Number.isFinite(limitInput)
+        ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
+        : 100;
+      const result = await callOp(
+        "op_actor_state_list",
+        namespace,
+        actorKey,
+        prefix,
+        limit,
+      );
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "actor storage list failed"));
+      }
+      return Array.isArray(result?.entries) ? result.entries : [];
+    },
+  });
+
+  const createActorBinding = (namespace, actorKey) => ({
+    storage: createActorStorageBinding(namespace, actorKey),
+    async fetch(inputValue, initValue = undefined) {
+      const request = await normalizeActorFetchInput(inputValue, initValue);
+      actorInvokeSeq += 1;
+      const result = await callOp(
+        "op_actor_invoke",
+        JSON.stringify({
+          worker_name: workerName,
+          binding: namespace,
+          key: actorKey,
+          method: request.method,
+          url: request.url,
+          headers: request.headers,
+          body: Array.from(request.body),
+          request_id: `${requestId}:actor:${actorInvokeSeq}`,
+        }),
+      );
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "actor invoke failed"));
+      }
+      return new Response(new Uint8Array(Array.isArray(result.body) ? result.body : []), {
+        status: Number(result.status ?? 200),
+        headers: Array.isArray(result.headers) ? result.headers : [],
+      });
+    },
+  });
+
   const buildEnv = () => {
     const env = {};
-    const bindings = Array.isArray(kvBindingsConfig)
+    const kvBindings = Array.isArray(kvBindingsConfig)
       ? kvBindingsConfig
       : kvBindingsConfig && typeof kvBindingsConfig === "object"
         ? Object.entries(kvBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
         : [];
 
-    for (const binding of bindings) {
+    for (const binding of kvBindings) {
       const [envName, bindingName] = Array.isArray(binding)
         ? binding
         : [binding, binding];
@@ -242,7 +411,32 @@
       });
     }
 
-    return env;
+    const actorBindings = Array.isArray(actorBindingsConfig)
+      ? actorBindingsConfig
+      : actorBindingsConfig && typeof actorBindingsConfig === "object"
+        ? Object.entries(actorBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
+        : [];
+    const actorNamespaces = new Set();
+    for (const binding of actorBindings) {
+      const [envName, bindingName] = Array.isArray(binding)
+        ? binding
+        : [binding, binding];
+      if (typeof envName !== "string" || envName.length === 0) {
+        continue;
+      }
+      if (typeof bindingName !== "string" || bindingName.length === 0) {
+        continue;
+      }
+      actorNamespaces.add(bindingName);
+      Object.defineProperty(env, envName, {
+        value: { __dd_actor_binding: bindingName },
+        enumerable: true,
+        configurable: true,
+        writable: false,
+      });
+    }
+
+    return { env, actorNamespaces };
   };
 
   const emitWaitUntilDone = async (timedOut) => {
@@ -343,12 +537,37 @@
         body: requestBody,
         signal: controller.signal,
       });
-      const env = buildEnv();
+      const envResult = buildEnv();
+      const env = envResult.env;
+      const actorNamespaces = envResult.actorNamespaces;
       const ctx = {
         requestId: input.request_id,
         signal: controller.signal,
         waitUntil(promise) {
           return trackWaitUntil(promise);
+        },
+        actor(bindingRef, key) {
+          let namespace = null;
+          if (typeof bindingRef === "string") {
+            namespace = bindingRef;
+          } else if (
+            bindingRef
+            && typeof bindingRef === "object"
+            && typeof bindingRef.__dd_actor_binding === "string"
+          ) {
+            namespace = bindingRef.__dd_actor_binding;
+          }
+          if (typeof namespace !== "string" || namespace.length === 0) {
+            throw new Error("ctx.actor requires a declared actor binding");
+          }
+          if (!actorNamespaces.has(namespace)) {
+            throw new Error(`actor binding not declared for worker: ${namespace}`);
+          }
+          const actorKey = String(key ?? "").trim();
+          if (!actorKey) {
+            throw new Error("ctx.actor requires a non-empty key");
+          }
+          return createActorBinding(namespace, actorKey);
         },
         async sleep(millis) {
           await sleep(millis);

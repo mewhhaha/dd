@@ -277,10 +277,12 @@ fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformEr
     let mut seen = HashSet::new();
     for binding in bindings {
         match binding {
-            DeployBinding::Kv { binding } if binding.trim().is_empty() => {
+            DeployBinding::Kv { binding } | DeployBinding::Actor { binding }
+                if binding.trim().is_empty() =>
+            {
                 return Err(PlatformError::bad_request("binding name must not be empty"));
             }
-            DeployBinding::Kv { binding } => {
+            DeployBinding::Kv { binding } | DeployBinding::Actor { binding } => {
                 let normalized = binding.trim().to_string();
                 if !seen.insert(normalized.clone()) {
                     return Err(PlatformError::bad_request(format!(
@@ -591,6 +593,19 @@ mod tests {
             },
             DeployBinding::Kv {
                 binding: "MY_KV".to_string(),
+            },
+        ];
+        assert!(validate_deploy_bindings(&bindings).is_err());
+    }
+
+    #[test]
+    fn kv_and_actor_binding_name_collision_is_rejected() {
+        let bindings = vec![
+            DeployBinding::Kv {
+                binding: "SHARED".to_string(),
+            },
+            DeployBinding::Actor {
+                binding: "SHARED".to_string(),
             },
         ];
         assert!(validate_deploy_bindings(&bindings).is_err());

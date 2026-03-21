@@ -1,5 +1,7 @@
+use crate::actor::{ActorStateEntry, ActorStore};
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvStore};
+use common::{Result, WorkerInvocation, WorkerOutput};
 use deno_core::OpState;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -9,22 +11,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 #[derive(Clone)]
 pub struct IsolateEventSender(pub tokio::sync::mpsc::UnboundedSender<IsolateEventPayload>);
 
-#[derive(Debug)]
 pub enum IsolateEventPayload {
     Completion(String),
     WaitUntilDone(String),
     ResponseStart(String),
     ResponseChunk(String),
     CacheRevalidate(String),
+    ActorInvoke(ActorInvokeEvent),
 }
 
 pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
 pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
+
+pub struct ActorInvokeEvent {
+    pub worker_name: String,
+    pub binding: String,
+    pub key: String,
+    pub request: WorkerInvocation,
+    pub reply: oneshot::Sender<Result<WorkerOutput>>,
+}
 
 #[derive(Default)]
 pub struct RequestBodyStreams {
@@ -140,6 +150,60 @@ struct RequestBodyReadResult {
 #[derive(Debug, Deserialize)]
 struct CompletionRequestId {
     request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorInvokePayload {
+    worker_name: String,
+    binding: String,
+    key: String,
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: Vec<u8>,
+    request_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorInvokeResult {
+    ok: bool,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateGetResult {
+    ok: bool,
+    found: bool,
+    value: String,
+    version: i64,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateWriteResult {
+    ok: bool,
+    conflict: bool,
+    version: i64,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateListItem {
+    key: String,
+    value: String,
+    version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateListResult {
+    ok: bool,
+    entries: Vec<ActorStateListItem>,
+    error: String,
 }
 
 static PROCESS_MONO_START: OnceLock<Instant> = OnceLock::new();
@@ -478,6 +542,253 @@ fn op_request_body_cancel(state: &mut OpState, #[string] request_id: String) {
     cancel_request_body_stream(state, &request_id);
 }
 
+#[deno_core::op2]
+#[serde]
+async fn op_actor_invoke(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> ActorInvokeResult {
+    let payload = match crate::json::from_string::<ActorInvokePayload>(payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return ActorInvokeResult {
+                ok: false,
+                status: 500,
+                headers: Vec::new(),
+                body: Vec::new(),
+                error: format!("invalid actor invoke payload: {error}"),
+            };
+        }
+    };
+    if payload.worker_name.trim().is_empty() {
+        return ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "actor invoke requires worker_name".to_string(),
+        };
+    }
+    if payload.binding.trim().is_empty() {
+        return ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "actor invoke requires binding".to_string(),
+        };
+    }
+    if payload.key.trim().is_empty() {
+        return ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "actor invoke requires key".to_string(),
+        };
+    }
+    if payload.request_id.trim().is_empty() {
+        return ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "actor invoke requires request_id".to_string(),
+        };
+    }
+
+    let request = WorkerInvocation {
+        method: payload.method,
+        url: payload.url,
+        headers: payload.headers,
+        body: payload.body,
+        request_id: payload.request_id,
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorInvoke(ActorInvokeEvent {
+            worker_name: payload.worker_name,
+            binding: payload.binding,
+            key: payload.key,
+            request,
+            reply: reply_tx,
+        }))
+        .is_err()
+    {
+        return ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "actor runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(output)) => ActorInvokeResult {
+            ok: true,
+            status: output.status,
+            headers: output.headers,
+            body: output.body,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "actor invoke response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_get(
+    state: Rc<RefCell<OpState>>,
+    #[string] namespace: String,
+    #[string] actor_key: String,
+    #[string] key: String,
+) -> ActorStateGetResult {
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store.get(&namespace, &actor_key, &key).await {
+        Ok(Some(value)) => ActorStateGetResult {
+            ok: true,
+            found: true,
+            value: value.value,
+            version: value.version,
+            error: String::new(),
+        },
+        Ok(None) => ActorStateGetResult {
+            ok: true,
+            found: false,
+            value: String::new(),
+            version: -1,
+            error: String::new(),
+        },
+        Err(error) => ActorStateGetResult {
+            ok: false,
+            found: false,
+            value: String::new(),
+            version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_set(
+    state: Rc<RefCell<OpState>>,
+    #[string] namespace: String,
+    #[string] actor_key: String,
+    #[string] key: String,
+    #[string] value: String,
+    #[bigint] expected_version: i64,
+) -> ActorStateWriteResult {
+    let expected_version = if expected_version < 0 {
+        None
+    } else {
+        Some(expected_version)
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .put(&namespace, &actor_key, &key, &value, expected_version)
+        .await
+    {
+        Ok(result) => ActorStateWriteResult {
+            ok: true,
+            conflict: result.conflict,
+            version: result.version,
+            error: String::new(),
+        },
+        Err(error) => ActorStateWriteResult {
+            ok: false,
+            conflict: false,
+            version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_delete(
+    state: Rc<RefCell<OpState>>,
+    #[string] namespace: String,
+    #[string] actor_key: String,
+    #[string] key: String,
+    #[bigint] expected_version: i64,
+) -> ActorStateWriteResult {
+    let expected_version = if expected_version < 0 {
+        None
+    } else {
+        Some(expected_version)
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .delete(&namespace, &actor_key, &key, expected_version)
+        .await
+    {
+        Ok(result) => ActorStateWriteResult {
+            ok: true,
+            conflict: result.conflict,
+            version: result.version,
+            error: String::new(),
+        },
+        Err(error) => ActorStateWriteResult {
+            ok: false,
+            conflict: false,
+            version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_list(
+    state: Rc<RefCell<OpState>>,
+    #[string] namespace: String,
+    #[string] actor_key: String,
+    #[string] prefix: String,
+    limit: u32,
+) -> ActorStateListResult {
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    let clamped_limit = limit.clamp(1, 1000) as usize;
+    match store
+        .list(&namespace, &actor_key, &prefix, clamped_limit)
+        .await
+    {
+        Ok(entries) => ActorStateListResult {
+            ok: true,
+            entries: entries
+                .into_iter()
+                .map(|entry: ActorStateEntry| ActorStateListItem {
+                    key: entry.key,
+                    value: entry.value,
+                    version: entry.version,
+                })
+                .collect(),
+            error: String::new(),
+        },
+        Err(error) => ActorStateListResult {
+            ok: false,
+            entries: Vec::new(),
+            error: error.to_string(),
+        },
+    }
+}
+
 #[deno_core::op2(fast)]
 fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
     if let Some(request_id) = completion_request_id(&payload) {
@@ -525,6 +836,11 @@ deno_core::extension!(
         op_cache_delete,
         op_request_body_read,
         op_request_body_cancel,
+        op_actor_invoke,
+        op_actor_state_get,
+        op_actor_state_set,
+        op_actor_state_delete,
+        op_actor_state_list,
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,

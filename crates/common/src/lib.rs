@@ -87,6 +87,7 @@ pub struct DeployConfig {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DeployBinding {
     Kv { binding: String },
+    Actor { binding: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,3 +1,4 @@
+mod actor;
 mod assets;
 mod blob;
 mod cache;

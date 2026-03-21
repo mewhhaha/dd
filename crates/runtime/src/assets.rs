@@ -15,6 +15,7 @@ pub fn install_worker_js() -> String {
 pub fn execute_worker_js(
     worker_name: &str,
     kv_bindings_json: &str,
+    actor_bindings_json: &str,
     request_id: &str,
     completion_token: &str,
     has_request_body_stream: bool,
@@ -23,6 +24,7 @@ pub fn execute_worker_js(
     EXECUTE_WORKER_TEMPLATE
         .replace("__WORKER_NAME__", worker_name)
         .replace("__KV_BINDINGS_JSON__", kv_bindings_json)
+        .replace("__ACTOR_BINDINGS_JSON__", actor_bindings_json)
         .replace("__REQUEST_ID__", request_id)
         .replace("__COMPLETION_TOKEN__", completion_token)
         .replace(

@@ -28,6 +28,9 @@ struct DeployCmd {
 
     #[arg(long = "kv-binding")]
     kv_bindings: Vec<String>,
+
+    #[arg(long = "actor-binding")]
+    actor_bindings: Vec<String>,
 }
 
 #[derive(Args)]
@@ -64,13 +67,18 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
     let source = tokio::fs::read_to_string(&command.file)
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
-    let config = DeployConfig {
-        bindings: command
-            .kv_bindings
+    let mut bindings: Vec<DeployBinding> = command
+        .kv_bindings
+        .into_iter()
+        .map(|binding| DeployBinding::Kv { binding })
+        .collect();
+    bindings.extend(
+        command
+            .actor_bindings
             .into_iter()
-            .map(|binding| DeployBinding::Kv { binding })
-            .collect(),
-    };
+            .map(|binding| DeployBinding::Actor { binding }),
+    );
+    let config = DeployConfig { bindings };
     let response = client
         .post(format!("{server}/deploy"))
         .json(&DeployRequest {

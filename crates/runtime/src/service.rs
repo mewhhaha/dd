@@ -1,3 +1,4 @@
+use crate::actor::ActorStore;
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
@@ -6,7 +7,7 @@ use crate::engine::{
 use crate::kv::KvStore;
 use crate::ops::{
     cancel_request_body_stream, clear_request_body_stream, register_request_body_stream,
-    IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
+    ActorInvokeEvent, IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
 };
 use common::{DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
 use opentelemetry::global;
@@ -117,6 +118,7 @@ struct WorkerManager {
     config: RuntimeConfig,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
+    actor_store: ActorStore,
     cache_store: CacheStore,
     workers: HashMap<String, WorkerEntry>,
     pre_canceled: HashMap<String, HashSet<String>>,
@@ -147,8 +149,11 @@ struct WorkerPool {
     deployment_id: String,
     snapshot: &'static [u8],
     kv_bindings: Vec<String>,
+    actor_bindings: Vec<String>,
     queue: VecDeque<PendingInvoke>,
     isolates: Vec<IsolateHandle>,
+    actor_owners: HashMap<String, u64>,
+    actor_inflight: HashMap<String, usize>,
     stats: PoolStats,
     queue_warn_level: usize,
 }
@@ -164,6 +169,7 @@ struct PendingInvoke {
     runtime_request_id: String,
     request: WorkerInvocation,
     request_body: Option<InvokeRequestBodyReceiver>,
+    actor_route: Option<ActorRoute>,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     enqueued_at: Instant,
 }
@@ -171,10 +177,30 @@ struct PendingInvoke {
 struct PendingReply {
     completion_token: String,
     canceled: bool,
+    actor_key: Option<String>,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     traceparent: Option<String>,
     user_request_id: String,
     dispatched_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ActorRoute {
+    binding: String,
+    key: String,
+}
+
+impl ActorRoute {
+    fn owner_key(&self) -> String {
+        format!("{}\u{001f}{}", self.binding, self.key)
+    }
+}
+
+struct DispatchCandidate {
+    queue_idx: usize,
+    isolate_idx: usize,
+    actor_key: Option<String>,
+    assign_owner: bool,
 }
 
 struct IsolateHandle {
@@ -193,6 +219,7 @@ enum IsolateCommand {
         completion_token: String,
         worker_name: String,
         kv_bindings: Vec<String>,
+        actor_bindings: Vec<String>,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
     },
@@ -277,6 +304,7 @@ enum RuntimeEvent {
         generation: u64,
         payload: String,
     },
+    ActorInvoke(ActorInvokeEvent),
     IsolateFailed {
         worker_name: String,
         generation: u64,
@@ -374,6 +402,7 @@ impl RuntimeService {
 
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
         let kv_store = KvStore::from_env().await?;
+        let actor_store = ActorStore::from_env().await?;
         let cache_store = CacheStore::from_env(CacheConfig {
             max_entries: config.cache_max_entries,
             max_bytes: config.cache_max_bytes,
@@ -388,6 +417,7 @@ impl RuntimeService {
             cancel_receiver,
             bootstrap_snapshot,
             kv_store,
+            actor_store,
             cache_store.clone(),
             config,
         )?;
@@ -675,6 +705,7 @@ impl WorkerManager {
     fn new(
         bootstrap_snapshot: &'static [u8],
         kv_store: KvStore,
+        actor_store: ActorStore,
         cache_store: CacheStore,
         config: RuntimeConfig,
     ) -> Self {
@@ -682,6 +713,7 @@ impl WorkerManager {
             config,
             bootstrap_snapshot,
             kv_store,
+            actor_store,
             cache_store,
             workers: HashMap::new(),
             pre_canceled: HashMap::new(),
@@ -721,6 +753,7 @@ impl WorkerManager {
                     runtime_request_id,
                     request,
                     request_body,
+                    None,
                     reply,
                     event_tx,
                 );
@@ -817,6 +850,9 @@ impl WorkerManager {
             } => {
                 self.schedule_cache_revalidate(&worker_name, generation, payload, event_tx);
             }
+            RuntimeEvent::ActorInvoke(payload) => {
+                self.enqueue_actor_invoke(payload, event_tx);
+            }
             RuntimeEvent::IsolateFailed {
                 worker_name,
                 generation,
@@ -841,7 +877,7 @@ impl WorkerManager {
         if worker_name.is_empty() {
             return Err(PlatformError::bad_request("Worker name must not be empty"));
         }
-        let kv_bindings = extract_kv_bindings(&config)?;
+        let bindings = extract_bindings(&config)?;
 
         validate_worker(self.bootstrap_snapshot, &source).await?;
         let worker_snapshot = build_worker_snapshot(self.bootstrap_snapshot, &source).await?;
@@ -857,9 +893,12 @@ impl WorkerManager {
             generation,
             deployment_id: deployment_id.clone(),
             snapshot: worker_snapshot,
-            kv_bindings,
+            kv_bindings: bindings.kv,
+            actor_bindings: bindings.actor,
             queue: VecDeque::new(),
             isolates: Vec::new(),
+            actor_owners: HashMap::new(),
+            actor_inflight: HashMap::new(),
             stats: PoolStats::default(),
             queue_warn_level: 0,
         };
@@ -904,6 +943,7 @@ impl WorkerManager {
         runtime_request_id: String,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
+        actor_route: Option<ActorRoute>,
         reply: oneshot::Sender<Result<WorkerOutput>>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
@@ -935,10 +975,26 @@ impl WorkerManager {
         };
 
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
+            if let Some(route) = &actor_route {
+                if !pool
+                    .actor_bindings
+                    .iter()
+                    .any(|binding| binding == &route.binding)
+                {
+                    let error = PlatformError::bad_request(format!(
+                        "unknown actor binding for worker {}: {}",
+                        worker_name, route.binding
+                    ));
+                    let _ = reply.send(Err(error.clone()));
+                    self.fail_stream_registration(&worker_name, &runtime_request_id, error);
+                    return;
+                }
+            }
             pool.queue.push_back(PendingInvoke {
                 runtime_request_id,
                 request,
                 request_body,
+                actor_route,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -951,6 +1007,33 @@ impl WorkerManager {
         }
 
         self.dispatch_pool(&worker_name, generation, event_tx);
+    }
+
+    fn enqueue_actor_invoke(
+        &mut self,
+        payload: ActorInvokeEvent,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let route = ActorRoute {
+            binding: payload.binding.trim().to_string(),
+            key: payload.key.trim().to_string(),
+        };
+        if route.binding.is_empty() || route.key.is_empty() {
+            let _ = payload.reply.send(Err(PlatformError::bad_request(
+                "actor binding/key must not be empty",
+            )));
+            return;
+        }
+        self.enqueue_invoke(
+            payload.worker_name,
+            runtime_request_id,
+            payload.request,
+            None,
+            Some(route),
+            payload.reply,
+            event_tx,
+        );
     }
 
     fn cancel_invoke(
@@ -1051,33 +1134,23 @@ impl WorkerManager {
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         loop {
-            let mut selected_isolate_idx: Option<usize> = None;
-            let mut pending: Option<PendingInvoke> = None;
             let max_inflight = self.config.max_inflight_per_isolate;
-
-            let spawn_needed = {
+            let (candidate, spawn_needed) = {
                 let Some(pool) = self.get_pool_mut(worker_name, generation) else {
                     return;
                 };
-
                 if pool.queue.is_empty() {
                     pool.log_stats("dispatch");
                     return;
                 }
-
-                if let Some((idx, _)) = pool
+                let has_capacity = pool
                     .isolates
                     .iter()
-                    .enumerate()
-                    .filter(|(_, isolate)| isolate.inflight_count < max_inflight)
-                    .min_by_key(|(_, isolate)| isolate.inflight_count)
-                {
-                    selected_isolate_idx = Some(idx);
-                    pending = pool.queue.pop_front();
-                    false
-                } else {
-                    pool.isolates.len() < self.config.max_isolates
-                }
+                    .any(|isolate| isolate.inflight_count < max_inflight);
+                (
+                    select_dispatch_candidate(pool, max_inflight),
+                    !has_capacity && pool.isolates.len() < self.config.max_isolates,
+                )
             };
 
             if spawn_needed {
@@ -1092,10 +1165,14 @@ impl WorkerManager {
                 continue;
             }
 
-            let Some(isolate_idx) = selected_isolate_idx else {
+            let Some(candidate) = candidate else {
                 return;
             };
-            let Some(pending_invoke) = pending else {
+            let isolate_idx = candidate.isolate_idx;
+            let Some(pending_invoke) = self
+                .get_pool_mut(worker_name, generation)
+                .and_then(|pool| pool.queue.remove(candidate.queue_idx))
+            else {
                 return;
             };
 
@@ -1129,9 +1206,18 @@ impl WorkerManager {
                 }
 
                 let kv_bindings = pool.kv_bindings.clone();
+                let actor_bindings = pool.actor_bindings.clone();
                 let should_count_reuse = pool.isolates[isolate_idx].served_requests > 0;
                 if should_count_reuse {
                     pool.stats.reuse_count += 1;
+                }
+                if let Some(actor_key) = &candidate.actor_key {
+                    if candidate.assign_owner {
+                        let owner_id = pool.isolates[isolate_idx].id;
+                        pool.actor_owners.insert(actor_key.clone(), owner_id);
+                    }
+                    let entry = pool.actor_inflight.entry(actor_key.clone()).or_insert(0);
+                    *entry += 1;
                 }
                 let isolate = &mut pool.isolates[isolate_idx];
                 isolate.served_requests += 1;
@@ -1140,6 +1226,7 @@ impl WorkerManager {
                     completion_token: completion_token.clone(),
                     worker_name: worker_name.to_string(),
                     kv_bindings,
+                    actor_bindings,
                     request: pending_invoke.request,
                     request_body: pending_invoke.request_body,
                 };
@@ -1153,6 +1240,7 @@ impl WorkerManager {
                         PendingReply {
                             completion_token,
                             canceled: false,
+                            actor_key: candidate.actor_key.clone(),
                             reply: pending_reply
                                 .take()
                                 .expect("pending reply must exist before dispatch"),
@@ -1197,10 +1285,12 @@ impl WorkerManager {
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
+        let actor_store = self.actor_store.clone();
         let cache_store = self.cache_store.clone();
         let isolate = spawn_isolate_thread(
             snapshot,
             kv_store,
+            actor_store,
             cache_store,
             worker_name.to_string(),
             generation,
@@ -1266,6 +1356,9 @@ impl WorkerManager {
                     isolate.last_used_at = Instant::now();
                 }
                 if let Some(pending) = isolate.pending_replies.remove(request_id) {
+                    if let Some(actor_key) = &pending.actor_key {
+                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    }
                     canceled = pending.canceled;
                     if wait_until_count > 0 {
                         isolate
@@ -1488,6 +1581,7 @@ impl WorkerManager {
                 runtime_request_id: runtime_request_id.clone(),
                 request: invocation,
                 request_body: None,
+                actor_route: None,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -1601,11 +1695,16 @@ impl WorkerManager {
             if isolate_idx < pool.isolates.len() {
                 let isolate = pool.isolates.swap_remove(isolate_idx);
                 let _ = isolate.sender.send(IsolateCommand::Shutdown);
-                return isolate
-                    .pending_replies
-                    .into_iter()
-                    .map(|(request_id, pending)| (request_id, pending.reply))
-                    .collect();
+                pool.actor_owners
+                    .retain(|_, owner_id| *owner_id != isolate.id);
+                let mut replies = Vec::with_capacity(isolate.pending_replies.len());
+                for (request_id, pending) in isolate.pending_replies {
+                    if let Some(actor_key) = pending.actor_key.as_deref() {
+                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    }
+                    replies.push((request_id, pending.reply));
+                }
+                return replies;
             }
         }
         Vec::new()
@@ -1671,6 +1770,13 @@ impl WorkerManager {
                 };
                 let isolate = pool.isolates.swap_remove(idx);
                 pool.stats.scale_down_count += 1;
+                pool.actor_owners
+                    .retain(|_, owner_id| *owner_id != isolate.id);
+                for pending in isolate.pending_replies.values() {
+                    if let Some(actor_key) = pending.actor_key.as_deref() {
+                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    }
+                }
                 removed.push(isolate);
             }
 
@@ -1767,6 +1873,73 @@ impl WorkerManager {
     }
 }
 
+fn select_dispatch_candidate(
+    pool: &mut WorkerPool,
+    max_inflight: usize,
+) -> Option<DispatchCandidate> {
+    for (queue_idx, pending) in pool.queue.iter().enumerate() {
+        let Some(route) = &pending.actor_route else {
+            return least_loaded_isolate_idx(&pool.isolates, max_inflight).map(|isolate_idx| {
+                DispatchCandidate {
+                    queue_idx,
+                    isolate_idx,
+                    actor_key: None,
+                    assign_owner: false,
+                }
+            });
+        };
+
+        let actor_key = route.owner_key();
+
+        if let Some(owner_id) = pool.actor_owners.get(&actor_key).copied() {
+            if let Some((idx, _)) = pool.isolates.iter().enumerate().find(|(_, isolate)| {
+                isolate.id == owner_id && isolate.inflight_count < max_inflight
+            }) {
+                return Some(DispatchCandidate {
+                    queue_idx,
+                    isolate_idx: idx,
+                    actor_key: Some(actor_key),
+                    assign_owner: false,
+                });
+            }
+            if !pool.isolates.iter().any(|isolate| isolate.id == owner_id) {
+                pool.actor_owners.remove(&actor_key);
+            } else {
+                continue;
+            }
+        }
+
+        if let Some(isolate_idx) = least_loaded_isolate_idx(&pool.isolates, max_inflight) {
+            return Some(DispatchCandidate {
+                queue_idx,
+                isolate_idx,
+                actor_key: Some(actor_key),
+                assign_owner: true,
+            });
+        }
+    }
+    None
+}
+
+fn least_loaded_isolate_idx(isolates: &[IsolateHandle], max_inflight: usize) -> Option<usize> {
+    isolates
+        .iter()
+        .enumerate()
+        .filter(|(_, isolate)| isolate.inflight_count < max_inflight)
+        .min_by_key(|(_, isolate)| isolate.inflight_count)
+        .map(|(idx, _)| idx)
+}
+
+fn decrement_actor_inflight(actor_inflight: &mut HashMap<String, usize>, actor_key: &str) {
+    let Some(current) = actor_inflight.get_mut(actor_key) else {
+        return;
+    };
+    *current = current.saturating_sub(1);
+    if *current == 0 {
+        actor_inflight.remove(actor_key);
+    }
+}
+
 impl WorkerPool {
     fn is_drained(&self) -> bool {
         self.queue.is_empty() && self.inflight_total() == 0 && self.wait_until_total() == 0
@@ -1844,8 +2017,14 @@ impl WorkerPool {
     }
 }
 
-fn extract_kv_bindings(config: &DeployConfig) -> Result<Vec<String>> {
-    let mut bindings = Vec::new();
+struct DeployBindings {
+    kv: Vec<String>,
+    actor: Vec<String>,
+}
+
+fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
+    let mut kv = Vec::new();
+    let mut actor = Vec::new();
     let mut seen = HashSet::new();
     for binding in &config.bindings {
         match binding {
@@ -1859,11 +2038,23 @@ fn extract_kv_bindings(config: &DeployConfig) -> Result<Vec<String>> {
                         "duplicate binding name: {name}"
                     )));
                 }
-                bindings.push(name.to_string());
+                kv.push(name.to_string());
+            }
+            DeployBinding::Actor { binding } => {
+                let name = binding.trim();
+                if name.is_empty() {
+                    return Err(PlatformError::bad_request("binding name must not be empty"));
+                }
+                if !seen.insert(name.to_string()) {
+                    return Err(PlatformError::bad_request(format!(
+                        "duplicate binding name: {name}"
+                    )));
+                }
+                actor.push(name.to_string());
             }
         }
     }
-    Ok(bindings)
+    Ok(DeployBindings { kv, actor })
 }
 
 fn spawn_runtime_thread(
@@ -1871,6 +2062,7 @@ fn spawn_runtime_thread(
     mut cancel_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
+    actor_store: ActorStore,
     cache_store: CacheStore,
     config: RuntimeConfig,
 ) -> Result<()> {
@@ -1884,8 +2076,13 @@ fn spawn_runtime_thread(
 
             runtime.block_on(async move {
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-                let mut manager =
-                    WorkerManager::new(bootstrap_snapshot, kv_store, cache_store, config.clone());
+                let mut manager = WorkerManager::new(
+                    bootstrap_snapshot,
+                    kv_store,
+                    actor_store,
+                    cache_store,
+                    config.clone(),
+                );
                 let mut ticker = tokio::time::interval(config.scale_tick);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1920,6 +2117,7 @@ fn spawn_runtime_thread(
 fn spawn_isolate_thread(
     snapshot: &'static [u8],
     kv_store: KvStore,
+    actor_store: ActorStore,
     cache_store: CacheStore,
     worker_name: String,
     generation: u64,
@@ -1957,6 +2155,7 @@ fn spawn_isolate_thread(
                     let mut op_state = op_state.borrow_mut();
                     op_state.put(IsolateEventSender(event_payload_tx));
                     op_state.put(kv_store.clone());
+                    op_state.put(actor_store.clone());
                     op_state.put(cache_store.clone());
                     op_state.put(RequestBodyStreams::default());
                 }
@@ -2065,6 +2264,9 @@ fn spawn_isolate_thread(
                                         payload,
                                     });
                                 }
+                                IsolateEventPayload::ActorInvoke(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorInvoke(payload));
+                                }
                             }
                         }
                         Some(command) = command_rx.recv() => {
@@ -2074,6 +2276,7 @@ fn spawn_isolate_thread(
                                     completion_token,
                                     worker_name: worker_name_for_env,
                                     kv_bindings,
+                                    actor_bindings,
                                     request,
                                     request_body,
                                 } => {
@@ -2108,6 +2311,7 @@ fn spawn_isolate_thread(
                                         &completion_token,
                                         &worker_name_for_env,
                                         &kv_bindings,
+                                        &actor_bindings,
                                         has_request_body_stream,
                                         request,
                                     ) {
@@ -2419,7 +2623,7 @@ impl Extractor for TraceparentExtractor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeConfig, RuntimeService};
-    use common::WorkerInvocation;
+    use common::{DeployBinding, DeployConfig, WorkerInvocation};
     use serial_test::serial;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -2600,9 +2804,97 @@ export default {
         .to_string()
     }
 
+    fn actor_worker() -> String {
+        r#"
+let active = 0;
+let maxActive = 0;
+
+function asNumber(input, fallback = 0) {
+  const parsed = Number(input);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function queryParam(search, name) {
+  const trimmed = String(search || "").replace(/^\?/, "");
+  if (!trimmed) {
+    return null;
+  }
+  for (const pair of trimmed.split("&")) {
+    if (!pair) {
+      continue;
+    }
+    const [rawKey, rawValue = ""] = pair.split("=");
+    if (decodeURIComponent(rawKey) === name) {
+      return decodeURIComponent(rawValue);
+    }
+  }
+  return null;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const key = queryParam(url.search, "key") ?? "default";
+    const actor = ctx.actor(env.MY_ACTOR, key);
+
+    if (url.pathname === "/actor/work") {
+      active += 1;
+      if (active > maxActive) {
+        maxActive = active;
+      }
+      await Deno.core.ops.op_sleep(25);
+      active -= 1;
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/actor/max") {
+      return new Response(String(maxActive));
+    }
+
+    if (url.pathname === "/run") {
+      return actor.fetch("/actor/work", { method: "POST" });
+    }
+
+    if (url.pathname === "/max") {
+      return actor.fetch("/actor/max");
+    }
+
+    if (url.pathname === "/seed") {
+      await actor.storage.put("count", "0");
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/inc-cas") {
+      const current = await actor.storage.get("count");
+      const currentValue = current ? asNumber(current.value, 0) : 0;
+      const expectedVersion = current ? current.version : -1;
+      await Deno.core.ops.op_sleep(10);
+      const write = await actor.storage.put("count", String(currentValue + 1), {
+        expectedVersion,
+      });
+      if (write.conflict) {
+        return new Response("conflict", { status: 409 });
+      }
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/get") {
+      const current = await actor.storage.get("count");
+      return new Response(current ? String(current.value) : "0");
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
     async fn test_service(config: RuntimeConfig) -> RuntimeService {
         let db_path = format!("/tmp/dd-test-{}.db", Uuid::new_v4());
+        let store_dir = format!("/tmp/dd-store-{}", Uuid::new_v4());
         std::env::set_var("TURSO_DATABASE_URL", format!("file:{db_path}"));
+        std::env::set_var("DD_STORE_DIR", &store_dir);
         RuntimeService::start_with_config(config)
             .await
             .expect("service should start")
@@ -3097,6 +3389,121 @@ export default {
             .expect("join")
             .expect("invoke should succeed");
         assert_eq!(String::from_utf8(output.body).expect("utf8"), "hello");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_same_key_allows_overlap_by_default() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 3,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let mut tasks = Vec::new();
+        for idx in 0..8 {
+            let svc = service.clone();
+            tasks.push(tokio::spawn(async move {
+                svc.invoke(
+                    "actor".to_string(),
+                    test_invocation_with_path("/run?key=user-1", &format!("actor-run-{idx}")),
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            let output = task.await.expect("join").expect("invoke should succeed");
+            assert_eq!(output.status, 200);
+        }
+
+        let max = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/max?key=user-1", "actor-max"),
+            )
+            .await
+            .expect("max invoke should succeed");
+        let parsed = String::from_utf8(max.body)
+            .expect("utf8")
+            .parse::<u64>()
+            .expect("numeric max");
+        assert!(parsed > 1, "expected overlap for same actor key by default");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_storage_cas_reports_conflicts_under_concurrency() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 3,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/seed?key=user-3", "seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let mut tasks = Vec::new();
+        for idx in 0..16 {
+            let svc = service.clone();
+            tasks.push(tokio::spawn(async move {
+                svc.invoke(
+                    "actor".to_string(),
+                    test_invocation_with_path("/inc-cas?key=user-3", &format!("cas-{idx}")),
+                )
+                .await
+            }));
+        }
+
+        let mut conflicts = 0usize;
+        for task in tasks {
+            let output = task.await.expect("join").expect("invoke should succeed");
+            if output.status == 409 {
+                conflicts += 1;
+            }
+        }
+
+        assert!(conflicts > 0, "expected at least one CAS conflict");
     }
 
     #[tokio::test]

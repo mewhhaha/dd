@@ -1,4 +1,4 @@
-use common::WorkerInvocation;
+use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -251,11 +251,72 @@ export default {
                 .map_err(|error| error.to_string())?;
             println!("{}", format_scale_up_result(scale));
             println!();
+
+            println!("== kv-writes: {} ==", config.name);
+            let kv_service = start_service("kv-writes", config.runtime.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let kv_worker_name = format!("kv-writes-{}", Uuid::new_v4());
+            kv_service
+                .deploy_with_config(
+                    kv_worker_name.clone(),
+                    KV_WRITE_WORKER_SOURCE.to_string(),
+                    DeployConfig {
+                        bindings: vec![DeployBinding::Kv {
+                            binding: "MY_KV".to_string(),
+                        }],
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let kv_sync = run_scenario(
+                &kv_service,
+                &kv_worker_name,
+                Scenario {
+                    name: "kv-write-sync",
+                    worker_source: KV_WRITE_WORKER_SOURCE,
+                    requests: 1000,
+                    concurrency: 1,
+                    paths: &["/write"],
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            println!("{}", format_scenario_result("kv-write-sync", kv_sync));
+
+            let kv_concurrent = run_scenario(
+                &kv_service,
+                &kv_worker_name,
+                Scenario {
+                    name: "kv-write-concurrent",
+                    worker_source: KV_WRITE_WORKER_SOURCE,
+                    requests: 1000,
+                    concurrency: 96,
+                    paths: &["/write"],
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                format_scenario_result("kv-write-concurrent", kv_concurrent)
+            );
+            println!();
         }
     }
 
     Ok(())
 }
+
+const KV_WRITE_WORKER_SOURCE: &str = r#"
+export default {
+  async fetch(request, env) {
+    await env.MY_KV.set("hot", "1");
+    return new Response("ok");
+  },
+};
+"#;
 
 async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<RuntimeService> {
     let paths = bench_paths(tag);

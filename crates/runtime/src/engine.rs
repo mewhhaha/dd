@@ -53,6 +53,7 @@ pub fn dispatch_worker_request(
     completion_token: &str,
     worker_name: &str,
     kv_bindings: &[String],
+    actor_bindings: &[String],
     has_request_body_stream: bool,
     request: WorkerInvocation,
 ) -> Result<()> {
@@ -62,6 +63,8 @@ pub fn dispatch_worker_request(
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let kv_bindings_json = crate::json::to_string(kv_bindings)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
+    let actor_bindings_json = crate::json::to_string(actor_bindings)
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
     let request_id_json = crate::json::to_string(request_id)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let completion_token_json = crate::json::to_string(completion_token)
@@ -69,6 +72,7 @@ pub fn dispatch_worker_request(
     let entry_code = execute_worker_js(
         &worker_name_json,
         &kv_bindings_json,
+        &actor_bindings_json,
         &request_id_json,
         &completion_token_json,
         has_request_body_stream,
