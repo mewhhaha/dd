@@ -11,6 +11,7 @@ deno_core.workspace = true
 turso = "0.5.1"
 capnp = "0.20"
 serde.workspace = true
+serde_json.workspace = true
 simd-json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

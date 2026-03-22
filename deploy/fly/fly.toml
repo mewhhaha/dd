@@ -9,7 +9,7 @@ kill_timeout = "30s"
 [env]
   BIND_PUBLIC_ADDR = "0.0.0.0:8080"
   BIND_PRIVATE_ADDR = "[::]:8081"
-  PUBLIC_BASE_DOMAIN = "example.com"
+  PUBLIC_BASE_DOMAIN = "wdyt.chat"
   RUST_LOG = "info"
 
 [http_service]

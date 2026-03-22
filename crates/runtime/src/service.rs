@@ -1691,7 +1691,9 @@ impl WorkerManager {
             wait_until_count,
         };
 
-        let body = match crate::json::to_vec(&payload) {
+        // Use serde_json for trace forwarding payloads to avoid simd-json's
+        // mutable-buffer serialization path on this hot async boundary.
+        let body = match serde_json::to_vec(&payload) {
             Ok(body) => body,
             Err(error) => {
                 warn!(

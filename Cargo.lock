@@ -2828,6 +2828,7 @@ dependencies = [
  "deno_core",
  "opentelemetry",
  "serde",
+ "serde_json",
  "serial_test",
  "simd-json",
  "tokio",
