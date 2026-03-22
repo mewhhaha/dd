@@ -1,6 +1,5 @@
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -37,15 +36,13 @@ pub struct ActorWriteResult {
 }
 
 impl ActorStore {
-    pub async fn from_env() -> Result<Self> {
-        let store_dir = env::var("DD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
-        let root_dir = PathBuf::from(store_dir).join("actors");
+    pub async fn new(root_dir: PathBuf, shards_per_namespace: usize) -> Result<Self> {
         std::fs::create_dir_all(&root_dir).map_err(actor_error)?;
-        let shards_per_namespace = env::var("DD_ACTOR_SHARDS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        if shards_per_namespace == 0 {
+            return Err(PlatformError::internal(
+                "actor_shards_per_namespace must be greater than 0",
+            ));
+        }
         Ok(Self {
             root_dir: Arc::new(root_dir),
             shards_per_namespace,

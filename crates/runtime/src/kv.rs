@@ -1,6 +1,5 @@
 use common::{PlatformError, Result};
 use std::collections::HashSet;
-use std::env;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,13 +29,10 @@ pub struct KvEntry {
 }
 
 impl KvStore {
-    pub async fn from_env() -> Result<Self> {
-        let store_dir = env::var("DD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
-        let database_url =
-            env::var("TURSO_DATABASE_URL").unwrap_or_else(|_| format!("file:{store_dir}/dd-kv.db"));
+    pub async fn from_database_url(database_url: &str) -> Result<Self> {
         let local_path = database_url
             .strip_prefix("file:")
-            .unwrap_or(&database_url)
+            .unwrap_or(database_url)
             .to_string();
         ensure_parent_dir(Path::new(&local_path))?;
         let database = Builder::new_local(&local_path)

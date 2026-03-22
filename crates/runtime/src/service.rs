@@ -2,6 +2,7 @@ use crate::actor::ActorStore;
 use crate::actor_rpc::{
     decode_actor_invoke_request, encode_actor_invoke_response, ActorInvokeCall, ActorInvokeResponse,
 };
+use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
@@ -19,7 +20,6 @@ use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -29,6 +29,13 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
+
+const INTERNAL_HEADER: &str = "x-dd-internal";
+const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";
+const TRACE_SOURCE_WORKER_HEADER: &str = "x-dd-trace-source-worker";
+const TRACE_SOURCE_GENERATION_HEADER: &str = "x-dd-trace-source-generation";
+const CONTENT_TYPE_HEADER: &str = "content-type";
+const JSON_CONTENT_TYPE: &str = "application/json";
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -59,9 +66,40 @@ impl Default for RuntimeConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeStorageConfig {
+    pub store_dir: PathBuf,
+    pub database_url: String,
+    pub actor_shards_per_namespace: usize,
+    pub worker_store_enabled: bool,
+    pub blob_store: BlobStoreConfig,
+}
+
+impl Default for RuntimeStorageConfig {
+    fn default() -> Self {
+        let store_dir = PathBuf::from("./store");
+        let database_url = format!("file:{}/dd-kv.db", store_dir.display());
+        let blob_root = store_dir.join("blobs");
+        Self {
+            store_dir,
+            database_url,
+            actor_shards_per_namespace: 64,
+            worker_store_enabled: !cfg!(test),
+            blob_store: BlobStoreConfig::local(blob_root),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeServiceConfig {
+    pub runtime: RuntimeConfig,
+    pub storage: RuntimeStorageConfig,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkerStats {
     pub generation: u64,
+    pub public: bool,
     pub queued: usize,
     pub busy: usize,
     pub inflight_total: usize,
@@ -86,6 +124,7 @@ pub struct RuntimeService {
     sender: mpsc::Sender<RuntimeCommand>,
     cancel_sender: mpsc::UnboundedSender<RuntimeCommand>,
     cache_store: CacheStore,
+    storage: RuntimeStorageConfig,
 }
 
 enum RuntimeCommand {
@@ -120,6 +159,7 @@ enum RuntimeCommand {
 
 struct WorkerManager {
     config: RuntimeConfig,
+    storage: RuntimeStorageConfig,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
     actor_store: ActorStore,
@@ -147,10 +187,18 @@ struct WorkerEntry {
     pools: HashMap<u64, WorkerPool>,
 }
 
+#[derive(Clone, Debug)]
+struct InternalTraceDestination {
+    worker: String,
+    path: String,
+}
+
 struct WorkerPool {
     worker_name: String,
     generation: u64,
     deployment_id: String,
+    internal_trace: Option<InternalTraceDestination>,
+    is_public: bool,
     snapshot: &'static [u8],
     kv_bindings: Vec<String>,
     actor_bindings: Vec<(String, String)>,
@@ -175,6 +223,7 @@ struct PendingInvoke {
     request_body: Option<InvokeRequestBodyReceiver>,
     actor_route: Option<ActorRoute>,
     actor_call: Option<ActorExecutionCall>,
+    internal_origin: bool,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     enqueued_at: Instant,
 }
@@ -183,6 +232,9 @@ struct PendingReply {
     completion_token: String,
     canceled: bool,
     actor_key: Option<String>,
+    internal_origin: bool,
+    method: String,
+    url: String,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     traceparent: Option<String>,
     user_request_id: String,
@@ -345,6 +397,22 @@ struct CompletionPayload {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+struct TraceEventPayload {
+    ts_ms: i64,
+    worker: String,
+    generation: u64,
+    request_id: String,
+    runtime_request_id: String,
+    method: String,
+    url: String,
+    status: Option<u16>,
+    ok: bool,
+    error: Option<String>,
+    execution_ms: u64,
+    wait_until_count: usize,
+}
+
 #[derive(Deserialize)]
 struct WaitUntilPayload {
     request_id: String,
@@ -386,50 +454,52 @@ struct StoredWorkerDeployment {
 
 impl RuntimeService {
     pub async fn start() -> Result<Self> {
-        Self::start_with_config(RuntimeConfig::default()).await
+        Self::start_with_service_config(RuntimeServiceConfig::default()).await
     }
 
     pub async fn start_with_config(config: RuntimeConfig) -> Result<Self> {
-        if config.max_isolates == 0 {
+        Self::start_with_service_config(RuntimeServiceConfig {
+            runtime: config,
+            storage: RuntimeStorageConfig::default(),
+        })
+        .await
+    }
+
+    pub async fn start_with_service_config(config: RuntimeServiceConfig) -> Result<Self> {
+        let RuntimeServiceConfig { runtime, storage } = config;
+        validate_runtime_config(&runtime)?;
+        if storage.actor_shards_per_namespace == 0 {
             return Err(PlatformError::internal(
-                "max_isolates must be greater than 0",
+                "actor_shards_per_namespace must be greater than 0",
             ));
         }
-        if config.max_inflight_per_isolate == 0 {
-            return Err(PlatformError::internal(
-                "max_inflight_per_isolate must be greater than 0",
-            ));
-        }
-        if config.min_isolates > config.max_isolates {
-            return Err(PlatformError::internal(
-                "min_isolates cannot exceed max_isolates",
-            ));
-        }
-        if config.cache_max_entries == 0 {
-            return Err(PlatformError::internal(
-                "cache_max_entries must be greater than 0",
-            ));
-        }
-        if config.cache_max_bytes == 0 {
-            return Err(PlatformError::internal(
-                "cache_max_bytes must be greater than 0",
-            ));
-        }
-        if config.cache_default_ttl.is_zero() {
-            return Err(PlatformError::internal(
-                "cache_default_ttl must be greater than 0",
-            ));
-        }
+        tokio::fs::create_dir_all(&storage.store_dir)
+            .await
+            .map_err(|error| {
+                PlatformError::internal(format!(
+                    "failed to create store directory {}: {error}",
+                    storage.store_dir.display()
+                ))
+            })?;
 
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
-        let kv_store = KvStore::from_env().await?;
-        let actor_store = ActorStore::from_env().await?;
-        let cache_store = CacheStore::from_env(CacheConfig {
-            max_entries: config.cache_max_entries,
-            max_bytes: config.cache_max_bytes,
-            default_ttl: config.cache_default_ttl,
-            ..CacheConfig::default()
-        })
+        let kv_store = KvStore::from_database_url(&storage.database_url).await?;
+        let actor_store = ActorStore::new(
+            storage.store_dir.join("actors"),
+            storage.actor_shards_per_namespace,
+        )
+        .await?;
+        let blob_store = BlobStore::from_config(storage.blob_store.clone()).await?;
+        let cache_store = CacheStore::from_config(
+            CacheConfig {
+                max_entries: runtime.cache_max_entries,
+                max_bytes: runtime.cache_max_bytes,
+                default_ttl: runtime.cache_default_ttl,
+                ..CacheConfig::default()
+            },
+            &storage.database_url,
+            blob_store,
+        )
         .await?;
         let (sender, receiver) = mpsc::channel(256);
         let (cancel_sender, cancel_receiver) = mpsc::unbounded_channel();
@@ -440,62 +510,29 @@ impl RuntimeService {
             kv_store,
             actor_store,
             cache_store.clone(),
-            config,
+            runtime,
+            storage.clone(),
         )?;
         let service = Self {
             sender,
             cancel_sender,
             cache_store,
+            storage,
         };
         service.restore_workers_from_store().await?;
         Ok(service)
     }
 
-    pub async fn deploy(&self, worker_name: String, source: String) -> Result<String> {
-        self.deploy_with_config(worker_name, source, DeployConfig::default())
-            .await
-    }
-
-    pub async fn deploy_with_config(
-        &self,
-        worker_name: String,
-        source: String,
-        config: DeployConfig,
-    ) -> Result<String> {
-        self.deploy_with_config_internal(worker_name, source, config, true)
-            .await
-    }
-
-    async fn deploy_with_config_internal(
-        &self,
-        worker_name: String,
-        source: String,
-        config: DeployConfig,
-        persist: bool,
-    ) -> Result<String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::Deploy {
-                worker_name,
-                source,
-                config,
-                persist,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime deploy channel closed"))?
+    fn worker_store_dir(&self) -> PathBuf {
+        self.storage.store_dir.join("workers")
     }
 
     async fn restore_workers_from_store(&self) -> Result<()> {
-        if !worker_store_enabled() {
+        if !self.storage.worker_store_enabled {
             return Ok(());
         }
 
-        let workers_dir = worker_store_dir().join("workers");
+        let workers_dir = self.worker_store_dir();
         let mut read_dir = match tokio::fs::read_dir(&workers_dir).await {
             Ok(read_dir) => read_dir,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -566,6 +603,45 @@ impl RuntimeService {
             info!(restored, "restored workers from local store");
         }
         Ok(())
+    }
+
+    pub async fn deploy(&self, worker_name: String, source: String) -> Result<String> {
+        self.deploy_with_config(worker_name, source, DeployConfig::default())
+            .await
+    }
+
+    pub async fn deploy_with_config(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+    ) -> Result<String> {
+        self.deploy_with_config_internal(worker_name, source, config, true)
+            .await
+    }
+
+    async fn deploy_with_config_internal(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+        persist: bool,
+    ) -> Result<String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::Deploy {
+                worker_name,
+                source,
+                config,
+                persist,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| PlatformError::internal("runtime deploy channel closed"))?
     }
 
     pub async fn invoke(
@@ -729,9 +805,11 @@ impl WorkerManager {
         actor_store: ActorStore,
         cache_store: CacheStore,
         config: RuntimeConfig,
+        storage: RuntimeStorageConfig,
     ) -> Self {
         Self {
             config,
+            storage,
             bootstrap_snapshot,
             kv_store,
             actor_store,
@@ -776,6 +854,7 @@ impl WorkerManager {
                     request_body,
                     None,
                     None,
+                    false,
                     reply,
                     event_tx,
                 );
@@ -822,6 +901,7 @@ impl WorkerManager {
                     &completion_token,
                     wait_until_count,
                     result,
+                    event_tx,
                 );
                 self.dispatch_pool(&worker_name, generation, event_tx);
                 self.cleanup_drained_generations_for(&worker_name);
@@ -913,13 +993,25 @@ impl WorkerManager {
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
         if persist {
-            persist_worker_deployment(&worker_name, &source, &config, &deployment_id).await?;
+            persist_worker_deployment(
+                &self.storage,
+                &worker_name,
+                &source,
+                &config,
+                &deployment_id,
+            )
+            .await?;
         }
 
         let pool = WorkerPool {
             worker_name: worker_name.clone(),
             generation,
             deployment_id: deployment_id.clone(),
+            internal_trace: config.internal.trace.as_ref().map(|trace| InternalTraceDestination {
+                worker: trace.worker.trim().to_string(),
+                path: normalize_trace_path(&trace.path),
+            }),
+            is_public: config.public,
             snapshot: worker_snapshot,
             kv_bindings: bindings.kv,
             actor_bindings: bindings.actor,
@@ -973,6 +1065,7 @@ impl WorkerManager {
         request_body: Option<InvokeRequestBodyReceiver>,
         actor_route: Option<ActorRoute>,
         actor_call: Option<ActorExecutionCall>,
+        internal_origin: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
@@ -1025,6 +1118,7 @@ impl WorkerManager {
                 request_body,
                 actor_route,
                 actor_call,
+                internal_origin,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -1099,6 +1193,7 @@ impl WorkerManager {
             None,
             Some(route),
             Some(actor_call),
+            false,
             reply_tx,
             event_tx,
         );
@@ -1274,6 +1369,9 @@ impl WorkerManager {
             let queue_wait_ms = pending_invoke.enqueued_at.elapsed().as_millis() as u64;
             let runtime_request_id = pending_invoke.runtime_request_id.clone();
             let user_request_id = pending_invoke.request.request_id.clone();
+            let request_method = pending_invoke.request.method.clone();
+            let request_url = pending_invoke.request.url.clone();
+            let internal_origin = pending_invoke.internal_origin;
             let traceparent = traceparent_from_headers(&pending_invoke.request.headers);
             let span = tracing::info_span!(
                 "runtime.dispatch",
@@ -1338,6 +1436,9 @@ impl WorkerManager {
                             completion_token,
                             canceled: false,
                             actor_key: candidate.actor_key.clone(),
+                            internal_origin,
+                            method: request_method,
+                            url: request_url,
                             reply: pending_reply
                                 .take()
                                 .expect("pending reply must exist before dispatch"),
@@ -1413,14 +1514,22 @@ impl WorkerManager {
         completion_token: &str,
         wait_until_count: usize,
         result: Result<WorkerOutput>,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let stream_result = result.clone();
+        let trace_result = result.clone();
         let mut reply = None;
         let mut canceled = false;
         let mut clear_revalidation = false;
         let mut completion_traceparent: Option<String> = None;
         let mut user_request_id = String::new();
+        let mut request_method = String::new();
+        let mut request_url = String::new();
         let mut execution_ms: Option<u64> = None;
+        let mut internal_origin = false;
+        let trace_destination = self
+            .get_pool_mut(worker_name, generation)
+            .and_then(|pool| pool.internal_trace.clone());
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool
                 .isolates
@@ -1457,6 +1566,9 @@ impl WorkerManager {
                         decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
                     }
                     canceled = pending.canceled;
+                    internal_origin = pending.internal_origin;
+                    request_method = pending.method;
+                    request_url = pending.url;
                     if wait_until_count > 0 {
                         isolate
                             .pending_wait_until
@@ -1508,7 +1620,135 @@ impl WorkerManager {
                 "dropped completion for canceled request"
             );
         }
+        self.enqueue_trace_forward(
+            worker_name,
+            generation,
+            &request_method,
+            &request_url,
+            request_id,
+            &user_request_id,
+            &trace_result,
+            execution_ms.unwrap_or_default(),
+            wait_until_count,
+            internal_origin,
+            trace_destination,
+            event_tx,
+        );
         self.complete_stream_registration(worker_name, request_id, completion_token, stream_result);
+    }
+
+    fn enqueue_trace_forward(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        request_method: &str,
+        request_url: &str,
+        runtime_request_id: &str,
+        user_request_id: &str,
+        result: &Result<WorkerOutput>,
+        execution_ms: u64,
+        wait_until_count: usize,
+        internal_origin: bool,
+        trace_destination: Option<InternalTraceDestination>,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let Some(trace_destination) = trace_destination else {
+            return;
+        };
+        if internal_origin {
+            return;
+        }
+
+        let (status, error) = match result {
+            Ok(output) => (Some(output.status), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+
+        let payload = TraceEventPayload {
+            ts_ms: match epoch_ms_i64() {
+                Ok(ts_ms) => ts_ms,
+                Err(error) => {
+                    warn!(
+                        worker = %worker_name,
+                        generation,
+                        runtime_request_id,
+                        error = %error,
+                        "skipping trace forward due invalid clock"
+                    );
+                    return;
+                }
+            },
+            worker: worker_name.to_string(),
+            generation,
+            request_id: user_request_id.to_string(),
+            runtime_request_id: runtime_request_id.to_string(),
+            method: request_method.to_string(),
+            url: request_url.to_string(),
+            status,
+            ok: status.is_some(),
+            error,
+            execution_ms,
+            wait_until_count,
+        };
+
+        let body = match crate::json::to_vec(&payload) {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(
+                    worker = %worker_name,
+                    generation,
+                    runtime_request_id,
+                    error = %error,
+                    "skipping trace forward due payload serialization failure"
+                );
+                return;
+            }
+        };
+        let mut headers = vec![(CONTENT_TYPE_HEADER.to_string(), JSON_CONTENT_TYPE.to_string())];
+        append_internal_trace_headers(&mut headers, worker_name, generation);
+        let trace_request = WorkerInvocation {
+            method: "POST".to_string(),
+            url: format!(
+                "http://{}{}",
+                trace_destination.worker,
+                normalize_trace_path(&trace_destination.path)
+            ),
+            headers,
+            body,
+            request_id: Uuid::new_v4().to_string(),
+        };
+        let (reply, reply_rx) = oneshot::channel();
+        self.enqueue_invoke(
+            trace_destination.worker,
+            Uuid::new_v4().to_string(),
+            trace_request,
+            None,
+            None,
+            None,
+            true,
+            reply,
+            event_tx,
+        );
+        let request_id_for_warning = runtime_request_id.to_string();
+        tokio::spawn(async move {
+            match reply_rx.await {
+                Ok(Ok(output)) => {
+                    if !matches!(output.status, 200..=299) {
+                        warn!(
+                            request_id = %request_id_for_warning,
+                            status = output.status,
+                            "internal trace forward responded non-2xx"
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    warn!(error = %error, "internal trace forward failed");
+                }
+                Err(error) => {
+                    warn!(error = %error, "internal trace forward receiver dropped");
+                }
+            }
+        });
     }
 
     fn fail_isolate(
@@ -1680,6 +1920,7 @@ impl WorkerManager {
                 request_body: None,
                 actor_route: None,
                 actor_call: None,
+                internal_origin: false,
                 reply,
                 enqueued_at: Instant::now(),
             });
@@ -2095,6 +2336,7 @@ impl WorkerPool {
     fn stats_snapshot(&self) -> WorkerStats {
         WorkerStats {
             generation: self.generation,
+            public: self.is_public,
             queued: self.queue.len(),
             busy: self.busy_count(),
             inflight_total: self.inflight_total(),
@@ -2111,6 +2353,7 @@ impl WorkerPool {
         info!(
             worker = %self.worker_name,
             generation = snapshot.generation,
+            public = snapshot.public,
             deployment_id = %self.deployment_id,
             queued = snapshot.queued,
             busy = snapshot.busy,
@@ -2170,6 +2413,40 @@ fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
     Ok(DeployBindings { kv, actor })
 }
 
+fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
+    if config.max_isolates == 0 {
+        return Err(PlatformError::internal(
+            "max_isolates must be greater than 0",
+        ));
+    }
+    if config.max_inflight_per_isolate == 0 {
+        return Err(PlatformError::internal(
+            "max_inflight_per_isolate must be greater than 0",
+        ));
+    }
+    if config.min_isolates > config.max_isolates {
+        return Err(PlatformError::internal(
+            "min_isolates cannot exceed max_isolates",
+        ));
+    }
+    if config.cache_max_entries == 0 {
+        return Err(PlatformError::internal(
+            "cache_max_entries must be greater than 0",
+        ));
+    }
+    if config.cache_max_bytes == 0 {
+        return Err(PlatformError::internal(
+            "cache_max_bytes must be greater than 0",
+        ));
+    }
+    if config.cache_default_ttl.is_zero() {
+        return Err(PlatformError::internal(
+            "cache_default_ttl must be greater than 0",
+        ));
+    }
+    Ok(())
+}
+
 fn spawn_runtime_thread(
     mut receiver: mpsc::Receiver<RuntimeCommand>,
     mut cancel_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
@@ -2178,6 +2455,7 @@ fn spawn_runtime_thread(
     actor_store: ActorStore,
     cache_store: CacheStore,
     config: RuntimeConfig,
+    storage: RuntimeStorageConfig,
 ) -> Result<()> {
     thread::Builder::new()
         .name("dd-runtime".to_string())
@@ -2195,6 +2473,7 @@ fn spawn_runtime_thread(
                     actor_store,
                     cache_store,
                     config.clone(),
+                    storage,
                 );
                 let mut ticker = tokio::time::interval(config.scale_tick);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2544,16 +2823,17 @@ fn spawn_isolate_thread(
 }
 
 async fn persist_worker_deployment(
+    storage: &RuntimeStorageConfig,
     worker_name: &str,
     source: &str,
     config: &DeployConfig,
     deployment_id: &str,
 ) -> Result<()> {
-    if !worker_store_enabled() {
+    if !storage.worker_store_enabled {
         return Ok(());
     }
 
-    let workers_dir = worker_store_dir().join("workers");
+    let workers_dir = storage.store_dir.join("workers");
     tokio::fs::create_dir_all(&workers_dir)
         .await
         .map_err(|error| {
@@ -2562,7 +2842,7 @@ async fn persist_worker_deployment(
                 workers_dir.display()
             ))
         })?;
-    let final_path = worker_store_path(worker_name);
+    let final_path = workers_dir.join(format!("{}.json", encoded_worker_name(worker_name)));
     let temp_path = workers_dir.join(format!("{}.tmp", encoded_worker_name(worker_name)));
     let payload = StoredWorkerDeployment {
         name: worker_name.to_string(),
@@ -2589,30 +2869,6 @@ async fn persist_worker_deployment(
             ))
         })?;
     Ok(())
-}
-
-fn worker_store_enabled() -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    env::var("DD_WORKER_STORE")
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            !(normalized == "0" || normalized == "false" || normalized == "off")
-        })
-        .unwrap_or(true)
-}
-
-fn worker_store_dir() -> PathBuf {
-    env::var("DD_STORE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./store"))
-}
-
-fn worker_store_path(worker_name: &str) -> PathBuf {
-    worker_store_dir()
-        .join("workers")
-        .join(format!("{}.json", encoded_worker_name(worker_name)))
 }
 
 fn encoded_worker_name(worker_name: &str) -> String {
@@ -2732,6 +2988,35 @@ fn cache_revalidation_key(
     )
 }
 
+fn append_internal_trace_headers(
+    headers: &mut Vec<(String, String)>,
+    worker: &str,
+    generation: u64,
+) {
+    append_or_update_header(headers, INTERNAL_HEADER, "1");
+    append_or_update_header(headers, INTERNAL_REASON_HEADER, "trace");
+    append_or_update_header(headers, TRACE_SOURCE_WORKER_HEADER, worker);
+    append_or_update_header(
+        headers,
+        TRACE_SOURCE_GENERATION_HEADER,
+        generation.to_string().as_str(),
+    );
+}
+
+fn append_or_update_header(headers: &mut Vec<(String, String)>, key: &str, value: &str) {
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(key));
+    headers.push((key.to_string(), value.to_string()));
+}
+
+fn normalize_trace_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 fn traceparent_from_headers(headers: &[(String, String)]) -> Option<String> {
     headers
         .iter()
@@ -2770,9 +3055,13 @@ impl Extractor for TraceparentExtractor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeConfig, RuntimeService};
-    use common::{DeployBinding, DeployConfig, WorkerInvocation};
+    use super::{BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
+    use common::{
+        DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination, WorkerInvocation,
+    };
     use serial_test::serial;
+    use serde::Deserialize;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
@@ -3110,14 +3399,64 @@ export class MyActor {
         .to_string()
     }
 
+fn trace_sink_worker() -> String {
+        r#"
+export default {
+  async fetch(request) {
+    return new Response("ok");
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn loop_trace_worker() -> String {
+        r#"
+let totalCalls = 0;
+let traceCalls = 0;
+
+export default {
+  async fetch(request) {
+    totalCalls += 1;
+    const path = new URL(request.url).pathname;
+    if (path === "/trace") {
+      traceCalls += 1;
+      return new Response("ok");
+    }
+    if (path === "/state") {
+      return new Response(
+        JSON.stringify({ total_calls: totalCalls, trace_calls: traceCalls }),
+        { headers: [["content-type", "application/json"]] }
+      );
+    }
+    return new Response("ok");
+  },
+};
+"#
+        .to_string()
+    }
+
+    #[derive(Deserialize)]
+    struct LoopTraceState {
+        total_calls: usize,
+        trace_calls: usize,
+    }
+
     async fn test_service(config: RuntimeConfig) -> RuntimeService {
         let db_path = format!("/tmp/dd-test-{}.db", Uuid::new_v4());
         let store_dir = format!("/tmp/dd-store-{}", Uuid::new_v4());
-        std::env::set_var("TURSO_DATABASE_URL", format!("file:{db_path}"));
-        std::env::set_var("DD_STORE_DIR", &store_dir);
-        RuntimeService::start_with_config(config)
-            .await
-            .expect("service should start")
+        RuntimeService::start_with_service_config(RuntimeServiceConfig {
+            runtime: config,
+            storage: RuntimeStorageConfig {
+                store_dir: PathBuf::from(&store_dir),
+                database_url: format!("file:{db_path}"),
+                actor_shards_per_namespace: 64,
+                worker_store_enabled: false,
+                blob_store: BlobStoreConfig::local(PathBuf::from(&store_dir).join("blobs")),
+            },
+        })
+        .await
+        .expect("service should start")
     }
 
     #[tokio::test]
@@ -3630,6 +3969,10 @@ export default {
                 "actor".to_string(),
                 actor_worker(),
                 DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig {
+                        trace: None,
+                    },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
                         class: "MyActor".to_string(),
@@ -3688,6 +4031,10 @@ export default {
                 "actor".to_string(),
                 actor_worker(),
                 DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig {
+                        trace: None,
+                    },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
                         class: "MyActor".to_string(),
@@ -3747,6 +4094,10 @@ export default {
                 "actor".to_string(),
                 actor_worker(),
                 DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig {
+                        trace: None,
+                    },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
                         class: "MyActor".to_string(),
@@ -3864,5 +4215,157 @@ export default {
         assert_eq!(String::from_utf8(a1.body).expect("utf8"), "A:1");
         assert_eq!(String::from_utf8(b1.body).expect("utf8"), "B:1");
         assert_eq!(String::from_utf8(a2.body).expect("utf8"), "A:2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn internal_trace_includes_markers_and_targets_configured_worker() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy("trace-sink".to_string(), trace_sink_worker())
+            .await
+            .expect("deploy trace sink should succeed");
+        service
+            .deploy_with_config(
+                "traced-worker".to_string(),
+                r#"
+                export default {
+                  async fetch() {
+                    return new Response("ok");
+                  },
+                };
+                "#
+                .to_string(),
+                DeployConfig {
+                    internal: DeployInternalConfig {
+                        trace: Some(DeployTraceDestination {
+                            worker: "trace-sink".to_string(),
+                            path: "/ingest".to_string(),
+                        }),
+                    },
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy traced worker should succeed");
+
+        let mut request = test_invocation_with_path("/", "trace-request");
+        request.headers.push(("x-test".to_string(), "value".to_string()));
+        service
+            .invoke("traced-worker".to_string(), request)
+            .await
+            .expect("traced invoke should succeed");
+
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    #[test]
+    fn internal_trace_headers_include_markers() {
+        let mut headers = vec![("x-other".to_string(), "value".to_string())];
+        super::append_internal_trace_headers(&mut headers, "traced-worker", 42);
+
+        let internal = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-dd-internal"))
+            .expect("x-dd-internal header should be present")
+            .1
+            .as_str();
+        let reason = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-dd-internal-reason"))
+            .expect("x-dd-internal-reason header should be present")
+            .1
+            .as_str();
+        let source_worker = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-dd-trace-source-worker"))
+            .expect("x-dd-trace-source-worker header should be present")
+            .1
+            .as_str();
+        let source_generation = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-dd-trace-source-generation"))
+            .expect("x-dd-trace-source-generation header should be present")
+            .1
+            .as_str();
+
+        assert_eq!(internal, "1");
+        assert_eq!(reason, "trace");
+        assert_eq!(source_worker, "traced-worker");
+        assert_eq!(source_generation, "42");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn internal_trace_invocations_do_not_recurse() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "loop-worker".to_string(),
+                loop_trace_worker(),
+                DeployConfig {
+                    internal: DeployInternalConfig {
+                        trace: Some(DeployTraceDestination {
+                            worker: "loop-worker".to_string(),
+                            path: "/trace".to_string(),
+                        }),
+                    },
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy loop worker should succeed");
+
+        service
+            .invoke("loop-worker".to_string(), test_invocation_with_path("/", "loop-user"))
+            .await
+            .expect("loop worker invoke should succeed");
+
+        sleep(Duration::from_millis(100)).await;
+        let state = timeout(Duration::from_secs(2), async {
+            loop {
+                let state_output = service
+                    .invoke(
+                        "loop-worker".to_string(),
+                        test_invocation_with_path("/state", "loop-state"),
+                    )
+                    .await
+                    .expect("loop worker state invoke should succeed");
+                let state: LoopTraceState = crate::json::from_string(
+                    String::from_utf8(state_output.body)
+                        .expect("loop state body should be utf8"),
+                )
+                .expect("loop state should parse as json");
+                if state.trace_calls >= 2 {
+                    return state;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loop state query should complete");
+
+        assert_eq!(state.trace_calls, 2);
+        assert!(state.total_calls >= 2);
     }
 }

@@ -1,5 +1,5 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
-use runtime::{RuntimeConfig, RuntimeService};
+use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -262,9 +262,11 @@ export default {
                     kv_worker_name.clone(),
                     KV_WRITE_WORKER_SOURCE.to_string(),
                     DeployConfig {
+                        public: false,
                         bindings: vec![DeployBinding::Kv {
                             binding: "MY_KV".to_string(),
                         }],
+                        ..DeployConfig::default()
                     },
                 )
                 .await
@@ -323,8 +325,12 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
     tokio::fs::create_dir_all(&paths.store_dir)
         .await
         .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    configure_runtime_env(&paths.db_path, &paths.store_dir);
-    RuntimeService::start_with_config(runtime).await
+    RuntimeService::start_with_service_config(runtime_service_config(
+        runtime,
+        &paths.db_path,
+        &paths.store_dir,
+    ))
+    .await
 }
 
 async fn start_service_with_paths(
@@ -335,14 +341,25 @@ async fn start_service_with_paths(
     tokio::fs::create_dir_all(store_dir)
         .await
         .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    configure_runtime_env(db_path, store_dir);
-    RuntimeService::start_with_config(runtime).await
+    RuntimeService::start_with_service_config(runtime_service_config(runtime, db_path, store_dir))
+        .await
 }
 
-fn configure_runtime_env(db_path: &Path, store_dir: &Path) {
-    std::env::set_var("TURSO_DATABASE_URL", format!("file:{}", db_path.display()));
-    std::env::set_var("DD_STORE_DIR", store_dir.display().to_string());
-    std::env::set_var("DD_WORKER_STORE", "1");
+fn runtime_service_config(
+    runtime: RuntimeConfig,
+    db_path: &Path,
+    store_dir: &Path,
+) -> RuntimeServiceConfig {
+    RuntimeServiceConfig {
+        runtime,
+        storage: RuntimeStorageConfig {
+            store_dir: store_dir.to_path_buf(),
+            database_url: format!("file:{}", db_path.display()),
+            actor_shards_per_namespace: 64,
+            worker_store_enabled: true,
+            blob_store: runtime::BlobStoreConfig::local(store_dir.join("blobs")),
+        },
+    }
 }
 
 struct BenchPaths {

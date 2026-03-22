@@ -1,7 +1,6 @@
 use crate::blob::BlobStore;
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -93,16 +92,16 @@ struct CacheControl {
 }
 
 impl CacheStore {
-    pub async fn from_env(config: CacheConfig) -> Result<Self> {
-        let store_dir = env::var("DD_STORE_DIR").unwrap_or_else(|_| "./store".to_string());
-        let database_url =
-            env::var("TURSO_DATABASE_URL").unwrap_or_else(|_| format!("file:{store_dir}/dd-kv.db"));
+    pub async fn from_config(
+        config: CacheConfig,
+        database_url: &str,
+        blob_store: BlobStore,
+    ) -> Result<Self> {
         let local_path = database_url
             .strip_prefix("file:")
-            .unwrap_or(&database_url)
+            .unwrap_or(database_url)
             .to_string();
         ensure_parent_dir(&local_path)?;
-        let blob_store = BlobStore::from_env().await?;
         Self::from_local_path(config, local_path, blob_store).await
     }
 

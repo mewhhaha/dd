@@ -80,7 +80,28 @@ pub struct DeployRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeployConfig {
     #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
     pub bindings: Vec<DeployBinding>,
+    #[serde(default)]
+    pub internal: DeployInternalConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployInternalConfig {
+    #[serde(default)]
+    pub trace: Option<DeployTraceDestination>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTraceDestination {
+    pub worker: String,
+    #[serde(default = "default_trace_path")]
+    pub path: String,
+}
+
+fn default_trace_path() -> String {
+    "/ingest".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

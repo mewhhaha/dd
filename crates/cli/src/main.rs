@@ -1,5 +1,8 @@
 use clap::{Args, Parser, Subcommand};
-use common::{DeployBinding, DeployConfig, DeployRequest, DeployResponse, ErrorBody};
+use common::{
+    DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse, DeployTraceDestination,
+    ErrorBody,
+};
 use std::env;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
@@ -26,11 +29,20 @@ struct DeployCmd {
 
     file: String,
 
+    #[arg(long)]
+    public: bool,
+
     #[arg(long = "kv-binding")]
     kv_bindings: Vec<String>,
 
     #[arg(long = "actor-binding")]
     actor_bindings: Vec<String>,
+
+    #[arg(long = "trace-worker")]
+    trace_worker: Option<String>,
+
+    #[arg(long = "trace-path", default_value = "/ingest")]
+    trace_path: String,
 }
 
 #[derive(Args)]
@@ -79,9 +91,18 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
             .map(parse_actor_binding)
             .collect::<Result<Vec<_>, _>>()?,
     );
-    let config = DeployConfig { bindings };
+    let config = DeployConfig {
+        public: command.public,
+        bindings,
+        internal: DeployInternalConfig {
+            trace: command.trace_worker.map(|worker| DeployTraceDestination {
+                worker,
+                path: command.trace_path,
+            }),
+        },
+    };
     let response = client
-        .post(format!("{server}/deploy"))
+        .post(format!("{server}/v1/deploy"))
         .json(&DeployRequest {
             name: command.name,
             source,
@@ -123,7 +144,7 @@ async fn invoke(client: &reqwest::Client, server: &str, command: InvokeCmd) -> R
     let body = read_request_body(command.body_file.as_deref()).await?;
     let path = normalize_path(&command.path);
     let url = format!(
-        "{}/invoke/{}{}",
+        "{}/v1/invoke/{}{}",
         server.trim_end_matches('/'),
         command.name,
         path
@@ -239,7 +260,7 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn default_server() -> String {
-    env::var("DD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string())
+    env::var("DD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string())
 }
 
 fn parse_json_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {

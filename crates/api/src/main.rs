@@ -1,15 +1,11 @@
-mod app;
-mod handlers;
-mod state;
-
 use common::{PlatformError, Result};
+use dd_server::ServerConfig;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::TracerProvider as OTelTracerProvider;
 use opentelemetry_sdk::Resource;
-use runtime::RuntimeService;
 use std::env;
 use std::net::SocketAddr;
 use tracing_subscriber::layer::SubscriberExt;
@@ -20,13 +16,26 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     let otel_provider = init_tracing()?;
 
-    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let addr: SocketAddr = bind_addr
+    let bind_public_addr =
+        env::var("BIND_PUBLIC_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let public_addr: SocketAddr = bind_public_addr
         .parse()
-        .map_err(|error| PlatformError::internal(format!("invalid BIND_ADDR: {error}")))?;
+        .map_err(|error| PlatformError::internal(format!("invalid BIND_PUBLIC_ADDR: {error}")))?;
+    let bind_private_addr =
+        env::var("BIND_PRIVATE_ADDR").unwrap_or_else(|_| "[::]:8081".to_string());
+    let private_addr: SocketAddr = bind_private_addr
+        .parse()
+        .map_err(|error| PlatformError::internal(format!("invalid BIND_PRIVATE_ADDR: {error}")))?;
+    let public_base_domain =
+        env::var("PUBLIC_BASE_DOMAIN").unwrap_or_else(|_| "example.com".to_string());
 
-    let state = state::AppState::new(RuntimeService::start().await?);
-    let result = app::serve(addr, state).await;
+    let result = dd_server::run(ServerConfig {
+        bind_public_addr: public_addr,
+        bind_private_addr: private_addr,
+        public_base_domain,
+        ..ServerConfig::default()
+    })
+    .await;
 
     if let Some(provider) = otel_provider {
         let _ = provider.shutdown();
@@ -44,7 +53,7 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
         .or_else(|| env::var("DD_OTEL_ENDPOINT").ok())
         .filter(|value| !value.trim().is_empty());
     let resource = Resource::new(vec![
-        KeyValue::new("service.name", "dd-api"),
+        KeyValue::new("service.name", "dd-server"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
     ]);
     let mut provider_builder = OTelTracerProvider::builder().with_resource(resource);

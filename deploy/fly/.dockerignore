@@ -1,0 +1,11 @@
+.git
+.github
+target
+**/target
+**/node_modules
+**/.cache
+**/.DS_Store
+**/*.log
+store
+**/tmp
+**/.tmp

@@ -1,0 +1,37 @@
+app = "dd-private-8956e096"
+primary_region = "ams"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  BIND_PUBLIC_ADDR = "0.0.0.0:8080"
+  BIND_PRIVATE_ADDR = "[::]:8081"
+  PUBLIC_BASE_DOMAIN = "example.com"
+  RUST_LOG = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = false
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
+
+[checks]
+  [checks.dd_tcp]
+    type = "tcp"
+    port = 8080
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "30s"
+
+[[mounts]]
+  source = "dd_store"
+  destination = "/app/store"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"

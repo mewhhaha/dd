@@ -6,8 +6,8 @@ A tiny workers platform built in Rust with Axum and autoscaling JavaScript isola
 
 This MVP supports:
 
-- `POST /deploy` with `{ "name", "source", "config": { "bindings": [...] } }`
-- raw HTTP invoke via `ANY /invoke/:worker/*path`
+- private control listener (`POST /v1/deploy`, `ANY /v1/invoke/:worker/*path`)
+- public listener with host routing (`worker.example.com/* -> worker`)
 - a tiny CLI for deploying and invoking named workers
 - in-memory worker state inside the server process
 - per-worker isolate pools with autoscale up/down
@@ -28,40 +28,81 @@ Workers are single JavaScript modules that export a default object with `fetch(r
 
 ## Environment
 
-Optional settings:
+Standalone binary settings:
 
 ```bash
-export BIND_ADDR="127.0.0.1:3000"
+export BIND_PUBLIC_ADDR="0.0.0.0:8080"
+export BIND_PRIVATE_ADDR="[::]:8081"
+export PUBLIC_BASE_DOMAIN="example.com"
 export RUST_LOG="info"
-export DD_STORE_DIR="./store"
-export TURSO_DATABASE_URL="file:./store/dd-kv.db"
-export DD_BLOB_BACKEND="local"
-export DD_BLOB_DIR="./store/blobs"
-export DD_ACTOR_SHARDS="64"
-export DD_WORKER_STORE="1"
-export DD_MAX_INVOKE_BODY_BYTES="16777216"
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:4317"
 ```
 
-`DD_BLOB_BACKEND=s3` is reserved for the upcoming S3-compatible implementation.
 `OTEL_EXPORTER_OTLP_ENDPOINT` (or `DD_OTEL_ENDPOINT`) enables OTLP span export.
-`DD_WORKER_STORE=0` disables file-based worker persistence/restore.
-`DD_MAX_INVOKE_BODY_BYTES` caps request body size accepted by `/invoke` (default: 16 MiB).
+
+Runtime/storage settings are now typed config (no env wiring). See `dd_server::ServerConfig`.
 
 ## Run
 
 ```bash
-cargo run -p api
+cargo run -p dd_server
+```
+
+## Embed as a library
+
+```rust
+use dd_server::{run, ServerConfig};
+use runtime::{BlobStoreConfig, RuntimeServiceConfig, RuntimeStorageConfig};
+use std::path::PathBuf;
+
+let store_dir = PathBuf::from("./store");
+run(ServerConfig {
+    bind_public_addr: "127.0.0.1:3000".parse().unwrap(),
+    bind_private_addr: "127.0.0.1:3001".parse().unwrap(),
+    public_base_domain: "example.com".to_string(),
+    invoke_max_body_bytes: 16 * 1024 * 1024,
+    runtime: RuntimeServiceConfig {
+        runtime: Default::default(),
+        storage: RuntimeStorageConfig {
+            store_dir: store_dir.clone(),
+            database_url: format!("file:{}/dd-kv.db", store_dir.display()),
+            actor_shards_per_namespace: 64,
+            worker_store_enabled: true,
+            blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
+        },
+    },
+}).await?;
 ```
 
 ## CLI
 
 ```bash
-cargo run -p cli -- deploy hello examples/hello.js
-cargo run -p cli -- invoke hello --method POST --path /echo --header "content-type: text/plain" --body-file -
+cargo run -p cli -- --server http://127.0.0.1:3001 deploy hello examples/hello.js --public
+cargo run -p cli -- --server http://127.0.0.1:3001 invoke hello --method POST --path /echo --header "content-type: text/plain" --body-file -
 ```
 
+`deploy --public` exposes a worker on the public listener. Without `--public`, a worker is private-only and can only be invoked through the private listener.
+
 Worker source/config is persisted under `./store/workers` by default and restored at startup.
+
+For Fly private deploys, use `deploy/fly/proxy-private-deploy.sh` and point CLI to `http://127.0.0.1:18081`.
+
+## Fly deploy model
+
+On Fly, there is one app process (`dd-private-...`) running `dd_server`.
+Workers are not separate Fly apps.
+
+- `flyctl deploy` updates the `dd_server` binary/container.
+- `dd deploy` (`cargo run -p cli -- deploy ...`) uploads worker source into that running app via `/v1/deploy`.
+
+Deploy a new worker to an already running Fly app:
+
+```bash
+./deploy/fly/proxy-private-deploy.sh dd-private-8956e096 18081 8081
+cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.js --public
+```
+
+This deploys worker `hello` inside `dd-private-8956e096`; it does not create another Fly app.
 
 ## Benchmark
 
@@ -116,6 +157,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/wait-until-kv.js` - `waitUntil` background write into KV
 - `examples/actor.js` - class-based actor namespace (`env.USER_ACTOR.idFromName/get`)
 - `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
+- `examples/trace-hub.js` - minimal internal trace receiver and web view
 
 Try them quickly:
 
@@ -133,6 +175,7 @@ cargo run -p cli -- deploy bg examples/wait-until.js
 cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR=UserActor
 cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
+cargo run -p cli -- deploy trace-hub examples/trace-hub.js
 ```
 
 Build/deploy the bundled TypeScript router:
@@ -162,6 +205,20 @@ cargo run -p cli -- invoke receipts --method POST --path /receipts --header "con
 cargo run -p cli -- invoke receipts --method GET --path /receipts
 ```
 
+Deploy a trace hub and route traces from another worker:
+
+```bash
+cargo run -p cli -- deploy trace-hub examples/trace-hub.js
+cargo run -p cli -- deploy api examples/hello.js --trace-worker trace-hub --trace-path /ingest
+```
+
+View traces:
+
+```bash
+curl http://localhost:3001/v1/invoke/trace-hub/
+curl "http://localhost:3001/v1/invoke/trace-hub/traces?app=api"
+```
+
 Named cache example inside workers:
 
 ```js
@@ -172,13 +229,14 @@ await apiCache.put(new Request("http://cache/key"), response.clone());
 ## Deploy
 
 ```bash
-curl -X POST http://localhost:3000/deploy \
+curl -X POST http://localhost:3001/v1/deploy \
   -H "content-type: application/json" \
   -d @- <<'JSON'
 {
   "name": "hello",
   "source": "export default { async fetch(request, env, ctx) { return new Response('hello from worker'); } }",
   "config": {
+    "public": true,
     "bindings": [
       { "type": "kv", "binding": "MY_KV" }
     ]
@@ -187,14 +245,26 @@ curl -X POST http://localhost:3000/deploy \
 JSON
 ```
 
+CLI can do the same via:
+
+```bash
+cargo run -p cli -- deploy api examples/hello.js --trace-worker trace-hub --trace-path /ingest
+```
+
 ## Invoke
 
 ```bash
-cargo run -p cli -- invoke hello --method GET --path /
+cargo run -p cli -- --server http://127.0.0.1:3001 invoke hello --method GET --path /
 ```
 
 Expected body:
 
 ```text
 hello from worker
+```
+
+Public invoke shape (when `PUBLIC_BASE_DOMAIN=example.com`) is host-based:
+
+```bash
+curl -H "host: hello.example.com" http://127.0.0.1:3000/
 ```
