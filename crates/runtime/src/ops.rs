@@ -5,9 +5,15 @@ use crate::actor_rpc::{
 };
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvStore};
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes128Gcm, Aes192Gcm, Aes256Gcm, KeyInit, Nonce};
 use common::{PlatformError, Result};
 use deno_core::OpState;
+use getrandom::fill as fill_random_bytes;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -16,6 +22,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct IsolateEventSender(pub tokio::sync::mpsc::UnboundedSender<IsolateEventPayload>);
@@ -393,6 +400,77 @@ struct ActorStateListResult {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CryptoDigestPayload {
+    algorithm: String,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct CryptoDigestResult {
+    ok: bool,
+    digest: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CryptoHmacPayload {
+    hash: String,
+    key: Vec<u8>,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CryptoHmacVerifyPayload {
+    hash: String,
+    key: Vec<u8>,
+    data: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CryptoAesGcmPayload {
+    key: Vec<u8>,
+    iv: Vec<u8>,
+    data: Vec<u8>,
+    #[serde(default)]
+    additional_data: Vec<u8>,
+    #[serde(default = "default_tag_length_bits")]
+    tag_length: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct CryptoBytesResult {
+    ok: bool,
+    bytes: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CryptoBoolResult {
+    ok: bool,
+    value: bool,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CryptoRandomValuesResult {
+    ok: bool,
+    bytes: Vec<u8>,
+    error: String,
+}
+
+enum CryptoDigestAlgorithm {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+fn default_tag_length_bits() -> u8 {
+    128
+}
+
 static PROCESS_MONO_START: OnceLock<Instant> = OnceLock::new();
 
 #[deno_core::op2]
@@ -410,6 +488,229 @@ async fn op_time_boundary_now() -> TimeBoundary {
         .as_secs_f64()
         * 1000.0;
     TimeBoundary { now_ms, perf_ms }
+}
+
+#[deno_core::op2]
+#[string]
+fn op_crypto_random_uuid() -> String {
+    Uuid::new_v4().to_string()
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_crypto_get_random_values(len: u32) -> CryptoRandomValuesResult {
+    const MAX_BYTES: usize = 1 << 20;
+    let len = len as usize;
+    if len > MAX_BYTES {
+        return CryptoRandomValuesResult {
+            ok: false,
+            bytes: Vec::new(),
+            error: format!("random byte request too large (max {MAX_BYTES})"),
+        };
+    }
+
+    let mut bytes = vec![0_u8; len];
+    match fill_random_bytes(&mut bytes) {
+        Ok(()) => CryptoRandomValuesResult {
+            ok: true,
+            bytes,
+            error: String::new(),
+        },
+        Err(error) => CryptoRandomValuesResult {
+            ok: false,
+            bytes: Vec::new(),
+            error: format!("random bytes failed: {error}"),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_crypto_digest(#[string] payload: String) -> CryptoDigestResult {
+    let payload = match crate::json::from_string::<CryptoDigestPayload>(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return CryptoDigestResult {
+                ok: false,
+                digest: Vec::new(),
+                error: format!("invalid digest payload: {error}"),
+            };
+        }
+    };
+
+    let algorithm = match parse_crypto_digest_algorithm(&payload.algorithm) {
+        Some(value) => value,
+        None => {
+            return CryptoDigestResult {
+                ok: false,
+                digest: Vec::new(),
+                error: format!("unsupported digest algorithm: {}", payload.algorithm),
+            };
+        }
+    };
+
+    let digest = match algorithm {
+        CryptoDigestAlgorithm::Sha1 => {
+            let mut hasher = Sha1::new();
+            hasher.update(&payload.data);
+            hasher.finalize().to_vec()
+        }
+        CryptoDigestAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            hasher.update(&payload.data);
+            hasher.finalize().to_vec()
+        }
+        CryptoDigestAlgorithm::Sha384 => {
+            let mut hasher = Sha384::new();
+            hasher.update(&payload.data);
+            hasher.finalize().to_vec()
+        }
+        CryptoDigestAlgorithm::Sha512 => {
+            let mut hasher = Sha512::new();
+            hasher.update(&payload.data);
+            hasher.finalize().to_vec()
+        }
+    };
+
+    CryptoDigestResult {
+        ok: true,
+        digest,
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_crypto_hmac_sign(#[string] payload: String) -> CryptoBytesResult {
+    let payload: CryptoHmacPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return CryptoBytesResult {
+                ok: false,
+                bytes: Vec::new(),
+                error: format!("invalid hmac sign payload: {error}"),
+            };
+        }
+    };
+
+    let hash = match parse_crypto_digest_algorithm(&payload.hash) {
+        Some(value) => value,
+        None => {
+            return CryptoBytesResult {
+                ok: false,
+                bytes: Vec::new(),
+                error: format!("unsupported hmac hash algorithm: {}", payload.hash),
+            };
+        }
+    };
+
+    match compute_hmac(hash, &payload.key, &payload.data) {
+        Ok(bytes) => CryptoBytesResult {
+            ok: true,
+            bytes,
+            error: String::new(),
+        },
+        Err(error) => CryptoBytesResult {
+            ok: false,
+            bytes: Vec::new(),
+            error,
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_crypto_hmac_verify(#[string] payload: String) -> CryptoBoolResult {
+    let payload: CryptoHmacVerifyPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return CryptoBoolResult {
+                ok: false,
+                value: false,
+                error: format!("invalid hmac verify payload: {error}"),
+            };
+        }
+    };
+
+    let hash = match parse_crypto_digest_algorithm(&payload.hash) {
+        Some(value) => value,
+        None => {
+            return CryptoBoolResult {
+                ok: false,
+                value: false,
+                error: format!("unsupported hmac hash algorithm: {}", payload.hash),
+            };
+        }
+    };
+
+    match verify_hmac(hash, &payload.key, &payload.data, &payload.signature) {
+        Ok(value) => CryptoBoolResult {
+            ok: true,
+            value,
+            error: String::new(),
+        },
+        Err(error) => CryptoBoolResult {
+            ok: false,
+            value: false,
+            error,
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_crypto_aes_gcm_encrypt(#[string] payload: String) -> CryptoBytesResult {
+    let payload: CryptoAesGcmPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return CryptoBytesResult {
+                ok: false,
+                bytes: Vec::new(),
+                error: format!("invalid aes-gcm encrypt payload: {error}"),
+            };
+        }
+    };
+
+    match aes_gcm_encrypt(&payload) {
+        Ok(bytes) => CryptoBytesResult {
+            ok: true,
+            bytes,
+            error: String::new(),
+        },
+        Err(error) => CryptoBytesResult {
+            ok: false,
+            bytes: Vec::new(),
+            error,
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_crypto_aes_gcm_decrypt(#[string] payload: String) -> CryptoBytesResult {
+    let payload: CryptoAesGcmPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return CryptoBytesResult {
+                ok: false,
+                bytes: Vec::new(),
+                error: format!("invalid aes-gcm decrypt payload: {error}"),
+            };
+        }
+    };
+
+    match aes_gcm_decrypt(&payload) {
+        Ok(bytes) => CryptoBytesResult {
+            ok: true,
+            bytes,
+            error: String::new(),
+        },
+        Err(error) => CryptoBytesResult {
+            ok: false,
+            bytes: Vec::new(),
+            error,
+        },
+    }
 }
 
 #[deno_core::op2]
@@ -1603,6 +1904,13 @@ deno_core::extension!(
     ops = [
         op_sleep,
         op_time_boundary_now,
+        op_crypto_random_uuid,
+        op_crypto_get_random_values,
+        op_crypto_digest,
+        op_crypto_hmac_sign,
+        op_crypto_hmac_verify,
+        op_crypto_aes_gcm_encrypt,
+        op_crypto_aes_gcm_decrypt,
         op_kv_get,
         op_kv_get_value,
         op_kv_set,
@@ -1635,6 +1943,190 @@ deno_core::extension!(
 
 pub fn runtime_extension() -> deno_core::Extension {
     dd_runtime_ops::init()
+}
+
+fn parse_crypto_digest_algorithm(value: &str) -> Option<CryptoDigestAlgorithm> {
+    let normalized = value.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "SHA-1" | "SHA1" => Some(CryptoDigestAlgorithm::Sha1),
+        "SHA-256" | "SHA256" => Some(CryptoDigestAlgorithm::Sha256),
+        "SHA-384" | "SHA384" => Some(CryptoDigestAlgorithm::Sha384),
+        "SHA-512" | "SHA512" => Some(CryptoDigestAlgorithm::Sha512),
+        _ => None,
+    }
+}
+
+fn compute_hmac(
+    algorithm: CryptoDigestAlgorithm,
+    key: &[u8],
+    data: &[u8],
+) -> std::result::Result<Vec<u8>, String> {
+    match algorithm {
+        CryptoDigestAlgorithm::Sha1 => {
+            let mut mac = Hmac::<Sha1>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+        CryptoDigestAlgorithm::Sha256 => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+        CryptoDigestAlgorithm::Sha384 => {
+            let mut mac = Hmac::<Sha384>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+        CryptoDigestAlgorithm::Sha512 => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+    }
+}
+
+fn verify_hmac(
+    algorithm: CryptoDigestAlgorithm,
+    key: &[u8],
+    data: &[u8],
+    signature: &[u8],
+) -> std::result::Result<bool, String> {
+    match algorithm {
+        CryptoDigestAlgorithm::Sha1 => {
+            let mut mac = Hmac::<Sha1>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.verify_slice(signature).is_ok())
+        }
+        CryptoDigestAlgorithm::Sha256 => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.verify_slice(signature).is_ok())
+        }
+        CryptoDigestAlgorithm::Sha384 => {
+            let mut mac = Hmac::<Sha384>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.verify_slice(signature).is_ok())
+        }
+        CryptoDigestAlgorithm::Sha512 => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key)
+                .map_err(|error| format!("hmac init failed: {error}"))?;
+            mac.update(data);
+            Ok(mac.verify_slice(signature).is_ok())
+        }
+    }
+}
+
+fn aes_gcm_encrypt(payload: &CryptoAesGcmPayload) -> std::result::Result<Vec<u8>, String> {
+    if payload.iv.len() != 12 {
+        return Err("AES-GCM iv must be exactly 12 bytes in v1".to_string());
+    }
+    if payload.tag_length != 128 {
+        return Err("AES-GCM tagLength must be 128 in v1".to_string());
+    }
+
+    let nonce = Nonce::from_slice(&payload.iv);
+    match payload.key.len() {
+        16 => {
+            let cipher = Aes128Gcm::new_from_slice(&payload.key)
+                .map_err(|error| format!("AES-128-GCM key init failed: {error}"))?;
+            cipher
+                .encrypt(
+                    nonce,
+                    Payload {
+                        msg: &payload.data,
+                        aad: &payload.additional_data,
+                    },
+                )
+                .map_err(|error| format!("AES-128-GCM encrypt failed: {error}"))
+        }
+        24 => {
+            let cipher = Aes192Gcm::new_from_slice(&payload.key)
+                .map_err(|error| format!("AES-192-GCM key init failed: {error}"))?;
+            cipher
+                .encrypt(
+                    nonce,
+                    Payload {
+                        msg: &payload.data,
+                        aad: &payload.additional_data,
+                    },
+                )
+                .map_err(|error| format!("AES-192-GCM encrypt failed: {error}"))
+        }
+        32 => {
+            let cipher = Aes256Gcm::new_from_slice(&payload.key)
+                .map_err(|error| format!("AES-256-GCM key init failed: {error}"))?;
+            cipher
+                .encrypt(
+                    nonce,
+                    Payload {
+                        msg: &payload.data,
+                        aad: &payload.additional_data,
+                    },
+                )
+                .map_err(|error| format!("AES-256-GCM encrypt failed: {error}"))
+        }
+        _ => Err("AES-GCM key length must be 16, 24, or 32 bytes".to_string()),
+    }
+}
+
+fn aes_gcm_decrypt(payload: &CryptoAesGcmPayload) -> std::result::Result<Vec<u8>, String> {
+    if payload.iv.len() != 12 {
+        return Err("AES-GCM iv must be exactly 12 bytes in v1".to_string());
+    }
+    if payload.tag_length != 128 {
+        return Err("AES-GCM tagLength must be 128 in v1".to_string());
+    }
+
+    let nonce = Nonce::from_slice(&payload.iv);
+    match payload.key.len() {
+        16 => {
+            let cipher = Aes128Gcm::new_from_slice(&payload.key)
+                .map_err(|error| format!("AES-128-GCM key init failed: {error}"))?;
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: &payload.data,
+                        aad: &payload.additional_data,
+                    },
+                )
+                .map_err(|error| format!("AES-128-GCM decrypt failed: {error}"))
+        }
+        24 => {
+            let cipher = Aes192Gcm::new_from_slice(&payload.key)
+                .map_err(|error| format!("AES-192-GCM key init failed: {error}"))?;
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: &payload.data,
+                        aad: &payload.additional_data,
+                    },
+                )
+                .map_err(|error| format!("AES-192-GCM decrypt failed: {error}"))
+        }
+        32 => {
+            let cipher = Aes256Gcm::new_from_slice(&payload.key)
+                .map_err(|error| format!("AES-256-GCM key init failed: {error}"))?;
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: &payload.data,
+                        aad: &payload.additional_data,
+                    },
+                )
+                .map_err(|error| format!("AES-256-GCM decrypt failed: {error}"))
+        }
+        _ => Err("AES-GCM key length must be 16, 24, or 32 bytes".to_string()),
+    }
 }
 
 pub fn register_request_body_stream(
