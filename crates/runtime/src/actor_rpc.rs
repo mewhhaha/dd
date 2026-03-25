@@ -27,6 +27,26 @@ pub enum ActorInvokeResponse {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum WorkerSocketFrame {
+    Message {
+        session_id: String,
+        is_text: bool,
+        data: Vec<u8>,
+    },
+    Close {
+        session_id: String,
+        code: u16,
+        reason: String,
+    },
+    Open {
+        session_id: String,
+        binding: String,
+        key: String,
+        request_id: String,
+    },
+}
+
 pub fn encode_actor_invoke_request(request: &ActorInvokeRequest) -> Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<actor_rpc_capnp::invoke_request::Builder<'_>>();
@@ -188,6 +208,87 @@ fn read_text(reader: capnp::text::Reader<'_>) -> Result<String> {
         .map_err(actor_rpc_error)
 }
 
+pub fn encode_worker_socket_frame(frame: &WorkerSocketFrame) -> Result<Vec<u8>> {
+    let mut message = capnp::message::Builder::new_default();
+    let mut root = message.init_root::<actor_rpc_capnp::worker_socket_frame::Builder<'_>>();
+    match frame {
+        WorkerSocketFrame::Message {
+            session_id,
+            is_text,
+            data,
+        } => {
+            let mut message = root.reborrow().init_message(*is_text);
+            message.set_session_id(session_id);
+            message.set_is_text(*is_text);
+            message.set_data(data);
+        }
+        WorkerSocketFrame::Close {
+            session_id,
+            code,
+            reason,
+        } => {
+            let mut close = root.init_close();
+            close.set_session_id(session_id);
+            close.set_code(*code);
+            close.set_reason(reason);
+        }
+        WorkerSocketFrame::Open {
+            session_id,
+            binding,
+            key,
+            request_id,
+        } => {
+            let mut open = root.init_open();
+            open.set_session_id(session_id);
+            open.set_binding(binding);
+            open.set_key(key);
+            open.set_request_id(request_id);
+        }
+    }
+    let mut out = Vec::new();
+    capnp::serialize_packed::write_message(&mut out, &message).map_err(actor_rpc_error)?;
+    Ok(out)
+}
+
+pub fn decode_worker_socket_frame(frame: &[u8]) -> Result<WorkerSocketFrame> {
+    let mut cursor = Cursor::new(frame);
+    let message =
+        capnp::serialize_packed::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+            .map_err(actor_rpc_error)?;
+    let root = message
+        .get_root::<actor_rpc_capnp::worker_socket_frame::Reader<'_>>()
+        .map_err(actor_rpc_error)?;
+
+    let frame = match root.which().map_err(actor_rpc_error)? {
+        actor_rpc_capnp::worker_socket_frame::Message(msg) => {
+            let msg = msg.map_err(actor_rpc_error)?;
+            WorkerSocketFrame::Message {
+                session_id: read_text(msg.get_session_id().map_err(actor_rpc_error)?)?,
+                is_text: msg.get_is_text(),
+                data: msg.get_data().map_err(actor_rpc_error)?.to_vec(),
+            }
+        }
+        actor_rpc_capnp::worker_socket_frame::Close(close) => {
+            let close = close.map_err(actor_rpc_error)?;
+            WorkerSocketFrame::Close {
+                session_id: read_text(close.get_session_id().map_err(actor_rpc_error)?)?,
+                code: close.get_code(),
+                reason: read_text(close.get_reason().map_err(actor_rpc_error)?)?,
+            }
+        }
+        actor_rpc_capnp::worker_socket_frame::Open(open) => {
+            let open = open.map_err(actor_rpc_error)?;
+            WorkerSocketFrame::Open {
+                session_id: read_text(open.get_session_id().map_err(actor_rpc_error)?)?,
+                binding: read_text(open.get_binding().map_err(actor_rpc_error)?)?,
+                key: read_text(open.get_key().map_err(actor_rpc_error)?)?,
+                request_id: read_text(open.get_request_id().map_err(actor_rpc_error)?)?,
+            }
+        }
+    };
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +325,52 @@ mod tests {
                 }
             }
             _ => panic!("expected fetch call"),
+        }
+    }
+
+    #[test]
+    fn socket_frame_roundtrip_message() {
+        let request = WorkerSocketFrame::Message {
+            session_id: "sess-1".to_string(),
+            is_text: true,
+            data: vec![1, 2, 3],
+        };
+        let encoded = encode_worker_socket_frame(&request).expect("frame should encode");
+        let decoded = decode_worker_socket_frame(&encoded).expect("frame should decode");
+        match decoded {
+            WorkerSocketFrame::Message {
+                session_id,
+                is_text,
+                data,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert!(is_text);
+                assert_eq!(data, vec![1, 2, 3]);
+            }
+            _ => panic!("expected message frame"),
+        }
+    }
+
+    #[test]
+    fn socket_frame_roundtrip_close() {
+        let request = WorkerSocketFrame::Close {
+            session_id: "sess-1".to_string(),
+            code: 1000,
+            reason: "done".to_string(),
+        };
+        let encoded = encode_worker_socket_frame(&request).expect("frame should encode");
+        let decoded = decode_worker_socket_frame(&encoded).expect("frame should decode");
+        match decoded {
+            WorkerSocketFrame::Close {
+                session_id,
+                code,
+                reason,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(code, 1000);
+                assert_eq!(reason, "done");
+            }
+            _ => panic!("expected close frame"),
         }
     }
 

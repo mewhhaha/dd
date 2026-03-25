@@ -34,6 +34,14 @@ const INTERNAL_HEADER: &str = "x-dd-internal";
 const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";
 const TRACE_SOURCE_WORKER_HEADER: &str = "x-dd-trace-source-worker";
 const TRACE_SOURCE_GENERATION_HEADER: &str = "x-dd-trace-source-generation";
+const INTERNAL_WS_ACCEPT_HEADER: &str = "x-dd-ws-accept";
+const INTERNAL_WS_SESSION_HEADER: &str = "x-dd-ws-session";
+const INTERNAL_WS_HANDLE_HEADER: &str = "x-dd-ws-handle";
+const INTERNAL_WS_BINDING_HEADER: &str = "x-dd-ws-actor-binding";
+const INTERNAL_WS_KEY_HEADER: &str = "x-dd-ws-actor-key";
+const INTERNAL_WS_BINARY_HEADER: &str = "x-dd-ws-binary";
+const INTERNAL_WS_CLOSE_CODE_HEADER: &str = "x-dd-ws-close-code";
+const INTERNAL_WS_CLOSE_REASON_HEADER: &str = "x-dd-ws-close-reason";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 
@@ -117,6 +125,13 @@ pub struct WorkerStreamOutput {
     pub body: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
 }
 
+#[derive(Debug)]
+pub struct WebSocketOpen {
+    pub session_id: String,
+    pub worker_name: String,
+    pub output: WorkerOutput,
+}
+
 pub type InvokeRequestBodyReceiver = mpsc::Receiver<std::result::Result<Vec<u8>, String>>;
 
 #[derive(Clone)]
@@ -155,6 +170,27 @@ enum RuntimeCommand {
         worker_name: String,
         reply: oneshot::Sender<Option<WorkerStats>>,
     },
+    OpenWebsocket {
+        worker_name: String,
+        request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
+        session_id: String,
+        reply: oneshot::Sender<Result<WebSocketOpen>>,
+    },
+    SendWebsocketFrame {
+        worker_name: String,
+        session_id: String,
+        frame: Vec<u8>,
+        is_binary: bool,
+        reply: oneshot::Sender<Result<WorkerOutput>>,
+    },
+    CloseWebsocket {
+        worker_name: String,
+        session_id: String,
+        close_code: u16,
+        close_reason: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 struct WorkerManager {
@@ -169,8 +205,37 @@ struct WorkerManager {
     stream_registrations: HashMap<String, StreamRegistration>,
     revalidation_keys: HashSet<String>,
     revalidation_requests: HashMap<String, String>,
+    websocket_sessions: HashMap<String, WorkerWebSocketSession>,
+    websocket_handle_index: HashMap<String, String>,
+    websocket_open_handles: HashMap<String, HashSet<String>>,
+    websocket_pending_closes: HashMap<String, HashMap<String, Vec<SocketCloseEvent>>>,
+    websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
+    websocket_close_signals: HashMap<String, SocketCloseEvent>,
+    websocket_open_waiters: HashMap<String, oneshot::Sender<Result<WebSocketOpen>>>,
     next_generation: u64,
     next_isolate_id: u64,
+}
+
+#[derive(Clone)]
+struct WorkerWebSocketSession {
+    worker_name: String,
+    generation: u64,
+    isolate_id: u64,
+    binding: String,
+    key: String,
+    handle: String,
+}
+
+#[derive(Clone)]
+struct SocketCloseEvent {
+    code: u16,
+    reason: String,
+}
+
+#[derive(Clone)]
+struct WebSocketOutboundFrame {
+    is_binary: bool,
+    payload: Vec<u8>,
 }
 
 struct StreamRegistration {
@@ -223,9 +288,23 @@ struct PendingInvoke {
     request_body: Option<InvokeRequestBodyReceiver>,
     actor_route: Option<ActorRoute>,
     actor_call: Option<ActorExecutionCall>,
+    reply_kind: PendingReplyKind,
     internal_origin: bool,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     enqueued_at: Instant,
+}
+
+#[derive(Clone)]
+enum PendingReplyKind {
+    Normal,
+    WebsocketOpen { session_id: String },
+    WebsocketFrame { session_id: String },
+}
+
+impl Default for PendingReplyKind {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 struct PendingReply {
@@ -238,6 +317,7 @@ struct PendingReply {
     reply: oneshot::Sender<Result<WorkerOutput>>,
     traceparent: Option<String>,
     user_request_id: String,
+    kind: PendingReplyKind,
     dispatched_at: Instant,
 }
 
@@ -264,6 +344,7 @@ struct IsolateHandle {
     id: u64,
     sender: mpsc::UnboundedSender<IsolateCommand>,
     inflight_count: usize,
+    active_websocket_sessions: usize,
     served_requests: u64,
     last_used_at: Instant,
     pending_replies: HashMap<String, PendingReply>,
@@ -299,6 +380,20 @@ enum ActorExecutionCall {
         key: String,
         name: String,
         args: Vec<u8>,
+    },
+    Message {
+        binding: String,
+        key: String,
+        handle: String,
+        is_text: bool,
+        data: Vec<u8>,
+    },
+    Close {
+        binding: String,
+        key: String,
+        handle: String,
+        code: u16,
+        reason: String,
     },
 }
 
@@ -378,6 +473,18 @@ enum RuntimeEvent {
         payload: String,
     },
     ActorInvoke(ActorInvokeEvent),
+    ActorSocketSend(crate::ops::ActorSocketSendEvent),
+    ActorSocketClose(crate::ops::ActorSocketCloseEvent),
+    ActorSocketList {
+        worker_name: String,
+        generation: u64,
+        payload: crate::ops::ActorSocketListEvent,
+    },
+    ActorSocketConsumeClose {
+        worker_name: String,
+        generation: u64,
+        payload: crate::ops::ActorSocketConsumeCloseEvent,
+    },
     IsolateFailed {
         worker_name: String,
         generation: u64,
@@ -757,6 +864,84 @@ impl RuntimeService {
         ready
     }
 
+    pub async fn open_websocket(
+        &self,
+        worker_name: String,
+        request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
+    ) -> Result<WebSocketOpen> {
+        let session_id = Uuid::new_v4().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::OpenWebsocket {
+                worker_name,
+                request,
+                request_body,
+                session_id: session_id.clone(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        let mut opened = reply_rx
+            .await
+            .map_err(|_| PlatformError::internal("runtime open websocket channel closed"))??;
+        opened.session_id = session_id;
+        Ok(opened)
+    }
+
+    pub async fn websocket_send_frame(
+        &self,
+        worker_name: String,
+        session_id: String,
+        frame: Vec<u8>,
+        is_binary: bool,
+    ) -> Result<WorkerOutput> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::SendWebsocketFrame {
+                worker_name,
+                session_id,
+                frame,
+                is_binary,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime websocket send channel closed",
+            ))
+        })
+    }
+
+    pub async fn websocket_close(
+        &self,
+        worker_name: String,
+        session_id: String,
+        close_code: u16,
+        close_reason: String,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::CloseWebsocket {
+                worker_name,
+                session_id,
+                close_code,
+                close_reason,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime websocket close channel closed",
+            ))
+        })
+    }
+
     pub async fn stats(&self, worker_name: String) -> Option<WorkerStats> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -819,6 +1004,13 @@ impl WorkerManager {
             stream_registrations: HashMap::new(),
             revalidation_keys: HashSet::new(),
             revalidation_requests: HashMap::new(),
+            websocket_sessions: HashMap::new(),
+            websocket_handle_index: HashMap::new(),
+            websocket_open_handles: HashMap::new(),
+            websocket_pending_closes: HashMap::new(),
+            websocket_outbound_frames: HashMap::new(),
+            websocket_close_signals: HashMap::new(),
+            websocket_open_waiters: HashMap::new(),
             next_generation: 1,
             next_isolate_id: 1,
         }
@@ -847,17 +1039,86 @@ impl WorkerManager {
                 request_body,
                 reply,
             } => {
-                self.enqueue_invoke(
+                let _ = self.enqueue_invoke(
                     worker_name,
                     runtime_request_id,
                     request,
                     request_body,
                     None,
                     None,
+                    None,
                     false,
+                    reply,
+                    PendingReplyKind::Normal,
+                    event_tx,
+                );
+            }
+            RuntimeCommand::OpenWebsocket {
+                worker_name,
+                mut request,
+                request_body,
+                session_id,
+                reply,
+            } => {
+                if !self.workers.contains_key(worker_name.trim()) {
+                    let _ = reply.send(Err(PlatformError::not_found("Worker not found")));
+                    return;
+                }
+                let (inner_tx, _inner_rx) = oneshot::channel();
+                append_or_update_header(
+                    &mut request.headers,
+                    INTERNAL_WS_SESSION_HEADER,
+                    &session_id,
+                );
+                self.websocket_open_waiters
+                    .insert(session_id.clone(), reply);
+
+                let runtime_request_id = Uuid::new_v4().to_string();
+                let _ = self.enqueue_invoke(
+                    worker_name,
+                    runtime_request_id,
+                    request,
+                    request_body,
+                    None,
+                    None,
+                    None,
+                    false,
+                    inner_tx,
+                    PendingReplyKind::WebsocketOpen { session_id },
+                    event_tx,
+                );
+            }
+            RuntimeCommand::SendWebsocketFrame {
+                worker_name,
+                session_id,
+                frame,
+                is_binary,
+                reply,
+            } => {
+                self.enqueue_websocket_frame(
+                    &worker_name,
+                    &session_id,
+                    frame,
+                    is_binary,
                     reply,
                     event_tx,
                 );
+            }
+            RuntimeCommand::CloseWebsocket {
+                worker_name,
+                session_id,
+                close_code,
+                close_reason,
+                reply,
+            } => {
+                let result = self.close_websocket(
+                    &worker_name,
+                    &session_id,
+                    close_code,
+                    close_reason,
+                    event_tx,
+                );
+                let _ = reply.send(result);
             }
             RuntimeCommand::RegisterStream {
                 worker_name,
@@ -955,6 +1216,26 @@ impl WorkerManager {
             RuntimeEvent::ActorInvoke(payload) => {
                 self.enqueue_actor_invoke(payload, event_tx);
             }
+            RuntimeEvent::ActorSocketSend(payload) => {
+                self.handle_actor_socket_send(payload, event_tx);
+            }
+            RuntimeEvent::ActorSocketClose(payload) => {
+                self.handle_actor_socket_close(payload, event_tx);
+            }
+            RuntimeEvent::ActorSocketList {
+                worker_name: _worker_name,
+                generation: _generation,
+                payload,
+            } => {
+                self.handle_actor_socket_list(payload, event_tx);
+            }
+            RuntimeEvent::ActorSocketConsumeClose {
+                worker_name: _worker_name,
+                generation: _generation,
+                payload,
+            } => {
+                self.handle_actor_socket_consume_close(payload, event_tx);
+            }
             RuntimeEvent::IsolateFailed {
                 worker_name,
                 generation,
@@ -966,6 +1247,433 @@ impl WorkerManager {
                 self.cleanup_drained_generations_for(&worker_name);
             }
         }
+    }
+
+    fn enqueue_websocket_frame(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+        frame: Vec<u8>,
+        is_binary: bool,
+        reply: oneshot::Sender<Result<WorkerOutput>>,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let Some(session) = self.websocket_sessions.get(session_id).cloned() else {
+            let _ = reply.send(Err(PlatformError::not_found("websocket session not found")));
+            return;
+        };
+        if session.worker_name != worker_name {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "websocket session worker mismatch",
+            )));
+            return;
+        }
+
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let route = ActorRoute {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+        };
+        let actor_call = ActorExecutionCall::Message {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+            handle: session.handle.clone(),
+            is_text: !is_binary,
+            data: frame,
+        };
+        let invoke = WorkerInvocation {
+            method: "WS-MESSAGE".to_string(),
+            url: format!("http://actor/__dd_socket/{session_id}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: format!("ws-message-{runtime_request_id}"),
+        };
+        self.enqueue_invoke(
+            session.worker_name,
+            runtime_request_id,
+            invoke,
+            None,
+            Some(route),
+            Some(actor_call),
+            Some(session.generation),
+            true,
+            reply,
+            PendingReplyKind::WebsocketFrame {
+                session_id: session_id.to_string(),
+            },
+            event_tx,
+        );
+    }
+
+    fn close_websocket(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+        close_code: u16,
+        close_reason: String,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<()> {
+        let Some(existing) = self.websocket_sessions.get(session_id) else {
+            return Err(PlatformError::not_found("websocket session not found"));
+        };
+        if existing.worker_name != worker_name {
+            return Err(PlatformError::bad_request(
+                "websocket session worker mismatch",
+            ));
+        }
+
+        let session = self
+            .unregister_websocket_session(session_id)
+            .ok_or_else(|| PlatformError::not_found("websocket session not found"))?;
+        self.queue_websocket_close_replay(&session, close_code, close_reason.clone());
+
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let route = ActorRoute {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+        };
+        let actor_call = ActorExecutionCall::Close {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+            handle: session.handle.clone(),
+            code: close_code,
+            reason: close_reason,
+        };
+        let invoke = WorkerInvocation {
+            method: "WS-CLOSE".to_string(),
+            url: format!("http://actor/__dd_socket_close/{session_id}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: format!("ws-close-{runtime_request_id}"),
+        };
+        let (reply, receiver) = oneshot::channel();
+        self.enqueue_invoke(
+            session.worker_name,
+            runtime_request_id,
+            invoke,
+            None,
+            Some(route),
+            Some(actor_call),
+            Some(session.generation),
+            true,
+            reply,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        tokio::spawn(async move {
+            let _ = receiver.await;
+        });
+        Ok(())
+    }
+
+    fn complete_websocket_open(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        session_id: String,
+        result: Result<WorkerOutput>,
+    ) {
+        let Some(waiter) = self.websocket_open_waiters.remove(&session_id) else {
+            warn!(
+                worker = %worker_name,
+                generation,
+                isolate_id,
+                session_id,
+                "missing websocket open waiter"
+            );
+            return;
+        };
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = waiter.send(Err(error));
+                return;
+            }
+        };
+        let (handle, binding, key) = match parse_websocket_open_metadata(&output, &session_id) {
+            Ok(values) => values,
+            Err(error) => {
+                let _ = waiter.send(Err(error));
+                return;
+            }
+        };
+        if let Err(error) = self.register_websocket_session(
+            worker_name,
+            generation,
+            isolate_id,
+            &session_id,
+            &binding,
+            &key,
+            &handle,
+        ) {
+            let _ = waiter.send(Err(error));
+            return;
+        }
+        let mut output = output;
+        output.headers = strip_websocket_open_internal_headers(&output.headers);
+        let _ = waiter.send(Ok(WebSocketOpen {
+            session_id,
+            worker_name: worker_name.to_string(),
+            output,
+        }));
+    }
+
+    fn complete_websocket_frame(
+        &mut self,
+        session_id: String,
+        reply: Option<oneshot::Sender<Result<WorkerOutput>>>,
+        result: Result<WorkerOutput>,
+    ) {
+        let Some(reply) = reply else {
+            return;
+        };
+        match result {
+            Ok(mut output) => {
+                output.headers = strip_websocket_frame_internal_headers(&output.headers);
+                if let Some(frame) = self
+                    .websocket_outbound_frames
+                    .get_mut(&session_id)
+                    .and_then(|queue| queue.pop_front())
+                {
+                    output.body = frame.payload;
+                    if frame.is_binary {
+                        append_or_update_header(
+                            &mut output.headers,
+                            INTERNAL_WS_BINARY_HEADER,
+                            "1",
+                        );
+                    } else {
+                        output.headers.retain(|(name, _)| {
+                            !name.eq_ignore_ascii_case(INTERNAL_WS_BINARY_HEADER)
+                        });
+                    }
+                }
+                if let Some(close) = self.websocket_close_signals.remove(&session_id) {
+                    append_or_update_header(
+                        &mut output.headers,
+                        INTERNAL_WS_CLOSE_CODE_HEADER,
+                        close.code.to_string().as_str(),
+                    );
+                    append_or_update_header(
+                        &mut output.headers,
+                        INTERNAL_WS_CLOSE_REASON_HEADER,
+                        &close.reason,
+                    );
+                }
+                let _ = reply.send(Ok(output));
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    fn register_websocket_session(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        session_id: &str,
+        binding: &str,
+        key: &str,
+        handle: &str,
+    ) -> Result<()> {
+        let owner_key = actor_owner_key(binding, key);
+        let owner_isolate_id = self
+            .get_pool_mut(worker_name, generation)
+            .and_then(|pool| pool.actor_owners.get(&owner_key).copied())
+            .unwrap_or(isolate_id);
+
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return Err(PlatformError::not_found("worker pool missing"));
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|candidate| candidate.id == owner_isolate_id)
+        else {
+            return Err(PlatformError::not_found(
+                "websocket owner isolate is not available",
+            ));
+        };
+        isolate.active_websocket_sessions += 1;
+
+        if self.websocket_sessions.contains_key(session_id) {
+            let _ = self.unregister_websocket_session(session_id);
+        }
+
+        let session = WorkerWebSocketSession {
+            worker_name: worker_name.to_string(),
+            generation,
+            isolate_id: owner_isolate_id,
+            binding: binding.to_string(),
+            key: key.to_string(),
+            handle: handle.to_string(),
+        };
+        self.websocket_sessions
+            .insert(session_id.to_string(), session.clone());
+        self.websocket_handle_index.insert(
+            actor_handle_key(&session.binding, &session.key, &session.handle),
+            session_id.to_string(),
+        );
+        self.websocket_open_handles
+            .entry(owner_key)
+            .or_default()
+            .insert(handle.to_string());
+        Ok(())
+    }
+
+    fn unregister_websocket_session(&mut self, session_id: &str) -> Option<WorkerWebSocketSession> {
+        let session = self.websocket_sessions.remove(session_id)?;
+        self.websocket_handle_index.remove(&actor_handle_key(
+            &session.binding,
+            &session.key,
+            &session.handle,
+        ));
+        self.websocket_outbound_frames.remove(session_id);
+        self.websocket_close_signals.remove(session_id);
+
+        let owner_key = actor_owner_key(&session.binding, &session.key);
+        let remove_owner_key =
+            if let Some(handles) = self.websocket_open_handles.get_mut(&owner_key) {
+                handles.remove(&session.handle);
+                handles.is_empty()
+            } else {
+                false
+            };
+        if remove_owner_key {
+            self.websocket_open_handles.remove(&owner_key);
+        }
+
+        if let Some(pool) = self.get_pool_mut(&session.worker_name, session.generation) {
+            if let Some(isolate) = pool
+                .isolates
+                .iter_mut()
+                .find(|isolate| isolate.id == session.isolate_id)
+            {
+                isolate.active_websocket_sessions =
+                    isolate.active_websocket_sessions.saturating_sub(1);
+            }
+        }
+        Some(session)
+    }
+
+    fn queue_websocket_close_replay(
+        &mut self,
+        session: &WorkerWebSocketSession,
+        close_code: u16,
+        close_reason: String,
+    ) {
+        let owner_key = actor_owner_key(&session.binding, &session.key);
+        self.websocket_pending_closes
+            .entry(owner_key)
+            .or_default()
+            .entry(session.handle.clone())
+            .or_default()
+            .push(SocketCloseEvent {
+                code: close_code,
+                reason: close_reason,
+            });
+    }
+
+    fn handle_actor_socket_send(
+        &mut self,
+        payload: crate::ops::ActorSocketSendEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorSocketSendEvent {
+            reply,
+            handle,
+            binding,
+            key,
+            is_text,
+            message,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let result = match self.websocket_handle_index.get(&index_key) {
+            Some(session_id) => {
+                self.websocket_outbound_frames
+                    .entry(session_id.clone())
+                    .or_default()
+                    .push_back(WebSocketOutboundFrame {
+                        is_binary: !is_text,
+                        payload: message,
+                    });
+                Ok(())
+            }
+            None => Err(PlatformError::not_found("websocket session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_socket_close(
+        &mut self,
+        payload: crate::ops::ActorSocketCloseEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorSocketCloseEvent {
+            reply,
+            handle,
+            binding,
+            key,
+            code,
+            reason,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let result = match self.websocket_handle_index.get(&index_key) {
+            Some(session_id) => {
+                self.websocket_close_signals
+                    .insert(session_id.clone(), SocketCloseEvent { code, reason });
+                Ok(())
+            }
+            None => Err(PlatformError::not_found("websocket session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_socket_list(
+        &mut self,
+        payload: crate::ops::ActorSocketListEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+        let mut handles: Vec<String> = self
+            .websocket_open_handles
+            .get(&owner_key)
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default();
+        handles.sort();
+        let _ = payload.reply.send(Ok(handles));
+    }
+
+    fn handle_actor_socket_consume_close(
+        &mut self,
+        payload: crate::ops::ActorSocketConsumeCloseEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+        let events = self
+            .websocket_pending_closes
+            .get_mut(&owner_key)
+            .and_then(|by_handle| by_handle.remove(&payload.handle))
+            .unwrap_or_default();
+        let remove_owner_key = self
+            .websocket_pending_closes
+            .get(&owner_key)
+            .map(|by_handle| by_handle.is_empty())
+            .unwrap_or(false);
+        if remove_owner_key {
+            self.websocket_pending_closes.remove(&owner_key);
+        }
+        let replay: Vec<crate::ops::ActorSocketCloseReplayEvent> = events
+            .into_iter()
+            .map(|event| crate::ops::ActorSocketCloseReplayEvent {
+                code: event.code,
+                reason: event.reason,
+            })
+            .collect();
+        let _ = payload.reply.send(Ok(replay));
     }
 
     async fn deploy(
@@ -1003,25 +1711,28 @@ impl WorkerManager {
             .await?;
         }
 
-        let pool = WorkerPool {
-            worker_name: worker_name.clone(),
-            generation,
-            deployment_id: deployment_id.clone(),
-            internal_trace: config.internal.trace.as_ref().map(|trace| InternalTraceDestination {
-                worker: trace.worker.trim().to_string(),
-                path: normalize_trace_path(&trace.path),
-            }),
-            is_public: config.public,
-            snapshot: worker_snapshot,
-            kv_bindings: bindings.kv,
-            actor_bindings: bindings.actor,
-            queue: VecDeque::new(),
-            isolates: Vec::new(),
-            actor_owners: HashMap::new(),
-            actor_inflight: HashMap::new(),
-            stats: PoolStats::default(),
-            queue_warn_level: 0,
-        };
+        let pool =
+            WorkerPool {
+                worker_name: worker_name.clone(),
+                generation,
+                deployment_id: deployment_id.clone(),
+                internal_trace: config.internal.trace.as_ref().map(|trace| {
+                    InternalTraceDestination {
+                        worker: trace.worker.trim().to_string(),
+                        path: normalize_trace_path(&trace.path),
+                    }
+                }),
+                is_public: config.public,
+                snapshot: worker_snapshot,
+                kv_bindings: bindings.kv,
+                actor_bindings: bindings.actor,
+                queue: VecDeque::new(),
+                isolates: Vec::new(),
+                actor_owners: HashMap::new(),
+                actor_inflight: HashMap::new(),
+                stats: PoolStats::default(),
+                queue_warn_level: 0,
+            };
 
         let entry = self
             .workers
@@ -1065,8 +1776,10 @@ impl WorkerManager {
         request_body: Option<InvokeRequestBodyReceiver>,
         actor_route: Option<ActorRoute>,
         actor_call: Option<ActorExecutionCall>,
+        target_generation: Option<u64>,
         internal_origin: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
+        reply_kind: PendingReplyKind,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let worker_name = worker_name.trim().to_string();
@@ -1085,16 +1798,19 @@ impl WorkerManager {
             return;
         }
         let warn_thresholds = self.config.queue_warn_thresholds.clone();
-        let Some(generation) = self
-            .workers
-            .get(&worker_name)
-            .map(|entry| entry.current_generation)
-        else {
+        let Some(entry) = self.workers.get(&worker_name) else {
             let error = PlatformError::not_found("Worker not found");
             let _ = reply.send(Err(error.clone()));
             self.fail_stream_registration(&worker_name, &runtime_request_id, error);
             return;
         };
+        let generation = target_generation.unwrap_or(entry.current_generation);
+        if !entry.pools.contains_key(&generation) {
+            let error = PlatformError::not_found("Worker generation not found");
+            let _ = reply.send(Err(error.clone()));
+            self.fail_stream_registration(&worker_name, &runtime_request_id, error);
+            return;
+        }
 
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
             if let Some(route) = &actor_route {
@@ -1120,6 +1836,7 @@ impl WorkerManager {
                 actor_call,
                 internal_origin,
                 reply,
+                reply_kind,
                 enqueued_at: Instant::now(),
             });
             pool.update_queue_warning(&warn_thresholds);
@@ -1193,8 +1910,10 @@ impl WorkerManager {
             None,
             Some(route),
             Some(actor_call),
+            None,
             false,
             reply_tx,
+            PendingReplyKind::Normal,
             event_tx,
         );
         tokio::spawn(async move {
@@ -1241,6 +1960,7 @@ impl WorkerManager {
         let mut abort_commands = Vec::new();
         let mut matched = false;
         let mut cleared_request_ids = Vec::new();
+        let mut websocket_waiters_to_abort = Vec::new();
 
         if let Some(entry) = self.workers.get_mut(&worker_name) {
             for (generation, pool) in &mut entry.pools {
@@ -1252,6 +1972,9 @@ impl WorkerManager {
                     .position(|pending| pending.runtime_request_id == runtime_request_id)
                 {
                     if let Some(pending) = pool.queue.remove(idx) {
+                        if let PendingReplyKind::WebsocketOpen { session_id } = pending.reply_kind {
+                            websocket_waiters_to_abort.push(session_id);
+                        }
                         cleared_request_ids.push(pending.runtime_request_id.clone());
                         let _ = pending
                             .reply
@@ -1265,6 +1988,10 @@ impl WorkerManager {
                     if let Some(pending_reply) =
                         isolate.pending_replies.get_mut(&runtime_request_id)
                     {
+                        if let PendingReplyKind::WebsocketOpen { session_id } = &pending_reply.kind
+                        {
+                            websocket_waiters_to_abort.push(session_id.clone());
+                        }
                         pending_reply.canceled = true;
                         abort_commands.push((*generation, isolate.id, isolate.sender.clone()));
                         generation_touched = true;
@@ -1281,6 +2008,14 @@ impl WorkerManager {
 
         for request_id in cleared_request_ids {
             self.clear_revalidation_for_request(&request_id);
+        }
+
+        websocket_waiters_to_abort.sort();
+        websocket_waiters_to_abort.dedup();
+        for session_id in websocket_waiters_to_abort {
+            if let Some(waiter) = self.websocket_open_waiters.remove(&session_id) {
+                let _ = waiter.send(Err(PlatformError::runtime("request was aborted")));
+            }
         }
 
         for (generation, isolate_id, sender) in abort_commands {
@@ -1404,6 +2139,7 @@ impl WorkerManager {
                 if should_count_reuse {
                     pool.stats.reuse_count += 1;
                 }
+                let pending_kind = pending_invoke.reply_kind.clone();
                 if let Some(actor_key) = &candidate.actor_key {
                     if candidate.assign_owner {
                         let owner_id = pool.isolates[isolate_idx].id;
@@ -1444,6 +2180,7 @@ impl WorkerManager {
                                 .expect("pending reply must exist before dispatch"),
                             traceparent: traceparent.clone(),
                             user_request_id: user_request_id.clone(),
+                            kind: pending_kind,
                             dispatched_at: Instant::now(),
                         },
                     );
@@ -1527,6 +2264,7 @@ impl WorkerManager {
         let mut request_url = String::new();
         let mut execution_ms: Option<u64> = None;
         let mut internal_origin = false;
+        let mut pending_kind = PendingReplyKind::Normal;
         let trace_destination = self
             .get_pool_mut(worker_name, generation)
             .and_then(|pool| pool.internal_trace.clone());
@@ -1578,6 +2316,7 @@ impl WorkerManager {
                     completion_traceparent = pending.traceparent;
                     user_request_id = pending.user_request_id;
                     execution_ms = Some(pending.dispatched_at.elapsed().as_millis() as u64);
+                    pending_kind = pending.kind;
                     reply = Some(pending.reply);
                 }
             }
@@ -1607,8 +2346,24 @@ impl WorkerManager {
         let _complete_guard = complete_span.enter();
 
         if !canceled {
-            if let Some(reply) = reply {
-                let _ = reply.send(result);
+            match pending_kind {
+                PendingReplyKind::Normal => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                }
+                PendingReplyKind::WebsocketOpen { session_id } => {
+                    self.complete_websocket_open(
+                        worker_name,
+                        generation,
+                        isolate_id,
+                        session_id,
+                        result,
+                    );
+                }
+                PendingReplyKind::WebsocketFrame { session_id } => {
+                    self.complete_websocket_frame(session_id, reply, result);
+                }
             }
             tracing::info!("request completion delivered");
         } else {
@@ -1706,7 +2461,10 @@ impl WorkerManager {
                 return;
             }
         };
-        let mut headers = vec![(CONTENT_TYPE_HEADER.to_string(), JSON_CONTENT_TYPE.to_string())];
+        let mut headers = vec![(
+            CONTENT_TYPE_HEADER.to_string(),
+            JSON_CONTENT_TYPE.to_string(),
+        )];
         append_internal_trace_headers(&mut headers, worker_name, generation);
         let trace_request = WorkerInvocation {
             method: "POST".to_string(),
@@ -1727,8 +2485,10 @@ impl WorkerManager {
             None,
             None,
             None,
+            None,
             true,
             reply,
+            PendingReplyKind::Normal,
             event_tx,
         );
         let request_id_for_warning = runtime_request_id.to_string();
@@ -1760,10 +2520,25 @@ impl WorkerManager {
         isolate_id: u64,
         error: PlatformError,
     ) {
+        let affected_sessions: Vec<String> = self
+            .websocket_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.worker_name == worker_name
+                    && session.generation == generation
+                    && session.isolate_id == isolate_id
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
         for (request_id, reply) in failed {
             self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
+        }
+        for session_id in affected_sessions {
+            if let Some(session) = self.unregister_websocket_session(&session_id) {
+                self.queue_websocket_close_replay(&session, 1006, "isolate failed".to_string());
+            }
         }
         self.fail_all_streams_for_worker(worker_name, error);
     }
@@ -1924,6 +2699,7 @@ impl WorkerManager {
                 actor_call: None,
                 internal_origin: false,
                 reply,
+                reply_kind: PendingReplyKind::Normal,
                 enqueued_at: Instant::now(),
             });
             pool.update_queue_warning(&warn_thresholds);
@@ -2032,23 +2808,38 @@ impl WorkerManager {
         generation: u64,
         isolate_idx: usize,
     ) -> Vec<(String, oneshot::Sender<Result<WorkerOutput>>)> {
+        let mut websocket_open_session_ids = Vec::new();
+        let mut replies = Vec::new();
+        let mut removed = false;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if isolate_idx < pool.isolates.len() {
                 let isolate = pool.isolates.swap_remove(isolate_idx);
                 let _ = isolate.sender.send(IsolateCommand::Shutdown);
                 pool.actor_owners
                     .retain(|_, owner_id| *owner_id != isolate.id);
-                let mut replies = Vec::with_capacity(isolate.pending_replies.len());
+                replies = Vec::with_capacity(isolate.pending_replies.len());
                 for (request_id, pending) in isolate.pending_replies {
                     if let Some(actor_key) = pending.actor_key.as_deref() {
                         decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
                     }
+                    if let PendingReplyKind::WebsocketOpen { session_id } = pending.kind {
+                        websocket_open_session_ids.push(session_id);
+                    }
                     replies.push((request_id, pending.reply));
                 }
-                return replies;
+                removed = true;
             }
         }
-        Vec::new()
+        for session_id in websocket_open_session_ids {
+            if let Some(waiter) = self.websocket_open_waiters.remove(&session_id) {
+                let _ = waiter.send(Err(PlatformError::internal("isolate is unavailable")));
+            }
+        }
+        if removed {
+            replies
+        } else {
+            Vec::new()
+        }
     }
 
     fn remove_isolate_by_id(
@@ -2104,6 +2895,7 @@ impl WorkerManager {
                     .enumerate()
                     .filter(|(_, isolate)| isolate.inflight_count == 0)
                     .filter(|(_, isolate)| isolate.pending_wait_until.is_empty())
+                    .filter(|(_, isolate)| isolate.active_websocket_sessions == 0)
                     .filter(|(_, isolate)| now.duration_since(isolate.last_used_at) >= idle_ttl)
                     .min_by_key(|(_, isolate)| isolate.last_used_at);
                 let Some((idx, _)) = candidate else {
@@ -2211,6 +3003,15 @@ impl WorkerManager {
                 let _ = registration.body_sender.send(Err(error));
             }
         }
+        for (_, waiter) in std::mem::take(&mut self.websocket_open_waiters) {
+            let _ = waiter.send(Err(PlatformError::internal("runtime shutting down")));
+        }
+        self.websocket_sessions.clear();
+        self.websocket_handle_index.clear();
+        self.websocket_open_handles.clear();
+        self.websocket_pending_closes.clear();
+        self.websocket_outbound_frames.clear();
+        self.websocket_close_signals.clear();
     }
 }
 
@@ -2294,13 +3095,20 @@ fn decrement_actor_inflight(actor_inflight: &mut HashMap<String, usize>, actor_k
 
 impl WorkerPool {
     fn is_drained(&self) -> bool {
-        self.queue.is_empty() && self.inflight_total() == 0 && self.wait_until_total() == 0
+        self.queue.is_empty()
+            && self.inflight_total() == 0
+            && self.wait_until_total() == 0
+            && self.active_websocket_total() == 0
     }
 
     fn busy_count(&self) -> usize {
         self.isolates
             .iter()
-            .filter(|isolate| isolate.inflight_count > 0 || !isolate.pending_wait_until.is_empty())
+            .filter(|isolate| {
+                isolate.inflight_count > 0
+                    || !isolate.pending_wait_until.is_empty()
+                    || isolate.active_websocket_sessions > 0
+            })
             .count()
     }
 
@@ -2315,6 +3123,13 @@ impl WorkerPool {
         self.isolates
             .iter()
             .map(|isolate| isolate.pending_wait_until.len())
+            .sum()
+    }
+
+    fn active_websocket_total(&self) -> usize {
+        self.isolates
+            .iter()
+            .map(|isolate| isolate.active_websocket_sessions)
             .sum()
     }
 
@@ -2662,6 +3477,26 @@ fn spawn_isolate_thread(
                                 IsolateEventPayload::ActorInvoke(payload) => {
                                     let _ = event_tx.send(RuntimeEvent::ActorInvoke(payload));
                                 }
+                                IsolateEventPayload::ActorSocketSend(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorSocketSend(payload));
+                                }
+                                IsolateEventPayload::ActorSocketClose(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorSocketClose(payload));
+                                }
+                                IsolateEventPayload::ActorSocketList(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorSocketList {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        payload,
+                                    });
+                                }
+                                IsolateEventPayload::ActorSocketConsumeClose(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorSocketConsumeClose {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        payload,
+                                    });
+                                }
                             }
                         }
                         Some(command) = command_rx.recv() => {
@@ -2727,6 +3562,32 @@ fn spawn_isolate_thread(
                                             key: key.clone(),
                                             name: name.clone(),
                                             args: args.clone(),
+                                        },
+                                        ActorExecutionCall::Message {
+                                            binding,
+                                            key,
+                                            handle,
+                                            is_text,
+                                            data,
+                                        } => ExecuteActorCall::Message {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                            handle: handle.clone(),
+                                            is_text: *is_text,
+                                            data: data.clone(),
+                                        },
+                                        ActorExecutionCall::Close {
+                                            binding,
+                                            key,
+                                            handle,
+                                            code,
+                                            reason,
+                                        } => ExecuteActorCall::Close {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                            handle: handle.clone(),
+                                            code: *code,
+                                            reason: reason.clone(),
                                         },
                                     });
                                     if let Err(error) = dispatch_worker_request(
@@ -2814,6 +3675,7 @@ fn spawn_isolate_thread(
             id: isolate_id,
             sender: command_tx,
             inflight_count: 0,
+            active_websocket_sessions: 0,
             served_requests: 0,
             last_used_at: Instant::now(),
             pending_replies: HashMap::new(),
@@ -3010,6 +3872,78 @@ fn append_or_update_header(headers: &mut Vec<(String, String)>, key: &str, value
     headers.push((key.to_string(), value.to_string()));
 }
 
+fn actor_owner_key(binding: &str, key: &str) -> String {
+    format!("{binding}\u{001f}{key}")
+}
+
+fn actor_handle_key(binding: &str, key: &str, handle: &str) -> String {
+    format!("{binding}\u{001f}{key}\u{001f}{handle}")
+}
+
+fn internal_header_value(headers: &[(String, String)], key: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.clone())
+}
+
+fn parse_websocket_open_metadata(
+    output: &WorkerOutput,
+    expected_session_id: &str,
+) -> Result<(String, String, String)> {
+    if output.status != 101 {
+        return Err(PlatformError::bad_request(
+            "websocket upgrade rejected by worker",
+        ));
+    }
+    let accepted = internal_header_value(&output.headers, INTERNAL_WS_ACCEPT_HEADER)
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    if !accepted {
+        return Err(PlatformError::bad_request(
+            "worker did not accept websocket request",
+        ));
+    }
+    let handle = internal_header_value(&output.headers, INTERNAL_WS_HANDLE_HEADER)
+        .unwrap_or_else(|| expected_session_id.to_string());
+    let binding = internal_header_value(&output.headers, INTERNAL_WS_BINDING_HEADER)
+        .ok_or_else(|| PlatformError::bad_request("missing websocket actor binding metadata"))?;
+    let key = internal_header_value(&output.headers, INTERNAL_WS_KEY_HEADER)
+        .ok_or_else(|| PlatformError::bad_request("missing websocket actor key metadata"))?;
+    if let Some(session_id) = internal_header_value(&output.headers, INTERNAL_WS_SESSION_HEADER) {
+        if session_id != expected_session_id {
+            return Err(PlatformError::bad_request(
+                "websocket session metadata mismatch",
+            ));
+        }
+    }
+    Ok((handle, binding, key))
+}
+
+fn strip_websocket_open_internal_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_ACCEPT_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_SESSION_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_HANDLE_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_BINDING_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_KEY_HEADER))
+        .cloned()
+        .collect()
+}
+
+fn strip_websocket_frame_internal_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_ACCEPT_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_SESSION_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_HANDLE_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_BINDING_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_KEY_HEADER))
+        .cloned()
+        .collect()
+}
+
 fn normalize_trace_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.starts_with('/') {
@@ -3057,12 +3991,14 @@ impl Extractor for TraceparentExtractor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
+    use super::{
+        BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
+    };
     use common::{
         DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination, WorkerInvocation,
     };
-    use serial_test::serial;
     use serde::Deserialize;
+    use serial_test::serial;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -3401,7 +4337,7 @@ export class MyActor {
         .to_string()
     }
 
-fn trace_sink_worker() -> String {
+    fn trace_sink_worker() -> String {
         r#"
 export default {
   async fetch(request) {
@@ -3972,9 +4908,7 @@ export default {
                 actor_worker(),
                 DeployConfig {
                     public: false,
-                    internal: DeployInternalConfig {
-                        trace: None,
-                    },
+                    internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
                         class: "MyActor".to_string(),
@@ -4034,9 +4968,7 @@ export default {
                 actor_worker(),
                 DeployConfig {
                     public: false,
-                    internal: DeployInternalConfig {
-                        trace: None,
-                    },
+                    internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
                         class: "MyActor".to_string(),
@@ -4097,9 +5029,7 @@ export default {
                 actor_worker(),
                 DeployConfig {
                     public: false,
-                    internal: DeployInternalConfig {
-                        trace: None,
-                    },
+                    internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
                         class: "MyActor".to_string(),
@@ -4262,7 +5192,9 @@ export default {
             .expect("deploy traced worker should succeed");
 
         let mut request = test_invocation_with_path("/", "trace-request");
-        request.headers.push(("x-test".to_string(), "value".to_string()));
+        request
+            .headers
+            .push(("x-test".to_string(), "value".to_string()));
         service
             .invoke("traced-worker".to_string(), request)
             .await
@@ -4339,7 +5271,10 @@ export default {
             .expect("deploy loop worker should succeed");
 
         service
-            .invoke("loop-worker".to_string(), test_invocation_with_path("/", "loop-user"))
+            .invoke(
+                "loop-worker".to_string(),
+                test_invocation_with_path("/", "loop-user"),
+            )
             .await
             .expect("loop worker invoke should succeed");
 
@@ -4354,8 +5289,7 @@ export default {
                     .await
                     .expect("loop worker state invoke should succeed");
                 let state: LoopTraceState = crate::json::from_string(
-                    String::from_utf8(state_output.body)
-                        .expect("loop state body should be utf8"),
+                    String::from_utf8(state_output.body).expect("loop state body should be utf8"),
                 )
                 .expect("loop state should parse as json");
                 if state.trace_calls >= 2 {

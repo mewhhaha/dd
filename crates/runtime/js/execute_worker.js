@@ -281,6 +281,25 @@
     }
   };
 
+  const isBinaryLike = (value) => (
+    value instanceof ArrayBuffer
+    || ArrayBuffer.isView(value)
+    || value instanceof Uint8Array
+  );
+
+  const normalizeSocketMessageForJs = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return value;
+    }
+    if (value.__dd_rpc_type === "socket_message") {
+      if (String(value.kind || "").toLowerCase() === "binary") {
+        return toArrayBytes(value.value ?? value.body ?? value.data);
+      }
+      return String(value.value ?? value.body ?? "");
+    }
+    return value;
+  };
+
   const normalizeActorFetchInput = async (inputValue, initValue) => {
     let method = "GET";
     let url = "http://worker/";
@@ -382,6 +401,9 @@
   };
 
   const decodeRpcValue = (value) => {
+    if (value?.__dd_rpc_type === "socket_message") {
+      return normalizeSocketMessageForJs(value);
+    }
     if (Array.isArray(value)) {
       return value.map((item) => decodeRpcValue(item));
     }
@@ -441,6 +463,41 @@
   };
 
   const decodeRpcResult = (bytes) => decodeRpcValue(Deno.core.deserialize(bytes));
+
+  const INTERNAL_WS_ACCEPT_HEADER = "x-dd-ws-accept";
+  const INTERNAL_WS_SESSION_HEADER = "x-dd-ws-session";
+  const INTERNAL_WS_HANDLE_HEADER = "x-dd-ws-handle";
+  const INTERNAL_WS_BINDING_HEADER = "x-dd-ws-actor-binding";
+  const INTERNAL_WS_KEY_HEADER = "x-dd-ws-actor-key";
+
+  const encodeSocketSendPayload = (value, kind) => {
+    if (kind != null) {
+      const normalizedKind = String(kind).toLowerCase();
+      if (normalizedKind === "text") {
+        return {
+          kind: "text",
+          value: String(value),
+        };
+      }
+      if (normalizedKind === "binary") {
+        return {
+          kind: "binary",
+          value: Array.from(toArrayBytes(value)),
+        };
+      }
+      throw new Error(`WebSocket(handle).send unsupported kind: ${kind}`);
+    }
+    if (isBinaryLike(value)) {
+      return {
+        kind: "binary",
+        value: Array.from(toArrayBytes(value)),
+      };
+    }
+    return {
+      kind: "text",
+      value: String(value ?? ""),
+    };
+  };
 
   const createActorStorageBinding = (runtimeRequestId) => ({
     async get(key) {
@@ -563,14 +620,258 @@
     },
   });
 
-  const createActorRuntimeState = (actorKey, runtimeRequestId) => ({
-    id: {
-      toString() {
-        return actorKey;
+  const createActorSocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
+    const socketsByHandle = entry.socketBindings ??= new Map();
+    const openHandles = entry.openSocketHandles ??= new Set();
+
+    const consumeCloseEvents = async (target) => {
+      const result = await callOp("op_actor_socket_consume_close", {
+        request_id: runtimeRequestId,
+        handle: target.__dd_handle,
+      });
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "socket consumeClose failed"));
+      }
+      const events = Array.isArray(result?.events) ? result.events : [];
+      for (const event of events) {
+        target.__dd_dispatchClose(
+          Number(event?.code ?? 1000),
+          String(event?.reason ?? ""),
+        );
+      }
+    };
+
+    const ensureSocket = (handle) => {
+      const normalizedHandle = String(handle ?? "").trim();
+      if (!normalizedHandle) {
+        throw new Error("WebSocket(handle) requires a non-empty handle");
+      }
+      const existing = socketsByHandle.get(normalizedHandle);
+      if (existing) {
+        consumeCloseEvents(existing).catch(() => {});
+        return existing;
+      }
+
+      const listeners = new Map();
+      let onmessage = null;
+      let onclose = null;
+      const closeQueue = [];
+      let closed = false;
+      const target = {
+        __dd_handle: normalizedHandle,
+        binaryType: "arraybuffer",
+        get readyState() {
+          return closed ? 3 : 1;
+        },
+        addEventListener(type, listener) {
+          const key = String(type ?? "");
+          if (!listeners.has(key)) {
+            listeners.set(key, new Set());
+          }
+          if (typeof listener === "function") {
+            listeners.get(key).add(listener);
+          }
+          if (key === "close") {
+            this.__dd_flushCloseQueue();
+          }
+        },
+        removeEventListener(type, listener) {
+          const key = String(type ?? "");
+          if (!listeners.has(key)) {
+            return;
+          }
+          listeners.get(key).delete(listener);
+        },
+        get onmessage() {
+          return onmessage;
+        },
+        set onmessage(listener) {
+          onmessage = typeof listener === "function" ? listener : null;
+        },
+        get onclose() {
+          return onclose;
+        },
+        set onclose(listener) {
+          onclose = typeof listener === "function" ? listener : null;
+          this.__dd_flushCloseQueue();
+        },
+        async send(value, kind) {
+          const payload = encodeSocketSendPayload(value, kind);
+          const result = await callOp("op_actor_socket_send", {
+            request_id: runtimeRequestId,
+            handle: normalizedHandle,
+            message_kind: payload.kind,
+            message: payload.value,
+          });
+          await syncFrozenTime();
+          if (result && typeof result === "object" && result.ok === false) {
+            throw new Error(String(result.error ?? "socket send failed"));
+          }
+        },
+        async close(code, reason) {
+          const normalizedCode = Number.isFinite(Number(code))
+            ? Math.trunc(Number(code))
+            : 1000;
+          const result = await callOp("op_actor_socket_close", {
+            request_id: runtimeRequestId,
+            handle: normalizedHandle,
+            code: normalizedCode,
+            reason: reason == null ? "" : String(reason),
+          });
+          await syncFrozenTime();
+          if (result && typeof result === "object" && result.ok === false) {
+            throw new Error(String(result.error ?? "socket close failed"));
+          }
+        },
+        __dd_dispatch(type, event) {
+          const current = listeners.get(type);
+          if (current) {
+            for (const listener of current) {
+              try {
+                listener.call(this, event);
+              } catch {
+                // Ignore listener failures.
+              }
+            }
+          }
+        },
+        __dd_dispatchMessage(value) {
+          const event = { type: "message", data: value, target: this };
+          this.__dd_dispatch("message", event);
+          if (typeof onmessage === "function") {
+            try {
+              onmessage.call(this, event);
+            } catch {
+              // Ignore onmessage failures.
+            }
+          }
+        },
+        __dd_dispatchClose(code, reason) {
+          const event = {
+            type: "close",
+            code: Number(code),
+            reason: String(reason ?? ""),
+            wasClean: true,
+            target: this,
+          };
+          closeQueue.push(event);
+          closed = true;
+          openHandles.delete(normalizedHandle);
+          this.__dd_flushCloseQueue();
+        },
+        __dd_flushCloseQueue() {
+          if (closeQueue.length === 0) {
+            return;
+          }
+          if (!onclose && !(listeners.get("close")?.size > 0)) {
+            return;
+          }
+          while (closeQueue.length > 0) {
+            const event = closeQueue.shift();
+            this.__dd_dispatch("close", event);
+            if (typeof onclose === "function") {
+              try {
+                onclose.call(this, event);
+              } catch {
+                // Ignore onclose failures.
+              }
+            }
+          }
+        },
+      };
+      socketsByHandle.set(normalizedHandle, target);
+      consumeCloseEvents(target).catch(() => {});
+      return target;
+    };
+
+    const WebSocketForActor = function WebSocket(handle) {
+      return ensureSocket(handle);
+    };
+
+    const upgradeAccepted = { used: false };
+    const sockets = {
+      async accept(request, options = {}) {
+        const _ = options;
+        if (!allowSocketAccept) {
+          throw new Error("state.sockets.accept is only available during actor fetch()");
+        }
+        if (upgradeAccepted.used) {
+          throw new Error("state.sockets.accept can only be called once per request");
+        }
+        if (!(request instanceof Request)) {
+          throw new Error("state.sockets.accept requires a Request");
+        }
+        const connection = String(request.headers.get("connection") ?? "");
+        const upgrade = String(request.headers.get("upgrade") ?? "");
+        const hasUpgrade = connection
+          .split(",")
+          .map((value) => value.trim().toLowerCase())
+          .includes("upgrade");
+        if (!hasUpgrade || upgrade.toLowerCase() !== "websocket") {
+          throw new Error("state.sockets.accept requires a websocket upgrade request");
+        }
+        const sessionId = String(request.headers.get(INTERNAL_WS_SESSION_HEADER) ?? "").trim();
+        if (!sessionId) {
+          throw new Error("state.sockets.accept missing runtime websocket session metadata");
+        }
+        const handle = sessionId;
+        const headers = new Headers();
+        headers.set(INTERNAL_WS_ACCEPT_HEADER, "1");
+        headers.set(INTERNAL_WS_SESSION_HEADER, sessionId);
+        headers.set(INTERNAL_WS_HANDLE_HEADER, handle);
+        headers.set(INTERNAL_WS_BINDING_HEADER, entry.binding);
+        headers.set(INTERNAL_WS_KEY_HEADER, entry.actorKey);
+        upgradeAccepted.used = true;
+        openHandles.add(handle);
+        return {
+          handle,
+          response: new Response(null, {
+            status: 101,
+            headers: Array.from(headers.entries()),
+          }),
+        };
       },
-    },
-    storage: createActorStorageBinding(runtimeRequestId),
-  });
+      values() {
+        return Array.from(openHandles.values());
+      },
+    };
+
+    return {
+      sockets,
+      WebSocket: WebSocketForActor,
+      ensureSocket,
+      async refreshOpenHandles() {
+        const result = await callOp("op_actor_socket_list", {
+          request_id: runtimeRequestId,
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "socket values failed"));
+        }
+        openHandles.clear();
+        const handles = Array.isArray(result?.handles) ? result.handles : [];
+        for (const value of handles) {
+          openHandles.add(String(value));
+        }
+      },
+    };
+  };
+
+  const createActorRuntimeState = (entry, runtimeRequestId, allowSocketAccept) => {
+    const socketRuntime = createActorSocketRuntime(entry, runtimeRequestId, allowSocketAccept);
+    entry.socketRuntime = socketRuntime;
+    return {
+      id: {
+        toString() {
+          return entry.actorKey;
+        },
+      },
+      storage: createActorStorageBinding(runtimeRequestId),
+      sockets: socketRuntime.sockets,
+      __dd_socket_runtime: socketRuntime,
+    };
+  };
 
   const actorInstances = globalThis.__dd_actor_instances ??= new Map();
 
@@ -580,6 +881,10 @@
     || name === "fetch"
     || name === "then"
     || name.startsWith("__dd_")
+  );
+
+  const actorMethodNameIsBlockedForProxy = (name) => (
+    actorMethodNameIsBlocked(name)
   );
 
   const createActorStub = (namespace, actorKey) => {
@@ -623,7 +928,7 @@
         if (methodName === "then") {
           return undefined;
         }
-        if (actorMethodNameIsBlocked(methodName)) {
+        if (actorMethodNameIsBlockedForProxy(methodName)) {
           throw new Error(`actor method is blocked: ${methodName}`);
         }
         return async (...args) => {
@@ -758,12 +1063,36 @@
     let entry = actorInstances.get(cacheKey);
     if (!entry) {
       entry = {
-        instance: new actorClass(createActorRuntimeState(actorKey, requestId), env),
+        binding,
+        actorKey,
+        socketBindings: new Map(),
+        socketRuntime: null,
       };
+      const constructorState = createActorRuntimeState(entry, requestId, false);
+      await constructorState.__dd_socket_runtime.refreshOpenHandles();
+      const previousWebSocketForCtor = globalThis.WebSocket;
+      globalThis.WebSocket = constructorState.__dd_socket_runtime.WebSocket;
+      try {
+        entry = {
+          ...entry,
+          instance: new actorClass(constructorState, env),
+        };
+      } finally {
+        if (previousWebSocketForCtor === undefined) {
+          delete globalThis.WebSocket;
+        } else {
+          globalThis.WebSocket = previousWebSocketForCtor;
+        }
+      }
       actorInstances.set(cacheKey, entry);
     }
+    entry.binding = binding;
+    entry.actorKey = actorKey;
 
-    const scopedState = createActorRuntimeState(actorKey, requestId);
+    const kind = String(actorCall.kind ?? "");
+    const scopedState = createActorRuntimeState(entry, requestId, kind === "fetch");
+    const previousWebSocket = globalThis.WebSocket;
+    globalThis.WebSocket = scopedState.__dd_socket_runtime.WebSocket;
     const receiver = new Proxy(entry.instance, {
       get(target, prop, receiverValue) {
         if (prop === "state") {
@@ -779,31 +1108,58 @@
       },
     });
 
-    const kind = String(actorCall.kind ?? "");
-    if (kind === "fetch") {
-      if (typeof entry.instance.fetch !== "function") {
-        throw new Error(`actor class does not define fetch(): ${className}`);
+    try {
+      await scopedState.__dd_socket_runtime.refreshOpenHandles();
+      if (kind === "fetch") {
+        if (typeof entry.instance.fetch !== "function") {
+          throw new Error(`actor class does not define fetch(): ${className}`);
+        }
+        return await entry.instance.fetch.call(receiver, request);
       }
-      return await entry.instance.fetch.call(receiver, request);
+      if (kind === "method") {
+        const methodName = String(actorCall.name ?? "").trim();
+        if (actorMethodNameIsBlocked(methodName)) {
+          throw new Error(`actor method is blocked: ${methodName}`);
+        }
+        const method = entry.instance[methodName];
+        if (typeof method !== "function") {
+          throw new Error(`actor method not found: ${methodName}`);
+        }
+        const args = decodeRpcArgs(toArrayBytes(actorCall.args));
+        const value = await method.apply(receiver, args);
+        const encoded = await encodeRpcResult(value);
+        return new Response(encoded, {
+          status: 200,
+          headers: [["content-type", "application/octet-stream"]],
+        });
+      }
+      if (kind === "message") {
+        const handle = String(actorCall.handle ?? "").trim();
+        if (!handle) {
+          throw new Error("actor message invoke requires socket handle");
+        }
+        const ws = new globalThis.WebSocket(handle);
+        const raw = toArrayBytes(actorCall.data);
+        const message = actorCall.is_text === true ? Deno.core.decode(raw) : raw;
+        ws.__dd_dispatchMessage(message);
+        return new Response(null, { status: 204 });
+      }
+      if (kind === "close") {
+        const handle = String(actorCall.handle ?? "").trim();
+        if (!handle) {
+          throw new Error("actor close invoke requires socket handle");
+        }
+        new globalThis.WebSocket(handle);
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unsupported actor invoke kind: ${kind}`);
+    } finally {
+      if (previousWebSocket === undefined) {
+        delete globalThis.WebSocket;
+      } else {
+        globalThis.WebSocket = previousWebSocket;
+      }
     }
-    if (kind === "method") {
-      const methodName = String(actorCall.name ?? "").trim();
-      if (actorMethodNameIsBlocked(methodName)) {
-        throw new Error(`actor method is blocked: ${methodName}`);
-      }
-      const method = entry.instance[methodName];
-      if (typeof method !== "function") {
-        throw new Error(`actor method not found: ${methodName}`);
-      }
-      const args = decodeRpcArgs(toArrayBytes(actorCall.args));
-      const value = await method.apply(receiver, args);
-      const encoded = await encodeRpcResult(value);
-      return new Response(encoded, {
-        status: 200,
-        headers: [["content-type", "application/octet-stream"]],
-      });
-    }
-    throw new Error(`unsupported actor invoke kind: ${kind}`);
   };
 
   const emitWaitUntilDone = async (timedOut) => {

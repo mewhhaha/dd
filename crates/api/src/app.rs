@@ -4,7 +4,7 @@ use common::{PlatformError, Result};
 use std::net::SocketAddr;
 use tracing::info;
 
-fn private_router(state: AppState) -> axum::Router {
+pub(crate) fn private_router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/v1/deploy", axum::routing::post(deploy_worker))
         .route("/v1/invoke", axum::routing::any(invoke_worker_private))
@@ -15,7 +15,7 @@ fn private_router(state: AppState) -> axum::Router {
         .with_state(state)
 }
 
-fn public_router(state: AppState) -> axum::Router {
+pub(crate) fn public_router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::any(invoke_worker_public))
         .route("/{*path}", axum::routing::any(invoke_worker_public))

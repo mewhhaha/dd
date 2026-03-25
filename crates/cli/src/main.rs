@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use common::{
-    DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse, DeployTraceDestination,
-    ErrorBody,
+    DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse,
+    DeployTraceDestination, ErrorBody,
 };
 use std::env;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};

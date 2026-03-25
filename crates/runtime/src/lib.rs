@@ -14,5 +14,5 @@ pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use service::{
     InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, WorkerStats, WorkerStreamOutput,
+    RuntimeStorageConfig, WebSocketOpen, WorkerStats, WorkerStreamOutput,
 };

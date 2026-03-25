@@ -24,6 +24,20 @@ pub enum ExecuteActorCall {
         name: String,
         args: Vec<u8>,
     },
+    Message {
+        binding: String,
+        key: String,
+        handle: String,
+        is_text: bool,
+        data: Vec<u8>,
+    },
+    Close {
+        binding: String,
+        key: String,
+        handle: String,
+        code: u16,
+        reason: String,
+    },
 }
 
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {

@@ -29,6 +29,25 @@ struct MethodResult {
   value @0 :Data;
 }
 
+struct SocketMessage {
+  sessionId @0 :Text;
+  isText @1 :Bool;
+  data @2 :Data;
+}
+
+struct SocketClose {
+  sessionId @0 :Text;
+  code @1 :UInt16;
+  reason @2 :Text;
+}
+
+struct SocketOpen {
+  sessionId @0 :Text;
+  binding @1 :Text;
+  key @2 :Text;
+  requestId @3 :Text;
+}
+
 struct Target {
   workerName @0 :Text;
   binding @1 :Text;
@@ -48,5 +67,13 @@ struct InvokeResponse {
     fetch @0 :HttpResponse;
     method @1 :MethodResult;
     error @2 :Text;
+  }
+}
+
+struct WorkerSocketFrame {
+  union {
+    message @0 :SocketMessage;
+    close @1 :SocketClose;
+    open @2 :SocketOpen;
   }
 }

@@ -27,6 +27,10 @@ pub enum IsolateEventPayload {
     ResponseChunk(String),
     CacheRevalidate(String),
     ActorInvoke(ActorInvokeEvent),
+    ActorSocketSend(ActorSocketSendEvent),
+    ActorSocketClose(ActorSocketCloseEvent),
+    ActorSocketList(ActorSocketListEvent),
+    ActorSocketConsumeClose(ActorSocketConsumeCloseEvent),
 }
 
 pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
@@ -35,6 +39,43 @@ pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
 pub struct ActorInvokeEvent {
     pub request_frame: Vec<u8>,
     pub reply: oneshot::Sender<Result<Vec<u8>>>,
+}
+
+pub struct ActorSocketSendEvent {
+    pub reply: oneshot::Sender<Result<()>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+    pub is_text: bool,
+    pub message: Vec<u8>,
+}
+
+pub struct ActorSocketCloseEvent {
+    pub reply: oneshot::Sender<Result<()>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+    pub code: u16,
+    pub reason: String,
+}
+
+pub struct ActorSocketListEvent {
+    pub reply: oneshot::Sender<Result<Vec<String>>>,
+    pub binding: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActorSocketCloseReplayEvent {
+    pub code: u16,
+    pub reason: String,
+}
+
+pub struct ActorSocketConsumeCloseEvent {
+    pub reply: oneshot::Sender<Result<Vec<ActorSocketCloseReplayEvent>>>,
+    pub binding: String,
+    pub key: String,
+    pub handle: String,
 }
 
 #[derive(Default)]
@@ -235,6 +276,65 @@ struct ActorInvokeMethodPayload {
 struct ActorInvokeMethodResult {
     ok: bool,
     value: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorSocketSendPayload {
+    request_id: String,
+    handle: String,
+    message_kind: String,
+    message: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorSocketSendResult {
+    ok: bool,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorSocketClosePayload {
+    request_id: String,
+    handle: String,
+    code: u16,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorSocketListPayload {
+    request_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorSocketListResult {
+    ok: bool,
+    handles: Vec<String>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorSocketConsumeClosePayload {
+    request_id: String,
+    handle: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorSocketReplayClose {
+    code: u16,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorSocketConsumeCloseResult {
+    ok: bool,
+    events: Vec<ActorSocketReplayClose>,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorSocketCloseResult {
+    ok: bool,
     error: String,
 }
 
@@ -1175,6 +1275,289 @@ async fn op_actor_state_list(
     }
 }
 
+#[deno_core::op2]
+#[serde]
+async fn op_actor_socket_send(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorSocketSendPayload,
+) -> ActorSocketSendResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorSocketSendResult {
+            ok: false,
+            error: "actor socket send requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorSocketSendResult {
+            ok: false,
+            error: "actor socket send requires handle".to_string(),
+        };
+    }
+    let normalized_kind = payload.message_kind.as_str();
+    let is_text = match normalized_kind {
+        "text" => true,
+        "binary" => false,
+        _ => {
+            return ActorSocketSendResult {
+                ok: false,
+                error: format!("unsupported message kind: {normalized_kind}"),
+            };
+        }
+    };
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorSocketSendResult {
+                ok: false,
+                error: error.to_string(),
+            }
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorSocketSend(ActorSocketSendEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+            is_text,
+            message: payload.message,
+        }))
+        .is_err()
+    {
+        return ActorSocketSendResult {
+            ok: false,
+            error: "actor socket send runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => ActorSocketSendResult {
+            ok: true,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorSocketSendResult {
+            ok: false,
+            error: error.to_string(),
+        },
+        Err(_) => ActorSocketSendResult {
+            ok: false,
+            error: "actor socket send response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_socket_close(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorSocketClosePayload,
+) -> ActorSocketCloseResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorSocketCloseResult {
+            ok: false,
+            error: "actor socket close requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorSocketCloseResult {
+            ok: false,
+            error: "actor socket close requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorSocketCloseResult {
+                ok: false,
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorSocketClose(
+            ActorSocketCloseEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+                code: payload.code,
+                reason: payload.reason,
+            },
+        ))
+        .is_err()
+    {
+        return ActorSocketCloseResult {
+            ok: false,
+            error: "actor socket close runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => ActorSocketCloseResult {
+            ok: true,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorSocketCloseResult {
+            ok: false,
+            error: error.to_string(),
+        },
+        Err(_) => ActorSocketCloseResult {
+            ok: false,
+            error: "actor socket close response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_socket_list(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorSocketListPayload,
+) -> ActorSocketListResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorSocketListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: "actor socket list requires request_id".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorSocketListResult {
+                ok: false,
+                handles: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorSocketList(ActorSocketListEvent {
+            reply: reply_tx,
+            binding,
+            key,
+        }))
+        .is_err()
+    {
+        return ActorSocketListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: "actor socket list runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(handles)) => ActorSocketListResult {
+            ok: true,
+            handles,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorSocketListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorSocketListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: "actor socket list response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_socket_consume_close(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorSocketConsumeClosePayload,
+) -> ActorSocketConsumeCloseResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorSocketConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor socket consumeClose requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorSocketConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor socket consumeClose requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorSocketConsumeCloseResult {
+                ok: false,
+                events: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorSocketConsumeClose(
+            ActorSocketConsumeCloseEvent {
+                reply: reply_tx,
+                binding,
+                key,
+                handle: payload.handle,
+            },
+        ))
+        .is_err()
+    {
+        return ActorSocketConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor socket consumeClose runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(events)) => ActorSocketConsumeCloseResult {
+            ok: true,
+            events: events
+                .into_iter()
+                .map(|event| ActorSocketReplayClose {
+                    code: event.code,
+                    reason: event.reason,
+                })
+                .collect(),
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorSocketConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorSocketConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor socket consumeClose response channel closed".to_string(),
+        },
+    }
+}
+
 #[deno_core::op2(fast)]
 fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
     if let Some(meta) = completion_meta(&payload) {
@@ -1238,6 +1621,10 @@ deno_core::extension!(
         op_actor_state_set_value,
         op_actor_state_delete,
         op_actor_state_list,
+        op_actor_socket_send,
+        op_actor_socket_close,
+        op_actor_socket_list,
+        op_actor_socket_consume_close,
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,
