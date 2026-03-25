@@ -13,7 +13,7 @@ license = "MIT"
 version = "0.1.0"
 
 [workspace.dependencies]
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 deno_core = "0.386"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

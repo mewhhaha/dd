@@ -217,7 +217,7 @@ pub fn encode_worker_socket_frame(frame: &WorkerSocketFrame) -> Result<Vec<u8>> 
             is_text,
             data,
         } => {
-            let mut message = root.reborrow().init_message(*is_text);
+            let mut message = root.reborrow().init_message();
             message.set_session_id(session_id);
             message.set_is_text(*is_text);
             message.set_data(data);

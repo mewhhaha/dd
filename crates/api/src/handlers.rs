@@ -262,16 +262,14 @@ async fn invoke_worker_websocket_with_target(
     ws_upgrade: Option<WebSocketUpgrade>,
 ) -> ApiResult<Response<Body>> {
     let Some(ws_upgrade) = ws_upgrade else {
-        return Err(PlatformError::bad_request("missing websocket upgrade"));
+        return Err(PlatformError::bad_request("missing websocket upgrade").into());
     };
 
     if parts.method.as_str().to_ascii_uppercase() != "GET" {
-        return Err(PlatformError::bad_request("websocket upgrade requires GET"));
+        return Err(PlatformError::bad_request("websocket upgrade requires GET").into());
     }
     if !is_websocket_upgrade(&parts.headers) {
-        return Err(PlatformError::bad_request(
-            "missing websocket upgrade headers",
-        ));
+        return Err(PlatformError::bad_request("missing websocket upgrade headers").into());
     }
 
     let mut headers = Vec::with_capacity(parts.headers.len());
@@ -306,9 +304,7 @@ async fn invoke_worker_websocket_with_target(
         .map_err(|error| PlatformError::bad_request(format!("websocket open failed: {error}")))?;
 
     if output.status != 101 {
-        return Err(PlatformError::bad_request(
-            "websocket upgrade rejected by worker",
-        ));
+        return Err(PlatformError::bad_request("websocket upgrade rejected by worker").into());
     }
 
     let filtered_headers = sanitize_websocket_handshake_headers(output.headers);
