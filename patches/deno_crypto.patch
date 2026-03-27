@@ -1,0 +1,25 @@
+--- a/00_crypto.js
++++ b/00_crypto.js
+@@ -91,7 +91,10 @@
+ import * as webidl from "ext:deno_webidl/00_webidl.js";
+ import { createFilteredInspectProxy } from "ext:deno_web/01_console.js";
+ import { DOMException } from "ext:deno_web/01_dom_exception.js";
+-import { kKeyObject } from "ext:deno_node/internal/crypto/constants.ts";
++
++// dd does not embed the deno_node extension graph in worker snapshots.
++// deno_crypto only needs a stable symbol key here.
++const kKeyObject = SymbolFor("dd.crypto.kKeyObject");
+ 
+ const supportedNamedCurves = ["P-256", "P-384", "P-521"];
+ const recognisedUsages = [
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,7 +31,7 @@
+ path = "lib.rs"
+ 
+ [dependencies.aes]
+-version = "=0.8.3"
++version = "0.8.4"
+ 
+ [dependencies.aes-gcm]
+ version = "0.10"

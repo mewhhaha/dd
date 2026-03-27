@@ -137,844 +137,874 @@ deno_core::extension!(deno_crypto,
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum CryptoError {
-    #[class(inherit)]
-    #[error(transparent)]
-    General(
-        #[from]
-        #[inherit]
-        SharedError,
-    ),
-    #[class(inherit)]
-    #[error(transparent)]
-    JoinError(
-        #[from]
-        #[inherit]
-        tokio::task::JoinError,
-    ),
-    #[class(generic)]
-    #[error(transparent)]
-    Der(#[from] rsa::pkcs1::der::Error),
-    #[class(type)]
-    #[error("Missing argument hash")]
-    MissingArgumentHash,
-    #[class(type)]
-    #[error("Missing argument saltLength")]
-    MissingArgumentSaltLength,
-    #[class(type)]
-    #[error("unsupported algorithm")]
-    UnsupportedAlgorithm,
-    #[class(generic)]
-    #[error(transparent)]
-    KeyRejected(#[from] aws_lc_rs::error::KeyRejected),
-    #[class(generic)]
-    #[error(transparent)]
-    RSA(#[from] rsa::Error),
-    #[class(generic)]
-    #[error(transparent)]
-    Pkcs1(#[from] rsa::pkcs1::Error),
-    #[class(generic)]
-    #[error(transparent)]
-    Unspecified(#[from] aws_lc_rs::error::Unspecified),
-    #[class(type)]
-    #[error("Invalid key format")]
-    InvalidKeyFormat,
-    #[class(generic)]
-    #[error(transparent)]
-    P256Ecdsa(#[from] p256::ecdsa::Error),
-    #[class(type)]
-    #[error("Unexpected error decoding private key")]
-    DecodePrivateKey,
-    #[class(type)]
-    #[error("Missing argument publicKey")]
-    MissingArgumentPublicKey,
-    #[class(type)]
-    #[error("Missing argument namedCurve")]
-    MissingArgumentNamedCurve,
-    #[class(type)]
-    #[error("Missing argument info")]
-    MissingArgumentInfo,
-    #[class("DOMExceptionOperationError")]
-    #[error("The length provided for HKDF is too large")]
-    HKDFLengthTooLarge,
-    #[class(generic)]
-    #[error(transparent)]
-    Base64Decode(#[from] base64::DecodeError),
-    #[class(type)]
-    #[error("Data must be multiple of 8 bytes")]
-    DataInvalidSize,
-    #[class(type)]
-    #[error("Invalid key length")]
-    InvalidKeyLength,
-    #[class("DOMExceptionOperationError")]
-    #[error("encryption error")]
-    EncryptionError,
-    #[class("DOMExceptionOperationError")]
-    #[error("decryption error - integrity check failed")]
-    DecryptionError,
-    #[class("DOMExceptionQuotaExceededError")]
-    #[error(
-        "The ArrayBufferView's byte length ({0}) exceeds the number of bytes of entropy available via this API (65536)"
-    )]
-    ArrayBufferViewLengthExceeded(usize),
-    #[class(inherit)]
-    #[error(transparent)]
-    Other(
-        #[from]
-        #[inherit]
-        JsErrorBox,
-    ),
+  #[class(inherit)]
+  #[error(transparent)]
+  General(
+    #[from]
+    #[inherit]
+    SharedError,
+  ),
+  #[class(inherit)]
+  #[error(transparent)]
+  JoinError(
+    #[from]
+    #[inherit]
+    tokio::task::JoinError,
+  ),
+  #[class(generic)]
+  #[error(transparent)]
+  Der(#[from] rsa::pkcs1::der::Error),
+  #[class(type)]
+  #[error("Missing argument hash")]
+  MissingArgumentHash,
+  #[class(type)]
+  #[error("Missing argument saltLength")]
+  MissingArgumentSaltLength,
+  #[class(type)]
+  #[error("unsupported algorithm")]
+  UnsupportedAlgorithm,
+  #[class(generic)]
+  #[error(transparent)]
+  KeyRejected(#[from] aws_lc_rs::error::KeyRejected),
+  #[class(generic)]
+  #[error(transparent)]
+  RSA(#[from] rsa::Error),
+  #[class(generic)]
+  #[error(transparent)]
+  Pkcs1(#[from] rsa::pkcs1::Error),
+  #[class(generic)]
+  #[error(transparent)]
+  Unspecified(#[from] aws_lc_rs::error::Unspecified),
+  #[class(type)]
+  #[error("Invalid key format")]
+  InvalidKeyFormat,
+  #[class(generic)]
+  #[error(transparent)]
+  P256Ecdsa(#[from] p256::ecdsa::Error),
+  #[class(type)]
+  #[error("Unexpected error decoding private key")]
+  DecodePrivateKey,
+  #[class(type)]
+  #[error("Missing argument publicKey")]
+  MissingArgumentPublicKey,
+  #[class(type)]
+  #[error("Missing argument namedCurve")]
+  MissingArgumentNamedCurve,
+  #[class(type)]
+  #[error("Missing argument info")]
+  MissingArgumentInfo,
+  #[class("DOMExceptionOperationError")]
+  #[error("The length provided for HKDF is too large")]
+  HKDFLengthTooLarge,
+  #[class(generic)]
+  #[error(transparent)]
+  Base64Decode(#[from] base64::DecodeError),
+  #[class(type)]
+  #[error("Data must be multiple of 8 bytes")]
+  DataInvalidSize,
+  #[class(type)]
+  #[error("Invalid key length")]
+  InvalidKeyLength,
+  #[class("DOMExceptionOperationError")]
+  #[error("encryption error")]
+  EncryptionError,
+  #[class("DOMExceptionOperationError")]
+  #[error("decryption error - integrity check failed")]
+  DecryptionError,
+  #[class("DOMExceptionQuotaExceededError")]
+  #[error(
+    "The ArrayBufferView's byte length ({0}) exceeds the number of bytes of entropy available via this API (65536)"
+  )]
+  ArrayBufferViewLengthExceeded(usize),
+  #[class(inherit)]
+  #[error(transparent)]
+  Other(
+    #[from]
+    #[inherit]
+    JsErrorBox,
+  ),
 }
 
 #[op2]
-pub fn op_crypto_base64url_decode(#[string] data: String) -> Result<Uint8Array, CryptoError> {
-    let data: Vec<u8> = BASE64_URL_SAFE_NO_PAD.decode(data)?;
-    Ok(data.into())
+pub fn op_crypto_base64url_decode(
+  #[string] data: String,
+) -> Result<Uint8Array, CryptoError> {
+  let data: Vec<u8> = BASE64_URL_SAFE_NO_PAD.decode(data)?;
+  Ok(data.into())
 }
 
 #[op2]
 #[string]
 pub fn op_crypto_base64url_encode(#[buffer] data: JsBuffer) -> String {
-    let data: String = BASE64_URL_SAFE_NO_PAD.encode(data);
-    data
+  let data: String = BASE64_URL_SAFE_NO_PAD.encode(data);
+  data
 }
 
 #[op2(fast)]
 pub fn op_crypto_get_random_values(
-    state: &mut OpState,
-    #[buffer] out: &mut [u8],
+  state: &mut OpState,
+  #[buffer] out: &mut [u8],
 ) -> Result<(), CryptoError> {
-    if out.len() > 65536 {
-        return Err(CryptoError::ArrayBufferViewLengthExceeded(out.len()));
-    }
+  if out.len() > 65536 {
+    return Err(CryptoError::ArrayBufferViewLengthExceeded(out.len()));
+  }
 
-    let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
-    if let Some(seeded_rng) = maybe_seeded_rng {
-        seeded_rng.fill(out);
-    } else {
-        let mut rng = thread_rng();
-        rng.fill(out);
-    }
+  let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
+  if let Some(seeded_rng) = maybe_seeded_rng {
+    seeded_rng.fill(out);
+  } else {
+    let mut rng = thread_rng();
+    rng.fill(out);
+  }
 
-    Ok(())
+  Ok(())
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyFormat {
-    Raw,
-    Pkcs8,
-    Spki,
+  Raw,
+  Pkcs8,
+  Spki,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyType {
-    Secret,
-    Private,
-    Public,
+  Secret,
+  Private,
+  Public,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct KeyData {
-    r#type: KeyType,
-    data: JsBuffer,
+  r#type: KeyType,
+  data: JsBuffer,
 }
 
 #[derive(deno_core::FromV8)]
 pub struct SignArg {
-    #[from_v8(serde)]
-    key: KeyData,
-    #[from_v8(serde)]
-    algorithm: Algorithm,
-    salt_length: Option<u32>,
-    #[from_v8(serde)]
-    hash: Option<CryptoHash>,
-    #[from_v8(serde)]
-    named_curve: Option<CryptoNamedCurve>,
+  #[from_v8(serde)]
+  key: KeyData,
+  #[from_v8(serde)]
+  algorithm: Algorithm,
+  salt_length: Option<u32>,
+  #[from_v8(serde)]
+  hash: Option<CryptoHash>,
+  #[from_v8(serde)]
+  named_curve: Option<CryptoNamedCurve>,
 }
 
 #[op2]
 pub async fn op_crypto_sign_key(
-    #[scoped] args: SignArg,
-    #[buffer] zero_copy: JsBuffer,
+  #[scoped] args: SignArg,
+  #[buffer] zero_copy: JsBuffer,
 ) -> Result<Uint8Array, CryptoError> {
-    deno_core::unsync::spawn_blocking(move || {
-        let data = &*zero_copy;
-        let algorithm = args.algorithm;
+  deno_core::unsync::spawn_blocking(move || {
+    let data = &*zero_copy;
+    let algorithm = args.algorithm;
 
-        let signature = match algorithm {
-            Algorithm::RsassaPkcs1v15 => {
-                use rsa::pkcs1v15::SigningKey;
-                let private_key = RsaPrivateKey::from_pkcs1_der(&args.key.data)?;
-                match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
-                    CryptoHash::Sha1 => {
-                        let signing_key = SigningKey::<Sha1>::new(private_key);
-                        signing_key.sign(data)
-                    }
-                    CryptoHash::Sha256 => {
-                        let signing_key = SigningKey::<Sha256>::new(private_key);
-                        signing_key.sign(data)
-                    }
-                    CryptoHash::Sha384 => {
-                        let signing_key = SigningKey::<Sha384>::new(private_key);
-                        signing_key.sign(data)
-                    }
-                    CryptoHash::Sha512 => {
-                        let signing_key = SigningKey::<Sha512>::new(private_key);
-                        signing_key.sign(data)
-                    }
-                }
-                .to_vec()
-            }
-            Algorithm::RsaPss => {
-                let private_key = RsaPrivateKey::from_pkcs1_der(&args.key.data)?;
+    let signature = match algorithm {
+      Algorithm::RsassaPkcs1v15 => {
+        use rsa::pkcs1v15::SigningKey;
+        let private_key = RsaPrivateKey::from_pkcs1_der(&args.key.data)?;
+        match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
+          CryptoHash::Sha1 => {
+            let signing_key = SigningKey::<Sha1>::new(private_key);
+            signing_key.sign(data)
+          }
+          CryptoHash::Sha256 => {
+            let signing_key = SigningKey::<Sha256>::new(private_key);
+            signing_key.sign(data)
+          }
+          CryptoHash::Sha384 => {
+            let signing_key = SigningKey::<Sha384>::new(private_key);
+            signing_key.sign(data)
+          }
+          CryptoHash::Sha512 => {
+            let signing_key = SigningKey::<Sha512>::new(private_key);
+            signing_key.sign(data)
+          }
+        }
+        .to_vec()
+      }
+      Algorithm::RsaPss => {
+        let private_key = RsaPrivateKey::from_pkcs1_der(&args.key.data)?;
 
-                let salt_len = args
-                    .salt_length
-                    .ok_or_else(|| CryptoError::MissingArgumentSaltLength)?
-                    as usize;
+        let salt_len = args
+          .salt_length
+          .ok_or_else(|| CryptoError::MissingArgumentSaltLength)?
+          as usize;
 
-                let mut rng = OsRng;
-                match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
-                    CryptoHash::Sha1 => {
-                        let signing_key = Pss::new_with_salt::<Sha1>(salt_len);
-                        let hashed = Sha1::digest(data);
-                        signing_key.sign(Some(&mut rng), &private_key, &hashed)?
-                    }
-                    CryptoHash::Sha256 => {
-                        let signing_key = Pss::new_with_salt::<Sha256>(salt_len);
-                        let hashed = Sha256::digest(data);
-                        signing_key.sign(Some(&mut rng), &private_key, &hashed)?
-                    }
-                    CryptoHash::Sha384 => {
-                        let signing_key = Pss::new_with_salt::<Sha384>(salt_len);
-                        let hashed = Sha384::digest(data);
-                        signing_key.sign(Some(&mut rng), &private_key, &hashed)?
-                    }
-                    CryptoHash::Sha512 => {
-                        let signing_key = Pss::new_with_salt::<Sha512>(salt_len);
-                        let hashed = Sha512::digest(data);
-                        signing_key.sign(Some(&mut rng), &private_key, &hashed)?
-                    }
-                }
-                .to_vec()
-            }
-            Algorithm::Ecdsa => {
-                let hash = args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)?;
-                let named_curve = args.named_curve.ok_or_else(JsErrorBox::not_supported)?;
-                match named_curve {
-                    CryptoNamedCurve::P256 => {
-                        // Decode PKCS#8 private key.
-                        let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)
-                            .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                        let signing_key = P256SigningKey::from(secret_key);
-                        let prehash = match hash {
-                            CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                            CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                            CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                            CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                        };
-                        // Sign the prehashed message, producing a raw r||s signature.
-                        let signature: P256Signature = signing_key.sign_prehash(&prehash)?;
-                        signature.to_bytes().to_vec()
-                    }
-                    CryptoNamedCurve::P384 => {
-                        let secret_key = p384::SecretKey::from_pkcs8_der(&args.key.data)
-                            .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                        let signing_key = P384SigningKey::from(secret_key);
-                        let prehash = match hash {
-                            CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                            CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                            CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                            CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                        };
-                        let signature: P384Signature = signing_key.sign_prehash(&prehash)?;
-                        signature.to_bytes().to_vec()
-                    }
-                    CryptoNamedCurve::P521 => {
-                        let secret_key = p521::SecretKey::from_pkcs8_der(&args.key.data)
-                            .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                        let signing_key = P521SigningKey::from_bytes(&secret_key.to_bytes())
-                            .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                        let prehash = match hash {
-                            CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                            CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                            CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                            CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                        };
-                        // P-521 field size is 66 bytes; bits2field requires at least
-                        // half that (33 bytes). Left-pad shorter hashes to meet the
-                        // minimum.
-                        let prehash = if prehash.len() < 33 {
-                            let mut padded = vec![0u8; 33 - prehash.len()];
-                            padded.extend_from_slice(&prehash);
-                            padded
-                        } else {
-                            prehash
-                        };
-                        let signature: P521Signature = signing_key.sign_prehash(&prehash)?;
-                        signature.to_bytes().to_vec()
-                    }
-                }
-            }
-            Algorithm::Hmac => {
-                let hash: HmacAlgorithm = args.hash.ok_or_else(JsErrorBox::not_supported)?.into();
+        let mut rng = OsRng;
+        match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
+          CryptoHash::Sha1 => {
+            let signing_key = Pss::new_with_salt::<Sha1>(salt_len);
+            let hashed = Sha1::digest(data);
+            signing_key.sign(Some(&mut rng), &private_key, &hashed)?
+          }
+          CryptoHash::Sha256 => {
+            let signing_key = Pss::new_with_salt::<Sha256>(salt_len);
+            let hashed = Sha256::digest(data);
+            signing_key.sign(Some(&mut rng), &private_key, &hashed)?
+          }
+          CryptoHash::Sha384 => {
+            let signing_key = Pss::new_with_salt::<Sha384>(salt_len);
+            let hashed = Sha384::digest(data);
+            signing_key.sign(Some(&mut rng), &private_key, &hashed)?
+          }
+          CryptoHash::Sha512 => {
+            let signing_key = Pss::new_with_salt::<Sha512>(salt_len);
+            let hashed = Sha512::digest(data);
+            signing_key.sign(Some(&mut rng), &private_key, &hashed)?
+          }
+        }
+        .to_vec()
+      }
+      Algorithm::Ecdsa => {
+        let hash = args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)?;
+        let named_curve =
+          args.named_curve.ok_or_else(JsErrorBox::not_supported)?;
+        match named_curve {
+          CryptoNamedCurve::P256 => {
+            // Decode PKCS#8 private key.
+            let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)
+              .map_err(|_| CryptoError::InvalidKeyFormat)?;
+            let signing_key = P256SigningKey::from(secret_key);
+            let prehash = match hash {
+              CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
+              CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+              CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+              CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+            };
+            // Sign the prehashed message, producing a raw r||s signature.
+            let signature: P256Signature =
+              signing_key.sign_prehash(&prehash)?;
+            signature.to_bytes().to_vec()
+          }
+          CryptoNamedCurve::P384 => {
+            let secret_key = p384::SecretKey::from_pkcs8_der(&args.key.data)
+              .map_err(|_| CryptoError::InvalidKeyFormat)?;
+            let signing_key = P384SigningKey::from(secret_key);
+            let prehash = match hash {
+              CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
+              CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+              CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+              CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+            };
+            let signature: P384Signature =
+              signing_key.sign_prehash(&prehash)?;
+            signature.to_bytes().to_vec()
+          }
+          CryptoNamedCurve::P521 => {
+            let secret_key = p521::SecretKey::from_pkcs8_der(&args.key.data)
+              .map_err(|_| CryptoError::InvalidKeyFormat)?;
+            let signing_key =
+              P521SigningKey::from_bytes(&secret_key.to_bytes())
+                .map_err(|_| CryptoError::InvalidKeyFormat)?;
+            let prehash = match hash {
+              CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
+              CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+              CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+              CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+            };
+            // P-521 field size is 66 bytes; bits2field requires at least
+            // half that (33 bytes). Left-pad shorter hashes to meet the
+            // minimum.
+            let prehash = if prehash.len() < 33 {
+              let mut padded = vec![0u8; 33 - prehash.len()];
+              padded.extend_from_slice(&prehash);
+              padded
+            } else {
+              prehash
+            };
+            let signature: P521Signature =
+              signing_key.sign_prehash(&prehash)?;
+            signature.to_bytes().to_vec()
+          }
+        }
+      }
+      Algorithm::Hmac => {
+        let hash: HmacAlgorithm =
+          args.hash.ok_or_else(JsErrorBox::not_supported)?.into();
 
-                let key = HmacKey::new(hash, &args.key.data);
+        let key = HmacKey::new(hash, &args.key.data);
 
-                let signature = aws_lc_rs::hmac::sign(&key, data);
-                signature.as_ref().to_vec()
-            }
-            _ => return Err(CryptoError::UnsupportedAlgorithm),
-        };
+        let signature = aws_lc_rs::hmac::sign(&key, data);
+        signature.as_ref().to_vec()
+      }
+      _ => return Err(CryptoError::UnsupportedAlgorithm),
+    };
 
-        Ok(signature.into())
-    })
-    .await?
+    Ok(signature.into())
+  })
+  .await?
 }
 
 #[derive(deno_core::FromV8)]
 pub struct VerifyArg {
-    #[from_v8(serde)]
-    key: KeyData,
-    #[from_v8(serde)]
-    algorithm: Algorithm,
-    salt_length: Option<u32>,
-    #[from_v8(serde)]
-    hash: Option<CryptoHash>,
-    signature: Uint8Array,
-    #[from_v8(serde)]
-    named_curve: Option<CryptoNamedCurve>,
+  #[from_v8(serde)]
+  key: KeyData,
+  #[from_v8(serde)]
+  algorithm: Algorithm,
+  salt_length: Option<u32>,
+  #[from_v8(serde)]
+  hash: Option<CryptoHash>,
+  signature: Uint8Array,
+  #[from_v8(serde)]
+  named_curve: Option<CryptoNamedCurve>,
 }
 
 #[op2]
 pub async fn op_crypto_verify_key(
-    #[scoped] args: VerifyArg,
-    #[buffer] zero_copy: JsBuffer,
+  #[scoped] args: VerifyArg,
+  #[buffer] zero_copy: JsBuffer,
 ) -> Result<bool, CryptoError> {
-    deno_core::unsync::spawn_blocking(move || {
-        let data = &*zero_copy;
-        let algorithm = args.algorithm;
+  deno_core::unsync::spawn_blocking(move || {
+    let data = &*zero_copy;
+    let algorithm = args.algorithm;
 
-        let verification = match algorithm {
-            Algorithm::RsassaPkcs1v15 => {
-                use rsa::pkcs1v15::Signature;
-                use rsa::pkcs1v15::VerifyingKey;
-                let public_key = read_rsa_public_key(args.key)?;
-                let signature: Signature = (&*args.signature).try_into()?;
-                match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
-                    CryptoHash::Sha1 => {
-                        let verifying_key = VerifyingKey::<Sha1>::new(public_key);
-                        verifying_key.verify(data, &signature).is_ok()
-                    }
-                    CryptoHash::Sha256 => {
-                        let verifying_key = VerifyingKey::<Sha256>::new(public_key);
-                        verifying_key.verify(data, &signature).is_ok()
-                    }
-                    CryptoHash::Sha384 => {
-                        let verifying_key = VerifyingKey::<Sha384>::new(public_key);
-                        verifying_key.verify(data, &signature).is_ok()
-                    }
-                    CryptoHash::Sha512 => {
-                        let verifying_key = VerifyingKey::<Sha512>::new(public_key);
-                        verifying_key.verify(data, &signature).is_ok()
-                    }
-                }
-            }
-            Algorithm::RsaPss => {
-                let public_key = read_rsa_public_key(args.key)?;
-                let signature = args.signature.as_ref();
+    let verification = match algorithm {
+      Algorithm::RsassaPkcs1v15 => {
+        use rsa::pkcs1v15::Signature;
+        use rsa::pkcs1v15::VerifyingKey;
+        let public_key = read_rsa_public_key(args.key)?;
+        let signature: Signature = (&*args.signature).try_into()?;
+        match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
+          CryptoHash::Sha1 => {
+            let verifying_key = VerifyingKey::<Sha1>::new(public_key);
+            verifying_key.verify(data, &signature).is_ok()
+          }
+          CryptoHash::Sha256 => {
+            let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+            verifying_key.verify(data, &signature).is_ok()
+          }
+          CryptoHash::Sha384 => {
+            let verifying_key = VerifyingKey::<Sha384>::new(public_key);
+            verifying_key.verify(data, &signature).is_ok()
+          }
+          CryptoHash::Sha512 => {
+            let verifying_key = VerifyingKey::<Sha512>::new(public_key);
+            verifying_key.verify(data, &signature).is_ok()
+          }
+        }
+      }
+      Algorithm::RsaPss => {
+        let public_key = read_rsa_public_key(args.key)?;
+        let signature = args.signature.as_ref();
 
-                let salt_len = args
-                    .salt_length
-                    .ok_or_else(|| CryptoError::MissingArgumentSaltLength)?
-                    as usize;
+        let salt_len = args
+          .salt_length
+          .ok_or_else(|| CryptoError::MissingArgumentSaltLength)?
+          as usize;
 
-                match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
-                    CryptoHash::Sha1 => {
-                        let pss = Pss::new_with_salt::<Sha1>(salt_len);
-                        let hashed = Sha1::digest(data);
-                        pss.verify(&public_key, &hashed, signature).is_ok()
-                    }
-                    CryptoHash::Sha256 => {
-                        let pss = Pss::new_with_salt::<Sha256>(salt_len);
-                        let hashed = Sha256::digest(data);
-                        pss.verify(&public_key, &hashed, signature).is_ok()
-                    }
-                    CryptoHash::Sha384 => {
-                        let pss = Pss::new_with_salt::<Sha384>(salt_len);
-                        let hashed = Sha384::digest(data);
-                        pss.verify(&public_key, &hashed, signature).is_ok()
-                    }
-                    CryptoHash::Sha512 => {
-                        let pss = Pss::new_with_salt::<Sha512>(salt_len);
-                        let hashed = Sha512::digest(data);
-                        pss.verify(&public_key, &hashed, signature).is_ok()
-                    }
-                }
+        match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
+          CryptoHash::Sha1 => {
+            let pss = Pss::new_with_salt::<Sha1>(salt_len);
+            let hashed = Sha1::digest(data);
+            pss.verify(&public_key, &hashed, signature).is_ok()
+          }
+          CryptoHash::Sha256 => {
+            let pss = Pss::new_with_salt::<Sha256>(salt_len);
+            let hashed = Sha256::digest(data);
+            pss.verify(&public_key, &hashed, signature).is_ok()
+          }
+          CryptoHash::Sha384 => {
+            let pss = Pss::new_with_salt::<Sha384>(salt_len);
+            let hashed = Sha384::digest(data);
+            pss.verify(&public_key, &hashed, signature).is_ok()
+          }
+          CryptoHash::Sha512 => {
+            let pss = Pss::new_with_salt::<Sha512>(salt_len);
+            let hashed = Sha512::digest(data);
+            pss.verify(&public_key, &hashed, signature).is_ok()
+          }
+        }
+      }
+      Algorithm::Hmac => {
+        let hash: HmacAlgorithm =
+          args.hash.ok_or_else(JsErrorBox::not_supported)?.into();
+        let key = HmacKey::new(hash, &args.key.data);
+        aws_lc_rs::hmac::verify(&key, data, &args.signature).is_ok()
+      }
+      Algorithm::Ecdsa => {
+        let hash = args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)?;
+        let named_curve =
+          args.named_curve.ok_or_else(JsErrorBox::not_supported)?;
+        match named_curve {
+          CryptoNamedCurve::P256 => {
+            let verifying_key = match args.key.r#type {
+              KeyType::Public => {
+                P256VerifyingKey::from_sec1_bytes(&args.key.data)
+                  .map_err(|_| CryptoError::InvalidKeyFormat)?
+              }
+              KeyType::Private => {
+                let secret_key =
+                  p256::SecretKey::from_pkcs8_der(&args.key.data)
+                    .map_err(|_| CryptoError::InvalidKeyFormat)?;
+                let signing_key = P256SigningKey::from(secret_key);
+                *signing_key.verifying_key()
+              }
+              _ => return Err(CryptoError::InvalidKeyFormat),
+            };
+            match P256Signature::from_slice(&args.signature) {
+              Ok(signature) => {
+                let prehash = match hash {
+                  CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
+                  CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                  CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                  CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+                };
+                verifying_key.verify_prehash(&prehash, &signature).is_ok()
+              }
+              _ => false,
             }
-            Algorithm::Hmac => {
-                let hash: HmacAlgorithm = args.hash.ok_or_else(JsErrorBox::not_supported)?.into();
-                let key = HmacKey::new(hash, &args.key.data);
-                aws_lc_rs::hmac::verify(&key, data, &args.signature).is_ok()
+          }
+          CryptoNamedCurve::P384 => {
+            let verifying_key = match args.key.r#type {
+              KeyType::Public => {
+                P384VerifyingKey::from_sec1_bytes(&args.key.data)
+                  .map_err(|_| CryptoError::InvalidKeyFormat)?
+              }
+              KeyType::Private => {
+                let secret_key =
+                  p384::SecretKey::from_pkcs8_der(&args.key.data)
+                    .map_err(|_| CryptoError::InvalidKeyFormat)?;
+                let signing_key = P384SigningKey::from(secret_key);
+                *signing_key.verifying_key()
+              }
+              _ => return Err(CryptoError::InvalidKeyFormat),
+            };
+            match P384Signature::from_slice(&args.signature) {
+              Ok(signature) => {
+                let prehash = match hash {
+                  CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
+                  CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                  CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                  CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+                };
+                verifying_key.verify_prehash(&prehash, &signature).is_ok()
+              }
+              _ => false,
             }
-            Algorithm::Ecdsa => {
-                let hash = args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)?;
-                let named_curve = args.named_curve.ok_or_else(JsErrorBox::not_supported)?;
-                match named_curve {
-                    CryptoNamedCurve::P256 => {
-                        let verifying_key = match args.key.r#type {
-                            KeyType::Public => P256VerifyingKey::from_sec1_bytes(&args.key.data)
-                                .map_err(|_| CryptoError::InvalidKeyFormat)?,
-                            KeyType::Private => {
-                                let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)
-                                    .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                                let signing_key = P256SigningKey::from(secret_key);
-                                *signing_key.verifying_key()
-                            }
-                            _ => return Err(CryptoError::InvalidKeyFormat),
-                        };
-                        match P256Signature::from_slice(&args.signature) {
-                            Ok(signature) => {
-                                let prehash = match hash {
-                                    CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                                    CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                                    CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                                    CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                                };
-                                verifying_key.verify_prehash(&prehash, &signature).is_ok()
-                            }
-                            _ => false,
-                        }
-                    }
-                    CryptoNamedCurve::P384 => {
-                        let verifying_key = match args.key.r#type {
-                            KeyType::Public => P384VerifyingKey::from_sec1_bytes(&args.key.data)
-                                .map_err(|_| CryptoError::InvalidKeyFormat)?,
-                            KeyType::Private => {
-                                let secret_key = p384::SecretKey::from_pkcs8_der(&args.key.data)
-                                    .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                                let signing_key = P384SigningKey::from(secret_key);
-                                *signing_key.verifying_key()
-                            }
-                            _ => return Err(CryptoError::InvalidKeyFormat),
-                        };
-                        match P384Signature::from_slice(&args.signature) {
-                            Ok(signature) => {
-                                let prehash = match hash {
-                                    CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                                    CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                                    CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                                    CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                                };
-                                verifying_key.verify_prehash(&prehash, &signature).is_ok()
-                            }
-                            _ => false,
-                        }
-                    }
-                    CryptoNamedCurve::P521 => {
-                        let verifying_key = match args.key.r#type {
-                            KeyType::Public => P521VerifyingKey::from_sec1_bytes(&args.key.data)
-                                .map_err(|_| CryptoError::InvalidKeyFormat)?,
-                            KeyType::Private => {
-                                let secret_key = p521::SecretKey::from_pkcs8_der(&args.key.data)
-                                    .map_err(|_| CryptoError::InvalidKeyFormat)?;
-                                // Construct inner ecdsa signing key to get verifying key
-                                let inner_signing_key =
-                                    ecdsa::SigningKey::<p521::NistP521>::from(secret_key);
-                                P521VerifyingKey::from(*inner_signing_key.verifying_key())
-                            }
-                            _ => return Err(CryptoError::InvalidKeyFormat),
-                        };
-                        match P521Signature::from_slice(&args.signature) {
-                            Ok(signature) => {
-                                let prehash = match hash {
-                                    CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                                    CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
-                                    CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
-                                    CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
-                                };
-                                // P-521 field size is 66 bytes; bits2field requires at least
-                                // half that (33 bytes). Left-pad shorter hashes to meet the
-                                // minimum.
-                                let prehash = if prehash.len() < 33 {
-                                    let mut padded = vec![0u8; 33 - prehash.len()];
-                                    padded.extend_from_slice(&prehash);
-                                    padded
-                                } else {
-                                    prehash
-                                };
-                                verifying_key.verify_prehash(&prehash, &signature).is_ok()
-                            }
-                            _ => false,
-                        }
-                    }
-                }
+          }
+          CryptoNamedCurve::P521 => {
+            let verifying_key = match args.key.r#type {
+              KeyType::Public => {
+                P521VerifyingKey::from_sec1_bytes(&args.key.data)
+                  .map_err(|_| CryptoError::InvalidKeyFormat)?
+              }
+              KeyType::Private => {
+                let secret_key =
+                  p521::SecretKey::from_pkcs8_der(&args.key.data)
+                    .map_err(|_| CryptoError::InvalidKeyFormat)?;
+                // Construct inner ecdsa signing key to get verifying key
+                let inner_signing_key =
+                  ecdsa::SigningKey::<p521::NistP521>::from(secret_key);
+                P521VerifyingKey::from(*inner_signing_key.verifying_key())
+              }
+              _ => return Err(CryptoError::InvalidKeyFormat),
+            };
+            match P521Signature::from_slice(&args.signature) {
+              Ok(signature) => {
+                let prehash = match hash {
+                  CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
+                  CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                  CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                  CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
+                };
+                // P-521 field size is 66 bytes; bits2field requires at least
+                // half that (33 bytes). Left-pad shorter hashes to meet the
+                // minimum.
+                let prehash = if prehash.len() < 33 {
+                  let mut padded = vec![0u8; 33 - prehash.len()];
+                  padded.extend_from_slice(&prehash);
+                  padded
+                } else {
+                  prehash
+                };
+                verifying_key.verify_prehash(&prehash, &signature).is_ok()
+              }
+              _ => false,
             }
-            _ => return Err(CryptoError::UnsupportedAlgorithm),
-        };
+          }
+        }
+      }
+      _ => return Err(CryptoError::UnsupportedAlgorithm),
+    };
 
-        Ok(verification)
-    })
-    .await?
+    Ok(verification)
+  })
+  .await?
 }
 
 #[derive(deno_core::FromV8)]
 pub struct DeriveKeyArg {
-    #[from_v8(serde)]
-    key: KeyData,
-    #[from_v8(serde)]
-    algorithm: Algorithm,
-    #[from_v8(serde)]
-    hash: Option<CryptoHash>,
-    length: usize,
-    iterations: Option<u32>,
-    // ECDH
-    #[from_v8(serde)]
-    public_key: Option<KeyData>,
-    #[from_v8(serde)]
-    named_curve: Option<CryptoNamedCurve>,
-    // HKDF
-    #[from_v8(serde)]
-    info: Option<JsBuffer>,
+  #[from_v8(serde)]
+  key: KeyData,
+  #[from_v8(serde)]
+  algorithm: Algorithm,
+  #[from_v8(serde)]
+  hash: Option<CryptoHash>,
+  length: usize,
+  iterations: Option<u32>,
+  // ECDH
+  #[from_v8(serde)]
+  public_key: Option<KeyData>,
+  #[from_v8(serde)]
+  named_curve: Option<CryptoNamedCurve>,
+  // HKDF
+  #[from_v8(serde)]
+  info: Option<JsBuffer>,
 }
 
 #[op2]
 pub async fn op_crypto_derive_bits(
-    #[scoped] args: DeriveKeyArg,
-    #[buffer] zero_copy: Option<JsBuffer>,
+  #[scoped] args: DeriveKeyArg,
+  #[buffer] zero_copy: Option<JsBuffer>,
 ) -> Result<Uint8Array, CryptoError> {
-    deno_core::unsync::spawn_blocking(move || {
-        let algorithm = args.algorithm;
-        match algorithm {
-            Algorithm::Pbkdf2 => {
-                let zero_copy = zero_copy.ok_or_else(JsErrorBox::not_supported)?;
-                let salt = &*zero_copy;
-                // The caller must validate these cases.
-                assert!(args.length > 0);
-                assert!(args.length.is_multiple_of(8));
+  deno_core::unsync::spawn_blocking(move || {
+    let algorithm = args.algorithm;
+    match algorithm {
+      Algorithm::Pbkdf2 => {
+        let zero_copy = zero_copy.ok_or_else(JsErrorBox::not_supported)?;
+        let salt = &*zero_copy;
+        // The caller must validate these cases.
+        assert!(args.length > 0);
+        assert!(args.length.is_multiple_of(8));
 
-                let algorithm = match args.hash.ok_or_else(JsErrorBox::not_supported)? {
-                    CryptoHash::Sha1 => pbkdf2::PBKDF2_HMAC_SHA1,
-                    CryptoHash::Sha256 => pbkdf2::PBKDF2_HMAC_SHA256,
-                    CryptoHash::Sha384 => pbkdf2::PBKDF2_HMAC_SHA384,
-                    CryptoHash::Sha512 => pbkdf2::PBKDF2_HMAC_SHA512,
-                };
+        let algorithm = match args.hash.ok_or_else(JsErrorBox::not_supported)? {
+          CryptoHash::Sha1 => pbkdf2::PBKDF2_HMAC_SHA1,
+          CryptoHash::Sha256 => pbkdf2::PBKDF2_HMAC_SHA256,
+          CryptoHash::Sha384 => pbkdf2::PBKDF2_HMAC_SHA384,
+          CryptoHash::Sha512 => pbkdf2::PBKDF2_HMAC_SHA512,
+        };
 
-                // This will never panic. We have already checked length earlier.
-                let iterations =
-                    NonZeroU32::new(args.iterations.ok_or_else(JsErrorBox::not_supported)?)
-                        .unwrap();
-                let secret = args.key.data;
-                let mut out = vec![0; args.length / 8];
-                pbkdf2::derive(algorithm, iterations, salt, &secret, &mut out);
-                Ok(out.into())
-            }
-            Algorithm::Ecdh => {
-                let named_curve = args
-                    .named_curve
-                    .ok_or_else(|| CryptoError::MissingArgumentNamedCurve)?;
+        // This will never panic. We have already checked length earlier.
+        let iterations = NonZeroU32::new(
+          args.iterations.ok_or_else(JsErrorBox::not_supported)?,
+        )
+        .unwrap();
+        let secret = args.key.data;
+        let mut out = vec![0; args.length / 8];
+        pbkdf2::derive(algorithm, iterations, salt, &secret, &mut out);
+        Ok(out.into())
+      }
+      Algorithm::Ecdh => {
+        let named_curve = args
+          .named_curve
+          .ok_or_else(|| CryptoError::MissingArgumentNamedCurve)?;
 
-                let public_key = args
-                    .public_key
-                    .ok_or_else(|| CryptoError::MissingArgumentPublicKey)?;
+        let public_key = args
+          .public_key
+          .ok_or_else(|| CryptoError::MissingArgumentPublicKey)?;
 
-                match named_curve {
-                    CryptoNamedCurve::P256 => {
-                        let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)
-                            .map_err(|_| CryptoError::DecodePrivateKey)?;
+        match named_curve {
+          CryptoNamedCurve::P256 => {
+            let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)
+              .map_err(|_| CryptoError::DecodePrivateKey)?;
 
-                        let public_key = match public_key.r#type {
-                            KeyType::Private => p256::SecretKey::from_pkcs8_der(&public_key.data)
-                                .map_err(|_| CryptoError::DecodePrivateKey)?
-                                .public_key(),
-                            KeyType::Public => {
-                                let point = p256::EncodedPoint::from_bytes(public_key.data)
-                                    .map_err(|_| CryptoError::DecodePrivateKey)?;
+            let public_key = match public_key.r#type {
+              KeyType::Private => {
+                p256::SecretKey::from_pkcs8_der(&public_key.data)
+                  .map_err(|_| CryptoError::DecodePrivateKey)?
+                  .public_key()
+              }
+              KeyType::Public => {
+                let point = p256::EncodedPoint::from_bytes(public_key.data)
+                  .map_err(|_| CryptoError::DecodePrivateKey)?;
 
-                                let pk = p256::PublicKey::from_encoded_point(&point);
-                                // pk is a constant time Option.
-                                if pk.is_some().into() {
-                                    pk.unwrap()
-                                } else {
-                                    return Err(CryptoError::DecodePrivateKey);
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        let shared_secret = p256::elliptic_curve::ecdh::diffie_hellman(
-                            secret_key.to_nonzero_scalar(),
-                            public_key.as_affine(),
-                        );
-
-                        // raw serialized x-coordinate of the computed point
-                        Ok(shared_secret.raw_secret_bytes().to_vec().into())
-                    }
-                    CryptoNamedCurve::P384 => {
-                        let secret_key = p384::SecretKey::from_pkcs8_der(&args.key.data)
-                            .map_err(|_| CryptoError::DecodePrivateKey)?;
-
-                        let public_key = match public_key.r#type {
-                            KeyType::Private => p384::SecretKey::from_pkcs8_der(&public_key.data)
-                                .map_err(|_| CryptoError::DecodePrivateKey)?
-                                .public_key(),
-                            KeyType::Public => {
-                                let point = p384::EncodedPoint::from_bytes(public_key.data)
-                                    .map_err(|_| CryptoError::DecodePrivateKey)?;
-
-                                let pk = p384::PublicKey::from_encoded_point(&point);
-                                // pk is a constant time Option.
-                                if pk.is_some().into() {
-                                    pk.unwrap()
-                                } else {
-                                    return Err(CryptoError::DecodePrivateKey);
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        let shared_secret = p384::elliptic_curve::ecdh::diffie_hellman(
-                            secret_key.to_nonzero_scalar(),
-                            public_key.as_affine(),
-                        );
-
-                        // raw serialized x-coordinate of the computed point
-                        Ok(shared_secret.raw_secret_bytes().to_vec().into())
-                    }
-                    CryptoNamedCurve::P521 => {
-                        let secret_key = p521::SecretKey::from_pkcs8_der(&args.key.data)
-                            .map_err(|_| CryptoError::DecodePrivateKey)?;
-
-                        let public_key = match public_key.r#type {
-                            KeyType::Private => p521::SecretKey::from_pkcs8_der(&public_key.data)
-                                .map_err(|_| CryptoError::DecodePrivateKey)?
-                                .public_key(),
-                            KeyType::Public => {
-                                let point = p521::EncodedPoint::from_bytes(public_key.data)
-                                    .map_err(|_| CryptoError::DecodePrivateKey)?;
-
-                                let pk = p521::PublicKey::from_encoded_point(&point);
-                                // pk is a constant time Option.
-                                if pk.is_some().into() {
-                                    pk.unwrap()
-                                } else {
-                                    return Err(CryptoError::DecodePrivateKey);
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        let shared_secret = p521::elliptic_curve::ecdh::diffie_hellman(
-                            secret_key.to_nonzero_scalar(),
-                            public_key.as_affine(),
-                        );
-
-                        // raw serialized x-coordinate of the computed point
-                        Ok(shared_secret.raw_secret_bytes().to_vec().into())
-                    }
+                let pk = p256::PublicKey::from_encoded_point(&point);
+                // pk is a constant time Option.
+                if pk.is_some().into() {
+                  pk.unwrap()
+                } else {
+                  return Err(CryptoError::DecodePrivateKey);
                 }
-            }
-            Algorithm::Hkdf => {
-                let zero_copy = zero_copy.ok_or_else(JsErrorBox::not_supported)?;
-                let salt = &*zero_copy;
-                let algorithm = match args.hash.ok_or_else(JsErrorBox::not_supported)? {
-                    CryptoHash::Sha1 => hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY,
-                    CryptoHash::Sha256 => hkdf::HKDF_SHA256,
-                    CryptoHash::Sha384 => hkdf::HKDF_SHA384,
-                    CryptoHash::Sha512 => hkdf::HKDF_SHA512,
-                };
+              }
+              _ => unreachable!(),
+            };
 
-                let info = args.info.ok_or(CryptoError::MissingArgumentInfo)?;
-                // IKM
-                let secret = args.key.data;
-                // L
-                let length = args.length / 8;
+            let shared_secret = p256::elliptic_curve::ecdh::diffie_hellman(
+              secret_key.to_nonzero_scalar(),
+              public_key.as_affine(),
+            );
 
-                let salt = hkdf::Salt::new(algorithm, salt);
-                let prk = salt.extract(&secret);
-                let info = &[&*info];
-                let okm = prk
-                    .expand(info, HkdfOutput(length))
-                    .map_err(|_e| CryptoError::HKDFLengthTooLarge)?;
-                let mut r = vec![0u8; length];
-                okm.fill(&mut r)?;
-                Ok(r.into())
-            }
-            _ => Err(CryptoError::UnsupportedAlgorithm),
+            // raw serialized x-coordinate of the computed point
+            Ok(shared_secret.raw_secret_bytes().to_vec().into())
+          }
+          CryptoNamedCurve::P384 => {
+            let secret_key = p384::SecretKey::from_pkcs8_der(&args.key.data)
+              .map_err(|_| CryptoError::DecodePrivateKey)?;
+
+            let public_key = match public_key.r#type {
+              KeyType::Private => {
+                p384::SecretKey::from_pkcs8_der(&public_key.data)
+                  .map_err(|_| CryptoError::DecodePrivateKey)?
+                  .public_key()
+              }
+              KeyType::Public => {
+                let point = p384::EncodedPoint::from_bytes(public_key.data)
+                  .map_err(|_| CryptoError::DecodePrivateKey)?;
+
+                let pk = p384::PublicKey::from_encoded_point(&point);
+                // pk is a constant time Option.
+                if pk.is_some().into() {
+                  pk.unwrap()
+                } else {
+                  return Err(CryptoError::DecodePrivateKey);
+                }
+              }
+              _ => unreachable!(),
+            };
+
+            let shared_secret = p384::elliptic_curve::ecdh::diffie_hellman(
+              secret_key.to_nonzero_scalar(),
+              public_key.as_affine(),
+            );
+
+            // raw serialized x-coordinate of the computed point
+            Ok(shared_secret.raw_secret_bytes().to_vec().into())
+          }
+          CryptoNamedCurve::P521 => {
+            let secret_key = p521::SecretKey::from_pkcs8_der(&args.key.data)
+              .map_err(|_| CryptoError::DecodePrivateKey)?;
+
+            let public_key = match public_key.r#type {
+              KeyType::Private => {
+                p521::SecretKey::from_pkcs8_der(&public_key.data)
+                  .map_err(|_| CryptoError::DecodePrivateKey)?
+                  .public_key()
+              }
+              KeyType::Public => {
+                let point = p521::EncodedPoint::from_bytes(public_key.data)
+                  .map_err(|_| CryptoError::DecodePrivateKey)?;
+
+                let pk = p521::PublicKey::from_encoded_point(&point);
+                // pk is a constant time Option.
+                if pk.is_some().into() {
+                  pk.unwrap()
+                } else {
+                  return Err(CryptoError::DecodePrivateKey);
+                }
+              }
+              _ => unreachable!(),
+            };
+
+            let shared_secret = p521::elliptic_curve::ecdh::diffie_hellman(
+              secret_key.to_nonzero_scalar(),
+              public_key.as_affine(),
+            );
+
+            // raw serialized x-coordinate of the computed point
+            Ok(shared_secret.raw_secret_bytes().to_vec().into())
+          }
         }
-    })
-    .await?
+      }
+      Algorithm::Hkdf => {
+        let zero_copy = zero_copy.ok_or_else(JsErrorBox::not_supported)?;
+        let salt = &*zero_copy;
+        let algorithm = match args.hash.ok_or_else(JsErrorBox::not_supported)? {
+          CryptoHash::Sha1 => hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY,
+          CryptoHash::Sha256 => hkdf::HKDF_SHA256,
+          CryptoHash::Sha384 => hkdf::HKDF_SHA384,
+          CryptoHash::Sha512 => hkdf::HKDF_SHA512,
+        };
+
+        let info = args.info.ok_or(CryptoError::MissingArgumentInfo)?;
+        // IKM
+        let secret = args.key.data;
+        // L
+        let length = args.length / 8;
+
+        let salt = hkdf::Salt::new(algorithm, salt);
+        let prk = salt.extract(&secret);
+        let info = &[&*info];
+        let okm = prk
+          .expand(info, HkdfOutput(length))
+          .map_err(|_e| CryptoError::HKDFLengthTooLarge)?;
+        let mut r = vec![0u8; length];
+        okm.fill(&mut r)?;
+        Ok(r.into())
+      }
+      _ => Err(CryptoError::UnsupportedAlgorithm),
+    }
+  })
+  .await?
 }
 
 fn read_rsa_public_key(key_data: KeyData) -> Result<RsaPublicKey, CryptoError> {
-    let public_key = match key_data.r#type {
-        KeyType::Private => RsaPrivateKey::from_pkcs1_der(&key_data.data)?.to_public_key(),
-        KeyType::Public => RsaPublicKey::from_pkcs1_der(&key_data.data)?,
-        KeyType::Secret => unreachable!("unexpected KeyType::Secret"),
-    };
-    Ok(public_key)
+  let public_key = match key_data.r#type {
+    KeyType::Private => {
+      RsaPrivateKey::from_pkcs1_der(&key_data.data)?.to_public_key()
+    }
+    KeyType::Public => RsaPublicKey::from_pkcs1_der(&key_data.data)?,
+    KeyType::Secret => unreachable!("unexpected KeyType::Secret"),
+  };
+  Ok(public_key)
 }
 
 #[op2]
 #[string]
-pub fn op_crypto_random_uuid(state: &mut OpState) -> Result<String, CryptoError> {
-    let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
-    let uuid = if let Some(seeded_rng) = maybe_seeded_rng {
-        let mut bytes = [0u8; 16];
-        seeded_rng.fill(&mut bytes);
-        fast_uuid_v4(&mut bytes)
-    } else {
-        let mut rng = thread_rng();
-        let mut bytes = [0u8; 16];
-        rng.fill(&mut bytes);
-        fast_uuid_v4(&mut bytes)
-    };
+pub fn op_crypto_random_uuid(
+  state: &mut OpState,
+) -> Result<String, CryptoError> {
+  let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
+  let uuid = if let Some(seeded_rng) = maybe_seeded_rng {
+    let mut bytes = [0u8; 16];
+    seeded_rng.fill(&mut bytes);
+    fast_uuid_v4(&mut bytes)
+  } else {
+    let mut rng = thread_rng();
+    let mut bytes = [0u8; 16];
+    rng.fill(&mut bytes);
+    fast_uuid_v4(&mut bytes)
+  };
 
-    Ok(uuid)
+  Ok(uuid)
 }
 
 #[op2]
 pub async fn op_crypto_subtle_digest(
-    #[serde] algorithm: CryptoHash,
-    #[buffer] data: JsBuffer,
+  #[serde] algorithm: CryptoHash,
+  #[buffer] data: JsBuffer,
 ) -> Result<Uint8Array, CryptoError> {
-    let output = spawn_blocking(move || {
-        digest::digest(algorithm.into(), &data)
-            .as_ref()
-            .to_vec()
-            .into()
-    })
-    .await?;
+  let output = spawn_blocking(move || {
+    digest::digest(algorithm.into(), &data)
+      .as_ref()
+      .to_vec()
+      .into()
+  })
+  .await?;
 
-    Ok(output)
+  Ok(output)
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WrapUnwrapKeyArg {
-    key: V8RawKeyData,
-    algorithm: Algorithm,
+  key: V8RawKeyData,
+  algorithm: Algorithm,
 }
 
 #[op2]
 pub fn op_crypto_wrap_key(
-    #[serde] args: WrapUnwrapKeyArg,
-    #[buffer] data: JsBuffer,
+  #[serde] args: WrapUnwrapKeyArg,
+  #[buffer] data: JsBuffer,
 ) -> Result<Uint8Array, CryptoError> {
-    let algorithm = args.algorithm;
+  let algorithm = args.algorithm;
 
-    match algorithm {
-        Algorithm::AesKw => {
-            let key = args.key.as_secret_key()?;
+  match algorithm {
+    Algorithm::AesKw => {
+      let key = args.key.as_secret_key()?;
 
-            if !data.len().is_multiple_of(8) {
-                return Err(CryptoError::DataInvalidSize);
-            }
+      if !data.len().is_multiple_of(8) {
+        return Err(CryptoError::DataInvalidSize);
+      }
 
-            let wrapped_key = match key.len() {
-                16 => KekAes128::new(key.into()).wrap_vec(&data),
-                24 => KekAes192::new(key.into()).wrap_vec(&data),
-                32 => KekAes256::new(key.into()).wrap_vec(&data),
-                _ => return Err(CryptoError::InvalidKeyLength),
-            }
-            .map_err(|_| CryptoError::EncryptionError)?;
+      let wrapped_key = match key.len() {
+        16 => KekAes128::new(key.into()).wrap_vec(&data),
+        24 => KekAes192::new(key.into()).wrap_vec(&data),
+        32 => KekAes256::new(key.into()).wrap_vec(&data),
+        _ => return Err(CryptoError::InvalidKeyLength),
+      }
+      .map_err(|_| CryptoError::EncryptionError)?;
 
-            Ok(wrapped_key.into())
-        }
-        _ => Err(CryptoError::UnsupportedAlgorithm),
+      Ok(wrapped_key.into())
     }
+    _ => Err(CryptoError::UnsupportedAlgorithm),
+  }
 }
 
 #[op2]
 pub fn op_crypto_unwrap_key(
-    #[serde] args: WrapUnwrapKeyArg,
-    #[buffer] data: JsBuffer,
+  #[serde] args: WrapUnwrapKeyArg,
+  #[buffer] data: JsBuffer,
 ) -> Result<Uint8Array, CryptoError> {
-    let algorithm = args.algorithm;
-    match algorithm {
-        Algorithm::AesKw => {
-            let key = args.key.as_secret_key()?;
+  let algorithm = args.algorithm;
+  match algorithm {
+    Algorithm::AesKw => {
+      let key = args.key.as_secret_key()?;
 
-            if !data.len().is_multiple_of(8) {
-                return Err(CryptoError::DataInvalidSize);
-            }
+      if !data.len().is_multiple_of(8) {
+        return Err(CryptoError::DataInvalidSize);
+      }
 
-            let unwrapped_key = match key.len() {
-                16 => KekAes128::new(key.into()).unwrap_vec(&data),
-                24 => KekAes192::new(key.into()).unwrap_vec(&data),
-                32 => KekAes256::new(key.into()).unwrap_vec(&data),
-                _ => return Err(CryptoError::InvalidKeyLength),
-            }
-            .map_err(|_| CryptoError::DecryptionError)?;
+      let unwrapped_key = match key.len() {
+        16 => KekAes128::new(key.into()).unwrap_vec(&data),
+        24 => KekAes192::new(key.into()).unwrap_vec(&data),
+        32 => KekAes256::new(key.into()).unwrap_vec(&data),
+        _ => return Err(CryptoError::InvalidKeyLength),
+      }
+      .map_err(|_| CryptoError::DecryptionError)?;
 
-            Ok(unwrapped_key.into())
-        }
-        _ => Err(CryptoError::UnsupportedAlgorithm),
+      Ok(unwrapped_key.into())
     }
+    _ => Err(CryptoError::UnsupportedAlgorithm),
+  }
 }
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 fn fast_uuid_v4(bytes: &mut [u8; 16]) -> String {
-    // Set UUID version to 4 and variant to 1.
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  // Set UUID version to 4 and variant to 1.
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
-    let buf = [
-        HEX_CHARS[(bytes[0] >> 4) as usize],
-        HEX_CHARS[(bytes[0] & 0x0f) as usize],
-        HEX_CHARS[(bytes[1] >> 4) as usize],
-        HEX_CHARS[(bytes[1] & 0x0f) as usize],
-        HEX_CHARS[(bytes[2] >> 4) as usize],
-        HEX_CHARS[(bytes[2] & 0x0f) as usize],
-        HEX_CHARS[(bytes[3] >> 4) as usize],
-        HEX_CHARS[(bytes[3] & 0x0f) as usize],
-        b'-',
-        HEX_CHARS[(bytes[4] >> 4) as usize],
-        HEX_CHARS[(bytes[4] & 0x0f) as usize],
-        HEX_CHARS[(bytes[5] >> 4) as usize],
-        HEX_CHARS[(bytes[5] & 0x0f) as usize],
-        b'-',
-        HEX_CHARS[(bytes[6] >> 4) as usize],
-        HEX_CHARS[(bytes[6] & 0x0f) as usize],
-        HEX_CHARS[(bytes[7] >> 4) as usize],
-        HEX_CHARS[(bytes[7] & 0x0f) as usize],
-        b'-',
-        HEX_CHARS[(bytes[8] >> 4) as usize],
-        HEX_CHARS[(bytes[8] & 0x0f) as usize],
-        HEX_CHARS[(bytes[9] >> 4) as usize],
-        HEX_CHARS[(bytes[9] & 0x0f) as usize],
-        b'-',
-        HEX_CHARS[(bytes[10] >> 4) as usize],
-        HEX_CHARS[(bytes[10] & 0x0f) as usize],
-        HEX_CHARS[(bytes[11] >> 4) as usize],
-        HEX_CHARS[(bytes[11] & 0x0f) as usize],
-        HEX_CHARS[(bytes[12] >> 4) as usize],
-        HEX_CHARS[(bytes[12] & 0x0f) as usize],
-        HEX_CHARS[(bytes[13] >> 4) as usize],
-        HEX_CHARS[(bytes[13] & 0x0f) as usize],
-        HEX_CHARS[(bytes[14] >> 4) as usize],
-        HEX_CHARS[(bytes[14] & 0x0f) as usize],
-        HEX_CHARS[(bytes[15] >> 4) as usize],
-        HEX_CHARS[(bytes[15] & 0x0f) as usize],
-    ];
+  let buf = [
+    HEX_CHARS[(bytes[0] >> 4) as usize],
+    HEX_CHARS[(bytes[0] & 0x0f) as usize],
+    HEX_CHARS[(bytes[1] >> 4) as usize],
+    HEX_CHARS[(bytes[1] & 0x0f) as usize],
+    HEX_CHARS[(bytes[2] >> 4) as usize],
+    HEX_CHARS[(bytes[2] & 0x0f) as usize],
+    HEX_CHARS[(bytes[3] >> 4) as usize],
+    HEX_CHARS[(bytes[3] & 0x0f) as usize],
+    b'-',
+    HEX_CHARS[(bytes[4] >> 4) as usize],
+    HEX_CHARS[(bytes[4] & 0x0f) as usize],
+    HEX_CHARS[(bytes[5] >> 4) as usize],
+    HEX_CHARS[(bytes[5] & 0x0f) as usize],
+    b'-',
+    HEX_CHARS[(bytes[6] >> 4) as usize],
+    HEX_CHARS[(bytes[6] & 0x0f) as usize],
+    HEX_CHARS[(bytes[7] >> 4) as usize],
+    HEX_CHARS[(bytes[7] & 0x0f) as usize],
+    b'-',
+    HEX_CHARS[(bytes[8] >> 4) as usize],
+    HEX_CHARS[(bytes[8] & 0x0f) as usize],
+    HEX_CHARS[(bytes[9] >> 4) as usize],
+    HEX_CHARS[(bytes[9] & 0x0f) as usize],
+    b'-',
+    HEX_CHARS[(bytes[10] >> 4) as usize],
+    HEX_CHARS[(bytes[10] & 0x0f) as usize],
+    HEX_CHARS[(bytes[11] >> 4) as usize],
+    HEX_CHARS[(bytes[11] & 0x0f) as usize],
+    HEX_CHARS[(bytes[12] >> 4) as usize],
+    HEX_CHARS[(bytes[12] & 0x0f) as usize],
+    HEX_CHARS[(bytes[13] >> 4) as usize],
+    HEX_CHARS[(bytes[13] & 0x0f) as usize],
+    HEX_CHARS[(bytes[14] >> 4) as usize],
+    HEX_CHARS[(bytes[14] & 0x0f) as usize],
+    HEX_CHARS[(bytes[15] >> 4) as usize],
+    HEX_CHARS[(bytes[15] & 0x0f) as usize],
+  ];
 
-    // Safety: the buffer is all valid UTF-8.
-    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
+  // Safety: the buffer is all valid UTF-8.
+  unsafe { String::from_utf8_unchecked(buf.to_vec()) }
 }
 
 #[test]
 fn test_fast_uuid_v4_correctness() {
-    let mut rng = thread_rng();
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-    let uuid = fast_uuid_v4(&mut bytes.clone());
-    let uuid_lib = uuid::Builder::from_bytes(bytes)
-        .set_variant(uuid::Variant::RFC4122)
-        .set_version(uuid::Version::Random)
-        .as_uuid()
-        .to_string();
-    assert_eq!(uuid, uuid_lib);
+  let mut rng = thread_rng();
+  let mut bytes = [0u8; 16];
+  rng.fill(&mut bytes);
+  let uuid = fast_uuid_v4(&mut bytes.clone());
+  let uuid_lib = uuid::Builder::from_bytes(bytes)
+    .set_variant(uuid::Variant::RFC4122)
+    .set_version(uuid::Version::Random)
+    .as_uuid()
+    .to_string();
+  assert_eq!(uuid, uuid_lib);
 }

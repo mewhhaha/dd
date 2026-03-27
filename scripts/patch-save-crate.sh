@@ -5,11 +5,18 @@ crate="${1:-}"
 version="${2:-}"
 
 if [[ -z "$crate" ]]; then
-  echo "usage: just patch <crate> [version]" >&2
+  echo "usage: just patch-save <crate> [version]" >&2
   exit 1
 fi
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+dest_dir="$repo_root/vendor/$crate"
+
+if [[ ! -d "$dest_dir" ]]; then
+  echo "vendored crate not found at $dest_dir" >&2
+  echo "run 'just patch $crate ${version}' first" >&2
+  exit 1
+fi
 
 if [[ -z "$version" ]]; then
   version="$(
@@ -53,22 +60,41 @@ if [[ -z "$source_dir" ]]; then
   exit 1
 fi
 
-dest_dir="$repo_root/vendor/$crate"
-if [[ -d "$dest_dir" && "${PATCH_REFRESH:-0}" != "1" ]]; then
-  echo "vendor patch already exists at $dest_dir"
-  echo "edit it, then run 'just patch-save $crate ${version}' to refresh patches/${crate}.patch"
-  echo "or run 'just patch-refresh $crate ${version}' to replace it from the registry cache and reapply the saved patch"
+patch_dir="$repo_root/patches"
+patch_file="$patch_dir/${crate}.patch"
+tmp_file="$(mktemp)"
+trap 'rm -f "$tmp_file"' EXIT
+
+mkdir -p "$patch_dir"
+
+mapfile -t files < <(
+  {
+    cd "$source_dir" && find . -type f | sed 's#^\./##'
+    cd "$dest_dir" && find . -type f | sed 's#^\./##'
+  } | sort -u
+)
+
+for rel in "${files[@]}"; do
+  left="$source_dir/$rel"
+  right="$dest_dir/$rel"
+  if [[ -f "$left" && -f "$right" ]] && cmp -s "$left" "$right"; then
+    continue
+  fi
+
+  if [[ -f "$left" && -f "$right" ]]; then
+    diff -u --label "a/$rel" --label "b/$rel" "$left" "$right" >> "$tmp_file" || true
+  elif [[ -f "$left" ]]; then
+    diff -u --label "a/$rel" --label "b/$rel" "$left" /dev/null >> "$tmp_file" || true
+  else
+    diff -u --label "a/$rel" --label "b/$rel" /dev/null "$right" >> "$tmp_file" || true
+  fi
+done
+
+if [[ ! -s "$tmp_file" ]]; then
+  rm -f "$patch_file"
+  echo "no patch needed for ${crate}@${version}; removed $patch_file if it existed"
   exit 0
 fi
 
-rm -rf "$dest_dir"
-mkdir -p "$repo_root/vendor"
-cp -R "$source_dir" "$dest_dir"
-
-patch_file="$repo_root/patches/${crate}.patch"
-if [[ -f "$patch_file" ]]; then
-  patch -d "$dest_dir" -p1 < "$patch_file"
-  echo "applied $patch_file"
-fi
-
-echo "materialized ${crate}@${version} into $dest_dir"
+mv "$tmp_file" "$patch_file"
+echo "wrote $patch_file"

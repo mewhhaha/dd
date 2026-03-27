@@ -30,13 +30,21 @@ Workers are single JavaScript modules that export a default object with `fetch(r
 
 ## Patch workflow
 
-Vendored crate patches live under `./vendor`, and the workspace owns the override through `[patch.crates-io]`.
+Vendored crate overrides live under `./vendor`, and the actual source patch lives under `./patches`. The workspace owns the override through `[patch.crates-io]`.
 
 ```bash
 just patch deno_crypto
 ```
 
-That copies the currently locked crates.io source into `vendor/deno_crypto` the first time. After that, edit the vendored crate directly. To replace an existing vendored copy from your local cargo registry cache:
+That materializes `vendor/deno_crypto` from the currently locked crates.io source and applies `patches/deno_crypto.patch` if it exists.
+
+If you edit the vendored crate, save the diff back into the checked-in patch file with:
+
+```bash
+just patch-save deno_crypto 0.255.0
+```
+
+To rebuild the vendored copy from your local cargo registry cache and reapply the saved patch:
 
 ```bash
 just patch-refresh deno_crypto 0.255.0
