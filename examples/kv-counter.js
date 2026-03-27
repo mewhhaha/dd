@@ -13,6 +13,20 @@ export default {
     const path = parsePath(request.url);
     const current = Number((await kv.get("counter")) ?? "0") || 0;
 
+    if (path === "/" && request.method === "GET") {
+      return new Response(JSON.stringify({
+        ok: true,
+        worker: "kv-counter",
+        routes: [
+          "GET /value",
+          "POST /inc",
+          "POST /reset",
+        ],
+      }), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+
     if (path === "/value" && request.method === "GET") {
       return new Response(String(current), {
         headers: { "content-type": "text/plain; charset=utf-8" },

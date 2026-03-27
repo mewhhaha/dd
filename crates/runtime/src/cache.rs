@@ -342,7 +342,6 @@ impl CacheStore {
         let conn = self.connect()?;
         let now_ms = epoch_ms_i64()?;
         let expires_at_ms = now_ms + ttl.as_millis() as i64;
-        let entry_id = Uuid::new_v4().to_string();
         let existing_variant = self
             .load_variant_candidates(
                 &conn,
@@ -353,42 +352,83 @@ impl CacheStore {
                 &vary_values_json,
             )
             .await?;
-
-        let insert_result = conn
-            .execute(
-                "INSERT INTO worker_cache_entries (
-                   id, cache_name, method, url, vary_headers_json, vary_values_json,
-                   status, headers_json, body_storage, body_inline_hex, body_ref,
-                   body_size, expires_at_ms, last_access_seq, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                (
-                    entry_id.as_str(),
-                    cache_name.as_str(),
-                    method.as_str(),
-                    request.url.as_str(),
-                    vary_headers_json.as_str(),
-                    vary_values_json.as_str(),
-                    response.status as i64,
-                    headers_json.as_str(),
-                    body_storage.as_str(),
-                    body_inline_hex.as_str(),
-                    body_ref.as_str(),
-                    size_bytes as i64,
-                    expires_at_ms,
-                    self.next_access_seq(),
-                    now_ms,
-                ),
-            )
-            .await;
-        if let Err(error) = insert_result {
-            if body_storage == "blob" && !body_ref.is_empty() {
-                let _ = self.blob_store.delete(&body_ref).await;
+        let access_seq = self.next_access_seq();
+        if let Some(existing) = existing_variant.first() {
+            let old_body_storage = existing.body_storage.clone();
+            let old_body_ref = existing.body_ref.clone();
+            let update_result = conn
+                .execute(
+                    "UPDATE worker_cache_entries
+                     SET status = ?2,
+                         headers_json = ?3,
+                         body_storage = ?4,
+                         body_inline_hex = ?5,
+                         body_ref = ?6,
+                         body_size = ?7,
+                         expires_at_ms = ?8,
+                         last_access_seq = ?9,
+                         updated_at_ms = ?10
+                     WHERE id = ?1",
+                    (
+                        existing.id.as_str(),
+                        response.status as i64,
+                        headers_json.as_str(),
+                        body_storage.as_str(),
+                        body_inline_hex.as_str(),
+                        body_ref.as_str(),
+                        size_bytes as i64,
+                        expires_at_ms,
+                        access_seq,
+                        now_ms,
+                    ),
+                )
+                .await;
+            if let Err(error) = update_result {
+                if body_storage == "blob" && !body_ref.is_empty() {
+                    let _ = self.blob_store.delete(&body_ref).await;
+                }
+                return Err(cache_error(error));
             }
-            return Err(cache_error(error));
-        }
-
-        if !existing_variant.is_empty() {
-            self.remove_records(&conn, &existing_variant).await?;
+            if old_body_storage == "blob" && !old_body_ref.is_empty() && old_body_ref != body_ref {
+                self.blob_store.delete(&old_body_ref).await?;
+            }
+            if existing_variant.len() > 1 {
+                self.remove_records(&conn, &existing_variant[1..]).await?;
+            }
+        } else {
+            let entry_id = Uuid::new_v4().to_string();
+            let insert_result = conn
+                .execute(
+                    "INSERT INTO worker_cache_entries (
+                       id, cache_name, method, url, vary_headers_json, vary_values_json,
+                       status, headers_json, body_storage, body_inline_hex, body_ref,
+                       body_size, expires_at_ms, last_access_seq, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    (
+                        entry_id.as_str(),
+                        cache_name.as_str(),
+                        method.as_str(),
+                        request.url.as_str(),
+                        vary_headers_json.as_str(),
+                        vary_values_json.as_str(),
+                        response.status as i64,
+                        headers_json.as_str(),
+                        body_storage.as_str(),
+                        body_inline_hex.as_str(),
+                        body_ref.as_str(),
+                        size_bytes as i64,
+                        expires_at_ms,
+                        access_seq,
+                        now_ms,
+                    ),
+                )
+                .await;
+            if let Err(error) = insert_result {
+                if body_storage == "blob" && !body_ref.is_empty() {
+                    let _ = self.blob_store.delete(&body_ref).await;
+                }
+                return Err(cache_error(error));
+            }
         }
         self.cleanup_expired(&conn, now_ms).await?;
         self.evict_if_needed(&conn).await?;
@@ -1061,6 +1101,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_overwrites_existing_variant_without_unique_conflict() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/overwrite");
+
+        assert!(store.put(&req, response("one")).await?);
+        assert!(store.put(&req, response("two")).await?);
+
+        match store.get(&req).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"two"),
+            other => panic!("expected overwritten cache entry, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_removes_recently_overwritten_variant() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/delete");
+
+        assert!(store.put(&req, response("temp")).await?);
+        assert!(store.put(&req, response("temp-2")).await?);
+        assert!(store.delete(&req).await?);
+        assert!(matches!(store.get(&req).await?, CacheLookup::Miss));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stale_while_revalidate_lookup_serves_stale() -> Result<()> {
         let store = test_store(CacheConfig {
             max_entries: 8,
@@ -1139,6 +1218,30 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1200)).await;
         req.bypass_stale = true;
         assert!(matches!(store.get(&req).await?, CacheLookup::Miss));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn put_same_variant_replaces_previous_entry() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/replace");
+
+        assert!(store.put(&req, response("first")).await?);
+        assert!(store.put(&req, response("second")).await?);
+
+        match store.get(&req).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"second"),
+            other => panic!("expected fresh second value, got {:?}", other),
+        }
+        assert!(store.delete(&req).await?);
+        assert!(matches!(store.get(&req).await?, CacheLookup::Miss));
+
         Ok(())
     }
 }

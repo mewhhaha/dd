@@ -6,13 +6,14 @@ use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
-    new_runtime_from_snapshot, pump_event_loop_once, validate_worker, ExecuteActorCall,
+    load_worker, new_runtime_from_snapshot, pump_event_loop_once, validate_loaded_worker_runtime,
+    validate_worker, ExecuteActorCall, ExecuteHostRpcCall,
 };
 use crate::kv::KvStore;
 use crate::ops::{
-    cancel_request_body_stream, clear_request_body_stream, register_actor_request_scope,
-    register_request_body_stream, ActorInvokeEvent, IsolateEventPayload, IsolateEventSender,
-    RequestBodyStreams,
+    cancel_request_body_stream, clear_request_body_stream, clear_request_secret_context,
+    register_actor_request_scope, register_request_body_stream, register_request_secret_context,
+    ActorInvokeEvent, IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
 };
 use common::{DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
 use opentelemetry::global;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
@@ -42,6 +44,13 @@ const INTERNAL_WS_KEY_HEADER: &str = "x-dd-ws-actor-key";
 const INTERNAL_WS_BINARY_HEADER: &str = "x-dd-ws-binary";
 const INTERNAL_WS_CLOSE_CODE_HEADER: &str = "x-dd-ws-close-code";
 const INTERNAL_WS_CLOSE_REASON_HEADER: &str = "x-dd-ws-close-reason";
+const INTERNAL_TRANSPORT_ACCEPT_HEADER: &str = "x-dd-transport-accept";
+const INTERNAL_TRANSPORT_SESSION_HEADER: &str = "x-dd-transport-session";
+const INTERNAL_TRANSPORT_HANDLE_HEADER: &str = "x-dd-transport-handle";
+const INTERNAL_TRANSPORT_BINDING_HEADER: &str = "x-dd-transport-actor-binding";
+const INTERNAL_TRANSPORT_KEY_HEADER: &str = "x-dd-transport-actor-key";
+const INTERNAL_TRANSPORT_CLOSE_CODE_HEADER: &str = "x-dd-transport-close-code";
+const INTERNAL_TRANSPORT_CLOSE_REASON_HEADER: &str = "x-dd-transport-close-reason";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 
@@ -132,6 +141,20 @@ pub struct WebSocketOpen {
     pub output: WorkerOutput,
 }
 
+#[derive(Debug)]
+pub struct TransportOpen {
+    pub session_id: String,
+    pub worker_name: String,
+    pub output: WorkerOutput,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicDeployResult {
+    pub worker: String,
+    pub deployment_id: String,
+    pub env_placeholders: HashMap<String, String>,
+}
+
 pub type InvokeRequestBodyReceiver = mpsc::Receiver<std::result::Result<Vec<u8>, String>>;
 
 #[derive(Clone)]
@@ -149,6 +172,12 @@ enum RuntimeCommand {
         config: DeployConfig,
         persist: bool,
         reply: oneshot::Sender<Result<String>>,
+    },
+    DeployDynamic {
+        source: String,
+        env: HashMap<String, String>,
+        egress_allow_hosts: Vec<String>,
+        reply: oneshot::Sender<Result<DynamicDeployResult>>,
     },
     Invoke {
         worker_name: String,
@@ -191,6 +220,34 @@ enum RuntimeCommand {
         close_reason: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    OpenTransport {
+        worker_name: String,
+        request: WorkerInvocation,
+        session_id: String,
+        stream_sender: mpsc::UnboundedSender<Vec<u8>>,
+        datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+        reply: oneshot::Sender<Result<TransportOpen>>,
+    },
+    PushTransportStream {
+        worker_name: String,
+        session_id: String,
+        chunk: Vec<u8>,
+        done: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    PushTransportDatagram {
+        worker_name: String,
+        session_id: String,
+        datagram: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    CloseTransport {
+        worker_name: String,
+        session_id: String,
+        close_code: u16,
+        close_reason: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 struct WorkerManager {
@@ -212,8 +269,42 @@ struct WorkerManager {
     websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
     websocket_close_signals: HashMap<String, SocketCloseEvent>,
     websocket_open_waiters: HashMap<String, oneshot::Sender<Result<WebSocketOpen>>>,
+    transport_sessions: HashMap<String, WorkerTransportSession>,
+    transport_handle_index: HashMap<String, String>,
+    transport_open_handles: HashMap<String, HashSet<String>>,
+    transport_pending_closes: HashMap<String, HashMap<String, Vec<TransportCloseEvent>>>,
+    transport_open_channels: HashMap<String, TransportOpenChannels>,
+    transport_open_waiters: HashMap<String, oneshot::Sender<Result<TransportOpen>>>,
+    dynamic_worker_handles: HashMap<String, DynamicWorkerHandle>,
+    dynamic_worker_ids: HashMap<DynamicWorkerIdKey, HashMap<String, String>>,
+    host_rpc_providers: HashMap<String, HostRpcProvider>,
     next_generation: u64,
     next_isolate_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DynamicWorkerIdKey {
+    owner_worker: String,
+    owner_generation: u64,
+    binding: String,
+}
+
+#[derive(Clone)]
+struct DynamicWorkerHandle {
+    owner_worker: String,
+    owner_generation: u64,
+    binding: String,
+    worker_name: String,
+    timeout: u64,
+}
+
+#[derive(Clone)]
+struct HostRpcProvider {
+    owner_worker: String,
+    owner_generation: u64,
+    owner_isolate_id: u64,
+    target_id: String,
+    methods: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -236,6 +327,32 @@ struct SocketCloseEvent {
 struct WebSocketOutboundFrame {
     is_binary: bool,
     payload: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct WorkerTransportSession {
+    worker_name: String,
+    generation: u64,
+    isolate_id: u64,
+    binding: String,
+    key: String,
+    handle: String,
+    stream_sender: mpsc::UnboundedSender<Vec<u8>>,
+    datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+    inbound_streams: VecDeque<Vec<u8>>,
+    inbound_stream_closed: bool,
+    inbound_datagrams: VecDeque<Vec<u8>>,
+}
+
+struct TransportOpenChannels {
+    stream_sender: mpsc::UnboundedSender<Vec<u8>>,
+    datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct TransportCloseEvent {
+    code: u16,
+    reason: String,
 }
 
 struct StreamRegistration {
@@ -265,14 +382,29 @@ struct WorkerPool {
     internal_trace: Option<InternalTraceDestination>,
     is_public: bool,
     snapshot: &'static [u8],
+    snapshot_preloaded: bool,
+    source: Arc<str>,
+    actor_classes: Arc<[String]>,
     kv_bindings: Vec<String>,
     actor_bindings: Vec<(String, String)>,
+    dynamic_bindings: Vec<String>,
+    dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
+    dynamic_env: Vec<(String, String)>,
+    secret_replacements: Vec<(String, String)>,
+    egress_allow_hosts: Vec<String>,
+    strict_request_isolation: bool,
     queue: VecDeque<PendingInvoke>,
     isolates: Vec<IsolateHandle>,
     actor_owners: HashMap<String, u64>,
     actor_inflight: HashMap<String, usize>,
     stats: PoolStats,
     queue_warn_level: usize,
+}
+
+#[derive(Clone)]
+struct DynamicRpcBinding {
+    binding: String,
+    provider_id: String,
 }
 
 #[derive(Default)]
@@ -288,6 +420,8 @@ struct PendingInvoke {
     request_body: Option<InvokeRequestBodyReceiver>,
     actor_route: Option<ActorRoute>,
     actor_call: Option<ActorExecutionCall>,
+    host_rpc_call: Option<HostRpcExecutionCall>,
+    target_isolate_id: Option<u64>,
     reply_kind: PendingReplyKind,
     internal_origin: bool,
     reply: oneshot::Sender<Result<WorkerOutput>>,
@@ -299,6 +433,7 @@ enum PendingReplyKind {
     Normal,
     WebsocketOpen { session_id: String },
     WebsocketFrame { session_id: String },
+    TransportOpen { session_id: String },
 }
 
 impl Default for PendingReplyKind {
@@ -345,6 +480,7 @@ struct IsolateHandle {
     sender: mpsc::UnboundedSender<IsolateCommand>,
     inflight_count: usize,
     active_websocket_sessions: usize,
+    active_transport_sessions: usize,
     served_requests: u64,
     last_used_at: Instant,
     pending_replies: HashMap<String, PendingReply>,
@@ -358,9 +494,15 @@ enum IsolateCommand {
         worker_name: String,
         kv_bindings: Vec<String>,
         actor_bindings: Vec<(String, String)>,
+        dynamic_bindings: Vec<String>,
+        dynamic_rpc_bindings: Vec<String>,
+        dynamic_env: Vec<(String, String)>,
+        secret_replacements: Vec<(String, String)>,
+        egress_allow_hosts: Vec<String>,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         actor_call: Option<ActorExecutionCall>,
+        host_rpc_call: Option<HostRpcExecutionCall>,
         actor_route: Option<ActorRoute>,
     },
     Abort {
@@ -395,6 +537,32 @@ enum ActorExecutionCall {
         code: u16,
         reason: String,
     },
+    TransportDatagram {
+        binding: String,
+        key: String,
+        handle: String,
+        data: Vec<u8>,
+    },
+    TransportStream {
+        binding: String,
+        key: String,
+        handle: String,
+        data: Vec<u8>,
+    },
+    TransportClose {
+        binding: String,
+        key: String,
+        handle: String,
+        code: u16,
+        reason: String,
+    },
+}
+
+#[derive(Clone)]
+struct HostRpcExecutionCall {
+    target_id: String,
+    method: String,
+    args: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -485,6 +653,27 @@ enum RuntimeEvent {
         generation: u64,
         payload: crate::ops::ActorSocketConsumeCloseEvent,
     },
+    ActorTransportSendStream(crate::ops::ActorTransportSendStreamEvent),
+    ActorTransportSendDatagram(crate::ops::ActorTransportSendDatagramEvent),
+    ActorTransportRecvStream(crate::ops::ActorTransportRecvStreamEvent),
+    ActorTransportRecvDatagram(crate::ops::ActorTransportRecvDatagramEvent),
+    ActorTransportClose(crate::ops::ActorTransportCloseEvent),
+    ActorTransportList {
+        worker_name: String,
+        generation: u64,
+        payload: crate::ops::ActorTransportListEvent,
+    },
+    ActorTransportConsumeClose {
+        worker_name: String,
+        generation: u64,
+        payload: crate::ops::ActorTransportConsumeCloseEvent,
+    },
+    DynamicWorkerCreate(crate::ops::DynamicWorkerCreateEvent),
+    DynamicWorkerLookup(crate::ops::DynamicWorkerLookupEvent),
+    DynamicWorkerList(crate::ops::DynamicWorkerListEvent),
+    DynamicWorkerDelete(crate::ops::DynamicWorkerDeleteEvent),
+    DynamicWorkerInvoke(crate::ops::DynamicWorkerInvokeEvent),
+    DynamicHostRpcInvoke(crate::ops::DynamicHostRpcInvokeEvent),
     IsolateFailed {
         worker_name: String,
         generation: u64,
@@ -573,6 +762,7 @@ impl RuntimeService {
     }
 
     pub async fn start_with_service_config(config: RuntimeServiceConfig) -> Result<Self> {
+        ensure_rustls_crypto_provider();
         let RuntimeServiceConfig { runtime, storage } = config;
         validate_runtime_config(&runtime)?;
         if storage.actor_shards_per_namespace == 0 {
@@ -751,6 +941,28 @@ impl RuntimeService {
             .map_err(|_| PlatformError::internal("runtime deploy channel closed"))?
     }
 
+    pub async fn deploy_dynamic(
+        &self,
+        source: String,
+        env: HashMap<String, String>,
+        egress_allow_hosts: Vec<String>,
+    ) -> Result<DynamicDeployResult> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::DeployDynamic {
+                source,
+                env,
+                egress_allow_hosts,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| PlatformError::internal("runtime dynamic deploy channel closed"))?
+    }
+
     pub async fn invoke(
         &self,
         worker_name: String,
@@ -890,6 +1102,34 @@ impl RuntimeService {
         Ok(opened)
     }
 
+    pub async fn open_transport(
+        &self,
+        worker_name: String,
+        request: WorkerInvocation,
+        stream_sender: mpsc::UnboundedSender<Vec<u8>>,
+        datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<TransportOpen> {
+        let session_id = Uuid::new_v4().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::OpenTransport {
+                worker_name,
+                request,
+                session_id: session_id.clone(),
+                stream_sender,
+                datagram_sender,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        let mut opened = reply_rx
+            .await
+            .map_err(|_| PlatformError::internal("runtime open transport channel closed"))??;
+        opened.session_id = session_id;
+        Ok(opened)
+    }
+
     pub async fn websocket_send_frame(
         &self,
         worker_name: String,
@@ -942,6 +1182,82 @@ impl RuntimeService {
         })
     }
 
+    pub async fn transport_push_stream(
+        &self,
+        worker_name: String,
+        session_id: String,
+        chunk: Vec<u8>,
+        done: bool,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::PushTransportStream {
+                worker_name,
+                session_id,
+                chunk,
+                done,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime transport stream push channel closed",
+            ))
+        })
+    }
+
+    pub async fn transport_push_datagram(
+        &self,
+        worker_name: String,
+        session_id: String,
+        datagram: Vec<u8>,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::PushTransportDatagram {
+                worker_name,
+                session_id,
+                datagram,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime transport datagram push channel closed",
+            ))
+        })
+    }
+
+    pub async fn transport_close(
+        &self,
+        worker_name: String,
+        session_id: String,
+        close_code: u16,
+        close_reason: String,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::CloseTransport {
+                worker_name,
+                session_id,
+                close_code,
+                close_reason,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime transport close channel closed",
+            ))
+        })
+    }
+
     pub async fn stats(&self, worker_name: String) -> Option<WorkerStats> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -983,6 +1299,13 @@ impl RuntimeService {
     }
 }
 
+fn ensure_rustls_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 impl WorkerManager {
     fn new(
         bootstrap_snapshot: &'static [u8],
@@ -1011,6 +1334,15 @@ impl WorkerManager {
             websocket_outbound_frames: HashMap::new(),
             websocket_close_signals: HashMap::new(),
             websocket_open_waiters: HashMap::new(),
+            transport_sessions: HashMap::new(),
+            transport_handle_index: HashMap::new(),
+            transport_open_handles: HashMap::new(),
+            transport_pending_closes: HashMap::new(),
+            transport_open_channels: HashMap::new(),
+            transport_open_waiters: HashMap::new(),
+            dynamic_worker_handles: HashMap::new(),
+            dynamic_worker_ids: HashMap::new(),
+            host_rpc_providers: HashMap::new(),
             next_generation: 1,
             next_isolate_id: 1,
         }
@@ -1032,6 +1364,17 @@ impl WorkerManager {
                 let result = self.deploy(worker_name, source, config, persist).await;
                 let _ = reply.send(result);
             }
+            RuntimeCommand::DeployDynamic {
+                source,
+                env,
+                egress_allow_hosts,
+                reply,
+            } => {
+                let result = self
+                    .deploy_dynamic(source, env, egress_allow_hosts, Vec::new())
+                    .await;
+                let _ = reply.send(result);
+            }
             RuntimeCommand::Invoke {
                 worker_name,
                 runtime_request_id,
@@ -1044,6 +1387,8 @@ impl WorkerManager {
                     runtime_request_id,
                     request,
                     request_body,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1079,6 +1424,8 @@ impl WorkerManager {
                     runtime_request_id,
                     request,
                     request_body,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1120,6 +1467,88 @@ impl WorkerManager {
                 );
                 let _ = reply.send(result);
             }
+            RuntimeCommand::OpenTransport {
+                worker_name,
+                mut request,
+                session_id,
+                stream_sender,
+                datagram_sender,
+                reply,
+            } => {
+                if !self.workers.contains_key(worker_name.trim()) {
+                    let _ = reply.send(Err(PlatformError::not_found("Worker not found")));
+                    return;
+                }
+                let (inner_tx, _inner_rx) = oneshot::channel();
+                append_or_update_header(
+                    &mut request.headers,
+                    INTERNAL_TRANSPORT_SESSION_HEADER,
+                    &session_id,
+                );
+                self.transport_open_waiters
+                    .insert(session_id.clone(), reply);
+                self.transport_open_channels.insert(
+                    session_id.clone(),
+                    TransportOpenChannels {
+                        stream_sender,
+                        datagram_sender,
+                    },
+                );
+
+                let runtime_request_id = Uuid::new_v4().to_string();
+                let _ = self.enqueue_invoke(
+                    worker_name,
+                    runtime_request_id,
+                    request,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    inner_tx,
+                    PendingReplyKind::TransportOpen { session_id },
+                    event_tx,
+                );
+            }
+            RuntimeCommand::PushTransportStream {
+                worker_name,
+                session_id,
+                chunk,
+                done,
+                reply,
+            } => {
+                let result =
+                    self.push_transport_stream(&worker_name, &session_id, chunk, done, event_tx);
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::PushTransportDatagram {
+                worker_name,
+                session_id,
+                datagram,
+                reply,
+            } => {
+                let result =
+                    self.push_transport_datagram(&worker_name, &session_id, datagram, event_tx);
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::CloseTransport {
+                worker_name,
+                session_id,
+                close_code,
+                close_reason,
+                reply,
+            } => {
+                let result = self.close_transport(
+                    &worker_name,
+                    &session_id,
+                    close_code,
+                    close_reason,
+                    event_tx,
+                );
+                let _ = reply.send(result);
+            }
             RuntimeCommand::RegisterStream {
                 worker_name,
                 runtime_request_id,
@@ -1139,7 +1568,7 @@ impl WorkerManager {
         }
     }
 
-    fn handle_event(
+    async fn handle_event(
         &mut self,
         event: RuntimeEvent,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
@@ -1236,6 +1665,53 @@ impl WorkerManager {
             } => {
                 self.handle_actor_socket_consume_close(payload, event_tx);
             }
+            RuntimeEvent::ActorTransportSendStream(payload) => {
+                self.handle_actor_transport_send_stream(payload, event_tx);
+            }
+            RuntimeEvent::ActorTransportSendDatagram(payload) => {
+                self.handle_actor_transport_send_datagram(payload, event_tx);
+            }
+            RuntimeEvent::ActorTransportRecvStream(payload) => {
+                self.handle_actor_transport_recv_stream(payload, event_tx);
+            }
+            RuntimeEvent::ActorTransportRecvDatagram(payload) => {
+                self.handle_actor_transport_recv_datagram(payload, event_tx);
+            }
+            RuntimeEvent::ActorTransportClose(payload) => {
+                self.handle_actor_transport_close(payload, event_tx);
+            }
+            RuntimeEvent::ActorTransportList {
+                worker_name: _worker_name,
+                generation: _generation,
+                payload,
+            } => {
+                self.handle_actor_transport_list(payload, event_tx);
+            }
+            RuntimeEvent::ActorTransportConsumeClose {
+                worker_name: _worker_name,
+                generation: _generation,
+                payload,
+            } => {
+                self.handle_actor_transport_consume_close(payload, event_tx);
+            }
+            RuntimeEvent::DynamicWorkerCreate(payload) => {
+                self.handle_dynamic_worker_create(payload).await;
+            }
+            RuntimeEvent::DynamicWorkerLookup(payload) => {
+                self.handle_dynamic_worker_lookup(payload);
+            }
+            RuntimeEvent::DynamicWorkerList(payload) => {
+                self.handle_dynamic_worker_list(payload);
+            }
+            RuntimeEvent::DynamicWorkerDelete(payload) => {
+                self.handle_dynamic_worker_delete(payload);
+            }
+            RuntimeEvent::DynamicWorkerInvoke(payload) => {
+                self.handle_dynamic_worker_invoke(payload, event_tx);
+            }
+            RuntimeEvent::DynamicHostRpcInvoke(payload) => {
+                self.handle_dynamic_host_rpc_invoke(payload, event_tx);
+            }
             RuntimeEvent::IsolateFailed {
                 worker_name,
                 generation,
@@ -1295,6 +1771,8 @@ impl WorkerManager {
             None,
             Some(route),
             Some(actor_call),
+            None,
+            None,
             Some(session.generation),
             true,
             reply,
@@ -1354,6 +1832,8 @@ impl WorkerManager {
             None,
             Some(route),
             Some(actor_call),
+            None,
+            None,
             Some(session.generation),
             true,
             reply,
@@ -1559,6 +2039,121 @@ impl WorkerManager {
         Some(session)
     }
 
+    fn register_transport_session(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        session_id: &str,
+        binding: &str,
+        key: &str,
+        handle: &str,
+        stream_sender: mpsc::UnboundedSender<Vec<u8>>,
+        datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<()> {
+        let owner_key = actor_owner_key(binding, key);
+        let owner_isolate_id = self
+            .get_pool_mut(worker_name, generation)
+            .and_then(|pool| pool.actor_owners.get(&owner_key).copied())
+            .unwrap_or(isolate_id);
+
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return Err(PlatformError::not_found("worker pool missing"));
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|candidate| candidate.id == owner_isolate_id)
+        else {
+            return Err(PlatformError::not_found(
+                "transport owner isolate is not available",
+            ));
+        };
+        isolate.active_transport_sessions += 1;
+
+        if self.transport_sessions.contains_key(session_id) {
+            let _ = self.unregister_transport_session(session_id);
+        }
+
+        let session = WorkerTransportSession {
+            worker_name: worker_name.to_string(),
+            generation,
+            isolate_id: owner_isolate_id,
+            binding: binding.to_string(),
+            key: key.to_string(),
+            handle: handle.to_string(),
+            stream_sender,
+            datagram_sender,
+            inbound_streams: VecDeque::new(),
+            inbound_stream_closed: false,
+            inbound_datagrams: VecDeque::new(),
+        };
+        self.transport_sessions
+            .insert(session_id.to_string(), session.clone());
+        self.transport_handle_index.insert(
+            actor_handle_key(&session.binding, &session.key, &session.handle),
+            session_id.to_string(),
+        );
+        self.transport_open_handles
+            .entry(owner_key)
+            .or_default()
+            .insert(handle.to_string());
+        Ok(())
+    }
+
+    fn unregister_transport_session(&mut self, session_id: &str) -> Option<WorkerTransportSession> {
+        let session = self.transport_sessions.remove(session_id)?;
+        self.transport_handle_index.remove(&actor_handle_key(
+            &session.binding,
+            &session.key,
+            &session.handle,
+        ));
+        self.transport_open_channels.remove(session_id);
+        self.transport_open_waiters.remove(session_id);
+
+        let owner_key = actor_owner_key(&session.binding, &session.key);
+        let remove_owner_key =
+            if let Some(handles) = self.transport_open_handles.get_mut(&owner_key) {
+                handles.remove(&session.handle);
+                handles.is_empty()
+            } else {
+                false
+            };
+        if remove_owner_key {
+            self.transport_open_handles.remove(&owner_key);
+        }
+
+        if let Some(pool) = self.get_pool_mut(&session.worker_name, session.generation) {
+            if let Some(isolate) = pool
+                .isolates
+                .iter_mut()
+                .find(|isolate| isolate.id == session.isolate_id)
+            {
+                isolate.active_transport_sessions =
+                    isolate.active_transport_sessions.saturating_sub(1);
+            }
+        }
+        Some(session)
+    }
+
+    fn queue_transport_close_replay(
+        &mut self,
+        session: &WorkerTransportSession,
+        close_code: u16,
+        close_reason: String,
+    ) {
+        let owner_key = actor_owner_key(&session.binding, &session.key);
+        self.transport_pending_closes
+            .entry(owner_key)
+            .or_default()
+            .entry(session.handle.clone())
+            .or_default()
+            .push(TransportCloseEvent {
+                code: close_code,
+                reason: close_reason,
+            });
+    }
+
     fn queue_websocket_close_replay(
         &mut self,
         session: &WorkerWebSocketSession,
@@ -1575,6 +2170,69 @@ impl WorkerManager {
                 code: close_code,
                 reason: close_reason,
             });
+    }
+
+    fn complete_transport_open(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        session_id: String,
+        result: Result<WorkerOutput>,
+    ) {
+        let Some(waiter) = self.transport_open_waiters.remove(&session_id) else {
+            warn!(
+                worker = %worker_name,
+                generation,
+                isolate_id,
+                session_id,
+                "missing transport open waiter"
+            );
+            self.transport_open_channels.remove(&session_id);
+            return;
+        };
+        let channels = self.transport_open_channels.remove(&session_id);
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = waiter.send(Err(error));
+                return;
+            }
+        };
+        let (handle, binding, key) = match parse_transport_open_metadata(&output, &session_id) {
+            Ok(values) => values,
+            Err(error) => {
+                let _ = waiter.send(Err(error));
+                return;
+            }
+        };
+        let Some(channels) = channels else {
+            let _ = waiter.send(Err(PlatformError::internal(
+                "missing transport open channels",
+            )));
+            return;
+        };
+        if let Err(error) = self.register_transport_session(
+            worker_name,
+            generation,
+            isolate_id,
+            &session_id,
+            &binding,
+            &key,
+            &handle,
+            channels.stream_sender,
+            channels.datagram_sender,
+        ) {
+            let _ = waiter.send(Err(error));
+            return;
+        }
+        let mut output = output;
+        output.headers = strip_transport_open_internal_headers(&output.headers);
+        let _ = waiter.send(Ok(TransportOpen {
+            session_id,
+            worker_name: worker_name.to_string(),
+            output,
+        }));
     }
 
     fn handle_actor_socket_send(
@@ -1676,6 +2334,779 @@ impl WorkerManager {
         let _ = payload.reply.send(Ok(replay));
     }
 
+    fn push_transport_stream(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+        chunk: Vec<u8>,
+        done: bool,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<()> {
+        let _ = done;
+        let Some(session) = self.transport_sessions.get(session_id).cloned() else {
+            return Err(PlatformError::not_found("transport session not found"));
+        };
+        if session.worker_name != worker_name {
+            return Err(PlatformError::bad_request(
+                "transport session worker mismatch",
+            ));
+        }
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let route = ActorRoute {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+        };
+        let actor_call = ActorExecutionCall::TransportStream {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+            handle: session.handle.clone(),
+            data: chunk,
+        };
+        let invoke = WorkerInvocation {
+            method: "TRANSPORT-STREAM".to_string(),
+            url: format!("http://actor/__dd_transport_stream/{session_id}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: format!("transport-stream-{runtime_request_id}"),
+        };
+        let (reply, receiver) = oneshot::channel();
+        self.enqueue_invoke(
+            session.worker_name,
+            runtime_request_id,
+            invoke,
+            None,
+            Some(route),
+            Some(actor_call),
+            None,
+            None,
+            Some(session.generation),
+            true,
+            reply,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        tokio::spawn(async move {
+            let _ = receiver.await;
+        });
+        Ok(())
+    }
+
+    fn push_transport_datagram(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+        datagram: Vec<u8>,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<()> {
+        let Some(session) = self.transport_sessions.get(session_id).cloned() else {
+            return Err(PlatformError::not_found("transport session not found"));
+        };
+        if session.worker_name != worker_name {
+            return Err(PlatformError::bad_request(
+                "transport session worker mismatch",
+            ));
+        }
+        if datagram.is_empty() {
+            return Ok(());
+        }
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let route = ActorRoute {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+        };
+        let actor_call = ActorExecutionCall::TransportDatagram {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+            handle: session.handle.clone(),
+            data: datagram,
+        };
+        let invoke = WorkerInvocation {
+            method: "TRANSPORT-DATAGRAM".to_string(),
+            url: format!("http://actor/__dd_transport_datagram/{session_id}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: format!("transport-datagram-{runtime_request_id}"),
+        };
+        let (reply, receiver) = oneshot::channel();
+        self.enqueue_invoke(
+            session.worker_name,
+            runtime_request_id,
+            invoke,
+            None,
+            Some(route),
+            Some(actor_call),
+            None,
+            None,
+            Some(session.generation),
+            true,
+            reply,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        tokio::spawn(async move {
+            let _ = receiver.await;
+        });
+        Ok(())
+    }
+
+    fn close_transport(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+        close_code: u16,
+        close_reason: String,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) -> Result<()> {
+        let Some(existing) = self.transport_sessions.get(session_id) else {
+            return Err(PlatformError::not_found("transport session not found"));
+        };
+        if existing.worker_name != worker_name {
+            return Err(PlatformError::bad_request(
+                "transport session worker mismatch",
+            ));
+        }
+
+        let session = self
+            .unregister_transport_session(session_id)
+            .ok_or_else(|| PlatformError::not_found("transport session not found"))?;
+        self.queue_transport_close_replay(&session, close_code, close_reason.clone());
+
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let route = ActorRoute {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+        };
+        let actor_call = ActorExecutionCall::TransportClose {
+            binding: session.binding.clone(),
+            key: session.key.clone(),
+            handle: session.handle.clone(),
+            code: close_code,
+            reason: close_reason,
+        };
+        let invoke = WorkerInvocation {
+            method: "TRANSPORT-CLOSE".to_string(),
+            url: format!("http://actor/__dd_transport_close/{session_id}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: format!("transport-close-{runtime_request_id}"),
+        };
+        let (reply, receiver) = oneshot::channel();
+        self.enqueue_invoke(
+            session.worker_name,
+            runtime_request_id,
+            invoke,
+            None,
+            Some(route),
+            Some(actor_call),
+            None,
+            None,
+            Some(session.generation),
+            true,
+            reply,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        tokio::spawn(async move {
+            let _ = receiver.await;
+        });
+        Ok(())
+    }
+
+    fn handle_actor_transport_send_stream(
+        &mut self,
+        payload: crate::ops::ActorTransportSendStreamEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorTransportSendStreamEvent {
+            reply,
+            handle,
+            binding,
+            key,
+            chunk,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        let result = match session_id.as_deref() {
+            Some(session_id) => match self.transport_sessions.get(session_id) {
+                Some(session) => session
+                    .stream_sender
+                    .send(chunk)
+                    .map_err(|_| PlatformError::internal("transport stream channel closed")),
+                None => Err(PlatformError::not_found("transport session not found")),
+            },
+            None => Err(PlatformError::not_found("transport session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_transport_send_datagram(
+        &mut self,
+        payload: crate::ops::ActorTransportSendDatagramEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorTransportSendDatagramEvent {
+            reply,
+            handle,
+            binding,
+            key,
+            datagram,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        let result = match session_id.as_deref() {
+            Some(session_id) => match self.transport_sessions.get(session_id) {
+                Some(session) => session
+                    .datagram_sender
+                    .send(datagram)
+                    .map_err(|_| PlatformError::internal("transport datagram channel closed")),
+                None => Err(PlatformError::not_found("transport session not found")),
+            },
+            None => Err(PlatformError::not_found("transport session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_transport_recv_stream(
+        &mut self,
+        payload: crate::ops::ActorTransportRecvStreamEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorTransportRecvStreamEvent {
+            reply,
+            handle,
+            binding,
+            key,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        let result = match session_id.as_deref() {
+            Some(session_id) => match self.transport_sessions.get_mut(session_id) {
+                Some(session) => {
+                    let chunk = session.inbound_streams.pop_front().unwrap_or_default();
+                    let done = chunk.is_empty() && session.inbound_stream_closed;
+                    Ok(crate::ops::TransportRecvEvent { done, chunk })
+                }
+                None => Err(PlatformError::not_found("transport session not found")),
+            },
+            None => Err(PlatformError::not_found("transport session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_transport_recv_datagram(
+        &mut self,
+        payload: crate::ops::ActorTransportRecvDatagramEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorTransportRecvDatagramEvent {
+            reply,
+            handle,
+            binding,
+            key,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        let result = match session_id.as_deref() {
+            Some(session_id) => match self.transport_sessions.get_mut(session_id) {
+                Some(session) => {
+                    let chunk = session.inbound_datagrams.pop_front().unwrap_or_default();
+                    Ok(crate::ops::TransportRecvEvent { done: false, chunk })
+                }
+                None => Err(PlatformError::not_found("transport session not found")),
+            },
+            None => Err(PlatformError::not_found("transport session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_transport_close(
+        &mut self,
+        payload: crate::ops::ActorTransportCloseEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::ActorTransportCloseEvent {
+            reply,
+            handle,
+            binding,
+            key,
+            code,
+            reason,
+        } = payload;
+        let index_key = actor_handle_key(&binding, &key, &handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        let result = match session_id.as_deref() {
+            Some(session_id) => {
+                if let Some(session) = self.unregister_transport_session(session_id) {
+                    self.queue_transport_close_replay(&session, code, reason);
+                    Ok(())
+                } else {
+                    Err(PlatformError::not_found("transport session not found"))
+                }
+            }
+            None => Err(PlatformError::not_found("transport session not found")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_actor_transport_list(
+        &mut self,
+        payload: crate::ops::ActorTransportListEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+        let mut handles: Vec<String> = self
+            .transport_open_handles
+            .get(&owner_key)
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default();
+        handles.sort();
+        let _ = payload.reply.send(Ok(handles));
+    }
+
+    fn handle_actor_transport_consume_close(
+        &mut self,
+        payload: crate::ops::ActorTransportConsumeCloseEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+        let events = self
+            .transport_pending_closes
+            .get_mut(&owner_key)
+            .and_then(|by_handle| by_handle.remove(&payload.handle))
+            .unwrap_or_default();
+        let remove_owner_key = self
+            .transport_pending_closes
+            .get(&owner_key)
+            .map(|by_handle| by_handle.is_empty())
+            .unwrap_or(false);
+        if remove_owner_key {
+            self.transport_pending_closes.remove(&owner_key);
+        }
+        let replay: Vec<crate::ops::ActorTransportCloseReplayEvent> = events
+            .into_iter()
+            .map(|event| crate::ops::ActorTransportCloseReplayEvent {
+                code: event.code,
+                reason: event.reason,
+            })
+            .collect();
+        let _ = payload.reply.send(Ok(replay));
+    }
+
+    async fn handle_dynamic_worker_create(
+        &mut self,
+        payload: crate::ops::DynamicWorkerCreateEvent,
+    ) {
+        let crate::ops::DynamicWorkerCreateEvent {
+            owner_worker,
+            owner_generation,
+            owner_isolate_id,
+            binding,
+            id,
+            source,
+            env,
+            timeout,
+            host_rpc_bindings,
+            reply,
+        } = payload;
+        let normalized_id = id.trim().to_string();
+        if normalized_id.is_empty() {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "dynamic worker id must not be empty",
+            )));
+            return;
+        }
+        let timeout = timeout.clamp(1, 60_000);
+        let id_key = DynamicWorkerIdKey {
+            owner_worker: owner_worker.clone(),
+            owner_generation,
+            binding: binding.clone(),
+        };
+        if let Some(handle) = self
+            .dynamic_worker_ids
+            .get(&id_key)
+            .and_then(|by_id| by_id.get(&normalized_id))
+            .cloned()
+        {
+            if let Some(entry) = self.dynamic_worker_handles.get(&handle) {
+                let _ = reply.send(Ok(crate::ops::DynamicWorkerCreateReply {
+                    handle,
+                    worker_name: entry.worker_name.clone(),
+                    timeout: entry.timeout,
+                }));
+                return;
+            }
+            if let Some(by_id) = self.dynamic_worker_ids.get_mut(&id_key) {
+                by_id.remove(&normalized_id);
+            }
+        }
+        let mut dynamic_rpc_bindings = Vec::new();
+        let mut created_provider_ids = Vec::new();
+        let mut seen_binding_names = HashSet::new();
+        for binding_spec in host_rpc_bindings {
+            let binding_name = binding_spec.binding.trim().to_string();
+            let target_id = binding_spec.target_id.trim().to_string();
+            if binding_name.is_empty() {
+                let _ = reply.send(Err(PlatformError::bad_request(
+                    "dynamic host rpc binding must not be empty",
+                )));
+                return;
+            }
+            if target_id.is_empty() {
+                let _ = reply.send(Err(PlatformError::bad_request(
+                    "dynamic host rpc target_id must not be empty",
+                )));
+                return;
+            }
+            if !seen_binding_names.insert(binding_name.clone()) {
+                let _ = reply.send(Err(PlatformError::bad_request(format!(
+                    "duplicate dynamic host rpc binding: {binding_name}"
+                ))));
+                return;
+            }
+            let provider_id = format!("hrpc-{}", Uuid::new_v4().simple());
+            let methods = binding_spec
+                .methods
+                .into_iter()
+                .map(|method| method.trim().to_string())
+                .filter(|method| !method.is_empty())
+                .collect::<HashSet<_>>();
+            self.host_rpc_providers.insert(
+                provider_id.clone(),
+                HostRpcProvider {
+                    owner_worker: owner_worker.clone(),
+                    owner_generation,
+                    owner_isolate_id,
+                    target_id,
+                    methods,
+                },
+            );
+            created_provider_ids.push(provider_id.clone());
+            dynamic_rpc_bindings.push(DynamicRpcBinding {
+                binding: binding_name,
+                provider_id,
+            });
+        }
+        let result = self
+            .deploy_dynamic(source, env, Vec::new(), dynamic_rpc_bindings)
+            .await;
+        let result = result.map(|deployed| {
+            let handle = format!("dynh-{}", Uuid::new_v4().simple());
+            let worker_name = deployed.worker;
+            self.dynamic_worker_handles.insert(
+                handle.clone(),
+                DynamicWorkerHandle {
+                    owner_worker,
+                    owner_generation,
+                    binding,
+                    worker_name: worker_name.clone(),
+                    timeout,
+                },
+            );
+            self.dynamic_worker_ids
+                .entry(id_key)
+                .or_default()
+                .insert(normalized_id, handle.clone());
+            crate::ops::DynamicWorkerCreateReply {
+                handle,
+                worker_name,
+                timeout,
+            }
+        });
+        if result.is_err() {
+            for provider_id in created_provider_ids {
+                self.host_rpc_providers.remove(&provider_id);
+            }
+        }
+        let _ = reply.send(result);
+    }
+
+    fn handle_dynamic_worker_lookup(&mut self, payload: crate::ops::DynamicWorkerLookupEvent) {
+        let crate::ops::DynamicWorkerLookupEvent {
+            owner_worker,
+            owner_generation,
+            binding,
+            id,
+            reply,
+        } = payload;
+        let key = DynamicWorkerIdKey {
+            owner_worker,
+            owner_generation,
+            binding,
+        };
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "dynamic worker id must not be empty",
+            )));
+            return;
+        }
+        let handle = self
+            .dynamic_worker_ids
+            .get(&key)
+            .and_then(|by_id| by_id.get(&id))
+            .cloned();
+        let Some(handle) = handle else {
+            let _ = reply.send(Ok(None));
+            return;
+        };
+        let Some(entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
+            if let Some(by_id) = self.dynamic_worker_ids.get_mut(&key) {
+                by_id.remove(&id);
+            }
+            let _ = reply.send(Ok(None));
+            return;
+        };
+        let _ = reply.send(Ok(Some(crate::ops::DynamicWorkerCreateReply {
+            handle,
+            worker_name: entry.worker_name,
+            timeout: entry.timeout,
+        })));
+    }
+
+    fn handle_dynamic_worker_list(&mut self, payload: crate::ops::DynamicWorkerListEvent) {
+        let crate::ops::DynamicWorkerListEvent {
+            owner_worker,
+            owner_generation,
+            binding,
+            reply,
+        } = payload;
+        let key = DynamicWorkerIdKey {
+            owner_worker,
+            owner_generation,
+            binding,
+        };
+        let mut ids = self
+            .dynamic_worker_ids
+            .get(&key)
+            .map(|by_id| by_id.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        ids.sort();
+        let _ = reply.send(Ok(ids));
+    }
+
+    fn handle_dynamic_worker_delete(&mut self, payload: crate::ops::DynamicWorkerDeleteEvent) {
+        let crate::ops::DynamicWorkerDeleteEvent {
+            owner_worker,
+            owner_generation,
+            binding,
+            id,
+            reply,
+        } = payload;
+        let key = DynamicWorkerIdKey {
+            owner_worker,
+            owner_generation,
+            binding,
+        };
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "dynamic worker id must not be empty",
+            )));
+            return;
+        }
+        let handle = self
+            .dynamic_worker_ids
+            .get_mut(&key)
+            .and_then(|by_id| by_id.remove(&id));
+        if self
+            .dynamic_worker_ids
+            .get(&key)
+            .map(|by_id| by_id.is_empty())
+            .unwrap_or(false)
+        {
+            self.dynamic_worker_ids.remove(&key);
+        }
+        let Some(handle) = handle else {
+            let _ = reply.send(Ok(false));
+            return;
+        };
+        let Some(entry) = self.dynamic_worker_handles.remove(&handle) else {
+            let _ = reply.send(Ok(false));
+            return;
+        };
+        self.retire_worker_completely(&entry.worker_name);
+        let _ = reply.send(Ok(true));
+    }
+
+    fn handle_dynamic_worker_invoke(
+        &mut self,
+        payload: crate::ops::DynamicWorkerInvokeEvent,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::DynamicWorkerInvokeEvent {
+            owner_worker,
+            owner_generation,
+            binding,
+            handle,
+            request,
+            reply,
+        } = payload;
+        let Some(handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
+            let _ = reply.send(Err(PlatformError::not_found(
+                "dynamic worker handle not found",
+            )));
+            return;
+        };
+        if handle_entry.owner_worker != owner_worker {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "dynamic worker handle owner mismatch",
+            )));
+            return;
+        }
+        if handle_entry.owner_generation != owner_generation {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "dynamic worker handle generation mismatch",
+            )));
+            return;
+        }
+        if handle_entry.binding != binding {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "dynamic worker binding mismatch",
+            )));
+            return;
+        }
+
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
+        let timeout = handle_entry.timeout;
+        self.enqueue_invoke(
+            handle_entry.worker_name,
+            runtime_request_id,
+            request,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            inner_reply_tx,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        tokio::spawn(async move {
+            let result =
+                match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(_)) => Err(PlatformError::internal(
+                        "dynamic worker invoke response channel closed",
+                    )),
+                    Err(_) => Err(PlatformError::runtime(format!(
+                        "dynamic worker invoke timed out after {timeout}ms"
+                    ))),
+                };
+            let _ = reply.send(result);
+        });
+    }
+
+    fn handle_dynamic_host_rpc_invoke(
+        &mut self,
+        payload: crate::ops::DynamicHostRpcInvokeEvent,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let crate::ops::DynamicHostRpcInvokeEvent {
+            caller_worker,
+            caller_generation,
+            binding,
+            method_name,
+            args,
+            reply,
+        } = payload;
+        if host_rpc_method_blocked(&method_name) {
+            let _ = reply.send(Err(PlatformError::bad_request(format!(
+                "dynamic host rpc method is blocked: {method_name}"
+            ))));
+            return;
+        }
+
+        let provider_id = {
+            let Some(pool) = self.get_pool_mut(&caller_worker, caller_generation) else {
+                let _ = reply.send(Err(PlatformError::not_found(
+                    "dynamic worker pool not found",
+                )));
+                return;
+            };
+            pool.dynamic_rpc_bindings
+                .iter()
+                .find(|entry| entry.binding == binding)
+                .map(|entry| entry.provider_id.clone())
+        };
+        let Some(provider_id) = provider_id else {
+            let _ = reply.send(Err(PlatformError::bad_request(format!(
+                "dynamic host rpc binding not found: {binding}"
+            ))));
+            return;
+        };
+        let Some(provider) = self.host_rpc_providers.get(&provider_id).cloned() else {
+            let _ = reply.send(Err(PlatformError::not_found(
+                "dynamic host rpc provider not found",
+            )));
+            return;
+        };
+        if !provider.methods.contains(&method_name) {
+            let _ = reply.send(Err(PlatformError::bad_request(format!(
+                "dynamic host rpc method is not allowed: {method_name}"
+            ))));
+            return;
+        }
+        let owner_isolate_exists = self
+            .get_pool_mut(&provider.owner_worker, provider.owner_generation)
+            .map(|pool| {
+                pool.isolates
+                    .iter()
+                    .any(|isolate| isolate.id == provider.owner_isolate_id)
+            })
+            .unwrap_or(false);
+        if !owner_isolate_exists {
+            let _ = reply.send(Err(PlatformError::runtime(
+                "dynamic host rpc provider isolate is unavailable",
+            )));
+            return;
+        }
+
+        let runtime_request_id = Uuid::new_v4().to_string();
+        let request = WorkerInvocation {
+            method: "RPC".to_string(),
+            url: format!("http://host-rpc/{}", method_name),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: format!("host-rpc-{runtime_request_id}"),
+        };
+        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
+        self.enqueue_invoke(
+            provider.owner_worker.clone(),
+            runtime_request_id,
+            request,
+            None,
+            None,
+            None,
+            Some(HostRpcExecutionCall {
+                target_id: provider.target_id.clone(),
+                method: method_name,
+                args,
+            }),
+            Some(provider.owner_isolate_id),
+            Some(provider.owner_generation),
+            true,
+            inner_reply_tx,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        tokio::spawn(async move {
+            let result = match inner_reply_rx.await {
+                Ok(Ok(output)) => Ok(output.body),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(PlatformError::internal(
+                    "dynamic host rpc invoke response channel closed",
+                )),
+            };
+            let _ = reply.send(result);
+        });
+    }
+
     async fn deploy(
         &mut self,
         worker_name: String,
@@ -1695,8 +3126,15 @@ impl WorkerManager {
             .collect();
 
         validate_worker(self.bootstrap_snapshot, &source, &actor_classes).await?;
-        let worker_snapshot =
-            build_worker_snapshot(self.bootstrap_snapshot, &source, &actor_classes).await?;
+        let has_dynamic_bindings = !bindings.dynamic.is_empty();
+        let (snapshot, snapshot_preloaded) = if has_dynamic_bindings {
+            (self.bootstrap_snapshot, false)
+        } else {
+            let worker_snapshot =
+                build_worker_snapshot(self.bootstrap_snapshot, &source, &actor_classes).await?;
+            validate_loaded_worker_runtime(worker_snapshot)?;
+            (worker_snapshot, true)
+        };
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
@@ -1710,7 +3148,6 @@ impl WorkerManager {
             )
             .await?;
         }
-
         let pool =
             WorkerPool {
                 worker_name: worker_name.clone(),
@@ -1723,9 +3160,18 @@ impl WorkerManager {
                     }
                 }),
                 is_public: config.public,
-                snapshot: worker_snapshot,
+                snapshot,
+                snapshot_preloaded,
+                source: Arc::<str>::from(source.clone()),
+                actor_classes: Arc::<[String]>::from(actor_classes.clone()),
                 kv_bindings: bindings.kv,
                 actor_bindings: bindings.actor,
+                dynamic_bindings: bindings.dynamic,
+                dynamic_rpc_bindings: Vec::new(),
+                dynamic_env: Vec::new(),
+                secret_replacements: Vec::new(),
+                egress_allow_hosts: Vec::new(),
+                strict_request_isolation: has_dynamic_bindings,
                 queue: VecDeque::new(),
                 isolates: Vec::new(),
                 actor_owners: HashMap::new(),
@@ -1746,6 +3192,73 @@ impl WorkerManager {
         self.cleanup_drained_generations_for(&worker_name);
         info!(worker = %worker_name, generation, deployment_id = %deployment_id, "deployed worker");
         Ok(deployment_id)
+    }
+
+    async fn deploy_dynamic(
+        &mut self,
+        source: String,
+        env: HashMap<String, String>,
+        egress_allow_hosts: Vec<String>,
+        dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
+    ) -> Result<DynamicDeployResult> {
+        let worker_name = format!("dyn-{}", Uuid::new_v4().simple());
+        let dynamic_config =
+            build_dynamic_worker_config(env, egress_allow_hosts, dynamic_rpc_bindings)?;
+        let actor_classes: Vec<String> = Vec::new();
+
+        validate_worker(self.bootstrap_snapshot, &source, &actor_classes).await?;
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        let deployment_id = Uuid::new_v4().to_string();
+
+        let pool = WorkerPool {
+            worker_name: worker_name.clone(),
+            generation,
+            deployment_id: deployment_id.clone(),
+            internal_trace: None,
+            is_public: false,
+            snapshot: self.bootstrap_snapshot,
+            snapshot_preloaded: false,
+            source: Arc::<str>::from(source),
+            actor_classes: Arc::<[String]>::from(actor_classes),
+            kv_bindings: Vec::new(),
+            actor_bindings: Vec::new(),
+            dynamic_bindings: Vec::new(),
+            dynamic_rpc_bindings: dynamic_config.dynamic_rpc_bindings.clone(),
+            dynamic_env: dynamic_config.dynamic_env.clone(),
+            secret_replacements: dynamic_config.secret_replacements.clone(),
+            egress_allow_hosts: dynamic_config.egress_allow_hosts.clone(),
+            strict_request_isolation: true,
+            queue: VecDeque::new(),
+            isolates: Vec::new(),
+            actor_owners: HashMap::new(),
+            actor_inflight: HashMap::new(),
+            stats: PoolStats::default(),
+            queue_warn_level: 0,
+        };
+
+        let entry = self
+            .workers
+            .entry(worker_name.clone())
+            .or_insert_with(|| WorkerEntry {
+                current_generation: generation,
+                pools: HashMap::new(),
+            });
+        entry.current_generation = generation;
+        entry.pools.insert(generation, pool);
+        self.cleanup_drained_generations_for(&worker_name);
+        info!(
+            worker = %worker_name,
+            generation,
+            deployment_id = %deployment_id,
+            "deployed dynamic worker"
+        );
+
+        Ok(DynamicDeployResult {
+            worker: worker_name,
+            deployment_id,
+            env_placeholders: dynamic_config.env_placeholders,
+        })
     }
 
     fn register_stream(
@@ -1776,6 +3289,8 @@ impl WorkerManager {
         request_body: Option<InvokeRequestBodyReceiver>,
         actor_route: Option<ActorRoute>,
         actor_call: Option<ActorExecutionCall>,
+        host_rpc_call: Option<HostRpcExecutionCall>,
+        target_isolate_id: Option<u64>,
         target_generation: Option<u64>,
         internal_origin: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
@@ -1834,6 +3349,8 @@ impl WorkerManager {
                 request_body,
                 actor_route,
                 actor_call,
+                host_rpc_call,
+                target_isolate_id,
                 internal_origin,
                 reply,
                 reply_kind,
@@ -1910,6 +3427,8 @@ impl WorkerManager {
             None,
             Some(route),
             Some(actor_call),
+            None,
+            None,
             None,
             false,
             reply_tx,
@@ -2058,8 +3577,9 @@ impl WorkerManager {
         generation: u64,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
+        let max_inflight_per_isolate = self.config.max_inflight_per_isolate;
+        let max_isolates = self.config.max_isolates;
         loop {
-            let max_inflight = self.config.max_inflight_per_isolate;
             let (candidate, spawn_needed) = {
                 let Some(pool) = self.get_pool_mut(worker_name, generation) else {
                     return;
@@ -2068,14 +3588,34 @@ impl WorkerManager {
                     pool.log_stats("dispatch");
                     return;
                 }
-                let has_capacity = pool
-                    .isolates
-                    .iter()
-                    .any(|isolate| isolate.inflight_count < max_inflight);
-                (
-                    select_dispatch_candidate(pool, max_inflight),
-                    !has_capacity && pool.isolates.len() < self.config.max_isolates,
-                )
+                if let Some(stale_idx) = pool.queue.iter().position(|pending| {
+                    pending.target_isolate_id.is_some()
+                        && pending
+                            .target_isolate_id
+                            .map(|target| !pool.isolates.iter().any(|isolate| isolate.id == target))
+                            .unwrap_or(false)
+                }) {
+                    if let Some(stale) = pool.queue.remove(stale_idx) {
+                        let _ = stale
+                            .reply
+                            .send(Err(PlatformError::runtime("target isolate is unavailable")));
+                    }
+                    continue;
+                }
+                let max_inflight = if pool.strict_request_isolation {
+                    1
+                } else {
+                    max_inflight_per_isolate
+                };
+                let has_capacity = pool.isolates.iter().any(|isolate| {
+                    isolate.inflight_count < max_inflight
+                        && (!pool.strict_request_isolation || isolate.pending_wait_until.is_empty())
+                });
+                let candidate =
+                    select_dispatch_candidate(pool, max_inflight, pool.strict_request_isolation);
+                let spawn_needed =
+                    candidate.is_none() && !has_capacity && pool.isolates.len() < max_isolates;
+                (candidate, spawn_needed)
             };
 
             if spawn_needed {
@@ -2135,6 +3675,15 @@ impl WorkerManager {
 
                 let kv_bindings = pool.kv_bindings.clone();
                 let actor_bindings = pool.actor_bindings.clone();
+                let dynamic_bindings = pool.dynamic_bindings.clone();
+                let dynamic_rpc_bindings = pool
+                    .dynamic_rpc_bindings
+                    .iter()
+                    .map(|binding| binding.binding.clone())
+                    .collect::<Vec<_>>();
+                let dynamic_env = pool.dynamic_env.clone();
+                let secret_replacements = pool.secret_replacements.clone();
+                let egress_allow_hosts = pool.egress_allow_hosts.clone();
                 let should_count_reuse = pool.isolates[isolate_idx].served_requests > 0;
                 if should_count_reuse {
                     pool.stats.reuse_count += 1;
@@ -2156,9 +3705,15 @@ impl WorkerManager {
                     worker_name: worker_name.to_string(),
                     kv_bindings,
                     actor_bindings,
+                    dynamic_bindings,
+                    dynamic_rpc_bindings,
+                    dynamic_env,
+                    secret_replacements,
+                    egress_allow_hosts,
                     request: pending_invoke.request,
                     request_body: pending_invoke.request_body,
                     actor_call: pending_invoke.actor_call,
+                    host_rpc_call: pending_invoke.host_rpc_call,
                     actor_route: pending_invoke.actor_route,
                 };
 
@@ -2213,10 +3768,19 @@ impl WorkerManager {
         generation: u64,
         event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<()> {
-        let snapshot = self
-            .get_pool_mut(worker_name, generation)
-            .ok_or_else(|| PlatformError::not_found("Worker not found"))?
-            .snapshot;
+        let (snapshot, snapshot_preloaded, source, actor_classes) = self
+            .workers
+            .get(worker_name)
+            .and_then(|entry| entry.pools.get(&generation))
+            .map(|pool| {
+                (
+                    pool.snapshot,
+                    pool.snapshot_preloaded,
+                    pool.source.clone(),
+                    pool.actor_classes.clone(),
+                )
+            })
+            .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
@@ -2224,6 +3788,9 @@ impl WorkerManager {
         let cache_store = self.cache_store.clone();
         let isolate = spawn_isolate_thread(
             snapshot,
+            snapshot_preloaded,
+            source,
+            actor_classes,
             kv_store,
             actor_store,
             cache_store,
@@ -2364,6 +3931,15 @@ impl WorkerManager {
                 PendingReplyKind::WebsocketFrame { session_id } => {
                     self.complete_websocket_frame(session_id, reply, result);
                 }
+                PendingReplyKind::TransportOpen { session_id } => {
+                    self.complete_transport_open(
+                        worker_name,
+                        generation,
+                        isolate_id,
+                        session_id,
+                        result,
+                    );
+                }
             }
             tracing::info!("request completion delivered");
         } else {
@@ -2486,6 +4062,8 @@ impl WorkerManager {
             None,
             None,
             None,
+            None,
+            None,
             true,
             reply,
             PendingReplyKind::Normal,
@@ -2530,6 +4108,16 @@ impl WorkerManager {
             })
             .map(|(session_id, _)| session_id.clone())
             .collect();
+        let affected_transport_sessions: Vec<String> = self
+            .transport_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.worker_name == worker_name
+                    && session.generation == generation
+                    && session.isolate_id == isolate_id
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
         for (request_id, reply) in failed {
             self.clear_revalidation_for_request(&request_id);
@@ -2538,6 +4126,11 @@ impl WorkerManager {
         for session_id in affected_sessions {
             if let Some(session) = self.unregister_websocket_session(&session_id) {
                 self.queue_websocket_close_replay(&session, 1006, "isolate failed".to_string());
+            }
+        }
+        for session_id in affected_transport_sessions {
+            if let Some(session) = self.unregister_transport_session(&session_id) {
+                self.queue_transport_close_replay(&session, 1006, "isolate failed".to_string());
             }
         }
         self.fail_all_streams_for_worker(worker_name, error);
@@ -2697,6 +4290,8 @@ impl WorkerManager {
                 request_body: None,
                 actor_route: None,
                 actor_call: None,
+                host_rpc_call: None,
+                target_isolate_id: None,
                 internal_origin: false,
                 reply,
                 reply_kind: PendingReplyKind::Normal,
@@ -2802,6 +4397,40 @@ impl WorkerManager {
         }
     }
 
+    fn retire_worker_completely(&mut self, worker_name: &str) {
+        let mut clear_request_ids = Vec::new();
+        if let Some(mut entry) = self.workers.remove(worker_name) {
+            for (_, pool) in entry.pools.drain() {
+                for isolate in pool.isolates {
+                    let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                    for (request_id, pending) in isolate.pending_replies {
+                        clear_request_ids.push(request_id);
+                        let _ = pending
+                            .reply
+                            .send(Err(PlatformError::internal("dynamic worker was deleted")));
+                    }
+                }
+            }
+        }
+        for request_id in clear_request_ids {
+            self.clear_revalidation_for_request(&request_id);
+        }
+        self.fail_all_streams_for_worker(
+            worker_name,
+            PlatformError::internal("dynamic worker was deleted"),
+        );
+        self.dynamic_worker_handles
+            .retain(|_, handle| handle.worker_name != worker_name);
+        let existing_handles: HashSet<String> =
+            self.dynamic_worker_handles.keys().cloned().collect();
+        self.dynamic_worker_ids.retain(|_, by_id| {
+            by_id.retain(|_, handle| existing_handles.contains(handle));
+            !by_id.is_empty()
+        });
+        self.host_rpc_providers
+            .retain(|_, provider| provider.owner_worker != worker_name);
+    }
+
     fn remove_isolate(
         &mut self,
         worker_name: &str,
@@ -2809,6 +4438,7 @@ impl WorkerManager {
         isolate_idx: usize,
     ) -> Vec<(String, oneshot::Sender<Result<WorkerOutput>>)> {
         let mut websocket_open_session_ids = Vec::new();
+        let mut transport_open_session_ids = Vec::new();
         let mut replies = Vec::new();
         let mut removed = false;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
@@ -2822,8 +4452,14 @@ impl WorkerManager {
                     if let Some(actor_key) = pending.actor_key.as_deref() {
                         decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
                     }
-                    if let PendingReplyKind::WebsocketOpen { session_id } = pending.kind {
-                        websocket_open_session_ids.push(session_id);
+                    match &pending.kind {
+                        PendingReplyKind::WebsocketOpen { session_id } => {
+                            websocket_open_session_ids.push(session_id.clone());
+                        }
+                        PendingReplyKind::TransportOpen { session_id } => {
+                            transport_open_session_ids.push(session_id.clone());
+                        }
+                        PendingReplyKind::Normal | PendingReplyKind::WebsocketFrame { .. } => {}
                     }
                     replies.push((request_id, pending.reply));
                 }
@@ -2834,6 +4470,12 @@ impl WorkerManager {
             if let Some(waiter) = self.websocket_open_waiters.remove(&session_id) {
                 let _ = waiter.send(Err(PlatformError::internal("isolate is unavailable")));
             }
+        }
+        for session_id in transport_open_session_ids {
+            if let Some(waiter) = self.transport_open_waiters.remove(&session_id) {
+                let _ = waiter.send(Err(PlatformError::internal("isolate is unavailable")));
+            }
+            self.transport_open_channels.remove(&session_id);
         }
         if removed {
             replies
@@ -2895,7 +4537,10 @@ impl WorkerManager {
                     .enumerate()
                     .filter(|(_, isolate)| isolate.inflight_count == 0)
                     .filter(|(_, isolate)| isolate.pending_wait_until.is_empty())
-                    .filter(|(_, isolate)| isolate.active_websocket_sessions == 0)
+                    .filter(|(_, isolate)| {
+                        isolate.active_websocket_sessions == 0
+                            && isolate.active_transport_sessions == 0
+                    })
                     .filter(|(_, isolate)| now.duration_since(isolate.last_used_at) >= idle_ttl)
                     .min_by_key(|(_, isolate)| isolate.last_used_at);
                 let Some((idx, _)) = candidate else {
@@ -2931,6 +4576,7 @@ impl WorkerManager {
 
     fn cleanup_drained_generations_for(&mut self, worker_name: &str) {
         let mut clear_request_ids = Vec::new();
+        let mut retired_generations = HashSet::new();
         {
             let Some(entry) = self.workers.get_mut(worker_name) else {
                 return;
@@ -2947,6 +4593,7 @@ impl WorkerManager {
 
             for generation in drained {
                 if let Some(pool) = entry.pools.remove(&generation) {
+                    retired_generations.insert(generation);
                     for isolate in pool.isolates {
                         let _ = isolate.sender.send(IsolateCommand::Shutdown);
                         for (request_id, pending) in isolate.pending_replies {
@@ -2963,6 +4610,28 @@ impl WorkerManager {
         for request_id in clear_request_ids {
             self.clear_revalidation_for_request(&request_id);
         }
+        if retired_generations.is_empty() {
+            return;
+        }
+        self.dynamic_worker_handles.retain(|_, handle| {
+            !(handle.owner_worker == worker_name
+                && retired_generations.contains(&handle.owner_generation))
+        });
+        let existing_handles: HashSet<String> =
+            self.dynamic_worker_handles.keys().cloned().collect();
+        self.dynamic_worker_ids.retain(|key, by_id| {
+            if key.owner_worker == worker_name
+                && retired_generations.contains(&key.owner_generation)
+            {
+                return false;
+            }
+            by_id.retain(|_, handle| existing_handles.contains(handle));
+            !by_id.is_empty()
+        });
+        self.host_rpc_providers.retain(|_, provider| {
+            !(provider.owner_worker == worker_name
+                && retired_generations.contains(&provider.owner_generation))
+        });
     }
 
     fn worker_stats(&self, worker_name: &str) -> Option<WorkerStats> {
@@ -3006,29 +4675,64 @@ impl WorkerManager {
         for (_, waiter) in std::mem::take(&mut self.websocket_open_waiters) {
             let _ = waiter.send(Err(PlatformError::internal("runtime shutting down")));
         }
+        for (_, waiter) in std::mem::take(&mut self.transport_open_waiters) {
+            let _ = waiter.send(Err(PlatformError::internal("runtime shutting down")));
+        }
         self.websocket_sessions.clear();
         self.websocket_handle_index.clear();
         self.websocket_open_handles.clear();
         self.websocket_pending_closes.clear();
         self.websocket_outbound_frames.clear();
         self.websocket_close_signals.clear();
+        self.transport_sessions.clear();
+        self.transport_handle_index.clear();
+        self.transport_open_handles.clear();
+        self.transport_pending_closes.clear();
+        self.transport_open_channels.clear();
+        self.dynamic_worker_handles.clear();
+        self.dynamic_worker_ids.clear();
+        self.host_rpc_providers.clear();
     }
 }
 
 fn select_dispatch_candidate(
     pool: &mut WorkerPool,
     max_inflight: usize,
+    require_wait_until_idle: bool,
 ) -> Option<DispatchCandidate> {
     for (queue_idx, pending) in pool.queue.iter().enumerate() {
+        if let Some(target_isolate_id) = pending.target_isolate_id {
+            if let Some((isolate_idx, isolate)) = pool
+                .isolates
+                .iter()
+                .enumerate()
+                .find(|(_, isolate)| isolate.id == target_isolate_id)
+            {
+                let targeted_host_rpc = pending.host_rpc_call.is_some();
+                if (targeted_host_rpc || isolate.inflight_count < max_inflight)
+                    && (targeted_host_rpc
+                        || !require_wait_until_idle
+                        || isolate.pending_wait_until.is_empty())
+                {
+                    return Some(DispatchCandidate {
+                        queue_idx,
+                        isolate_idx,
+                        actor_key: None,
+                        assign_owner: false,
+                    });
+                }
+            }
+            continue;
+        }
+
         let Some(route) = &pending.actor_route else {
-            return least_loaded_isolate_idx(&pool.isolates, max_inflight).map(|isolate_idx| {
-                DispatchCandidate {
+            return least_loaded_isolate_idx(&pool.isolates, max_inflight, require_wait_until_idle)
+                .map(|isolate_idx| DispatchCandidate {
                     queue_idx,
                     isolate_idx,
                     actor_key: None,
                     assign_owner: false,
-                }
-            });
+                });
         };
 
         let actor_key = route.owner_key();
@@ -3054,7 +4758,9 @@ fn select_dispatch_candidate(
             }
         }
 
-        if let Some(isolate_idx) = least_loaded_isolate_any_idx(&pool.isolates) {
+        if let Some(isolate_idx) =
+            least_loaded_isolate_any_idx(&pool.isolates, require_wait_until_idle)
+        {
             return Some(DispatchCandidate {
                 queue_idx,
                 isolate_idx,
@@ -3066,19 +4772,37 @@ fn select_dispatch_candidate(
     None
 }
 
-fn least_loaded_isolate_idx(isolates: &[IsolateHandle], max_inflight: usize) -> Option<usize> {
+fn host_rpc_method_blocked(method: &str) -> bool {
+    let method = method.trim();
+    method.is_empty()
+        || method == "constructor"
+        || method == "then"
+        || method == "fetch"
+        || method.starts_with("__dd_")
+}
+
+fn least_loaded_isolate_idx(
+    isolates: &[IsolateHandle],
+    max_inflight: usize,
+    require_wait_until_idle: bool,
+) -> Option<usize> {
     isolates
         .iter()
         .enumerate()
         .filter(|(_, isolate)| isolate.inflight_count < max_inflight)
+        .filter(|(_, isolate)| !require_wait_until_idle || isolate.pending_wait_until.is_empty())
         .min_by_key(|(_, isolate)| isolate.inflight_count)
         .map(|(idx, _)| idx)
 }
 
-fn least_loaded_isolate_any_idx(isolates: &[IsolateHandle]) -> Option<usize> {
+fn least_loaded_isolate_any_idx(
+    isolates: &[IsolateHandle],
+    require_wait_until_idle: bool,
+) -> Option<usize> {
     isolates
         .iter()
         .enumerate()
+        .filter(|(_, isolate)| !require_wait_until_idle || isolate.pending_wait_until.is_empty())
         .min_by_key(|(_, isolate)| isolate.inflight_count)
         .map(|(idx, _)| idx)
 }
@@ -3099,6 +4823,7 @@ impl WorkerPool {
             && self.inflight_total() == 0
             && self.wait_until_total() == 0
             && self.active_websocket_total() == 0
+            && self.active_transport_total() == 0
     }
 
     fn busy_count(&self) -> usize {
@@ -3108,6 +4833,7 @@ impl WorkerPool {
                 isolate.inflight_count > 0
                     || !isolate.pending_wait_until.is_empty()
                     || isolate.active_websocket_sessions > 0
+                    || isolate.active_transport_sessions > 0
             })
             .count()
     }
@@ -3130,6 +4856,13 @@ impl WorkerPool {
         self.isolates
             .iter()
             .map(|isolate| isolate.active_websocket_sessions)
+            .sum()
+    }
+
+    fn active_transport_total(&self) -> usize {
+        self.isolates
+            .iter()
+            .map(|isolate| isolate.active_transport_sessions)
             .sum()
     }
 
@@ -3189,11 +4922,21 @@ impl WorkerPool {
 struct DeployBindings {
     kv: Vec<String>,
     actor: Vec<(String, String)>,
+    dynamic: Vec<String>,
+}
+
+struct DynamicWorkerConfig {
+    dynamic_env: Vec<(String, String)>,
+    dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
+    secret_replacements: Vec<(String, String)>,
+    egress_allow_hosts: Vec<String>,
+    env_placeholders: HashMap<String, String>,
 }
 
 fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
     let mut kv = Vec::new();
     let mut actor = Vec::new();
+    let mut dynamic = Vec::new();
     let mut seen = HashSet::new();
     for binding in &config.bindings {
         match binding {
@@ -3225,9 +4968,104 @@ fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
                 }
                 actor.push((name.to_string(), class_name.to_string()));
             }
+            DeployBinding::Dynamic { binding } => {
+                let name = binding.trim();
+                if name.is_empty() {
+                    return Err(PlatformError::bad_request("binding name must not be empty"));
+                }
+                if !seen.insert(name.to_string()) {
+                    return Err(PlatformError::bad_request(format!(
+                        "duplicate binding name: {name}"
+                    )));
+                }
+                dynamic.push(name.to_string());
+            }
         }
     }
-    Ok(DeployBindings { kv, actor })
+    Ok(DeployBindings { kv, actor, dynamic })
+}
+
+fn build_dynamic_worker_config(
+    env: HashMap<String, String>,
+    egress_allow_hosts: Vec<String>,
+    dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
+) -> Result<DynamicWorkerConfig> {
+    let mut dynamic_env = Vec::new();
+    let mut secret_replacements = Vec::new();
+    let mut env_placeholders = HashMap::new();
+
+    for (name, value) in env {
+        let key = name.trim().to_string();
+        if key.is_empty() {
+            return Err(PlatformError::bad_request(
+                "dynamic env variable name must not be empty",
+            ));
+        }
+        if !is_valid_env_name(&key) {
+            return Err(PlatformError::bad_request(format!(
+                "invalid dynamic env variable name: {key}"
+            )));
+        }
+        if env_placeholders.contains_key(&key) {
+            return Err(PlatformError::bad_request(format!(
+                "duplicate dynamic env variable name: {key}"
+            )));
+        }
+
+        let placeholder = format!("__DD_SECRET_{}__", Uuid::new_v4().simple());
+        dynamic_env.push((key.clone(), placeholder.clone()));
+        secret_replacements.push((placeholder.clone(), value));
+        env_placeholders.insert(key, placeholder);
+    }
+
+    let mut normalized_hosts = Vec::new();
+    let mut seen_hosts = HashSet::new();
+    for host in egress_allow_hosts {
+        let normalized = host.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if !is_valid_egress_host(&normalized) {
+            return Err(PlatformError::bad_request(format!(
+                "invalid egress allow host: {normalized}"
+            )));
+        }
+        if seen_hosts.insert(normalized.clone()) {
+            normalized_hosts.push(normalized);
+        }
+    }
+
+    Ok(DynamicWorkerConfig {
+        dynamic_env,
+        dynamic_rpc_bindings,
+        secret_replacements,
+        egress_allow_hosts: normalized_hosts,
+        env_placeholders,
+    })
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|char| char == '_' || char.is_ascii_alphanumeric())
+}
+
+fn is_valid_egress_host(host: &str) -> bool {
+    if let Some(rest) = host.strip_prefix("*.") {
+        return !rest.is_empty()
+            && rest
+                .chars()
+                .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '.')
+            && rest.contains('.');
+    }
+    host.chars()
+        .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '.')
+        && host.contains('.')
 }
 
 fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
@@ -3304,7 +5142,7 @@ fn spawn_runtime_thread(
                             manager.handle_command(command, &event_tx).await;
                         }
                         Some(event) = event_rx.recv() => {
-                            manager.handle_event(event, &event_tx);
+                            manager.handle_event(event, &event_tx).await;
                         }
                         _ = ticker.tick() => {
                             manager.scale_down_idle();
@@ -3325,6 +5163,9 @@ fn spawn_runtime_thread(
 
 fn spawn_isolate_thread(
     snapshot: &'static [u8],
+    snapshot_preloaded: bool,
+    source: Arc<str>,
+    actor_classes: Arc<[String]>,
     kv_store: KvStore,
     actor_store: ActorStore,
     cache_store: CacheStore,
@@ -3368,6 +5209,14 @@ fn spawn_isolate_thread(
                     op_state.put(cache_store.clone());
                     op_state.put(RequestBodyStreams::default());
                     op_state.put(crate::ops::ActorRequestScopes::default());
+                    op_state.put(crate::ops::RequestSecretContexts::default());
+                }
+                if !snapshot_preloaded {
+                    if let Err(error) = load_worker(&mut js_runtime, &source, &actor_classes).await
+                    {
+                        let _ = init_tx.send(Err(error));
+                        return;
+                    }
                 }
                 let _ = init_tx.send(Ok(()));
 
@@ -3497,6 +5346,62 @@ fn spawn_isolate_thread(
                                         payload,
                                     });
                                 }
+                                IsolateEventPayload::ActorTransportSendStream(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorTransportSendStream(
+                                        payload,
+                                    ));
+                                }
+                                IsolateEventPayload::ActorTransportSendDatagram(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorTransportSendDatagram(
+                                        payload,
+                                    ));
+                                }
+                                IsolateEventPayload::ActorTransportRecvStream(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorTransportRecvStream(
+                                        payload,
+                                    ));
+                                }
+                                IsolateEventPayload::ActorTransportRecvDatagram(payload) => {
+                                    let _ =
+                                        event_tx.send(RuntimeEvent::ActorTransportRecvDatagram(
+                                            payload,
+                                        ));
+                                }
+                                IsolateEventPayload::ActorTransportClose(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorTransportClose(payload));
+                                }
+                                IsolateEventPayload::ActorTransportList(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorTransportList {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        payload,
+                                    });
+                                }
+                                IsolateEventPayload::ActorTransportConsumeClose(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::ActorTransportConsumeClose {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        payload,
+                                    });
+                                }
+                                IsolateEventPayload::DynamicWorkerCreate(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerCreate(payload));
+                                }
+                                IsolateEventPayload::DynamicWorkerLookup(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerLookup(payload));
+                                }
+                                IsolateEventPayload::DynamicWorkerList(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerList(payload));
+                                }
+                                IsolateEventPayload::DynamicWorkerDelete(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerDelete(payload));
+                                }
+                                IsolateEventPayload::DynamicWorkerInvoke(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerInvoke(payload));
+                                }
+                                IsolateEventPayload::DynamicHostRpcInvoke(payload) => {
+                                    let _ = event_tx.send(RuntimeEvent::DynamicHostRpcInvoke(payload));
+                                }
                             }
                         }
                         Some(command) = command_rx.recv() => {
@@ -3507,9 +5412,15 @@ fn spawn_isolate_thread(
                                     worker_name: worker_name_for_env,
                                     kv_bindings,
                                     actor_bindings,
+                                    dynamic_bindings,
+                                    dynamic_rpc_bindings,
+                                    dynamic_env,
+                                    secret_replacements,
+                                    egress_allow_hosts,
                                     request,
                                     request_body,
                                     actor_call,
+                                    host_rpc_call,
                                     actor_route,
                                 } => {
                                     let request_id = request.request_id.clone();
@@ -3531,6 +5442,21 @@ fn spawn_isolate_thread(
                                             runtime_request_id.clone(),
                                             route.binding.clone(),
                                             route.key.clone(),
+                                        );
+                                    }
+                                    {
+                                        let op_state = js_runtime.op_state();
+                                        let mut op_state = op_state.borrow_mut();
+                                        register_request_secret_context(
+                                            &mut op_state,
+                                            runtime_request_id.clone(),
+                                            worker_name_for_env.clone(),
+                                            generation,
+                                            isolate_id,
+                                            dynamic_bindings.clone(),
+                                            dynamic_rpc_bindings.clone(),
+                                            secret_replacements,
+                                            egress_allow_hosts,
                                         );
                                     }
                                     let execute_span = tracing::info_span!(
@@ -3589,6 +5515,48 @@ fn spawn_isolate_thread(
                                             code: *code,
                                             reason: reason.clone(),
                                         },
+                                        ActorExecutionCall::TransportDatagram {
+                                            binding,
+                                            key,
+                                            handle,
+                                            data,
+                                        } => ExecuteActorCall::TransportDatagram {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                            handle: handle.clone(),
+                                            data: data.clone(),
+                                        },
+                                        ActorExecutionCall::TransportStream {
+                                            binding,
+                                            key,
+                                            handle,
+                                            data,
+                                        } => ExecuteActorCall::TransportStream {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                            handle: handle.clone(),
+                                            data: data.clone(),
+                                        },
+                                        ActorExecutionCall::TransportClose {
+                                            binding,
+                                            key,
+                                            handle,
+                                            code,
+                                            reason,
+                                        } => ExecuteActorCall::TransportClose {
+                                            binding: binding.clone(),
+                                            key: key.clone(),
+                                            handle: handle.clone(),
+                                            code: *code,
+                                            reason: reason.clone(),
+                                        },
+                                    });
+                                    let dispatch_host_rpc_call = host_rpc_call.as_ref().map(|call| {
+                                        ExecuteHostRpcCall {
+                                            target_id: call.target_id.clone(),
+                                            method: call.method.clone(),
+                                            args: call.args.clone(),
+                                        }
                                     });
                                     if let Err(error) = dispatch_worker_request(
                                         &mut js_runtime,
@@ -3597,10 +5565,27 @@ fn spawn_isolate_thread(
                                         &worker_name_for_env,
                                         &kv_bindings,
                                         &actor_bindings,
+                                        &dynamic_bindings,
+                                        &dynamic_rpc_bindings,
+                                        &dynamic_env,
                                         has_request_body_stream,
                                         dispatch_actor_call.as_ref(),
+                                        dispatch_host_rpc_call.as_ref(),
                                         request,
                                     ) {
+                                        {
+                                            let op_state = js_runtime.op_state();
+                                            let mut op_state = op_state.borrow_mut();
+                                            clear_request_body_stream(&mut op_state, &runtime_request_id);
+                                            crate::ops::clear_actor_request_scope(
+                                                &mut op_state,
+                                                &runtime_request_id,
+                                            );
+                                            clear_request_secret_context(
+                                                &mut op_state,
+                                                &runtime_request_id,
+                                            );
+                                        }
                                         tracing::warn!(
                                             dispatch_ms = started_at.elapsed().as_millis() as u64,
                                             error = %error,
@@ -3632,6 +5617,7 @@ fn spawn_isolate_thread(
                                             &mut op_state,
                                             &runtime_request_id,
                                         );
+                                        clear_request_secret_context(&mut op_state, &runtime_request_id);
                                     }
                                     if let Err(error) =
                                         abort_worker_request(&mut js_runtime, &runtime_request_id)
@@ -3676,6 +5662,7 @@ fn spawn_isolate_thread(
             sender: command_tx,
             inflight_count: 0,
             active_websocket_sessions: 0,
+            active_transport_sessions: 0,
             served_requests: 0,
             last_used_at: Instant::now(),
             pending_replies: HashMap::new(),
@@ -3944,6 +5931,55 @@ fn strip_websocket_frame_internal_headers(headers: &[(String, String)]) -> Vec<(
         .collect()
 }
 
+fn parse_transport_open_metadata(
+    output: &WorkerOutput,
+    expected_session_id: &str,
+) -> Result<(String, String, String)> {
+    if output.status != 200 {
+        return Err(PlatformError::bad_request(
+            "transport connect rejected by worker",
+        ));
+    }
+    let accepted = internal_header_value(&output.headers, INTERNAL_TRANSPORT_ACCEPT_HEADER)
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    if !accepted {
+        return Err(PlatformError::bad_request(
+            "worker did not accept transport request",
+        ));
+    }
+    let handle = internal_header_value(&output.headers, INTERNAL_TRANSPORT_HANDLE_HEADER)
+        .unwrap_or_else(|| expected_session_id.to_string());
+    let binding = internal_header_value(&output.headers, INTERNAL_TRANSPORT_BINDING_HEADER)
+        .ok_or_else(|| PlatformError::bad_request("missing transport actor binding metadata"))?;
+    let key = internal_header_value(&output.headers, INTERNAL_TRANSPORT_KEY_HEADER)
+        .ok_or_else(|| PlatformError::bad_request("missing transport actor key metadata"))?;
+    if let Some(session_id) =
+        internal_header_value(&output.headers, INTERNAL_TRANSPORT_SESSION_HEADER)
+    {
+        if session_id != expected_session_id {
+            return Err(PlatformError::bad_request(
+                "transport session metadata mismatch",
+            ));
+        }
+    }
+    Ok((handle, binding, key))
+}
+
+fn strip_transport_open_internal_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_ACCEPT_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_SESSION_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_HANDLE_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_BINDING_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_KEY_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_CLOSE_CODE_HEADER))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_CLOSE_REASON_HEADER))
+        .cloned()
+        .collect()
+}
+
 fn normalize_trace_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.starts_with('/') {
@@ -3999,8 +6035,11 @@ mod tests {
     };
     use serde::Deserialize;
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio::time::{sleep, timeout};
     use uuid::Uuid;
@@ -4050,6 +6089,324 @@ export default {
         .to_string()
     }
 
+    fn dynamic_namespace_worker() -> String {
+        r#"
+let child = null;
+class Api extends RpcTarget {
+  constructor() {
+    super();
+    this.count = 0;
+  }
+  async bump() {
+    this.count += 1;
+    return this.count;
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    if (!child) {
+      child = await env.SANDBOX.get("test:v1", async () => ({
+        entrypoint: "worker.js",
+        modules: {
+          "worker.js": "import { nextCounter } from './lib.js'; export default { async fetch(_request, childEnv) { const hostCount = await childEnv.API.bump(); return new Response(String(nextCounter()) + ':' + String(hostCount)); } };",
+          "./lib.js": "let counter = 0; export function nextCounter() { counter += 1; return counter; }",
+        },
+        env: { SECRET: "ok", API: new Api() },
+        timeout: 1_500,
+      }));
+    }
+    const response = await child.fetch("http://worker/");
+    return new Response(await response.text());
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_namespace_admin_worker() -> String {
+        r#"
+let slow = null;
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/ensure") {
+      await env.SANDBOX.get("admin:v1", async () => ({
+        entrypoint: "worker.js",
+        modules: {
+          "worker.js": "export default { async fetch() { return new Response('ok'); } };",
+        },
+        timeout: 200,
+      }));
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/ids") {
+      const ids = await env.SANDBOX.list();
+      return new Response(JSON.stringify(ids.sort()), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+
+    if (url.pathname === "/delete") {
+      const deleted = await env.SANDBOX.delete("admin:v1");
+      return new Response(String(Boolean(deleted)));
+    }
+
+    if (url.pathname === "/timeout") {
+      if (!slow) {
+        slow = await env.SANDBOX.get("slow:v1", async () => ({
+          entrypoint: "worker.js",
+          modules: {
+            "worker.js": "export default { async fetch() { await Deno.core.ops.op_sleep(100); return new Response('slow'); } };",
+          },
+          timeout: 25,
+        }));
+      }
+      try {
+        await slow.fetch("http://worker/");
+        return new Response("no-timeout", { status: 200 });
+      } catch (error) {
+        return new Response(String(error || "timeout"), { status: 504 });
+      }
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_response_json_worker() -> String {
+        r#"
+export default {
+  async fetch(_request, env) {
+    const child = await env.SANDBOX.get("json:v1", async () => ({
+      entrypoint: "worker.js",
+      modules: {
+        "worker.js": "export default { async fetch() { return Response.json({ ok: true, source: 'dynamic-child' }); } };",
+      },
+      timeout: 1_500,
+    }));
+    const response = await child.fetch("http://worker/");
+    return new Response(await response.text(), {
+      headers: [["content-type", "application/json; charset=utf-8"]],
+    });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_runtime_surface_worker() -> String {
+        r#"
+function runtimeSurface() {
+  return {
+    fetch: typeof fetch === "function",
+    request: typeof Request === "function",
+    response: typeof Response === "function",
+    headers: typeof Headers === "function",
+    formData: typeof FormData === "function",
+    url: typeof URL === "function",
+    urlPattern: typeof URLPattern === "function",
+    readableStream: typeof ReadableStream === "function",
+    blob: typeof Blob === "function",
+    textEncoder: typeof TextEncoder === "function",
+    textDecoder: typeof TextDecoder === "function",
+    structuredClone: typeof structuredClone === "function",
+    cryptoDigest: typeof crypto?.subtle?.digest === "function",
+    responseJsonType: Response.json({ ok: true }).headers.get("content-type"),
+  };
+}
+
+export default {
+  async fetch(_request, env) {
+    const child = await env.SANDBOX.get("surface:v1", async () => ({
+      entrypoint: "worker.js",
+      modules: {
+        "worker.js": `
+function runtimeSurface() {
+  return {
+    fetch: typeof fetch === "function",
+    request: typeof Request === "function",
+    response: typeof Response === "function",
+    headers: typeof Headers === "function",
+    formData: typeof FormData === "function",
+    url: typeof URL === "function",
+    urlPattern: typeof URLPattern === "function",
+    readableStream: typeof ReadableStream === "function",
+    blob: typeof Blob === "function",
+    textEncoder: typeof TextEncoder === "function",
+    textDecoder: typeof TextDecoder === "function",
+    structuredClone: typeof structuredClone === "function",
+    cryptoDigest: typeof crypto?.subtle?.digest === "function",
+    responseJsonType: Response.json({ ok: true }).headers.get("content-type"),
+  };
+}
+
+export default {
+  async fetch() {
+    return Response.json(runtimeSurface());
+  },
+};
+        `,
+      },
+      timeout: 1_500,
+    }));
+    const childResponse = await child.fetch("http://worker/");
+    const childSurface = await childResponse.json();
+    const selfSurface = runtimeSurface();
+    return Response.json({
+      same: JSON.stringify(selfSurface) === JSON.stringify(childSurface),
+      self: selfSurface,
+      child: childSurface,
+    });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_fetch_probe_worker(url: &str) -> String {
+        format!(
+            r#"
+export default {{
+  async fetch(_request, env) {{
+    const response = await fetch("{url}?token=" + encodeURIComponent(env.API_TOKEN), {{
+      headers: {{
+        "authorization": "Bearer " + env.API_TOKEN,
+        "x-dd-secret": env.API_TOKEN,
+      }},
+    }});
+    return new Response(await response.text(), {{
+      status: response.status,
+      headers: response.headers,
+    }});
+  }},
+}};
+"#
+        )
+    }
+
+    fn dynamic_fetch_abort_worker(url: &str) -> String {
+        format!(
+            r#"
+export default {{
+  async fetch() {{
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("stop")), 25);
+    try {{
+      await fetch("{url}", {{
+        signal: controller.signal,
+        headers: {{
+          "x-abort-test": "true",
+        }},
+      }});
+      return new Response("unexpected-success", {{ status: 500 }});
+    }} catch (error) {{
+      return new Response(String(error?.name ?? error));
+    }}
+  }},
+}};
+"#
+        )
+    }
+
+    fn preview_dynamic_worker() -> String {
+        r#"
+class PreviewControl extends RpcTarget {
+  constructor(previewId) {
+    super();
+    this.previewId = previewId;
+    this.hits = 0;
+  }
+
+  async metadata() {
+    this.hits += 1;
+    return {
+      previewId: this.previewId,
+      hits: this.hits,
+    };
+  }
+}
+
+function previewModules() {
+  return {
+    "worker.js": `
+      export default {
+        async fetch(request, env) {
+          const url = new URL(request.url);
+          const meta = await env.PREVIEW.metadata();
+          if (url.pathname === "/" || url.pathname === "/index.html") {
+            return new Response(JSON.stringify({
+              ok: true,
+              preview: meta.previewId,
+              hits: meta.hits,
+              route: "root",
+            }), {
+              headers: { "content-type": "application/json; charset=utf-8" },
+            });
+          }
+          if (url.pathname === "/api/health") {
+            return new Response(JSON.stringify({
+              ok: true,
+              preview: meta.previewId,
+              hits: meta.hits,
+              route: "health",
+            }), {
+              headers: { "content-type": "application/json; charset=utf-8" },
+            });
+          }
+          return new Response("preview route not found", { status: 404 });
+        },
+      };
+    `,
+  };
+}
+
+async function ensurePreview(env, previewId) {
+  return env.SANDBOX.get(`preview:${previewId}`, async () => ({
+    entrypoint: "worker.js",
+    modules: previewModules(),
+    env: {
+      PREVIEW: new PreviewControl(previewId),
+    },
+    timeout: 3000,
+  }));
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/") {
+      return new Response("preview manager");
+    }
+
+    if (!url.pathname.startsWith("/preview/")) {
+      return new Response("not found", { status: 404 });
+    }
+
+    const rest = url.pathname.slice("/preview/".length);
+    const slashIdx = rest.indexOf("/");
+    const previewId = slashIdx === -1 ? rest : rest.slice(0, slashIdx);
+    const tailPath = slashIdx === -1 ? "/" : rest.slice(slashIdx);
+    const preview = await ensurePreview(env, previewId);
+    const target = new URL(`http://worker${tailPath}`);
+    target.search = url.search;
+    return preview.fetch(target.toString(), {
+      method: request.method,
+      headers: request.headers,
+    });
+  },
+};
+"#
+        .to_string()
+    }
+
     fn versioned_worker(version: &str, delay_ms: u64) -> String {
         format!(
             r#"
@@ -4069,6 +6426,55 @@ export default {
   async fetch() {
     await Deno.core.ops.op_sleep(50);
     return new Response("ok");
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn frozen_time_worker() -> String {
+        r#"
+export default {
+  async fetch() {
+    const now0 = Date.now();
+    const perf0 = performance.now();
+    let guard = 0;
+    for (let i = 0; i < 250000; i++) {
+      guard += i;
+    }
+    const now1 = Date.now();
+    const perf1 = performance.now();
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const now2 = Date.now();
+    const perf2 = performance.now();
+    return new Response(JSON.stringify({ now0, now1, now2, perf0, perf1, perf2, guard }), {
+      headers: [["content-type", "application/json"]],
+    });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn crypto_worker() -> String {
+        r#"
+export default {
+  async fetch() {
+    const random = new Uint8Array(16);
+    crypto.getRandomValues(random);
+    const digestBuffer = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode("dd-runtime"),
+    );
+    const digest = Array.from(new Uint8Array(digestBuffer));
+    return Response.json({
+      random_length: random.length,
+      random_non_zero: random.some((value) => value !== 0),
+      uuid: crypto.randomUUID(),
+      digest_length: digest.length,
+    });
   },
 };
 "#
@@ -4380,6 +6786,25 @@ export default {
         trace_calls: usize,
     }
 
+    #[derive(Deserialize)]
+    struct FrozenTimeState {
+        now0: i64,
+        now1: i64,
+        now2: i64,
+        perf0: f64,
+        perf1: f64,
+        perf2: f64,
+        guard: i64,
+    }
+
+    #[derive(Deserialize)]
+    struct CryptoState {
+        random_length: usize,
+        random_non_zero: bool,
+        uuid: String,
+        digest_length: usize,
+    }
+
     async fn test_service(config: RuntimeConfig) -> RuntimeService {
         let db_path = format!("/tmp/dd-test-{}.db", Uuid::new_v4());
         let store_dir = format!("/tmp/dd-store-{}", Uuid::new_v4());
@@ -4395,6 +6820,91 @@ export default {
         })
         .await
         .expect("service should start")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_starts_with_deno_runtime_bootstrap() {
+        let _ = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_can_deploy_simple_worker_with_deno_runtime_bootstrap() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy(
+                "simple-deno-worker".to_string(),
+                r#"
+                export default {
+                  async fetch() {
+                    return new Response("ok");
+                  }
+                };
+                "#
+                .to_string(),
+            )
+            .await
+            .expect("deploy should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_can_invoke_simple_worker_with_deno_runtime_bootstrap() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy(
+                "simple-deno-invoke".to_string(),
+                r#"
+                export default {
+                  async fetch() {
+                    return new Response("ok");
+                  }
+                };
+                "#
+                .to_string(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("simple-deno-invoke".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(output.status, 200);
+        assert_eq!(
+            String::from_utf8(output.body).expect("body should be utf8"),
+            "ok"
+        );
     }
 
     #[tokio::test]
@@ -4427,6 +6937,613 @@ export default {
 
         assert_eq!(String::from_utf8(one.body).expect("utf8"), "1");
         assert_eq!(String::from_utf8(two.body).expect("utf8"), "2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn spectre_time_mitigation_freezes_time_between_io_boundaries() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy("frozen-time".to_string(), frozen_time_worker())
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("frozen-time".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+        let payload: FrozenTimeState = crate::json::from_string(
+            String::from_utf8(output.body).expect("frozen-time body should be utf8"),
+        )
+        .expect("frozen-time response should parse");
+
+        assert_eq!(
+            payload.now0, payload.now1,
+            "Date.now should remain frozen during pure compute"
+        );
+        assert_eq!(
+            payload.perf0, payload.perf1,
+            "performance.now should remain frozen during pure compute"
+        );
+        assert!(
+            payload.now2 >= payload.now1,
+            "Date.now should not move backwards across I/O boundaries"
+        );
+        assert!(
+            payload.perf2 >= payload.perf1,
+            "performance.now should not move backwards across I/O boundaries"
+        );
+        assert!(
+            payload.now2 > payload.now1 || payload.perf2 > payload.perf1,
+            "expected frozen clocks to advance after an I/O boundary"
+        );
+        assert!(payload.guard > 0, "worker should run local compute loop");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn crypto_globals_work_with_deno_crypto_ops() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy("crypto-worker".to_string(), crypto_worker())
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("crypto-worker".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+        let payload: CryptoState =
+            crate::json::from_string(String::from_utf8(output.body).expect("body should be utf8"))
+                .expect("response should parse");
+
+        assert_eq!(payload.random_length, 16);
+        assert!(
+            payload.random_non_zero,
+            "random bytes should not be all zero"
+        );
+        assert_eq!(payload.digest_length, 32);
+        assert_eq!(payload.uuid.len(), 36, "uuid should be canonical v4 length");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_can_create_and_invoke_dynamic_workers() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "dynamic-parent".to_string(),
+                dynamic_namespace_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let one = service
+            .invoke("dynamic-parent".to_string(), test_invocation())
+            .await
+            .expect("first invoke should succeed");
+        let two = service
+            .invoke("dynamic-parent".to_string(), test_invocation())
+            .await
+            .expect("second invoke should succeed");
+
+        assert_eq!(String::from_utf8(one.body).expect("utf8"), "1:1");
+        assert_eq!(String::from_utf8(two.body).expect("utf8"), "2:2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_supports_list_delete_and_timeout() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 2,
+            max_inflight_per_isolate: 2,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "dynamic-admin".to_string(),
+                dynamic_namespace_admin_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let ensure = service
+            .invoke(
+                "dynamic-admin".to_string(),
+                test_invocation_with_path("/ensure", "dyn-admin-ensure"),
+            )
+            .await
+            .expect("ensure should succeed");
+        assert_eq!(ensure.status, 200);
+
+        let ids = service
+            .invoke(
+                "dynamic-admin".to_string(),
+                test_invocation_with_path("/ids", "dyn-admin-ids-1"),
+            )
+            .await
+            .expect("ids should succeed");
+        assert_eq!(String::from_utf8(ids.body).expect("utf8"), "[\"admin:v1\"]");
+
+        let deleted = service
+            .invoke(
+                "dynamic-admin".to_string(),
+                test_invocation_with_path("/delete", "dyn-admin-delete"),
+            )
+            .await
+            .expect("delete should succeed");
+        assert_eq!(String::from_utf8(deleted.body).expect("utf8"), "true");
+
+        let ids_after = service
+            .invoke(
+                "dynamic-admin".to_string(),
+                test_invocation_with_path("/ids", "dyn-admin-ids-2"),
+            )
+            .await
+            .expect("ids after delete should succeed");
+        assert_eq!(String::from_utf8(ids_after.body).expect("utf8"), "[]");
+
+        let timeout_out = service
+            .invoke(
+                "dynamic-admin".to_string(),
+                test_invocation_with_path("/timeout", "dyn-admin-timeout"),
+            )
+            .await
+            .expect("timeout invoke should succeed");
+        assert_eq!(timeout_out.status, 504);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_child_can_return_json_response() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 2,
+            max_inflight_per_isolate: 2,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "dynamic-parent-json".to_string(),
+                r#"
+let child = null;
+
+export default {
+  async fetch(_request, env) {
+    if (!child) {
+      child = await env.SANDBOX.get("json-child", async () => ({
+        entrypoint: "worker.js",
+        modules: {
+          "worker.js": "export default { async fetch() { return Response.json({ ok: true }, { status: 201 }); } };",
+        },
+        timeout: 1500,
+      }));
+    }
+    return child.fetch("http://worker/");
+  },
+};
+"#
+                .to_string(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("dynamic-parent-json".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+
+        assert_eq!(output.status, 201);
+        assert_eq!(
+            String::from_utf8(output.body).expect("utf8"),
+            r#"{"ok":true}"#
+        );
+        assert!(output
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
+                && value == "application/json; charset=utf-8"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_host_rpc_works_with_single_inflight_parent_isolate() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "dynamic-parent".to_string(),
+                dynamic_namespace_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = timeout(Duration::from_secs(2), async {
+            service
+                .invoke("dynamic-parent".to_string(), test_invocation())
+                .await
+        })
+        .await
+        .expect("dynamic invoke should not deadlock")
+        .expect("dynamic invoke should succeed");
+
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "1:1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_child_can_use_response_json() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "dynamic-json".to_string(),
+                dynamic_response_json_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("dynamic-json".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(output.status, 200);
+        assert_eq!(
+            String::from_utf8(output.body).expect("utf8"),
+            r#"{"ok":true,"source":"dynamic-child"}"#
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn normal_and_dynamic_workers_expose_same_runtime_surface() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "dynamic-surface".to_string(),
+                dynamic_runtime_surface_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("dynamic-surface".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(output.status, 200);
+        let body = String::from_utf8(output.body).expect("utf8");
+        assert!(body.contains(r#""same":true"#), "body was {body}");
+        assert!(body.contains(r#""fetch":true"#), "body was {body}");
+        assert!(body.contains(r#""request":true"#), "body was {body}");
+        assert!(body.contains(r#""response":true"#), "body was {body}");
+        assert!(body.contains(r#""headers":true"#), "body was {body}");
+        assert!(body.contains(r#""formData":true"#), "body was {body}");
+        assert!(
+            body.contains(r#""responseJsonType":"application/json""#),
+            "body was {body}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_worker_fetch_uses_deno_fetch_with_host_policy_and_secret_replacement() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept should succeed");
+            let mut buffer = vec![0_u8; 8192];
+            let bytes_read = socket
+                .read(&mut buffer)
+                .await
+                .expect("server read should succeed");
+            request_tx
+                .send(String::from_utf8_lossy(&buffer[..bytes_read]).to_string())
+                .expect("request should be captured");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                )
+                .await
+                .expect("server write should succeed");
+        });
+
+        let deployed = service
+            .deploy_dynamic(
+                dynamic_fetch_probe_worker(&format!("http://{address}/fetch-probe")),
+                HashMap::from([("API_TOKEN".to_string(), "secret-value".to_string())]),
+                vec!["127.0.0.1".to_string()],
+            )
+            .await
+            .expect("dynamic deploy should succeed");
+
+        let output = service
+            .invoke(deployed.worker, test_invocation())
+            .await
+            .expect("dynamic fetch invoke should succeed");
+        assert_eq!(output.status, 200);
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "ok");
+
+        let raw_request = request_rx.await.expect("request should arrive");
+        assert!(
+            raw_request.starts_with("GET /fetch-probe?token=secret-value HTTP/1.1\r\n"),
+            "raw request was {raw_request}"
+        );
+        assert!(
+            raw_request.contains("\r\nauthorization: Bearer secret-value\r\n"),
+            "raw request was {raw_request}"
+        );
+        assert!(
+            raw_request.contains("\r\nx-dd-secret: secret-value\r\n"),
+            "raw request was {raw_request}"
+        );
+        assert!(
+            !raw_request.contains("__DD_SECRET_"),
+            "secret placeholders leaked into outbound request: {raw_request}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_worker_fetch_rejects_egress_hosts_outside_allowlist() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let deployed = service
+            .deploy_dynamic(
+                dynamic_fetch_probe_worker("http://127.0.0.1:9/blocked"),
+                HashMap::from([("API_TOKEN".to_string(), "secret-value".to_string())]),
+                vec!["example.com".to_string()],
+            )
+            .await
+            .expect("dynamic deploy should succeed");
+
+        let error = service
+            .invoke(deployed.worker, test_invocation())
+            .await
+            .expect_err("dynamic fetch invoke should fail");
+        let body = error.to_string();
+        assert!(
+            body.contains("egress host is not allowed: 127.0.0.1"),
+            "body was {body}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_worker_fetch_abort_signal_cancels_outbound_request() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept should succeed");
+            let mut buffer = vec![0_u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            sleep(Duration::from_millis(200)).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let deployed = service
+            .deploy_dynamic(
+                dynamic_fetch_abort_worker(&format!("http://{address}/abort-probe")),
+                HashMap::new(),
+                vec!["127.0.0.1".to_string()],
+            )
+            .await
+            .expect("dynamic deploy should succeed");
+
+        let started_at = Instant::now();
+        let output = timeout(
+            Duration::from_secs(2),
+            service.invoke(deployed.worker, test_invocation()),
+        )
+        .await
+        .expect("invoke should not hang")
+        .expect("invoke should succeed");
+        assert_eq!(output.status, 200);
+        let body = String::from_utf8(output.body).expect("utf8");
+        assert!(
+            body == "Error"
+                || body.contains("Abort")
+                || body.to_ascii_lowercase().contains("abort"),
+            "body was {body}"
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "abort should finish quickly"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn preview_dynamic_worker_can_proxy_module_based_children() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 2,
+            max_inflight_per_isolate: 2,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "preview-dynamic".to_string(),
+                preview_dynamic_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let root = service
+            .invoke(
+                "preview-dynamic".to_string(),
+                test_invocation_with_path("/preview/pr-123", "preview-root"),
+            )
+            .await
+            .expect("preview root should succeed");
+        assert_eq!(root.status, 200);
+        let root_text = String::from_utf8(root.body).expect("utf8");
+        assert!(root_text.contains("\"preview\":\"pr-123\""));
+        assert!(root_text.contains("\"route\":\"root\""));
+
+        let health = service
+            .invoke(
+                "preview-dynamic".to_string(),
+                test_invocation_with_path("/preview/pr-123/api/health", "preview-health"),
+            )
+            .await
+            .expect("preview health should succeed");
+        assert_eq!(health.status, 200);
+        let health_text = String::from_utf8(health.body).expect("utf8");
+        assert!(health_text.contains("\"route\":\"health\""));
     }
 
     #[tokio::test]
@@ -5303,5 +8420,72 @@ export default {
 
         assert_eq!(state.trace_calls, 2);
         assert!(state.total_calls >= 2);
+    }
+
+    #[test]
+    fn dynamic_worker_config_builds_placeholders() {
+        let mut env = HashMap::new();
+        env.insert("OPENAI_API_KEY".to_string(), "sk-test-123".to_string());
+        let config =
+            super::build_dynamic_worker_config(env, vec!["api.openai.com".to_string()], Vec::new())
+                .expect("dynamic config should build");
+
+        assert_eq!(config.dynamic_env.len(), 1);
+        assert_eq!(config.secret_replacements.len(), 1);
+        assert_eq!(
+            config.egress_allow_hosts,
+            vec!["api.openai.com".to_string()]
+        );
+
+        let placeholder = config
+            .env_placeholders
+            .get("OPENAI_API_KEY")
+            .expect("placeholder should be present");
+        assert!(placeholder.starts_with("__DD_SECRET_"));
+    }
+
+    #[test]
+    fn dynamic_worker_config_rejects_invalid_host() {
+        let config = super::build_dynamic_worker_config(
+            HashMap::new(),
+            vec!["http://bad-host".to_string()],
+            Vec::new(),
+        );
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn extract_bindings_collects_dynamic_bindings() {
+        let bindings = super::extract_bindings(&DeployConfig {
+            bindings: vec![
+                DeployBinding::Kv {
+                    binding: "MY_KV".to_string(),
+                },
+                DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                },
+            ],
+            ..DeployConfig::default()
+        })
+        .expect("bindings should parse");
+
+        assert_eq!(bindings.kv, vec!["MY_KV".to_string()]);
+        assert_eq!(bindings.dynamic, vec!["SANDBOX".to_string()]);
+    }
+
+    #[test]
+    fn extract_bindings_rejects_duplicate_dynamic_name() {
+        let result = super::extract_bindings(&DeployConfig {
+            bindings: vec![
+                DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                },
+                DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                },
+            ],
+            ..DeployConfig::default()
+        });
+        assert!(result.is_err());
     }
 }

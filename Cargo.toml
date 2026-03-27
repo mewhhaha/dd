@@ -13,8 +13,7 @@ license = "MIT"
 version = "0.1.0"
 
 [workspace.dependencies]
-axum = { version = "0.8", features = ["json", "ws"] }
-deno_core = "0.386"
+deno_core = "0.394"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = { version = "0.14", features = ["serde_impl"] }
@@ -29,3 +28,6 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[patch.crates-io]
+deno_crypto = { path = "vendor/deno_crypto" }

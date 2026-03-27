@@ -1,6 +1,6 @@
 # dd
 
-A tiny workers platform built in Rust with Axum and autoscaling JavaScript isolates.
+A tiny workers platform built in Rust with Deno-backed isolates, Hyper/TCP ingress, and QUIC/HTTP3 public ingress.
 
 ## What it does
 
@@ -16,6 +16,8 @@ This MVP supports:
 - `ctx.waitUntil()` with a 30s cap
 - optional Turso KV bindings injected in `env`
 - optional actor namespace bindings in `env` (`idFromName()` + `get()`)
+- optional dynamic namespace bindings in `env` (`get(id, factory)`, `list()`, `delete(id)`)
+- private dynamic worker deploys (`POST /v1/dynamic/deploy`) for ephemeral LLM-style code execution
 - global in-process Cache API (`caches.default` + `caches.open(name)`) shared across workers
 - cache index persisted in Turso; large cache bodies spill to blob storage (local FS now, S3-like backend hook ready)
 
@@ -25,6 +27,20 @@ Workers are single JavaScript modules that export a default object with `fetch(r
 
 - Rust toolchain
 - Cap'n Proto compiler (`capnp`) available on `PATH`
+
+## Patch workflow
+
+Vendored crate patches live under `./vendor`, and the workspace owns the override through `[patch.crates-io]`.
+
+```bash
+just patch deno_crypto
+```
+
+That copies the currently locked crates.io source into `vendor/deno_crypto` the first time. After that, edit the vendored crate directly. To replace an existing vendored copy from your local cargo registry cache:
+
+```bash
+just patch-refresh deno_crypto 0.255.0
+```
 
 ## Environment
 
@@ -79,6 +95,8 @@ run(ServerConfig {
 ```bash
 cargo run -p cli -- --server http://127.0.0.1:3001 deploy hello examples/hello.js --public
 cargo run -p cli -- --server http://127.0.0.1:3001 invoke hello --method POST --path /echo --header "content-type: text/plain" --body-file -
+cargo run -p cli -- --server http://127.0.0.1:3001 dynamic-deploy examples/hello.js --env OPENAI_API_KEY=sk-...
+cargo run -p cli -- --server http://127.0.0.1:3001 deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
 ```
 
 `deploy --public` exposes a worker on the public listener. Without `--public`, a worker is private-only and can only be invoked through the private listener.
@@ -86,6 +104,34 @@ cargo run -p cli -- --server http://127.0.0.1:3001 invoke hello --method POST --
 Worker source/config is persisted under `./store/workers` by default and restored at startup.
 
 For Fly private deploys, use `deploy/fly/proxy-private-deploy.sh` and point CLI to `http://127.0.0.1:18081`.
+
+Dynamic deploys are private-only and in-memory (not restored from `./store/workers`).
+Dynamic env values are exposed to user code as opaque placeholders and replaced with real values only at host I/O boundaries. Dynamic workers are sandboxed with no direct outbound network access.
+
+Dynamic namespace bindings let a normal worker spawn dynamic workers directly:
+
+```js
+class MyApi extends RpcTarget {
+  async ping(name) {
+    return `hello ${name}`;
+  }
+}
+
+const child = await env.SANDBOX.get("tool:v1", async () => ({
+  entrypoint: "worker.js",
+  modules: {
+    "worker.js": "export default { async fetch(_req, env) { return new Response(await env.API.ping('worker')); } };",
+  },
+  env: {
+    API_TOKEN: "secret-value",
+    API: new MyApi(),
+  },
+  timeout: 2500,
+}));
+const response = await child.fetch("http://worker/");
+const ids = await env.SANDBOX.list();
+const deleted = await env.SANDBOX.delete("tool:v1");
+```
 
 ## Fly deploy model
 
@@ -135,6 +181,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - structured values use V8 storage serialization (`forStorage: true`) and reject unsupported host/function types
 - actor storage uses namespace shards (default 64 shards per namespace)
 - dropped invokes are canceled and signaled via `ctx.signal`
+- Spectre-style timer mitigation is enabled: `Date.now()` / `performance.now()` stay frozen between host I/O boundaries
 - cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure
 - cache metadata lives in Turso; inline bodies <= 64KiB, larger bodies use blob storage refs
 - local defaults persist into `./store` (`workers`, `dd-kv.db`, `blobs`)
@@ -158,6 +205,9 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/actor.js` - class-based actor namespace (`env.USER_ACTOR.idFromName/get`)
 - `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
 - `examples/trace-hub.js` - minimal internal trace receiver and web view
+- `examples/dynamic-namespace.js` - spawn + invoke dynamic workers from `env.SANDBOX`
+- `examples/llm-dynamic-exec.js` - pretend LLM planner that executes via dynamic workers
+- `examples/preview-dynamic.js` - dynamic preview environments (`/preview/{id}`)
 
 Try them quickly:
 
@@ -176,6 +226,9 @@ cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR=UserActor
 cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
 cargo run -p cli -- deploy trace-hub examples/trace-hub.js
+cargo run -p cli -- deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
+cargo run -p cli -- deploy llm-dynamic examples/llm-dynamic-exec.js --dynamic-binding SANDBOX
+cargo run -p cli -- deploy preview-dynamic examples/preview-dynamic.js --dynamic-binding SANDBOX
 ```
 
 Build/deploy the bundled TypeScript router:
@@ -196,15 +249,36 @@ printf "ping" | cargo run -p cli -- invoke router --method POST --path /echo --h
 cargo run -p cli -- invoke bundled-router --method GET --path /health
 cargo run -p cli -- invoke cache-vary --method GET --path /greet --header "accept-language: fr"
 cargo run -p cli -- invoke stream --method GET --path /
+cargo run -p cli -- invoke kv-counter --method GET --path /
 cargo run -p cli -- invoke kv-counter --method POST --path /inc
 cargo run -p cli -- invoke kv-counter --method GET --path /value
 printf "req-123" | xargs -I{} cargo run -p cli -- invoke bg-kv --method GET --path / --header "x-request-id: {}"
+cargo run -p cli -- invoke bg-kv --method GET --path / --header "x-request-id: verify-root"
+cargo run -p cli -- invoke actor --method GET --path /
 cargo run -p cli -- invoke actor --method POST --path /inc?user=alice
 cargo run -p cli -- invoke actor --method GET --path /value?user=alice
 cargo run -p cli -- invoke receipts --method POST --path /receipts --header "content-type: application/json" --body-file -
 cargo run -p cli -- invoke receipts --method GET --path /receipts
+cargo run -p cli -- invoke dynamic --method GET --path /run?path=/hello
+cargo run -p cli -- invoke llm-dynamic --method GET --path /run?prompt=echo\&input=hello
+cargo run -p cli -- invoke llm-dynamic --method GET --path /run?prompt=sum\&n=1\&n=2\&n=3
+cargo run -p cli -- invoke preview-dynamic --method GET --path /preview/pr-123
+cargo run -p cli -- invoke preview-dynamic --method GET --path /preview/pr-123/api/health
 ```
 
+Primary public route notes:
+
+- `kv-counter`: use `/` for docs, then `/value`, `/inc`, `/reset`.
+- `actor`: use `/` for docs, then `/ping`, `/inc?user=...`, `/value?user=...`.
+- `bg-kv`: use `/` for docs, then repeat `/` with an `x-request-id` header for the queued write path.
+- `dynamic`, `llm-dynamic`, `preview-dynamic`: use `/` for docs, then their explicit `/run` or `/preview/{id}` paths.
+- `trace-hub` includes a root summary; cache examples are best verified on their primary behavior routes.
+
+Run the checked-in public smoke matrix with:
+
+```bash
+bash scripts/smoke_examples.sh
+```
 Deploy a trace hub and route traces from another worker:
 
 ```bash
@@ -238,7 +312,8 @@ curl -X POST http://localhost:3001/v1/deploy \
   "config": {
     "public": true,
     "bindings": [
-      { "type": "kv", "binding": "MY_KV" }
+      { "type": "kv", "binding": "MY_KV" },
+      { "type": "dynamic", "binding": "SANDBOX" }
     ]
   }
 }

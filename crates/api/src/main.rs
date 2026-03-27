@@ -8,6 +8,7 @@ use opentelemetry_sdk::trace::TracerProvider as OTelTracerProvider;
 use opentelemetry_sdk::Resource;
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -28,11 +29,15 @@ async fn main() -> Result<()> {
         .map_err(|error| PlatformError::internal(format!("invalid BIND_PRIVATE_ADDR: {error}")))?;
     let public_base_domain =
         env::var("PUBLIC_BASE_DOMAIN").unwrap_or_else(|_| "example.com".to_string());
+    let public_tls_cert_path = env::var("PUBLIC_TLS_CERT_PATH").ok().map(PathBuf::from);
+    let public_tls_key_path = env::var("PUBLIC_TLS_KEY_PATH").ok().map(PathBuf::from);
 
     let result = dd_server::run(ServerConfig {
         bind_public_addr: public_addr,
         bind_private_addr: private_addr,
         public_base_domain,
+        public_tls_cert_path,
+        public_tls_key_path,
         ..ServerConfig::default()
     })
     .await;

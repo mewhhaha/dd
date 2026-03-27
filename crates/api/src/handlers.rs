@@ -1,29 +1,38 @@
 use crate::state::AppState;
-use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
-use axum::http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, HOST};
-use axum::http::{HeaderMap, Response, StatusCode};
-use axum::response::IntoResponse;
-use axum::Json;
+use bytes::Bytes;
 use common::{
-    DeployBinding, DeployInternalConfig, DeployRequest, DeployResponse, ErrorBody, ErrorKind,
-    PlatformError, WorkerInvocation, WorkerOutput,
+    DeployBinding, DeployInternalConfig, DeployRequest, DeployResponse, DynamicDeployRequest,
+    DynamicDeployResponse, ErrorBody, ErrorKind, PlatformError, WorkerInvocation, WorkerOutput,
 };
-use futures_util::{stream::SplitSink, SinkExt};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, HOST};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http_body::Body as HttpBody;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use hyper::body::Frame;
+use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use opentelemetry::global;
 use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::TraceContextExt;
 use runtime::{CacheLookup, CacheRequest, CacheResponse};
 use std::collections::HashSet;
+use std::convert::Infallible;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_tungstenite::tungstenite::handshake::server::create_response as create_ws_response;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
+use tokio_tungstenite::WebSocketStream;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type ResponseBody = BoxBody<Bytes, BoxError>;
 
+#[derive(Debug)]
 pub struct ApiError(pub PlatformError);
 
 const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
@@ -37,10 +46,115 @@ const HEADER_WS_BINARY: &str = "x-dd-ws-binary";
 const HEADER_WS_CLOSE_CODE: &str = "x-dd-ws-close-code";
 const HEADER_WS_CLOSE_REASON: &str = "x-dd-ws-close-reason";
 
-pub async fn deploy_worker(
-    State(state): State<AppState>,
-    Json(payload): Json<DeployRequest>,
-) -> ApiResult<Json<DeployResponse>> {
+pub async fn handle_private_request<B>(
+    state: AppState,
+    request: Request<B>,
+) -> Response<ResponseBody>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    respond(route_private_request(state, request).await)
+}
+
+pub async fn handle_public_request<B>(
+    state: AppState,
+    request: Request<B>,
+) -> Response<ResponseBody>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    respond(route_public_request(state, request).await)
+}
+
+pub async fn handle_public_h3_request(
+    state: AppState,
+    request: Request<()>,
+    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
+) -> Response<ResponseBody> {
+    respond(route_public_h3_request(state, request, request_body_stream).await)
+}
+
+async fn route_private_request<B>(
+    state: AppState,
+    mut request: Request<B>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let path = request.uri().path().to_string();
+    if request.method() == Method::POST && path == "/v1/deploy" {
+        let payload: DeployRequest =
+            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
+        let response = deploy_worker(state, payload).await?;
+        return Ok(json_response(StatusCode::OK, &response)?);
+    }
+    if request.method() == Method::POST && path == "/v1/dynamic/deploy" {
+        let payload: DynamicDeployRequest =
+            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
+        let response = deploy_dynamic_worker(state, payload).await?;
+        return Ok(json_response(StatusCode::OK, &response)?);
+    }
+    if path == "/v1/invoke" || path.starts_with("/v1/invoke/") {
+        let ws_upgrade = if is_websocket_upgrade(request.headers()) {
+            Some(prepare_websocket_upgrade(&mut request)?)
+        } else {
+            None
+        };
+        return invoke_worker_private(state, request, ws_upgrade).await;
+    }
+    Err(PlatformError::not_found("not found").into())
+}
+
+async fn route_public_request<B>(
+    state: AppState,
+    mut request: Request<B>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let path = request.uri().path().to_string();
+    if path.starts_with("/v1/deploy")
+        || path.starts_with("/v1/dynamic")
+        || path.starts_with("/v1/invoke")
+    {
+        return Err(PlatformError::not_found("not found").into());
+    }
+    let ws_upgrade = if is_websocket_upgrade(request.headers()) {
+        Some(prepare_websocket_upgrade(&mut request)?)
+    } else {
+        None
+    };
+    invoke_worker_public(state, request, ws_upgrade).await
+}
+
+async fn route_public_h3_request(
+    state: AppState,
+    request: Request<()>,
+    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
+) -> ApiResult<Response<ResponseBody>> {
+    let path = request.uri().path().to_string();
+    if path.starts_with("/v1/deploy")
+        || path.starts_with("/v1/dynamic")
+        || path.starts_with("/v1/invoke")
+    {
+        return Err(PlatformError::not_found("not found").into());
+    }
+    if is_websocket_upgrade(request.headers()) {
+        return Err(
+            PlatformError::bad_request("websocket upgrade is unsupported over http/3").into(),
+        );
+    }
+    if request.method() == Method::CONNECT {
+        return Err(PlatformError::bad_request("CONNECT is unsupported over http/3").into());
+    }
+    invoke_worker_public_h3(state, request, request_body_stream).await
+}
+
+pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult<DeployResponse> {
     let name = payload.name.trim();
     let span = tracing::info_span!("http.deploy", worker.name = %name);
     let _guard = span.enter();
@@ -56,19 +170,43 @@ pub async fn deploy_worker(
         .await?;
     tracing::info!(deployment_id = %deployment_id, "worker deployed");
 
-    Ok(Json(DeployResponse {
+    Ok(DeployResponse {
         ok: true,
         worker: name.to_string(),
         deployment_id,
-    }))
+    })
 }
 
-pub async fn invoke_worker_private(
-    State(state): State<AppState>,
-    ws_upgrade: Option<WebSocketUpgrade>,
-    request: Request,
-) -> ApiResult<Response<Body>> {
-    if ws_upgrade.is_some() && is_websocket_upgrade(request.headers()) {
+pub async fn deploy_dynamic_worker(
+    state: AppState,
+    payload: DynamicDeployRequest,
+) -> ApiResult<DynamicDeployResponse> {
+    if payload.source.trim().is_empty() {
+        return Err(PlatformError::bad_request("Worker source must not be empty").into());
+    }
+    let deployed = state
+        .runtime
+        .deploy_dynamic(payload.source, payload.env, payload.egress_allow_hosts)
+        .await?;
+
+    Ok(DynamicDeployResponse {
+        ok: true,
+        worker: deployed.worker,
+        deployment_id: deployed.deployment_id,
+        env_placeholders: deployed.env_placeholders,
+    })
+}
+
+pub async fn invoke_worker_private<B>(
+    state: AppState,
+    request: Request<B>,
+    ws_upgrade: Option<PreparedWebSocketUpgrade>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    if ws_upgrade.is_some() {
         return invoke_worker_websocket_private(state, request, ws_upgrade).await;
     }
     let (parts, body) = request.into_parts();
@@ -77,33 +215,58 @@ pub async fn invoke_worker_private(
     invoke_worker_with_target(state, parts, body, worker_name, url).await
 }
 
-pub async fn invoke_worker_public(
-    State(state): State<AppState>,
-    ws_upgrade: Option<WebSocketUpgrade>,
-    request: Request,
-) -> ApiResult<Response<Body>> {
-    if ws_upgrade.is_some() && is_websocket_upgrade(request.headers()) {
+pub async fn invoke_worker_public<B>(
+    state: AppState,
+    request: Request<B>,
+    ws_upgrade: Option<PreparedWebSocketUpgrade>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let (parts, body) = request.into_parts();
+    let worker_name = parse_public_worker_name_from_request(
+        &parts.headers,
+        &parts.uri,
+        &state.public_base_domain,
+    )?;
+    ensure_public_worker(&state, &worker_name).await?;
+    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    let request = Request::from_parts(parts, body);
+    if ws_upgrade.is_some() {
         return invoke_worker_websocket_public(state, request, ws_upgrade).await;
     }
     let (parts, body) = request.into_parts();
-    let path = parts.uri.path();
-    if path.starts_with("/v1/deploy") || path.starts_with("/v1/invoke") {
-        return Err(PlatformError::not_found("not found").into());
-    }
-    let worker_name =
-        parse_public_worker_name_from_host(&parts.headers, &state.public_base_domain)?;
-    ensure_public_worker(&state, &worker_name).await?;
-    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
     invoke_worker_with_target(state, parts, body, worker_name, url).await
 }
 
-async fn invoke_worker_with_target(
+pub async fn invoke_worker_public_h3(
     state: AppState,
-    parts: axum::http::request::Parts,
-    body: Body,
+    request: Request<()>,
+    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
+) -> ApiResult<Response<ResponseBody>> {
+    let (parts, _body) = request.into_parts();
+    let worker_name = parse_public_worker_name_from_request(
+        &parts.headers,
+        &parts.uri,
+        &state.public_base_domain,
+    )?;
+    ensure_public_worker(&state, &worker_name).await?;
+    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url).await
+}
+
+async fn invoke_worker_with_target<B>(
+    state: AppState,
+    parts: http::request::Parts,
+    body: B,
     worker_name: String,
     url: String,
-) -> ApiResult<Response<Body>> {
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let method = parts.method.as_str().to_string();
     let invoke_span = tracing::info_span!(
         "http.invoke",
@@ -121,7 +284,30 @@ async fn invoke_worker_with_target(
         ))
         .into());
     }
-    let request_body_stream = build_request_body_stream(body, max_body_bytes);
+    let request_body_stream = if request_method_allows_body(&parts.method) {
+        Some(build_request_body_stream(body, max_body_bytes))
+    } else {
+        None
+    };
+    invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url).await
+}
+
+async fn invoke_worker_from_body_stream(
+    state: AppState,
+    parts: http::request::Parts,
+    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
+    worker_name: String,
+    url: String,
+) -> ApiResult<Response<ResponseBody>> {
+    let method = parts.method.as_str().to_string();
+    let invoke_span = tracing::info_span!(
+        "http.invoke",
+        worker.name = %worker_name,
+        http.method = %method,
+        http.route = %parts.uri.path()
+    );
+    set_span_parent_from_http_headers(&invoke_span, &parts.headers);
+    let _invoke_guard = invoke_span.enter();
 
     let mut headers = Vec::with_capacity(parts.headers.len());
     for (name, value) in &parts.headers {
@@ -134,7 +320,7 @@ async fn invoke_worker_with_target(
     let request_id = Uuid::new_v4().to_string();
 
     let invocation = WorkerInvocation {
-        method,
+        method: method.clone(),
         url,
         headers,
         body: Vec::new(),
@@ -145,7 +331,7 @@ async fn invoke_worker_with_target(
     if !is_cacheable_request(&invocation) {
         let output = state
             .runtime
-            .invoke_stream_with_request_body(worker_name, invocation, Some(request_body_stream))
+            .invoke_stream_with_request_body(worker_name, invocation, request_body_stream)
             .await?;
         let mut response = build_worker_stream_response(output)?;
         annotate_response_with_trace_id(&mut response);
@@ -176,7 +362,7 @@ async fn invoke_worker_with_target(
         CacheLookup::StaleIfError(response) => {
             let origin = state
                 .runtime
-                .invoke_with_request_body(worker_name, invocation, Some(request_body_stream))
+                .invoke_with_request_body(worker_name, invocation, request_body_stream)
                 .await;
             return match origin {
                 Ok(output) => {
@@ -195,7 +381,11 @@ async fn invoke_worker_with_target(
                         return Ok(fallback);
                     }
                     store_worker_output_in_cache(&state, &cache_request, &output).await;
-                    tracing::info!(request_id = %request_id, cache_status = "MISS", "cache refreshed from origin");
+                    tracing::info!(
+                        request_id = %request_id,
+                        cache_status = "MISS",
+                        "cache refreshed from origin"
+                    );
                     build_worker_buffered_response(output, "MISS")
                 }
                 Err(_error) => {
@@ -218,58 +408,160 @@ async fn invoke_worker_with_target(
 
     let output = state
         .runtime
-        .invoke_with_request_body(worker_name, invocation, Some(request_body_stream))
+        .invoke_with_request_body(worker_name, invocation, request_body_stream)
         .await?;
     store_worker_output_in_cache(&state, &cache_request, &output).await;
     tracing::info!(request_id = %request_id, cache_status = "MISS", "origin miss stored");
     build_worker_buffered_response(output, "MISS")
 }
 
-async fn invoke_worker_websocket_private(
+async fn invoke_worker_websocket_private<B>(
     state: AppState,
-    request: Request,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> ApiResult<Response<Body>> {
+    request: Request<B>,
+    ws_upgrade: Option<PreparedWebSocketUpgrade>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let (parts, body) = request.into_parts();
     let (worker_name, url) =
         parse_invoke_request_uri(parts.uri.path(), parts.uri.path_and_query())?;
     invoke_worker_websocket_with_target(state, parts, body, worker_name, url, ws_upgrade).await
 }
 
-async fn invoke_worker_websocket_public(
+async fn invoke_worker_websocket_public<B>(
     state: AppState,
-    request: Request,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> ApiResult<Response<Body>> {
+    request: Request<B>,
+    ws_upgrade: Option<PreparedWebSocketUpgrade>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let (parts, body) = request.into_parts();
-    let path = parts.uri.path();
-    if path.starts_with("/v1/deploy") || path.starts_with("/v1/invoke") {
-        return Err(PlatformError::not_found("not found").into());
-    }
-    let worker_name =
-        parse_public_worker_name_from_host(&parts.headers, &state.public_base_domain)?;
+    let worker_name = parse_public_worker_name_from_request(
+        &parts.headers,
+        &parts.uri,
+        &state.public_base_domain,
+    )?;
     ensure_public_worker(&state, &worker_name).await?;
     let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
     invoke_worker_websocket_with_target(state, parts, body, worker_name, url, ws_upgrade).await
 }
 
-async fn invoke_worker_websocket_with_target(
+async fn invoke_worker_websocket_with_target<B>(
     state: AppState,
-    parts: axum::http::request::Parts,
-    _body: Body,
+    parts: http::request::Parts,
+    _body: B,
     worker_name: String,
     url: String,
-    ws_upgrade: Option<WebSocketUpgrade>,
-) -> ApiResult<Response<Body>> {
+    ws_upgrade: Option<PreparedWebSocketUpgrade>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let Some(ws_upgrade) = ws_upgrade else {
         return Err(PlatformError::bad_request("missing websocket upgrade").into());
     };
+    let runtime::WebSocketOpen {
+        session_id,
+        worker_name: runtime_worker_name,
+        output,
+    } = open_websocket_session_from_parts(&state, &parts, worker_name, url).await?;
 
+    if output.status != 101 {
+        return Err(PlatformError::bad_request("websocket upgrade rejected by worker").into());
+    }
+
+    let filtered_headers = sanitize_websocket_handshake_headers(output.headers);
+    let runtime = state.runtime.clone();
+    let state_for_session = state.clone();
+    let handshake_session_id = session_id.clone();
+    let runtime_worker_name_for_frames = runtime_worker_name.clone();
+    let on_upgrade = ws_upgrade.on_upgrade;
+
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                {
+                    let mut sessions = state_for_session.websocket_sessions.lock().await;
+                    sessions.insert(
+                        handshake_session_id.clone(),
+                        crate::state::WebSocketSession {
+                            id: handshake_session_id.clone(),
+                            worker_name: runtime_worker_name_for_frames.clone(),
+                            started_at: std::time::Instant::now(),
+                        },
+                    );
+                }
+
+                let socket =
+                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
+                        .await;
+                handle_websocket_session(
+                    state_for_session,
+                    socket,
+                    handshake_session_id,
+                    runtime_worker_name_for_frames,
+                    runtime,
+                    output.body,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %handshake_session_id,
+                    error = %error,
+                    "websocket upgrade failed"
+                );
+                let _ = runtime
+                    .websocket_close(
+                        runtime_worker_name_for_frames,
+                        handshake_session_id,
+                        1011,
+                        "upgrade failed".to_string(),
+                    )
+                    .await;
+            }
+        }
+    });
+
+    let mut response = build_websocket_handshake_response(&ws_upgrade.handshake_request)?;
+    for (name, value) in &filtered_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            response.headers_mut().append(name, value);
+        }
+    }
+    if let Ok(session_header) = HeaderValue::from_str(&session_id) {
+        response.headers_mut().append(
+            HeaderName::from_static("x-dd-websocket-session"),
+            session_header,
+        );
+    }
+    response
+        .headers_mut()
+        .remove(HeaderName::from_static(HEADER_WS_SESSION));
+    Ok(response)
+}
+
+pub(crate) async fn open_websocket_session_from_parts(
+    state: &AppState,
+    parts: &http::request::Parts,
+    worker_name: String,
+    url: String,
+) -> Result<runtime::WebSocketOpen, PlatformError> {
     if parts.method.as_str().to_ascii_uppercase() != "GET" {
-        return Err(PlatformError::bad_request("websocket upgrade requires GET").into());
+        return Err(PlatformError::bad_request("websocket upgrade requires GET"));
     }
     if !is_websocket_upgrade(&parts.headers) {
-        return Err(PlatformError::bad_request("missing websocket upgrade headers").into());
+        return Err(PlatformError::bad_request(
+            "missing websocket upgrade headers",
+        ));
     }
 
     let mut headers = Vec::with_capacity(parts.headers.len());
@@ -293,81 +585,62 @@ async fn invoke_worker_websocket_with_target(
         request_id,
     };
 
-    let runtime::WebSocketOpen {
-        session_id,
-        worker_name: runtime_worker_name,
-        output,
-    } = state
+    state
         .runtime
         .open_websocket(worker_name, invocation, None)
         .await
-        .map_err(|error| PlatformError::bad_request(format!("websocket open failed: {error}")))?;
-
-    if output.status != 101 {
-        return Err(PlatformError::bad_request("websocket upgrade rejected by worker").into());
-    }
-
-    let filtered_headers = sanitize_websocket_handshake_headers(output.headers);
-    let runtime = state.runtime.clone();
-    let state_for_session = state.clone();
-    let handshake_session_id = session_id.clone();
-    let runtime_worker_name_for_frames = runtime_worker_name.clone();
-
-    let response = ws_upgrade.on_upgrade(move |socket| {
-        let request_worker_name = runtime_worker_name_for_frames.clone();
-        async move {
-            {
-                let mut sessions = state_for_session.websocket_sessions.lock().await;
-                sessions.insert(
-                    handshake_session_id.clone(),
-                    crate::state::WebSocketSession {
-                        id: handshake_session_id.clone(),
-                        worker_name: request_worker_name.clone(),
-                        started_at: std::time::Instant::now(),
-                    },
-                );
-            }
-            handle_websocket_session(
-                state_for_session,
-                socket,
-                handshake_session_id,
-                request_worker_name,
-                runtime,
-                output.body,
-            )
-            .await;
-        }
-    });
-
-    let mut response = response.into_response();
-    for (name, value) in &filtered_headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            response.headers_mut().append(name, value);
-        }
-    }
-    if let Ok(session_header) = HeaderValue::from_str(&session_id) {
-        response.headers_mut().append(
-            HeaderName::from_static("x-dd-websocket-session"),
-            session_header,
-        );
-    }
-    response
-        .headers_mut()
-        .remove(HeaderName::from_static(HEADER_WS_SESSION));
-    Ok(response)
+        .map_err(|error| PlatformError::bad_request(format!("websocket open failed: {error}")))
 }
 
-async fn handle_websocket_session(
+pub(crate) async fn open_transport_session_from_parts(
+    state: &AppState,
+    parts: &http::request::Parts,
+    worker_name: String,
+    url: String,
+    stream_sender: mpsc::UnboundedSender<Vec<u8>>,
+    datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<runtime::TransportOpen, PlatformError> {
+    if parts.method != Method::CONNECT {
+        return Err(PlatformError::bad_request(
+            "transport open requires CONNECT",
+        ));
+    }
+
+    let mut headers = Vec::with_capacity(parts.headers.len());
+    for (name, value) in &parts.headers {
+        let value = value.to_str().map_err(|error| {
+            PlatformError::bad_request(format!("invalid header value for {name}: {error}"))
+        })?;
+        headers.push((name.as_str().to_string(), value.to_string()));
+    }
+    inject_current_trace_context(&mut headers);
+    let request_id = Uuid::new_v4().to_string();
+
+    let invocation = WorkerInvocation {
+        method: parts.method.as_str().to_string(),
+        url,
+        headers,
+        body: Vec::new(),
+        request_id,
+    };
+
+    state
+        .runtime
+        .open_transport(worker_name, invocation, stream_sender, datagram_sender)
+        .await
+        .map_err(|error| PlatformError::bad_request(format!("transport open failed: {error}")))
+}
+
+pub(crate) async fn handle_websocket_session<S>(
     state: AppState,
-    socket: WebSocket,
+    socket: WebSocketStream<S>,
     session_id: String,
     worker_name: String,
     runtime: runtime::RuntimeService,
     _initial_response_body: Vec<u8>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut sender, mut receiver) = socket.split();
 
     while let Some(message) = receiver.next().await {
@@ -379,7 +652,7 @@ async fn handle_websocket_session(
                         &runtime,
                         &worker_name,
                         &session_id,
-                        text.into_bytes(),
+                        text.to_string().into_bytes(),
                         false,
                     )
                     .await
@@ -408,8 +681,12 @@ async fn handle_websocket_session(
                         .as_ref()
                         .map(|frame| frame.reason.to_string())
                         .unwrap_or_default();
+                    let code = frame
+                        .as_ref()
+                        .map(|frame| u16::from(frame.code))
+                        .unwrap_or(1000);
                     let _ = runtime
-                        .websocket_close(worker_name.clone(), session_id.clone(), 1000, reason)
+                        .websocket_close(worker_name.clone(), session_id.clone(), code, reason)
                         .await;
                     break;
                 }
@@ -419,6 +696,7 @@ async fn handle_websocket_session(
                     }
                 }
                 Message::Pong(_) => {}
+                Message::Frame(_) => {}
             },
             Err(_) => break,
         }
@@ -431,14 +709,17 @@ async fn handle_websocket_session(
     sessions.remove(&session_id);
 }
 
-async fn forward_websocket_frame(
-    sender: &mut SplitSink<WebSocket, Message>,
+async fn forward_websocket_frame<S>(
+    sender: &mut SplitSink<WebSocketStream<S>, Message>,
     runtime: &runtime::RuntimeService,
     worker_name: &str,
     session_id: &str,
     payload: Vec<u8>,
     is_binary: bool,
-) -> std::result::Result<(), ()> {
+) -> std::result::Result<(), ()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     match runtime
         .websocket_send_frame(
             worker_name.to_string(),
@@ -453,8 +734,8 @@ async fn forward_websocket_frame(
                 extract_websocket_close_signal(&output.headers)
             {
                 let _ = sender
-                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: close_code,
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code.into(),
                         reason: close_reason.into(),
                     })))
                     .await;
@@ -482,7 +763,7 @@ async fn forward_websocket_frame(
                         return Err(());
                     }
                 } else if let Ok(body) = String::from_utf8(output.body.clone()) {
-                    if sender.send(Message::Text(body)).await.is_err() {
+                    if sender.send(Message::Text(body.into())).await.is_err() {
                         return Err(());
                     }
                 } else if sender
@@ -502,7 +783,9 @@ async fn forward_websocket_frame(
     }
 }
 
-fn sanitize_websocket_handshake_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+pub(crate) fn sanitize_websocket_handshake_headers(
+    headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
     headers
         .into_iter()
         .filter(|(name, _)| !is_internal_proxy_upgrade_header(name))
@@ -535,6 +818,40 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     upgrade_value.trim().eq_ignore_ascii_case("websocket")
 }
 
+fn prepare_websocket_upgrade<B>(
+    request: &mut Request<B>,
+) -> Result<PreparedWebSocketUpgrade, PlatformError> {
+    let mut builder = Request::builder()
+        .method(request.method())
+        .uri(request.uri().clone())
+        .version(request.version());
+    for (name, value) in request.headers() {
+        builder = builder.header(name, value);
+    }
+    let handshake_request = builder
+        .body(())
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    Ok(PreparedWebSocketUpgrade {
+        on_upgrade: hyper::upgrade::on(request),
+        handshake_request,
+    })
+}
+
+fn build_websocket_handshake_response(
+    request: &Request<()>,
+) -> Result<Response<ResponseBody>, PlatformError> {
+    let response = create_ws_response(request).map_err(|error| {
+        PlatformError::bad_request(format!("invalid websocket upgrade: {error}"))
+    })?;
+    let (parts, _) = response.into_parts();
+    let mut output = Response::builder()
+        .status(parts.status)
+        .body(empty_body())
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    *output.headers_mut() = parts.headers;
+    Ok(output)
+}
+
 fn is_internal_proxy_upgrade_header(name: &str) -> bool {
     name.to_ascii_lowercase()
         .starts_with(HEADER_WS_INTERNAL_PREFIX)
@@ -554,18 +871,27 @@ fn extract_websocket_close_signal(headers: &[(String, String)]) -> Option<(u16, 
     close_code.map(|code| (code, close_reason))
 }
 
-fn parse_public_worker_name_from_host(
+pub(crate) fn parse_public_worker_name_from_request(
     headers: &HeaderMap,
+    uri: &http::Uri,
     public_base_domain: &str,
 ) -> Result<String, PlatformError> {
     let host = headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_string())
+        })
         .ok_or_else(|| PlatformError::not_found("not found"))?;
     parse_worker_from_host(host, public_base_domain)
 }
 
-async fn ensure_public_worker(state: &AppState, worker_name: &str) -> Result<(), PlatformError> {
+pub(crate) async fn ensure_public_worker(
+    state: &AppState,
+    worker_name: &str,
+) -> Result<(), PlatformError> {
     let Some(stats) = state.runtime.stats(worker_name.to_string()).await else {
         return Err(PlatformError::not_found("not found"));
     };
@@ -577,7 +903,7 @@ async fn ensure_public_worker(state: &AppState, worker_name: &str) -> Result<(),
 
 fn parse_invoke_request_uri(
     path: &str,
-    path_and_query: Option<&axum::http::uri::PathAndQuery>,
+    path_and_query: Option<&http::uri::PathAndQuery>,
 ) -> Result<(String, String), PlatformError> {
     let remainder = path
         .strip_prefix("/v1/invoke")
@@ -612,7 +938,10 @@ fn parse_invoke_request_uri(
     Ok((worker_name.to_string(), url))
 }
 
-fn build_worker_url(path: &str, path_and_query: Option<&axum::http::uri::PathAndQuery>) -> String {
+pub(crate) fn build_worker_url(
+    path: &str,
+    path_and_query: Option<&http::uri::PathAndQuery>,
+) -> String {
     let normalized_path = if path.is_empty() { "/" } else { path };
     let query_suffix = match path_and_query {
         Some(path_and_query) => path_and_query
@@ -625,8 +954,11 @@ fn build_worker_url(path: &str, path_and_query: Option<&axum::http::uri::PathAnd
     format!("http://worker{}{}", normalized_path, query_suffix)
 }
 
-fn parse_worker_from_host(host: &str, public_base_domain: &str) -> Result<String, PlatformError> {
-    let Some(host) = normalize_host(host) else {
+fn parse_worker_from_host(
+    host: impl AsRef<str>,
+    public_base_domain: &str,
+) -> Result<String, PlatformError> {
+    let Some(host) = normalize_host(host.as_ref()) else {
         return Err(PlatformError::not_found("not found"));
     };
     let Some(base_domain) = normalize_host(public_base_domain) else {
@@ -673,7 +1005,11 @@ fn normalize_host(host: &str) -> Option<String> {
     Some(lower)
 }
 
-fn build_request_body_stream(body: Body, max_bytes: usize) -> runtime::InvokeRequestBodyReceiver {
+fn build_request_body_stream<B>(body: B, max_bytes: usize) -> runtime::InvokeRequestBodyReceiver
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let (tx, rx) = mpsc::channel(REQUEST_BODY_STREAM_CAPACITY);
     tokio::spawn(async move {
         let mut stream = body.into_data_stream();
@@ -712,11 +1048,17 @@ fn request_content_length(headers: &HeaderMap) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+fn request_method_allows_body(method: &Method) -> bool {
+    *method != Method::GET && *method != Method::HEAD
+}
+
 fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformError> {
     let mut seen = HashSet::new();
     for binding in bindings {
         match binding {
-            DeployBinding::Kv { binding } | DeployBinding::Actor { binding, .. }
+            DeployBinding::Kv { binding }
+            | DeployBinding::Actor { binding, .. }
+            | DeployBinding::Dynamic { binding }
                 if binding.trim().is_empty() =>
             {
                 return Err(PlatformError::bad_request("binding name must not be empty"));
@@ -724,7 +1066,9 @@ fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformEr
             DeployBinding::Actor { class, .. } if class.trim().is_empty() => {
                 return Err(PlatformError::bad_request("actor class must not be empty"));
             }
-            DeployBinding::Kv { binding } | DeployBinding::Actor { binding, .. } => {
+            DeployBinding::Kv { binding }
+            | DeployBinding::Actor { binding, .. }
+            | DeployBinding::Dynamic { binding } => {
                 let normalized = binding.trim().to_string();
                 if !seen.insert(normalized.clone()) {
                     return Err(PlatformError::bad_request(format!(
@@ -761,18 +1105,16 @@ fn validate_internal_config(internal: &DeployInternalConfig) -> Result<(), Platf
 
 fn build_worker_stream_response(
     worker_response: runtime::WorkerStreamOutput,
-) -> ApiResult<Response<Body>> {
+) -> ApiResult<Response<ResponseBody>> {
+    let stream = UnboundedReceiverStream::new(worker_response.body).map(|chunk| {
+        chunk
+            .map(Bytes::from)
+            .map(Frame::data)
+            .map_err(|error| -> BoxError { std::io::Error::other(error.to_string()).into() })
+    });
     let mut response = Response::builder()
         .status(worker_response.status)
-        .body(Body::from_stream(
-            tokio_stream::wrappers::UnboundedReceiverStream::new(worker_response.body).map(
-                |chunk| {
-                    chunk
-                        .map(axum::body::Bytes::from)
-                        .map_err(|error| std::io::Error::other(error.to_string()))
-                },
-            ),
-        ))
+        .body(BodyExt::boxed(StreamBody::new(stream)))
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
     for (name, value) in worker_response.headers {
@@ -820,7 +1162,7 @@ fn build_edge_cache_request(worker_name: &str, invocation: &WorkerInvocation) ->
 fn build_cached_response(
     cache_response: CacheResponse,
     cache_status: &str,
-) -> ApiResult<Response<Body>> {
+) -> ApiResult<Response<ResponseBody>> {
     build_buffered_response(
         cache_response.status,
         cache_response.headers,
@@ -832,7 +1174,7 @@ fn build_cached_response(
 fn build_worker_buffered_response(
     output: WorkerOutput,
     cache_status: &str,
-) -> ApiResult<Response<Body>> {
+) -> ApiResult<Response<ResponseBody>> {
     build_buffered_response(output.status, output.headers, output.body, cache_status)
 }
 
@@ -841,10 +1183,10 @@ fn build_buffered_response(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     cache_status: &str,
-) -> ApiResult<Response<Body>> {
+) -> ApiResult<Response<ResponseBody>> {
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from(body))
+        .body(full_body(body))
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
     for (name, value) in headers {
@@ -957,7 +1299,7 @@ fn set_span_parent_from_http_headers(span: &Span, headers: &HeaderMap) {
     });
 }
 
-fn inject_current_trace_context(headers: &mut Vec<(String, String)>) {
+pub(crate) fn inject_current_trace_context(headers: &mut Vec<(String, String)>) {
     let context = Span::current().context();
     global::get_text_map_propagator(|propagator| {
         let mut injector = InvocationHeaderInjector(headers);
@@ -965,7 +1307,7 @@ fn inject_current_trace_context(headers: &mut Vec<(String, String)>) {
     });
 }
 
-fn annotate_response_with_trace_id(response: &mut Response<Body>) {
+pub(crate) fn annotate_response_with_trace_id(response: &mut Response<ResponseBody>) {
     let context = Span::current().context();
     let span = context.span();
     let span_context = span.span_context();
@@ -1013,39 +1355,104 @@ impl From<PlatformError> for ApiError {
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response<Body> {
+impl ApiError {
+    fn into_http_response(self) -> Response<ResponseBody> {
         let status = match self.0.kind() {
             ErrorKind::BadRequest | ErrorKind::Runtime => StatusCode::BAD_REQUEST,
             ErrorKind::NotFound => StatusCode::NOT_FOUND,
             ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
-
-        let mut response = (status, Json(ErrorBody::from_error(&self.0))).into_response();
+        let body = serde_json::to_vec(&ErrorBody::from_error(&self.0))
+            .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
+        let mut response = Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(full_body(body))
+            .unwrap_or_else(|_| {
+                Response::new(full_body(b"{\"error\":\"internal error\"}".to_vec()))
+            });
         annotate_response_with_trace_id(&mut response);
         response
     }
 }
 
+fn respond(result: ApiResult<Response<ResponseBody>>) -> Response<ResponseBody> {
+    match result {
+        Ok(response) => response,
+        Err(error) => error.into_http_response(),
+    }
+}
+
+pub(crate) fn empty_body() -> ResponseBody {
+    Empty::<Bytes>::new()
+        .map_err(infallible_to_box_error)
+        .boxed()
+}
+
+pub(crate) fn full_body(body: Vec<u8>) -> ResponseBody {
+    Full::new(Bytes::from(body))
+        .map_err(infallible_to_box_error)
+        .boxed()
+}
+
+fn infallible_to_box_error(value: Infallible) -> BoxError {
+    match value {}
+}
+
+fn json_response<T: serde::Serialize>(
+    status: StatusCode,
+    value: &T,
+) -> Result<Response<ResponseBody>, PlatformError> {
+    let body =
+        serde_json::to_vec(value).map_err(|error| PlatformError::internal(error.to_string()))?;
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full_body(body))
+        .map_err(|error| PlatformError::internal(error.to_string()))
+}
+
+async fn read_json_body<T, B>(body: B, max_bytes: usize) -> Result<T, PlatformError>
+where
+    T: serde::de::DeserializeOwned,
+    B: HttpBody<Data = Bytes> + Send,
+    B::Error: std::fmt::Display,
+{
+    let collected = body.collect().await.map_err(|error| {
+        PlatformError::bad_request(format!("failed to read request body: {error}"))
+    })?;
+    let bytes = collected.to_bytes();
+    if bytes.len() > max_bytes {
+        return Err(PlatformError::bad_request(format!(
+            "request body too large (max {max_bytes} bytes)"
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| PlatformError::bad_request(format!("invalid json: {error}")))
+}
+
+pub struct PreparedWebSocketUpgrade {
+    on_upgrade: OnUpgrade,
+    handshake_request: Request<()>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_worker, invoke_worker_private, invoke_worker_public, parse_invoke_request_uri,
-        parse_worker_from_host, validate_deploy_bindings, validate_internal_config,
+        deploy_worker, handle_private_request, handle_public_request, invoke_worker_private,
+        invoke_worker_public, parse_invoke_request_uri, parse_worker_from_host,
+        validate_deploy_bindings, validate_internal_config,
     };
-    use crate::app::{private_router, public_router};
     use crate::state::AppState;
-    use axum::body::{to_bytes, Body};
-    use axum::extract::State;
-    use axum::http::{HeaderMap, Request, StatusCode};
-    use axum::Json;
+    use bytes::Bytes;
     use common::{
         DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployTraceDestination,
         ErrorKind,
     };
+    use http::{HeaderMap, Request, StatusCode};
+    use http_body_util::{BodyExt, Empty};
     use runtime::{RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
     use std::path::PathBuf;
-    use tower::ServiceExt;
     use uuid::Uuid;
 
     async fn create_test_state(public_base_domain: &str) -> AppState {
@@ -1062,12 +1469,18 @@ mod tests {
         })
         .await
         .expect("runtime");
-        AppState::new(runtime, 1024 * 1024, public_base_domain.to_string())
+        AppState::new(
+            runtime,
+            1024 * 1024,
+            public_base_domain.to_string(),
+            None,
+            None,
+        )
     }
 
     #[test]
     fn parse_invoke_path_and_query() {
-        let uri: axum::http::Uri = "/v1/invoke/hello/api/v1?x=1&y=2".parse().expect("uri");
+        let uri: http::Uri = "/v1/invoke/hello/api/v1?x=1&y=2".parse().expect("uri");
         let (worker, url) = parse_invoke_request_uri(uri.path(), uri.path_and_query()).expect("ok");
         assert_eq!(worker, "hello");
         assert_eq!(url, "http://worker/api/v1?x=1&y=2");
@@ -1075,7 +1488,7 @@ mod tests {
 
     #[test]
     fn parse_invoke_root_path() {
-        let uri: axum::http::Uri = "/v1/invoke/hello".parse().expect("uri");
+        let uri: http::Uri = "/v1/invoke/hello".parse().expect("uri");
         let (worker, url) = parse_invoke_request_uri(uri.path(), uri.path_and_query()).expect("ok");
         assert_eq!(worker, "hello");
         assert_eq!(url, "http://worker/");
@@ -1114,6 +1527,19 @@ mod tests {
             binding: "MY_ACTOR".to_string(),
             class: String::new(),
         }];
+        assert!(validate_deploy_bindings(&bindings).is_err());
+    }
+
+    #[test]
+    fn dynamic_binding_name_collision_is_rejected() {
+        let bindings = vec![
+            DeployBinding::Kv {
+                binding: "SHARED".to_string(),
+            },
+            DeployBinding::Dynamic {
+                binding: "SHARED".to_string(),
+            },
+        ];
         assert!(validate_deploy_bindings(&bindings).is_err());
     }
 
@@ -1199,12 +1625,12 @@ mod tests {
             .method("POST")
             .uri("/v1/deploy")
             .header("host", "echo.example.com")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .expect("request");
-        let error = invoke_worker_public(State(state), None, request)
+        let response = invoke_worker_public(state, request, None)
             .await
-            .expect_err("public deploy path should be blocked");
-        assert_eq!(error.0.kind(), ErrorKind::NotFound);
+            .expect_err("blocked");
+        assert_eq!(response.0.kind(), ErrorKind::NotFound);
     }
 
     #[tokio::test]
@@ -1220,24 +1646,23 @@ mod tests {
                 ..Default::default()
             },
         };
-        let response = match deploy_worker(State(state.clone()), Json(deploy)).await {
-            Ok(value) => value,
-            Err(_) => panic!("deploy should succeed"),
-        };
-        assert!(response.0.ok);
+        let response = deploy_worker(state.clone(), deploy).await.expect("deploy");
+        assert!(response.ok);
 
         let request = Request::builder()
             .method("GET")
             .uri("/v1/invoke/echo")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .expect("request");
-        let response = match invoke_worker_private(State(state), None, request).await {
-            Ok(value) => value,
-            Err(_) => panic!("invoke should succeed"),
-        };
-        let body = to_bytes(response.into_body(), usize::MAX)
+        let response = invoke_worker_private(state, request, None)
             .await
-            .expect("body");
+            .expect("invoke");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         assert_eq!(body.as_ref(), b"ok");
     }
 
@@ -1263,15 +1688,17 @@ mod tests {
             .method("GET")
             .uri("/")
             .header("host", "echo.example.com")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .expect("request");
-        let response = match invoke_worker_public(State(state), None, request).await {
-            Ok(value) => value,
-            Err(_) => panic!("invoke should succeed"),
-        };
-        let body = to_bytes(response.into_body(), usize::MAX)
+        let response = invoke_worker_public(state, request, None)
             .await
-            .expect("body");
+            .expect("invoke");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         assert_eq!(body.as_ref(), b"host-ok");
     }
 
@@ -1298,9 +1725,9 @@ mod tests {
             .method("GET")
             .uri("/")
             .header("host", "private-worker.example.com")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .expect("request");
-        let error = invoke_worker_public(State(state), None, request)
+        let error = invoke_worker_public(state, request, None)
             .await
             .expect_err("private worker should not be public");
         assert_eq!(error.0.kind(), ErrorKind::NotFound);
@@ -1337,7 +1764,6 @@ mod tests {
             .await
             .expect("deploy");
 
-        let app = private_router(state.clone());
         let request = Request::builder()
             .method("GET")
             .uri("/v1/invoke/echo")
@@ -1345,10 +1771,10 @@ mod tests {
             .header("connection", "Upgrade")
             .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .header("sec-websocket-version", "13")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .expect("request");
 
-        let response = app.oneshot(request).await.expect("request").status();
+        let response = handle_private_request(state, request).await.status();
         assert_eq!(response, StatusCode::BAD_REQUEST);
     }
 
@@ -1370,7 +1796,6 @@ mod tests {
             .await
             .expect("deploy");
 
-        let app = public_router(state.clone());
         let request = Request::builder()
             .method("GET")
             .uri("/")
@@ -1379,10 +1804,10 @@ mod tests {
             .header("connection", "Upgrade")
             .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .header("sec-websocket-version", "13")
-            .body(Body::empty())
+            .body(Empty::<Bytes>::new())
             .expect("request");
 
-        let response = app.oneshot(request).await.expect("request").status();
+        let response = handle_public_request(state, request).await.status();
         assert_eq!(response, StatusCode::BAD_REQUEST);
     }
 }

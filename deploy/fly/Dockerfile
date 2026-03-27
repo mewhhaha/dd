@@ -5,6 +5,7 @@ RUN apt-get update \
     ca-certificates \
     capnproto \
     curl \
+    libssl-dev \
     pkg-config \
   && rm -rf /var/lib/apt/lists/*
 

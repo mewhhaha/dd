@@ -6,23 +6,23 @@ use crate::actor_rpc::{
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvStore};
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes128Gcm, Aes192Gcm, Aes256Gcm, KeyInit, Nonce};
-use common::{PlatformError, Result};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
+use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
 use deno_core::OpState;
-use getrandom::fill as fill_random_bytes;
+use deno_permissions::{PermissionsContainer, RuntimePermissionDescriptorParser};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sys_traits::impls::RealSys;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct IsolateEventSender(pub tokio::sync::mpsc::UnboundedSender<IsolateEventPayload>);
@@ -38,6 +38,19 @@ pub enum IsolateEventPayload {
     ActorSocketClose(ActorSocketCloseEvent),
     ActorSocketList(ActorSocketListEvent),
     ActorSocketConsumeClose(ActorSocketConsumeCloseEvent),
+    ActorTransportSendStream(ActorTransportSendStreamEvent),
+    ActorTransportSendDatagram(ActorTransportSendDatagramEvent),
+    ActorTransportRecvStream(ActorTransportRecvStreamEvent),
+    ActorTransportRecvDatagram(ActorTransportRecvDatagramEvent),
+    ActorTransportClose(ActorTransportCloseEvent),
+    ActorTransportList(ActorTransportListEvent),
+    ActorTransportConsumeClose(ActorTransportConsumeCloseEvent),
+    DynamicWorkerCreate(DynamicWorkerCreateEvent),
+    DynamicWorkerLookup(DynamicWorkerLookupEvent),
+    DynamicWorkerList(DynamicWorkerListEvent),
+    DynamicWorkerDelete(DynamicWorkerDeleteEvent),
+    DynamicWorkerInvoke(DynamicWorkerInvokeEvent),
+    DynamicHostRpcInvoke(DynamicHostRpcInvokeEvent),
 }
 
 pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
@@ -85,6 +98,139 @@ pub struct ActorSocketConsumeCloseEvent {
     pub handle: String,
 }
 
+pub struct ActorTransportSendStreamEvent {
+    pub reply: oneshot::Sender<Result<()>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+    pub chunk: Vec<u8>,
+}
+
+pub struct ActorTransportSendDatagramEvent {
+    pub reply: oneshot::Sender<Result<()>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+    pub datagram: Vec<u8>,
+}
+
+pub struct ActorTransportRecvStreamEvent {
+    pub reply: oneshot::Sender<Result<TransportRecvEvent>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+}
+
+pub struct ActorTransportRecvDatagramEvent {
+    pub reply: oneshot::Sender<Result<TransportRecvEvent>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+}
+
+pub struct ActorTransportCloseEvent {
+    pub reply: oneshot::Sender<Result<()>>,
+    pub handle: String,
+    pub binding: String,
+    pub key: String,
+    pub code: u16,
+    pub reason: String,
+}
+
+pub struct ActorTransportListEvent {
+    pub reply: oneshot::Sender<Result<Vec<String>>>,
+    pub binding: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActorTransportCloseReplayEvent {
+    pub code: u16,
+    pub reason: String,
+}
+
+pub struct ActorTransportConsumeCloseEvent {
+    pub reply: oneshot::Sender<Result<Vec<ActorTransportCloseReplayEvent>>>,
+    pub binding: String,
+    pub key: String,
+    pub handle: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransportRecvEvent {
+    pub done: bool,
+    pub chunk: Vec<u8>,
+}
+
+pub struct DynamicWorkerCreateEvent {
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub owner_isolate_id: u64,
+    pub binding: String,
+    pub id: String,
+    pub source: String,
+    pub env: HashMap<String, String>,
+    pub timeout: u64,
+    pub host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
+    pub reply: oneshot::Sender<Result<DynamicWorkerCreateReply>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicWorkerCreateReply {
+    pub handle: String,
+    pub worker_name: String,
+    pub timeout: u64,
+}
+
+pub struct DynamicWorkerLookupEvent {
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub binding: String,
+    pub id: String,
+    pub reply: oneshot::Sender<Result<Option<DynamicWorkerCreateReply>>>,
+}
+
+pub struct DynamicWorkerListEvent {
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub binding: String,
+    pub reply: oneshot::Sender<Result<Vec<String>>>,
+}
+
+pub struct DynamicWorkerDeleteEvent {
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub binding: String,
+    pub id: String,
+    pub reply: oneshot::Sender<Result<bool>>,
+}
+
+pub struct DynamicWorkerInvokeEvent {
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub binding: String,
+    pub handle: String,
+    pub request: WorkerInvocation,
+    pub reply: oneshot::Sender<Result<WorkerOutput>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicHostRpcBindingSpec {
+    pub binding: String,
+    pub target_id: String,
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+pub struct DynamicHostRpcInvokeEvent {
+    pub caller_worker: String,
+    pub caller_generation: u64,
+    pub binding: String,
+    pub method_name: String,
+    pub args: Vec<u8>,
+    pub reply: oneshot::Sender<Result<Vec<u8>>>,
+}
+
 #[derive(Default)]
 pub struct ActorRequestScopes {
     scopes: HashMap<String, ActorRequestScope>,
@@ -94,6 +240,23 @@ pub struct ActorRequestScopes {
 struct ActorRequestScope {
     namespace: String,
     actor_key: String,
+}
+
+#[derive(Default)]
+pub struct RequestSecretContexts {
+    contexts: HashMap<String, RequestSecretContext>,
+}
+
+struct RequestSecretContext {
+    worker_name: String,
+    generation: u64,
+    isolate_id: u64,
+    dynamic_bindings: HashSet<String>,
+    dynamic_rpc_bindings: HashSet<String>,
+    replacements: HashMap<String, String>,
+    egress_allow_hosts: Vec<String>,
+    canceled: Arc<AtomicBool>,
+    canceled_notify: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -225,6 +388,137 @@ struct CacheDeleteResult {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct HttpFetchPayload {
+    request_id: String,
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpPrepareResult {
+    ok: bool,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicWorkerCreatePayload {
+    request_id: String,
+    binding: String,
+    id: String,
+    source: String,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default = "default_dynamic_worker_timeout")]
+    timeout: u64,
+    #[serde(default)]
+    host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicWorkerCreateResult {
+    ok: bool,
+    handle: String,
+    worker: String,
+    timeout: u64,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicWorkerLookupPayload {
+    request_id: String,
+    binding: String,
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicWorkerLookupResult {
+    ok: bool,
+    found: bool,
+    handle: String,
+    worker: String,
+    timeout: u64,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicWorkerListPayload {
+    request_id: String,
+    binding: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicWorkerListResult {
+    ok: bool,
+    ids: Vec<String>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicWorkerDeletePayload {
+    request_id: String,
+    binding: String,
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicWorkerDeleteResult {
+    ok: bool,
+    deleted: bool,
+    error: String,
+}
+
+fn default_dynamic_worker_timeout() -> u64 {
+    5_000
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicWorkerInvokePayload {
+    request_id: String,
+    subrequest_id: String,
+    binding: String,
+    handle: String,
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicWorkerInvokeResult {
+    ok: bool,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicHostRpcInvokePayload {
+    request_id: String,
+    binding: String,
+    method_name: String,
+    #[serde(default)]
+    args: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicHostRpcInvokeResult {
+    ok: bool,
+    value: Vec<u8>,
+    error: String,
+}
+
 #[derive(Debug, Serialize)]
 struct RequestBodyReadResult {
     ok: bool,
@@ -346,6 +640,85 @@ struct ActorSocketCloseResult {
 }
 
 #[derive(Debug, Deserialize)]
+struct ActorTransportSendStreamPayload {
+    request_id: String,
+    handle: String,
+    chunk: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorTransportSendDatagramPayload {
+    request_id: String,
+    handle: String,
+    datagram: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorTransportRecvPayload {
+    request_id: String,
+    handle: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorTransportSendResult {
+    ok: bool,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorTransportRecvResult {
+    ok: bool,
+    done: bool,
+    chunk: Vec<u8>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorTransportClosePayload {
+    request_id: String,
+    handle: String,
+    code: u16,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorTransportListPayload {
+    request_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorTransportListResult {
+    ok: bool,
+    handles: Vec<String>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorTransportConsumeClosePayload {
+    request_id: String,
+    handle: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorTransportReplayClose {
+    code: u16,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorTransportConsumeCloseResult {
+    ok: bool,
+    events: Vec<ActorTransportReplayClose>,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorTransportCloseResult {
+    ok: bool,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ActorStateGetValuePayload {
     request_id: String,
     key: String,
@@ -453,13 +826,6 @@ struct CryptoBoolResult {
     error: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CryptoRandomValuesResult {
-    ok: bool,
-    bytes: Vec<u8>,
-    error: String,
-}
-
 enum CryptoDigestAlgorithm {
     Sha1,
     Sha256,
@@ -488,40 +854,6 @@ async fn op_time_boundary_now() -> TimeBoundary {
         .as_secs_f64()
         * 1000.0;
     TimeBoundary { now_ms, perf_ms }
-}
-
-#[deno_core::op2]
-#[string]
-fn op_crypto_random_uuid() -> String {
-    Uuid::new_v4().to_string()
-}
-
-#[deno_core::op2]
-#[serde]
-fn op_crypto_get_random_values(len: u32) -> CryptoRandomValuesResult {
-    const MAX_BYTES: usize = 1 << 20;
-    let len = len as usize;
-    if len > MAX_BYTES {
-        return CryptoRandomValuesResult {
-            ok: false,
-            bytes: Vec::new(),
-            error: format!("random byte request too large (max {MAX_BYTES})"),
-        };
-    }
-
-    let mut bytes = vec![0_u8; len];
-    match fill_random_bytes(&mut bytes) {
-        Ok(()) => CryptoRandomValuesResult {
-            ok: true,
-            bytes,
-            error: String::new(),
-        },
-        Err(error) => CryptoRandomValuesResult {
-            ok: false,
-            bytes: Vec::new(),
-            error: format!("random bytes failed: {error}"),
-        },
-    }
 }
 
 #[deno_core::op2]
@@ -1045,6 +1377,673 @@ async fn op_cache_delete(
             ok: false,
             deleted: false,
             error: error.to_string(),
+        },
+    }
+}
+
+fn prepare_http_fetch_request(
+    state: &Rc<RefCell<OpState>>,
+    payload: HttpFetchPayload,
+) -> std::result::Result<
+    (
+        reqwest::Method,
+        reqwest::Url,
+        Vec<(String, String)>,
+        Vec<u8>,
+        Arc<AtomicBool>,
+        Arc<Notify>,
+    ),
+    String,
+> {
+    if payload.request_id.trim().is_empty() {
+        return Err("host fetch request_id must not be empty".to_string());
+    }
+
+    let context = {
+        let state_ref = state.borrow();
+        state_ref
+            .borrow::<RequestSecretContexts>()
+            .contexts
+            .get(payload.request_id.trim())
+            .map(|context| {
+                (
+                    context.replacements.clone(),
+                    context.egress_allow_hosts.clone(),
+                    context.canceled.clone(),
+                    context.canceled_notify.clone(),
+                )
+            })
+    };
+    let Some((replacements, egress_allow_hosts, canceled, canceled_notify)) = context else {
+        return Err("host fetch context is unavailable (request likely canceled)".to_string());
+    };
+    if canceled.load(Ordering::SeqCst) {
+        canceled_notify.notify_waiters();
+        return Err("host fetch request canceled".to_string());
+    }
+
+    let method_raw = replace_placeholders_text(&payload.method, &replacements);
+    let method = reqwest::Method::from_bytes(method_raw.trim().to_ascii_uppercase().as_bytes())
+        .map_err(|error| format!("invalid host fetch method: {error}"))?;
+
+    let url = replace_placeholders_text(&payload.url, &replacements);
+    let parsed_url =
+        reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
+    let host = parsed_url
+        .host_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !is_egress_host_allowed(&host, &egress_allow_hosts) {
+        return Err(format!("egress host is not allowed: {host}"));
+    }
+
+    let headers = payload
+        .headers
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let normalized_name = replace_placeholders_text(&name, &replacements);
+            let normalized_value = replace_placeholders_text(&value, &replacements);
+            let trimmed = normalized_name.trim().to_string();
+            if trimmed.eq_ignore_ascii_case("host")
+                || trimmed.eq_ignore_ascii_case("content-length")
+            {
+                return None;
+            }
+            Some((trimmed, normalized_value))
+        })
+        .collect::<Vec<_>>();
+    let body = replace_placeholders_in_body(payload.body, &replacements);
+
+    Ok((method, parsed_url, headers, body, canceled, canceled_notify))
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_http_prepare(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> HttpPrepareResult {
+    let payload: HttpFetchPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return HttpPrepareResult {
+                ok: false,
+                method: String::new(),
+                url: String::new(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                error: format!("invalid host fetch payload: {error}"),
+            };
+        }
+    };
+
+    match prepare_http_fetch_request(&state, payload) {
+        Ok((method, url, headers, body, _, _)) => HttpPrepareResult {
+            ok: true,
+            method: method.as_str().to_string(),
+            url: url.to_string(),
+            headers,
+            body,
+            error: String::new(),
+        },
+        Err(error) => HttpPrepareResult {
+            ok: false,
+            method: String::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            error,
+        },
+    }
+}
+
+fn dynamic_worker_owner_for_request(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+    binding: &str,
+) -> Result<(String, u64, u64)> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(PlatformError::bad_request(
+            "dynamic worker request_id must not be empty",
+        ));
+    }
+    let binding = binding.trim();
+    if binding.is_empty() {
+        return Err(PlatformError::bad_request(
+            "dynamic worker binding must not be empty",
+        ));
+    }
+    let (worker_name, generation, isolate_id) = {
+        let op_state = state.borrow();
+        let contexts = op_state.borrow::<RequestSecretContexts>();
+        let context = contexts
+            .contexts
+            .get(request_id)
+            .ok_or_else(|| PlatformError::runtime("dynamic worker request scope is unavailable"))?;
+        if !context.dynamic_bindings.contains(binding) {
+            return Err(PlatformError::runtime(format!(
+                "dynamic worker binding is not allowed: {binding}"
+            )));
+        }
+        (
+            context.worker_name.clone(),
+            context.generation,
+            context.isolate_id,
+        )
+    };
+    Ok((worker_name, generation, isolate_id))
+}
+
+fn dynamic_host_rpc_owner_for_request(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+    binding: &str,
+) -> Result<(String, u64)> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(PlatformError::bad_request(
+            "dynamic host rpc request_id must not be empty",
+        ));
+    }
+    let binding = binding.trim();
+    if binding.is_empty() {
+        return Err(PlatformError::bad_request(
+            "dynamic host rpc binding must not be empty",
+        ));
+    }
+    let (worker_name, generation) = {
+        let op_state = state.borrow();
+        let contexts = op_state.borrow::<RequestSecretContexts>();
+        let context = contexts.contexts.get(request_id).ok_or_else(|| {
+            PlatformError::runtime("dynamic host rpc request scope is unavailable")
+        })?;
+        if !context.dynamic_rpc_bindings.contains(binding) {
+            return Err(PlatformError::runtime(format!(
+                "dynamic host rpc binding is not allowed: {binding}"
+            )));
+        }
+        (context.worker_name.clone(), context.generation)
+    };
+    Ok((worker_name, generation))
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_worker_create(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicWorkerCreatePayload,
+) -> DynamicWorkerCreateResult {
+    let id = payload.id.trim();
+    if id.is_empty() {
+        return DynamicWorkerCreateResult {
+            ok: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker id must not be empty".to_string(),
+        };
+    }
+    if payload.source.trim().is_empty() {
+        return DynamicWorkerCreateResult {
+            ok: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker source must not be empty".to_string(),
+        };
+    }
+    if payload.timeout == 0 {
+        return DynamicWorkerCreateResult {
+            ok: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker timeout must be greater than 0".to_string(),
+        };
+    }
+    let (owner_worker, owner_generation, owner_isolate_id) =
+        match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return DynamicWorkerCreateResult {
+                    ok: false,
+                    handle: String::new(),
+                    worker: String::new(),
+                    timeout: 0,
+                    error: error.to_string(),
+                };
+            }
+        };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::DynamicWorkerCreate(
+            DynamicWorkerCreateEvent {
+                owner_worker,
+                owner_generation,
+                owner_isolate_id,
+                binding: payload.binding,
+                id: id.to_string(),
+                source: payload.source,
+                env: payload.env,
+                timeout: payload.timeout,
+                host_rpc_bindings: payload.host_rpc_bindings,
+                reply: reply_tx,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicWorkerCreateResult {
+            ok: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(created)) => DynamicWorkerCreateResult {
+            ok: true,
+            handle: created.handle,
+            worker: created.worker_name,
+            timeout: created.timeout,
+            error: String::new(),
+        },
+        Ok(Err(error)) => DynamicWorkerCreateResult {
+            ok: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: error.to_string(),
+        },
+        Err(_) => DynamicWorkerCreateResult {
+            ok: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker create response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_worker_lookup(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicWorkerLookupPayload,
+) -> DynamicWorkerLookupResult {
+    let id = payload.id.trim();
+    if id.is_empty() {
+        return DynamicWorkerLookupResult {
+            ok: false,
+            found: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker id must not be empty".to_string(),
+        };
+    }
+    let (owner_worker, owner_generation, _) =
+        match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return DynamicWorkerLookupResult {
+                    ok: false,
+                    found: false,
+                    handle: String::new(),
+                    worker: String::new(),
+                    timeout: 0,
+                    error: error.to_string(),
+                };
+            }
+        };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::DynamicWorkerLookup(
+            DynamicWorkerLookupEvent {
+                owner_worker,
+                owner_generation,
+                binding: payload.binding,
+                id: id.to_string(),
+                reply: reply_tx,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicWorkerLookupResult {
+            ok: false,
+            found: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(Some(found))) => DynamicWorkerLookupResult {
+            ok: true,
+            found: true,
+            handle: found.handle,
+            worker: found.worker_name,
+            timeout: found.timeout,
+            error: String::new(),
+        },
+        Ok(Ok(None)) => DynamicWorkerLookupResult {
+            ok: true,
+            found: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: String::new(),
+        },
+        Ok(Err(error)) => DynamicWorkerLookupResult {
+            ok: false,
+            found: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: error.to_string(),
+        },
+        Err(_) => DynamicWorkerLookupResult {
+            ok: false,
+            found: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            error: "dynamic worker lookup response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_worker_list(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicWorkerListPayload,
+) -> DynamicWorkerListResult {
+    let (owner_worker, owner_generation, _) =
+        match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return DynamicWorkerListResult {
+                    ok: false,
+                    ids: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::DynamicWorkerList(
+            DynamicWorkerListEvent {
+                owner_worker,
+                owner_generation,
+                binding: payload.binding,
+                reply: reply_tx,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicWorkerListResult {
+            ok: false,
+            ids: Vec::new(),
+            error: "dynamic worker runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(ids)) => DynamicWorkerListResult {
+            ok: true,
+            ids,
+            error: String::new(),
+        },
+        Ok(Err(error)) => DynamicWorkerListResult {
+            ok: false,
+            ids: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => DynamicWorkerListResult {
+            ok: false,
+            ids: Vec::new(),
+            error: "dynamic worker list response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_worker_delete(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicWorkerDeletePayload,
+) -> DynamicWorkerDeleteResult {
+    let id = payload.id.trim();
+    if id.is_empty() {
+        return DynamicWorkerDeleteResult {
+            ok: false,
+            deleted: false,
+            error: "dynamic worker id must not be empty".to_string(),
+        };
+    }
+    let (owner_worker, owner_generation, _) =
+        match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return DynamicWorkerDeleteResult {
+                    ok: false,
+                    deleted: false,
+                    error: error.to_string(),
+                };
+            }
+        };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::DynamicWorkerDelete(
+            DynamicWorkerDeleteEvent {
+                owner_worker,
+                owner_generation,
+                binding: payload.binding,
+                id: id.to_string(),
+                reply: reply_tx,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicWorkerDeleteResult {
+            ok: false,
+            deleted: false,
+            error: "dynamic worker runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(deleted)) => DynamicWorkerDeleteResult {
+            ok: true,
+            deleted,
+            error: String::new(),
+        },
+        Ok(Err(error)) => DynamicWorkerDeleteResult {
+            ok: false,
+            deleted: false,
+            error: error.to_string(),
+        },
+        Err(_) => DynamicWorkerDeleteResult {
+            ok: false,
+            deleted: false,
+            error: "dynamic worker delete response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_worker_invoke(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicWorkerInvokePayload,
+) -> DynamicWorkerInvokeResult {
+    if payload.subrequest_id.trim().is_empty() {
+        return DynamicWorkerInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "dynamic worker subrequest_id must not be empty".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return DynamicWorkerInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "dynamic worker handle must not be empty".to_string(),
+        };
+    }
+    let (owner_worker, owner_generation, _) =
+        match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return DynamicWorkerInvokeResult {
+                    ok: false,
+                    status: 500,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
+
+    let request = WorkerInvocation {
+        method: payload.method,
+        url: payload.url,
+        headers: payload.headers,
+        body: payload.body,
+        request_id: payload.subrequest_id,
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::DynamicWorkerInvoke(
+            DynamicWorkerInvokeEvent {
+                owner_worker,
+                owner_generation,
+                binding: payload.binding,
+                handle: payload.handle,
+                request,
+                reply: reply_tx,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicWorkerInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "dynamic worker runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(output)) => DynamicWorkerInvokeResult {
+            ok: true,
+            status: output.status,
+            headers: output.headers,
+            body: output.body,
+            error: String::new(),
+        },
+        Ok(Err(error)) => DynamicWorkerInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => DynamicWorkerInvokeResult {
+            ok: false,
+            status: 500,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error: "dynamic worker invoke response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_host_rpc_invoke(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicHostRpcInvokePayload,
+) -> DynamicHostRpcInvokeResult {
+    let method_name = payload.method_name.trim();
+    if method_name.is_empty() {
+        return DynamicHostRpcInvokeResult {
+            ok: false,
+            value: Vec::new(),
+            error: "dynamic host rpc method_name must not be empty".to_string(),
+        };
+    }
+    let (caller_worker, caller_generation) =
+        match dynamic_host_rpc_owner_for_request(&state, &payload.request_id, &payload.binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return DynamicHostRpcInvokeResult {
+                    ok: false,
+                    value: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::DynamicHostRpcInvoke(
+            DynamicHostRpcInvokeEvent {
+                caller_worker,
+                caller_generation,
+                binding: payload.binding,
+                method_name: method_name.to_string(),
+                args: payload.args,
+                reply: reply_tx,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicHostRpcInvokeResult {
+            ok: false,
+            value: Vec::new(),
+            error: "dynamic host rpc runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(value)) => DynamicHostRpcInvokeResult {
+            ok: true,
+            value,
+            error: String::new(),
+        },
+        Ok(Err(error)) => DynamicHostRpcInvokeResult {
+            ok: false,
+            value: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => DynamicHostRpcInvokeResult {
+            ok: false,
+            value: Vec::new(),
+            error: "dynamic host rpc invoke response channel closed".to_string(),
         },
     }
 }
@@ -1859,6 +2858,505 @@ async fn op_actor_socket_consume_close(
     }
 }
 
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_send_stream(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportSendStreamPayload,
+) -> ActorTransportSendResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendStream requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendStream requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportSendResult {
+                ok: false,
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportSendStream(
+            ActorTransportSendStreamEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+                chunk: payload.chunk,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendStream runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => ActorTransportSendResult {
+            ok: true,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportSendResult {
+            ok: false,
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendStream response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_send_datagram(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportSendDatagramPayload,
+) -> ActorTransportSendResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendDatagram requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendDatagram requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportSendResult {
+                ok: false,
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportSendDatagram(
+            ActorTransportSendDatagramEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+                datagram: payload.datagram,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendDatagram runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => ActorTransportSendResult {
+            ok: true,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportSendResult {
+            ok: false,
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportSendResult {
+            ok: false,
+            error: "actor transport sendDatagram response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_recv_stream(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportRecvPayload,
+) -> ActorTransportRecvResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvStream requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvStream requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportRecvResult {
+                ok: false,
+                done: true,
+                chunk: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportRecvStream(
+            ActorTransportRecvStreamEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvStream runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(event)) => ActorTransportRecvResult {
+            ok: true,
+            done: event.done,
+            chunk: event.chunk,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvStream response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_recv_datagram(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportRecvPayload,
+) -> ActorTransportRecvResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvDatagram requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvDatagram requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportRecvResult {
+                ok: false,
+                done: true,
+                chunk: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportRecvDatagram(
+            ActorTransportRecvDatagramEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvDatagram runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(event)) => ActorTransportRecvResult {
+            ok: true,
+            done: event.done,
+            chunk: event.chunk,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportRecvResult {
+            ok: false,
+            done: true,
+            chunk: Vec::new(),
+            error: "actor transport recvDatagram response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_close(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportClosePayload,
+) -> ActorTransportCloseResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportCloseResult {
+            ok: false,
+            error: "actor transport close requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorTransportCloseResult {
+            ok: false,
+            error: "actor transport close requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportCloseResult {
+                ok: false,
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportClose(
+            ActorTransportCloseEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+                code: payload.code,
+                reason: payload.reason,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportCloseResult {
+            ok: false,
+            error: "actor transport close runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => ActorTransportCloseResult {
+            ok: true,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportCloseResult {
+            ok: false,
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportCloseResult {
+            ok: false,
+            error: "actor transport close response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_list(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportListPayload,
+) -> ActorTransportListResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: "actor transport list requires request_id".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportListResult {
+                ok: false,
+                handles: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportList(
+            ActorTransportListEvent {
+                reply: reply_tx,
+                binding,
+                key,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: "actor transport list runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(handles)) => ActorTransportListResult {
+            ok: true,
+            handles,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportListResult {
+            ok: false,
+            handles: Vec::new(),
+            error: "actor transport list response channel closed".to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_transport_consume_close(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorTransportConsumeClosePayload,
+) -> ActorTransportConsumeCloseResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorTransportConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor transport consumeClose requires request_id".to_string(),
+        };
+    }
+    if payload.handle.trim().is_empty() {
+        return ActorTransportConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor transport consumeClose requires handle".to_string(),
+        };
+    }
+
+    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return ActorTransportConsumeCloseResult {
+                ok: false,
+                events: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::ActorTransportConsumeClose(
+            ActorTransportConsumeCloseEvent {
+                reply: reply_tx,
+                binding,
+                key,
+                handle: payload.handle,
+            },
+        ))
+        .is_err()
+    {
+        return ActorTransportConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor transport consumeClose runtime is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(events)) => ActorTransportConsumeCloseResult {
+            ok: true,
+            events: events
+                .into_iter()
+                .map(|event| ActorTransportReplayClose {
+                    code: event.code,
+                    reason: event.reason,
+                })
+                .collect(),
+            error: String::new(),
+        },
+        Ok(Err(error)) => ActorTransportConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: error.to_string(),
+        },
+        Err(_) => ActorTransportConsumeCloseResult {
+            ok: false,
+            events: Vec::new(),
+            error: "actor transport consumeClose response channel closed".to_string(),
+        },
+    }
+}
+
 #[deno_core::op2(fast)]
 fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
     if let Some(meta) = completion_meta(&payload) {
@@ -1866,6 +3364,7 @@ fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
         clear_request_body_stream(state, &request_id);
         if meta.wait_until_count == 0 {
             clear_actor_request_scope(state, &request_id);
+            clear_request_secret_context(state, &request_id);
         }
     }
     let sender = state.borrow::<IsolateEventSender>().clone();
@@ -1876,6 +3375,7 @@ fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
 fn op_emit_wait_until_done(state: &mut OpState, #[string] payload: String) {
     if let Some(request_id) = wait_until_request_id(&payload) {
         clear_actor_request_scope(state, &request_id);
+        clear_request_secret_context(state, &request_id);
     }
     let sender = state.borrow::<IsolateEventSender>().clone();
     let _ = sender.0.send(IsolateEventPayload::WaitUntilDone(payload));
@@ -1904,8 +3404,6 @@ deno_core::extension!(
     ops = [
         op_sleep,
         op_time_boundary_now,
-        op_crypto_random_uuid,
-        op_crypto_get_random_values,
         op_crypto_digest,
         op_crypto_hmac_sign,
         op_crypto_hmac_verify,
@@ -1920,6 +3418,13 @@ deno_core::extension!(
         op_cache_match,
         op_cache_put,
         op_cache_delete,
+        op_http_prepare,
+        op_dynamic_worker_create,
+        op_dynamic_worker_lookup,
+        op_dynamic_worker_list,
+        op_dynamic_worker_delete,
+        op_dynamic_worker_invoke,
+        op_dynamic_host_rpc_invoke,
         op_request_body_read,
         op_request_body_cancel,
         op_actor_invoke_fetch,
@@ -1933,12 +3438,23 @@ deno_core::extension!(
         op_actor_socket_close,
         op_actor_socket_list,
         op_actor_socket_consume_close,
+        op_actor_transport_send_stream,
+        op_actor_transport_send_datagram,
+        op_actor_transport_recv_stream,
+        op_actor_transport_recv_datagram,
+        op_actor_transport_close,
+        op_actor_transport_list,
+        op_actor_transport_consume_close,
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,
         op_emit_response_chunk,
         op_emit_cache_revalidate
-    ]
+    ],
+    state = |state| {
+        let parser = Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
+        state.put(PermissionsContainer::allow_all(parser));
+    }
 );
 
 pub fn runtime_extension() -> deno_core::Extension {
@@ -1963,25 +3479,25 @@ fn compute_hmac(
 ) -> std::result::Result<Vec<u8>, String> {
     match algorithm {
         CryptoDigestAlgorithm::Sha1 => {
-            let mut mac = Hmac::<Sha1>::new_from_slice(key)
+            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.finalize().into_bytes().to_vec())
         }
         CryptoDigestAlgorithm::Sha256 => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key)
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.finalize().into_bytes().to_vec())
         }
         CryptoDigestAlgorithm::Sha384 => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(key)
+            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.finalize().into_bytes().to_vec())
         }
         CryptoDigestAlgorithm::Sha512 => {
-            let mut mac = Hmac::<Sha512>::new_from_slice(key)
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.finalize().into_bytes().to_vec())
@@ -1997,25 +3513,25 @@ fn verify_hmac(
 ) -> std::result::Result<bool, String> {
     match algorithm {
         CryptoDigestAlgorithm::Sha1 => {
-            let mut mac = Hmac::<Sha1>::new_from_slice(key)
+            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.verify_slice(signature).is_ok())
         }
         CryptoDigestAlgorithm::Sha256 => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key)
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.verify_slice(signature).is_ok())
         }
         CryptoDigestAlgorithm::Sha384 => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(key)
+            let mut mac = <Hmac<Sha384> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.verify_slice(signature).is_ok())
         }
         CryptoDigestAlgorithm::Sha512 => {
-            let mut mac = Hmac::<Sha512>::new_from_slice(key)
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key)
                 .map_err(|error| format!("hmac init failed: {error}"))?;
             mac.update(data);
             Ok(mac.verify_slice(signature).is_ok())
@@ -2046,19 +3562,6 @@ fn aes_gcm_encrypt(payload: &CryptoAesGcmPayload) -> std::result::Result<Vec<u8>
                 )
                 .map_err(|error| format!("AES-128-GCM encrypt failed: {error}"))
         }
-        24 => {
-            let cipher = Aes192Gcm::new_from_slice(&payload.key)
-                .map_err(|error| format!("AES-192-GCM key init failed: {error}"))?;
-            cipher
-                .encrypt(
-                    nonce,
-                    Payload {
-                        msg: &payload.data,
-                        aad: &payload.additional_data,
-                    },
-                )
-                .map_err(|error| format!("AES-192-GCM encrypt failed: {error}"))
-        }
         32 => {
             let cipher = Aes256Gcm::new_from_slice(&payload.key)
                 .map_err(|error| format!("AES-256-GCM key init failed: {error}"))?;
@@ -2072,7 +3575,7 @@ fn aes_gcm_encrypt(payload: &CryptoAesGcmPayload) -> std::result::Result<Vec<u8>
                 )
                 .map_err(|error| format!("AES-256-GCM encrypt failed: {error}"))
         }
-        _ => Err("AES-GCM key length must be 16, 24, or 32 bytes".to_string()),
+        _ => Err("AES-GCM key length must be 16 or 32 bytes".to_string()),
     }
 }
 
@@ -2099,19 +3602,6 @@ fn aes_gcm_decrypt(payload: &CryptoAesGcmPayload) -> std::result::Result<Vec<u8>
                 )
                 .map_err(|error| format!("AES-128-GCM decrypt failed: {error}"))
         }
-        24 => {
-            let cipher = Aes192Gcm::new_from_slice(&payload.key)
-                .map_err(|error| format!("AES-192-GCM key init failed: {error}"))?;
-            cipher
-                .decrypt(
-                    nonce,
-                    Payload {
-                        msg: &payload.data,
-                        aad: &payload.additional_data,
-                    },
-                )
-                .map_err(|error| format!("AES-192-GCM decrypt failed: {error}"))
-        }
         32 => {
             let cipher = Aes256Gcm::new_from_slice(&payload.key)
                 .map_err(|error| format!("AES-256-GCM key init failed: {error}"))?;
@@ -2125,8 +3615,52 @@ fn aes_gcm_decrypt(payload: &CryptoAesGcmPayload) -> std::result::Result<Vec<u8>
                 )
                 .map_err(|error| format!("AES-256-GCM decrypt failed: {error}"))
         }
-        _ => Err("AES-GCM key length must be 16, 24, or 32 bytes".to_string()),
+        _ => Err("AES-GCM key length must be 16 or 32 bytes".to_string()),
     }
+}
+
+fn replace_placeholders_text(value: &str, replacements: &HashMap<String, String>) -> String {
+    if replacements.is_empty() {
+        return value.to_string();
+    }
+    let mut output = value.to_string();
+    for (placeholder, secret) in replacements {
+        if placeholder.is_empty() {
+            continue;
+        }
+        output = output.replace(placeholder, secret);
+    }
+    output
+}
+
+fn replace_placeholders_in_body(body: Vec<u8>, replacements: &HashMap<String, String>) -> Vec<u8> {
+    if replacements.is_empty() || body.is_empty() {
+        return body;
+    }
+    match String::from_utf8(body) {
+        Ok(value) => replace_placeholders_text(&value, replacements).into_bytes(),
+        Err(error) => error.into_bytes(),
+    }
+}
+
+fn is_egress_host_allowed(host: &str, allow_hosts: &[String]) -> bool {
+    if allow_hosts.is_empty() {
+        return false;
+    }
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    allow_hosts.iter().any(|allowed| {
+        let allowed = allowed.trim().to_ascii_lowercase();
+        if allowed.is_empty() {
+            return false;
+        }
+        if let Some(suffix) = allowed.strip_prefix("*.") {
+            return host == suffix || host.ends_with(&format!(".{suffix}"));
+        }
+        host == allowed
+    })
 }
 
 pub fn register_request_body_stream(
@@ -2155,6 +3689,56 @@ pub fn register_actor_request_scope(
     );
 }
 
+pub fn register_request_secret_context(
+    state: &mut OpState,
+    request_id: String,
+    worker_name: String,
+    generation: u64,
+    isolate_id: u64,
+    dynamic_bindings: Vec<String>,
+    dynamic_rpc_bindings: Vec<String>,
+    replacements: Vec<(String, String)>,
+    egress_allow_hosts: Vec<String>,
+) {
+    let dynamic_bindings: HashSet<String> = dynamic_bindings
+        .into_iter()
+        .map(|binding| binding.trim().to_string())
+        .filter(|binding| !binding.is_empty())
+        .collect();
+    let dynamic_rpc_bindings: HashSet<String> = dynamic_rpc_bindings
+        .into_iter()
+        .map(|binding| binding.trim().to_string())
+        .filter(|binding| !binding.is_empty())
+        .collect();
+    let replacements = replacements
+        .into_iter()
+        .filter_map(|(placeholder, value)| {
+            let key = placeholder.trim().to_string();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key, value))
+        })
+        .collect();
+    if let Some(previous) = state.borrow_mut::<RequestSecretContexts>().contexts.insert(
+        request_id,
+        RequestSecretContext {
+            worker_name,
+            generation,
+            isolate_id,
+            dynamic_bindings,
+            dynamic_rpc_bindings,
+            replacements,
+            egress_allow_hosts,
+            canceled: Arc::new(AtomicBool::new(false)),
+            canceled_notify: Arc::new(Notify::new()),
+        },
+    ) {
+        previous.canceled.store(true, Ordering::SeqCst);
+        previous.canceled_notify.notify_waiters();
+    }
+}
+
 pub fn cancel_request_body_stream(state: &mut OpState, request_id: &str) {
     if let Some(stream) = state.borrow::<RequestBodyStreams>().streams.get(request_id) {
         stream.cancel();
@@ -2176,6 +3760,17 @@ pub fn clear_actor_request_scope(state: &mut OpState, request_id: &str) {
         .borrow_mut::<ActorRequestScopes>()
         .scopes
         .remove(request_id);
+}
+
+pub fn clear_request_secret_context(state: &mut OpState, request_id: &str) {
+    if let Some(context) = state
+        .borrow_mut::<RequestSecretContexts>()
+        .contexts
+        .remove(request_id)
+    {
+        context.canceled.store(true, Ordering::SeqCst);
+        context.canceled_notify.notify_waiters();
+    }
 }
 
 fn clear_request_body_stream_entry(state: &Rc<RefCell<OpState>>, request_id: &str) {

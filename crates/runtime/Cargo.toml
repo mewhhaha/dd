@@ -8,7 +8,8 @@ build = "build.rs"
 [dependencies]
 common = { path = "../common" }
 deno_core.workspace = true
-turso = "0.5.1"
+deno_error = "0.7"
+turso = "0.6.0-pre.9"
 capnp = "0.20"
 serde.workspace = true
 serde_json.workspace = true
@@ -18,11 +19,19 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 opentelemetry.workspace = true
 uuid.workspace = true
+reqwest.workspace = true
 getrandom = "0.3"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 aes-gcm = { version = "0.10", features = ["aes"] }
+deno_webidl = "0.241.0"
+deno_web = "0.272.0"
+deno_fetch = "0.265.0"
+deno_crypto = "0.255.0"
+deno_permissions = "0.100.0"
+rustls = "0.23.28"
+sys_traits = { version = "0.1.25", features = ["real", "libc"] }
 
 [dev-dependencies]
 serial_test = "3"

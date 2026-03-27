@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -109,6 +109,7 @@ fn default_trace_path() -> String {
 pub enum DeployBinding {
     Kv { binding: String },
     Actor { binding: String, class: String },
+    Dynamic { binding: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +117,23 @@ pub struct DeployResponse {
     pub ok: bool,
     pub worker: String,
     pub deployment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicDeployRequest {
+    pub source: String,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub egress_allow_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicDeployResponse {
+    pub ok: bool,
+    pub worker: String,
+    pub deployment_id: String,
+    pub env_placeholders: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -30,6 +30,20 @@ export default {
     const id = env.USER_ACTOR.idFromName(key);
     const actor = env.USER_ACTOR.get(id);
 
+    if (url.pathname === "/" && request.method === "GET") {
+      return json({
+        ok: true,
+        worker: "actor",
+        routes: [
+          "GET /ping?user={name}",
+          "POST /inc?user={name}",
+          "GET /value?user={name}",
+          "POST /profile?user={name}",
+          "GET /profile?user={name}",
+        ],
+      });
+    }
+
     if (url.pathname === "/inc" && request.method === "POST") {
       const value = await actor.increment(1);
       return json({ ok: true, user: key, value });

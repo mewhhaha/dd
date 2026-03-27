@@ -18,7 +18,11 @@ pub fn execute_worker_js(
     worker_name: &str,
     kv_bindings_json: &str,
     actor_bindings_json: &str,
+    dynamic_bindings_json: &str,
+    dynamic_rpc_bindings_json: &str,
+    dynamic_env_json: &str,
     actor_call_json: &str,
+    host_rpc_call_json: &str,
     request_id: &str,
     completion_token: &str,
     has_request_body_stream: bool,
@@ -28,7 +32,11 @@ pub fn execute_worker_js(
         .replace("__WORKER_NAME__", worker_name)
         .replace("__KV_BINDINGS_JSON__", kv_bindings_json)
         .replace("__ACTOR_BINDINGS_JSON__", actor_bindings_json)
+        .replace("__DYNAMIC_BINDINGS_JSON__", dynamic_bindings_json)
+        .replace("__DYNAMIC_RPC_BINDINGS_JSON__", dynamic_rpc_bindings_json)
+        .replace("__DYNAMIC_ENV_JSON__", dynamic_env_json)
         .replace("__ACTOR_CALL_JSON__", actor_call_json)
+        .replace("__HOST_RPC_CALL_JSON__", host_rpc_call_json)
         .replace("__REQUEST_ID__", request_id)
         .replace("__COMPLETION_TOKEN__", completion_token)
         .replace(

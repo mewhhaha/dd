@@ -13,6 +13,7 @@ mod service;
 pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use service::{
-    InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, WebSocketOpen, WorkerStats, WorkerStreamOutput,
+    DynamicDeployResult, InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService,
+    RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerStats,
+    WorkerStreamOutput,
 };

@@ -1,8 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use common::{
     DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse,
-    DeployTraceDestination, ErrorBody,
+    DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
 };
+use std::collections::HashMap;
 use std::env;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
@@ -20,6 +21,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Deploy(DeployCmd),
+    DynamicDeploy(DynamicDeployCmd),
     Invoke(InvokeCmd),
 }
 
@@ -37,6 +39,9 @@ struct DeployCmd {
 
     #[arg(long = "actor-binding")]
     actor_bindings: Vec<String>,
+
+    #[arg(long = "dynamic-binding")]
+    dynamic_bindings: Vec<String>,
 
     #[arg(long = "trace-worker")]
     trace_worker: Option<String>,
@@ -62,6 +67,17 @@ struct InvokeCmd {
     body_file: Option<String>,
 }
 
+#[derive(Args)]
+struct DynamicDeployCmd {
+    file: String,
+
+    #[arg(long = "env")]
+    env_vars: Vec<String>,
+
+    #[arg(long = "allow-host")]
+    allow_hosts: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
@@ -69,6 +85,7 @@ async fn main() -> Result<(), String> {
 
     match cli.command {
         Command::Deploy(command) => deploy(&client, &cli.server, command).await?,
+        Command::DynamicDeploy(command) => dynamic_deploy(&client, &cli.server, command).await?,
         Command::Invoke(command) => invoke(&client, &cli.server, command).await?,
     }
 
@@ -90,6 +107,14 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
             .into_iter()
             .map(parse_actor_binding)
             .collect::<Result<Vec<_>, _>>()?,
+    );
+    bindings.extend(
+        command
+            .dynamic_bindings
+            .into_iter()
+            .map(|binding| DeployBinding::Dynamic {
+                binding: binding.trim().to_string(),
+            }),
     );
     let config = DeployConfig {
         public: command.public,
@@ -117,6 +142,31 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
     Ok(())
 }
 
+async fn dynamic_deploy(
+    client: &reqwest::Client,
+    server: &str,
+    command: DynamicDeployCmd,
+) -> Result<(), String> {
+    let source = tokio::fs::read_to_string(&command.file)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", command.file))?;
+    let env = parse_env_vars(&command.env_vars)?;
+    let response = client
+        .post(format!("{server}/v1/dynamic/deploy"))
+        .json(&DynamicDeployRequest {
+            source,
+            env,
+            egress_allow_hosts: command.allow_hosts,
+        })
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let deployed: DynamicDeployResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&deployed)?);
+    Ok(())
+}
+
 fn parse_actor_binding(value: String) -> Result<DeployBinding, String> {
     let trimmed = value.trim();
     let Some((binding, class)) = trimmed.split_once('=') else {
@@ -135,6 +185,22 @@ fn parse_actor_binding(value: String) -> Result<DeployBinding, String> {
         binding: binding.to_string(),
         class: class.to_string(),
     })
+}
+
+fn parse_env_vars(values: &[String]) -> Result<HashMap<String, String>, String> {
+    let mut out = HashMap::new();
+    for value in values {
+        let trimmed = value.trim();
+        let Some((name, secret)) = trimmed.split_once('=') else {
+            return Err(format!("invalid env value {trimmed:?}, expected KEY=VALUE"));
+        };
+        let key = name.trim();
+        if key.is_empty() {
+            return Err("env key must not be empty".to_string());
+        }
+        out.insert(key.to_string(), secret.to_string());
+    }
+    Ok(out)
 }
 
 async fn invoke(client: &reqwest::Client, server: &str, command: InvokeCmd) -> Result<(), String> {

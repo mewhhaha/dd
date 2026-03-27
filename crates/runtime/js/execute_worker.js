@@ -4,7 +4,11 @@
   const workerName = __WORKER_NAME__;
   const kvBindingsConfig = __KV_BINDINGS_JSON__;
   const actorBindingsConfig = __ACTOR_BINDINGS_JSON__;
+  const dynamicBindingsConfig = __DYNAMIC_BINDINGS_JSON__;
+  const dynamicRpcBindingsConfig = __DYNAMIC_RPC_BINDINGS_JSON__;
+  const dynamicEnvConfig = __DYNAMIC_ENV_JSON__;
   const actorCallConfig = __ACTOR_CALL_JSON__;
+  const hostRpcCallConfig = __HOST_RPC_CALL_JSON__;
   const hasRequestBodyStream = __HAS_REQUEST_BODY_STREAM__;
   const worker = globalThis.__dd_worker;
 
@@ -13,11 +17,17 @@
   }
 
   const inflightRequests = globalThis.__dd_inflight_requests ??= new Map();
+  const hostRpcTargets = globalThis.__dd_host_rpc_targets ??= new Map();
+  const RpcTarget = globalThis.RpcTarget ?? class RpcTarget {};
+  if (globalThis.RpcTarget !== RpcTarget) {
+    globalThis.RpcTarget = RpcTarget;
+  }
   const input = __REQUEST_JSON__;
   const controller = new AbortController();
   const waitUntilPromises = [];
   let waitUntilDoneSent = false;
   let actorInvokeSeq = 0;
+  globalThis.__dd_active_request_id = requestId;
 
   inflightRequests.set(requestId, controller);
 
@@ -27,6 +37,24 @@
       return undefined;
     }
     return op(...args);
+  };
+
+  const callOpAny = (names, ...args) => {
+    for (const name of names) {
+      const result = callOp(name, ...args);
+      if (result !== undefined) {
+        return result;
+      }
+    }
+    return undefined;
+  };
+
+  const activeRequestId = () => {
+    const scoped = String(globalThis.__dd_active_request_id ?? requestId).trim();
+    if (!scoped) {
+      throw new Error("dynamic worker request scope is unavailable");
+    }
+    return scoped;
   };
 
   const sleep = (millis) => callOp("op_sleep", Number(millis) || 0);
@@ -287,6 +315,126 @@
     || value instanceof Uint8Array
   );
 
+  const normalizeHostFetchInput = async (inputValue, initValue = undefined) => {
+    let method = "GET";
+    let url = "";
+    let headers = [];
+    let body = new Uint8Array();
+    let signal = undefined;
+
+    if (inputValue instanceof Request) {
+      method = String(inputValue.method || "GET").toUpperCase();
+      url = String(inputValue.url || "");
+      headers = Array.from(inputValue.headers.entries());
+      body = new Uint8Array(await inputValue.arrayBuffer());
+      signal = inputValue.signal;
+    } else {
+      method = String(initValue?.method ?? "GET").toUpperCase();
+      const raw = String(inputValue ?? "");
+      url = raw;
+      headers = toHeaderEntries(initValue?.headers);
+      body = toUtf8Bytes(initValue?.body);
+      signal = initValue?.signal;
+    }
+
+    if (inputValue instanceof Request && initValue) {
+      if (initValue.method != null) {
+        method = String(initValue.method).toUpperCase();
+      }
+      if (initValue.headers != null) {
+        headers = toHeaderEntries(initValue.headers);
+      }
+      if (Object.prototype.hasOwnProperty.call(initValue, "body")) {
+        body = toUtf8Bytes(initValue.body);
+      }
+      if (initValue.signal != null) {
+        signal = initValue.signal;
+      }
+    }
+
+    if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+      throw new TypeError("fetch requires an absolute http(s) URL in this runtime");
+    }
+
+    return {
+      method,
+      url,
+      headers,
+      body,
+      signal,
+    };
+  };
+
+  const composeAbortSignal = (signals) => {
+    const filtered = signals.filter((signal) => (
+      signal
+      && typeof signal === "object"
+      && typeof signal.addEventListener === "function"
+    ));
+    if (filtered.length === 0) {
+      return undefined;
+    }
+    if (filtered.some((signal) => signal.aborted)) {
+      const aborted = filtered.find((signal) => signal.aborted);
+      const composed = new AbortController();
+      composed.abort(aborted?.reason);
+      return composed.signal;
+    }
+    if (filtered.length === 1) {
+      return filtered[0];
+    }
+    const composed = new AbortController();
+    const abort = (event) => {
+      if (!composed.signal.aborted) {
+        composed.abort(event?.target?.reason);
+      }
+    };
+    for (const signal of filtered) {
+      signal.addEventListener("abort", abort, { once: true });
+    }
+    return composed.signal;
+  };
+
+  const installHostFetch = () => {
+    const previousFetch = globalThis.fetch;
+    if (typeof previousFetch !== "function") {
+      throw new TypeError("fetch is not available in this runtime");
+    }
+    const scopedFetch = async (inputValue, initValue = undefined) => {
+      const normalized = await normalizeHostFetchInput(inputValue, initValue);
+      const prepared = await callOp(
+        "op_http_prepare",
+        JSON.stringify({
+          request_id: requestId,
+          method: normalized.method,
+          url: normalized.url,
+          headers: normalized.headers,
+          body: Array.from(normalized.body),
+        }),
+      );
+      await syncFrozenTime();
+      if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
+        throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
+      }
+      const signal = composeAbortSignal([controller.signal, normalized.signal]);
+      const body = Array.isArray(prepared.body) && prepared.body.length > 0
+        ? toArrayBytes(prepared.body)
+        : undefined;
+      return previousFetch(new Request(String(prepared.url), {
+        method: String(prepared.method || "GET"),
+        headers: Array.isArray(prepared.headers) ? prepared.headers : [],
+        body,
+        signal,
+      }));
+    };
+    globalThis.fetch = scopedFetch;
+    return () => {
+      if (globalThis.fetch === scopedFetch) {
+        globalThis.fetch = previousFetch;
+      }
+    };
+  };
+
   const normalizeSocketMessageForJs = (value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return value;
@@ -341,7 +489,18 @@
     };
   };
 
-  const toArrayBytes = (value) => new Uint8Array(Array.isArray(value) ? value : []);
+  const toArrayBytes = (value) => {
+    if (value instanceof Uint8Array) {
+      return value;
+    }
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+    if (value instanceof ArrayBuffer) {
+      return new Uint8Array(value);
+    }
+    return new Uint8Array(Array.isArray(value) ? value : []);
+  };
 
   const isPlainObject = (value) => {
     if (!value || typeof value !== "object") {
@@ -469,6 +628,11 @@
   const INTERNAL_WS_HANDLE_HEADER = "x-dd-ws-handle";
   const INTERNAL_WS_BINDING_HEADER = "x-dd-ws-actor-binding";
   const INTERNAL_WS_KEY_HEADER = "x-dd-ws-actor-key";
+  const INTERNAL_TRANSPORT_ACCEPT_HEADER = "x-dd-transport-accept";
+  const INTERNAL_TRANSPORT_SESSION_HEADER = "x-dd-transport-session";
+  const INTERNAL_TRANSPORT_HANDLE_HEADER = "x-dd-transport-handle";
+  const INTERNAL_TRANSPORT_BINDING_HEADER = "x-dd-transport-actor-binding";
+  const INTERNAL_TRANSPORT_KEY_HEADER = "x-dd-transport-actor-key";
 
   const encodeSocketSendPayload = (value, kind) => {
     if (kind != null) {
@@ -476,7 +640,7 @@
       if (normalizedKind === "text") {
         return {
           kind: "text",
-          value: String(value),
+          value: Array.from(toUtf8Bytes(String(value))),
         };
       }
       if (normalizedKind === "binary") {
@@ -495,7 +659,7 @@
     }
     return {
       kind: "text",
-      value: String(value ?? ""),
+      value: Array.from(toUtf8Bytes(String(value ?? ""))),
     };
   };
 
@@ -623,10 +787,11 @@
   const createActorSocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
     const socketsByHandle = entry.socketBindings ??= new Map();
     const openHandles = entry.openSocketHandles ??= new Set();
+    const currentSocketRequestId = () => activeRequestId() || runtimeRequestId;
 
     const consumeCloseEvents = async (target) => {
       const result = await callOp("op_actor_socket_consume_close", {
-        request_id: runtimeRequestId,
+        request_id: currentSocketRequestId(),
         handle: target.__dd_handle,
       });
       await syncFrozenTime();
@@ -699,7 +864,7 @@
         async send(value, kind) {
           const payload = encodeSocketSendPayload(value, kind);
           const result = await callOp("op_actor_socket_send", {
-            request_id: runtimeRequestId,
+            request_id: currentSocketRequestId(),
             handle: normalizedHandle,
             message_kind: payload.kind,
             message: payload.value,
@@ -714,7 +879,7 @@
             ? Math.trunc(Number(code))
             : 1000;
           const result = await callOp("op_actor_socket_close", {
-            request_id: runtimeRequestId,
+            request_id: currentSocketRequestId(),
             handle: normalizedHandle,
             code: normalizedCode,
             reason: reason == null ? "" : String(reason),
@@ -724,26 +889,40 @@
             throw new Error(String(result.error ?? "socket close failed"));
           }
         },
-        __dd_dispatch(type, event) {
+        async __dd_dispatch(type, event) {
           const current = listeners.get(type);
           if (current) {
             for (const listener of current) {
               try {
-                listener.call(this, event);
-              } catch {
-                // Ignore listener failures.
+                await listener.call(this, event);
+              } catch (error) {
+                try {
+                  console.warn(
+                    "actor websocket listener failed",
+                    String((error && (error.stack || error.message)) || error),
+                  );
+                } catch {
+                  // Ignore logging failures.
+                }
               }
             }
           }
         },
-        __dd_dispatchMessage(value) {
+        async __dd_dispatchMessage(value) {
           const event = { type: "message", data: value, target: this };
-          this.__dd_dispatch("message", event);
+          await this.__dd_dispatch("message", event);
           if (typeof onmessage === "function") {
             try {
-              onmessage.call(this, event);
-            } catch {
-              // Ignore onmessage failures.
+              await onmessage.call(this, event);
+            } catch (error) {
+              try {
+                console.warn(
+                  "actor websocket onmessage failed",
+                  String((error && (error.stack || error.message)) || error),
+                );
+              } catch {
+                // Ignore logging failures.
+              }
             }
           }
         },
@@ -826,10 +1005,12 @@
         openHandles.add(handle);
         return {
           handle,
-          response: new Response(null, {
+          response: {
+            __dd_websocket_accept: true,
             status: 101,
-            headers: Array.from(headers.entries()),
-          }),
+            headers,
+            body: null,
+          },
         };
       },
       values() {
@@ -843,7 +1024,7 @@
       ensureSocket,
       async refreshOpenHandles() {
         const result = await callOp("op_actor_socket_list", {
-          request_id: runtimeRequestId,
+          request_id: currentSocketRequestId(),
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -858,9 +1039,306 @@
     };
   };
 
-  const createActorRuntimeState = (entry, runtimeRequestId, allowSocketAccept) => {
+  const createTransportReadableChannel = () => {
+    const queue = [];
+    let controller = null;
+    let closed = false;
+    const readable = new ReadableStream({
+      start(nextController) {
+        controller = nextController;
+        while (queue.length > 0) {
+          controller.enqueue(queue.shift());
+        }
+        if (closed) {
+          controller.close();
+        }
+      },
+      cancel() {
+        closed = true;
+      },
+    });
+    return {
+      readable,
+      push(value) {
+        if (closed) {
+          return;
+        }
+        const bytes = toArrayBytes(value);
+        if (controller) {
+          controller.enqueue(bytes);
+          return;
+        }
+        queue.push(bytes);
+      },
+      close() {
+        closed = true;
+        if (controller) {
+          controller.close();
+        }
+      },
+      error(error) {
+        closed = true;
+        if (controller) {
+          controller.error(error);
+        }
+      },
+    };
+  };
+
+  const createActorTransportRuntime = (entry, runtimeRequestId, allowTransportAccept) => {
+    const transportsByHandle = entry.transportBindings ??= new Map();
+    const openHandles = entry.openTransportHandles ??= new Set();
+    const currentTransportRequestId = () => activeRequestId() || runtimeRequestId;
+
+    const consumeCloseEvents = async (target) => {
+      const result = await callOp("op_actor_transport_consume_close", {
+        request_id: currentTransportRequestId(),
+        handle: target.__dd_handle,
+      });
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "transport consumeClose failed"));
+      }
+      const events = Array.isArray(result?.events) ? result.events : [];
+      for (const event of events) {
+        target.__dd_dispatchClose(
+          Number(event?.code ?? 0),
+          String(event?.reason ?? ""),
+        );
+      }
+    };
+
+    const ensureTransport = (handle) => {
+      const normalizedHandle = String(handle ?? "").trim();
+      if (!normalizedHandle) {
+        throw new Error("WebTransportSession(handle) requires a non-empty handle");
+      }
+      const existing = transportsByHandle.get(normalizedHandle);
+      if (existing) {
+        consumeCloseEvents(existing).catch(() => {});
+        return existing;
+      }
+
+      const datagramReadable = createTransportReadableChannel();
+      const streamReadable = createTransportReadableChannel();
+      let closed = false;
+      let closedResolved = false;
+      let closedResolve = null;
+      const closedPromise = new Promise((resolve) => {
+        closedResolve = resolve;
+      });
+
+      const finishClosed = () => {
+        if (closedResolved) {
+          return;
+        }
+        closedResolved = true;
+        closed = true;
+        openHandles.delete(normalizedHandle);
+        datagramReadable.close();
+        streamReadable.close();
+        if (typeof closedResolve === "function") {
+          closedResolve(undefined);
+        }
+      };
+
+      const sendTransportPayload = async (kind, value) => {
+        const bytes = isBinaryLike(value) ? toArrayBytes(value) : toUtf8Bytes(value);
+        const payload = Array.from(bytes);
+        const result = await callOpAny(
+          [
+            kind === "datagram"
+              ? "op_actor_transport_datagram_send"
+              : "op_actor_transport_stream_send",
+            "op_actor_transport_send",
+          ],
+          {
+            request_id: currentTransportRequestId(),
+            handle: normalizedHandle,
+            message_kind: kind,
+            message: payload,
+          },
+        );
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? `transport ${kind} send failed`));
+        }
+      };
+
+      const target = {
+        __dd_handle: normalizedHandle,
+        get readyState() {
+          return closed ? 3 : 1;
+        },
+        ready: Promise.resolve(undefined),
+        closed: closedPromise,
+        datagrams: {
+          readable: datagramReadable.readable,
+          writable: new WritableStream({
+            write(chunk) {
+              return sendTransportPayload("datagram", chunk);
+            },
+            close() {
+              return undefined;
+            },
+            abort() {
+              return undefined;
+            },
+          }),
+        },
+        stream: {
+          readable: streamReadable.readable,
+          writable: new WritableStream({
+            write(chunk) {
+              return sendTransportPayload("stream", chunk);
+            },
+            close() {
+              return undefined;
+            },
+            abort() {
+              return undefined;
+            },
+          }),
+        },
+        async close(code, reason) {
+          const normalizedCode = Number.isFinite(Number(code))
+            ? Math.trunc(Number(code))
+            : 0;
+          const result = await callOpAny(
+            [
+              "op_actor_transport_close",
+              "op_actor_transport_terminate",
+            ],
+            {
+              request_id: currentTransportRequestId(),
+              handle: normalizedHandle,
+              code: normalizedCode,
+              reason: reason == null ? "" : String(reason),
+            },
+          );
+          await syncFrozenTime();
+          if (result && typeof result === "object" && result.ok === false) {
+            throw new Error(String(result.error ?? "transport close failed"));
+          }
+          finishClosed();
+        },
+        __dd_dispatchDatagram(value) {
+          datagramReadable.push(value);
+        },
+        __dd_dispatchStreamChunk(value) {
+          streamReadable.push(value);
+        },
+        __dd_dispatchClose(code, reason) {
+          if (closedResolved) {
+            return;
+          }
+          finishClosed();
+          target.__dd_lastClose = {
+            code: Number(code),
+            reason: String(reason ?? ""),
+          };
+        },
+      };
+
+      transportsByHandle.set(normalizedHandle, target);
+      consumeCloseEvents(target).catch(() => {});
+      return target;
+    };
+
+    const WebTransportSessionForActor = function WebTransportSession(handle) {
+      return ensureTransport(handle);
+    };
+
+    const transportAccepted = { used: false };
+    const transports = {
+      async accept(request, options = {}) {
+        const _ = options;
+        if (!allowTransportAccept) {
+          throw new Error("state.transports.accept is only available during actor fetch()");
+        }
+        if (transportAccepted.used) {
+          throw new Error("state.transports.accept can only be called once per request");
+        }
+        if (!(request instanceof Request)) {
+          throw new Error("state.transports.accept requires a Request");
+        }
+        if (String(request.method || "").toUpperCase() !== "CONNECT") {
+          throw new Error("state.transports.accept requires a CONNECT request");
+        }
+        const protocol = String(
+          request.headers.get(":protocol")
+          ?? request.headers.get("protocol")
+          ?? request.headers.get("x-dd-transport-protocol")
+          ?? "",
+        ).trim().toLowerCase();
+        if (protocol && protocol !== "webtransport") {
+          throw new Error("state.transports.accept requires a webtransport request");
+        }
+        const sessionId = String(
+          request.headers.get(INTERNAL_TRANSPORT_SESSION_HEADER)
+          ?? request.headers.get(INTERNAL_TRANSPORT_HANDLE_HEADER)
+          ?? "",
+        ).trim();
+        if (!sessionId) {
+          throw new Error("state.transports.accept missing runtime transport session metadata");
+        }
+        const handle = sessionId;
+        const headers = new Headers();
+        headers.set(INTERNAL_TRANSPORT_ACCEPT_HEADER, "1");
+        headers.set(INTERNAL_TRANSPORT_SESSION_HEADER, sessionId);
+        headers.set(INTERNAL_TRANSPORT_HANDLE_HEADER, handle);
+        headers.set(INTERNAL_TRANSPORT_BINDING_HEADER, entry.binding);
+        headers.set(INTERNAL_TRANSPORT_KEY_HEADER, entry.actorKey);
+        transportAccepted.used = true;
+        openHandles.add(handle);
+        return {
+          handle,
+          response: {
+            __dd_transport_accept: true,
+            status: 200,
+            headers,
+            body: null,
+          },
+        };
+      },
+      values() {
+        return Array.from(openHandles.values());
+      },
+    };
+
+    return {
+      transports,
+      WebTransportSession: WebTransportSessionForActor,
+      ensureTransport,
+      async refreshOpenHandles() {
+        const result = await callOpAny([
+          "op_actor_transport_list",
+          "op_actor_transport_handles",
+        ], {
+          request_id: currentTransportRequestId(),
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "transport values failed"));
+        }
+        openHandles.clear();
+        const handles = Array.isArray(result?.handles)
+          ? result.handles
+          : Array.isArray(result?.values)
+            ? result.values
+            : [];
+        for (const value of handles) {
+          openHandles.add(String(value));
+        }
+      },
+    };
+  };
+
+  const createActorRuntimeState = (entry, runtimeRequestId, allowSocketAccept, allowTransportAccept) => {
     const socketRuntime = createActorSocketRuntime(entry, runtimeRequestId, allowSocketAccept);
+    const transportRuntime = createActorTransportRuntime(entry, runtimeRequestId, allowTransportAccept);
     entry.socketRuntime = socketRuntime;
+    entry.transportRuntime = transportRuntime;
     return {
       id: {
         toString() {
@@ -869,7 +1347,9 @@
       },
       storage: createActorStorageBinding(runtimeRequestId),
       sockets: socketRuntime.sockets,
+      transports: transportRuntime.transports,
       __dd_socket_runtime: socketRuntime,
+      __dd_transport_runtime: transportRuntime,
     };
   };
 
@@ -886,6 +1366,72 @@
   const actorMethodNameIsBlockedForProxy = (name) => (
     actorMethodNameIsBlocked(name)
   );
+
+  const hostRpcMethodNameIsBlocked = (name) => (
+    !name
+    || name === "constructor"
+    || name === "fetch"
+    || name === "then"
+    || name.startsWith("__dd_")
+  );
+
+  const isRpcTargetInstance = (value) => (
+    value != null
+    && typeof value === "object"
+    && typeof RpcTarget === "function"
+    && value instanceof RpcTarget
+  );
+
+  const extractRpcTargetMethods = (target) => {
+    const methods = new Set();
+    let proto = Object.getPrototypeOf(target);
+    while (proto && proto !== Object.prototype) {
+      for (const name of Object.getOwnPropertyNames(proto)) {
+        if (hostRpcMethodNameIsBlocked(name)) {
+          continue;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+        if (!descriptor || typeof descriptor.value !== "function") {
+          continue;
+        }
+        methods.add(name);
+      }
+      if (proto === RpcTarget.prototype) {
+        break;
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+    return Array.from(methods.values()).sort();
+  };
+
+  const createDynamicHostRpcNamespace = (bindingName) => new Proxy({}, {
+    get(_target, prop) {
+      if (typeof prop === "symbol") {
+        return undefined;
+      }
+      const methodName = String(prop);
+      if (methodName === "then") {
+        return undefined;
+      }
+      if (hostRpcMethodNameIsBlocked(methodName)) {
+        throw new Error(`dynamic host rpc method is blocked: ${methodName}`);
+      }
+      return async (...args) => {
+        const argsBytes = await encodeRpcArgs(args);
+        const result = await callOp("op_dynamic_host_rpc_invoke", {
+          request_id: requestId,
+          binding: bindingName,
+          method_name: methodName,
+          args: Array.from(argsBytes),
+        });
+        await syncFrozenTime();
+        if (!result || typeof result !== "object" || result.ok === false) {
+          throw new Error(String(result?.error ?? `dynamic host rpc invoke failed: ${methodName}`));
+        }
+        return decodeRpcResult(toArrayBytes(result.value));
+      };
+    },
+  });
 
   const createActorStub = (namespace, actorKey) => {
     const target = {
@@ -909,9 +1455,31 @@
         if (!result || typeof result !== "object" || result.ok === false) {
           throw new Error(String(result?.error ?? "actor fetch invoke failed"));
         }
+        const status = Number(result.status ?? 200);
+        const headers = Array.isArray(result.headers) ? result.headers : [];
+        const responseHeaders = new Headers(headers);
+        if (status === 101) {
+          return {
+            __dd_websocket_accept: true,
+            status,
+            headers: responseHeaders,
+            body: null,
+          };
+        }
+        if (
+          status === 200
+          && String(responseHeaders.get(INTERNAL_TRANSPORT_ACCEPT_HEADER) ?? "") === "1"
+        ) {
+          return {
+            __dd_transport_accept: true,
+            status,
+            headers: responseHeaders,
+            body: null,
+          };
+        }
         return new Response(toArrayBytes(result.body), {
-          status: Number(result.status ?? 200),
-          headers: Array.isArray(result.headers) ? result.headers : [],
+          status,
+          headers,
         });
       },
     };
@@ -988,6 +1556,407 @@
     },
   });
 
+  const splitDynamicEnvInput = (value) => {
+    if (value == null) {
+      return {
+        stringEnv: {},
+        hostRpcBindings: [],
+      };
+    }
+    if (typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("dynamic worker env must be an object");
+    }
+    const stringEnv = {};
+    const hostRpcBindings = [];
+    for (const [key, entry] of Object.entries(value)) {
+      const name = String(key ?? "").trim();
+      if (!name) {
+        throw new Error("dynamic worker env key must not be empty");
+      }
+      if (isRpcTargetInstance(entry)) {
+        const targetIdRaw = callOp("op_crypto_random_uuid");
+        const targetId = String(targetIdRaw ?? "").trim();
+        if (!targetId) {
+          throw new Error("failed to allocate dynamic host rpc target id");
+        }
+        const methods = extractRpcTargetMethods(entry);
+        hostRpcTargets.set(targetId, entry);
+        hostRpcBindings.push({
+          binding: name,
+          target_id: targetId,
+          methods,
+        });
+        continue;
+      }
+      if (entry != null && typeof entry === "object") {
+        throw new Error(`dynamic worker env value for ${name} must be primitive or RpcTarget`);
+      }
+      stringEnv[name] = String(entry ?? "");
+    }
+    return {
+      stringEnv,
+      hostRpcBindings,
+    };
+  };
+
+  const normalizeDynamicInstanceId = (value) => {
+    const normalized = String(value ?? "").trim();
+    if (!normalized) {
+      throw new Error("dynamic worker id must not be empty");
+    }
+    return normalized;
+  };
+
+  const normalizeDynamicTimeout = (value) => {
+    if (value == null) {
+      return 5_000;
+    }
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error("dynamic worker timeout must be a positive number");
+    }
+    const normalized = Math.trunc(parsed);
+    if (normalized > 60_000) {
+      return 60_000;
+    }
+    return normalized;
+  };
+
+  const normalizeModulePath = (value) => {
+    const raw = String(value ?? "").replaceAll("\\", "/").trim();
+    if (!raw) {
+      throw new Error("dynamic worker module path must not be empty");
+    }
+    const absolute = raw.startsWith("/");
+    const parts = raw.split("/");
+    const out = [];
+    for (const part of parts) {
+      if (!part || part === ".") {
+        continue;
+      }
+      if (part === "..") {
+        if (out.length > 0) {
+          out.pop();
+        }
+        continue;
+      }
+      out.push(part);
+    }
+    const normalized = out.join("/");
+    return absolute ? normalized : normalized;
+  };
+
+  const resolveModuleSpecifier = (fromPath, specifier) => {
+    const spec = String(specifier ?? "").trim();
+    if (!spec) {
+      return null;
+    }
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec) || spec.startsWith("//")) {
+      return null;
+    }
+    if (!spec.startsWith("./") && !spec.startsWith("../") && !spec.startsWith("/")) {
+      return normalizeModulePath(spec);
+    }
+    const baseParts = normalizeModulePath(fromPath).split("/");
+    if (baseParts.length > 0) {
+      baseParts.pop();
+    }
+    const relative = spec.startsWith("/") ? spec.slice(1) : spec;
+    const merged = spec.startsWith("/") ? relative : `${baseParts.join("/")}/${relative}`;
+    return normalizeModulePath(merged);
+  };
+
+  const replaceModuleSpecifiers = (modulePath, source, mapResolver) => {
+    let out = String(source ?? "");
+    const fromReplace = /(\bfrom\s*['"])([^'"]+)(['"])/g;
+    out = out.replace(fromReplace, (full, prefix, spec, suffix) => {
+      const replacement = mapResolver(modulePath, spec);
+      if (!replacement) {
+        return full;
+      }
+      return `${prefix}${replacement}${suffix}`;
+    });
+    const sideEffectImport = /(\bimport\s*['"])([^'"]+)(['"])/g;
+    out = out.replace(sideEffectImport, (full, prefix, spec, suffix) => {
+      const replacement = mapResolver(modulePath, spec);
+      if (!replacement) {
+        return full;
+      }
+      return `${prefix}${replacement}${suffix}`;
+    });
+    const dynamicImport = /(\bimport\s*\(\s*['"])([^'"]+)(['"]\s*\))/g;
+    out = out.replace(dynamicImport, (full, prefix, spec, suffix) => {
+      const replacement = mapResolver(modulePath, spec);
+      if (!replacement) {
+        return full;
+      }
+      return `${prefix}${replacement}${suffix}`;
+    });
+    return out;
+  };
+
+  const buildSourceFromModules = (entrypointInput, modulesInput) => {
+    const entrypoint = normalizeModulePath(entrypointInput || "worker.js");
+    if (!isPlainObject(modulesInput)) {
+      throw new Error("dynamic worker modules must be an object");
+    }
+
+    const modules = new Map();
+    for (const [rawPath, rawCode] of Object.entries(modulesInput)) {
+      const modulePath = normalizeModulePath(rawPath);
+      const source = String(rawCode ?? "");
+      if (!source.trim()) {
+        throw new Error(`dynamic worker module must not be empty: ${modulePath}`);
+      }
+      modules.set(modulePath, source);
+    }
+    if (modules.size === 0) {
+      throw new Error("dynamic worker modules must not be empty");
+    }
+    if (!modules.has(entrypoint)) {
+      throw new Error(`dynamic worker missing entrypoint module: ${entrypoint}`);
+    }
+
+    const encodedByPath = new Map();
+    const urlsByPath = new Map();
+    const unresolved = new Set();
+    const maxRounds = 16;
+    for (let round = 0; round < maxRounds; round += 1) {
+      unresolved.clear();
+      let changed = false;
+      for (const [modulePath, moduleSource] of modules.entries()) {
+        const rewritten = replaceModuleSpecifiers(
+          modulePath,
+          moduleSource,
+          (fromPath, specifier) => {
+            const resolved = resolveModuleSpecifier(fromPath, specifier);
+            if (!resolved) {
+              return null;
+            }
+            if (!modules.has(resolved)) {
+              unresolved.add(`${fromPath} -> ${specifier}`);
+              return null;
+            }
+            const url = urlsByPath.get(resolved);
+            if (!url) {
+              unresolved.add(`${fromPath} -> ${specifier}`);
+              return null;
+            }
+            return url;
+          },
+        );
+        const encoded = `data:text/javascript;charset=utf-8,${encodeURIComponent(rewritten)}`;
+        if (encodedByPath.get(modulePath) !== encoded) {
+          encodedByPath.set(modulePath, encoded);
+          urlsByPath.set(modulePath, encoded);
+          changed = true;
+        }
+      }
+      if (!changed && unresolved.size === 0) {
+        break;
+      }
+      if (round === maxRounds - 1) {
+        if (unresolved.size > 0) {
+          throw new Error(
+            `dynamic worker module graph did not resolve after ${maxRounds} rounds; unresolved imports: ${Array.from(unresolved).slice(0, 5).join(", ")}`,
+          );
+        }
+        throw new Error(
+          "dynamic worker module graph did not stabilize; avoid circular imports in dynamic modules",
+        );
+      }
+    }
+
+    const entryUrl = urlsByPath.get(entrypoint);
+    if (!entryUrl) {
+      throw new Error("dynamic worker entrypoint URL could not be built");
+    }
+    return `export { default } from ${JSON.stringify(entryUrl)};\n`;
+  };
+
+  const resolveDynamicWorkerSource = (options) => {
+    if (Object.prototype.hasOwnProperty.call(options, "source")) {
+      const source = String(options.source ?? "");
+      if (!source.trim()) {
+        throw new Error("dynamic worker source must not be empty");
+      }
+      return source;
+    }
+
+    const entrypoint = String(options.entrypoint ?? "worker.js").trim();
+    if (!entrypoint) {
+      throw new Error("dynamic worker entrypoint must not be empty");
+    }
+    const modules = options.modules;
+    if (!isPlainObject(modules)) {
+      throw new Error("dynamic worker modules must be an object");
+    }
+    return buildSourceFromModules(entrypoint, modules);
+  };
+
+  const createDynamicWorkerStub = (bindingName, handle, worker, timeout) => ({
+    worker,
+    async fetch(inputValue, initValue = undefined) {
+      const request = await normalizeActorFetchInput(inputValue, initValue);
+      const scopedRequestId = activeRequestId();
+      actorInvokeSeq += 1;
+      let timeoutId = 0;
+      const timeoutError = new Promise((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error(`dynamic worker invoke timed out after ${timeout}ms`)),
+          timeout,
+        );
+      });
+      const result = await Promise.race([
+        callOp("op_dynamic_worker_invoke", {
+          request_id: scopedRequestId,
+          subrequest_id: `${scopedRequestId}:dynamic:${actorInvokeSeq}`,
+          binding: bindingName,
+          handle,
+          method: request.method,
+          url: request.url,
+          headers: request.headers,
+          body: Array.from(request.body),
+        }),
+        timeoutError,
+      ]).finally(() => clearTimeout(timeoutId));
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "dynamic worker invoke failed"));
+      }
+      return new Response(toArrayBytes(result.body), {
+        status: Number(result.status ?? 200),
+        headers: Array.isArray(result.headers) ? result.headers : [],
+      });
+    },
+  });
+
+  const parseDynamicFactoryOptions = async (factory) => {
+    if (typeof factory !== "function") {
+      throw new Error("dynamic worker get() requires a factory function");
+    }
+    const options = await factory();
+    if (!options || typeof options !== "object" || Array.isArray(options)) {
+      throw new Error("dynamic worker factory must return an options object");
+    }
+    return options;
+  };
+
+  /**
+   * @typedef {Object} DynamicWorkerConfig
+   * @property {string} [source] Full worker source. If omitted, `entrypoint + modules` are used.
+   * @property {string} [entrypoint] Entrypoint module path when using `modules`. Defaults to `worker.js`.
+   * @property {Record<string, string>} [modules] Module graph map: `modulePath -> source`.
+   * @property {Record<string, any>} [env] Env bindings for the dynamic worker.
+   * String values stay opaque and are only resolved at host I/O boundaries; `RpcTarget` values become host RPC bindings.
+   * @property {number} [timeout] Per-invoke timeout in ms. Default `5000`, max `60000`.
+   */
+
+  /**
+   * @typedef {Object} DynamicWorkerStub
+   * @property {string} worker Generated internal worker name.
+   * @property {(input: Request|string, init?: RequestInit) => Promise<Response>} fetch Invoke the dynamic worker over HTTP-style fetch.
+   */
+
+  const createDynamicNamespace = (bindingName) => ({
+    /**
+     * Get or lazily create a dynamic worker by stable id.
+     *
+     * @param {string} id
+     * @param {() => Promise<DynamicWorkerConfig>|DynamicWorkerConfig} factory
+     * @returns {Promise<DynamicWorkerStub>}
+     */
+    async get(id, factory) {
+      const instanceId = normalizeDynamicInstanceId(id);
+      const scopedRequestId = activeRequestId();
+      const lookup = await callOp("op_dynamic_worker_lookup", {
+        request_id: scopedRequestId,
+        binding: bindingName,
+        id: instanceId,
+      });
+      await syncFrozenTime();
+      if (!lookup || typeof lookup !== "object" || lookup.ok === false) {
+        throw new Error(String(lookup?.error ?? "dynamic worker lookup failed"));
+      }
+      if (lookup.found === true) {
+        return createDynamicWorkerStub(
+          bindingName,
+          String(lookup.handle ?? "").trim(),
+          String(lookup.worker ?? ""),
+          normalizeDynamicTimeout(lookup.timeout),
+        );
+      }
+
+      const options = await parseDynamicFactoryOptions(factory);
+      const source = resolveDynamicWorkerSource(options);
+      const envInput = options.env;
+      const envConfig = splitDynamicEnvInput(envInput);
+      const timeout = normalizeDynamicTimeout(options.timeout);
+      const result = await callOp("op_dynamic_worker_create", {
+        request_id: scopedRequestId,
+        binding: bindingName,
+        id: instanceId,
+        source,
+        env: envConfig.stringEnv,
+        host_rpc_bindings: envConfig.hostRpcBindings,
+        timeout,
+      });
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "dynamic worker create failed"));
+      }
+      const handle = String(result.handle ?? "").trim();
+      if (!handle) {
+        throw new Error("dynamic worker create returned an invalid handle");
+      }
+      return createDynamicWorkerStub(
+        bindingName,
+        handle,
+        String(result.worker ?? ""),
+        normalizeDynamicTimeout(result.timeout ?? timeout),
+      );
+    },
+    /**
+     * List active dynamic worker ids for this namespace in the current owner worker generation.
+     *
+     * @returns {Promise<string[]>}
+     */
+    async list() {
+      const scopedRequestId = activeRequestId();
+      const result = await callOp("op_dynamic_worker_list", {
+        request_id: scopedRequestId,
+        binding: bindingName,
+      });
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "dynamic worker list failed"));
+      }
+      return Array.isArray(result.ids)
+        ? result.ids.map((value) => String(value))
+        : [];
+    },
+    /**
+     * Delete a dynamic worker by stable id.
+     *
+     * @param {string} id
+     * @returns {Promise<boolean>} True when an existing worker was deleted.
+     */
+    async delete(id) {
+      const instanceId = normalizeDynamicInstanceId(id);
+      const scopedRequestId = activeRequestId();
+      const result = await callOp("op_dynamic_worker_delete", {
+        request_id: scopedRequestId,
+        binding: bindingName,
+        id: instanceId,
+      });
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "dynamic worker delete failed"));
+      }
+      return Boolean(result.deleted);
+    },
+  });
+
   const buildEnv = () => {
     const env = {};
     const actorBindingClasses = new Map();
@@ -1006,6 +1975,64 @@
       }
       Object.defineProperty(env, envName, {
         value: createKvBinding(bindingName),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+
+    const dynamicBindings = Array.isArray(dynamicBindingsConfig)
+      ? dynamicBindingsConfig
+      : dynamicBindingsConfig && typeof dynamicBindingsConfig === "object"
+        ? Object.entries(dynamicBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
+        : [];
+    for (const binding of dynamicBindings) {
+      const [envName, bindingName] = Array.isArray(binding)
+        ? binding
+        : [binding, binding];
+      if (typeof envName !== "string" || envName.trim().length === 0) {
+        continue;
+      }
+      Object.defineProperty(env, envName.trim(), {
+        value: createDynamicNamespace(String(bindingName ?? envName).trim()),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+
+    const dynamicRpcBindings = Array.isArray(dynamicRpcBindingsConfig)
+      ? dynamicRpcBindingsConfig
+      : dynamicRpcBindingsConfig && typeof dynamicRpcBindingsConfig === "object"
+        ? Object.entries(dynamicRpcBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
+        : [];
+    for (const binding of dynamicRpcBindings) {
+      const [envName, bindingName] = Array.isArray(binding)
+        ? binding
+        : [binding, binding];
+      if (typeof envName !== "string" || envName.trim().length === 0) {
+        continue;
+      }
+      Object.defineProperty(env, envName.trim(), {
+        value: createDynamicHostRpcNamespace(String(bindingName ?? envName).trim()),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+
+    const dynamicEnv = Array.isArray(dynamicEnvConfig)
+      ? dynamicEnvConfig
+      : dynamicEnvConfig && typeof dynamicEnvConfig === "object"
+        ? Object.entries(dynamicEnvConfig)
+        : [];
+    for (const entry of dynamicEnv) {
+      const [envName, value] = Array.isArray(entry) ? entry : [null, null];
+      if (typeof envName !== "string" || envName.trim().length === 0) {
+        continue;
+      }
+      Object.defineProperty(env, envName.trim(), {
+        value: String(value ?? ""),
         enumerable: true,
         configurable: true,
         writable: true,
@@ -1067,11 +2094,16 @@
         actorKey,
         socketBindings: new Map(),
         socketRuntime: null,
+        transportBindings: new Map(),
+        transportRuntime: null,
       };
-      const constructorState = createActorRuntimeState(entry, requestId, false);
+      const constructorState = createActorRuntimeState(entry, requestId, false, false);
       await constructorState.__dd_socket_runtime.refreshOpenHandles();
+      await constructorState.__dd_transport_runtime.refreshOpenHandles();
       const previousWebSocketForCtor = globalThis.WebSocket;
+      const previousWebTransportForCtor = globalThis.WebTransportSession;
       globalThis.WebSocket = constructorState.__dd_socket_runtime.WebSocket;
+      globalThis.WebTransportSession = constructorState.__dd_transport_runtime.WebTransportSession;
       try {
         entry = {
           ...entry,
@@ -1083,6 +2115,11 @@
         } else {
           globalThis.WebSocket = previousWebSocketForCtor;
         }
+        if (previousWebTransportForCtor === undefined) {
+          delete globalThis.WebTransportSession;
+        } else {
+          globalThis.WebTransportSession = previousWebTransportForCtor;
+        }
       }
       actorInstances.set(cacheKey, entry);
     }
@@ -1090,9 +2127,11 @@
     entry.actorKey = actorKey;
 
     const kind = String(actorCall.kind ?? "");
-    const scopedState = createActorRuntimeState(entry, requestId, kind === "fetch");
+    const scopedState = createActorRuntimeState(entry, requestId, kind === "fetch", kind === "fetch");
     const previousWebSocket = globalThis.WebSocket;
+    const previousWebTransport = globalThis.WebTransportSession;
     globalThis.WebSocket = scopedState.__dd_socket_runtime.WebSocket;
+    globalThis.WebTransportSession = scopedState.__dd_transport_runtime.WebTransportSession;
     const receiver = new Proxy(entry.instance, {
       get(target, prop, receiverValue) {
         if (prop === "state") {
@@ -1110,6 +2149,7 @@
 
     try {
       await scopedState.__dd_socket_runtime.refreshOpenHandles();
+      await scopedState.__dd_transport_runtime.refreshOpenHandles();
       if (kind === "fetch") {
         if (typeof entry.instance.fetch !== "function") {
           throw new Error(`actor class does not define fetch(): ${className}`);
@@ -1141,7 +2181,37 @@
         const ws = new globalThis.WebSocket(handle);
         const raw = toArrayBytes(actorCall.data);
         const message = actorCall.is_text === true ? Deno.core.decode(raw) : raw;
-        ws.__dd_dispatchMessage(message);
+        await ws.__dd_dispatchMessage(message);
+        return new Response(null, { status: 204 });
+      }
+      if (kind === "transport_datagram" || kind === "datagram") {
+        const handle = String(actorCall.handle ?? "").trim();
+        if (!handle) {
+          throw new Error("actor transport datagram invoke requires transport handle");
+        }
+        const session = new globalThis.WebTransportSession(handle);
+        await session.__dd_dispatchDatagram(toArrayBytes(actorCall.data));
+        return new Response(null, { status: 204 });
+      }
+      if (kind === "transport_stream" || kind === "stream") {
+        const handle = String(actorCall.handle ?? "").trim();
+        if (!handle) {
+          throw new Error("actor transport stream invoke requires transport handle");
+        }
+        const session = new globalThis.WebTransportSession(handle);
+        await session.__dd_dispatchStreamChunk(toArrayBytes(actorCall.data));
+        return new Response(null, { status: 204 });
+      }
+      if (kind === "transport_close" || kind === "transport") {
+        const handle = String(actorCall.handle ?? "").trim();
+        if (!handle) {
+          throw new Error("actor transport close invoke requires transport handle");
+        }
+        const session = new globalThis.WebTransportSession(handle);
+        session.__dd_dispatchClose(
+          Number(actorCall.code ?? 0),
+          String(actorCall.reason ?? ""),
+        );
         return new Response(null, { status: 204 });
       }
       if (kind === "close") {
@@ -1159,7 +2229,44 @@
       } else {
         globalThis.WebSocket = previousWebSocket;
       }
+      if (previousWebTransport === undefined) {
+        delete globalThis.WebTransportSession;
+      } else {
+        globalThis.WebTransportSession = previousWebTransport;
+      }
     }
+  };
+
+  const invokeHostRpcCall = async (hostRpcCall) => {
+    if (!hostRpcCall || typeof hostRpcCall !== "object") {
+      throw new Error("host rpc call config is missing");
+    }
+    const targetId = String(hostRpcCall.target_id ?? hostRpcCall.targetId ?? "").trim();
+    const methodName = String(hostRpcCall.method ?? "").trim();
+    if (!targetId) {
+      throw new Error("host rpc target id is missing");
+    }
+    if (!methodName) {
+      throw new Error("host rpc method is missing");
+    }
+    if (hostRpcMethodNameIsBlocked(methodName)) {
+      throw new Error(`host rpc method is blocked: ${methodName}`);
+    }
+    const target = hostRpcTargets.get(targetId);
+    if (!target) {
+      throw new Error("host rpc target is unavailable");
+    }
+    const method = target[methodName];
+    if (typeof method !== "function") {
+      throw new Error(`host rpc method not found: ${methodName}`);
+    }
+    const args = decodeRpcArgs(toArrayBytes(hostRpcCall.args));
+    const value = await method.apply(target, args);
+    const encoded = await encodeRpcResult(value);
+    return new Response(encoded, {
+      status: 200,
+      headers: [["content-type", "application/octet-stream"]],
+    });
   };
 
   const emitWaitUntilDone = async (timedOut) => {
@@ -1247,8 +2354,10 @@
   };
 
   (async () => {
+    let restoreHostFetch = null;
     try {
       await syncFrozenTime();
+      restoreHostFetch = installHostFetch();
       const requestBody = hasRequestBodyStream
         ? createRequestBodyStream()
         : input.body?.length
@@ -1275,50 +2384,64 @@
         },
       };
 
-      const response = actorCallConfig
-        ? await invokeActorClass(actorCallConfig, request, env, actorBindingClasses)
-        : await worker.fetch(request, env, ctx);
+      const response = hostRpcCallConfig
+        ? await invokeHostRpcCall(hostRpcCallConfig)
+        : actorCallConfig
+          ? await invokeActorClass(actorCallConfig, request, env, actorBindingClasses)
+          : await worker.fetch(request, env, ctx);
       await syncFrozenTime();
 
-      if (!(response instanceof Response)) {
+      const isWebSocketAcceptResponse = Boolean(
+        response
+          && typeof response === "object"
+          && response.__dd_websocket_accept === true,
+      );
+      const isTransportAcceptResponse = Boolean(
+        response
+          && typeof response === "object"
+          && response.__dd_transport_accept === true,
+      );
+      if (!(response instanceof Response) && !isWebSocketAcceptResponse && !isTransportAcceptResponse) {
         throw new Error("Worker fetch() must return a Response");
       }
 
-      const headers = Array.from(response.headers.entries());
-      await emitResponseStart(response.status, headers);
+      const responseHeaders = (isWebSocketAcceptResponse || isTransportAcceptResponse)
+        ? new Headers(response.headers ?? [])
+        : response.headers;
+      const status = isWebSocketAcceptResponse
+        ? Number(response.status ?? 101)
+        : isTransportAcceptResponse
+          ? Number(response.status ?? 200)
+          : response.status;
+      const headers = Array.from(responseHeaders.entries());
+      await emitResponseStart(status, headers);
 
       const bodyBytes = [];
-      if (response.body && typeof response.body.getReader === "function") {
+      if (!isWebSocketAcceptResponse && response.body) {
         const reader = response.body.getReader();
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) {
-              break;
-            }
-            const emitted = await emitResponseChunk(value);
-            bodyBytes.push(...emitted);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
           }
-        } finally {
-          if (typeof reader.releaseLock === "function") {
-            try {
-              reader.releaseLock();
-            } catch {
-              // Ignore release failures.
-            }
+          const chunk = toUtf8Bytes(value);
+          if (chunk.length === 0) {
+            continue;
           }
+          const emitted = await emitResponseChunk(chunk);
+          bodyBytes.push(...emitted);
         }
-      } else {
-        const emitted = await emitResponseChunk(new Uint8Array(await response.arrayBuffer()));
-        bodyBytes.push(...emitted);
       }
 
       return {
-        status: response.status,
+        status,
         headers,
         body: bodyBytes,
       };
     } finally {
+      if (typeof restoreHostFetch === "function") {
+        restoreHostFetch();
+      }
       inflightRequests.delete(requestId);
     }
   })()

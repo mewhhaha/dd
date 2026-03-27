@@ -5,6 +5,21 @@ export default {
       return new Response("missing KV binding: MY_KV", { status: 500 });
     }
 
+    if (
+      request.method === "GET"
+      && new URL(request.url).pathname === "/"
+      && !request.headers.get("x-request-id")
+    ) {
+      return Response.json({
+        ok: true,
+        worker: "wait-until-kv",
+        routes: [
+          "GET / with x-request-id header",
+        ],
+        note: "bg task writes done:{id} in waitUntil",
+      });
+    }
+
     const requestId = request.headers.get("x-request-id") ?? String(Date.now());
     ctx.waitUntil(
       (async () => {
