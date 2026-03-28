@@ -633,6 +633,7 @@
   const INTERNAL_TRANSPORT_HANDLE_HEADER = "x-dd-transport-handle";
   const INTERNAL_TRANSPORT_BINDING_HEADER = "x-dd-transport-actor-binding";
   const INTERNAL_TRANSPORT_KEY_HEADER = "x-dd-transport-actor-key";
+  const INTERNAL_TRANSPORT_METHOD_HEADER = "x-dd-transport-method";
 
   const encodeSocketSendPayload = (value, kind) => {
     if (kind != null) {
@@ -1115,12 +1116,14 @@
       }
       const existing = transportsByHandle.get(normalizedHandle);
       if (existing) {
+        existing.__dd_bindRequestId(currentTransportRequestId());
         consumeCloseEvents(existing).catch(() => {});
         return existing;
       }
 
       const datagramReadable = createTransportReadableChannel();
       const streamReadable = createTransportReadableChannel();
+      let boundRequestId = currentTransportRequestId();
       let closed = false;
       let closedResolved = false;
       let closedResolve = null;
@@ -1145,19 +1148,29 @@
       const sendTransportPayload = async (kind, value) => {
         const bytes = isBinaryLike(value) ? toArrayBytes(value) : toUtf8Bytes(value);
         const payload = Array.from(bytes);
+        const body = kind === "datagram"
+          ? {
+            request_id: boundRequestId,
+            handle: normalizedHandle,
+            binding: entry.binding,
+            key: entry.actorKey,
+            datagram: payload,
+          }
+          : {
+            request_id: boundRequestId,
+            handle: normalizedHandle,
+            binding: entry.binding,
+            key: entry.actorKey,
+            chunk: payload,
+          };
         const result = await callOpAny(
           [
             kind === "datagram"
-              ? "op_actor_transport_datagram_send"
-              : "op_actor_transport_stream_send",
+              ? "op_actor_transport_send_datagram"
+              : "op_actor_transport_send_stream",
             "op_actor_transport_send",
           ],
-          {
-            request_id: currentTransportRequestId(),
-            handle: normalizedHandle,
-            message_kind: kind,
-            message: payload,
-          },
+          body,
         );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -1167,6 +1180,12 @@
 
       const target = {
         __dd_handle: normalizedHandle,
+        __dd_bindRequestId(nextRequestId) {
+          const normalizedRequestId = String(nextRequestId ?? "").trim();
+          if (normalizedRequestId) {
+            boundRequestId = normalizedRequestId;
+          }
+        },
         get readyState() {
           return closed ? 3 : 1;
         },
@@ -1212,6 +1231,8 @@
             {
               request_id: currentTransportRequestId(),
               handle: normalizedHandle,
+              binding: entry.binding,
+              key: entry.actorKey,
               code: normalizedCode,
               reason: reason == null ? "" : String(reason),
             },
@@ -1223,12 +1244,15 @@
           finishClosed();
         },
         __dd_dispatchDatagram(value) {
+          target.__dd_bindRequestId(currentTransportRequestId());
           datagramReadable.push(value);
         },
         __dd_dispatchStreamChunk(value) {
+          target.__dd_bindRequestId(currentTransportRequestId());
           streamReadable.push(value);
         },
         __dd_dispatchClose(code, reason) {
+          target.__dd_bindRequestId(currentTransportRequestId());
           if (closedResolved) {
             return;
           }
@@ -1262,12 +1286,16 @@
         if (!(request instanceof Request)) {
           throw new Error("state.transports.accept requires a Request");
         }
-        if (String(request.method || "").toUpperCase() !== "CONNECT") {
+        const requestMethod = String(
+          request.headers.get(INTERNAL_TRANSPORT_METHOD_HEADER)
+          ?? request.method
+          ?? "",
+        ).toUpperCase();
+        if (requestMethod !== "CONNECT") {
           throw new Error("state.transports.accept requires a CONNECT request");
         }
         const protocol = String(
-          request.headers.get(":protocol")
-          ?? request.headers.get("protocol")
+          request.headers.get("protocol")
           ?? request.headers.get("x-dd-transport-protocol")
           ?? "",
         ).trim().toLowerCase();
@@ -2363,12 +2391,33 @@
         : input.body?.length
           ? new Uint8Array(input.body)
           : undefined;
+      const requestHeaders = new Headers(input.headers);
+      let requestMethod = String(input.method || "GET");
+      const isTransportConnect = requestMethod.toUpperCase() === "CONNECT"
+        && String(
+          requestHeaders.get("x-dd-transport-protocol")
+          ?? "",
+        ).trim().toLowerCase() === "webtransport";
+      if (isTransportConnect) {
+        requestHeaders.set(INTERNAL_TRANSPORT_METHOD_HEADER, requestMethod);
+        requestMethod = "GET";
+      }
       const request = new Request(input.url, {
-        method: input.method,
-        headers: input.headers,
+        method: requestMethod,
+        headers: requestHeaders,
         body: requestBody,
         signal: controller.signal,
       });
+      const workerRequest = isTransportConnect
+        ? new Proxy(request, {
+          get(target, property, receiver) {
+            if (property === "method") {
+              return "CONNECT";
+            }
+            return Reflect.get(target, property, receiver);
+          },
+        })
+        : request;
       const envResult = buildEnv();
       const env = envResult.env;
       const actorBindingClasses = envResult.actorBindingClasses;
@@ -2387,8 +2436,8 @@
       const response = hostRpcCallConfig
         ? await invokeHostRpcCall(hostRpcCallConfig)
         : actorCallConfig
-          ? await invokeActorClass(actorCallConfig, request, env, actorBindingClasses)
-          : await worker.fetch(request, env, ctx);
+          ? await invokeActorClass(actorCallConfig, workerRequest, env, actorBindingClasses)
+          : await worker.fetch(workerRequest, env, ctx);
       await syncFrozenTime();
 
       const isWebSocketAcceptResponse = Boolean(

@@ -13,6 +13,7 @@ WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 
 RUN cargo build --locked --release -p dd_server
 

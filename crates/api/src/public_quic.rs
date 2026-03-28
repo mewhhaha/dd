@@ -294,7 +294,7 @@ async fn handle_public_h3_transport(
     mut flow_send: OutboundFrameSender,
     mut flow_recv: InboundFrameStream,
 ) -> Result<()> {
-    validate_h3_transport_request(&parsed.request)?;
+    validate_h3_transport_request(parsed.method.as_str(), parsed.connect_protocol.as_deref())?;
 
     let (parts, _body) = parsed.request.into_parts();
     let worker_name = parse_public_worker_name_from_request(
@@ -400,8 +400,24 @@ async fn handle_public_h3_transport(
                         break;
                     }
                 }
-                InboundFrame::Body(_, fin) if fin => break,
-                InboundFrame::Body(_, _) => {}
+                InboundFrame::Body(body, fin) => {
+                    if !body.as_ref().is_empty()
+                        && runtime_for_datagrams
+                            .transport_push_stream(
+                                worker_for_datagrams.clone(),
+                                session_for_datagrams.clone(),
+                                body.as_ref().to_vec(),
+                                false,
+                            )
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                    if fin {
+                        break;
+                    }
+                }
             }
         }
         let _ = close_transport_session_once(
@@ -661,10 +677,19 @@ fn validate_h3_websocket_request(request: &Request<()>) -> Result<()> {
     Ok(())
 }
 
-fn validate_h3_transport_request(request: &Request<()>) -> Result<()> {
-    if request.method() != Method::CONNECT {
+fn validate_h3_transport_request(method: &str, connect_protocol: Option<&str>) -> Result<()> {
+    if !method.eq_ignore_ascii_case("CONNECT") {
         return Err(PlatformError::bad_request(
             "transport over http/3 requires CONNECT",
+        ));
+    }
+    let protocol = connect_protocol
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if protocol != "webtransport" {
+        return Err(PlatformError::bad_request(
+            "transport over http/3 requires :protocol=webtransport",
         ));
     }
     Ok(())

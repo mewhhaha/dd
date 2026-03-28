@@ -643,6 +643,10 @@ struct ActorSocketCloseResult {
 struct ActorTransportSendStreamPayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
     chunk: Vec<u8>,
 }
 
@@ -650,6 +654,10 @@ struct ActorTransportSendStreamPayload {
 struct ActorTransportSendDatagramPayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
     datagram: Vec<u8>,
 }
 
@@ -677,6 +685,10 @@ struct ActorTransportRecvResult {
 struct ActorTransportClosePayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
     code: u16,
     reason: String,
 }
@@ -2858,6 +2870,20 @@ async fn op_actor_socket_consume_close(
     }
 }
 
+fn actor_transport_scope_for_payload(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+    binding: &str,
+    key: &str,
+) -> std::result::Result<(String, String), PlatformError> {
+    let binding = binding.trim();
+    let key = key.trim();
+    if !binding.is_empty() && !key.is_empty() {
+        return Ok((binding.to_string(), key.to_string()));
+    }
+    actor_scope_for_request(state, request_id)
+}
+
 #[deno_core::op2]
 #[serde]
 async fn op_actor_transport_send_stream(
@@ -2877,7 +2903,12 @@ async fn op_actor_transport_send_stream(
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportSendResult {
@@ -2943,7 +2974,12 @@ async fn op_actor_transport_send_datagram(
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportSendResult {
@@ -3167,7 +3203,12 @@ async fn op_actor_transport_close(
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportCloseResult {

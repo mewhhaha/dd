@@ -1,5 +1,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+default_app := "dd-private-8956e096"
+default_fly_config := "deploy/fly/fly.toml"
+default_private_server := "http://127.0.0.1:18081"
+
 # Materialize vendor/<crate> from the locked crates.io source and apply patches/<crate>.patch if it exists.
 patch crate version='':
   ./scripts/patch-crate.sh {{crate}} {{version}}
@@ -11,3 +15,27 @@ patch-refresh crate version='':
 # Regenerate patches/<crate>.patch from vendor/<crate> versus the locked crates.io source.
 patch-save crate version='':
   ./scripts/patch-save-crate.sh {{crate}} {{version}}
+
+# Deploy the dd_server app to Fly.
+fly-deploy app=default_app config=default_fly_config:
+  FLYCTL_BIN="${FLYCTL_BIN:-$(
+    if command -v flyctl >/dev/null 2>&1; then
+      command -v flyctl
+    elif [ -x /home/mewhhaha/.fly/bin/flyctl ]; then
+      printf %s /home/mewhhaha/.fly/bin/flyctl
+    elif command -v fly >/dev/null 2>&1; then
+      command -v fly
+    else
+      echo "flyctl not found (set FLYCTL_BIN or install flyctl)" >&2
+      exit 1
+    fi
+  )}"; \
+  "$FLYCTL_BIN" deploy --app {{app}} --config {{config}} --remote-only --no-cache
+
+# Open a local proxy to the private deploy port on Fly.
+fly-proxy app=default_app local_port='18081' remote_port='8081':
+  ./deploy/fly/proxy-private-deploy.sh {{app}} {{local_port}} {{remote_port}}
+
+# Deploy a worker into the running Fly app through the private proxy.
+fly-worker-deploy name file server=default_private_server +flags:
+  cargo run -p cli -- --server {{server}} deploy {{name}} {{file}} {{flags}}

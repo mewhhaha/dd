@@ -34,6 +34,12 @@ flyctl volumes create dd_store --app your-dd-app --region ams --size 1
 flyctl deploy --app your-dd-app --config deploy/fly/fly.toml --flycast
 ```
 
+From the repo root you can use the built-in helper instead:
+
+```bash
+just fly-deploy your-dd-app
+```
+
 Use the Fly app default domain while iterating (`https://<app-name>.fly.dev`) once public ingress exists.
 
 The app keeps persistent data in `/app/store`:
@@ -50,10 +56,23 @@ Use the helper to resolve the active machine IPv6 and proxy local deploy traffic
 ./deploy/fly/proxy-private-deploy.sh your-dd-app 18081 8081
 ```
 
+Or from the repo root:
+
+```bash
+just fly-proxy your-dd-app
+```
+
 Then deploy workers to the private endpoint:
 
 ```bash
 cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.js
+```
+
+Or from the repo root:
+
+```bash
+just fly-worker-deploy hello examples/hello.js
+just fly-worker-deploy echo examples/echo.js --public
 ```
 
 This command deploys worker `hello` inside your existing Fly app. It does not create a new Fly app.

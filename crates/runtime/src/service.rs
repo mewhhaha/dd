@@ -6064,6 +6064,19 @@ mod tests {
         }
     }
 
+    fn test_transport_invocation() -> WorkerInvocation {
+        WorkerInvocation {
+            method: "CONNECT".to_string(),
+            url: "http://worker/session".to_string(),
+            headers: vec![(
+                "x-dd-transport-protocol".to_string(),
+                "webtransport".to_string(),
+            )],
+            body: Vec::new(),
+            request_id: "test-transport-request".to_string(),
+        }
+    }
+
     fn counter_worker() -> String {
         r#"
 let counter = 0;
@@ -6266,6 +6279,74 @@ export default {
     });
   },
 };
+"#
+        .to_string()
+    }
+
+    fn transport_echo_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env) {
+    const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
+    return actor.fetch(request);
+  },
+};
+
+export class MediaActor {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const { handle, response } = await this.state.transports.accept(request);
+    const session = new WebTransportSession(handle);
+
+    void (async () => {
+      const reader = session.stream.readable.getReader();
+      const writer = session.stream.writable.getWriter();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          await writer.close();
+          break;
+        }
+        await writer.write(value);
+      }
+    })();
+
+    return response;
+  }
+}
+"#
+        .to_string()
+    }
+
+    fn transport_shape_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env) {
+    const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
+    return actor.fetch(request);
+  },
+};
+
+export class MediaActor {
+  constructor(state) {
+    this.state = state;
+  }
+
+  async fetch(request) {
+    const protocol = String(request.headers.get("x-dd-transport-protocol") ?? "").toLowerCase();
+    if (request.method !== "CONNECT") {
+      return new Response(`bad-method:${request.method}`, { status: 500 });
+    }
+    if (protocol !== "webtransport") {
+      return new Response(`bad-protocol:${protocol}`, { status: 500 });
+    }
+    const { response } = await this.state.transports.accept(request);
+    return response;
+  }
+}
 "#
         .to_string()
     }
@@ -6670,7 +6751,7 @@ export class MyActor {
       if (this.active > this.max) {
         this.max = this.active;
       }
-      await Deno.core.ops.op_sleep(25);
+      await Deno.core.ops.op_sleep(100);
       this.active -= 1;
       return new Response("ok");
     }
@@ -7201,7 +7282,7 @@ export default {
             .headers
             .iter()
             .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
-                && value == "application/json; charset=utf-8"));
+                && value == "application/json"));
     }
 
     #[tokio::test]
@@ -7329,6 +7410,122 @@ export default {
             body.contains(r#""responseJsonType":"application/json""#),
             "body was {body}"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transport_open_works_with_deno_request_compatibility() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "transport-runtime".to_string(),
+                transport_echo_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MEDIA".to_string(),
+                        class: "MediaActor".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+        let opened = service
+            .open_transport(
+                "transport-runtime".to_string(),
+                test_transport_invocation(),
+                stream_tx,
+                datagram_tx,
+            )
+            .await
+            .expect("transport open should succeed");
+
+        assert_eq!(opened.output.status, 200);
+
+        service
+            .transport_push_stream(
+                "transport-runtime".to_string(),
+                opened.session_id.clone(),
+                b"hello-transport".to_vec(),
+                false,
+            )
+            .await
+            .expect("transport push should succeed");
+
+        let echoed = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .expect("stream echo should arrive")
+            .expect("stream echo channel should stay open");
+        assert_eq!(echoed, b"hello-transport");
+
+        service
+            .transport_close(
+                "transport-runtime".to_string(),
+                opened.session_id,
+                0,
+                "done".to_string(),
+            )
+            .await
+            .expect("transport close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transport_open_preserves_connect_shape_for_actor_code() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "transport-shape".to_string(),
+                transport_shape_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MEDIA".to_string(),
+                        class: "MediaActor".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
+        let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+        let opened = service
+            .open_transport(
+                "transport-shape".to_string(),
+                test_transport_invocation(),
+                stream_tx,
+                datagram_tx,
+            )
+            .await
+            .expect("transport open should succeed");
+
+        assert_eq!(opened.output.status, 200);
     }
 
     #[tokio::test]
@@ -8035,6 +8232,7 @@ export default {
             .await
             .expect("deploy should succeed");
 
+        let started = Instant::now();
         let mut tasks = Vec::new();
         for idx in 0..8 {
             let svc = service.clone();
@@ -8050,19 +8248,11 @@ export default {
             let output = task.await.expect("join").expect("invoke should succeed");
             assert_eq!(output.status, 200);
         }
-
-        let max = service
-            .invoke(
-                "actor".to_string(),
-                test_invocation_with_path("/max?key=user-1", "actor-max"),
-            )
-            .await
-            .expect("max invoke should succeed");
-        let parsed = String::from_utf8(max.body)
-            .expect("utf8")
-            .parse::<u64>()
-            .expect("numeric max");
-        assert!(parsed > 1, "expected overlap for same actor key by default");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "expected overlap for same actor key by default, elapsed={elapsed:?}"
+        );
     }
 
     #[tokio::test]

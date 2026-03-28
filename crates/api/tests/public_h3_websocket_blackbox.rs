@@ -120,16 +120,72 @@ async fn blackbox_public_h3_websocket_echoes_text_and_binary() {
     );
 }
 
-#[tokio::test]
-#[ignore = "raw quiche client stack-overflows on webtransport CONNECT in this harness; keep as a focused repro until replaced"]
-async fn blackbox_public_h3_transport_echoes_stream() {
-    let _guard = test_lock().lock().await;
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let harness = ServerHarness::start().await;
-        harness
-            .deploy_public_worker(
-                "transport",
-                r#"
+#[test]
+fn blackbox_public_h3_rejects_unknown_extended_connect_protocol() {
+    std::thread::Builder::new()
+        .name("dd-h3-invalid-connect-blackbox".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async {
+                let _guard = test_lock().lock().await;
+                let harness = ServerHarness::start().await;
+
+                let mut client = RawQuicheH3Client::connect(harness.public_addr).await;
+                let stream_id = client
+                    .send_request(
+                        vec![
+                            Header::new(b":method", b"CONNECT"),
+                            Header::new(b":scheme", b"https"),
+                            Header::new(
+                                b":authority",
+                                format!("echo.localhost:{}", harness.public_addr.port()).as_bytes(),
+                            ),
+                            Header::new(b":path", b"/session"),
+                            Header::new(b":protocol", b"not-webtransport"),
+                        ],
+                        true,
+                    )
+                    .await;
+
+                let response = client.recv_response_headers(stream_id).await;
+                assert_eq!(header_value(&response, ":status"), Some("501"));
+
+                let body = client.recv_body_chunk(stream_id).await;
+                assert!(
+                    String::from_utf8_lossy(&body)
+                        .contains("unsupported extended CONNECT protocol"),
+                    "unexpected error body: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            });
+        })
+        .expect("spawn invalid connect blackbox thread")
+        .join()
+        .expect("invalid connect blackbox thread panicked");
+}
+
+#[test]
+fn blackbox_public_h3_transport_echoes_stream() {
+    std::thread::Builder::new()
+        .name("dd-h3-transport-blackbox".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async {
+                let _guard = test_lock().lock().await;
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    let harness = ServerHarness::start().await;
+                    harness
+                        .deploy_public_worker(
+                            "transport",
+                            r#"
                 export default {
                   async fetch(request, env) {
                     const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
@@ -162,46 +218,52 @@ async fn blackbox_public_h3_transport_echoes_stream() {
                   }
                 }
             "#,
-                DeployConfig {
-                    public: true,
-                    bindings: vec![DeployBinding::Actor {
-                        binding: "MEDIA".to_string(),
-                        class: "MediaActor".to_string(),
-                    }],
-                    ..Default::default()
-                },
-            )
-            .await;
+                            DeployConfig {
+                                public: true,
+                                bindings: vec![DeployBinding::Actor {
+                                    binding: "MEDIA".to_string(),
+                                    class: "MediaActor".to_string(),
+                                }],
+                                ..Default::default()
+                            },
+                        )
+                        .await;
 
-        let mut client = RawQuicheH3Client::connect(harness.public_addr).await;
-        let stream_id = client
-            .send_request(
-                vec![
-                    Header::new(b":method", b"CONNECT"),
-                    Header::new(b":scheme", b"https"),
-                    Header::new(
-                        b":authority",
-                        format!("transport.localhost:{}", harness.public_addr.port()).as_bytes(),
-                    ),
-                    Header::new(b":path", b"/session"),
-                    Header::new(b":protocol", b"webtransport"),
-                ],
-                false,
-            )
-            .await;
+                    let mut client = RawQuicheH3Client::connect(harness.public_addr).await;
+                    let stream_id = client
+                        .send_request(
+                            vec![
+                                Header::new(b":method", b"CONNECT"),
+                                Header::new(b":scheme", b"https"),
+                                Header::new(
+                                    b":authority",
+                                    format!("transport.localhost:{}", harness.public_addr.port())
+                                        .as_bytes(),
+                                ),
+                                Header::new(b":path", b"/session"),
+                                Header::new(b":protocol", b"webtransport"),
+                            ],
+                            false,
+                        )
+                        .await;
 
-        let response = client.recv_response_headers(stream_id).await;
-        assert_eq!(header_value(&response, ":status"), Some("200"));
-        assert_eq!(header_value(&response, "connection"), None);
-        assert_eq!(header_value(&response, "upgrade"), None);
+                    let response = client.recv_response_headers(stream_id).await;
+                    assert_eq!(header_value(&response, ":status"), Some("200"));
+                    assert_eq!(header_value(&response, "connection"), None);
+                    assert_eq!(header_value(&response, "upgrade"), None);
 
-        client
-            .send_body_chunk(stream_id, b"stream-hello", false)
-            .await;
-        assert_eq!(client.recv_body_chunk(stream_id).await, b"stream-hello");
-    })
-    .await
-    .expect("transport blackbox test timed out");
+                    client
+                        .send_body_chunk(stream_id, b"stream-hello", false)
+                        .await;
+                    assert_eq!(client.recv_body_chunk(stream_id).await, b"stream-hello");
+                })
+                .await
+                .expect("transport blackbox test timed out");
+            });
+        })
+        .expect("spawn transport blackbox thread")
+        .join()
+        .expect("transport blackbox thread panicked");
 }
 
 fn test_lock() -> &'static Mutex<()> {

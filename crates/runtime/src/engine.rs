@@ -475,6 +475,7 @@ unsafe fn noop_waker_drop(_: *const ()) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     async fn resolve_with_event_loop(
         js_runtime: &mut JsRuntime,
@@ -501,6 +502,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn bootstrap_snapshot_builds() {
         let _ = build_bootstrap_snapshot()
             .await
@@ -508,6 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn runtime_starts_from_bootstrap_snapshot() {
         let snapshot = build_bootstrap_snapshot()
             .await
@@ -516,6 +519,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn worker_snapshot_builds_from_bootstrap_snapshot() {
         let snapshot = build_bootstrap_snapshot()
             .await
@@ -530,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn deno_fetch_classes_work_from_bootstrap_snapshot() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -662,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn direct_worker_fetch_works_after_loading_worker_into_runtime() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -715,6 +721,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn response_constructor_works_after_loading_worker_into_runtime() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
