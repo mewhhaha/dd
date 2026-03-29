@@ -18,18 +18,7 @@ patch-save crate version='':
 
 # Deploy the dd_server app to Fly.
 fly-deploy app=default_app config=default_fly_config:
-  FLYCTL_BIN="${FLYCTL_BIN:-$(
-    if command -v flyctl >/dev/null 2>&1; then
-      command -v flyctl
-    elif [ -x /home/mewhhaha/.fly/bin/flyctl ]; then
-      printf %s /home/mewhhaha/.fly/bin/flyctl
-    elif command -v fly >/dev/null 2>&1; then
-      command -v fly
-    else
-      echo "flyctl not found (set FLYCTL_BIN or install flyctl)" >&2
-      exit 1
-    fi
-  )}"; \
+  FLYCTL_BIN="${FLYCTL_BIN:-$(if command -v flyctl >/dev/null 2>&1; then command -v flyctl; elif [ -x /home/mewhhaha/.fly/bin/flyctl ]; then printf %s /home/mewhhaha/.fly/bin/flyctl; elif command -v fly >/dev/null 2>&1; then command -v fly; else echo "flyctl not found (set FLYCTL_BIN or install flyctl)" >&2; exit 1; fi)}"; \
   "$FLYCTL_BIN" deploy --app {{app}} --config {{config}} --remote-only --no-cache
 
 # Open a local proxy to the private deploy port on Fly.
@@ -37,5 +26,5 @@ fly-proxy app=default_app local_port='18081' remote_port='8081':
   ./deploy/fly/proxy-private-deploy.sh {{app}} {{local_port}} {{remote_port}}
 
 # Deploy a worker into the running Fly app through the private proxy.
-fly-worker-deploy name file server=default_private_server +flags:
-  cargo run -p cli -- --server {{server}} deploy {{name}} {{file}} {{flags}}
+fly-worker-deploy name file +flags:
+  cargo run -p cli -- --server {{default_private_server}} deploy {{name}} {{file}} {{flags}}

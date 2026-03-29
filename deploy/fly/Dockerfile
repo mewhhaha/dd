@@ -1,11 +1,17 @@
-FROM rust:1-slim AS builder
+FROM rust:1-bookworm AS builder
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     capnproto \
+    clang \
+    cmake \
     curl \
+    git \
     libssl-dev \
+    ninja-build \
+    perl \
     pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
