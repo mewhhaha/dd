@@ -184,8 +184,8 @@ Current baseline results are in `BENCHMARKS.md`.
 - same actor key can run with multiple in-flight requests on its owner isolate
 - KV `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
 - actor storage is only available inside actor classes via `constructor(state, env)`
-- actor storage writes should use CAS (`expectedVersion`) to avoid lost updates
-- actor storage `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
+- actor storage `get/put/delete/list` are synchronous inside actor classes
+- actor storage writes are write-last with monotonic versions
 - structured values use V8 storage serialization (`forStorage: true`) and reject unsupported host/function types
 - actor storage uses namespace shards (default 64 shards per namespace)
 - dropped invokes are canceled and signaled via `ctx.signal`

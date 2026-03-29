@@ -13,28 +13,36 @@ If you want to try the built-in Fly domain, set `PUBLIC_BASE_DOMAIN` to your app
 
 ## Important model
 
-Workers are deployed into the running `dd_server` app via its private deploy endpoint.
-They are not separate Fly apps.
+On Fly there is one app process:
 
-- `flyctl deploy` updates the server app image.
-- `cargo run -p cli -- deploy ...` (against private port `8081`) deploys worker code.
+- app/container: `dd_server`
+- workers: deployed into that running app through the private deploy endpoint
 
-## 1) App and volume
+Workers are **not** separate Fly apps.
 
-`fly.toml` currently points to `dd-private-8956e096` in `ams`.
+That means:
+
+- `fly deploy` updates the `dd_server` binary/container
+- `dd deploy` uploads worker source/config into the running `dd_server`
+
+## 1) Create the app + volume
 
 ```bash
 flyctl apps create your-dd-app
-flyctl volumes create dd_store --app your-dd-app --region ams --size 1
+flyctl volumes create dd_store --region ams --size 1 --app your-dd-app
 ```
 
-## 2) Deploy
+This profile defaults to `ams` because it is EU and widely available.
+
+## 2) Deploy the platform
+
+From the repo root:
 
 ```bash
-flyctl deploy --app your-dd-app --config deploy/fly/fly.toml --flycast
+flyctl deploy --app your-dd-app --config deploy/fly/fly.toml --remote-only --no-cache
 ```
 
-From the repo root you can use the built-in helper instead:
+Or use the helper:
 
 ```bash
 just fly-deploy your-dd-app
@@ -44,7 +52,7 @@ Use the Fly app default domain while iterating (`https://<app-name>.fly.dev`) on
 
 The app keeps persistent data in `/app/store`:
 
-- worker deployment files
+- deployed worker source/config
 - KV/actor/sqlite files
 - cache blobs/indexes
 
@@ -66,37 +74,26 @@ Then deploy workers to the private endpoint:
 
 ```bash
 cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.js
+cargo run -p cli -- --server http://127.0.0.1:18081 deploy echo examples/echo.js --public
 ```
-
-Or from the repo root:
-
-```bash
-just fly-worker-deploy hello examples/hello.js
-just fly-worker-deploy echo examples/echo.js --public
-```
-
-This command deploys worker `hello` inside your existing Fly app. It does not create a new Fly app.
 
 ## 4) Public worker traffic
 
-Set `PUBLIC_BASE_DOMAIN` in `fly.toml` to your domain (for example `example.com`).
-Public requests route by subdomain:
+Once a worker is deployed with `--public`, public internet traffic can reach it via host routing:
 
-- `foo.example.com/*` invokes worker `foo`
-- apex `example.com` returns `404`
+- `echo.example.com/* -> worker "echo"`
 
-Public deploy route is not exposed.
+For the built-in Fly domain:
 
-## 5) Custom domain + wildcard
+- if app name is `your-dd-app`
+- set `PUBLIC_BASE_DOMAIN=your-dd-app.fly.dev`
+- then `https://echo.your-dd-app.fly.dev/` maps to worker `echo`
 
-Allocate public ingress for internet traffic:
+Fly’s default app hostname itself (the apex) is not mapped to a worker and returns `404`.
 
-```bash
-flyctl ips allocate-v4 --shared --app your-dd-app
-flyctl ips allocate-v6 --app your-dd-app
-```
+## 5) Custom domain + wildcard subdomains
 
-Attach your domain and wildcard to the app:
+If you want `worker.yourdomain.com -> worker`, add certs + DNS:
 
 ```bash
 flyctl certs add example.com --app your-dd-app
@@ -105,10 +102,25 @@ flyctl certs add "*.example.com" --app your-dd-app
 
 Add DNS records at your DNS provider as instructed by `flyctl certs show`.
 
+Then set:
+
+```toml
+[env]
+PUBLIC_BASE_DOMAIN = "example.com"
+```
+
+Now:
+
+- `echo.example.com` -> worker `echo`
+- `chat.example.com` -> worker `chat`
+
 ## 6) Operations
 
-```bash
-flyctl logs --app your-dd-app
-flyctl machines list --app your-dd-app
-flyctl ips list --app your-dd-app
-```
+- redeploy platform:
+  - `just fly-deploy your-dd-app`
+- open private deploy proxy:
+  - `just fly-proxy your-dd-app`
+- deploy worker:
+  - `cargo run -p cli -- --server http://127.0.0.1:18081 deploy name file.js [--public]`
+- invoke private worker:
+  - `cargo run -p cli -- --server http://127.0.0.1:18081 invoke name --method GET --path /`

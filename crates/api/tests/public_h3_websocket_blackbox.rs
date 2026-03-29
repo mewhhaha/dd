@@ -3,21 +3,30 @@ use quiche::h3::{Header, NameValue};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tokio::{io::AsyncReadExt, io::AsyncWriteExt};
 use uuid::Uuid;
 
 const MAX_QUIC_DATAGRAM_SIZE: usize = 1350;
 
-#[tokio::test]
-async fn blackbox_public_h3_websocket_echoes_text_and_binary() {
-    let _guard = test_lock().lock().await;
-    let harness = ServerHarness::start().await;
-    harness
-        .deploy_public_worker(
-            "echo",
-            r#"
+#[test]
+fn blackbox_public_h3_websocket_echoes_text_and_binary() {
+    std::thread::Builder::new()
+        .name("dd-h3-websocket-echo-blackbox".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async {
+                let _guard = test_lock().lock().await;
+                let harness = ServerHarness::start().await;
+                harness
+                    .deploy_public_worker(
+                        "echo",
+                        r#"
                 export default {
                   async fetch(request, env) {
                     const actor = env.CHAT.get(env.CHAT.idFromName("global"));
@@ -48,76 +57,192 @@ async fn blackbox_public_h3_websocket_echoes_text_and_binary() {
                   }
                 }
             "#,
-            DeployConfig {
-                public: true,
-                bindings: vec![DeployBinding::Actor {
-                    binding: "CHAT".to_string(),
-                    class: "ChatActor".to_string(),
-                }],
-                ..Default::default()
-            },
-        )
-        .await;
+                        DeployConfig {
+                            public: true,
+                            bindings: vec![DeployBinding::Actor {
+                                binding: "CHAT".to_string(),
+                                class: "ChatActor".to_string(),
+                            }],
+                            ..Default::default()
+                        },
+                    )
+                    .await;
 
-    let mut client = RawQuicheH3Client::connect(harness.public_addr).await;
-    let stream_id = client
-        .send_request(
-            vec![
-                Header::new(b":method", b"CONNECT"),
-                Header::new(b":scheme", b"https"),
-                Header::new(
-                    b":authority",
-                    format!("echo.localhost:{}", harness.public_addr.port()).as_bytes(),
-                ),
-                Header::new(b":path", b"/ws"),
-                Header::new(b":protocol", b"websocket"),
-                Header::new(b"sec-websocket-version", b"13"),
-                Header::new(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="),
-            ],
-            false,
-        )
-        .await;
+                let mut client = RawQuicheH3Client::connect(harness.public_addr).await;
+                let stream_id = client
+                    .send_request(
+                        vec![
+                            Header::new(b":method", b"CONNECT"),
+                            Header::new(b":scheme", b"https"),
+                            Header::new(
+                                b":authority",
+                                format!("echo.localhost:{}", harness.public_addr.port())
+                                    .as_bytes(),
+                            ),
+                            Header::new(b":path", b"/ws"),
+                            Header::new(b":protocol", b"websocket"),
+                            Header::new(b"sec-websocket-version", b"13"),
+                            Header::new(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="),
+                        ],
+                        false,
+                    )
+                    .await;
 
-    let response = client.recv_response_headers(stream_id).await;
-    assert_eq!(header_value(&response, ":status"), Some("200"));
-    assert_eq!(header_value(&response, "connection"), None);
-    assert_eq!(header_value(&response, "upgrade"), None);
-    assert_eq!(header_value(&response, "sec-websocket-accept"), None);
+                let response = client.recv_response_headers(stream_id).await;
+                assert_eq!(header_value(&response, ":status"), Some("200"));
+                assert_eq!(header_value(&response, "connection"), None);
+                assert_eq!(header_value(&response, "upgrade"), None);
+                assert_eq!(header_value(&response, "sec-websocket-accept"), None);
 
-    client
-        .send_websocket_frame(stream_id, WebSocketFrame::Text("hello".to_string()))
-        .await;
-    assert_eq!(
-        client.recv_websocket_frame(stream_id).await,
-        WebSocketFrame::Text("echo:hello".to_string())
-    );
+                client
+                    .send_websocket_frame(stream_id, WebSocketFrame::Text("hello".to_string()))
+                    .await;
+                assert_eq!(
+                    client.recv_websocket_frame(stream_id).await,
+                    WebSocketFrame::Text("echo:hello".to_string())
+                );
 
-    client
-        .send_websocket_frame(stream_id, WebSocketFrame::Binary(vec![1, 2, 3, 4]))
-        .await;
-    assert_eq!(
-        client.recv_websocket_frame(stream_id).await,
-        WebSocketFrame::Binary(vec![1, 2, 3, 4])
-    );
+                client
+                    .send_websocket_frame(stream_id, WebSocketFrame::Binary(vec![1, 2, 3, 4]))
+                    .await;
+                assert_eq!(
+                    client.recv_websocket_frame(stream_id).await,
+                    WebSocketFrame::Binary(vec![1, 2, 3, 4])
+                );
 
-    client
-        .send_websocket_frame(stream_id, WebSocketFrame::Ping(vec![9, 8, 7]))
-        .await;
-    assert_eq!(
-        client.recv_websocket_frame(stream_id).await,
-        WebSocketFrame::Pong(vec![9, 8, 7])
-    );
+                client
+                    .send_websocket_frame(stream_id, WebSocketFrame::Ping(vec![9, 8, 7]))
+                    .await;
+                assert_eq!(
+                    client.recv_websocket_frame(stream_id).await,
+                    WebSocketFrame::Pong(vec![9, 8, 7])
+                );
 
-    client
-        .send_websocket_frame(stream_id, WebSocketFrame::Text("bye".to_string()))
-        .await;
-    assert_eq!(
-        client.recv_websocket_frame(stream_id).await,
-        WebSocketFrame::Close {
-            code: 4001,
-            reason: "done".to_string(),
-        }
-    );
+                client
+                    .send_websocket_frame(stream_id, WebSocketFrame::Text("bye".to_string()))
+                    .await;
+                assert_eq!(
+                    client.recv_websocket_frame(stream_id).await,
+                    WebSocketFrame::Close {
+                        code: 4001,
+                        reason: "done".to_string(),
+                    }
+                );
+            });
+        })
+        .expect("spawn websocket echo blackbox thread")
+        .join()
+        .expect("websocket echo blackbox thread panicked");
+}
+
+#[test]
+fn blackbox_public_h3_websocket_storage_on_message_does_not_close() {
+    std::thread::Builder::new()
+        .name("dd-h3-websocket-storage-blackbox".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async {
+                let _guard = test_lock().lock().await;
+                let harness = ServerHarness::start().await;
+                harness
+                    .deploy_public_worker(
+                        "chat",
+                        r#"
+                export default {
+                  async fetch(request, env) {
+                    const actor = env.CHAT.get(env.CHAT.idFromName("global"));
+                    return actor.fetch(request);
+                  }
+                };
+
+                export class ChatActor {
+                  constructor(state) {
+                    this.state = state;
+                    this.memoryCount = 0;
+                  }
+
+                  async fetch(request) {
+                    const { handle, response } = await this.state.sockets.accept(request);
+                    const ws = new WebSocket(handle);
+                    ws.addEventListener("message", async (event) => {
+                      this.memoryCount += 1;
+                      const text = typeof event.data === "string"
+                        ? event.data
+                        : new TextDecoder().decode(event.data);
+                      const stored = this.state.storage.get("chat");
+                      const next = {
+                        count: Number(stored?.value?.count ?? 0) + 1,
+                        last: text,
+                      };
+                      this.state.storage.put("chat", next);
+                      await ws.send(JSON.stringify({
+                        seen: text,
+                        count: next.count,
+                        memory: this.memoryCount,
+                      }));
+                    });
+                    return response;
+                  }
+                }
+            "#,
+                        DeployConfig {
+                            public: true,
+                            bindings: vec![DeployBinding::Actor {
+                                binding: "CHAT".to_string(),
+                                class: "ChatActor".to_string(),
+                            }],
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                let mut client = RawQuicheH3Client::connect(harness.public_addr).await;
+                let stream_id = client
+                    .send_request(
+                        vec![
+                            Header::new(b":method", b"CONNECT"),
+                            Header::new(b":scheme", b"https"),
+                            Header::new(
+                                b":authority",
+                                format!("chat.localhost:{}", harness.public_addr.port())
+                                    .as_bytes(),
+                            ),
+                            Header::new(b":path", b"/ws"),
+                            Header::new(b":protocol", b"websocket"),
+                            Header::new(b"sec-websocket-version", b"13"),
+                            Header::new(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="),
+                        ],
+                        false,
+                    )
+                    .await;
+
+                let response = client.recv_response_headers(stream_id).await;
+                assert_eq!(header_value(&response, ":status"), Some("200"));
+
+                client
+                    .send_websocket_frame(stream_id, WebSocketFrame::Text("ready".to_string()))
+                    .await;
+                assert_eq!(
+                    client.recv_websocket_frame(stream_id).await,
+                    WebSocketFrame::Text(r#"{"seen":"ready","count":1,"memory":1}"#.to_string())
+                );
+
+                client
+                    .send_websocket_frame(stream_id, WebSocketFrame::Text("again".to_string()))
+                    .await;
+                assert_eq!(
+                    client.recv_websocket_frame(stream_id).await,
+                    WebSocketFrame::Text(r#"{"seen":"again","count":2,"memory":2}"#.to_string())
+                );
+            });
+        })
+        .expect("spawn websocket storage blackbox thread")
+        .join()
+        .expect("websocket storage blackbox thread panicked");
 }
 
 #[test]
@@ -264,6 +389,36 @@ fn blackbox_public_h3_transport_echoes_stream() {
         .expect("spawn transport blackbox thread")
         .join()
         .expect("transport blackbox thread panicked");
+}
+
+#[test]
+fn blackbox_public_h3_blocks_control_plane_routes() {
+    std::thread::Builder::new()
+        .name("dd-public-h3-blocks-control-plane".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async {
+                let _guard = test_lock().lock().await;
+                let harness = ServerHarness::start().await;
+                let response = send_h3_request(
+                    harness.public_addr,
+                    "localhost",
+                    "POST",
+                    "/v1/deploy",
+                    &[("content-type".to_string(), "application/json".to_string())],
+                    b"{}",
+                )
+                .await;
+                assert_eq!(response.0, 404);
+            });
+        })
+        .expect("spawn public h3 block control-plane thread")
+        .join()
+        .expect("public h3 block control-plane thread panicked");
 }
 
 fn test_lock() -> &'static Mutex<()> {
@@ -415,6 +570,41 @@ fn parse_http_response(bytes: &[u8]) -> (u16, String) {
     (status, body)
 }
 
+async fn send_h3_request(
+    address: std::net::SocketAddr,
+    authority_host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> (u16, String) {
+    let mut client = RawQuicheH3Client::connect(address).await;
+    let mut request_headers = vec![
+        Header::new(b":method", method.as_bytes()),
+        Header::new(b":scheme", b"https"),
+        Header::new(
+            b":authority",
+            format!("{authority_host}:{}", address.port()).as_bytes(),
+        ),
+        Header::new(b":path", path.as_bytes()),
+    ];
+    for (name, value) in headers {
+        request_headers.push(Header::new(name.as_bytes(), value.as_bytes()));
+    }
+    let stream_id = client
+        .send_request(request_headers, body.is_empty())
+        .await;
+    if !body.is_empty() {
+        client.send_body_chunk(stream_id, body, true).await;
+    }
+    let headers = client.recv_response_headers(stream_id).await;
+    let status = header_value(&headers, ":status")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or_default();
+    let body = client.recv_full_body(stream_id).await;
+    (status, String::from_utf8_lossy(&body).to_string())
+}
+
 struct RawQuicheH3Client {
     socket: tokio::net::UdpSocket,
     local_addr: std::net::SocketAddr,
@@ -436,20 +626,29 @@ enum WebSocketFrame {
 
 impl RawQuicheH3Client {
     async fn connect(public_addr: std::net::SocketAddr) -> Self {
+        Self::try_connect(public_addr)
+            .await
+            .expect("connect raw quiche client")
+    }
+
+    async fn try_connect(public_addr: std::net::SocketAddr) -> Result<Self, String> {
         let bind_addr = match public_addr {
             std::net::SocketAddr::V4(_) => "0.0.0.0:0",
             std::net::SocketAddr::V6(_) => "[::]:0",
         };
         let socket = tokio::net::UdpSocket::bind(bind_addr)
             .await
-            .expect("bind raw quiche client socket");
-        let local_addr = socket.local_addr().expect("raw quiche client local addr");
+            .map_err(|error| format!("bind raw quiche client socket: {error}"))?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|error| format!("raw quiche client local addr: {error}"))?;
 
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("quiche config");
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
+            .map_err(|error| format!("quiche config: {error}"))?;
         config.verify_peer(false);
         config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-            .expect("set h3 alpn");
+            .map_err(|error| format!("set h3 alpn: {error}"))?;
         config.set_max_idle_timeout(5_000);
         config.set_max_recv_udp_payload_size(MAX_QUIC_DATAGRAM_SIZE);
         config.set_max_send_udp_payload_size(MAX_QUIC_DATAGRAM_SIZE);
@@ -471,7 +670,7 @@ impl RawQuicheH3Client {
             public_addr,
             &mut config,
         )
-        .expect("connect raw quiche client");
+        .map_err(|error| format!("connect raw quiche client: {error}"))?;
         let mut read_buffer = [0; 65535];
         let mut write_buffer = [0; 65535];
 
@@ -490,11 +689,11 @@ impl RawQuicheH3Client {
 
         let h3 = quiche::h3::Connection::with_transport(
             &mut conn,
-            &quiche::h3::Config::new().expect("h3 config"),
+            &quiche::h3::Config::new().map_err(|error| format!("h3 config: {error}"))?,
         )
-        .expect("create raw h3 connection");
+        .map_err(|error| format!("create raw h3 connection: {error}"))?;
 
-        Self {
+        Ok(Self {
             socket,
             local_addr,
             conn,
@@ -502,7 +701,7 @@ impl RawQuicheH3Client {
             read_buffer,
             write_buffer,
             websocket_buffer: Vec::new(),
-        }
+        })
     }
 
     async fn send_request(&mut self, headers: Vec<quiche::h3::Header>, fin: bool) -> u64 {
@@ -586,6 +785,17 @@ impl RawQuicheH3Client {
                     panic!("raw h3 response stream reset: {error}");
                 }
             }
+        }
+    }
+
+    async fn recv_full_body(&mut self, expected_stream_id: u64) -> Vec<u8> {
+        let mut body = Vec::new();
+        loop {
+            let chunk = self.recv_body_chunk(expected_stream_id).await;
+            if chunk.is_empty() {
+                return body;
+            }
+            body.extend_from_slice(&chunk);
         }
     }
 

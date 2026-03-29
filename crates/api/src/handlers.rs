@@ -642,63 +642,119 @@ pub(crate) async fn handle_websocket_session<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (mut sender, mut receiver) = socket.split();
+    let mut wait_for_frame =
+        Box::pin(runtime.websocket_wait_frame(worker_name.clone(), session_id.clone()));
 
-    while let Some(message) = receiver.next().await {
-        match message {
-            Ok(message) => match message {
-                Message::Text(text) => {
-                    if forward_websocket_frame(
-                        &mut sender,
-                        &runtime,
-                        &worker_name,
-                        &session_id,
-                        text.to_string().into_bytes(),
-                        false,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-                Message::Binary(payload) => {
-                    if forward_websocket_frame(
-                        &mut sender,
-                        &runtime,
-                        &worker_name,
-                        &session_id,
-                        payload.to_vec(),
-                        true,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-                Message::Close(frame) => {
-                    let reason = frame
-                        .as_ref()
-                        .map(|frame| frame.reason.to_string())
-                        .unwrap_or_default();
-                    let code = frame
-                        .as_ref()
-                        .map(|frame| u16::from(frame.code))
-                        .unwrap_or(1000);
-                    let _ = runtime
-                        .websocket_close(worker_name.clone(), session_id.clone(), code, reason)
-                        .await;
+    loop {
+        tokio::select! {
+            message = receiver.next() => {
+                let Some(message) = message else {
                     break;
+                };
+                match message {
+                    Ok(message) => match message {
+                        Message::Text(text) => {
+                            if forward_websocket_frame(
+                                &mut sender,
+                                &runtime,
+                                &worker_name,
+                                &session_id,
+                                text.to_string().into_bytes(),
+                                false,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Message::Binary(payload) => {
+                            if forward_websocket_frame(
+                                &mut sender,
+                                &runtime,
+                                &worker_name,
+                                &session_id,
+                                payload.to_vec(),
+                                true,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Message::Close(frame) => {
+                            let reason = frame
+                                .as_ref()
+                                .map(|frame| frame.reason.to_string())
+                                .unwrap_or_default();
+                            let code = frame
+                                .as_ref()
+                                .map(|frame| u16::from(frame.code))
+                                .unwrap_or(1000);
+                            let _ = runtime
+                                .websocket_close(worker_name.clone(), session_id.clone(), code, reason)
+                                .await;
+                            break;
+                        }
+                        Message::Ping(payload) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Pong(_) => {}
+                        Message::Frame(_) => {}
+                    },
+                    Err(_) => break,
                 }
-                Message::Ping(payload) => {
-                    if sender.send(Message::Pong(payload)).await.is_err() {
+            }
+            wait = &mut wait_for_frame => {
+                match wait {
+                    Ok(()) => {
+                        let mut should_stop = false;
+                        loop {
+                            match runtime
+                                .websocket_drain_frame(worker_name.clone(), session_id.clone())
+                                .await
+                            {
+                                Ok(Some(output)) => {
+                                    if deliver_websocket_output(
+                                        &mut sender,
+                                        &runtime,
+                                        &worker_name,
+                                        &session_id,
+                                        output,
+                                        false,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        should_stop = true;
+                                        break;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    let _ = sender.send(Message::Close(None)).await;
+                                    should_stop = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if should_stop {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = sender.send(Message::Close(None)).await;
                         break;
                     }
                 }
-                Message::Pong(_) => {}
-                Message::Frame(_) => {}
-            },
-            Err(_) => break,
+                wait_for_frame = Box::pin(runtime.websocket_wait_frame(
+                    worker_name.clone(),
+                    session_id.clone(),
+                ));
+            }
         }
     }
 
@@ -730,57 +786,78 @@ where
         .await
     {
         Ok(output) => {
-            if let Some((close_code, close_reason)) =
-                extract_websocket_close_signal(&output.headers)
-            {
-                let _ = sender
-                    .send(Message::Close(Some(CloseFrame {
-                        code: close_code.into(),
-                        reason: close_reason.into(),
-                    })))
-                    .await;
-                let _ = runtime
-                    .websocket_close(
-                        worker_name.to_string(),
-                        session_id.to_string(),
-                        close_code,
-                        String::new(),
-                    )
-                    .await;
-                return Err(());
-            }
-            if !output.body.is_empty() {
-                let response_binary = is_binary
-                    || output.headers.iter().any(|(name, value)| {
-                        name.eq_ignore_ascii_case(HEADER_WS_BINARY) && value == "1"
-                    });
-                if response_binary {
-                    if sender
-                        .send(Message::Binary(output.body.into()))
-                        .await
-                        .is_err()
-                    {
-                        return Err(());
-                    }
-                } else if let Ok(body) = String::from_utf8(output.body.clone()) {
-                    if sender.send(Message::Text(body.into())).await.is_err() {
-                        return Err(());
-                    }
-                } else if sender
-                    .send(Message::Binary(output.body.into()))
-                    .await
-                    .is_err()
-                {
-                    return Err(());
-                }
-            }
-            Ok(())
+            deliver_websocket_output(sender, runtime, worker_name, session_id, output, is_binary)
+                .await
         }
         Err(_) => {
             let _ = sender.send(Message::Close(None)).await;
             Err(())
         }
     }
+}
+
+async fn deliver_websocket_output<S>(
+    sender: &mut SplitSink<WebSocketStream<S>, Message>,
+    runtime: &runtime::RuntimeService,
+    worker_name: &str,
+    session_id: &str,
+    output: WorkerOutput,
+    fallback_binary: bool,
+) -> std::result::Result<(), ()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if let Some((close_code, close_reason)) = extract_websocket_close_signal(&output.headers) {
+        let _ = sender
+            .send(Message::Close(Some(CloseFrame {
+                code: close_code.into(),
+                reason: close_reason.into(),
+            })))
+            .await;
+        let _ = runtime
+            .websocket_close(
+                worker_name.to_string(),
+                session_id.to_string(),
+                close_code,
+                String::new(),
+            )
+            .await;
+        return Err(());
+    }
+
+    if output.body.is_empty() {
+        return Ok(());
+    }
+
+    let response_binary = fallback_binary
+        || output
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case(HEADER_WS_BINARY) && value == "1");
+    if response_binary {
+        if sender
+            .send(Message::Binary(output.body.into()))
+            .await
+            .is_err()
+        {
+            return Err(());
+        }
+        return Ok(());
+    }
+
+    if let Ok(body) = String::from_utf8(output.body.clone()) {
+        if sender.send(Message::Text(body.into())).await.is_err() {
+            return Err(());
+        }
+    } else if sender
+        .send(Message::Binary(output.body.into()))
+        .await
+        .is_err()
+    {
+        return Err(());
+    }
+
+    Ok(())
 }
 
 pub(crate) fn sanitize_websocket_handshake_headers(

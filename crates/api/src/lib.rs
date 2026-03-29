@@ -2,8 +2,6 @@ mod app;
 mod handlers;
 mod public_quic;
 mod state;
-#[cfg(test)]
-mod test_support;
 
 use common::Result;
 use runtime::{RuntimeService, RuntimeServiceConfig};
