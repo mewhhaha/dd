@@ -27,4 +27,12 @@ fly-proxy app=default_app local_port='18081' remote_port='8081':
 
 # Deploy a worker into the running Fly app through the private proxy.
 fly-worker-deploy name file +flags:
-  cargo run -p cli -- --server {{default_private_server}} deploy {{name}} {{file}} {{flags}}
+  ./deploy/fly/post-worker-deploy.sh {{default_private_server}} {{name}} {{file}} {{flags}}
+
+# Deploy a worker into the running Fly app through an explicitly chosen private proxy endpoint.
+fly-worker-deploy-at server name file +flags:
+  ./deploy/fly/post-worker-deploy.sh {{server}} {{name}} {{file}} {{flags}}
+
+# Deploy a worker by writing directly into the persisted Fly worker store, then restarting the machine.
+fly-worker-store-deploy name file +flags:
+  ./deploy/fly/store-worker-deploy.sh {{default_app}} {{name}} {{file}} {{flags}}

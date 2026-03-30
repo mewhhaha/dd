@@ -1,0 +1,15 @@
+{
+  "name": "dd-chat-worker-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsdown src/worker.js --format esm --target esnext --out-dir dist --clean",
+    "watch": "tsdown src/worker.js --format esm --target esnext --out-dir dist --watch"
+  },
+  "dependencies": {
+    "itty-router": "^5.0.22"
+  },
+  "devDependencies": {
+    "tsdown": "^0.13.1"
+  }
+}

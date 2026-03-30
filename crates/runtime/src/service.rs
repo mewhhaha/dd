@@ -213,6 +213,16 @@ enum RuntimeCommand {
         is_binary: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
     },
+    WaitWebsocketFrame {
+        worker_name: String,
+        session_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    DrainWebsocketFrame {
+        worker_name: String,
+        session_id: String,
+        reply: oneshot::Sender<Result<Option<WorkerOutput>>>,
+    },
     CloseWebsocket {
         worker_name: String,
         session_id: String,
@@ -268,6 +278,7 @@ struct WorkerManager {
     websocket_pending_closes: HashMap<String, HashMap<String, Vec<SocketCloseEvent>>>,
     websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
     websocket_close_signals: HashMap<String, SocketCloseEvent>,
+    websocket_frame_waiters: HashMap<String, Vec<oneshot::Sender<Result<()>>>>,
     websocket_open_waiters: HashMap<String, oneshot::Sender<Result<WebSocketOpen>>>,
     transport_sessions: HashMap<String, WorkerTransportSession>,
     transport_handle_index: HashMap<String, String>,
@@ -841,7 +852,7 @@ impl RuntimeService {
             }
         };
 
-        let mut restored = 0usize;
+        let mut latest_by_worker: HashMap<String, (StoredWorkerDeployment, PathBuf)> = HashMap::new();
         while let Some(entry) = read_dir.next_entry().await.map_err(|error| {
             PlatformError::internal(format!(
                 "failed to read worker store entry in {}: {error}",
@@ -867,7 +878,23 @@ impl RuntimeService {
                     continue;
                 }
             };
+            match latest_by_worker.get(&stored.name) {
+                Some((current, current_path)) => {
+                    let replace = stored.updated_at_ms > current.updated_at_ms
+                        || (stored.updated_at_ms == current.updated_at_ms
+                            && path.file_name() > current_path.file_name());
+                    if replace {
+                        latest_by_worker.insert(stored.name.clone(), (stored, path));
+                    }
+                }
+                None => {
+                    latest_by_worker.insert(stored.name.clone(), (stored, path));
+                }
+            }
+        }
 
+        let mut restored = 0usize;
+        for (_worker_name, (stored, path)) in latest_by_worker {
             match self
                 .deploy_with_config_internal(
                     stored.name.clone(),
@@ -1156,6 +1183,50 @@ impl RuntimeService {
         })
     }
 
+    pub async fn websocket_wait_frame(
+        &self,
+        worker_name: String,
+        session_id: String,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::WaitWebsocketFrame {
+                worker_name,
+                session_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime websocket wait channel closed",
+            ))
+        })
+    }
+
+    pub async fn websocket_drain_frame(
+        &self,
+        worker_name: String,
+        session_id: String,
+    ) -> Result<Option<WorkerOutput>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::DrainWebsocketFrame {
+                worker_name,
+                session_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(PlatformError::internal(
+                "runtime websocket drain channel closed",
+            ))
+        })
+    }
+
     pub async fn websocket_close(
         &self,
         worker_name: String,
@@ -1333,6 +1404,7 @@ impl WorkerManager {
             websocket_pending_closes: HashMap::new(),
             websocket_outbound_frames: HashMap::new(),
             websocket_close_signals: HashMap::new(),
+            websocket_frame_waiters: HashMap::new(),
             websocket_open_waiters: HashMap::new(),
             transport_sessions: HashMap::new(),
             transport_handle_index: HashMap::new(),
@@ -1450,6 +1522,21 @@ impl WorkerManager {
                     reply,
                     event_tx,
                 );
+            }
+            RuntimeCommand::WaitWebsocketFrame {
+                worker_name,
+                session_id,
+                reply,
+            } => {
+                self.wait_websocket_frame(&worker_name, &session_id, reply);
+            }
+            RuntimeCommand::DrainWebsocketFrame {
+                worker_name,
+                session_id,
+                reply,
+            } => {
+                let result = self.drain_websocket_frame(&worker_name, &session_id);
+                let _ = reply.send(result);
             }
             RuntimeCommand::CloseWebsocket {
                 worker_name,
@@ -1846,6 +1933,108 @@ impl WorkerManager {
         Ok(())
     }
 
+    fn wait_websocket_frame(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        let Some(session) = self.websocket_sessions.get(session_id) else {
+            let _ = reply.send(Err(PlatformError::not_found("websocket session not found")));
+            return;
+        };
+        if session.worker_name != worker_name {
+            let _ = reply.send(Err(PlatformError::bad_request(
+                "websocket session worker mismatch",
+            )));
+            return;
+        }
+        let has_frame = self
+            .websocket_outbound_frames
+            .get(session_id)
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false);
+        let has_close = self.websocket_close_signals.contains_key(session_id);
+        if has_frame || has_close {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        self.websocket_frame_waiters
+            .entry(session_id.to_string())
+            .or_default()
+            .push(reply);
+    }
+
+    fn notify_websocket_frame_waiters(&mut self, session_id: &str) {
+        if let Some(waiters) = self.websocket_frame_waiters.remove(session_id) {
+            for waiter in waiters {
+                let _ = waiter.send(Ok(()));
+            }
+        }
+    }
+
+    fn fail_websocket_frame_waiters(&mut self, session_id: &str, error: PlatformError) {
+        if let Some(waiters) = self.websocket_frame_waiters.remove(session_id) {
+            for waiter in waiters {
+                let _ = waiter.send(Err(error.clone()));
+            }
+        }
+    }
+
+    fn drain_websocket_frame(
+        &mut self,
+        worker_name: &str,
+        session_id: &str,
+    ) -> Result<Option<WorkerOutput>> {
+        let Some(session) = self.websocket_sessions.get(session_id) else {
+            return Err(PlatformError::not_found("websocket session not found"));
+        };
+        if session.worker_name != worker_name {
+            return Err(PlatformError::bad_request(
+                "websocket session worker mismatch",
+            ));
+        }
+
+        let mut output = WorkerOutput {
+            status: 204,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let mut has_output = false;
+
+        if let Some(frame) = self
+            .websocket_outbound_frames
+            .get_mut(session_id)
+            .and_then(|queue| queue.pop_front())
+        {
+            has_output = true;
+            output.body = frame.payload;
+            if frame.is_binary {
+                append_or_update_header(&mut output.headers, INTERNAL_WS_BINARY_HEADER, "1");
+            }
+        }
+
+        if let Some(close) = self.websocket_close_signals.remove(session_id) {
+            has_output = true;
+            append_or_update_header(
+                &mut output.headers,
+                INTERNAL_WS_CLOSE_CODE_HEADER,
+                close.code.to_string().as_str(),
+            );
+            append_or_update_header(
+                &mut output.headers,
+                INTERNAL_WS_CLOSE_REASON_HEADER,
+                &close.reason,
+            );
+        }
+
+        if has_output {
+            Ok(Some(output))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn complete_websocket_open(
         &mut self,
         worker_name: &str,
@@ -2006,6 +2195,10 @@ impl WorkerManager {
 
     fn unregister_websocket_session(&mut self, session_id: &str) -> Option<WorkerWebSocketSession> {
         let session = self.websocket_sessions.remove(session_id)?;
+        self.fail_websocket_frame_waiters(
+            session_id,
+            PlatformError::not_found("websocket session not found"),
+        );
         self.websocket_handle_index.remove(&actor_handle_key(
             &session.binding,
             &session.key,
@@ -2249,7 +2442,7 @@ impl WorkerManager {
             message,
         } = payload;
         let index_key = actor_handle_key(&binding, &key, &handle);
-        let result = match self.websocket_handle_index.get(&index_key) {
+        let result = match self.websocket_handle_index.get(&index_key).cloned() {
             Some(session_id) => {
                 self.websocket_outbound_frames
                     .entry(session_id.clone())
@@ -2258,6 +2451,7 @@ impl WorkerManager {
                         is_binary: !is_text,
                         payload: message,
                     });
+                self.notify_websocket_frame_waiters(&session_id);
                 Ok(())
             }
             None => Err(PlatformError::not_found("websocket session not found")),
@@ -2279,10 +2473,11 @@ impl WorkerManager {
             reason,
         } = payload;
         let index_key = actor_handle_key(&binding, &key, &handle);
-        let result = match self.websocket_handle_index.get(&index_key) {
+        let result = match self.websocket_handle_index.get(&index_key).cloned() {
             Some(session_id) => {
                 self.websocket_close_signals
                     .insert(session_id.clone(), SocketCloseEvent { code, reason });
+                self.notify_websocket_frame_waiters(&session_id);
                 Ok(())
             }
             None => Err(PlatformError::not_found("websocket session not found")),
@@ -4678,6 +4873,11 @@ impl WorkerManager {
         for (_, waiter) in std::mem::take(&mut self.transport_open_waiters) {
             let _ = waiter.send(Err(PlatformError::internal("runtime shutting down")));
         }
+        for (_, waiters) in std::mem::take(&mut self.websocket_frame_waiters) {
+            for waiter in waiters {
+                let _ = waiter.send(Err(PlatformError::internal("runtime shutting down")));
+            }
+        }
         self.websocket_sessions.clear();
         self.websocket_handle_index.clear();
         self.websocket_open_handles.clear();
@@ -6064,6 +6264,24 @@ mod tests {
         }
     }
 
+    fn test_websocket_invocation(path: &str, request_id: &str) -> WorkerInvocation {
+        WorkerInvocation {
+            method: "GET".to_string(),
+            url: format!("http://worker{path}"),
+            headers: vec![
+                ("connection".to_string(), "Upgrade".to_string()),
+                ("upgrade".to_string(), "websocket".to_string()),
+                ("sec-websocket-version".to_string(), "13".to_string()),
+                (
+                    "sec-websocket-key".to_string(),
+                    "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+                ),
+            ],
+            body: Vec::new(),
+            request_id: request_id.to_string(),
+        }
+    }
+
     fn test_transport_invocation() -> WorkerInvocation {
         WorkerInvocation {
             method: "CONNECT".to_string(),
@@ -6344,6 +6562,54 @@ export class MediaActor {
       return new Response(`bad-protocol:${protocol}`, { status: 500 });
     }
     const { response } = await this.state.transports.accept(request);
+    return response;
+  }
+}
+"#
+        .to_string()
+    }
+
+    fn websocket_storage_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env) {
+    const actor = env.CHAT.get(env.CHAT.idFromName("global"));
+    return actor.fetch(request);
+  },
+};
+
+export class ChatActor {
+  constructor(state) {
+    this.state = state;
+    this.memoryCount = 0;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/state") {
+      const stored = this.state.storage.get("chat");
+      return Response.json(stored?.value ?? { count: 0, last: null });
+    }
+
+    const { handle, response } = await this.state.sockets.accept(request);
+    const ws = new WebSocket(handle);
+    ws.addEventListener("message", async (event) => {
+      this.memoryCount += 1;
+      const text = typeof event.data === "string"
+        ? event.data
+        : new TextDecoder().decode(event.data);
+      const stored = this.state.storage.get("chat");
+      const next = {
+        count: Number(stored?.value?.count ?? 0) + 1,
+        last: text,
+      };
+      this.state.storage.put("chat", next);
+      await ws.send(JSON.stringify({
+        seen: text,
+        count: next.count,
+        memory: this.memoryCount,
+      }));
+    });
     return response;
   }
 }
@@ -6720,6 +6986,11 @@ export default {
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
+    if (url.pathname === "/local-visibility") {
+      const ok = await actor.localVisibility();
+      return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
+    }
+
     if (url.pathname === "/inc-cas") {
       const result = await actor.incCas();
       if (result && result.conflict) {
@@ -6763,12 +7034,12 @@ export class MyActor {
   }
 
   async seedCount() {
-    await this.state.storage.put("count", "0");
+    this.state.storage.put("count", "0");
     return true;
   }
 
   async incCas() {
-    const current = await this.state.storage.get("count");
+    const current = this.state.storage.get("count");
     const currentValue = current ? asNumber(current.value, 0) : 0;
     const expectedVersion = current ? current.version : -1;
     await Deno.core.ops.op_sleep(10);
@@ -6776,12 +7047,12 @@ export class MyActor {
   }
 
   async getCount() {
-    const current = await this.state.storage.get("count");
+    const current = this.state.storage.get("count");
     return current ? String(current.value) : "0";
   }
 
   async valueRoundtrip() {
-    const write = await this.state.storage.put("profile", {
+    const write = this.state.storage.put("profile", {
       name: "alice",
       createdAt: new Date("2026-01-02T03:04:05.000Z"),
       flags: new Set(["a", "b"]),
@@ -6791,7 +7062,7 @@ export class MyActor {
     if (write.conflict) {
       return false;
     }
-    const loaded = await this.state.storage.get("profile");
+    const loaded = this.state.storage.get("profile");
     const value = loaded?.value;
     return Boolean(
       value
@@ -6809,8 +7080,8 @@ export class MyActor {
   }
 
   async valueStringGetGuard() {
-    await this.state.storage.put("profile", { nested: { ok: true } });
-    const loaded = await this.state.storage.get("profile");
+    this.state.storage.put("profile", { nested: { ok: true } });
+    const loaded = this.state.storage.get("profile");
     return Boolean(
       loaded
         && loaded.encoding === "v8sc"
@@ -6818,6 +7089,67 @@ export class MyActor {
         && loaded.value.nested
         && loaded.value.nested.ok === true,
     );
+  }
+
+  async localVisibility() {
+    this.state.storage.put("count", "41");
+    const loaded = this.state.storage.get("count");
+    const listed = this.state.storage.list({ prefix: "co" });
+    return Boolean(
+      loaded
+        && loaded.value === "41"
+        && Array.isArray(listed)
+        && listed.length === 1
+        && listed[0].key === "count"
+        && listed[0].value === "41",
+    );
+  }
+}
+"#
+        .to_string()
+    }
+
+    fn actor_constructor_storage_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env) {
+    const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName("user-ctor"));
+    const url = new URL(request.url);
+
+    if (url.pathname === "/seed") {
+      await actor.seed();
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/constructor-value") {
+      return new Response(String(await actor.constructorValue()));
+    }
+
+    if (url.pathname === "/current-value") {
+      return new Response(String(await actor.currentValue()));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+
+export class MyActor {
+  constructor(state) {
+    this.state = state;
+    this.initialValue = state.storage.get("count")?.value ?? "missing";
+  }
+
+  async seed() {
+    this.state.storage.put("count", "7");
+    return true;
+  }
+
+  async constructorValue() {
+    return this.initialValue;
+  }
+
+  async currentValue() {
+    return this.state.storage.get("count")?.value ?? "missing";
   }
 }
 "#
@@ -7526,6 +7858,164 @@ export default {
             .expect("transport open should succeed");
 
         assert_eq!(opened.output.status, 200);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_message_handler_can_use_actor_storage_after_handshake() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-storage".to_string(),
+                websocket_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                        class: "ChatActor".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let opened = service
+            .open_websocket(
+                "ws-storage".to_string(),
+                test_websocket_invocation("/ws", "ws-open"),
+                None,
+            )
+            .await
+            .expect("websocket open should succeed");
+
+        assert_eq!(opened.output.status, 101);
+
+        let echoed = service
+            .websocket_send_frame(
+                "ws-storage".to_string(),
+                opened.session_id.clone(),
+                b"ready".to_vec(),
+                false,
+            )
+            .await
+            .expect("websocket message should succeed");
+        assert_eq!(echoed.status, 204);
+        assert_eq!(
+            String::from_utf8(echoed.body).expect("utf8"),
+            r#"{"seen":"ready","count":1,"memory":1}"#
+        );
+
+        let state = service
+            .invoke(
+                "ws-storage".to_string(),
+                test_invocation_with_path("/state", "ws-state"),
+            )
+            .await
+            .expect("state invoke should succeed");
+        assert_eq!(state.status, 200);
+        let state_json: serde_json::Value =
+            serde_json::from_slice(&state.body).expect("state body should be json");
+        assert_eq!(state_json["count"], 1);
+        assert_eq!(state_json["last"], "ready");
+
+        service
+            .websocket_close(
+                "ws-storage".to_string(),
+                opened.session_id,
+                1000,
+                "done".to_string(),
+            )
+            .await
+            .expect("websocket close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_storage_uses_current_request_scope_on_warm_actor_instance() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-storage".to_string(),
+                websocket_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                        class: "ChatActor".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let opened = service
+            .open_websocket(
+                "ws-storage".to_string(),
+                test_websocket_invocation("/ws", "ws-open-warm"),
+                None,
+            )
+            .await
+            .expect("websocket open should succeed");
+
+        let first = service
+            .websocket_send_frame(
+                "ws-storage".to_string(),
+                opened.session_id.clone(),
+                b"first".to_vec(),
+                false,
+            )
+            .await
+            .expect("first websocket message should succeed");
+        assert_eq!(
+            String::from_utf8(first.body).expect("utf8"),
+            r#"{"seen":"first","count":1,"memory":1}"#
+        );
+
+        let second = service
+            .websocket_send_frame(
+                "ws-storage".to_string(),
+                opened.session_id.clone(),
+                b"second".to_vec(),
+                false,
+            )
+            .await
+            .expect("second websocket message should succeed");
+        assert_eq!(
+            String::from_utf8(second.body).expect("utf8"),
+            r#"{"seen":"second","count":2,"memory":2}"#
+        );
+
+        service
+            .websocket_close(
+                "ws-storage".to_string(),
+                opened.session_id,
+                1000,
+                "done".to_string(),
+            )
+            .await
+            .expect("websocket close should succeed");
     }
 
     #[tokio::test]
@@ -8365,6 +8855,98 @@ export default {
             .expect("guard invoke should succeed");
         assert_eq!(guard.status, 200);
         assert_eq!(String::from_utf8(guard.body).expect("utf8"), "ok");
+
+        let visibility = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/local-visibility?key=user-6", "value-visibility"),
+            )
+            .await
+            .expect("visibility invoke should succeed");
+        assert_eq!(visibility.status, 200);
+        assert_eq!(String::from_utf8(visibility.body).expect("utf8"), "ok");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_millis(200),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-ctor".to_string(),
+                actor_constructor_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                        class: "MyActor".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let seeded = service
+            .invoke(
+                "actor-ctor".to_string(),
+                test_invocation_with_path("/seed", "ctor-seed"),
+            )
+            .await
+            .expect("seed invoke should succeed");
+        assert_eq!(seeded.status, 200);
+
+        let warm_ctor = service
+            .invoke(
+                "actor-ctor".to_string(),
+                test_invocation_with_path("/constructor-value", "ctor-warm"),
+            )
+            .await
+            .expect("warm constructor value should succeed");
+        assert_eq!(String::from_utf8(warm_ctor.body).expect("utf8"), "missing");
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let stats = service
+                    .stats("actor-ctor".to_string())
+                    .await
+                    .expect("stats");
+                if stats.isolates_total == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("actor pool should scale down to zero");
+
+        let cold_ctor = service
+            .invoke(
+                "actor-ctor".to_string(),
+                test_invocation_with_path("/constructor-value", "ctor-cold"),
+            )
+            .await
+            .expect("cold constructor value should succeed");
+        assert_eq!(String::from_utf8(cold_ctor.body).expect("utf8"), "7");
+
+        let current = service
+            .invoke(
+                "actor-ctor".to_string(),
+                test_invocation_with_path("/current-value", "ctor-current"),
+            )
+            .await
+            .expect("current value should succeed");
+        assert_eq!(String::from_utf8(current.body).expect("utf8"), "7");
     }
 
     #[tokio::test]

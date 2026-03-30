@@ -91,28 +91,25 @@ export class UserActor {
   }
 
   async increment(by = 1) {
-    const current = await this.state.storage.get("count");
+    const current = this.state.storage.get("count");
     const currentValue = current ? Number(current.value) || 0 : 0;
-    const write = await this.state.storage.put("count", String(currentValue + Number(by || 0)));
-    if (write.conflict) {
-      throw new Error("conflict");
-    }
+    this.state.storage.put("count", String(currentValue + Number(by || 0)));
     return currentValue + Number(by || 0);
   }
 
   async value() {
-    const current = await this.state.storage.get("count");
+    const current = this.state.storage.get("count");
     return current ? Number(current.value) || 0 : 0;
   }
 
   async updateProfile(profile) {
-    await this.state.storage.put("profile", profile);
-    const current = await this.state.storage.get("profile");
-    return current ? current.value : null;
+    this.state.storage.put("profile", profile);
+    const current = this.state.storage.get("profile");
+    return current?.value ?? null;
   }
 
   async profile() {
-    const current = await this.state.storage.get("profile");
-    return current ? current.value : null;
+    const current = this.state.storage.get("profile");
+    return current?.value ?? null;
   }
 }

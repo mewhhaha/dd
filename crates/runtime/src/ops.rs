@@ -1,4 +1,4 @@
-use crate::actor::{ActorStateEntry, ActorStore};
+use crate::actor::{ActorBatchMutation, ActorStore};
 use crate::actor_rpc::{
     decode_actor_invoke_response, encode_actor_invoke_request, ActorInvokeCall, ActorInvokeRequest,
     ActorInvokeResponse,
@@ -731,57 +731,48 @@ struct ActorTransportCloseResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateGetValuePayload {
+struct ActorStateSnapshotPayload {
     request_id: String,
-    key: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateGetValueResult {
-    ok: bool,
-    found: bool,
+struct ActorStateSnapshotEntry {
+    key: String,
     value: Vec<u8>,
     encoding: String,
     version: i64,
+    deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateSnapshotResult {
+    ok: bool,
+    entries: Vec<ActorStateSnapshotEntry>,
+    max_version: i64,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateSetValuePayload {
-    request_id: String,
+struct ActorStateBatchMutationPayload {
     key: String,
-    encoding: String,
     value: Vec<u8>,
-    expected_version: i64,
+    encoding: String,
+    version: i64,
+    deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateApplyBatchPayload {
+    request_id: String,
+    expected_base_version: i64,
+    mutations: Vec<ActorStateBatchMutationPayload>,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateWriteResult {
+struct ActorStateApplyBatchResult {
     ok: bool,
     conflict: bool,
-    version: i64,
-    error: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ActorStateListItem {
-    key: String,
-    value: String,
-    version: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActorStateListPayload {
-    request_id: String,
-    #[serde(default)]
-    prefix: String,
-    limit: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct ActorStateListResult {
-    ok: bool,
-    entries: Vec<ActorStateListItem>,
+    max_version: i64,
     error: String,
 }
 
@@ -2360,228 +2351,96 @@ fn actor_scope_for_request(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_get_value(
+async fn op_actor_state_snapshot(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateGetValuePayload,
-) -> ActorStateGetValueResult {
+    #[serde] payload: ActorStateSnapshotPayload,
+) -> ActorStateSnapshotResult {
     let (namespace, actor_key) = match actor_scope_for_request(&state, &payload.request_id) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateGetValueResult {
-                ok: false,
-                found: false,
-                value: Vec::new(),
-                encoding: "utf8".to_string(),
-                version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let store = state.borrow().borrow::<ActorStore>().clone();
-    match store.get(&namespace, &actor_key, &payload.key).await {
-        Ok(Some(value)) => ActorStateGetValueResult {
-            ok: true,
-            found: true,
-            value: value.value,
-            encoding: value.encoding,
-            version: value.version,
-            error: String::new(),
-        },
-        Ok(None) => ActorStateGetValueResult {
-            ok: true,
-            found: false,
-            value: Vec::new(),
-            encoding: "utf8".to_string(),
-            version: -1,
-            error: String::new(),
-        },
-        Err(error) => ActorStateGetValueResult {
-            ok: false,
-            found: false,
-            value: Vec::new(),
-            encoding: "utf8".to_string(),
-            version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-async fn op_actor_state_set(
-    state: Rc<RefCell<OpState>>,
-    #[string] request_id: String,
-    #[string] key: String,
-    #[string] value: String,
-    #[bigint] expected_version: i64,
-) -> ActorStateWriteResult {
-    let (namespace, actor_key) = match actor_scope_for_request(&state, &request_id) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return ActorStateWriteResult {
-                ok: false,
-                conflict: false,
-                version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
-    let expected_version = if expected_version < 0 {
-        None
-    } else {
-        Some(expected_version)
-    };
-    let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .put(&namespace, &actor_key, &key, &value, expected_version)
-        .await
-    {
-        Ok(result) => ActorStateWriteResult {
-            ok: true,
-            conflict: result.conflict,
-            version: result.version,
-            error: String::new(),
-        },
-        Err(error) => ActorStateWriteResult {
-            ok: false,
-            conflict: false,
-            version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-async fn op_actor_state_set_value(
-    state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateSetValuePayload,
-) -> ActorStateWriteResult {
-    let (namespace, actor_key) = match actor_scope_for_request(&state, &payload.request_id) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return ActorStateWriteResult {
-                ok: false,
-                conflict: false,
-                version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
-    let expected_version = if payload.expected_version < 0 {
-        None
-    } else {
-        Some(payload.expected_version)
-    };
-    let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .put_value(
-            &namespace,
-            &actor_key,
-            &payload.key,
-            &payload.value,
-            &payload.encoding,
-            expected_version,
-        )
-        .await
-    {
-        Ok(result) => ActorStateWriteResult {
-            ok: true,
-            conflict: result.conflict,
-            version: result.version,
-            error: String::new(),
-        },
-        Err(error) => ActorStateWriteResult {
-            ok: false,
-            conflict: false,
-            version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-async fn op_actor_state_delete(
-    state: Rc<RefCell<OpState>>,
-    #[string] request_id: String,
-    #[string] key: String,
-    #[bigint] expected_version: i64,
-) -> ActorStateWriteResult {
-    let (namespace, actor_key) = match actor_scope_for_request(&state, &request_id) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return ActorStateWriteResult {
-                ok: false,
-                conflict: false,
-                version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
-    let expected_version = if expected_version < 0 {
-        None
-    } else {
-        Some(expected_version)
-    };
-    let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .delete(&namespace, &actor_key, &key, expected_version)
-        .await
-    {
-        Ok(result) => ActorStateWriteResult {
-            ok: true,
-            conflict: result.conflict,
-            version: result.version,
-            error: String::new(),
-        },
-        Err(error) => ActorStateWriteResult {
-            ok: false,
-            conflict: false,
-            version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-async fn op_actor_state_list(
-    state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateListPayload,
-) -> ActorStateListResult {
-    let (namespace, actor_key) = match actor_scope_for_request(&state, &payload.request_id) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return ActorStateListResult {
+            return ActorStateSnapshotResult {
                 ok: false,
                 entries: Vec::new(),
+                max_version: -1,
                 error: error.to_string(),
             };
         }
     };
     let store = state.borrow().borrow::<ActorStore>().clone();
-    let clamped_limit = payload.limit.clamp(1, 1000) as usize;
-    match store
-        .list(&namespace, &actor_key, &payload.prefix, clamped_limit)
-        .await
-    {
-        Ok(entries) => ActorStateListResult {
+    match store.snapshot(&namespace, &actor_key).await {
+        Ok(snapshot) => ActorStateSnapshotResult {
             ok: true,
-            entries: entries
+            entries: snapshot
+                .entries
                 .into_iter()
-                .map(|entry: ActorStateEntry| ActorStateListItem {
+                .map(|entry| ActorStateSnapshotEntry {
                     key: entry.key,
                     value: entry.value,
+                    encoding: entry.encoding,
                     version: entry.version,
+                    deleted: entry.deleted,
                 })
                 .collect(),
+            max_version: snapshot.max_version,
             error: String::new(),
         },
-        Err(error) => ActorStateListResult {
+        Err(error) => ActorStateSnapshotResult {
             ok: false,
             entries: Vec::new(),
+            max_version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_apply_batch(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateApplyBatchPayload,
+) -> ActorStateApplyBatchResult {
+    let (namespace, actor_key) = match actor_scope_for_request(&state, &payload.request_id) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return ActorStateApplyBatchResult {
+                ok: false,
+                conflict: false,
+                max_version: -1,
+                error: error.to_string(),
+            };
+        }
+    };
+    let mutations = payload
+        .mutations
+        .into_iter()
+        .map(|mutation| ActorBatchMutation {
+            key: mutation.key,
+            value: mutation.value,
+            encoding: mutation.encoding,
+            version: mutation.version,
+            deleted: mutation.deleted,
+        })
+        .collect::<Vec<_>>();
+    let expected_base_version = if payload.expected_base_version < 0 {
+        Some(-1)
+    } else {
+        Some(payload.expected_base_version)
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .apply_batch(&namespace, &actor_key, &mutations, expected_base_version)
+        .await
+    {
+        Ok(result) => ActorStateApplyBatchResult {
+            ok: true,
+            conflict: result.conflict,
+            max_version: result.max_version,
+            error: String::new(),
+        },
+        Err(error) => ActorStateApplyBatchResult {
+            ok: false,
+            conflict: false,
+            max_version: -1,
             error: error.to_string(),
         },
     }
@@ -3470,11 +3329,8 @@ deno_core::extension!(
         op_request_body_cancel,
         op_actor_invoke_fetch,
         op_actor_invoke_method,
-        op_actor_state_get_value,
-        op_actor_state_set,
-        op_actor_state_set_value,
-        op_actor_state_delete,
-        op_actor_state_list,
+        op_actor_state_snapshot,
+        op_actor_state_apply_batch,
         op_actor_socket_send,
         op_actor_socket_close,
         op_actor_socket_list,

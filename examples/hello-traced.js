@@ -180,9 +180,9 @@ export class UserActor {
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/ping") {
-      const current = await this.state.storage.get("pings");
+      const current = this.state.storage.get("pings");
       const count = Number(current?.value || 0) + 1;
-      await this.state.storage.put("pings", String(count));
+      this.state.storage.put("pings", String(count));
       return json({
         ok: true,
         feature: "actor-fetch",

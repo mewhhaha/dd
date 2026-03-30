@@ -27,6 +27,8 @@
   const waitUntilPromises = [];
   let waitUntilDoneSent = false;
   let actorInvokeSeq = 0;
+  let currentActorEntry = null;
+  let currentActorRequestId = null;
   globalThis.__dd_active_request_id = requestId;
 
   inflightRequests.set(requestId, controller);
@@ -401,31 +403,37 @@
       throw new TypeError("fetch is not available in this runtime");
     }
     const scopedFetch = async (inputValue, initValue = undefined) => {
-      const normalized = await normalizeHostFetchInput(inputValue, initValue);
-      const prepared = await callOp(
-        "op_http_prepare",
-        JSON.stringify({
-          request_id: requestId,
-          method: normalized.method,
-          url: normalized.url,
-          headers: normalized.headers,
-          body: Array.from(normalized.body),
-        }),
-      );
-      await syncFrozenTime();
-      if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
-        throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
+      const run = async () => {
+        const normalized = await normalizeHostFetchInput(inputValue, initValue);
+        const prepared = await callOp(
+          "op_http_prepare",
+          JSON.stringify({
+            request_id: requestId,
+            method: normalized.method,
+            url: normalized.url,
+            headers: normalized.headers,
+            body: Array.from(normalized.body),
+          }),
+        );
+        await syncFrozenTime();
+        if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
+          throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
+        }
+        const signal = composeAbortSignal([controller.signal, normalized.signal]);
+        const body = Array.isArray(prepared.body) && prepared.body.length > 0
+          ? toArrayBytes(prepared.body)
+          : undefined;
+        return previousFetch(new Request(String(prepared.url), {
+          method: String(prepared.method || "GET"),
+          headers: Array.isArray(prepared.headers) ? prepared.headers : [],
+          body,
+          signal,
+        }));
+      };
+      if (currentActorEntry) {
+        return gateActorOutput(currentActorEntry, currentActorRequestId || requestId, run);
       }
-      const signal = composeAbortSignal([controller.signal, normalized.signal]);
-      const body = Array.isArray(prepared.body) && prepared.body.length > 0
-        ? toArrayBytes(prepared.body)
-        : undefined;
-      return previousFetch(new Request(String(prepared.url), {
-        method: String(prepared.method || "GET"),
-        headers: Array.isArray(prepared.headers) ? prepared.headers : [],
-        body,
-        signal,
-      }));
+      return run();
     };
     globalThis.fetch = scopedFetch;
     return () => {
@@ -664,126 +672,340 @@
     };
   };
 
-  const createActorStorageBinding = (runtimeRequestId) => ({
-    async get(key) {
-      const result = await callOp(
-        "op_actor_state_get_value",
-        {
+  const encodeActorStorageValue = (value) => {
+    if (typeof value === "string") {
+      return {
+        encoding: "utf8",
+        value: toUtf8Bytes(value),
+      };
+    }
+    return {
+      encoding: "v8sc",
+      value: new Uint8Array(Deno.core.serialize(value, { forStorage: true })),
+    };
+  };
+
+  const decodeActorStorageValue = (record) => {
+    if (!record) {
+      return null;
+    }
+    const encoding = String(record.encoding ?? "utf8");
+    const bytes = toArrayBytes(record.value ?? []);
+    if (encoding === "utf8") {
+      return Deno.core.decode(bytes);
+    }
+    if (encoding === "v8sc") {
+      return Deno.core.deserialize(bytes, { forStorage: true });
+    }
+    throw new Error(`actor storage get unsupported encoding: ${encoding}`);
+  };
+
+  const ensureActorStorageState = (entry) => {
+    if (!entry.storageState) {
+      entry.storageState = {
+        hydrated: false,
+        hydrating: null,
+        mirror: new Map(),
+        committedVersion: -1,
+        nextVersion: 0,
+        pendingMutations: [],
+        flushRunning: false,
+        flushTail: Promise.resolve(),
+        failedError: null,
+        outputGate: Promise.resolve(),
+      };
+    }
+    return entry.storageState;
+  };
+
+  const closeActorResourcesOnFailure = async (entry, runtimeRequestId) => {
+    const socketHandles = Array.from(entry.openSocketHandles ?? []);
+    for (const handle of socketHandles) {
+      try {
+        const result = await callOp("op_actor_socket_close", {
           request_id: runtimeRequestId,
-          key: String(key),
-        },
-      );
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "actor storage get failed"));
+          handle,
+          code: 1011,
+          reason: "actor storage flush failed",
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          console.warn(String(result.error ?? "actor socket close failed"));
+        }
+      } catch {
+        // Ignore follow-up close failures after the actor has already failed.
       }
-      if (result?.found !== true) {
-        return null;
-      }
-      const encoding = String(result.encoding ?? "utf8");
-      const bytes = toArrayBytes(result.value);
-      if (encoding === "utf8") {
-        return {
-          value: Deno.core.decode(bytes),
-          version: Number(result.version ?? -1),
-          encoding,
-        };
-      }
-      if (encoding === "v8sc") {
-        return {
-          value: Deno.core.deserialize(bytes, { forStorage: true }),
-          version: Number(result.version ?? -1),
-          encoding,
-        };
-      }
-      throw new Error(`actor storage get unsupported encoding: ${encoding}`);
-    },
-    async put(key, value, options = {}) {
-      const expectedInput = options?.expectedVersion;
-      const expectedVersion = Number.isFinite(Number(expectedInput))
-        ? Math.trunc(Number(expectedInput))
-        : -1;
-      if (typeof value === "string") {
-        const result = await callOp(
-          "op_actor_state_set",
-          runtimeRequestId,
-          String(key),
-          value,
-          expectedVersion,
+    }
+
+    const transportHandles = Array.from(entry.openTransportHandles ?? []);
+    for (const handle of transportHandles) {
+      try {
+        const result = await callOpAny(
+          [
+            "op_actor_transport_close",
+            "op_actor_transport_terminate",
+          ],
+          {
+            request_id: runtimeRequestId,
+            handle,
+            code: 1011,
+            reason: "actor storage flush failed",
+          },
         );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? "actor storage put failed"));
+          console.warn(String(result.error ?? "actor transport close failed"));
+        }
+      } catch {
+        // Ignore follow-up close failures after the actor has already failed.
+      }
+    }
+  };
+
+  const failActorEntry = async (entry, runtimeRequestId, error) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
+    const failure = error instanceof Error ? error : new Error(String(error ?? "actor failed"));
+    storageState.failedError = failure;
+    if (entry.cacheKey) {
+      actorInstances.delete(entry.cacheKey);
+    }
+    await closeActorResourcesOnFailure(entry, runtimeRequestId);
+    throw failure;
+  };
+
+  const flushActorStorage = (entry, runtimeRequestId) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.flushRunning) {
+      return storageState.flushTail;
+    }
+    storageState.flushRunning = true;
+    storageState.flushTail = (async () => {
+      while (storageState.pendingMutations.length > 0) {
+        const mutations = storageState.pendingMutations.splice(0, storageState.pendingMutations.length);
+        const result = await callOp(
+          "op_actor_state_apply_batch",
+          {
+            request_id: runtimeRequestId,
+            expected_base_version: storageState.committedVersion,
+            mutations: mutations.map((mutation) => ({
+              key: mutation.key,
+              value: Array.from(mutation.value),
+              encoding: mutation.encoding,
+              version: mutation.version,
+              deleted: mutation.deleted,
+            })),
+          },
+        );
+        await syncFrozenTime();
+        if (!result || typeof result !== "object" || result.ok === false) {
+          throw new Error(String(result?.error ?? "actor storage batch flush failed"));
+        }
+        if (result.conflict === true) {
+          throw new Error("actor storage batch flush conflicted");
+        }
+        storageState.committedVersion = Number(result.max_version ?? storageState.committedVersion);
+      }
+    })()
+      .catch(async (error) => failActorEntry(entry, runtimeRequestId, error))
+      .finally(() => {
+        storageState.flushRunning = false;
+      });
+    return storageState.flushTail;
+  };
+
+  const queueActorMutation = (entry, runtimeRequestId, mutation) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
+    storageState.pendingMutations.push(mutation);
+    flushActorStorage(entry, runtimeRequestId).catch(() => {});
+  };
+
+  const waitForActorFlush = async (entry, runtimeRequestId) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
+    if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
+      await flushActorStorage(entry, runtimeRequestId);
+    }
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
+  };
+
+  const gateActorOutput = (entry, runtimeRequestId, callback) => {
+    const storageState = ensureActorStorageState(entry);
+    const run = async () => {
+      await waitForActorFlush(entry, runtimeRequestId);
+      return await callback();
+    };
+    const gated = storageState.outputGate.then(run, run);
+    storageState.outputGate = gated.then(
+      () => undefined,
+      () => undefined,
+    );
+    return gated;
+  };
+
+  const ensureActorStorageHydrated = async (entry, runtimeRequestId) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.hydrated) {
+      return storageState;
+    }
+    if (!storageState.hydrating) {
+      storageState.hydrating = (async () => {
+        const result = await callOp("op_actor_state_snapshot", {
+          request_id: runtimeRequestId,
+        });
+        await syncFrozenTime();
+        if (!result || typeof result !== "object" || result.ok === false) {
+          throw new Error(String(result?.error ?? "actor storage snapshot failed"));
+        }
+        storageState.mirror.clear();
+        const entries = Array.isArray(result.entries) ? result.entries : [];
+        let maxVersion = Number(result.max_version ?? -1);
+        for (const entryValue of entries) {
+          const version = Number(entryValue?.version ?? -1);
+          maxVersion = Math.max(maxVersion, version);
+          storageState.mirror.set(String(entryValue?.key ?? ""), {
+            key: String(entryValue?.key ?? ""),
+            value: toArrayBytes(entryValue?.value ?? []),
+            encoding: String(entryValue?.encoding ?? "utf8"),
+            version,
+            deleted: entryValue?.deleted === true,
+          });
+        }
+        storageState.committedVersion = maxVersion;
+        storageState.nextVersion = maxVersion + 1;
+        storageState.hydrated = true;
+        storageState.hydrating = null;
+        return storageState;
+      })().catch(async (error) => {
+        storageState.hydrating = null;
+        return await failActorEntry(entry, runtimeRequestId, error);
+      });
+    }
+    return await storageState.hydrating;
+  };
+
+  const createActorStorageBinding = (entry, runtimeRequestId) => {
+    const currentStorageRequestId = () => activeRequestId() || runtimeRequestId;
+    return {
+      get(key) {
+        const storageState = ensureActorStorageState(entry);
+        if (storageState.failedError) {
+          throw storageState.failedError;
+        }
+        const record = storageState.mirror.get(String(key));
+        if (!record || record.deleted) {
+          return null;
         }
         return {
-          ok: true,
-          conflict: result?.conflict === true,
-          version: Number(result?.version ?? -1),
+          value: decodeActorStorageValue(record),
+          version: Number(record.version ?? -1),
+          encoding: String(record.encoding ?? "utf8"),
         };
-      }
-      const encoded = new Uint8Array(Deno.core.serialize(value, { forStorage: true }));
-      const result = await callOp(
-        "op_actor_state_set_value",
-        {
-          request_id: runtimeRequestId,
-          key: String(key),
-          encoding: "v8sc",
-          value: Array.from(encoded),
-          expected_version: expectedVersion,
-        },
-      );
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "actor storage put failed"));
-      }
-      return {
-        ok: true,
-        conflict: result?.conflict === true,
-        version: Number(result?.version ?? -1),
-      };
-    },
-    async delete(key, options = {}) {
-      const expectedInput = options?.expectedVersion;
-      const expectedVersion = Number.isFinite(Number(expectedInput))
-        ? Math.trunc(Number(expectedInput))
-        : -1;
-      const result = await callOp(
-        "op_actor_state_delete",
-        runtimeRequestId,
-        String(key),
-        expectedVersion,
-      );
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "actor storage delete failed"));
-      }
-      return {
-        ok: true,
-        conflict: result?.conflict === true,
-        version: Number(result?.version ?? -1),
-      };
-    },
-    async list(options = {}) {
-      const prefix = String(options?.prefix ?? "");
-      const limitInput = Number(options?.limit ?? 100);
-      const limit = Number.isFinite(limitInput)
-        ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
-        : 100;
-      const result = await callOp(
-        "op_actor_state_list",
-        {
-          request_id: runtimeRequestId,
-          prefix,
-          limit,
-        },
-      );
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "actor storage list failed"));
-      }
-      return Array.isArray(result?.entries) ? result.entries : [];
-    },
-  });
+      },
+      put(key, value, options = {}) {
+        const storageState = ensureActorStorageState(entry);
+        if (storageState.failedError) {
+          throw storageState.failedError;
+        }
+        const normalizedKey = String(key);
+        const expectedInput = options?.expectedVersion;
+        const expectedVersion = Number.isFinite(Number(expectedInput))
+          ? Math.trunc(Number(expectedInput))
+          : -1;
+        const current = storageState.mirror.get(normalizedKey);
+        const currentVersion = current ? Number(current.version ?? -1) : -1;
+        if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
+          return {
+            ok: true,
+            conflict: true,
+            version: currentVersion,
+          };
+        }
+        const encoded = encodeActorStorageValue(value);
+        const version = storageState.nextVersion++;
+        const record = {
+          key: normalizedKey,
+          value: encoded.value,
+          encoding: encoded.encoding,
+          version,
+          deleted: false,
+        };
+        storageState.mirror.set(normalizedKey, record);
+        queueActorMutation(entry, currentStorageRequestId(), record);
+        return {
+          ok: true,
+          conflict: false,
+          version,
+        };
+      },
+      delete(key, options = {}) {
+        const storageState = ensureActorStorageState(entry);
+        if (storageState.failedError) {
+          throw storageState.failedError;
+        }
+        const normalizedKey = String(key);
+        const expectedInput = options?.expectedVersion;
+        const expectedVersion = Number.isFinite(Number(expectedInput))
+          ? Math.trunc(Number(expectedInput))
+          : -1;
+        const current = storageState.mirror.get(normalizedKey);
+        const currentVersion = current ? Number(current.version ?? -1) : -1;
+        if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
+          return {
+            ok: true,
+            conflict: true,
+            version: currentVersion,
+          };
+        }
+        const version = storageState.nextVersion++;
+        const record = {
+          key: normalizedKey,
+          value: new Uint8Array(),
+          encoding: "utf8",
+          version,
+          deleted: true,
+        };
+        storageState.mirror.set(normalizedKey, record);
+        queueActorMutation(entry, currentStorageRequestId(), record);
+        return {
+          ok: true,
+          conflict: false,
+          version,
+        };
+      },
+      list(options = {}) {
+        const storageState = ensureActorStorageState(entry);
+        if (storageState.failedError) {
+          throw storageState.failedError;
+        }
+        const prefix = String(options?.prefix ?? "");
+        const limitInput = Number(options?.limit ?? 100);
+        const limit = Number.isFinite(limitInput)
+          ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
+          : 100;
+        return Array.from(storageState.mirror.values())
+          .filter((record) => !record.deleted)
+          .filter((record) => record.encoding === "utf8")
+          .filter((record) => record.key.startsWith(prefix))
+          .sort((left, right) => left.key.localeCompare(right.key))
+          .slice(0, limit)
+          .map((record) => ({
+            key: record.key,
+            value: Deno.core.decode(toArrayBytes(record.value)),
+            version: Number(record.version ?? -1),
+          }));
+      },
+    };
+  };
 
   const createActorSocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
     const socketsByHandle = entry.socketBindings ??= new Map();
@@ -864,31 +1086,35 @@
         },
         async send(value, kind) {
           const payload = encodeSocketSendPayload(value, kind);
-          const result = await callOp("op_actor_socket_send", {
-            request_id: currentSocketRequestId(),
-            handle: normalizedHandle,
-            message_kind: payload.kind,
-            message: payload.value,
+          await gateActorOutput(entry, currentSocketRequestId(), async () => {
+            const result = await callOp("op_actor_socket_send", {
+              request_id: currentSocketRequestId(),
+              handle: normalizedHandle,
+              message_kind: payload.kind,
+              message: payload.value,
+            });
+            await syncFrozenTime();
+            if (result && typeof result === "object" && result.ok === false) {
+              throw new Error(String(result.error ?? "socket send failed"));
+            }
           });
-          await syncFrozenTime();
-          if (result && typeof result === "object" && result.ok === false) {
-            throw new Error(String(result.error ?? "socket send failed"));
-          }
         },
         async close(code, reason) {
           const normalizedCode = Number.isFinite(Number(code))
             ? Math.trunc(Number(code))
             : 1000;
-          const result = await callOp("op_actor_socket_close", {
-            request_id: currentSocketRequestId(),
-            handle: normalizedHandle,
-            code: normalizedCode,
-            reason: reason == null ? "" : String(reason),
+          await gateActorOutput(entry, currentSocketRequestId(), async () => {
+            const result = await callOp("op_actor_socket_close", {
+              request_id: currentSocketRequestId(),
+              handle: normalizedHandle,
+              code: normalizedCode,
+              reason: reason == null ? "" : String(reason),
+            });
+            await syncFrozenTime();
+            if (result && typeof result === "object" && result.ok === false) {
+              throw new Error(String(result.error ?? "socket close failed"));
+            }
           });
-          await syncFrozenTime();
-          if (result && typeof result === "object" && result.ok === false) {
-            throw new Error(String(result.error ?? "socket close failed"));
-          }
         },
         async __dd_dispatch(type, event) {
           const current = listeners.get(type);
@@ -1163,19 +1389,21 @@
             key: entry.actorKey,
             chunk: payload,
           };
-        const result = await callOpAny(
-          [
-            kind === "datagram"
-              ? "op_actor_transport_send_datagram"
-              : "op_actor_transport_send_stream",
-            "op_actor_transport_send",
-          ],
-          body,
-        );
-        await syncFrozenTime();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? `transport ${kind} send failed`));
-        }
+        await gateActorOutput(entry, currentTransportRequestId(), async () => {
+          const result = await callOpAny(
+            [
+              kind === "datagram"
+                ? "op_actor_transport_send_datagram"
+                : "op_actor_transport_send_stream",
+              "op_actor_transport_send",
+            ],
+            body,
+          );
+          await syncFrozenTime();
+          if (result && typeof result === "object" && result.ok === false) {
+            throw new Error(String(result.error ?? `transport ${kind} send failed`));
+          }
+        });
       };
 
       const target = {
@@ -1223,24 +1451,26 @@
           const normalizedCode = Number.isFinite(Number(code))
             ? Math.trunc(Number(code))
             : 0;
-          const result = await callOpAny(
-            [
-              "op_actor_transport_close",
-              "op_actor_transport_terminate",
-            ],
-            {
-              request_id: currentTransportRequestId(),
-              handle: normalizedHandle,
-              binding: entry.binding,
-              key: entry.actorKey,
-              code: normalizedCode,
-              reason: reason == null ? "" : String(reason),
-            },
-          );
-          await syncFrozenTime();
-          if (result && typeof result === "object" && result.ok === false) {
-            throw new Error(String(result.error ?? "transport close failed"));
-          }
+          await gateActorOutput(entry, currentTransportRequestId(), async () => {
+            const result = await callOpAny(
+              [
+                "op_actor_transport_close",
+                "op_actor_transport_terminate",
+              ],
+              {
+                request_id: currentTransportRequestId(),
+                handle: normalizedHandle,
+                binding: entry.binding,
+                key: entry.actorKey,
+                code: normalizedCode,
+                reason: reason == null ? "" : String(reason),
+              },
+            );
+            await syncFrozenTime();
+            if (result && typeof result === "object" && result.ok === false) {
+              throw new Error(String(result.error ?? "transport close failed"));
+            }
+          });
           finishClosed();
         },
         __dd_dispatchDatagram(value) {
@@ -1373,7 +1603,7 @@
           return entry.actorKey;
         },
       },
-      storage: createActorStorageBinding(runtimeRequestId),
+      storage: createActorStorageBinding(entry, runtimeRequestId),
       sockets: socketRuntime.sockets,
       transports: transportRuntime.transports,
       __dd_socket_runtime: socketRuntime,
@@ -2120,11 +2350,15 @@
       entry = {
         binding,
         actorKey,
+        cacheKey,
         socketBindings: new Map(),
+        openSocketHandles: new Set(),
         socketRuntime: null,
         transportBindings: new Map(),
+        openTransportHandles: new Set(),
         transportRuntime: null,
       };
+      await ensureActorStorageHydrated(entry, requestId);
       const constructorState = createActorRuntimeState(entry, requestId, false, false);
       await constructorState.__dd_socket_runtime.refreshOpenHandles();
       await constructorState.__dd_transport_runtime.refreshOpenHandles();
@@ -2153,8 +2387,10 @@
     }
     entry.binding = binding;
     entry.actorKey = actorKey;
+    entry.cacheKey = cacheKey;
 
     const kind = String(actorCall.kind ?? "");
+    await ensureActorStorageHydrated(entry, requestId);
     const scopedState = createActorRuntimeState(entry, requestId, kind === "fetch", kind === "fetch");
     const previousWebSocket = globalThis.WebSocket;
     const previousWebTransport = globalThis.WebTransportSession;
@@ -2178,11 +2414,15 @@
     try {
       await scopedState.__dd_socket_runtime.refreshOpenHandles();
       await scopedState.__dd_transport_runtime.refreshOpenHandles();
+      currentActorEntry = entry;
+      currentActorRequestId = requestId;
       if (kind === "fetch") {
         if (typeof entry.instance.fetch !== "function") {
           throw new Error(`actor class does not define fetch(): ${className}`);
         }
-        return await entry.instance.fetch.call(receiver, request);
+        const response = await entry.instance.fetch.call(receiver, request);
+        await gateActorOutput(entry, requestId, async () => undefined);
+        return response;
       }
       if (kind === "method") {
         const methodName = String(actorCall.name ?? "").trim();
@@ -2196,6 +2436,7 @@
         const args = decodeRpcArgs(toArrayBytes(actorCall.args));
         const value = await method.apply(receiver, args);
         const encoded = await encodeRpcResult(value);
+        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(encoded, {
           status: 200,
           headers: [["content-type", "application/octet-stream"]],
@@ -2210,6 +2451,7 @@
         const raw = toArrayBytes(actorCall.data);
         const message = actorCall.is_text === true ? Deno.core.decode(raw) : raw;
         await ws.__dd_dispatchMessage(message);
+        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       if (kind === "transport_datagram" || kind === "datagram") {
@@ -2219,6 +2461,7 @@
         }
         const session = new globalThis.WebTransportSession(handle);
         await session.__dd_dispatchDatagram(toArrayBytes(actorCall.data));
+        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       if (kind === "transport_stream" || kind === "stream") {
@@ -2228,6 +2471,7 @@
         }
         const session = new globalThis.WebTransportSession(handle);
         await session.__dd_dispatchStreamChunk(toArrayBytes(actorCall.data));
+        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       if (kind === "transport_close" || kind === "transport") {
@@ -2240,6 +2484,7 @@
           Number(actorCall.code ?? 0),
           String(actorCall.reason ?? ""),
         );
+        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       if (kind === "close") {
@@ -2248,10 +2493,13 @@
           throw new Error("actor close invoke requires socket handle");
         }
         new globalThis.WebSocket(handle);
+        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       throw new Error(`unsupported actor invoke kind: ${kind}`);
     } finally {
+      currentActorEntry = null;
+      currentActorRequestId = null;
       if (previousWebSocket === undefined) {
         delete globalThis.WebSocket;
       } else {

@@ -16,23 +16,33 @@ pub struct ActorStore {
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorStateValue {
+pub struct ActorSnapshotEntry {
+    pub key: String,
     pub value: Vec<u8>,
     pub encoding: String,
     pub version: i64,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorStateEntry {
+pub struct ActorSnapshot {
+    pub entries: Vec<ActorSnapshotEntry>,
+    pub max_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorBatchMutation {
     pub key: String,
-    pub value: String,
+    pub value: Vec<u8>,
+    pub encoding: String,
     pub version: i64,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorWriteResult {
+pub struct ActorBatchApplyResult {
     pub conflict: bool,
-    pub version: i64,
+    pub max_version: i64,
 }
 
 impl ActorStore {
@@ -51,253 +61,205 @@ impl ActorStore {
         })
     }
 
-    pub async fn get(
-        &self,
-        namespace: &str,
-        actor_key: &str,
-        key: &str,
-    ) -> Result<Option<ActorStateValue>> {
+    pub async fn snapshot(&self, namespace: &str, actor_key: &str) -> Result<ActorSnapshot> {
         let conn = self.connect(namespace, actor_key).await?;
         let mut rows = conn
             .query(
-                "SELECT value_blob, encoding, value, version, deleted
+                "SELECT item_key, value_blob, encoding, value, version, deleted
                  FROM actor_state
-                 WHERE entity_key = ?1 AND item_key = ?2",
-                (actor_key, key),
+                 WHERE entity_key = ?1
+                 ORDER BY item_key ASC",
+                (actor_key,),
             )
             .await
             .map_err(actor_error)?;
-        if let Some(row) = rows.next().await.map_err(actor_error)? {
-            let deleted: i64 = row.get::<i64>(4).map_err(actor_error)?;
-            if deleted != 0 {
-                return Ok(None);
-            }
-            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(actor_error)?;
-            let encoding: String = row.get::<String>(1).map_err(actor_error)?;
-            let legacy_value: String = row.get::<String>(2).map_err(actor_error)?;
-            let version: i64 = row.get::<i64>(3).map_err(actor_error)?;
-            let value = value_blob.unwrap_or_else(|| legacy_value.into_bytes());
-            return Ok(Some(ActorStateValue {
-                value,
+
+        let mut entries = Vec::new();
+        let mut max_version = -1i64;
+        while let Some(row) = rows.next().await.map_err(actor_error)? {
+            let key: String = row.get::<String>(0).map_err(actor_error)?;
+            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(1).map_err(actor_error)?;
+            let encoding: String = row.get::<String>(2).map_err(actor_error)?;
+            let legacy_value: String = row.get::<String>(3).map_err(actor_error)?;
+            let version: i64 = row.get::<i64>(4).map_err(actor_error)?;
+            let deleted: i64 = row.get::<i64>(5).map_err(actor_error)?;
+            max_version = max_version.max(version);
+            entries.push(ActorSnapshotEntry {
+                key,
+                value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
                 encoding: normalize_encoding(&encoding),
                 version,
-            }));
-        }
-        Ok(None)
-    }
-
-    pub async fn put(
-        &self,
-        namespace: &str,
-        actor_key: &str,
-        key: &str,
-        value: &str,
-        expected_version: Option<i64>,
-    ) -> Result<ActorWriteResult> {
-        self.put_value(
-            namespace,
-            actor_key,
-            key,
-            value.as_bytes(),
-            ENCODING_UTF8,
-            expected_version,
-        )
-        .await
-    }
-
-    pub async fn put_value(
-        &self,
-        namespace: &str,
-        actor_key: &str,
-        key: &str,
-        value: &[u8],
-        encoding: &str,
-        expected_version: Option<i64>,
-    ) -> Result<ActorWriteResult> {
-        if encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
-            return Err(PlatformError::bad_request(format!(
-                "unsupported actor storage encoding: {encoding}"
-            )));
-        }
-        let conn = self.connect(namespace, actor_key).await?;
-        let version = self.next_version();
-        let now_ms = epoch_ms_i64()?;
-        let value_blob = value.to_vec();
-        let value_text = if encoding == ENCODING_UTF8 {
-            std::str::from_utf8(value)
-                .map_err(|error| {
-                    PlatformError::bad_request(format!("invalid utf8 value: {error}"))
-                })?
-                .to_string()
-        } else {
-            String::new()
-        };
-        let encoding = encoding.to_string();
-
-        let affected = if let Some(expected_version) = expected_version {
-            execute_with_retry(|| {
-                conn.execute(
-                    "UPDATE actor_state
-                     SET value = ?1, value_blob = ?2, encoding = ?3, deleted = 0, version = ?4, updated_at_ms = ?5
-                     WHERE entity_key = ?6 AND item_key = ?7 AND version = ?8",
-                    (
-                        value_text.as_str(),
-                        value_blob.as_slice(),
-                        encoding.as_str(),
-                        version,
-                        now_ms,
-                        actor_key,
-                        key,
-                        expected_version,
-                    ),
-                )
-            })
-            .await?
-        } else {
-            execute_with_retry(|| {
-                conn.execute(
-                    "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-                     ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                       value = excluded.value,
-                       value_blob = excluded.value_blob,
-                       encoding = excluded.encoding,
-                       deleted = 0,
-                       version = excluded.version,
-                       updated_at_ms = excluded.updated_at_ms",
-                    (
-                        actor_key,
-                        key,
-                        value_text.as_str(),
-                        value_blob.as_slice(),
-                        encoding.as_str(),
-                        version,
-                        now_ms,
-                    ),
-                )
-            })
-            .await?
-        };
-
-        if affected == 0 {
-            let current_version = self
-                .current_version(&conn, actor_key, key)
-                .await?
-                .unwrap_or(-1);
-            return Ok(ActorWriteResult {
-                conflict: true,
-                version: current_version,
+                deleted: deleted != 0,
             });
         }
-
-        Ok(ActorWriteResult {
-            conflict: false,
-            version,
+        self.observe_version(max_version);
+        Ok(ActorSnapshot {
+            entries,
+            max_version,
         })
     }
 
-    pub async fn delete(
+    pub async fn apply_batch(
         &self,
         namespace: &str,
         actor_key: &str,
-        key: &str,
-        expected_version: Option<i64>,
-    ) -> Result<ActorWriteResult> {
+        mutations: &[ActorBatchMutation],
+        expected_base_version: Option<i64>,
+    ) -> Result<ActorBatchApplyResult> {
         let conn = self.connect(namespace, actor_key).await?;
-        let version = self.next_version();
-        let now_ms = epoch_ms_i64()?;
-        let empty_blob: &[u8] = &[];
-
-        let affected = if let Some(expected_version) = expected_version {
-            execute_with_retry(|| {
-                conn.execute(
-                    "UPDATE actor_state
-                     SET value = '', value_blob = ?1, encoding = ?2, deleted = 1, version = ?3, updated_at_ms = ?4
-                     WHERE entity_key = ?5 AND item_key = ?6 AND version = ?7",
-                    (
-                        empty_blob,
-                        ENCODING_UTF8,
-                        version,
-                        now_ms,
-                        actor_key,
-                        key,
-                        expected_version,
-                    ),
-                )
-            })
-            .await?
-        } else {
-            execute_with_retry(|| {
-                conn.execute(
-                    "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
-                     ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                       value = excluded.value,
-                       value_blob = excluded.value_blob,
-                       encoding = excluded.encoding,
-                       deleted = 1,
-                       version = excluded.version,
-                       updated_at_ms = excluded.updated_at_ms",
-                    (
-                        actor_key,
-                        key,
-                        empty_blob,
-                        ENCODING_UTF8,
-                        version,
-                        now_ms,
-                    ),
-                )
-            })
-            .await?
-        };
-
-        if affected == 0 {
-            let current_version = self
-                .current_version(&conn, actor_key, key)
+        if mutations.is_empty() {
+            let max_version = self
+                .max_version_for_actor(&conn, actor_key)
                 .await?
                 .unwrap_or(-1);
-            return Ok(ActorWriteResult {
-                conflict: true,
-                version: current_version,
+            self.observe_version(max_version);
+            return Ok(ActorBatchApplyResult {
+                conflict: false,
+                max_version,
             });
         }
 
-        Ok(ActorWriteResult {
-            conflict: false,
-            version,
-        })
-    }
-
-    pub async fn list(
-        &self,
-        namespace: &str,
-        actor_key: &str,
-        prefix: &str,
-        limit: usize,
-    ) -> Result<Vec<ActorStateEntry>> {
-        let conn = self.connect(namespace, actor_key).await?;
-        let pattern = format!("{prefix}%");
-        let mut rows = conn
-            .query(
-                "SELECT item_key, value, version
-                 FROM actor_state
-                 WHERE entity_key = ?1 AND deleted = 0 AND (encoding = ?2 OR encoding IS NULL) AND item_key LIKE ?3
-                 ORDER BY item_key ASC
-                 LIMIT ?4",
-                (actor_key, ENCODING_UTF8, pattern, limit as i64),
-            )
-            .await
-            .map_err(actor_error)?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(actor_error)? {
-            out.push(ActorStateEntry {
-                key: row.get::<String>(0).map_err(actor_error)?,
-                value: row.get::<String>(1).map_err(actor_error)?,
-                version: row.get::<i64>(2).map_err(actor_error)?,
-            });
+        for mutation in mutations {
+            if mutation.key.trim().is_empty() {
+                return Err(PlatformError::bad_request(
+                    "actor batch mutation key must not be empty",
+                ));
+            }
+            if mutation.version < 0 {
+                return Err(PlatformError::bad_request(
+                    "actor batch mutation version must be non-negative",
+                ));
+            }
+            if !mutation.deleted
+                && mutation.encoding != ENCODING_UTF8
+                && mutation.encoding != ENCODING_V8SC
+            {
+                return Err(PlatformError::bad_request(format!(
+                    "unsupported actor storage encoding: {}",
+                    mutation.encoding
+                )));
+            }
         }
-        Ok(out)
+
+        let mut previous_version = expected_base_version.unwrap_or(-1);
+        for mutation in mutations {
+            if mutation.version <= previous_version {
+                return Err(PlatformError::bad_request(
+                    "actor batch mutation versions must be strictly increasing",
+                ));
+            }
+            previous_version = mutation.version;
+        }
+
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match conn.execute("BEGIN IMMEDIATE", ()).await {
+                Ok(_) => {}
+                Err(error) if is_locked_error(&error) && attempt < 8 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(actor_error(error)),
+            }
+
+            let outcome = async {
+                let current = self.max_version_for_actor(&conn, actor_key).await?.unwrap_or(-1);
+                if let Some(expected) = expected_base_version {
+                    if current != expected {
+                        return Ok(ActorBatchApplyResult {
+                            conflict: true,
+                            max_version: current,
+                        });
+                    }
+                }
+
+                for mutation in mutations {
+                    let version = mutation.version;
+                    let now_ms = epoch_ms_i64()?;
+                    if mutation.deleted {
+                        let empty_blob: &[u8] = &[];
+                        conn.execute(
+                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                             VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
+                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                               value = excluded.value,
+                               value_blob = excluded.value_blob,
+                               encoding = excluded.encoding,
+                               deleted = 1,
+                               version = excluded.version,
+                               updated_at_ms = excluded.updated_at_ms",
+                            (
+                                actor_key,
+                                mutation.key.as_str(),
+                                empty_blob,
+                                ENCODING_UTF8,
+                                version,
+                                now_ms,
+                            ),
+                        )
+                        .await
+                        .map_err(actor_error)?;
+                        continue;
+                    }
+
+                    let value_text = if mutation.encoding == ENCODING_UTF8 {
+                        std::str::from_utf8(&mutation.value)
+                            .map_err(|error| {
+                                PlatformError::bad_request(format!("invalid utf8 value: {error}"))
+                            })?
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    conn.execute(
+                        "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+                         ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                           value = excluded.value,
+                           value_blob = excluded.value_blob,
+                           encoding = excluded.encoding,
+                           deleted = 0,
+                           version = excluded.version,
+                           updated_at_ms = excluded.updated_at_ms",
+                        (
+                            actor_key,
+                            mutation.key.as_str(),
+                            value_text.as_str(),
+                            mutation.value.as_slice(),
+                            mutation.encoding.as_str(),
+                            version,
+                            now_ms,
+                        ),
+                    )
+                    .await
+                    .map_err(actor_error)?;
+                }
+
+                let max_version = mutations.last().map(|mutation| mutation.version).unwrap_or(current);
+                Ok(ActorBatchApplyResult {
+                    conflict: false,
+                    max_version,
+                })
+            }
+            .await;
+
+            match outcome {
+                Ok(result) => {
+                    if result.conflict {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Ok(result);
+                    }
+                    conn.execute("COMMIT", ()).await.map_err(actor_error)?;
+                    self.observe_version(result.max_version);
+                    return Ok(result);
+                }
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+        }
     }
 
     async fn connect(&self, namespace: &str, actor_key: &str) -> Result<Connection> {
@@ -340,23 +302,22 @@ impl ActorStore {
         Ok(conn)
     }
 
-    async fn current_version(
+    async fn max_version_for_actor(
         &self,
         conn: &Connection,
         actor_key: &str,
-        key: &str,
     ) -> Result<Option<i64>> {
         let mut rows = conn
             .query(
-                "SELECT version FROM actor_state
-                 WHERE entity_key = ?1 AND item_key = ?2",
-                (actor_key, key),
+                "SELECT MAX(version) FROM actor_state
+                 WHERE entity_key = ?1",
+                (actor_key,),
             )
             .await
             .map_err(actor_error)?;
         if let Some(row) = rows.next().await.map_err(actor_error)? {
-            let version: i64 = row.get::<i64>(0).map_err(actor_error)?;
-            return Ok(Some(version));
+            let version = row.get::<Option<i64>>(0).map_err(actor_error)?;
+            return Ok(version);
         }
         Ok(None)
     }
@@ -373,8 +334,21 @@ impl ActorStore {
             .join(format!("shard-{shard:04}.db"))
     }
 
-    fn next_version(&self) -> i64 {
-        self.version.fetch_add(1, Ordering::SeqCst) as i64
+    fn observe_version(&self, version: i64) {
+        if version < 0 {
+            return;
+        }
+        let wanted = version as u64 + 1;
+        let mut current = self.version.load(Ordering::SeqCst);
+        while current < wanted {
+            match self
+                .version
+                .compare_exchange(current, wanted, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
     }
 }
 
@@ -448,30 +422,11 @@ async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-async fn execute_with_retry<F, Fut>(mut execute: F) -> Result<u64>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = turso::Result<u64>>,
-{
-    const MAX_ATTEMPTS: usize = 8;
-    let mut attempt = 0usize;
-    loop {
-        match execute().await {
-            Ok(affected) => return Ok(affected),
-            Err(error) => {
-                attempt += 1;
-                let message = error.to_string().to_ascii_lowercase();
-                let is_locked = message.contains("database is locked")
-                    || message.contains("database table is locked")
-                    || message.contains("database is busy");
-                if is_locked && attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
-                    continue;
-                }
-                return Err(actor_error(error));
-            }
-        }
-    }
+fn is_locked_error(error: &turso::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
 }
 
 fn epoch_ms_i64() -> Result<i64> {
