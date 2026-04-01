@@ -2070,7 +2070,6 @@
     async accept(request, options = {}) {
       const entry = await ensureActorEntry(bindingName, actorKey, requestId);
       const state = createActorRuntimeState(entry, requestId, true, false);
-      await state.__dd_socket_runtime.refreshOpenHandles();
       return state.sockets.accept(request, options);
     },
     async send(handle, value, kind) {
@@ -2097,7 +2096,6 @@
     async accept(request, options = {}) {
       const entry = await ensureActorEntry(bindingName, actorKey, requestId);
       const state = createActorRuntimeState(entry, requestId, false, true);
-      await state.__dd_transport_runtime.refreshOpenHandles();
       return state.transports.accept(request, options);
     },
     async values() {
