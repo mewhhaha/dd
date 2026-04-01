@@ -26,89 +26,131 @@ struct ScenarioResult {
     p99_ms: f64,
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn env_mode() -> Option<String> {
+    std::env::var("DD_BENCH_MODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 const ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.storage.put("payload", "1");
+  return true;
+}
+
+export function read(state) {
+  const current = state.storage.get("payload");
+  return current ? String(current.value) : "0";
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const id = env.BENCH_ACTOR.idFromName("hot");
     const actor = env.BENCH_ACTOR.get(id);
     if (url.pathname === "/seed") {
-      await actor.seed();
+      await actor.run(seed);
       return new Response("ok");
     }
-    const value = await actor.read();
+    const value = await actor.run(read);
     return new Response(String(value));
   },
 };
-
-export class BenchActor {
-  constructor(state) {
-    this.state = state;
-  }
-
-  async seed() {
-    await this.state.storage.put("payload", "1");
-    return true;
-  }
-
-  async read() {
-    const current = await this.state.storage.get("payload");
-    return current ? String(current.value) : "0";
-  }
-}
 "#;
 
 const ACTOR_READ_ASYNC_MEMORY_WORKER_SOURCE: &str = r#"
+export function read(_state) { return "1"; }
+
 export default {
   async fetch(_request, env) {
     const id = env.BENCH_ACTOR.idFromName("hot");
     const actor = env.BENCH_ACTOR.get(id);
-    const value = await actor.read();
+    const value = await actor.run(read);
     return new Response(String(value));
   },
 };
-
-export class BenchActor {
-  constructor(state) {
-    this.state = state;
-    this.cached = "1";
-  }
-
-  async read() {
-    return this.cached;
-  }
-}
 "#;
 
 const ACTOR_READ_SYNC_MEMORY_WORKER_SOURCE: &str = r#"
+export function read(_state) { return "1"; }
+
 export default {
   async fetch(_request, env) {
     const id = env.BENCH_ACTOR.idFromName("hot");
     const actor = env.BENCH_ACTOR.get(id);
-    return new Response(String(actor.read()));
+    return new Response(String(await actor.run(read)));
   },
 };
-
-export class BenchActor {
-  constructor(state) {
-    this.state = state;
-    this.cached = "1";
-  }
-
-  read() {
-    return this.cached;
-  }
-}
 "#;
+
+const ACTOR_STM_INCREMENT_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.set("count", "0");
+  return true;
+}
+
+export function increment(state) {
+  const current = Number(state.get("count")?.value ?? 0);
+  const next = current + 1;
+  state.set("count", String(next));
+  return next;
+}
+
+export function readCount(state) {
+  return String(state.get("count")?.value ?? "0");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName("hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/seed") {
+      await actor.run(seed);
+      return new Response("ok");
+    }
+    if (url.pathname === "/get") {
+      return new Response(String(await actor.run(readCount)));
+    }
+    const value = await actor.run(increment);
+    return new Response(String(value));
+  },
+};
+"#;
+
+fn env_duration_ms(name: &str, default: u64) -> Duration {
+    Duration::from_millis(
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(default),
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let runtime = RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(30),
-        scale_tick: Duration::from_secs(1),
+        min_isolates: env_usize("DD_BENCH_MIN_ISOLATES", 1),
+        max_isolates: env_usize("DD_BENCH_MAX_ISOLATES", 1),
+        max_inflight_per_isolate: env_usize("DD_BENCH_MAX_INFLIGHT", 1),
+        idle_ttl: env_duration_ms("DD_BENCH_IDLE_TTL_MS", 30_000),
+        scale_tick: env_duration_ms("DD_BENCH_SCALE_TICK_MS", 1_000),
         queue_warn_thresholds: vec![10, 100, 1000],
         ..RuntimeConfig::default()
     };
@@ -116,30 +158,64 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
 
-    println!("# actor storage benchmark (single-isolate)");
-    println!("# compares async host storage read vs async/sync in-memory reads in actor methods.");
+    println!("# actor storage benchmark");
+    println!("# compares hosted actor paths under configurable isolate and inflight settings.");
+    println!(
+        "# runtime min_isolates={} max_isolates={} max_inflight_per_isolate={}",
+        env_usize("DD_BENCH_MIN_ISOLATES", 1),
+        env_usize("DD_BENCH_MAX_ISOLATES", 1),
+        env_usize("DD_BENCH_MAX_INFLIGHT", 1),
+    );
+    let mode = env_mode();
 
-    run_and_print(
-        &service,
-        "actor-read-async-storage",
-        ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE,
-        true,
-    )
-    .await?;
-    run_and_print(
-        &service,
-        "actor-read-async-memory",
-        ACTOR_READ_ASYNC_MEMORY_WORKER_SOURCE,
-        false,
-    )
-    .await?;
-    run_and_print(
-        &service,
-        "actor-read-sync-memory",
-        ACTOR_READ_SYNC_MEMORY_WORKER_SOURCE,
-        false,
-    )
-    .await?;
+    if mode.as_deref().is_none() || mode.as_deref() == Some("async-storage") {
+        run_and_print(
+            &service,
+            "actor-read-async-storage",
+            ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE,
+            true,
+            "/read",
+            None,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("async-memory") {
+        run_and_print(
+            &service,
+            "actor-read-async-memory",
+            ACTOR_READ_ASYNC_MEMORY_WORKER_SOURCE,
+            false,
+            "/read",
+            None,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("sync-memory") {
+        run_and_print(
+            &service,
+            "actor-read-sync-memory",
+            ACTOR_READ_SYNC_MEMORY_WORKER_SOURCE,
+            false,
+            "/read",
+            None,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-inc") {
+        run_and_print(
+            &service,
+            "actor-stm-inc",
+            ACTOR_STM_INCREMENT_WORKER_SOURCE,
+            true,
+            "/inc",
+            Some("/get"),
+        )
+        .await?;
+    }
+
+    if env_flag("DD_BENCH_EXIT_IMMEDIATELY") {
+        std::process::exit(0);
+    }
 
     Ok(())
 }
@@ -149,7 +225,11 @@ async fn run_and_print(
     label: &str,
     source: &str,
     seed: bool,
+    path: &'static str,
+    verify_path: Option<&'static str>,
 ) -> Result<(), String> {
+    let requests = env_usize("DD_BENCH_REQUESTS", 1_000);
+    let concurrency = env_usize("DD_BENCH_CONCURRENCY", 1);
     let worker_name = format!("{label}-{}", Uuid::new_v4());
     service
         .deploy_with_config(
@@ -159,7 +239,6 @@ async fn run_and_print(
                 public: false,
                 bindings: vec![DeployBinding::Actor {
                     binding: "BENCH_ACTOR".to_string(),
-                    class: "BenchActor".to_string(),
                 }],
                 ..DeployConfig::default()
             },
@@ -178,13 +257,26 @@ async fn run_and_print(
         service,
         &worker_name,
         Scenario {
-            requests: 1000,
-            concurrency: 1,
-            path: "/read",
+            requests,
+            concurrency,
+            path,
         },
     )
     .await
     .map_err(|error| error.to_string())?;
+    if let Some(verify_path) = verify_path {
+        let verify = service
+            .invoke(worker_name.clone(), invocation(verify_path, requests + 1))
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed = String::from_utf8(verify.body).map_err(|error| error.to_string())?;
+        if observed.trim() != requests.to_string() {
+            return Err(format!(
+                "{label} verification failed: expected final count {}, got {}",
+                requests, observed
+            ));
+        }
+    }
     println!(
         "{:<24} requests={} concurrency={} total={:.2}ms throughput={:.0} req/s mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
         label,
@@ -225,9 +317,15 @@ async fn run_scenario(
                     break;
                 }
                 let invoke_started = Instant::now();
-                service
+                let output = service
                     .invoke(worker_name.clone(), invocation(&path, idx + 1))
                     .await?;
+                if output.status != 200 {
+                    return Err(common::PlatformError::runtime(format!(
+                        "benchmark invoke failed with status {} on {}",
+                        output.status, path
+                    )));
+                }
                 latencies.lock().await.push(invoke_started.elapsed());
             }
             Ok::<(), common::PlatformError>(())

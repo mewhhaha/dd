@@ -1,4 +1,4 @@
-use crate::actor::{ActorBatchMutation, ActorStore};
+use crate::actor::{ActorBatchMutation, ActorReadDependency, ActorStore};
 use crate::actor_rpc::{
     decode_actor_invoke_response, encode_actor_invoke_request, ActorInvokeCall, ActorInvokeRequest,
     ActorInvokeResponse,
@@ -58,6 +58,9 @@ pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
 
 pub struct ActorInvokeEvent {
     pub request_frame: Vec<u8>,
+    pub caller_worker_name: String,
+    pub caller_generation: u64,
+    pub caller_isolate_id: u64,
     pub reply: oneshot::Sender<Result<Vec<u8>>>,
 }
 
@@ -540,30 +543,8 @@ struct WaitUntilRequestId {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorInvokeFetchPayload {
-    worker_name: String,
-    binding: String,
-    key: String,
-    method: String,
-    url: String,
-    #[serde(default)]
-    headers: Vec<(String, String)>,
-    #[serde(default)]
-    body: Vec<u8>,
-    request_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ActorInvokeFetchResult {
-    ok: bool,
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    error: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct ActorInvokeMethodPayload {
+    caller_request_id: String,
     worker_name: String,
     binding: String,
     key: String,
@@ -762,9 +743,21 @@ struct ActorStateBatchMutationPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct ActorStateReadDependencyPayload {
+    key: String,
+    version: i64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ActorStateApplyBatchPayload {
     request_id: String,
     expected_base_version: i64,
+    #[serde(default)]
+    transactional: bool,
+    #[serde(default)]
+    reads: Vec<ActorStateReadDependencyPayload>,
+    #[serde(default)]
+    list_gate_version: i64,
     mutations: Vec<ActorStateBatchMutationPayload>,
 }
 
@@ -1571,6 +1564,32 @@ fn dynamic_host_rpc_owner_for_request(
     Ok((worker_name, generation))
 }
 
+fn actor_invoke_owner_for_request(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+) -> Result<(String, u64, u64)> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(PlatformError::bad_request(
+            "actor invoke caller_request_id must not be empty",
+        ));
+    }
+    let (worker_name, generation, isolate_id) = {
+        let op_state = state.borrow();
+        let contexts = op_state.borrow::<RequestSecretContexts>();
+        let context = contexts
+            .contexts
+            .get(request_id)
+            .ok_or_else(|| PlatformError::runtime("actor invoke request scope is unavailable"))?;
+        (
+            context.worker_name.clone(),
+            context.generation,
+            context.isolate_id,
+        )
+    };
+    Ok((worker_name, generation, isolate_id))
+}
+
 #[deno_core::op2]
 #[serde]
 async fn op_dynamic_worker_create(
@@ -2134,121 +2153,12 @@ fn op_request_body_cancel(state: &mut OpState, #[string] request_id: String) {
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_invoke_fetch(
-    state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorInvokeFetchPayload,
-) -> ActorInvokeFetchResult {
-    if payload.worker_name.trim().is_empty()
-        || payload.binding.trim().is_empty()
-        || payload.key.trim().is_empty()
-        || payload.request_id.trim().is_empty()
-    {
-        return ActorInvokeFetchResult {
-            ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-            error: "actor fetch invoke requires worker_name, binding, key, request_id".to_string(),
-        };
-    }
-    let request_frame = match encode_actor_invoke_request(&ActorInvokeRequest {
-        worker_name: payload.worker_name,
-        binding: payload.binding,
-        key: payload.key,
-        call: ActorInvokeCall::Fetch(common::WorkerInvocation {
-            method: payload.method,
-            url: payload.url,
-            headers: payload.headers,
-            body: payload.body,
-            request_id: payload.request_id,
-        }),
-    }) {
-        Ok(frame) => frame,
-        Err(error) => {
-            return ActorInvokeFetchResult {
-                ok: false,
-                status: 500,
-                headers: Vec::new(),
-                body: Vec::new(),
-                error: format!("actor fetch invoke encode failed: {error}"),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::ActorInvoke(ActorInvokeEvent {
-            request_frame,
-            reply: reply_tx,
-        }))
-        .is_err()
-    {
-        return ActorInvokeFetchResult {
-            ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-            error: "actor fetch runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(frame)) => match decode_actor_invoke_response(&frame) {
-            Ok(ActorInvokeResponse::Fetch(output)) => ActorInvokeFetchResult {
-                ok: true,
-                status: output.status,
-                headers: output.headers,
-                body: output.body,
-                error: String::new(),
-            },
-            Ok(ActorInvokeResponse::Error(error)) => ActorInvokeFetchResult {
-                ok: false,
-                status: 500,
-                headers: Vec::new(),
-                body: Vec::new(),
-                error,
-            },
-            Ok(ActorInvokeResponse::Method { .. }) => ActorInvokeFetchResult {
-                ok: false,
-                status: 500,
-                headers: Vec::new(),
-                body: Vec::new(),
-                error: "actor fetch invoke received method response".to_string(),
-            },
-            Err(error) => ActorInvokeFetchResult {
-                ok: false,
-                status: 500,
-                headers: Vec::new(),
-                body: Vec::new(),
-                error: format!("actor fetch invoke decode failed: {error}"),
-            },
-        },
-        Ok(Err(error)) => ActorInvokeFetchResult {
-            ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => ActorInvokeFetchResult {
-            ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-            error: "actor fetch invoke response channel closed".to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
 async fn op_actor_invoke_method(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorInvokeMethodPayload,
 ) -> ActorInvokeMethodResult {
-    if payload.worker_name.trim().is_empty()
+    if payload.caller_request_id.trim().is_empty()
+        || payload.worker_name.trim().is_empty()
         || payload.binding.trim().is_empty()
         || payload.key.trim().is_empty()
         || payload.method_name.trim().is_empty()
@@ -2257,11 +2167,21 @@ async fn op_actor_invoke_method(
         return ActorInvokeMethodResult {
             ok: false,
             value: Vec::new(),
-            error:
-                "actor method invoke requires worker_name, binding, key, method_name, request_id"
-                    .to_string(),
+            error: "actor method invoke requires caller_request_id, worker_name, binding, key, method_name, request_id"
+                .to_string(),
         };
     }
+    let (caller_worker_name, caller_generation, caller_isolate_id) =
+        match actor_invoke_owner_for_request(&state, &payload.caller_request_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return ActorInvokeMethodResult {
+                    ok: false,
+                    value: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
     let request_frame = match encode_actor_invoke_request(&ActorInvokeRequest {
         worker_name: payload.worker_name,
         binding: payload.binding,
@@ -2288,6 +2208,9 @@ async fn op_actor_invoke_method(
         .0
         .send(IsolateEventPayload::ActorInvoke(ActorInvokeEvent {
             request_frame,
+            caller_worker_name,
+            caller_generation,
+            caller_isolate_id,
             reply: reply_tx,
         }))
         .is_err()
@@ -2421,14 +2344,35 @@ async fn op_actor_state_apply_batch(
             deleted: mutation.deleted,
         })
         .collect::<Vec<_>>();
+    let reads = payload
+        .reads
+        .into_iter()
+        .map(|dependency| ActorReadDependency {
+            key: dependency.key,
+            version: dependency.version,
+        })
+        .collect::<Vec<_>>();
     let expected_base_version = if payload.expected_base_version < 0 {
         Some(-1)
     } else {
         Some(payload.expected_base_version)
     };
+    let list_gate_version = if payload.list_gate_version < 0 {
+        None
+    } else {
+        Some(payload.list_gate_version)
+    };
     let store = state.borrow().borrow::<ActorStore>().clone();
     match store
-        .apply_batch(&namespace, &actor_key, &mutations, expected_base_version)
+        .apply_batch(
+            &namespace,
+            &actor_key,
+            &reads,
+            &mutations,
+            expected_base_version,
+            list_gate_version,
+            payload.transactional,
+        )
         .await
     {
         Ok(result) => ActorStateApplyBatchResult {
@@ -3327,7 +3271,6 @@ deno_core::extension!(
         op_dynamic_host_rpc_invoke,
         op_request_body_read,
         op_request_body_cancel,
-        op_actor_invoke_fetch,
         op_actor_invoke_method,
         op_actor_state_snapshot,
         op_actor_state_apply_batch,

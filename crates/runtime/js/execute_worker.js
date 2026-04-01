@@ -59,6 +59,13 @@
     return scoped;
   };
 
+  const actorScopedRequestId = (entry, runtimeRequestId) => {
+    if (currentActorEntry === entry && currentActorRequestId) {
+      return currentActorRequestId;
+    }
+    return activeRequestId() || runtimeRequestId;
+  };
+
   const sleep = (millis) => callOp("op_sleep", Number(millis) || 0);
 
   const normalizeBoundaryValue = (value) => {
@@ -718,6 +725,94 @@
     return entry.storageState;
   };
 
+  const actorRecordVersion = (record) => (
+    record && !record.deleted ? Number(record.version ?? -1) : -1
+  );
+
+  const cloneActorRecord = (record) => {
+    if (!record) {
+      return null;
+    }
+    return {
+      key: String(record.key ?? ""),
+      value: toArrayBytes(record.value ?? []),
+      encoding: String(record.encoding ?? "utf8"),
+      version: Number(record.version ?? -1),
+      deleted: record.deleted === true,
+    };
+  };
+
+  const createActorTxn = (entry) => ({
+    entry,
+    reads: new Map(),
+    pendingReads: new Map(),
+    writes: new Map(),
+    listGateVersion: null,
+    pendingListGateVersion: null,
+    stagedVersionSeed: null,
+    effects: [],
+    committed: false,
+    committedVersion: null,
+  });
+
+  const actorTxnReadRecord = (txn, key) => {
+    const normalizedKey = String(key);
+    if (txn?.writes?.has(normalizedKey)) {
+      return txn.writes.get(normalizedKey);
+    }
+    const storageState = ensureActorStorageState(txn.entry);
+    return storageState.mirror.get(normalizedKey) ?? null;
+  };
+
+  const actorTxnTrackRead = (txn, key, record, allowConcurrency) => {
+    if (!txn || allowConcurrency) {
+      return;
+    }
+    const normalizedKey = String(key);
+    if (txn.reads.has(normalizedKey) || txn.pendingReads.has(normalizedKey)) {
+      return;
+    }
+    txn.pendingReads.set(normalizedKey, actorRecordVersion(record));
+  };
+
+  const actorTxnPromotePending = (txn) => {
+    if (!txn) {
+      return;
+    }
+    for (const [key, version] of txn.pendingReads.entries()) {
+      if (!txn.reads.has(key)) {
+        txn.reads.set(key, version);
+      }
+    }
+    txn.pendingReads.clear();
+    if (txn.pendingListGateVersion != null) {
+      txn.listGateVersion = Number(txn.pendingListGateVersion);
+      txn.pendingListGateVersion = null;
+    }
+  };
+
+  const actorTxnNextVersion = (txn) => {
+    if (!txn) {
+      throw new Error("transaction is required");
+    }
+    if (!Number.isFinite(Number(txn.stagedVersionSeed))) {
+      const storageState = ensureActorStorageState(txn.entry);
+      txn.stagedVersionSeed = Number(storageState.committedVersion ?? -1) + 1;
+    }
+    const version = Number(txn.stagedVersionSeed);
+    txn.stagedVersionSeed = version + 1;
+    return version;
+  };
+
+  const actorTxnQueueEffect = (txn, effect) => {
+    if (!txn) {
+      return effect();
+    }
+    actorTxnPromotePending(txn);
+    txn.effects.push(effect);
+    return Promise.resolve();
+  };
+
   const closeActorResourcesOnFailure = async (entry, runtimeRequestId) => {
     const socketHandles = Array.from(entry.openSocketHandles ?? []);
     for (const handle of socketHandles) {
@@ -770,7 +865,7 @@
     const failure = error instanceof Error ? error : new Error(String(error ?? "actor failed"));
     storageState.failedError = failure;
     if (entry.cacheKey) {
-      actorInstances.delete(entry.cacheKey);
+      actorStateEntries.delete(entry.cacheKey);
     }
     await closeActorResourcesOnFailure(entry, runtimeRequestId);
     throw failure;
@@ -893,15 +988,89 @@
     return await storageState.hydrating;
   };
 
-  const createActorStorageBinding = (entry, runtimeRequestId) => {
-    const currentStorageRequestId = () => activeRequestId() || runtimeRequestId;
+  const stageActorTxnWrite = (txn, record) => {
+    txn.writes.set(String(record.key ?? ""), cloneActorRecord(record));
+  };
+
+  const refreshActorEntrySnapshot = async (entry, runtimeRequestId) => {
+    const storageState = ensureActorStorageState(entry);
+    storageState.hydrated = false;
+    storageState.hydrating = null;
+    await ensureActorStorageHydrated(entry, runtimeRequestId);
+  };
+
+  const commitActorTxn = async (txn, runtimeRequestId) => {
+    if (!txn) {
+      return;
+    }
+    const storageState = ensureActorStorageState(txn.entry);
+    const writes = Array.from(txn.writes.values());
+    const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
+      key,
+      version: Number(version ?? -1),
+    }));
+    const result = await callOp("op_actor_state_apply_batch", {
+      request_id: runtimeRequestId,
+      transactional: true,
+      expected_base_version: -1,
+      reads,
+      list_gate_version: txn.listGateVersion == null ? -1 : Number(txn.listGateVersion),
+      mutations: writes.map((mutation) => ({
+        key: mutation.key,
+        value: Array.from(mutation.value),
+        encoding: mutation.encoding,
+        version: mutation.version,
+        deleted: mutation.deleted,
+      })),
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "actor transaction commit failed"));
+    }
+    if (result.conflict === true) {
+      await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
+      return false;
+    }
+    const committedVersion = Number(result.max_version ?? storageState.committedVersion);
+    for (const mutation of writes) {
+      storageState.mirror.set(mutation.key, {
+        ...cloneActorRecord(mutation),
+        version: committedVersion,
+      });
+    }
+    storageState.committedVersion = committedVersion;
+    storageState.nextVersion = Math.max(
+      Number(storageState.nextVersion ?? 0),
+      Number(storageState.committedVersion ?? -1) + 1,
+    );
+    txn.committed = true;
+    txn.committedVersion = committedVersion;
+    if (txn.effects.length > 0) {
+      await gateActorOutput(txn.entry, runtimeRequestId, async () => {
+        for (const effect of txn.effects) {
+          await effect();
+        }
+      });
+    } else {
+      await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
+    }
+    return true;
+  };
+
+  const createActorStorageBinding = (entry, runtimeRequestId, txn = null) => {
+    const currentStorageRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
     return {
-      get(key) {
+      get(key, options = {}) {
         const storageState = ensureActorStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        const record = storageState.mirror.get(String(key));
+        actorTxnPromotePending(txn);
+        const normalizedKey = String(key);
+        const record = txn
+          ? actorTxnReadRecord(txn, normalizedKey)
+          : storageState.mirror.get(normalizedKey);
+        actorTxnTrackRead(txn, normalizedKey, record, options?.allowConcurrency === true);
         if (!record || record.deleted) {
           return null;
         }
@@ -916,12 +1085,15 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
+        actorTxnPromotePending(txn);
         const normalizedKey = String(key);
         const expectedInput = options?.expectedVersion;
         const expectedVersion = Number.isFinite(Number(expectedInput))
           ? Math.trunc(Number(expectedInput))
           : -1;
-        const current = storageState.mirror.get(normalizedKey);
+        const current = txn
+          ? actorTxnReadRecord(txn, normalizedKey)
+          : storageState.mirror.get(normalizedKey);
         const currentVersion = current ? Number(current.version ?? -1) : -1;
         if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
           return {
@@ -931,7 +1103,7 @@
           };
         }
         const encoded = encodeActorStorageValue(value);
-        const version = storageState.nextVersion++;
+        const version = txn ? actorTxnNextVersion(txn) : storageState.nextVersion++;
         const record = {
           key: normalizedKey,
           value: encoded.value,
@@ -939,8 +1111,12 @@
           version,
           deleted: false,
         };
-        storageState.mirror.set(normalizedKey, record);
-        queueActorMutation(entry, currentStorageRequestId(), record);
+        if (txn) {
+          stageActorTxnWrite(txn, record);
+        } else {
+          storageState.mirror.set(normalizedKey, record);
+          queueActorMutation(entry, currentStorageRequestId(), record);
+        }
         return {
           ok: true,
           conflict: false,
@@ -952,12 +1128,15 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
+        actorTxnPromotePending(txn);
         const normalizedKey = String(key);
         const expectedInput = options?.expectedVersion;
         const expectedVersion = Number.isFinite(Number(expectedInput))
           ? Math.trunc(Number(expectedInput))
           : -1;
-        const current = storageState.mirror.get(normalizedKey);
+        const current = txn
+          ? actorTxnReadRecord(txn, normalizedKey)
+          : storageState.mirror.get(normalizedKey);
         const currentVersion = current ? Number(current.version ?? -1) : -1;
         if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
           return {
@@ -966,7 +1145,7 @@
             version: currentVersion,
           };
         }
-        const version = storageState.nextVersion++;
+        const version = txn ? actorTxnNextVersion(txn) : storageState.nextVersion++;
         const record = {
           key: normalizedKey,
           value: new Uint8Array(),
@@ -974,8 +1153,12 @@
           version,
           deleted: true,
         };
-        storageState.mirror.set(normalizedKey, record);
-        queueActorMutation(entry, currentStorageRequestId(), record);
+        if (txn) {
+          stageActorTxnWrite(txn, record);
+        } else {
+          storageState.mirror.set(normalizedKey, record);
+          queueActorMutation(entry, currentStorageRequestId(), record);
+        }
         return {
           ok: true,
           conflict: false,
@@ -987,12 +1170,22 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
+        actorTxnPromotePending(txn);
         const prefix = String(options?.prefix ?? "");
         const limitInput = Number(options?.limit ?? 100);
         const limit = Number.isFinite(limitInput)
           ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
           : 100;
-        return Array.from(storageState.mirror.values())
+        const merged = new Map(storageState.mirror);
+        if (txn) {
+          for (const [key, record] of txn.writes.entries()) {
+            merged.set(key, cloneActorRecord(record));
+          }
+          if (options?.allowConcurrency !== true) {
+            txn.pendingListGateVersion = Number(storageState.committedVersion ?? -1);
+          }
+        }
+        return Array.from(merged.values())
           .filter((record) => !record.deleted)
           .filter((record) => record.encoding === "utf8")
           .filter((record) => record.key.startsWith(prefix))
@@ -1010,7 +1203,7 @@
   const createActorSocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
     const socketsByHandle = entry.socketBindings ??= new Map();
     const openHandles = entry.openSocketHandles ??= new Set();
-    const currentSocketRequestId = () => activeRequestId() || runtimeRequestId;
+    const currentSocketRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
 
     const consumeCloseEvents = async (target) => {
       const result = await callOp("op_actor_socket_consume_close", {
@@ -1243,6 +1436,12 @@
       values() {
         return Array.from(openHandles.values());
       },
+      async send(handle, value, kind) {
+        return ensureSocket(handle).send(value, kind);
+      },
+      async close(handle, code, reason) {
+        return ensureSocket(handle).close(code, reason);
+      },
     };
 
     return {
@@ -1315,7 +1514,7 @@
   const createActorTransportRuntime = (entry, runtimeRequestId, allowTransportAccept) => {
     const transportsByHandle = entry.transportBindings ??= new Map();
     const openHandles = entry.openTransportHandles ??= new Set();
-    const currentTransportRequestId = () => activeRequestId() || runtimeRequestId;
+    const currentTransportRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
 
     const consumeCloseEvents = async (target) => {
       const result = await callOp("op_actor_transport_consume_close", {
@@ -1562,6 +1761,9 @@
       values() {
         return Array.from(openHandles.values());
       },
+      session(handle) {
+        return ensureTransport(handle);
+      },
     };
 
     return {
@@ -1592,9 +1794,38 @@
     };
   };
 
-  const createActorRuntimeState = (entry, runtimeRequestId, allowSocketAccept, allowTransportAccept) => {
-    const socketRuntime = createActorSocketRuntime(entry, runtimeRequestId, allowSocketAccept);
-    const transportRuntime = createActorTransportRuntime(entry, runtimeRequestId, allowTransportAccept);
+  const createActorRuntimeState = (
+    entry,
+    runtimeRequestId,
+    allowSocketAccept,
+    allowTransportAccept,
+    txn = null,
+  ) => {
+    const socketRuntime = createActorSocketRuntime(
+      entry,
+      runtimeRequestId,
+      allowSocketAccept,
+    );
+    const transportRuntime = createActorTransportRuntime(
+      entry,
+      runtimeRequestId,
+      allowTransportAccept,
+    );
+    const storage = createActorStorageBinding(entry, runtimeRequestId, txn);
+    const sockets = txn ? {
+      accept(...args) {
+        return socketRuntime.sockets.accept(...args);
+      },
+      values(...args) {
+        return socketRuntime.sockets.values(...args);
+      },
+      send(handle, value, kind) {
+        return actorTxnQueueEffect(txn, () => socketRuntime.sockets.send(handle, value, kind));
+      },
+      close(handle, code, reason) {
+        return actorTxnQueueEffect(txn, () => socketRuntime.sockets.close(handle, code, reason));
+      },
+    } : socketRuntime.sockets;
     entry.socketRuntime = socketRuntime;
     entry.transportRuntime = transportRuntime;
     return {
@@ -1603,22 +1834,106 @@
           return entry.actorKey;
         },
       },
-      storage: createActorStorageBinding(entry, runtimeRequestId),
-      sockets: socketRuntime.sockets,
+      get(key, options) {
+        return storage.get(key, options);
+      },
+      set(key, value, options) {
+        return storage.put(key, value, options);
+      },
+      delete(key, options) {
+        return storage.delete(key, options);
+      },
+      list(options) {
+        return storage.list(options);
+      },
+      storage,
+      sockets,
       transports: transportRuntime.transports,
       __dd_socket_runtime: socketRuntime,
       __dd_transport_runtime: transportRuntime,
     };
   };
 
-  const actorInstances = globalThis.__dd_actor_instances ??= new Map();
+  const createActorStateFacade = (stateRef) => {
+    const facade = {
+      id: {
+        toString() {
+          return stateRef.current.id.toString();
+        },
+      },
+      storage: {
+        get(...args) {
+          return stateRef.current.storage.get(...args);
+        },
+        put(...args) {
+          return stateRef.current.storage.put(...args);
+        },
+        delete(...args) {
+          return stateRef.current.storage.delete(...args);
+        },
+        list(...args) {
+          return stateRef.current.storage.list(...args);
+        },
+      },
+      get(...args) {
+        return stateRef.current.get(...args);
+      },
+      set(...args) {
+        return stateRef.current.set(...args);
+      },
+      delete(...args) {
+        return stateRef.current.delete(...args);
+      },
+      list(...args) {
+        return stateRef.current.list(...args);
+      },
+      sockets: {
+        accept(...args) {
+          return stateRef.current.sockets.accept(...args);
+        },
+        values(...args) {
+          return stateRef.current.sockets.values(...args);
+        },
+        send(...args) {
+          return stateRef.current.sockets.send(...args);
+        },
+        close(...args) {
+          return stateRef.current.sockets.close(...args);
+        },
+      },
+      transports: {
+        accept(...args) {
+          return stateRef.current.transports.accept(...args);
+        },
+        values(...args) {
+          return stateRef.current.transports.values(...args);
+        },
+      },
+    };
+    Object.defineProperty(facade, "__dd_socket_runtime", {
+      get() {
+        return stateRef.current.__dd_socket_runtime;
+      },
+    });
+    Object.defineProperty(facade, "__dd_transport_runtime", {
+      get() {
+        return stateRef.current.__dd_transport_runtime;
+      },
+    });
+    return facade;
+  };
+
+  const actorStateEntries = globalThis.__dd_actor_state_entries ??= new Map();
+  const liveActorExecutables = globalThis.__dd_live_actor_executables ??= new Map();
+  let liveActorExecutableSeq = globalThis.__dd_live_actor_executable_seq ?? 0;
+
+  const ACTOR_RUN_METHOD = "__dd_run";
 
   const actorMethodNameIsBlocked = (name) => (
     !name
     || name === "constructor"
     || name === "fetch"
     || name === "then"
-    || name.startsWith("__dd_")
   );
 
   const actorMethodNameIsBlockedForProxy = (name) => (
@@ -1691,101 +2006,165 @@
     },
   });
 
-  const createActorStub = (namespace, actorKey) => {
-    const target = {
-      async fetch(inputValue, initValue = undefined) {
-        const request = await normalizeActorFetchInput(inputValue, initValue);
-        actorInvokeSeq += 1;
+  const actorEntryKey = (binding, actorKey) => `${binding}\u001f${actorKey}`;
+
+  const createActorId = (bindingName, actorKey) => ({
+    __dd_actor_key: actorKey,
+    __dd_actor_binding: bindingName,
+    toString() {
+      return actorKey;
+    },
+  });
+
+  const ensureActorEntry = async (binding, actorKey, hydrationRequestId) => {
+    const cacheKey = actorEntryKey(binding, actorKey);
+    let entry = actorStateEntries.get(cacheKey);
+    if (!entry) {
+      entry = {
+        binding,
+        actorKey,
+        cacheKey,
+        socketBindings: new Map(),
+        openSocketHandles: new Set(),
+        socketRuntime: null,
+        transportBindings: new Map(),
+        openTransportHandles: new Set(),
+        transportRuntime: null,
+      };
+      actorStateEntries.set(cacheKey, entry);
+    }
+    entry.binding = binding;
+    entry.actorKey = actorKey;
+    entry.cacheKey = cacheKey;
+    await ensureActorStorageHydrated(entry, hydrationRequestId);
+    return entry;
+  };
+
+  const registerLiveActorExecutable = (executable) => {
+    liveActorExecutableSeq += 1;
+    globalThis.__dd_live_actor_executable_seq = liveActorExecutableSeq;
+    const token = `${requestId}:live-actor:${liveActorExecutableSeq}`;
+    liveActorExecutables.set(token, executable);
+    return token;
+  };
+
+  const extractExecDescriptor = (executable) => {
+    if (typeof executable !== "function") {
+      throw new Error("stub.run(fn, ...args) requires a function");
+    }
+    const workerModule = globalThis.__dd_worker_module;
+    const exportName = String(executable.name ?? "").trim();
+    const exported = exportName ? workerModule?.[exportName] : undefined;
+    const source = String(executable);
+    if (!exportName && !source.trim()) {
+      throw new Error("stub.run(fn, ...args) requires a non-empty function body");
+    }
+    const liveToken = registerLiveActorExecutable(executable);
+    if (exportName && exported === executable) {
+      return { live_token: liveToken, export_name: exportName, source };
+    }
+    return { live_token: liveToken, source };
+  };
+
+  const createActorStubSocketApi = (bindingName, actorKey) => ({
+    async accept(request, options = {}) {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, true, false);
+      await state.__dd_socket_runtime.refreshOpenHandles();
+      return state.sockets.accept(request, options);
+    },
+    async send(handle, value, kind) {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, false, false);
+      await state.__dd_socket_runtime.refreshOpenHandles();
+      return state.sockets.send(handle, value, kind);
+    },
+    async close(handle, code, reason) {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, false, false);
+      await state.__dd_socket_runtime.refreshOpenHandles();
+      return state.sockets.close(handle, code, reason);
+    },
+    async values() {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, false, false);
+      await state.__dd_socket_runtime.refreshOpenHandles();
+      return state.sockets.values();
+    },
+  });
+
+  const createActorStubTransportApi = (bindingName, actorKey) => ({
+    async accept(request, options = {}) {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, false, true);
+      await state.__dd_transport_runtime.refreshOpenHandles();
+      return state.transports.accept(request, options);
+    },
+    async values() {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, false, false);
+      await state.__dd_transport_runtime.refreshOpenHandles();
+      return state.transports.values();
+    },
+    async session(handle) {
+      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+      const state = createActorRuntimeState(entry, requestId, false, false);
+      await state.__dd_transport_runtime.refreshOpenHandles();
+      return state.transports.session(handle);
+    },
+  });
+
+  const createActorStub = (namespace, actorKey) => ({
+    id: createActorId(namespace, actorKey),
+    binding: namespace,
+    sockets: createActorStubSocketApi(namespace, actorKey),
+    transports: createActorStubTransportApi(namespace, actorKey),
+    async run(executable, ...args) {
+      actorInvokeSeq += 1;
+      const descriptor = extractExecDescriptor(executable);
+      const payload = [
+        {
+          ...descriptor,
+        },
+        ...args,
+      ];
+      const argsBytes = await encodeRpcArgs(payload);
+      try {
         const result = await callOp(
-          "op_actor_invoke_fetch",
+          "op_actor_invoke_method",
           {
             worker_name: workerName,
             binding: namespace,
             key: actorKey,
-            method: request.method,
-            url: request.url,
-            headers: request.headers,
-            body: Array.from(request.body),
-            request_id: `${requestId}:actor-fetch:${actorInvokeSeq}`,
+            method_name: ACTOR_RUN_METHOD,
+            args: Array.from(argsBytes),
+            caller_request_id: activeRequestId() || requestId,
+            request_id: `${requestId}:actor-run:${actorInvokeSeq}`,
           },
         );
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "actor fetch invoke failed"));
+          throw new Error(String(result?.error ?? "actor run failed"));
         }
-        const status = Number(result.status ?? 200);
-        const headers = Array.isArray(result.headers) ? result.headers : [];
-        const responseHeaders = new Headers(headers);
-        if (status === 101) {
-          return {
-            __dd_websocket_accept: true,
-            status,
-            headers: responseHeaders,
-            body: null,
-          };
+        return decodeRpcResult(toArrayBytes(result.value));
+      } finally {
+        if (descriptor.live_token) {
+          liveActorExecutables.delete(String(descriptor.live_token));
         }
-        if (
-          status === 200
-          && String(responseHeaders.get(INTERNAL_TRANSPORT_ACCEPT_HEADER) ?? "") === "1"
-        ) {
-          return {
-            __dd_transport_accept: true,
-            status,
-            headers: responseHeaders,
-            body: null,
-          };
-        }
-        return new Response(toArrayBytes(result.body), {
-          status,
-          headers,
-        });
-      },
-    };
-
-    return new Proxy(target, {
-      get(currentTarget, prop, receiver) {
-        if (typeof prop === "symbol") {
-          return Reflect.get(currentTarget, prop, receiver);
-        }
-        const methodName = String(prop);
-        if (methodName in currentTarget) {
-          return Reflect.get(currentTarget, prop, receiver);
-        }
-        if (methodName === "then") {
-          return undefined;
-        }
-        if (actorMethodNameIsBlockedForProxy(methodName)) {
-          throw new Error(`actor method is blocked: ${methodName}`);
-        }
-        return async (...args) => {
-          actorInvokeSeq += 1;
-          const argsBytes = await encodeRpcArgs(args);
-          const result = await callOp(
-            "op_actor_invoke_method",
-            {
-              worker_name: workerName,
-              binding: namespace,
-              key: actorKey,
-              method_name: methodName,
-              args: Array.from(argsBytes),
-              request_id: `${requestId}:actor-method:${actorInvokeSeq}`,
-            },
-          );
-          await syncFrozenTime();
-          if (!result || typeof result !== "object" || result.ok === false) {
-            throw new Error(String(result?.error ?? `actor method invoke failed: ${methodName}`));
-          }
-          return decodeRpcResult(toArrayBytes(result.value));
-        };
-      },
-    });
-  };
+      }
+    },
+  });
 
   const actorIdKey = (id) => {
     if (typeof id === "string") {
       return id;
     }
-    if (id && typeof id === "object" && typeof id.__dd_actor_key === "string") {
+    if (
+      id
+      && typeof id === "object"
+      && typeof id.__dd_actor_key === "string"
+      && typeof id.__dd_actor_binding === "string"
+    ) {
       return id.__dd_actor_key;
     }
     return "";
@@ -1797,15 +2176,19 @@
       if (!key) {
         throw new Error("actor idFromName requires a non-empty name");
       }
-      return {
-        __dd_actor_key: key,
-        __dd_actor_binding: bindingName,
-        toString() {
-          return key;
-        },
-      };
+      return createActorId(bindingName, key);
     },
     get(id) {
+      if (
+        id
+        && typeof id === "object"
+        && "__dd_actor_binding" in id
+        && String(id.__dd_actor_binding) !== bindingName
+      ) {
+        throw new Error(
+          `actor id belongs to namespace ${String(id.__dd_actor_binding)}, not ${bindingName}`,
+        );
+      }
       const actorKey = actorIdKey(id).trim();
       if (!actorKey) {
         throw new Error("actor namespace get() requires a valid actor id");
@@ -2217,7 +2600,6 @@
 
   const buildEnv = () => {
     const env = {};
-    const actorBindingClasses = new Map();
     const kvBindings = Array.isArray(kvBindingsConfig)
       ? kvBindingsConfig
       : kvBindingsConfig && typeof kvBindingsConfig === "object"
@@ -2299,20 +2681,15 @@
 
     const actorBindings = Array.isArray(actorBindingsConfig) ? actorBindingsConfig : [];
     for (const entry of actorBindings) {
-      let bindingName = "";
-      let className = "";
-      if (Array.isArray(entry) && entry.length >= 2) {
-        bindingName = String(entry[0] ?? "").trim();
-        className = String(entry[1] ?? "").trim();
-      } else if (entry && typeof entry === "object") {
-        bindingName = String(entry.binding ?? "").trim();
-        className = String(entry.class ?? entry.class_name ?? "").trim();
-      }
-      if (!bindingName || !className) {
+      const bindingName = Array.isArray(entry)
+        ? String(entry[0] ?? "").trim()
+        : entry && typeof entry === "object"
+          ? String(entry.binding ?? "").trim()
+          : String(entry ?? "").trim();
+      if (!bindingName) {
         continue;
       }
       const envName = bindingName;
-      actorBindingClasses.set(bindingName, className);
       Object.defineProperty(env, envName, {
         value: createActorNamespace(bindingName),
         enumerable: true,
@@ -2321,12 +2698,130 @@
       });
     }
 
-    return { env, actorBindingClasses };
+    return { env };
   };
 
-  const actorClassRegistry = globalThis.__dd_actor_classes ?? {};
+  const decodeExecPayload = (rawArgs) => {
+    const values = decodeRpcArgs(toArrayBytes(rawArgs));
+    if (!Array.isArray(values) || values.length === 0) {
+      throw new Error("actor run requires an executable payload");
+    }
+    const [descriptor, ...args] = values;
+    const exportName = String(descriptor?.export_name ?? descriptor?.exportName ?? "").trim();
+    const liveToken = String(descriptor?.live_token ?? descriptor?.liveToken ?? "").trim();
+    const source = String(descriptor?.source ?? "").trim();
+    if (!liveToken && !exportName && !source) {
+      throw new Error("actor run executable descriptor must not be empty");
+    }
+    return {
+      descriptor: { liveToken, exportName, source },
+      args,
+    };
+  };
 
-  const invokeActorClass = async (actorCall, request, env, actorBindingClasses) => {
+  const instantiateExecutable = (descriptor) => {
+    const liveToken = String(descriptor?.liveToken ?? "").trim();
+    if (liveToken && liveActorExecutables.has(liveToken)) {
+      const executable = liveActorExecutables.get(liveToken);
+      liveActorExecutables.delete(liveToken);
+      if (typeof executable === "function") {
+        return executable;
+      }
+    }
+    const exportName = String(descriptor?.exportName ?? "").trim();
+    if (exportName) {
+      const workerModule = globalThis.__dd_worker_module;
+      const registered = workerModule?.[exportName];
+      if (typeof registered === "function") {
+        return registered;
+      }
+    }
+    const source = String(descriptor?.source ?? "").trim();
+    try {
+      const executable = (0, eval)(`(${source})`);
+      if (typeof executable !== "function") {
+        throw new Error("actor executable did not evaluate to a function");
+      }
+      return executable;
+    } catch (error) {
+      throw new Error(`actor executable compile failed: ${String(error?.message ?? error)}`);
+    }
+  };
+
+  const executeActorTransaction = async (entry, runtimeRequestId, executable, args) => {
+    const maxRetries = 256;
+    let lastConflict = null;
+    for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+      const txn = createActorTxn(entry);
+      const scopedState = createActorRuntimeState(
+        entry,
+        runtimeRequestId,
+        false,
+        false,
+        txn,
+      );
+      try {
+        const value = await executable(scopedState, ...args);
+        const committed = await commitActorTxn(txn, runtimeRequestId);
+        if (!committed) {
+          lastConflict = new Error("actor transaction conflicted");
+          await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
+          continue;
+        }
+        return value;
+      } catch (error) {
+        if (txn.committed) {
+          throw error;
+        }
+        if (
+          error instanceof Error
+          && String(error.message ?? "").includes("conflicted")
+        ) {
+          lastConflict = error;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastConflict ?? new Error("actor transaction exceeded retry limit");
+  };
+
+  const buildWakeEvent = (actorCall, stub) => {
+    const kind = String(actorCall.kind ?? "").trim();
+    const event = {
+      type: kind,
+      binding: String(actorCall.binding ?? ""),
+      key: String(actorCall.key ?? ""),
+      stub,
+    };
+    if ("handle" in actorCall) {
+      event.handle = String(actorCall.handle ?? "");
+    }
+    if (kind === "message") {
+      const raw = toArrayBytes(actorCall.data);
+      event.data = actorCall.is_text === true ? Deno.core.decode(raw) : raw;
+      event.isText = actorCall.is_text === true;
+      event.type = "socketmessage";
+    } else if (kind === "close") {
+      event.code = Number(actorCall.code ?? 1000);
+      event.reason = String(actorCall.reason ?? "");
+      event.type = "socketclose";
+    } else if (kind === "transport_datagram" || kind === "datagram") {
+      event.data = toArrayBytes(actorCall.data);
+      event.type = "transportdatagram";
+    } else if (kind === "transport_stream" || kind === "stream") {
+      event.data = toArrayBytes(actorCall.data);
+      event.type = "transportstream";
+    } else if (kind === "transport_close" || kind === "transport") {
+      event.code = Number(actorCall.code ?? 0);
+      event.reason = String(actorCall.reason ?? "");
+      event.type = "transportclose";
+    }
+    return event;
+  };
+
+  const invokeActorCall = async (actorCall, request, env) => {
     if (!actorCall || typeof actorCall !== "object") {
       throw new Error("actor invoke config is missing");
     }
@@ -2335,171 +2830,73 @@
     if (!binding || !actorKey) {
       throw new Error("actor invoke requires binding and key");
     }
-    const className = actorBindingClasses.get(binding);
-    if (!className) {
+    if (!Object.prototype.hasOwnProperty.call(env, binding)) {
       throw new Error(`actor binding not declared for worker: ${binding}`);
     }
-    const actorClass = actorClassRegistry[className];
-    if (typeof actorClass !== "function") {
-      throw new Error(`actor class export not found: ${className}`);
-    }
-
-    const cacheKey = `${binding}\u001f${actorKey}`;
-    let entry = actorInstances.get(cacheKey);
-    if (!entry) {
-      entry = {
-        binding,
-        actorKey,
-        cacheKey,
-        socketBindings: new Map(),
-        openSocketHandles: new Set(),
-        socketRuntime: null,
-        transportBindings: new Map(),
-        openTransportHandles: new Set(),
-        transportRuntime: null,
-      };
-      await ensureActorStorageHydrated(entry, requestId);
-      const constructorState = createActorRuntimeState(entry, requestId, false, false);
-      await constructorState.__dd_socket_runtime.refreshOpenHandles();
-      await constructorState.__dd_transport_runtime.refreshOpenHandles();
-      const previousWebSocketForCtor = globalThis.WebSocket;
-      const previousWebTransportForCtor = globalThis.WebTransportSession;
-      globalThis.WebSocket = constructorState.__dd_socket_runtime.WebSocket;
-      globalThis.WebTransportSession = constructorState.__dd_transport_runtime.WebTransportSession;
-      try {
-        entry = {
-          ...entry,
-          instance: new actorClass(constructorState, env),
-        };
-      } finally {
-        if (previousWebSocketForCtor === undefined) {
-          delete globalThis.WebSocket;
-        } else {
-          globalThis.WebSocket = previousWebSocketForCtor;
-        }
-        if (previousWebTransportForCtor === undefined) {
-          delete globalThis.WebTransportSession;
-        } else {
-          globalThis.WebTransportSession = previousWebTransportForCtor;
-        }
-      }
-      actorInstances.set(cacheKey, entry);
-    }
-    entry.binding = binding;
-    entry.actorKey = actorKey;
-    entry.cacheKey = cacheKey;
-
+    const entry = await ensureActorEntry(binding, actorKey, requestId);
     const kind = String(actorCall.kind ?? "");
     await ensureActorStorageHydrated(entry, requestId);
-    const scopedState = createActorRuntimeState(entry, requestId, kind === "fetch", kind === "fetch");
+    const scopedState = createActorRuntimeState(entry, requestId, false, false);
     const previousWebSocket = globalThis.WebSocket;
     const previousWebTransport = globalThis.WebTransportSession;
+    const previousActorEntry = currentActorEntry;
+    const previousActorRequestId = currentActorRequestId;
     globalThis.WebSocket = scopedState.__dd_socket_runtime.WebSocket;
     globalThis.WebTransportSession = scopedState.__dd_transport_runtime.WebTransportSession;
-    const receiver = new Proxy(entry.instance, {
-      get(target, prop, receiverValue) {
-        if (prop === "state") {
-          return scopedState;
-        }
-        return Reflect.get(target, prop, target);
-      },
-      set(target, prop, value, receiverValue) {
-        if (prop === "state") {
-          return true;
-        }
-        return Reflect.set(target, prop, value, target);
-      },
-    });
-
+    currentActorEntry = entry;
+    currentActorRequestId = requestId;
     try {
+      await ensureActorStorageHydrated(entry, requestId);
       await scopedState.__dd_socket_runtime.refreshOpenHandles();
       await scopedState.__dd_transport_runtime.refreshOpenHandles();
-      currentActorEntry = entry;
-      currentActorRequestId = requestId;
-      if (kind === "fetch") {
-        if (typeof entry.instance.fetch !== "function") {
-          throw new Error(`actor class does not define fetch(): ${className}`);
-        }
-        const response = await entry.instance.fetch.call(receiver, request);
-        await gateActorOutput(entry, requestId, async () => undefined);
-        return response;
-      }
       if (kind === "method") {
         const methodName = String(actorCall.name ?? "").trim();
-        if (actorMethodNameIsBlocked(methodName)) {
+        if (!methodName) {
+          throw new Error("actor method invoke requires a method name");
+        }
+        if (actorMethodNameIsBlocked(methodName) && methodName !== ACTOR_RUN_METHOD) {
           throw new Error(`actor method is blocked: ${methodName}`);
         }
-        const method = entry.instance[methodName];
-        if (typeof method !== "function") {
-          throw new Error(`actor method not found: ${methodName}`);
+        if (methodName !== ACTOR_RUN_METHOD) {
+          throw new Error(`unsupported actor method: ${methodName}`);
         }
-        const args = decodeRpcArgs(toArrayBytes(actorCall.args));
-        const value = await method.apply(receiver, args);
+        const { descriptor, args } = decodeExecPayload(actorCall.args);
+        const executable = instantiateExecutable(descriptor);
+        const value = await executeActorTransaction(
+          entry,
+          requestId,
+          executable,
+          args,
+        );
         const encoded = await encodeRpcResult(value);
-        await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(encoded, {
           status: 200,
           headers: [["content-type", "application/octet-stream"]],
         });
       }
-      if (kind === "message") {
-        const handle = String(actorCall.handle ?? "").trim();
-        if (!handle) {
-          throw new Error("actor message invoke requires socket handle");
+      if (
+        kind === "message"
+        || kind === "close"
+        || kind === "transport_datagram"
+        || kind === "datagram"
+        || kind === "transport_stream"
+        || kind === "stream"
+        || kind === "transport_close"
+        || kind === "transport"
+      ) {
+        const wakeMethod = worker?.wake;
+        if (typeof wakeMethod !== "function") {
+          throw new Error("worker does not define wake(event, env)");
         }
-        const ws = new globalThis.WebSocket(handle);
-        const raw = toArrayBytes(actorCall.data);
-        const message = actorCall.is_text === true ? Deno.core.decode(raw) : raw;
-        await ws.__dd_dispatchMessage(message);
-        await gateActorOutput(entry, requestId, async () => undefined);
-        return new Response(null, { status: 204 });
-      }
-      if (kind === "transport_datagram" || kind === "datagram") {
-        const handle = String(actorCall.handle ?? "").trim();
-        if (!handle) {
-          throw new Error("actor transport datagram invoke requires transport handle");
-        }
-        const session = new globalThis.WebTransportSession(handle);
-        await session.__dd_dispatchDatagram(toArrayBytes(actorCall.data));
-        await gateActorOutput(entry, requestId, async () => undefined);
-        return new Response(null, { status: 204 });
-      }
-      if (kind === "transport_stream" || kind === "stream") {
-        const handle = String(actorCall.handle ?? "").trim();
-        if (!handle) {
-          throw new Error("actor transport stream invoke requires transport handle");
-        }
-        const session = new globalThis.WebTransportSession(handle);
-        await session.__dd_dispatchStreamChunk(toArrayBytes(actorCall.data));
-        await gateActorOutput(entry, requestId, async () => undefined);
-        return new Response(null, { status: 204 });
-      }
-      if (kind === "transport_close" || kind === "transport") {
-        const handle = String(actorCall.handle ?? "").trim();
-        if (!handle) {
-          throw new Error("actor transport close invoke requires transport handle");
-        }
-        const session = new globalThis.WebTransportSession(handle);
-        session.__dd_dispatchClose(
-          Number(actorCall.code ?? 0),
-          String(actorCall.reason ?? ""),
-        );
-        await gateActorOutput(entry, requestId, async () => undefined);
-        return new Response(null, { status: 204 });
-      }
-      if (kind === "close") {
-        const handle = String(actorCall.handle ?? "").trim();
-        if (!handle) {
-          throw new Error("actor close invoke requires socket handle");
-        }
-        new globalThis.WebSocket(handle);
+        const event = buildWakeEvent(actorCall, createActorStub(binding, actorKey));
+        await wakeMethod.call(worker, event, env);
         await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       throw new Error(`unsupported actor invoke kind: ${kind}`);
     } finally {
-      currentActorEntry = null;
-      currentActorRequestId = null;
+      currentActorEntry = previousActorEntry;
+      currentActorRequestId = previousActorRequestId;
       if (previousWebSocket === undefined) {
         delete globalThis.WebSocket;
       } else {
@@ -2668,7 +3065,6 @@
         : request;
       const envResult = buildEnv();
       const env = envResult.env;
-      const actorBindingClasses = envResult.actorBindingClasses;
       const ctx = {
         requestId: input.request_id,
         signal: controller.signal,
@@ -2684,7 +3080,7 @@
       const response = hostRpcCallConfig
         ? await invokeHostRpcCall(hostRpcCallConfig)
         : actorCallConfig
-          ? await invokeActorClass(actorCallConfig, workerRequest, env, actorBindingClasses)
+          ? await invokeActorCall(actorCallConfig, workerRequest, env)
           : await worker.fetch(workerRequest, env, ctx);
       await syncFrozenTime();
 

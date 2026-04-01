@@ -40,6 +40,12 @@ pub struct ActorBatchMutation {
 }
 
 #[derive(Debug, Clone)]
+pub struct ActorReadDependency {
+    pub key: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActorBatchApplyResult {
     pub conflict: bool,
     pub max_version: i64,
@@ -103,11 +109,14 @@ impl ActorStore {
         &self,
         namespace: &str,
         actor_key: &str,
+        reads: &[ActorReadDependency],
         mutations: &[ActorBatchMutation],
         expected_base_version: Option<i64>,
+        list_gate_version: Option<i64>,
+        transactional: bool,
     ) -> Result<ActorBatchApplyResult> {
         let conn = self.connect(namespace, actor_key).await?;
-        if mutations.is_empty() {
+        if mutations.is_empty() && reads.is_empty() && list_gate_version.is_none() {
             let max_version = self
                 .max_version_for_actor(&conn, actor_key)
                 .await?
@@ -141,14 +150,16 @@ impl ActorStore {
             }
         }
 
-        let mut previous_version = expected_base_version.unwrap_or(-1);
-        for mutation in mutations {
-            if mutation.version <= previous_version {
-                return Err(PlatformError::bad_request(
-                    "actor batch mutation versions must be strictly increasing",
-                ));
+        if !transactional {
+            let mut previous_version = expected_base_version.unwrap_or(-1);
+            for mutation in mutations {
+                if mutation.version <= previous_version {
+                    return Err(PlatformError::bad_request(
+                        "actor batch mutation versions must be strictly increasing",
+                    ));
+                }
+                previous_version = mutation.version;
             }
-            previous_version = mutation.version;
         }
 
         let mut attempt = 0usize;
@@ -165,17 +176,45 @@ impl ActorStore {
 
             let outcome = async {
                 let current = self.max_version_for_actor(&conn, actor_key).await?.unwrap_or(-1);
-                if let Some(expected) = expected_base_version {
-                    if current != expected {
+                if let Some(expected_list_version) = list_gate_version {
+                    if current != expected_list_version {
                         return Ok(ActorBatchApplyResult {
                             conflict: true,
                             max_version: current,
                         });
                     }
                 }
+                if !transactional {
+                    if let Some(expected) = expected_base_version {
+                        if current != expected {
+                            return Ok(ActorBatchApplyResult {
+                                conflict: true,
+                                max_version: current,
+                            });
+                        }
+                    }
+                }
+                for dependency in reads {
+                    let observed = self
+                        .version_for_key(&conn, actor_key, dependency.key.as_str())
+                        .await?
+                        .unwrap_or(-1);
+                    if observed != dependency.version {
+                        return Ok(ActorBatchApplyResult {
+                            conflict: true,
+                            max_version: current.max(observed),
+                        });
+                    }
+                }
+
+                let commit_version = if transactional && !mutations.is_empty() {
+                    Some(self.reserve_version_after(current))
+                } else {
+                    None
+                };
 
                 for mutation in mutations {
-                    let version = mutation.version;
+                    let version = commit_version.unwrap_or(mutation.version);
                     let now_ms = epoch_ms_i64()?;
                     if mutation.deleted {
                         let empty_blob: &[u8] = &[];
@@ -236,7 +275,14 @@ impl ActorStore {
                     .map_err(actor_error)?;
                 }
 
-                let max_version = mutations.last().map(|mutation| mutation.version).unwrap_or(current);
+                let max_version = if let Some(version) = commit_version {
+                    version
+                } else {
+                    mutations
+                        .last()
+                        .map(|mutation| mutation.version)
+                        .unwrap_or(current)
+                };
                 Ok(ActorBatchApplyResult {
                     conflict: false,
                     max_version,
@@ -258,6 +304,23 @@ impl ActorStore {
                     let _ = conn.execute("ROLLBACK", ()).await;
                     return Err(error);
                 }
+            }
+        }
+    }
+
+    fn reserve_version_after(&self, floor: i64) -> i64 {
+        let minimum = floor.saturating_add(1).max(1) as u64;
+        let mut current = self.version.load(Ordering::SeqCst);
+        loop {
+            let next = current.max(minimum);
+            match self.version.compare_exchange(
+                current,
+                next.saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next as i64,
+                Err(actual) => current = actual,
             }
         }
     }
@@ -318,6 +381,29 @@ impl ActorStore {
         if let Some(row) = rows.next().await.map_err(actor_error)? {
             let version = row.get::<Option<i64>>(0).map_err(actor_error)?;
             return Ok(version);
+        }
+        Ok(None)
+    }
+
+    async fn version_for_key(
+        &self,
+        conn: &Connection,
+        actor_key: &str,
+        item_key: &str,
+    ) -> Result<Option<i64>> {
+        let mut rows = conn
+            .query(
+                "SELECT version FROM actor_state
+                 WHERE entity_key = ?1 AND item_key = ?2
+                 LIMIT 1",
+                (actor_key, item_key),
+            )
+            .await
+            .map_err(actor_error)?;
+        if let Some(row) = rows.next().await.map_err(actor_error)? {
+            let version = row.get::<i64>(0).map_err(actor_error)?;
+            self.observe_version(version);
+            return Ok(Some(version));
         }
         Ok(None)
     }

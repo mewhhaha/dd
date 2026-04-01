@@ -53,6 +53,7 @@ const INTERNAL_TRANSPORT_CLOSE_CODE_HEADER: &str = "x-dd-transport-close-code";
 const INTERNAL_TRANSPORT_CLOSE_REASON_HEADER: &str = "x-dd-transport-close-reason";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const JSON_CONTENT_TYPE: &str = "application/json";
+const ACTOR_RUN_METHOD: &str = "__dd_run";
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -395,9 +396,8 @@ struct WorkerPool {
     snapshot: &'static [u8],
     snapshot_preloaded: bool,
     source: Arc<str>,
-    actor_classes: Arc<[String]>,
     kv_bindings: Vec<String>,
-    actor_bindings: Vec<(String, String)>,
+    actor_bindings: Vec<String>,
     dynamic_bindings: Vec<String>,
     dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     dynamic_env: Vec<(String, String)>,
@@ -504,7 +504,7 @@ enum IsolateCommand {
         completion_token: String,
         worker_name: String,
         kv_bindings: Vec<String>,
-        actor_bindings: Vec<(String, String)>,
+        actor_bindings: Vec<String>,
         dynamic_bindings: Vec<String>,
         dynamic_rpc_bindings: Vec<String>,
         dynamic_env: Vec<(String, String)>,
@@ -524,10 +524,6 @@ enum IsolateCommand {
 
 #[derive(Clone)]
 enum ActorExecutionCall {
-    Fetch {
-        binding: String,
-        key: String,
-    },
     Method {
         binding: String,
         key: String,
@@ -3314,19 +3310,13 @@ impl WorkerManager {
             return Err(PlatformError::bad_request("Worker name must not be empty"));
         }
         let bindings = extract_bindings(&config)?;
-        let actor_classes: Vec<String> = bindings
-            .actor
-            .iter()
-            .map(|(_, class)| class.clone())
-            .collect();
-
-        validate_worker(self.bootstrap_snapshot, &source, &actor_classes).await?;
+        validate_worker(self.bootstrap_snapshot, &source).await?;
         let has_dynamic_bindings = !bindings.dynamic.is_empty();
         let (snapshot, snapshot_preloaded) = if has_dynamic_bindings {
             (self.bootstrap_snapshot, false)
         } else {
             let worker_snapshot =
-                build_worker_snapshot(self.bootstrap_snapshot, &source, &actor_classes).await?;
+                build_worker_snapshot(self.bootstrap_snapshot, &source).await?;
             validate_loaded_worker_runtime(worker_snapshot)?;
             (worker_snapshot, true)
         };
@@ -3358,7 +3348,6 @@ impl WorkerManager {
                 snapshot,
                 snapshot_preloaded,
                 source: Arc::<str>::from(source.clone()),
-                actor_classes: Arc::<[String]>::from(actor_classes.clone()),
                 kv_bindings: bindings.kv,
                 actor_bindings: bindings.actor,
                 dynamic_bindings: bindings.dynamic,
@@ -3399,9 +3388,7 @@ impl WorkerManager {
         let worker_name = format!("dyn-{}", Uuid::new_v4().simple());
         let dynamic_config =
             build_dynamic_worker_config(env, egress_allow_hosts, dynamic_rpc_bindings)?;
-        let actor_classes: Vec<String> = Vec::new();
-
-        validate_worker(self.bootstrap_snapshot, &source, &actor_classes).await?;
+        validate_worker(self.bootstrap_snapshot, &source).await?;
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
@@ -3415,7 +3402,6 @@ impl WorkerManager {
             snapshot: self.bootstrap_snapshot,
             snapshot_preloaded: false,
             source: Arc::<str>::from(source),
-            actor_classes: Arc::<[String]>::from(actor_classes),
             kv_bindings: Vec::new(),
             actor_bindings: Vec::new(),
             dynamic_bindings: Vec::new(),
@@ -3527,7 +3513,7 @@ impl WorkerManager {
                 if !pool
                     .actor_bindings
                     .iter()
-                    .any(|(binding, _)| binding == &route.binding)
+                    .any(|binding| binding == &route.binding)
                 {
                     let error = PlatformError::bad_request(format!(
                         "unknown actor binding for worker {}: {}",
@@ -3574,35 +3560,36 @@ impl WorkerManager {
                 return;
             }
         };
-        let (request, actor_call) = match decoded.call {
-            ActorInvokeCall::Fetch(request) => (
-                request,
-                ActorExecutionCall::Fetch {
-                    binding: decoded.binding.clone(),
-                    key: decoded.key.clone(),
-                },
-            ),
+        let (request, actor_call, prefer_caller_isolate) = match decoded.call {
             ActorInvokeCall::Method {
                 name,
                 args,
                 request_id,
-            } => (
-                WorkerInvocation {
-                    method: "ACTOR-RPC".to_string(),
-                    url: format!("http://actor/__dd_rpc/{}", name),
-                    headers: Vec::new(),
-                    body: args.clone(),
-                    request_id,
-                },
-                ActorExecutionCall::Method {
-                    binding: decoded.binding.clone(),
-                    key: decoded.key.clone(),
-                    name,
-                    args,
-                },
-            ),
+            } => {
+                (
+                    WorkerInvocation {
+                        method: "ACTOR-RPC".to_string(),
+                        url: format!("http://actor/__dd_rpc/{}", name),
+                        headers: Vec::new(),
+                        body: args.clone(),
+                        request_id,
+                    },
+                    ActorExecutionCall::Method {
+                        binding: decoded.binding.clone(),
+                        key: decoded.key.clone(),
+                        name: name.clone(),
+                        args,
+                    },
+                    name == ACTOR_RUN_METHOD,
+                )
+            }
+            ActorInvokeCall::Fetch(_) => {
+                let _ = payload.reply.send(Err(PlatformError::bad_request(
+                    "actor fetch invoke is no longer supported; use fetch + wake + stub.run",
+                )));
+                return;
+            }
         };
-        let is_method_call = matches!(actor_call, ActorExecutionCall::Method { .. });
         let runtime_request_id = Uuid::new_v4().to_string();
         let route = ActorRoute {
             binding: decoded.binding.trim().to_string(),
@@ -3614,6 +3601,34 @@ impl WorkerManager {
             )));
             return;
         }
+        let mut target_generation = None;
+        let mut target_isolate_id = None;
+        if payload.caller_worker_name == decoded.worker_name {
+            if let Some(pool) = self
+                .workers
+                .get(&decoded.worker_name)
+                .and_then(|entry| entry.pools.get(&payload.caller_generation))
+            {
+                target_generation = Some(payload.caller_generation);
+                if prefer_caller_isolate
+                    && pool
+                        .isolates
+                        .iter()
+                        .any(|isolate| isolate.id == payload.caller_isolate_id)
+                {
+                    let owner_key = route.owner_key();
+                    match pool.actor_owners.get(&owner_key).copied() {
+                        Some(owner_id) if owner_id == payload.caller_isolate_id => {
+                            target_isolate_id = Some(payload.caller_isolate_id);
+                        }
+                        None => {
+                            target_isolate_id = Some(payload.caller_isolate_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.enqueue_invoke(
             decoded.worker_name,
@@ -3623,8 +3638,8 @@ impl WorkerManager {
             Some(route),
             Some(actor_call),
             None,
-            None,
-            None,
+            target_isolate_id,
+            target_generation,
             false,
             reply_tx,
             PendingReplyKind::Normal,
@@ -3632,15 +3647,9 @@ impl WorkerManager {
         );
         tokio::spawn(async move {
             let result = match reply_rx.await {
-                Ok(Ok(output)) => {
-                    if is_method_call {
-                        encode_actor_invoke_response(&ActorInvokeResponse::Method {
-                            value: output.body,
-                        })
-                    } else {
-                        encode_actor_invoke_response(&ActorInvokeResponse::Fetch(output))
-                    }
-                }
+                Ok(Ok(output)) => encode_actor_invoke_response(&ActorInvokeResponse::Method {
+                    value: output.body,
+                }),
                 Ok(Err(error)) => {
                     encode_actor_invoke_response(&ActorInvokeResponse::Error(error.to_string()))
                 }
@@ -3963,18 +3972,11 @@ impl WorkerManager {
         generation: u64,
         event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<()> {
-        let (snapshot, snapshot_preloaded, source, actor_classes) = self
+        let (snapshot, snapshot_preloaded, source) = self
             .workers
             .get(worker_name)
             .and_then(|entry| entry.pools.get(&generation))
-            .map(|pool| {
-                (
-                    pool.snapshot,
-                    pool.snapshot_preloaded,
-                    pool.source.clone(),
-                    pool.actor_classes.clone(),
-                )
-            })
+            .map(|pool| (pool.snapshot, pool.snapshot_preloaded, pool.source.clone()))
             .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
@@ -3985,7 +3987,6 @@ impl WorkerManager {
             snapshot,
             snapshot_preloaded,
             source,
-            actor_classes,
             kv_store,
             actor_store,
             cache_store,
@@ -4901,6 +4902,10 @@ fn select_dispatch_candidate(
     require_wait_until_idle: bool,
 ) -> Option<DispatchCandidate> {
     for (queue_idx, pending) in pool.queue.iter().enumerate() {
+        let ownerless_method = matches!(
+            pending.actor_call,
+            Some(ActorExecutionCall::Method { .. })
+        );
         if let Some(target_isolate_id) = pending.target_isolate_id {
             if let Some((isolate_idx, isolate)) = pool
                 .isolates
@@ -4908,17 +4913,23 @@ fn select_dispatch_candidate(
                 .enumerate()
                 .find(|(_, isolate)| isolate.id == target_isolate_id)
             {
-                let targeted_host_rpc = pending.host_rpc_call.is_some();
-                if (targeted_host_rpc || isolate.inflight_count < max_inflight)
-                    && (targeted_host_rpc
+                let targeted_nested_call =
+                    pending.host_rpc_call.is_some() || pending.actor_route.is_some();
+                let actor_key = pending.actor_route.as_ref().map(ActorRoute::owner_key);
+                let assign_owner = actor_key
+                    .as_ref()
+                    .map(|key| !ownerless_method && !pool.actor_owners.contains_key(key))
+                    .unwrap_or(false);
+                if (targeted_nested_call || isolate.inflight_count < max_inflight)
+                    && (targeted_nested_call
                         || !require_wait_until_idle
                         || isolate.pending_wait_until.is_empty())
                 {
                     return Some(DispatchCandidate {
                         queue_idx,
                         isolate_idx,
-                        actor_key: None,
-                        assign_owner: false,
+                        actor_key,
+                        assign_owner,
                     });
                 }
             }
@@ -4936,6 +4947,20 @@ fn select_dispatch_candidate(
         };
 
         let actor_key = route.owner_key();
+
+        if ownerless_method {
+            if let Some(isolate_idx) =
+                least_loaded_isolate_any_idx(&pool.isolates, require_wait_until_idle)
+            {
+                return Some(DispatchCandidate {
+                    queue_idx,
+                    isolate_idx,
+                    actor_key: Some(actor_key),
+                    assign_owner: false,
+                });
+            }
+            continue;
+        }
 
         if let Some(owner_id) = pool.actor_owners.get(&actor_key).copied() {
             if let Some((idx, _)) = pool
@@ -5121,7 +5146,7 @@ impl WorkerPool {
 
 struct DeployBindings {
     kv: Vec<String>,
-    actor: Vec<(String, String)>,
+    actor: Vec<String>,
     dynamic: Vec<String>,
 }
 
@@ -5152,21 +5177,17 @@ fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
                 }
                 kv.push(name.to_string());
             }
-            DeployBinding::Actor { binding, class } => {
+            DeployBinding::Actor { binding } => {
                 let name = binding.trim();
-                let class_name = class.trim();
                 if name.is_empty() {
                     return Err(PlatformError::bad_request("binding name must not be empty"));
-                }
-                if class_name.is_empty() {
-                    return Err(PlatformError::bad_request("actor class must not be empty"));
                 }
                 if !seen.insert(name.to_string()) {
                     return Err(PlatformError::bad_request(format!(
                         "duplicate binding name: {name}"
                     )));
                 }
-                actor.push((name.to_string(), class_name.to_string()));
+                actor.push(name.to_string());
             }
             DeployBinding::Dynamic { binding } => {
                 let name = binding.trim();
@@ -5365,7 +5386,6 @@ fn spawn_isolate_thread(
     snapshot: &'static [u8],
     snapshot_preloaded: bool,
     source: Arc<str>,
-    actor_classes: Arc<[String]>,
     kv_store: KvStore,
     actor_store: ActorStore,
     cache_store: CacheStore,
@@ -5412,7 +5432,7 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::RequestSecretContexts::default());
                 }
                 if !snapshot_preloaded {
-                    if let Err(error) = load_worker(&mut js_runtime, &source, &actor_classes).await
+                    if let Err(error) = load_worker(&mut js_runtime, &source).await
                     {
                         let _ = init_tx.send(Err(error));
                         return;
@@ -5674,10 +5694,6 @@ fn spawn_isolate_thread(
                                     let _execute_guard = execute_span.enter();
                                     let started_at = Instant::now();
                                     let dispatch_actor_call = actor_call.as_ref().map(|call| match call {
-                                        ActorExecutionCall::Fetch { binding, key } => ExecuteActorCall::Fetch {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                        },
                                         ActorExecutionCall::Method {
                                             binding,
                                             key,
@@ -6505,36 +6521,19 @@ export default {
         r#"
 export default {
   async fetch(request, env) {
-    const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
-    return actor.fetch(request);
+    const { response } = await env.MEDIA.get(env.MEDIA.idFromName("global")).transports.accept(request);
+    return response;
+  },
+
+  async wake(event, env) {
+    if (event.type !== "transportstream" || !event.stub || !event.handle) {
+      return;
+    }
+    const session = await event.stub.transports.session(event.handle);
+    const writer = session.stream.writable.getWriter();
+    await writer.write(event.data);
   },
 };
-
-export class MediaActor {
-  constructor(state) {
-    this.state = state;
-  }
-
-  async fetch(request) {
-    const { handle, response } = await this.state.transports.accept(request);
-    const session = new WebTransportSession(handle);
-
-    void (async () => {
-      const reader = session.stream.readable.getReader();
-      const writer = session.stream.writable.getWriter();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          await writer.close();
-          break;
-        }
-        await writer.write(value);
-      }
-    })();
-
-    return response;
-  }
-}
 "#
         .to_string()
     }
@@ -6543,17 +6542,6 @@ export class MediaActor {
         r#"
 export default {
   async fetch(request, env) {
-    const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
-    return actor.fetch(request);
-  },
-};
-
-export class MediaActor {
-  constructor(state) {
-    this.state = state;
-  }
-
-  async fetch(request) {
     const protocol = String(request.headers.get("x-dd-transport-protocol") ?? "").toLowerCase();
     if (request.method !== "CONNECT") {
       return new Response(`bad-method:${request.method}`, { status: 500 });
@@ -6561,58 +6549,51 @@ export class MediaActor {
     if (protocol !== "webtransport") {
       return new Response(`bad-protocol:${protocol}`, { status: 500 });
     }
-    const { response } = await this.state.transports.accept(request);
+    const { response } = await env.MEDIA.get(env.MEDIA.idFromName("global")).transports.accept(request);
     return response;
-  }
-}
+  },
+};
 "#
         .to_string()
     }
 
     fn websocket_storage_worker() -> String {
         r#"
+export function onSocketMessage(state, event) {
+  const text = typeof event.data === "string"
+    ? event.data
+    : new TextDecoder().decode(event.data);
+  const stored = state.storage.get("chat");
+  const next = {
+    count: Number(stored?.value?.count ?? 0) + 1,
+    last: text,
+  };
+  state.storage.put("chat", next);
+  return next;
+}
+
 export default {
   async fetch(request, env) {
-    const actor = env.CHAT.get(env.CHAT.idFromName("global"));
-    return actor.fetch(request);
-  },
-};
-
-export class ChatActor {
-  constructor(state) {
-    this.state = state;
-    this.memoryCount = 0;
-  }
-
-  async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/state") {
-      const stored = this.state.storage.get("chat");
-      return Response.json(stored?.value ?? { count: 0, last: null });
+      const stored = await env.CHAT.get(env.CHAT.idFromName("global")).run((state) => state.storage.get("chat")?.value ?? { count: 0, last: null });
+      return Response.json(stored ?? { count: 0, last: null });
     }
-
-    const { handle, response } = await this.state.sockets.accept(request);
-    const ws = new WebSocket(handle);
-    ws.addEventListener("message", async (event) => {
-      this.memoryCount += 1;
-      const text = typeof event.data === "string"
-        ? event.data
-        : new TextDecoder().decode(event.data);
-      const stored = this.state.storage.get("chat");
-      const next = {
-        count: Number(stored?.value?.count ?? 0) + 1,
-        last: text,
-      };
-      this.state.storage.put("chat", next);
-      await ws.send(JSON.stringify({
-        seen: text,
-        count: next.count,
-        memory: this.memoryCount,
-      }));
-    });
+    const { response } = await env.CHAT.get(env.CHAT.idFromName("global")).sockets.accept(request);
     return response;
-  }
-}
+  },
+
+  async wake(event, env) {
+    if (event.type !== "socketmessage" || !event.stub) {
+      return;
+    }
+    const next = await event.stub.run(onSocketMessage, event);
+    await event.stub.sockets.send(event.handle, JSON.stringify({
+      seen: next.last,
+      count: next.count,
+    }));
+  },
+};
 "#
         .to_string()
     }
@@ -6934,6 +6915,11 @@ export default {
 
     fn actor_worker() -> String {
         r#"
+globalThis.__dd_actor_runtime = globalThis.__dd_actor_runtime ?? {
+  active: new Map(),
+  max: new Map(),
+};
+
 function asNumber(input, fallback = 0) {
   const parsed = Number(input);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -6964,35 +6950,106 @@ export default {
     const actor = env.MY_ACTOR.get(id);
 
     if (url.pathname === "/run") {
-      return actor.fetch("/actor/work", { method: "POST" });
+      await actor.run(async (state) => {
+        const slot = String(state.id);
+        const runtime = globalThis.__dd_actor_runtime;
+        const active = (runtime.active.get(slot) ?? 0) + 1;
+        runtime.active.set(slot, active);
+        const max = Math.max(runtime.max.get(slot) ?? 0, active);
+        runtime.max.set(slot, max);
+        await Deno.core.ops.op_sleep(100);
+        runtime.active.set(slot, Math.max(0, (runtime.active.get(slot) ?? 1) - 1));
+        return null;
+      });
+      return new Response("ok");
     }
 
     if (url.pathname === "/max") {
-      return new Response(String(await actor.maxActive()));
+      return new Response(String(await actor.run((state) => {
+        const runtime = globalThis.__dd_actor_runtime;
+        return runtime.max.get(String(state.id)) ?? 0;
+      })));
     }
 
     if (url.pathname === "/seed") {
-      await actor.seedCount();
+      await actor.run((state) => {
+        state.storage.put("count", "0");
+        return true;
+      });
       return new Response("ok");
     }
 
     if (url.pathname === "/value-roundtrip") {
-      const ok = await actor.valueRoundtrip();
+      const ok = await actor.run((state) => {
+        const write = state.storage.put("profile", {
+          name: "alice",
+          createdAt: new Date("2026-01-02T03:04:05.000Z"),
+          flags: new Set(["a", "b"]),
+          scores: new Map([["p95", 21], ["p99", 32]]),
+          bytes: new Uint8Array([1, 2, 3, 4]),
+        });
+        if (write.conflict) {
+          return false;
+        }
+        const loaded = state.storage.get("profile");
+        const value = loaded?.value;
+        return Boolean(
+          value
+            && value.name === "alice"
+            && value.createdAt instanceof Date
+            && value.createdAt.toISOString() === "2026-01-02T03:04:05.000Z"
+            && value.flags instanceof Set
+            && value.flags.has("a")
+            && value.scores instanceof Map
+            && value.scores.get("p95") === 21
+            && value.bytes instanceof Uint8Array
+            && value.bytes.length === 4
+            && value.bytes[3] === 4,
+        );
+      });
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
     if (url.pathname === "/value-string-get-guard") {
-      const ok = await actor.valueStringGetGuard();
+      const ok = await actor.run((state) => {
+        state.storage.put("profile", { nested: { ok: true } });
+        const loaded = state.storage.get("profile");
+        return Boolean(
+          loaded
+            && loaded.encoding === "v8sc"
+            && loaded.value
+            && loaded.value.nested
+            && loaded.value.nested.ok === true,
+        );
+      });
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
     if (url.pathname === "/local-visibility") {
-      const ok = await actor.localVisibility();
+      const ok = await actor.run((state) => {
+        state.storage.put("count", "41");
+        const loaded = state.storage.get("count");
+        const listed = state.storage.list({ prefix: "co" });
+        return Boolean(
+          loaded
+            && loaded.value === "41"
+            && Array.isArray(listed)
+            && listed.length === 1
+            && listed[0].key === "count"
+            && listed[0].value === "41",
+        );
+      });
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
     if (url.pathname === "/inc-cas") {
-      const result = await actor.incCas();
+      const result = await actor.run(async (state) => {
+        const current = state.storage.get("count");
+        const currentValue = current ? asNumber(current.value, 0) : 0;
+        const expectedVersion = current ? current.version : -1;
+        await Deno.core.ops.op_sleep(10);
+        return state.storage.put("count", String(currentValue + 1), { expectedVersion });
+      });
       if (result && result.conflict) {
         return new Response("conflict", { status: 409 });
       }
@@ -7000,111 +7057,15 @@ export default {
     }
 
     if (url.pathname === "/get") {
-      return new Response(String(await actor.getCount()));
+      return new Response(String(await actor.run((state) => {
+        const current = state.storage.get("count");
+        return current ? String(current.value) : "0";
+      })));
     }
 
     return new Response("not found", { status: 404 });
   },
 };
-
-export class MyActor {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-    this.active = 0;
-    this.max = 0;
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname === "/actor/work") {
-      this.active += 1;
-      if (this.active > this.max) {
-        this.max = this.active;
-      }
-      await Deno.core.ops.op_sleep(100);
-      this.active -= 1;
-      return new Response("ok");
-    }
-    return new Response("not found", { status: 404 });
-  }
-
-  async maxActive() {
-    return this.max;
-  }
-
-  async seedCount() {
-    this.state.storage.put("count", "0");
-    return true;
-  }
-
-  async incCas() {
-    const current = this.state.storage.get("count");
-    const currentValue = current ? asNumber(current.value, 0) : 0;
-    const expectedVersion = current ? current.version : -1;
-    await Deno.core.ops.op_sleep(10);
-    return this.state.storage.put("count", String(currentValue + 1), { expectedVersion });
-  }
-
-  async getCount() {
-    const current = this.state.storage.get("count");
-    return current ? String(current.value) : "0";
-  }
-
-  async valueRoundtrip() {
-    const write = this.state.storage.put("profile", {
-      name: "alice",
-      createdAt: new Date("2026-01-02T03:04:05.000Z"),
-      flags: new Set(["a", "b"]),
-      scores: new Map([["p95", 21], ["p99", 32]]),
-      bytes: new Uint8Array([1, 2, 3, 4]),
-    });
-    if (write.conflict) {
-      return false;
-    }
-    const loaded = this.state.storage.get("profile");
-    const value = loaded?.value;
-    return Boolean(
-      value
-        && value.name === "alice"
-        && value.createdAt instanceof Date
-        && value.createdAt.toISOString() === "2026-01-02T03:04:05.000Z"
-        && value.flags instanceof Set
-        && value.flags.has("a")
-        && value.scores instanceof Map
-        && value.scores.get("p95") === 21
-        && value.bytes instanceof Uint8Array
-        && value.bytes.length === 4
-        && value.bytes[3] === 4,
-    );
-  }
-
-  async valueStringGetGuard() {
-    this.state.storage.put("profile", { nested: { ok: true } });
-    const loaded = this.state.storage.get("profile");
-    return Boolean(
-      loaded
-        && loaded.encoding === "v8sc"
-        && loaded.value
-        && loaded.value.nested
-        && loaded.value.nested.ok === true,
-    );
-  }
-
-  async localVisibility() {
-    this.state.storage.put("count", "41");
-    const loaded = this.state.storage.get("count");
-    const listed = this.state.storage.list({ prefix: "co" });
-    return Boolean(
-      loaded
-        && loaded.value === "41"
-        && Array.isArray(listed)
-        && listed.length === 1
-        && listed[0].key === "count"
-        && listed[0].value === "41",
-    );
-  }
-}
 "#
         .to_string()
     }
@@ -7117,41 +7078,121 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/seed") {
-      await actor.seed();
+      await actor.run((state) => {
+        state.storage.put("count", "7");
+        return true;
+      });
       return new Response("ok");
     }
 
     if (url.pathname === "/constructor-value") {
-      return new Response(String(await actor.constructorValue()));
+      return new Response(String(await actor.run((state) => state.storage.get("count")?.value ?? "missing")));
     }
 
     if (url.pathname === "/current-value") {
-      return new Response(String(await actor.currentValue()));
+      return new Response(String(await actor.run((state) => state.storage.get("count")?.value ?? "missing")));
     }
 
     return new Response("not found", { status: 404 });
   },
 };
+"#
+        .to_string()
+    }
 
-export class MyActor {
-  constructor(state) {
-    this.state = state;
-    this.initialValue = state.storage.get("count")?.value ?? "missing";
-  }
+    fn hosted_actor_worker() -> String {
+        r#"
+globalThis.__hosted_shared_global = globalThis.__hosted_shared_global ?? 0;
 
-  async seed() {
-    this.state.storage.put("count", "7");
-    return true;
-  }
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.MY_ACTOR.idFromName(url.searchParams.get("key") ?? "default");
+    const actor = env.MY_ACTOR.get(id);
 
-  async constructorValue() {
-    return this.initialValue;
-  }
+    if (url.pathname === "/alpha/inc") {
+      return new Response(String(await actor.run((state) => {
+        const current = Number(state.storage.get("count")?.value ?? 0);
+        const next = current + 1;
+        state.storage.put("count", String(next));
+        return next;
+      })));
+    }
 
-  async currentValue() {
-    return this.state.storage.get("count")?.value ?? "missing";
-  }
-}
+    if (url.pathname === "/beta/read") {
+      return new Response(String(await actor.run((state) => {
+        return String(state.storage.get("count")?.value ?? "0");
+      })));
+    }
+
+    if (url.pathname === "/worker/global/inc") {
+      globalThis.__hosted_shared_global += 1;
+      return new Response(String(globalThis.__hosted_shared_global));
+    }
+
+    if (url.pathname === "/actor/global/read") {
+      return new Response(String(await actor.run((_state) => globalThis.__hosted_shared_global)));
+    }
+
+    if (url.pathname === "/actor/global/inc") {
+      return new Response(String(await actor.run((_state) => {
+        globalThis.__hosted_shared_global += 1;
+        return globalThis.__hosted_shared_global;
+      })));
+    }
+
+    if (url.pathname === "/inline") {
+      const suffix = "inline";
+      return new Response(String(await actor.run(() => `ok-${suffix}`)));
+    }
+
+    if (url.pathname === "/stm/seed") {
+      await actor.run((state) => {
+        state.set("a", "0");
+        state.set("b", "0");
+        return true;
+      });
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/stm/write-a") {
+      const value = String(url.searchParams.get("value") ?? "1");
+      await actor.run((state) => {
+        state.set("a", value);
+        return value;
+      });
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/stm/read-once") {
+      return new Response(String(await actor.run(async (state) => {
+        const a = String(state.get("a")?.value ?? "missing");
+        await Deno.core.ops.op_sleep(40);
+        return a;
+      })));
+    }
+
+    if (url.pathname === "/stm/read-pair") {
+      return new Response(String(await actor.run(async (state) => {
+        const a = String(state.get("a")?.value ?? "missing");
+        await Deno.core.ops.op_sleep(40);
+        const b = String(state.get("b")?.value ?? "missing");
+        return `${a}:${b}`;
+      })));
+    }
+
+    if (url.pathname === "/stm/read-pair-allow") {
+      return new Response(String(await actor.run(async (state) => {
+        const a = String(state.get("a", { allowConcurrency: true })?.value ?? "missing");
+        await Deno.core.ops.op_sleep(40);
+        const b = String(state.get("b")?.value ?? "missing");
+        return `${a}:${b}`;
+      })));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
 "#
         .to_string()
     }
@@ -7767,7 +7808,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MEDIA".to_string(),
-                        class: "MediaActor".to_string(),
                     }],
                 },
             )
@@ -7838,7 +7878,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MEDIA".to_string(),
-                        class: "MediaActor".to_string(),
                     }],
                 },
             )
@@ -7883,7 +7922,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "CHAT".to_string(),
-                        class: "ChatActor".to_string(),
                     }],
                 },
             )
@@ -7963,7 +8001,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "CHAT".to_string(),
-                        class: "ChatActor".to_string(),
                     }],
                 },
             )
@@ -8715,7 +8752,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
-                        class: "MyActor".to_string(),
                     }],
                 },
             )
@@ -8768,7 +8804,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
-                        class: "MyActor".to_string(),
                     }],
                 },
             )
@@ -8829,7 +8864,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
-                        class: "MyActor".to_string(),
                     }],
                 },
             )
@@ -8890,7 +8924,6 @@ export default {
                     internal: DeployInternalConfig { trace: None },
                     bindings: vec![DeployBinding::Actor {
                         binding: "MY_ACTOR".to_string(),
-                        class: "MyActor".to_string(),
                     }],
                 },
             )
@@ -8913,7 +8946,7 @@ export default {
             )
             .await
             .expect("warm constructor value should succeed");
-        assert_eq!(String::from_utf8(warm_ctor.body).expect("utf8"), "missing");
+        assert_eq!(String::from_utf8(warm_ctor.body).expect("utf8"), "7");
 
         timeout(Duration::from_secs(3), async {
             loop {
@@ -8947,6 +8980,327 @@ export default {
             .await
             .expect("current value should succeed");
         assert_eq!(String::from_utf8(current.body).expect("utf8"), "7");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_actor_factories_share_state_and_module_globals() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "hosted-actor".to_string(),
+                hosted_actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let alpha = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/alpha/inc?key=user-1", "alpha-inc"),
+            )
+            .await
+            .expect("alpha invoke should succeed");
+        assert_eq!(String::from_utf8(alpha.body).expect("utf8"), "1");
+
+        let beta = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/beta/read?key=user-1", "beta-read"),
+            )
+            .await
+            .expect("beta invoke should succeed");
+        assert_eq!(String::from_utf8(beta.body).expect("utf8"), "1");
+
+        let worker_global = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/worker/global/inc?key=user-1", "worker-global-inc"),
+            )
+            .await
+            .expect("worker global increment should succeed");
+        assert_eq!(String::from_utf8(worker_global.body).expect("utf8"), "1");
+
+        let actor_global = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/actor/global/read?key=user-1", "actor-global-read"),
+            )
+            .await
+            .expect("actor global read should succeed");
+        assert_eq!(String::from_utf8(actor_global.body).expect("utf8"), "1");
+
+        let actor_global_inc = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/actor/global/inc?key=user-1", "actor-global-inc"),
+            )
+            .await
+            .expect("actor global increment should succeed");
+        assert_eq!(String::from_utf8(actor_global_inc.body).expect("utf8"), "2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_actor_allows_inline_closures() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 2,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "hosted-actor".to_string(),
+                hosted_actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/inline?key=user-2", "inline-closure"),
+            )
+            .await
+            .expect("inline closure invoke should succeed");
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "ok-inline");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_actor_stm_single_read_is_point_in_time_only() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 3,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "hosted-actor".to_string(),
+                hosted_actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/stm/seed?key=user-stm-once", "stm-seed-once"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let read_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .invoke(
+                        "hosted-actor".to_string(),
+                        test_invocation_with_path(
+                            "/stm/read-once?key=user-stm-once",
+                            "stm-read-once",
+                        ),
+                    )
+                    .await
+            })
+        };
+
+        sleep(Duration::from_millis(10)).await;
+
+        service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/write-a?key=user-stm-once&value=1",
+                    "stm-write-once",
+                ),
+            )
+            .await
+            .expect("write should succeed");
+
+        let read_once = read_task.await.expect("join").expect("invoke should succeed");
+        assert_eq!(String::from_utf8(read_once.body).expect("utf8"), "0");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 3,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "hosted-actor".to_string(),
+                hosted_actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/stm/seed?key=user-stm-pair", "stm-seed-pair"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let read_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .invoke(
+                        "hosted-actor".to_string(),
+                        test_invocation_with_path(
+                            "/stm/read-pair?key=user-stm-pair",
+                            "stm-read-pair",
+                        ),
+                    )
+                    .await
+            })
+        };
+
+        sleep(Duration::from_millis(10)).await;
+
+        service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/write-a?key=user-stm-pair&value=1",
+                    "stm-write-pair",
+                ),
+            )
+            .await
+            .expect("write should succeed");
+
+        let pair = read_task.await.expect("join").expect("invoke should succeed");
+        assert_eq!(String::from_utf8(pair.body).expect("utf8"), "1:0");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_actor_stm_allow_concurrency_skips_retry_for_that_read() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 3,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "hosted-actor".to_string(),
+                hosted_actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path("/stm/seed?key=user-stm-allow", "stm-seed-allow"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let read_task = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .invoke(
+                        "hosted-actor".to_string(),
+                        test_invocation_with_path(
+                            "/stm/read-pair-allow?key=user-stm-allow",
+                            "stm-read-allow",
+                        ),
+                    )
+                    .await
+            })
+        };
+
+        sleep(Duration::from_millis(10)).await;
+
+        service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/write-a?key=user-stm-allow&value=1",
+                    "stm-write-allow",
+                ),
+            )
+            .await
+            .expect("write should succeed");
+
+        let pair = read_task.await.expect("join").expect("invoke should succeed");
+        assert_eq!(String::from_utf8(pair.body).expect("utf8"), "0:0");
     }
 
     #[tokio::test]
