@@ -14,47 +14,31 @@ export default {
     if (url.pathname !== "/session") {
       return text("not found", 404);
     }
-    const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
-    return actor.fetch(request);
+    const media = env.MEDIA.get(env.MEDIA.idFromName("global"));
+    return await media.atomic((state) => {
+      const { response } = state.accept(request);
+      return response;
+    });
+  },
+  async wake(event, env) {
+    const _ = env;
+    if (!event?.stub || !event.handle) {
+      return;
+    }
+    if (event.type === "transportstream") {
+      await event.stub.apply([{
+        type: "transport.stream",
+        handle: event.handle,
+        payload: event.data,
+      }]);
+      return;
+    }
+    if (event.type === "transportdatagram") {
+      await event.stub.apply([{
+        type: "transport.datagram",
+        handle: event.handle,
+        payload: event.data,
+      }]);
+    }
   },
 };
-
-export class MediaActor {
-  constructor(state) {
-    this.state = state;
-  }
-
-  async fetch(request) {
-    const { handle, response } = await this.state.transports.accept(request);
-    const session = new WebTransportSession(handle);
-
-    void this.echoReliable(session);
-    void this.echoDatagrams(session);
-
-    return response;
-  }
-
-  async echoReliable(session) {
-    const reader = session.stream.readable.getReader();
-    const writer = session.stream.writable.getWriter();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      await writer.write(value);
-    }
-  }
-
-  async echoDatagrams(session) {
-    const reader = session.datagrams.readable.getReader();
-    const writer = session.datagrams.writable.getWriter();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      await writer.write(value);
-    }
-  }
-}

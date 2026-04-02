@@ -108,7 +108,7 @@ fn default_trace_path() -> String {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DeployBinding {
     Kv { binding: String },
-    Actor { binding: String, class: String },
+    Actor { binding: String },
     Dynamic { binding: String },
 }
 

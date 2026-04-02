@@ -169,21 +169,22 @@ async fn dynamic_deploy(
 
 fn parse_actor_binding(value: String) -> Result<DeployBinding, String> {
     let trimmed = value.trim();
-    let Some((binding, class)) = trimmed.split_once('=') else {
+    if trimmed.is_empty() {
+        return Err("actor binding must not be empty".to_string());
+    }
+    if trimmed.contains('=') {
         return Err(format!(
-            "invalid actor binding {trimmed:?}, expected BINDING=ClassName"
+            "invalid actor binding {trimmed:?}, expected BINDING"
         ));
-    };
-    let binding = binding.trim();
-    let class = class.trim();
-    if binding.is_empty() || class.is_empty() {
+    }
+    let binding = trimmed.trim();
+    if binding.is_empty() {
         return Err(format!(
-            "invalid actor binding {trimmed:?}, expected BINDING=ClassName"
+            "invalid actor binding {trimmed:?}, expected BINDING"
         ));
     }
     Ok(DeployBinding::Actor {
         binding: binding.to_string(),
-        class: class.to_string(),
     })
 }
 

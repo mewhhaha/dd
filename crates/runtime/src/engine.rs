@@ -25,10 +25,6 @@ include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 #[derive(Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ExecuteActorCall {
-    Fetch {
-        binding: String,
-        key: String,
-    },
     Method {
         binding: String,
         key: String,
@@ -93,20 +89,15 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     Ok(Box::leak(snapshot))
 }
 
-pub async fn validate_worker(
-    bootstrap_snapshot: &'static [u8],
-    source: &str,
-    actor_classes: &[String],
-) -> Result<()> {
+pub async fn validate_worker(bootstrap_snapshot: &'static [u8], source: &str) -> Result<()> {
     let mut runtime = new_runtime(bootstrap_snapshot)?;
-    load_worker(&mut runtime, source, actor_classes).await
+    load_worker(&mut runtime, source).await
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn build_worker_snapshot(
     _bootstrap_snapshot: &'static [u8],
     source: &str,
-    actor_classes: &[String],
 ) -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: runtime_extensions(),
@@ -117,9 +108,7 @@ pub async fn build_worker_snapshot(
         .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
         .map_err(runtime_error)?;
     evaluate_snapshot_module(&mut runtime, WORKER_SPECIFIER, source, false).await?;
-    let actor_classes_json = crate::json::to_string(actor_classes)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let install_code = install_worker_js(&actor_classes_json);
+    let install_code = install_worker_js();
     evaluate_snapshot_module(&mut runtime, INSTALL_SPECIFIER, &install_code, true).await?;
     let snapshot = runtime.snapshot();
     Ok(Box::leak(snapshot))
@@ -154,15 +143,9 @@ pub fn new_runtime_from_snapshot(startup_snapshot: &'static [u8]) -> Result<JsRu
     new_runtime(startup_snapshot)
 }
 
-pub async fn load_worker(
-    runtime: &mut JsRuntime,
-    source: &str,
-    actor_classes: &[String],
-) -> Result<()> {
+pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
     evaluate_module(runtime, WORKER_SPECIFIER, source, false).await?;
-    let actor_classes_json = crate::json::to_string(actor_classes)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let install_code = install_worker_js(&actor_classes_json);
+    let install_code = install_worker_js();
     evaluate_module(runtime, INSTALL_SPECIFIER, &install_code, true).await
 }
 
@@ -172,7 +155,7 @@ pub fn dispatch_worker_request(
     completion_token: &str,
     worker_name: &str,
     kv_bindings: &[String],
-    actor_bindings: &[(String, String)],
+    actor_bindings: &[String],
     dynamic_bindings: &[String],
     dynamic_rpc_bindings: &[String],
     dynamic_env: &[(String, String)],
@@ -524,10 +507,10 @@ mod tests {
         let snapshot = build_bootstrap_snapshot()
             .await
             .expect("bootstrap snapshot should build");
-        validate_worker(snapshot, simple_worker_source(), &[])
+        validate_worker(snapshot, simple_worker_source())
             .await
             .expect("worker should validate");
-        let worker_snapshot = build_worker_snapshot(snapshot, simple_worker_source(), &[])
+        let worker_snapshot = build_worker_snapshot(snapshot, simple_worker_source())
             .await
             .expect("worker snapshot should build");
         validate_loaded_worker_runtime(worker_snapshot).expect("worker snapshot should validate");
@@ -677,7 +660,7 @@ mod tests {
             let bootstrap = build_bootstrap_snapshot()
                 .await
                 .expect("bootstrap snapshot should build");
-            validate_worker(bootstrap, simple_worker_source(), &[])
+            validate_worker(bootstrap, simple_worker_source())
                 .await
                 .expect("worker should validate");
             bootstrap
@@ -685,7 +668,7 @@ mod tests {
         let mut js_runtime = new_runtime_from_snapshot(snapshot)
             .expect("runtime should start from bootstrap snapshot");
         runtime
-            .block_on(load_worker(&mut js_runtime, simple_worker_source(), &[]))
+            .block_on(load_worker(&mut js_runtime, simple_worker_source()))
             .expect("worker should load into runtime");
 
         let response_promise = js_runtime
@@ -731,7 +714,7 @@ mod tests {
             let bootstrap = build_bootstrap_snapshot()
                 .await
                 .expect("bootstrap snapshot should build");
-            validate_worker(bootstrap, simple_worker_source(), &[])
+            validate_worker(bootstrap, simple_worker_source())
                 .await
                 .expect("worker should validate");
             bootstrap
@@ -739,7 +722,7 @@ mod tests {
         let mut js_runtime = new_runtime_from_snapshot(snapshot)
             .expect("runtime should start from bootstrap snapshot");
         runtime
-            .block_on(load_worker(&mut js_runtime, simple_worker_source(), &[]))
+            .block_on(load_worker(&mut js_runtime, simple_worker_source()))
             .expect("worker should load into runtime");
 
         let response_value = js_runtime

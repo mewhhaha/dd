@@ -15,14 +15,14 @@ cp examples/chat-worker/src/worker.js examples/chat-worker/dist/worker.js
 ## Deploy
 
 ```bash
-cargo run -p cli -- deploy chat examples/chat-worker/dist/worker.js --actor-binding CHAT_ROOM=ChatRoomActor --public
+cargo run -p cli -- deploy chat examples/chat-worker/dist/worker.js --actor-binding CHAT_ROOM --public
 ```
 
 If you are deploying into the Fly app through the private proxy:
 
 ```bash
 just fly-proxy
-just fly-worker-deploy chat examples/chat-worker/dist/worker.js --actor-binding CHAT_ROOM=ChatRoomActor --public
+just fly-worker-deploy chat examples/chat-worker/dist/worker.js --actor-binding CHAT_ROOM --public
 ```
 
 ## Use

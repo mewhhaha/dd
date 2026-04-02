@@ -231,7 +231,7 @@ cargo run -p cli -- deploy kv examples/kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy kv-counter examples/kv-counter.js --kv-binding MY_KV
 cargo run -p cli -- deploy bg examples/wait-until.js
 cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
-cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR=UserActor
+cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR
 cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
 cargo run -p cli -- deploy trace-hub examples/trace-hub.js
 cargo run -p cli -- deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX

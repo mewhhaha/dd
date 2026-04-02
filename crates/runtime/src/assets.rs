@@ -8,10 +8,8 @@ const INSTALL_WORKER_TEMPLATE: &str = include_str!("../js/install_worker.js");
 const EXECUTE_WORKER_TEMPLATE: &str = include_str!("../js/execute_worker.js");
 const ABORT_WORKER_TEMPLATE: &str = include_str!("../js/abort_worker.js");
 
-pub fn install_worker_js(actor_classes_json: &str) -> String {
-    INSTALL_WORKER_TEMPLATE
-        .replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER)
-        .replace("__ACTOR_CLASSES_JSON__", actor_classes_json)
+pub fn install_worker_js() -> String {
+    INSTALL_WORKER_TEMPLATE.replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER)
 }
 
 pub fn execute_worker_js(

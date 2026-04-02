@@ -236,6 +236,155 @@ function roomActor(env, roomId) {
   return env.CHAT_ROOM.get(id);
 }
 
+function roomSnapshot(state) {
+  return state.get("room") ?? initialRoom(String(state.id));
+}
+
+export function openRoomSocket(state, payload) {
+  const { handle, response } = state.accept(payload.request);
+  let nextRoom = null;
+  let replacedHandles = [];
+  state.put("room", (previous) => {
+    const room = previous ?? initialRoom(payload.roomId);
+    room.roomId = payload.roomId;
+    replacedHandles = roomConnectionHandles(room).filter(
+      (existingHandle) => (
+        existingHandle !== handle
+        && room.connections[existingHandle] === payload.participantId
+      ),
+    );
+    room.participants[payload.participantId] = {
+      id: payload.participantId,
+      username: payload.username,
+      joinedAt: room.participants[payload.participantId]?.joinedAt ?? nowIso(),
+    };
+    for (const existingHandle of replacedHandles) {
+      delete room.connections[existingHandle];
+    }
+    room.connections[handle] = payload.participantId;
+    nextRoom = structuredClone(room);
+    return nextRoom;
+  });
+  const participantPayload = JSON.stringify(
+    fixiSwap(
+      "#participants",
+      "innerHTML",
+      renderParticipantsItems(nextRoom, roomConnectionHandles(nextRoom)),
+    ),
+  );
+  for (const existingHandle of replacedHandles) {
+    state.defer(() => state.stub.sockets.close(existingHandle, 1001, "replaced"));
+  }
+  for (const existingHandle of roomConnectionHandles(nextRoom)) {
+    if (existingHandle === handle) {
+      continue;
+    }
+    state.defer(() => state.stub.sockets.send(existingHandle, participantPayload, "text"));
+  }
+  return response;
+}
+
+export function roomStateResponse(state) {
+  const room = roomSnapshot(state);
+  return {
+    roomId: room.roomId,
+    messages: room.messages,
+    participants: listConnectedParticipants(room, roomConnectionHandles(room)),
+  };
+}
+
+export function handleRoomSocketMessage(state, event) {
+  const room = roomSnapshot(state);
+  const participantId = room.connections[event.handle];
+  if (!participantId) {
+    return false;
+  }
+  const participant = room.participants[participantId];
+  if (!participant) {
+    return false;
+  }
+  const payload = parseSocketPayload(event.data);
+  if (!payload) {
+    return false;
+  }
+  const type = String(payload.type ?? "");
+  if (type === "ready") {
+    const readyPayload = [
+      fixiSwap("#messages", "innerHTML", renderMessagesItems(room)),
+      fixiSwap(
+        "#participants",
+        "innerHTML",
+        renderParticipantsItems(room, roomConnectionHandles(room)),
+      ),
+    ];
+    state.defer(() => state.stub.sockets.send(event.handle, JSON.stringify(readyPayload), "text"));
+    return true;
+  }
+  if (type !== "message") {
+    return false;
+  }
+  const body = String(payload.text ?? "").trim();
+  if (!body || body.length > MAX_MESSAGE_LENGTH) {
+    return false;
+  }
+  let payloadOut = null;
+  let targets = [];
+  state.put("room", (previous) => {
+    const nextRoom = previous ?? initialRoom(String(state.id));
+    const nextMessage = {
+      seq: nextRoom.nextSeq + 1,
+      participantId,
+      username: participant.username,
+      text: body,
+      timestamp: nowIso(),
+    };
+    nextRoom.nextSeq = nextMessage.seq;
+    nextRoom.messages.push(nextMessage);
+    if (nextRoom.messages.length > MAX_HISTORY) {
+      nextRoom.messages.splice(0, nextRoom.messages.length - MAX_HISTORY);
+    }
+    payloadOut = JSON.stringify(
+      fixiSwap("#messages", "beforeend", renderMessageItem(nextMessage)),
+    );
+    targets = roomConnectionHandles(nextRoom);
+    return structuredClone(nextRoom);
+  });
+  for (const handle of targets) {
+    state.defer(() => state.stub.sockets.send(handle, payloadOut, "text"));
+  }
+  return true;
+}
+
+export function handleRoomSocketClose(state, event) {
+  let payload = null;
+  let targets = [];
+  let removed = false;
+  state.put("room", (previous) => {
+    const room = previous ?? initialRoom(String(state.id));
+    if (!room.connections[event.handle]) {
+      return room;
+    }
+    removed = true;
+    delete room.connections[event.handle];
+    payload = JSON.stringify(
+      fixiSwap(
+        "#participants",
+        "innerHTML",
+        renderParticipantsItems(room, roomConnectionHandles(room)),
+      ),
+    );
+    targets = roomConnectionHandles(room);
+    return structuredClone(room);
+  });
+  if (!removed) {
+    return false;
+  }
+  for (const handle of targets) {
+    state.defer(() => state.stub.sockets.send(handle, payload, "text"));
+  }
+  return true;
+}
+
 function joinPage(prefillRoom = "") {
   return `<!doctype html>
 <html>
@@ -422,10 +571,21 @@ export default {
       }
       const { roomId, action } = parsed;
       if (action === "ws") {
-        return roomActor(env, roomId).fetch(request);
+        const username = normalizeUsername(url.searchParams.get("username"));
+        const participantId = normalizeParticipantId(url.searchParams.get("participant"));
+        if (!username || !participantId) {
+          return json({ ok: false, error: "missing room, username, or participant id" }, 400);
+        }
+        const room = roomActor(env, roomId);
+        return await room.atomic(openRoomSocket, {
+          request,
+          roomId,
+          username,
+          participantId,
+        });
       }
       if (action === "state") {
-        return roomActor(env, roomId).fetch(request);
+        return json({ ok: true, ...(await roomActor(env, roomId).atomic(roomStateResponse)) });
       }
       const username = normalizeUsername(url.searchParams.get("username"));
       const participantId = normalizeParticipantId(url.searchParams.get("participant"));
@@ -438,185 +598,18 @@ export default {
 
     return text("not found", 404);
   },
+  async wake(event, env) {
+    const _ = env;
+    const stub = event?.stub ?? null;
+    if (!stub) {
+      return;
+    }
+    if (event.type === "socketmessage") {
+      await stub.atomic(handleRoomSocketMessage, event);
+      return;
+    }
+    if (event.type === "socketclose") {
+      await stub.atomic(handleRoomSocketClose, event);
+    }
+  },
 };
-
-export class ChatRoomActor {
-  constructor(state) {
-    this.state = state;
-    this.sockets = new Map();
-    this.room = this.state.storage.get("room")?.value ?? initialRoom(String(this.state.id));
-    for (const handle of this.state.sockets.values()) {
-      this.bindSocket(handle);
-    }
-  }
-
-  schedulePersist() {
-    const snapshot = structuredClone(this.room);
-    this.state.storage.put("room", snapshot);
-  }
-
-  bindSocket(handle) {
-    if (this.sockets.has(handle)) {
-      return this.sockets.get(handle);
-    }
-    const socket = new WebSocket(handle);
-    socket.addEventListener("message", async (event) => {
-      try {
-        await this.onSocketMessage(handle, event.data);
-      } catch {
-        try {
-          socket.close(1011, "message failed");
-        } catch {
-          // Ignore close failures.
-        }
-      }
-    });
-    socket.addEventListener("close", async () => {
-      try {
-        await this.onSocketClose(handle);
-      } catch {
-        // Ignore close handler errors.
-      }
-    });
-    this.sockets.set(handle, socket);
-    return socket;
-  }
-
-  async sendPayload(handle, payload) {
-    const socket = this.bindSocket(handle);
-    try {
-      await socket.send(JSON.stringify(payload), "text");
-      return true;
-    } catch {
-      this.dropHandle(handle);
-      return false;
-    }
-  }
-
-  dropHandle(handle) {
-    this.sockets.delete(handle);
-    delete this.room.connections[handle];
-    this.schedulePersist();
-  }
-
-  async broadcastParticipants(recipients = roomConnectionHandles(this.room)) {
-    const openHandles = roomConnectionHandles(this.room);
-    const targetHandles = recipients.filter((handle) => Boolean(this.room.connections[handle]));
-    const payload = fixiSwap(
-      "#participants",
-      "innerHTML",
-      renderParticipantsItems(this.room, openHandles),
-    );
-    await Promise.allSettled(targetHandles.map((handle) => this.sendPayload(handle, payload)));
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname.endsWith("/ws")) {
-      return this.handleWebSocket(request, url);
-    }
-    if (url.pathname.endsWith("/state")) {
-      return json({
-        ok: true,
-        roomId: this.room.roomId,
-        messages: this.room.messages,
-        participants: listConnectedParticipants(this.room, roomConnectionHandles(this.room)),
-      });
-    }
-    return text("not found", 404);
-  }
-
-  async handleWebSocket(request, url) {
-    const segments = url.pathname.split("/").filter(Boolean);
-    const roomId = normalizeRoomId(segments[1] ?? "");
-    const username = normalizeUsername(url.searchParams.get("username"));
-    const participantId = normalizeParticipantId(url.searchParams.get("participant"));
-    if (!roomId || !username || !participantId) {
-      return json({ ok: false, error: "missing room, username, or participant id" }, 400);
-    }
-
-    const { handle, response } = await this.state.sockets.accept(request);
-    this.bindSocket(handle);
-
-    this.room.roomId = roomId;
-    this.room.participants[participantId] = {
-      id: participantId,
-      username,
-      joinedAt: this.room.participants[participantId]?.joinedAt ?? nowIso(),
-    };
-    this.room.connections[handle] = participantId;
-    this.schedulePersist();
-    await this.broadcastParticipants(
-      roomConnectionHandles(this.room).filter((openHandle) => openHandle !== handle),
-    );
-
-    return response;
-  }
-
-  async onSocketMessage(handle, data) {
-    const payload = parseSocketPayload(data);
-    if (!payload) {
-      return;
-    }
-
-    const participantId = this.room.connections[handle];
-    if (!participantId) {
-      return;
-    }
-    const participant = this.room.participants[participantId];
-    if (!participant) {
-      return;
-    }
-
-    const type = String(payload.type ?? "");
-    if (type === "ready") {
-      await this.sendPayload(handle, [
-        fixiSwap("#messages", "innerHTML", renderMessagesItems(this.room)),
-        fixiSwap(
-          "#participants",
-          "innerHTML",
-          renderParticipantsItems(this.room, roomConnectionHandles(this.room)),
-        ),
-      ]);
-      return;
-    }
-
-    if (type !== "message") {
-      return;
-    }
-
-    const body = String(payload.text ?? "").trim();
-    if (!body || body.length > MAX_MESSAGE_LENGTH) {
-      return;
-    }
-
-    const message = {
-      seq: this.room.nextSeq + 1,
-      participantId,
-      username: participant.username,
-      text: body,
-      timestamp: nowIso(),
-    };
-    this.room.nextSeq = message.seq;
-    this.room.messages.push(message);
-    if (this.room.messages.length > MAX_HISTORY) {
-      this.room.messages = this.room.messages.slice(-MAX_HISTORY);
-    }
-    this.schedulePersist();
-
-    const payloadOut = fixiSwap("#messages", "beforeend", renderMessageItem(message));
-    await Promise.allSettled(
-      roomConnectionHandles(this.room).map((openHandle) => this.sendPayload(openHandle, payloadOut)),
-    );
-  }
-
-  async onSocketClose(handle) {
-    this.sockets.delete(handle);
-    if (!this.room.connections[handle]) {
-      return;
-    }
-    delete this.room.connections[handle];
-    this.schedulePersist();
-    await this.broadcastParticipants();
-  }
-}

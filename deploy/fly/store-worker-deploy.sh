@@ -62,20 +62,14 @@ while [ "$#" -gt 0 ]; do
         exit 1
       fi
       binding_value="$2"
-      if [[ "$binding_value" != *=* ]]; then
-        echo "invalid actor binding: $binding_value (expected BINDING=ClassName)" >&2
-        exit 1
-      fi
-      binding_name="${binding_value%%=*}"
-      class_name="${binding_value#*=}"
-      if [ -z "$binding_name" ] || [ -z "$class_name" ]; then
-        echo "invalid actor binding: $binding_value (expected BINDING=ClassName)" >&2
+      if [ -z "$binding_value" ] || [[ "$binding_value" == *=* ]]; then
+        echo "invalid actor binding: $binding_value (expected BINDING)" >&2
         exit 1
       fi
       config_json="$(
         printf '%s' "$config_json" \
-          | jq --arg binding "$binding_name" --arg class "$class_name" \
-            '.bindings += [{type: "actor", binding: $binding, class: $class}]'
+          | jq --arg binding "$binding_value" \
+            '.bindings += [{type: "actor", binding: $binding}]'
       )"
       shift 2
       ;;

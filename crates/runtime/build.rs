@@ -185,10 +185,16 @@ fn try_reuse_generated_actor_rpc() -> Option<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("../../target"));
     let profile = env::var("PROFILE").ok()?;
-    let build_dir = target_dir.join(profile).join("build");
-    let entries = fs::read_dir(&build_dir).ok()?;
-    let candidate = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+    let build_roots = [
+        target_dir.join(&profile).join("build"),
+        target_dir.join("debug").join("build"),
+        target_dir.join("release").join("build"),
+    ];
+    let candidate = build_roots
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .filter_map(|build_dir| fs::read_dir(&build_dir).ok())
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok().map(|entry| entry.path())))
         .map(|path| path.join("out/actor_rpc_capnp.rs"))
         .filter(|path| {
             path.is_file()

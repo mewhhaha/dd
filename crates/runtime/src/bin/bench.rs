@@ -56,12 +56,38 @@ struct ScaleUpResult {
     burst: ScenarioResult,
 }
 
+struct WebSocketBenchResult {
+    sessions: usize,
+    messages_per_session: usize,
+    open: Distribution,
+    roundtrip: ScenarioResult,
+}
+
 struct Distribution {
     mean_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn section_enabled(name: &str) -> bool {
+    let raw = std::env::var("DD_BENCH_ONLY").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return true;
+    }
+    raw.split(',')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .any(|value| value.eq_ignore_ascii_case(name))
 }
 
 #[tokio::main]
@@ -202,24 +228,40 @@ export default {
     println!();
 
     for config in configs {
-        println!("== steady-state: {} ==", config.name);
-        let service = start_service(config.name, config.runtime.clone())
-            .await
-            .map_err(|error| error.to_string())?;
-        for scenario in scenarios {
-            let worker_name = format!("{}-{}", config.name, scenario.name);
-            service
-                .deploy(worker_name.clone(), scenario.worker_source.to_string())
+        if section_enabled("steady-state") {
+            println!("== steady-state: {} ==", config.name);
+            let service = start_service(config.name, config.runtime.clone())
                 .await
                 .map_err(|error| error.to_string())?;
-            let result = run_scenario(&service, &worker_name, scenario)
-                .await
-                .map_err(|error| error.to_string())?;
-            println!("{}", format_scenario_result(scenario.name, result));
+            for scenario in scenarios {
+                let worker_name = format!("{}-{}", config.name, scenario.name);
+                service
+                    .deploy(worker_name.clone(), scenario.worker_source.to_string())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let result = run_scenario(&service, &worker_name, scenario)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                println!("{}", format_scenario_result(scenario.name, result));
+            }
+            println!();
         }
-        println!();
 
-        if config.name == "autoscaling-8" {
+        if section_enabled("websocket") {
+            println!("== websocket: {} ==", config.name);
+            let websocket_tag = format!("{}-websocket", config.name);
+            let websocket_service = start_service(&websocket_tag, config.runtime.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let websocket = run_websocket_bench(&websocket_service)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("{}", format_websocket_open_result(&websocket));
+            println!("{}", format_websocket_roundtrip_result(&websocket));
+            println!();
+        }
+
+        if config.name == "autoscaling-8" && section_enabled("lifecycle") {
             println!("== lifecycle: {} ==", config.name);
 
             let cold_service = start_service("cold-start", config.runtime.clone())
@@ -252,59 +294,61 @@ export default {
             println!("{}", format_scale_up_result(scale));
             println!();
 
-            println!("== kv-writes: {} ==", config.name);
-            let kv_service = start_service("kv-writes", config.runtime.clone())
-                .await
-                .map_err(|error| error.to_string())?;
-            let kv_worker_name = format!("kv-writes-{}", Uuid::new_v4());
-            kv_service
-                .deploy_with_config(
-                    kv_worker_name.clone(),
-                    KV_WRITE_WORKER_SOURCE.to_string(),
-                    DeployConfig {
-                        public: false,
-                        bindings: vec![DeployBinding::Kv {
-                            binding: "MY_KV".to_string(),
-                        }],
-                        ..DeployConfig::default()
+            if section_enabled("kv-writes") {
+                println!("== kv-writes: {} ==", config.name);
+                let kv_service = start_service("kv-writes", config.runtime.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let kv_worker_name = format!("kv-writes-{}", Uuid::new_v4());
+                kv_service
+                    .deploy_with_config(
+                        kv_worker_name.clone(),
+                        KV_WRITE_WORKER_SOURCE.to_string(),
+                        DeployConfig {
+                            public: false,
+                            bindings: vec![DeployBinding::Kv {
+                                binding: "MY_KV".to_string(),
+                            }],
+                            ..DeployConfig::default()
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+
+                let kv_sync = run_scenario(
+                    &kv_service,
+                    &kv_worker_name,
+                    Scenario {
+                        name: "kv-write-sync",
+                        worker_source: KV_WRITE_WORKER_SOURCE,
+                        requests: 1000,
+                        concurrency: 1,
+                        paths: &["/write"],
                     },
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+                println!("{}", format_scenario_result("kv-write-sync", kv_sync));
 
-            let kv_sync = run_scenario(
-                &kv_service,
-                &kv_worker_name,
-                Scenario {
-                    name: "kv-write-sync",
-                    worker_source: KV_WRITE_WORKER_SOURCE,
-                    requests: 1000,
-                    concurrency: 1,
-                    paths: &["/write"],
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            println!("{}", format_scenario_result("kv-write-sync", kv_sync));
-
-            let kv_concurrent = run_scenario(
-                &kv_service,
-                &kv_worker_name,
-                Scenario {
-                    name: "kv-write-concurrent",
-                    worker_source: KV_WRITE_WORKER_SOURCE,
-                    requests: 1000,
-                    concurrency: 96,
-                    paths: &["/write"],
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            println!(
-                "{}",
-                format_scenario_result("kv-write-concurrent", kv_concurrent)
-            );
-            println!();
+                let kv_concurrent = run_scenario(
+                    &kv_service,
+                    &kv_worker_name,
+                    Scenario {
+                        name: "kv-write-concurrent",
+                        worker_source: KV_WRITE_WORKER_SOURCE,
+                        requests: 1000,
+                        concurrency: 96,
+                        paths: &["/write"],
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    format_scenario_result("kv-write-concurrent", kv_concurrent)
+                );
+                println!();
+            }
         }
     }
 
@@ -316,6 +360,35 @@ export default {
   async fetch(request, env) {
     await env.MY_KV.set("hot", "1");
     return new Response("ok");
+  },
+};
+"#;
+
+const WEBSOCKET_ECHO_WORKER_SOURCE: &str = r#"
+export function openSocket(state, payload) {
+  const { response } = state.accept(payload.request);
+  return response;
+}
+
+export async function onSocketMessage(stub, event) {
+  if (typeof event.data === "string") {
+    await stub.sockets.send(event.handle, `echo:${event.data}`);
+    return;
+  }
+
+  await stub.sockets.send(event.handle, event.data, "binary");
+}
+
+export default {
+  async fetch(request, env) {
+    const actor = env.BENCH_ACTOR.get(env.BENCH_ACTOR.idFromName("global"));
+    return await actor.atomic(openSocket, { request });
+  },
+
+  async wake(event, _env) {
+    if (event.type === "socketmessage") {
+      await onSocketMessage(event.stub, event);
+    }
   },
 };
 "#;
@@ -595,6 +668,191 @@ export default {
     })
 }
 
+async fn run_websocket_bench(service: &RuntimeService) -> common::Result<WebSocketBenchResult> {
+    let sessions = env_usize("DD_BENCH_WS_SESSIONS", 24);
+    let messages_per_session = env_usize("DD_BENCH_WS_MESSAGES_PER_SESSION", 24);
+    let worker_name = format!("websocket-{}", Uuid::new_v4());
+    service
+        .deploy_with_config(
+            worker_name.clone(),
+            WEBSOCKET_ECHO_WORKER_SOURCE.to_string(),
+            DeployConfig {
+                public: false,
+                bindings: vec![DeployBinding::Actor {
+                    binding: "BENCH_ACTOR".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await?;
+
+    let (open, session_ids) = open_websocket_sessions(service, &worker_name, sessions).await?;
+    let roundtrip =
+        run_websocket_roundtrip(service, &worker_name, &session_ids, messages_per_session).await?;
+
+    close_websocket_sessions(service, &worker_name, &session_ids).await?;
+
+    Ok(WebSocketBenchResult {
+        sessions,
+        messages_per_session,
+        open,
+        roundtrip,
+    })
+}
+
+async fn with_timeout<T>(
+    label: &str,
+    future: impl std::future::Future<Output = common::Result<T>>,
+) -> common::Result<T> {
+    tokio::time::timeout(Duration::from_secs(5), future)
+        .await
+        .map_err(|_| common::PlatformError::runtime(format!("{label} timed out")))?
+}
+
+async fn open_websocket_sessions(
+    service: &RuntimeService,
+    worker_name: &str,
+    sessions: usize,
+) -> common::Result<(Distribution, Vec<String>)> {
+    let concurrency = sessions.min(16).max(1);
+    let next = Arc::new(AtomicUsize::new(0));
+    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(sessions)));
+    let session_ids = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(sessions)));
+    let mut tasks = Vec::with_capacity(concurrency);
+
+    for _ in 0..concurrency {
+        let service = service.clone();
+        let worker_name = worker_name.to_string();
+        let next = Arc::clone(&next);
+        let latencies = Arc::clone(&latencies);
+        let session_ids = Arc::clone(&session_ids);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= sessions {
+                    break;
+                }
+                let started = Instant::now();
+                let opened = with_timeout(
+                    "websocket open",
+                    service.open_websocket(
+                        worker_name.clone(),
+                        websocket_invocation("/ws", &format!("bench-ws-open-{idx}")),
+                        None,
+                    ),
+                )
+                .await?;
+                if opened.output.status != 101 {
+                    return Err(common::PlatformError::runtime(format!(
+                        "websocket benchmark open failed with status {}",
+                        opened.output.status
+                    )));
+                }
+                latencies.lock().await.push(started.elapsed());
+                session_ids.lock().await.push(opened.session_id);
+            }
+            Ok::<(), common::PlatformError>(())
+        }));
+    }
+
+    for task in tasks {
+        task.await
+            .map_err(|error| common::PlatformError::internal(error.to_string()))??;
+    }
+
+    let latencies = take_sorted_latencies(latencies)?;
+    let session_ids = Arc::try_unwrap(session_ids)
+        .map_err(|_| common::PlatformError::internal("websocket sessions still shared"))?
+        .into_inner();
+    Ok((summarize_distribution(&latencies), session_ids))
+}
+
+async fn run_websocket_roundtrip(
+    service: &RuntimeService,
+    worker_name: &str,
+    session_ids: &[String],
+    messages_per_session: usize,
+) -> common::Result<ScenarioResult> {
+    let total_requests = session_ids.len() * messages_per_session;
+    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(total_requests)));
+    let started_at = Instant::now();
+    let mut tasks = Vec::with_capacity(session_ids.len());
+
+    for (session_index, session_id) in session_ids.iter().cloned().enumerate() {
+        let service = service.clone();
+        let worker_name = worker_name.to_string();
+        let latencies = Arc::clone(&latencies);
+        tasks.push(tokio::spawn(async move {
+            for message_idx in 0..messages_per_session {
+                let payload = format!("hello-{session_index}-{message_idx}");
+                let started = Instant::now();
+                let sent = with_timeout(
+                    "websocket send",
+                    service.websocket_send_frame(
+                        worker_name.clone(),
+                        session_id.clone(),
+                        payload.as_bytes().to_vec(),
+                        false,
+                    ),
+                )
+                .await?;
+                if sent.status != 204 {
+                    return Err(common::PlatformError::runtime(format!(
+                        "websocket benchmark send failed with status {}",
+                        sent.status
+                    )));
+                }
+                let body = String::from_utf8(sent.body)
+                    .map_err(|error| common::PlatformError::internal(error.to_string()))?;
+                let expected = format!("echo:{payload}");
+                if body != expected {
+                    return Err(common::PlatformError::runtime(format!(
+                        "websocket benchmark expected {}, got {}",
+                        expected, body
+                    )));
+                }
+                latencies.lock().await.push(started.elapsed());
+            }
+
+            Ok::<(), common::PlatformError>(())
+        }));
+    }
+
+    for task in tasks {
+        task.await
+            .map_err(|error| common::PlatformError::internal(error.to_string()))??;
+    }
+
+    let total_duration = started_at.elapsed();
+    let latencies = take_sorted_latencies(latencies)?;
+    Ok(to_scenario_result(
+        total_requests,
+        session_ids.len(),
+        total_duration,
+        &latencies,
+    ))
+}
+
+async fn close_websocket_sessions(
+    service: &RuntimeService,
+    worker_name: &str,
+    session_ids: &[String],
+) -> common::Result<()> {
+    for session_id in session_ids {
+        with_timeout(
+            "websocket close",
+            service.websocket_close(
+                worker_name.to_string(),
+                session_id.clone(),
+                1000,
+                "bench-done".to_string(),
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn invocation(path: &str, idx: usize) -> WorkerInvocation {
     WorkerInvocation {
         method: "GET".to_string(),
@@ -602,6 +860,24 @@ fn invocation(path: &str, idx: usize) -> WorkerInvocation {
         headers: Vec::new(),
         body: Vec::new(),
         request_id: format!("bench-{idx}"),
+    }
+}
+
+fn websocket_invocation(path: &str, request_id: &str) -> WorkerInvocation {
+    WorkerInvocation {
+        method: "GET".to_string(),
+        url: format!("http://worker{path}"),
+        headers: vec![
+            ("connection".to_string(), "Upgrade".to_string()),
+            ("upgrade".to_string(), "websocket".to_string()),
+            ("sec-websocket-version".to_string(), "13".to_string()),
+            (
+                "sec-websocket-key".to_string(),
+                "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+            ),
+        ],
+        body: Vec::new(),
+        request_id: request_id.to_string(),
     }
 }
 
@@ -762,4 +1038,36 @@ fn format_restore_start_result(result: RestoreStartResult) -> String {
         result.first_invoke.p99_ms,
     );
     out
+}
+
+fn format_websocket_open_result(result: &WebSocketBenchResult) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "{:<18} sessions={} mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",
+        "ws-open",
+        result.sessions,
+        result.open.mean_ms,
+        result.open.p50_ms,
+        result.open.p95_ms,
+        result.open.p99_ms,
+        result.open.max_ms,
+    );
+    out
+}
+
+fn format_websocket_roundtrip_result(result: &WebSocketBenchResult) -> String {
+    format_scenario_result(
+        &format!("ws-send-echo x{}", result.messages_per_session),
+        ScenarioResult {
+            total_requests: result.roundtrip.total_requests,
+            concurrency: result.roundtrip.concurrency,
+            total_duration: result.roundtrip.total_duration,
+            throughput_rps: result.roundtrip.throughput_rps,
+            mean_ms: result.roundtrip.mean_ms,
+            p50_ms: result.roundtrip.p50_ms,
+            p95_ms: result.roundtrip.p95_ms,
+            p99_ms: result.roundtrip.p99_ms,
+        },
+    )
 }

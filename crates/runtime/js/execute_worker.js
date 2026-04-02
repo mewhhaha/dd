@@ -599,17 +599,28 @@
       return value;
     }
     if (value.__dd_rpc_type === "request") {
-      return new Request(String(value.url || "http://worker/"), {
-        method: String(value.method || "GET"),
+      const method = String(value.method || "GET");
+      const bodyBytes = toArrayBytes(value.body);
+      const init = {
+        method,
         headers: Array.isArray(value.headers) ? value.headers : [],
-        body: toArrayBytes(value.body),
-      });
+      };
+      if (!(bodyBytes.byteLength === 0 && /^(GET|HEAD)$/i.test(method))) {
+        init.body = bodyBytes;
+      }
+      return new Request(String(value.url || "http://worker/"), init);
     }
     if (value.__dd_rpc_type === "response") {
-      return new Response(toArrayBytes(value.body), {
-        status: Number(value.status || 200),
+      const status = Number(value.status || 200);
+      const bodyBytes = toArrayBytes(value.body);
+      const init = {
+        status,
         headers: Array.isArray(value.headers) ? value.headers : [],
-      });
+      };
+      const body = (bodyBytes.byteLength === 0 && [101, 204, 205, 304].includes(status))
+        ? null
+        : bodyBytes;
+      return new Response(body, init);
     }
     const out = {};
     for (const [key, item] of Object.entries(value)) {
@@ -745,12 +756,10 @@
   const createActorTxn = (entry) => ({
     entry,
     reads: new Map(),
-    pendingReads: new Map(),
     writes: new Map(),
+    deferred: [],
     listGateVersion: null,
-    pendingListGateVersion: null,
     stagedVersionSeed: null,
-    effects: [],
     committed: false,
     committedVersion: null,
   });
@@ -764,31 +773,15 @@
     return storageState.mirror.get(normalizedKey) ?? null;
   };
 
-  const actorTxnTrackRead = (txn, key, record, allowConcurrency) => {
-    if (!txn || allowConcurrency) {
+  const actorTxnTrackRead = (txn, key, record, strict) => {
+    if (!txn || strict !== true) {
       return;
     }
     const normalizedKey = String(key);
-    if (txn.reads.has(normalizedKey) || txn.pendingReads.has(normalizedKey)) {
+    if (txn.reads.has(normalizedKey)) {
       return;
     }
-    txn.pendingReads.set(normalizedKey, actorRecordVersion(record));
-  };
-
-  const actorTxnPromotePending = (txn) => {
-    if (!txn) {
-      return;
-    }
-    for (const [key, version] of txn.pendingReads.entries()) {
-      if (!txn.reads.has(key)) {
-        txn.reads.set(key, version);
-      }
-    }
-    txn.pendingReads.clear();
-    if (txn.pendingListGateVersion != null) {
-      txn.listGateVersion = Number(txn.pendingListGateVersion);
-      txn.pendingListGateVersion = null;
-    }
+    txn.reads.set(normalizedKey, actorRecordVersion(record));
   };
 
   const actorTxnNextVersion = (txn) => {
@@ -802,15 +795,6 @@
     const version = Number(txn.stagedVersionSeed);
     txn.stagedVersionSeed = version + 1;
     return version;
-  };
-
-  const actorTxnQueueEffect = (txn, effect) => {
-    if (!txn) {
-      return effect();
-    }
-    actorTxnPromotePending(txn);
-    txn.effects.push(effect);
-    return Promise.resolve();
   };
 
   const closeActorResourcesOnFailure = async (entry, runtimeRequestId) => {
@@ -1045,15 +1029,7 @@
     );
     txn.committed = true;
     txn.committedVersion = committedVersion;
-    if (txn.effects.length > 0) {
-      await gateActorOutput(txn.entry, runtimeRequestId, async () => {
-        for (const effect of txn.effects) {
-          await effect();
-        }
-      });
-    } else {
-      await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
-    }
+    await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
     return true;
   };
 
@@ -1065,12 +1041,11 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        actorTxnPromotePending(txn);
         const normalizedKey = String(key);
         const record = txn
           ? actorTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
-        actorTxnTrackRead(txn, normalizedKey, record, options?.allowConcurrency === true);
+        actorTxnTrackRead(txn, normalizedKey, record, options?.strict === true);
         if (!record || record.deleted) {
           return null;
         }
@@ -1085,7 +1060,6 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        actorTxnPromotePending(txn);
         const normalizedKey = String(key);
         const expectedInput = options?.expectedVersion;
         const expectedVersion = Number.isFinite(Number(expectedInput))
@@ -1128,7 +1102,6 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        actorTxnPromotePending(txn);
         const normalizedKey = String(key);
         const expectedInput = options?.expectedVersion;
         const expectedVersion = Number.isFinite(Number(expectedInput))
@@ -1170,7 +1143,6 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        actorTxnPromotePending(txn);
         const prefix = String(options?.prefix ?? "");
         const limitInput = Number(options?.limit ?? 100);
         const limit = Number.isFinite(limitInput)
@@ -1181,8 +1153,8 @@
           for (const [key, record] of txn.writes.entries()) {
             merged.set(key, cloneActorRecord(record));
           }
-          if (options?.allowConcurrency !== true) {
-            txn.pendingListGateVersion = Number(storageState.committedVersion ?? -1);
+          if (options?.strict === true) {
+            txn.listGateVersion = Number(storageState.committedVersion ?? -1);
           }
         }
         return Array.from(merged.values())
@@ -1204,6 +1176,46 @@
     const socketsByHandle = entry.socketBindings ??= new Map();
     const openHandles = entry.openSocketHandles ??= new Set();
     const currentSocketRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
+
+    const sendSocketFrame = async (requestIdForOp, normalizedHandle, payload, gated = true) => {
+      const perform = async () => {
+        const result = await callOp("op_actor_socket_send", {
+          request_id: requestIdForOp,
+          handle: normalizedHandle,
+          message_kind: payload.kind,
+          message: payload.value,
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "socket send failed"));
+        }
+      };
+      if (gated) {
+        await gateActorOutput(entry, requestIdForOp, perform);
+        return;
+      }
+      await perform();
+    };
+
+    const closeSocketFrame = async (requestIdForOp, normalizedHandle, code, reason, gated = true) => {
+      const perform = async () => {
+        const result = await callOp("op_actor_socket_close", {
+          request_id: requestIdForOp,
+          handle: normalizedHandle,
+          code,
+          reason,
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "socket close failed"));
+        }
+      };
+      if (gated) {
+        await gateActorOutput(entry, requestIdForOp, perform);
+        return;
+      }
+      await perform();
+    };
 
     const consumeCloseEvents = async (target) => {
       const result = await callOp("op_actor_socket_consume_close", {
@@ -1230,6 +1242,7 @@
       }
       const existing = socketsByHandle.get(normalizedHandle);
       if (existing) {
+        existing.__dd_bindRequestId(currentSocketRequestId());
         consumeCloseEvents(existing).catch(() => {});
         return existing;
       }
@@ -1239,8 +1252,18 @@
       let onclose = null;
       const closeQueue = [];
       let closed = false;
+      let boundRequestId = currentSocketRequestId();
       const target = {
         __dd_handle: normalizedHandle,
+        __dd_bindRequestId(nextRequestId) {
+          const normalizedRequestId = String(nextRequestId ?? "").trim();
+          if (normalizedRequestId) {
+            boundRequestId = normalizedRequestId;
+          }
+        },
+        __dd_boundRequestId() {
+          return boundRequestId;
+        },
         binaryType: "arraybuffer",
         get readyState() {
           return closed ? 3 : 1;
@@ -1279,35 +1302,19 @@
         },
         async send(value, kind) {
           const payload = encodeSocketSendPayload(value, kind);
-          await gateActorOutput(entry, currentSocketRequestId(), async () => {
-            const result = await callOp("op_actor_socket_send", {
-              request_id: currentSocketRequestId(),
-              handle: normalizedHandle,
-              message_kind: payload.kind,
-              message: payload.value,
-            });
-            await syncFrozenTime();
-            if (result && typeof result === "object" && result.ok === false) {
-              throw new Error(String(result.error ?? "socket send failed"));
-            }
-          });
+          await sendSocketFrame(boundRequestId, normalizedHandle, payload, true);
         },
         async close(code, reason) {
           const normalizedCode = Number.isFinite(Number(code))
             ? Math.trunc(Number(code))
             : 1000;
-          await gateActorOutput(entry, currentSocketRequestId(), async () => {
-            const result = await callOp("op_actor_socket_close", {
-              request_id: currentSocketRequestId(),
-              handle: normalizedHandle,
-              code: normalizedCode,
-              reason: reason == null ? "" : String(reason),
-            });
-            await syncFrozenTime();
-            if (result && typeof result === "object" && result.ok === false) {
-              throw new Error(String(result.error ?? "socket close failed"));
-            }
-          });
+          await closeSocketFrame(
+            boundRequestId,
+            normalizedHandle,
+            normalizedCode,
+            reason == null ? "" : String(reason),
+            true,
+          );
         },
         async __dd_dispatch(type, event) {
           const current = listeners.get(type);
@@ -1329,6 +1336,7 @@
           }
         },
         async __dd_dispatchMessage(value) {
+          this.__dd_bindRequestId(currentSocketRequestId());
           const event = { type: "message", data: value, target: this };
           await this.__dd_dispatch("message", event);
           if (typeof onmessage === "function") {
@@ -1347,6 +1355,7 @@
           }
         },
         __dd_dispatchClose(code, reason) {
+          this.__dd_bindRequestId(currentSocketRequestId());
           const event = {
             type: "close",
             code: Number(code),
@@ -1390,7 +1399,7 @@
 
     const upgradeAccepted = { used: false };
     const sockets = {
-      async accept(request, options = {}) {
+      accept(request, options = {}) {
         const _ = options;
         if (!allowSocketAccept) {
           throw new Error("state.sockets.accept is only available during actor fetch()");
@@ -1448,6 +1457,29 @@
       sockets,
       WebSocket: WebSocketForActor,
       ensureSocket,
+      async sendEffect(handle, value, kind) {
+        const socket = ensureSocket(handle);
+        const payload = encodeSocketSendPayload(value, kind);
+        await sendSocketFrame(
+          socket.__dd_boundRequestId(),
+          socket.__dd_handle,
+          payload,
+          false,
+        );
+      },
+      async closeEffect(handle, code, reason) {
+        const socket = ensureSocket(handle);
+        const normalizedCode = Number.isFinite(Number(code))
+          ? Math.trunc(Number(code))
+          : 1000;
+        await closeSocketFrame(
+          socket.__dd_boundRequestId(),
+          socket.__dd_handle,
+          normalizedCode,
+          reason == null ? "" : String(reason),
+          false,
+        );
+      },
       async refreshOpenHandles() {
         const result = await callOp("op_actor_socket_list", {
           request_id: currentSocketRequestId(),
@@ -1704,7 +1736,7 @@
 
     const transportAccepted = { used: false };
     const transports = {
-      async accept(request, options = {}) {
+      accept(request, options = {}) {
         const _ = options;
         if (!allowTransportAccept) {
           throw new Error("state.transports.accept is only available during actor fetch()");
@@ -1812,20 +1844,7 @@
       allowTransportAccept,
     );
     const storage = createActorStorageBinding(entry, runtimeRequestId, txn);
-    const sockets = txn ? {
-      accept(...args) {
-        return socketRuntime.sockets.accept(...args);
-      },
-      values(...args) {
-        return socketRuntime.sockets.values(...args);
-      },
-      send(handle, value, kind) {
-        return actorTxnQueueEffect(txn, () => socketRuntime.sockets.send(handle, value, kind));
-      },
-      close(handle, code, reason) {
-        return actorTxnQueueEffect(txn, () => socketRuntime.sockets.close(handle, code, reason));
-      },
-    } : socketRuntime.sockets;
+    const sockets = socketRuntime.sockets;
     entry.socketRuntime = socketRuntime;
     entry.transportRuntime = transportRuntime;
     return {
@@ -1851,6 +1870,94 @@
       transports: transportRuntime.transports,
       __dd_socket_runtime: socketRuntime,
       __dd_transport_runtime: transportRuntime,
+    };
+  };
+
+  const createActorAtomicState = (
+    entry,
+    runtimeRequestId,
+    allowSocketAccept,
+    allowTransportAccept,
+    txn,
+  ) => {
+    const runtimeState = createActorRuntimeState(
+      entry,
+      runtimeRequestId,
+      allowSocketAccept,
+      allowTransportAccept,
+      txn,
+    );
+    const stub = createActorStub(entry.binding, entry.actorKey);
+    const isTransportRequest = (request) => {
+      if (!(request instanceof Request)) {
+        return false;
+      }
+      const requestMethod = String(
+        request.headers.get(INTERNAL_TRANSPORT_METHOD_HEADER)
+        ?? request.method
+        ?? "",
+      ).toUpperCase();
+      return requestMethod === "CONNECT";
+    };
+    return {
+      id: runtimeState.id,
+      stub,
+      get(key, options) {
+        return runtimeState.storage.get(key, options)?.value ?? null;
+      },
+      set(key, value) {
+        runtimeState.storage.put(key, value);
+        return value;
+      },
+      put(key, updater) {
+        if (typeof updater !== "function") {
+          throw new Error("state.put(key, updater) requires a function updater");
+        }
+        const previous = runtimeState.storage.get(key, { strict: true })?.value ?? null;
+        const next = updater(previous);
+        runtimeState.storage.put(key, next);
+        return next;
+      },
+      delete(key) {
+        return runtimeState.storage.delete(key);
+      },
+      list(options) {
+        return runtimeState.storage.list(options).map((entryValue) => ({
+          key: entryValue.key,
+          value: entryValue.value,
+          version: entryValue.version,
+        }));
+      },
+      defer(callback) {
+        if (!txn) {
+          throw new Error("state.defer(callback) requires an active transaction");
+        }
+        if (typeof callback !== "function") {
+          throw new Error("state.defer(callback) requires a function");
+        }
+        txn.deferred.push(callback);
+        return callback;
+      },
+      accept(request, options = {}) {
+        if (isTransportRequest(request)) {
+          const accepted = runtimeState.transports.accept(request, options);
+          return {
+            handle: accepted.handle,
+            response: new Response(accepted.response.body ?? null, {
+              status: accepted.response.status ?? 200,
+              headers: accepted.response.headers ?? [],
+            }),
+          };
+        }
+        const accepted = runtimeState.sockets.accept(request, options);
+        return {
+          handle: accepted.handle,
+          response: new Response(accepted.response.body ?? null, {
+            status: accepted.response.status ?? 101,
+            headers: accepted.response.headers ?? [],
+          }),
+        };
+      },
     };
   };
 
@@ -1927,7 +2034,7 @@
   const liveActorExecutables = globalThis.__dd_live_actor_executables ??= new Map();
   let liveActorExecutableSeq = globalThis.__dd_live_actor_executable_seq ?? 0;
 
-  const ACTOR_RUN_METHOD = "__dd_run";
+  const ACTOR_ATOMIC_METHOD = "__dd_atomic";
 
   const actorMethodNameIsBlocked = (name) => (
     !name
@@ -2016,7 +2123,12 @@
     },
   });
 
-  const ensureActorEntry = async (binding, actorKey, hydrationRequestId) => {
+  const ensureActorEntry = async (
+    binding,
+    actorKey,
+    hydrationRequestId,
+    options = {},
+  ) => {
     const cacheKey = actorEntryKey(binding, actorKey);
     let entry = actorStateEntries.get(cacheKey);
     if (!entry) {
@@ -2036,7 +2148,9 @@
     entry.binding = binding;
     entry.actorKey = actorKey;
     entry.cacheKey = cacheKey;
-    await ensureActorStorageHydrated(entry, hydrationRequestId);
+    if (options?.hydrate !== false) {
+      await ensureActorStorageHydrated(entry, hydrationRequestId);
+    }
     return entry;
   };
 
@@ -2050,14 +2164,14 @@
 
   const extractExecDescriptor = (executable) => {
     if (typeof executable !== "function") {
-      throw new Error("stub.run(fn, ...args) requires a function");
+      throw new Error("stub.atomic(fn, ...args) requires a function");
     }
     const workerModule = globalThis.__dd_worker_module;
     const exportName = String(executable.name ?? "").trim();
     const exported = exportName ? workerModule?.[exportName] : undefined;
     const source = String(executable);
     if (!exportName && !source.trim()) {
-      throw new Error("stub.run(fn, ...args) requires a non-empty function body");
+      throw new Error("stub.atomic(fn, ...args) requires a non-empty function body");
     }
     const liveToken = registerLiveActorExecutable(executable);
     if (exportName && exported === executable) {
@@ -2067,37 +2181,63 @@
   };
 
   const createActorStubSocketApi = (bindingName, actorKey) => ({
-    async accept(request, options = {}) {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, true, false);
-      return state.sockets.accept(request, options);
-    },
     async send(handle, value, kind) {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, false, false);
-      await state.__dd_socket_runtime.refreshOpenHandles();
-      return state.sockets.send(handle, value, kind);
+      const normalizedHandle = String(handle ?? "").trim();
+      if (!normalizedHandle) {
+        throw new Error("stub.sockets.send requires a non-empty handle");
+      }
+      const payload = encodeSocketSendPayload(value, kind);
+      const result = await callOp("op_actor_socket_send", {
+        request_id: activeRequestId() || requestId,
+        binding: bindingName,
+        key: actorKey,
+        handle: normalizedHandle,
+        message_kind: payload.kind,
+        message: payload.value,
+      });
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "socket send failed"));
+      }
     },
     async close(handle, code, reason) {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, false, false);
-      await state.__dd_socket_runtime.refreshOpenHandles();
-      return state.sockets.close(handle, code, reason);
+      const normalizedHandle = String(handle ?? "").trim();
+      if (!normalizedHandle) {
+        throw new Error("stub.sockets.close requires a non-empty handle");
+      }
+      const normalizedCode = Number.isFinite(Number(code))
+        ? Math.trunc(Number(code))
+        : 1000;
+      const result = await callOp("op_actor_socket_close", {
+        request_id: activeRequestId() || requestId,
+        binding: bindingName,
+        key: actorKey,
+        handle: normalizedHandle,
+        code: normalizedCode,
+        reason: reason == null ? "" : String(reason),
+      });
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "socket close failed"));
+      }
     },
     async values() {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, false, false);
-      await state.__dd_socket_runtime.refreshOpenHandles();
-      return state.sockets.values();
+      const result = await callOp("op_actor_socket_list", {
+        request_id: activeRequestId() || requestId,
+        binding: bindingName,
+        key: actorKey,
+      });
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "socket values failed"));
+      }
+      return Array.isArray(result?.handles)
+        ? result.handles.map((value) => String(value))
+        : [];
     },
   });
 
   const createActorStubTransportApi = (bindingName, actorKey) => ({
-    async accept(request, options = {}) {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, false, true);
-      return state.transports.accept(request, options);
-    },
     async values() {
       const entry = await ensureActorEntry(bindingName, actorKey, requestId);
       const state = createActorRuntimeState(entry, requestId, false, false);
@@ -2117,7 +2257,80 @@
     binding: namespace,
     sockets: createActorStubSocketApi(namespace, actorKey),
     transports: createActorStubTransportApi(namespace, actorKey),
-    async run(executable, ...args) {
+    async atomic(executable, ...args) {
+      return await invokeActorExecutable(
+        namespace,
+        actorKey,
+        ACTOR_ATOMIC_METHOD,
+        executable,
+        args,
+      );
+    },
+    async apply(effects) {
+      if (effects == null) {
+        return;
+      }
+      if (!Array.isArray(effects)) {
+        throw new Error("stub.apply(effects) requires an array");
+      }
+      for (const effect of effects) {
+        if (!effect || typeof effect !== "object") {
+          continue;
+        }
+        const type = String(effect.type ?? "").trim();
+        if (type === "socket.send") {
+          await this.sockets.send(
+            String(effect.handle ?? ""),
+            effect.payload,
+            effect.kind == null ? undefined : String(effect.kind),
+          );
+          continue;
+        }
+        if (type === "socket.close") {
+          await this.sockets.close(
+            String(effect.handle ?? ""),
+            Number(effect.code ?? 1000),
+            String(effect.reason ?? ""),
+          );
+          continue;
+        }
+        if (type === "transport.stream") {
+          const session = await this.transports.session(String(effect.handle ?? ""));
+          const writer = session.stream.writable.getWriter();
+          try {
+            await writer.write(effect.payload ?? new Uint8Array());
+          } finally {
+            writer.releaseLock();
+          }
+          continue;
+        }
+        if (type === "transport.datagram") {
+          const session = await this.transports.session(String(effect.handle ?? ""));
+          const writer = session.datagrams.writable.getWriter();
+          try {
+            await writer.write(effect.payload ?? new Uint8Array());
+          } finally {
+            writer.releaseLock();
+          }
+          continue;
+        }
+        if (type === "transport.close") {
+          const session = await this.transports.session(String(effect.handle ?? ""));
+          await session.close(Number(effect.code ?? 0), String(effect.reason ?? ""));
+          continue;
+        }
+        throw new Error(`unsupported actor effect type: ${type}`);
+      }
+    },
+  });
+
+  const invokeActorExecutable = async (
+    namespace,
+    actorKey,
+    methodName,
+    executable,
+    args,
+  ) => {
       actorInvokeSeq += 1;
       const descriptor = extractExecDescriptor(executable);
       const payload = [
@@ -2128,13 +2341,15 @@
       ];
       const argsBytes = await encodeRpcArgs(payload);
       try {
+        const preferCallerIsolate = !descriptor.export_name;
         const result = await callOp(
           "op_actor_invoke_method",
           {
             worker_name: workerName,
             binding: namespace,
             key: actorKey,
-            method_name: ACTOR_RUN_METHOD,
+            method_name: methodName,
+            prefer_caller_isolate: preferCallerIsolate,
             args: Array.from(argsBytes),
             caller_request_id: activeRequestId() || requestId,
             request_id: `${requestId}:actor-run:${actorInvokeSeq}`,
@@ -2150,8 +2365,7 @@
           liveActorExecutables.delete(String(descriptor.live_token));
         }
       }
-    },
-  });
+    };
 
   const actorIdKey = (id) => {
     if (typeof id === "string") {
@@ -2746,25 +2960,39 @@
     }
   };
 
-  const executeActorTransaction = async (entry, runtimeRequestId, executable, args) => {
+  const executeActorTransaction = async (
+    entry,
+    runtimeRequestId,
+    executable,
+    args,
+  ) => {
     const maxRetries = 256;
     let lastConflict = null;
     for (let attempt = 0; attempt < maxRetries; attempt += 1) {
       const txn = createActorTxn(entry);
-      const scopedState = createActorRuntimeState(
+      const scopedState = createActorAtomicState(
         entry,
         runtimeRequestId,
-        false,
-        false,
+        true,
+        true,
         txn,
       );
       try {
-        const value = await executable(scopedState, ...args);
+        const value = executable(scopedState, ...args);
+        if (value instanceof Promise) {
+          throw new Error("stub.atomic callback must be synchronous");
+        }
         const committed = await commitActorTxn(txn, runtimeRequestId);
         if (!committed) {
           lastConflict = new Error("actor transaction conflicted");
           await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
           continue;
+        }
+        for (const deferred of txn.deferred) {
+          const deferredResult = deferred();
+          if (deferredResult instanceof Promise) {
+            await deferredResult;
+          }
         }
         return value;
       } catch (error) {
@@ -2791,8 +3019,13 @@
       type: kind,
       binding: String(actorCall.binding ?? ""),
       key: String(actorCall.key ?? ""),
-      stub,
     };
+    Object.defineProperty(event, "stub", {
+      value: stub,
+      enumerable: false,
+      configurable: true,
+      writable: false,
+    });
     if ("handle" in actorCall) {
       event.handle = String(actorCall.handle ?? "");
     }
@@ -2852,10 +3085,13 @@
         if (!methodName) {
           throw new Error("actor method invoke requires a method name");
         }
-        if (actorMethodNameIsBlocked(methodName) && methodName !== ACTOR_RUN_METHOD) {
+        if (
+          actorMethodNameIsBlocked(methodName)
+          && methodName !== ACTOR_ATOMIC_METHOD
+        ) {
           throw new Error(`actor method is blocked: ${methodName}`);
         }
-        if (methodName !== ACTOR_RUN_METHOD) {
+        if (methodName !== ACTOR_ATOMIC_METHOD) {
           throw new Error(`unsupported actor method: ${methodName}`);
         }
         const { descriptor, args } = decodeExecPayload(actorCall.args);

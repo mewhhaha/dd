@@ -61,6 +61,7 @@ pub struct ActorInvokeEvent {
     pub caller_worker_name: String,
     pub caller_generation: u64,
     pub caller_isolate_id: u64,
+    pub prefer_caller_isolate: bool,
     pub reply: oneshot::Sender<Result<Vec<u8>>>,
 }
 
@@ -550,6 +551,8 @@ struct ActorInvokeMethodPayload {
     key: String,
     method_name: String,
     #[serde(default)]
+    prefer_caller_isolate: bool,
+    #[serde(default)]
     args: Vec<u8>,
     request_id: String,
 }
@@ -565,6 +568,10 @@ struct ActorInvokeMethodResult {
 struct ActorSocketSendPayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
     message_kind: String,
     message: Vec<u8>,
 }
@@ -579,6 +586,10 @@ struct ActorSocketSendResult {
 struct ActorSocketClosePayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
     code: u16,
     reason: String,
 }
@@ -586,6 +597,10 @@ struct ActorSocketClosePayload {
 #[derive(Debug, Deserialize)]
 struct ActorSocketListPayload {
     request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -599,6 +614,10 @@ struct ActorSocketListResult {
 struct ActorSocketConsumeClosePayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2211,6 +2230,7 @@ async fn op_actor_invoke_method(
             caller_worker_name,
             caller_generation,
             caller_isolate_id,
+            prefer_caller_isolate: payload.prefer_caller_isolate,
             reply: reply_tx,
         }))
         .is_err()
@@ -2270,6 +2290,20 @@ fn actor_scope_for_request(
         .cloned()
         .map(|scope| (scope.namespace, scope.actor_key))
         .ok_or_else(|| PlatformError::runtime("actor storage scope is unavailable"))
+}
+
+fn actor_socket_scope_for_payload(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+    binding: &str,
+    key: &str,
+) -> Result<(String, String)> {
+    let binding = binding.trim();
+    let key = key.trim();
+    if !binding.is_empty() && !key.is_empty() {
+        return Ok((binding.to_string(), key.to_string()));
+    }
+    actor_scope_for_request(state, request_id)
 }
 
 #[deno_core::op2]
@@ -2420,7 +2454,12 @@ async fn op_actor_socket_send(
         }
     };
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_socket_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorSocketSendResult {
@@ -2485,7 +2524,12 @@ async fn op_actor_socket_close(
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_socket_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorSocketCloseResult {
@@ -2547,7 +2591,12 @@ async fn op_actor_socket_list(
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_socket_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorSocketListResult {
@@ -2616,7 +2665,12 @@ async fn op_actor_socket_consume_close(
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_socket_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorSocketConsumeCloseResult {

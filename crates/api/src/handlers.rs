@@ -1134,17 +1134,14 @@ fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformEr
     for binding in bindings {
         match binding {
             DeployBinding::Kv { binding }
-            | DeployBinding::Actor { binding, .. }
+            | DeployBinding::Actor { binding }
             | DeployBinding::Dynamic { binding }
                 if binding.trim().is_empty() =>
             {
                 return Err(PlatformError::bad_request("binding name must not be empty"));
             }
-            DeployBinding::Actor { class, .. } if class.trim().is_empty() => {
-                return Err(PlatformError::bad_request("actor class must not be empty"));
-            }
             DeployBinding::Kv { binding }
-            | DeployBinding::Actor { binding, .. }
+            | DeployBinding::Actor { binding }
             | DeployBinding::Dynamic { binding } => {
                 let normalized = binding.trim().to_string();
                 if !seen.insert(normalized.clone()) {
@@ -1592,17 +1589,15 @@ mod tests {
             },
             DeployBinding::Actor {
                 binding: "SHARED".to_string(),
-                class: "SharedActor".to_string(),
             },
         ];
         assert!(validate_deploy_bindings(&bindings).is_err());
     }
 
     #[test]
-    fn empty_actor_class_is_rejected() {
+    fn empty_actor_binding_name_is_rejected() {
         let bindings = vec![DeployBinding::Actor {
-            binding: "MY_ACTOR".to_string(),
-            class: String::new(),
+            binding: String::new(),
         }];
         assert!(validate_deploy_bindings(&bindings).is_err());
     }

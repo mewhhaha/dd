@@ -27,41 +27,39 @@ fn blackbox_public_h3_websocket_echoes_text_and_binary() {
                     .deploy_public_worker(
                         "echo",
                         r#"
+                export function openSocket(state, payload) {
+                  const { response } = state.accept(payload.request);
+                  return response;
+                }
+
+                export async function echoFrame(stub, event) {
+                  if (event.data === "bye") {
+                    await stub.apply([{ type: "socket.close", handle: event.handle, code: 4001, reason: "done" }]);
+                    return;
+                  }
+                  if (ArrayBuffer.isView(event.data) || event.data instanceof ArrayBuffer) {
+                    await stub.apply([{ type: "socket.send", handle: event.handle, payload: event.data, kind: "binary" }]);
+                    return;
+                  }
+                  await stub.apply([{ type: "socket.send", handle: event.handle, payload: `echo:${event.data}`, kind: "text" }]);
+                }
+
                 export default {
                   async fetch(request, env) {
-                    const actor = env.CHAT.get(env.CHAT.idFromName("global"));
-                    return actor.fetch(request);
+                    return await env.CHAT.get(env.CHAT.idFromName("global")).atomic(openSocket, { request });
+                  },
+
+                  async wake(event, env) {
+                    if (event.type === "socketmessage") {
+                      await echoFrame(event.stub, event);
+                    }
                   }
                 };
-
-                export class ChatActor {
-                  constructor(state) {
-                    this.state = state;
-                  }
-
-                  async fetch(request) {
-                    const { handle, response } = await this.state.sockets.accept(request);
-                    const ws = new WebSocket(handle);
-                    ws.addEventListener("message", async (event) => {
-                      if (event.data === "bye") {
-                        await ws.close(4001, "done");
-                        return;
-                      }
-                      if (ArrayBuffer.isView(event.data) || event.data instanceof ArrayBuffer) {
-                        await ws.send(event.data, "binary");
-                        return;
-                      }
-                      await ws.send(`echo:${event.data}`);
-                    });
-                    return response;
-                  }
-                }
             "#,
                         DeployConfig {
                             public: true,
                             bindings: vec![DeployBinding::Actor {
                                 binding: "CHAT".to_string(),
-                                class: "ChatActor".to_string(),
                             }],
                             ..Default::default()
                         },
@@ -152,48 +150,52 @@ fn blackbox_public_h3_websocket_storage_on_message_does_not_close() {
                     .deploy_public_worker(
                         "chat",
                         r#"
+                export function openSocket(state, payload) {
+                  const { response } = state.accept(payload.request);
+                  return response;
+                }
+
+                export function onMessage(state, event) {
+                  const text = typeof event.data === "string"
+                    ? event.data
+                    : new TextDecoder().decode(event.data);
+                  const stored = state.get("chat");
+                  const next = {
+                    count: Number(stored?.count ?? 0) + 1,
+                    last: text,
+                  };
+                  state.set("chat", next);
+                  return {
+                    value: next,
+                    effects: [{
+                      type: "socket.send",
+                      handle: event.handle,
+                      payload: JSON.stringify({
+                        seen: next.last,
+                        count: next.count
+                      }),
+                      kind: "text",
+                    }],
+                  };
+                }
+
                 export default {
                   async fetch(request, env) {
-                    const actor = env.CHAT.get(env.CHAT.idFromName("global"));
-                    return actor.fetch(request);
+                    return await env.CHAT.get(env.CHAT.idFromName("global")).atomic(openSocket, { request });
+                  },
+
+                  async wake(event, env) {
+                    if (event.type === "socketmessage") {
+                      const tx = await event.stub.atomic(onMessage, event);
+                      await event.stub.apply(tx.effects ?? []);
+                    }
                   }
                 };
-
-                export class ChatActor {
-                  constructor(state) {
-                    this.state = state;
-                    this.memoryCount = 0;
-                  }
-
-                  async fetch(request) {
-                    const { handle, response } = await this.state.sockets.accept(request);
-                    const ws = new WebSocket(handle);
-                    ws.addEventListener("message", async (event) => {
-                      this.memoryCount += 1;
-                      const text = typeof event.data === "string"
-                        ? event.data
-                        : new TextDecoder().decode(event.data);
-                      const stored = this.state.storage.get("chat");
-                      const next = {
-                        count: Number(stored?.value?.count ?? 0) + 1,
-                        last: text,
-                      };
-                      this.state.storage.put("chat", next);
-                      await ws.send(JSON.stringify({
-                        seen: text,
-                        count: next.count,
-                        memory: this.memoryCount,
-                      }));
-                    });
-                    return response;
-                  }
-                }
             "#,
                         DeployConfig {
                             public: true,
                             bindings: vec![DeployBinding::Actor {
                                 binding: "CHAT".to_string(),
-                                class: "ChatActor".to_string(),
                             }],
                             ..Default::default()
                         },
@@ -228,7 +230,7 @@ fn blackbox_public_h3_websocket_storage_on_message_does_not_close() {
                     .await;
                 assert_eq!(
                     client.recv_websocket_frame(stream_id).await,
-                    WebSocketFrame::Text(r#"{"seen":"ready","count":1,"memory":1}"#.to_string())
+                    WebSocketFrame::Text(r#"{"seen":"ready","count":1}"#.to_string())
                 );
 
                 client
@@ -236,7 +238,7 @@ fn blackbox_public_h3_websocket_storage_on_message_does_not_close() {
                     .await;
                 assert_eq!(
                     client.recv_websocket_frame(stream_id).await,
-                    WebSocketFrame::Text(r#"{"seen":"again","count":2,"memory":2}"#.to_string())
+                    WebSocketFrame::Text(r#"{"seen":"again","count":2}"#.to_string())
                 );
             });
         })
@@ -313,41 +315,26 @@ fn blackbox_public_h3_transport_echoes_stream() {
                             r#"
                 export default {
                   async fetch(request, env) {
-                    const actor = env.MEDIA.get(env.MEDIA.idFromName("global"));
-                    return actor.fetch(request);
+                    return await env.MEDIA.get(env.MEDIA.idFromName("global")).atomic((state) => {
+                      const { response } = state.accept(request);
+                      return response;
+                    });
+                  },
+
+                  async wake(event, env) {
+                    if (event.type !== "transportstream" || !event.stub || !event.handle) {
+                      return;
+                    }
+                    const session = await event.stub.transports.session(event.handle);
+                    const writer = session.stream.writable.getWriter();
+                    await writer.write(event.data);
                   }
                 };
-
-                export class MediaActor {
-                  constructor(state) {
-                    this.state = state;
-                  }
-
-                  async fetch(request) {
-                    const { handle, response } = await this.state.transports.accept(request);
-                    const session = new WebTransportSession(handle);
-
-                    void (async () => {
-                      const reader = session.stream.readable.getReader();
-                      const writer = session.stream.writable.getWriter();
-                      while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) {
-                          break;
-                        }
-                        await writer.write(value);
-                      }
-                    })();
-
-                    return response;
-                  }
-                }
             "#,
                             DeployConfig {
                                 public: true,
                                 bindings: vec![DeployBinding::Actor {
                                     binding: "MEDIA".to_string(),
-                                    class: "MediaActor".to_string(),
                                 }],
                                 ..Default::default()
                             },
@@ -591,9 +578,7 @@ async fn send_h3_request(
     for (name, value) in headers {
         request_headers.push(Header::new(name.as_bytes(), value.as_bytes()));
     }
-    let stream_id = client
-        .send_request(request_headers, body.is_empty())
-        .await;
+    let stream_id = client.send_request(request_headers, body.is_empty()).await;
     if !body.is_empty() {
         client.send_body_chunk(stream_id, body, true).await;
     }

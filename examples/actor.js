@@ -23,12 +23,40 @@ function userKey(url) {
   return "anonymous";
 }
 
+export function incrementUser(state, by = 1) {
+  const currentValue = Number(state.get("count") || 0) || 0;
+  state.set("count", String(currentValue + Number(by || 0)));
+  return currentValue + Number(by || 0);
+}
+
+export function readUserValue(state) {
+  return Number(state.get("count") || 0) || 0;
+}
+
+export function updateUserProfile(state, profile) {
+  state.set("profile", profile);
+  return state.get("profile") ?? null;
+}
+
+export function readUserProfile(state) {
+  return state.get("profile") ?? null;
+}
+
+export function pingUser(state) {
+  const count = Number(state.get("pings") || 0) + 1;
+  state.set("pings", String(count));
+  return {
+    ok: true,
+    actorId: String(state.id),
+    pings: count,
+  };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const key = userKey(url);
-    const id = env.USER_ACTOR.idFromName(key);
-    const actor = env.USER_ACTOR.get(id);
+    const actor = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(key));
 
     if (url.pathname === "/" && request.method === "GET") {
       return json({
@@ -45,17 +73,15 @@ export default {
     }
 
     if (url.pathname === "/inc" && request.method === "POST") {
-      const value = await actor.increment(1);
-      return json({ ok: true, user: key, value });
+      return json({ ok: true, user: key, value: await actor.atomic(incrementUser, 1) });
     }
 
     if (url.pathname === "/value" && request.method === "GET") {
-      const value = await actor.value();
-      return json({ ok: true, user: key, value });
+      return json({ ok: true, user: key, value: await actor.atomic(readUserValue) });
     }
 
     if (url.pathname === "/profile" && request.method === "POST") {
-      const profile = await actor.updateProfile({
+      const profile = await actor.atomic(updateUserProfile, {
         user: key,
         createdAt: new Date("2026-01-02T03:04:05.000Z"),
         flags: new Set(["paid", "beta"]),
@@ -65,51 +91,13 @@ export default {
     }
 
     if (url.pathname === "/profile" && request.method === "GET") {
-      const profile = await actor.profile();
-      return json({ ok: true, user: key, profile });
+      return json({ ok: true, user: key, profile: await actor.atomic(readUserProfile) });
     }
 
     if (url.pathname === "/ping" && request.method === "GET") {
-      return actor.fetch("/actor/ping");
+      return json(await actor.atomic(pingUser));
     }
 
     return json({ ok: false, error: "route not found" }, 404);
   },
 };
-
-export class UserActor {
-  constructor(state) {
-    this.state = state;
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname === "/actor/ping") {
-      return new Response("pong");
-    }
-    return new Response("not found", { status: 404 });
-  }
-
-  async increment(by = 1) {
-    const current = this.state.storage.get("count");
-    const currentValue = current ? Number(current.value) || 0 : 0;
-    this.state.storage.put("count", String(currentValue + Number(by || 0)));
-    return currentValue + Number(by || 0);
-  }
-
-  async value() {
-    const current = this.state.storage.get("count");
-    return current ? Number(current.value) || 0 : 0;
-  }
-
-  async updateProfile(profile) {
-    this.state.storage.put("profile", profile);
-    const current = this.state.storage.get("profile");
-    return current?.value ?? null;
-  }
-
-  async profile() {
-    const current = this.state.storage.get("profile");
-    return current?.value ?? null;
-  }
-}

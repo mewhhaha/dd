@@ -186,7 +186,10 @@ pub async fn serve_public_h3(public_addr: std::net::SocketAddr, state: AppState)
     }
 }
 
-async fn handle_public_h3_headers(state: AppState, incoming_headers: IncomingH3Headers) -> Result<()> {
+async fn handle_public_h3_headers(
+    state: AppState,
+    incoming_headers: IncomingH3Headers,
+) -> Result<()> {
     let parsed = parse_quiche_request(&incoming_headers.headers)?;
     if parsed.method == Method::CONNECT {
         return match parsed.connect_protocol.as_deref() {

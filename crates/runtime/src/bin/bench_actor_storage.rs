@@ -13,6 +13,7 @@ struct Scenario {
     requests: usize,
     concurrency: usize,
     path: &'static str,
+    key_space: usize,
 }
 
 struct ScenarioResult {
@@ -50,25 +51,24 @@ fn env_mode() -> Option<String> {
 
 const ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE: &str = r#"
 export function seed(state) {
-  state.storage.put("payload", "1");
+  state.set("payload", "1");
   return true;
 }
 
 export function read(state) {
-  const current = state.storage.get("payload");
-  return current ? String(current.value) : "0";
+  return String(state.get("payload") ?? "0");
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const id = env.BENCH_ACTOR.idFromName("hot");
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
     const actor = env.BENCH_ACTOR.get(id);
     if (url.pathname === "/seed") {
-      await actor.run(seed);
+      await actor.atomic(seed);
       return new Response("ok");
     }
-    const value = await actor.run(read);
+    const value = await actor.atomic(read);
     return new Response(String(value));
   },
 };
@@ -79,9 +79,10 @@ export function read(_state) { return "1"; }
 
 export default {
   async fetch(_request, env) {
-    const id = env.BENCH_ACTOR.idFromName("hot");
+    const url = new URL(_request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
     const actor = env.BENCH_ACTOR.get(id);
-    const value = await actor.run(read);
+    const value = await actor.atomic(read);
     return new Response(String(value));
   },
 };
@@ -92,9 +93,34 @@ export function read(_state) { return "1"; }
 
 export default {
   async fetch(_request, env) {
-    const id = env.BENCH_ACTOR.idFromName("hot");
+    const url = new URL(_request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
     const actor = env.BENCH_ACTOR.get(id);
-    return new Response(String(await actor.run(read)));
+    return new Response(String(await actor.atomic(read)));
+  },
+};
+"#;
+
+const ACTOR_ATOMIC_READ_MEMORY_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.set("payload", "1");
+  return true;
+}
+
+export function read(state) {
+  return String(state.get("payload") ?? "1");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/seed") {
+      await actor.atomic(seed);
+      return new Response("ok");
+    }
+    return new Response(String(await actor.atomic(read)));
   },
 };
 "#;
@@ -113,7 +139,7 @@ export function increment(state) {
 }
 
 export function readCount(state) {
-  return String(state.get("count")?.value ?? "0");
+  return String(state.get("count") ?? "0");
 }
 
 export default {
@@ -122,14 +148,50 @@ export default {
     const id = env.BENCH_ACTOR.idFromName("hot");
     const actor = env.BENCH_ACTOR.get(id);
     if (url.pathname === "/seed") {
-      await actor.run(seed);
+      await actor.atomic(seed);
       return new Response("ok");
     }
     if (url.pathname === "/get") {
-      return new Response(String(await actor.run(readCount)));
+      return new Response(String(await actor.atomic(readCount)));
     }
-    const value = await actor.run(increment);
+    const value = await actor.atomic(increment);
     return new Response(String(value));
+  },
+};
+"#;
+
+const ACTOR_ATOMIC_PUT_INCREMENT_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.set("count", "0");
+  return true;
+}
+
+export function increment(state) {
+  let next = 0;
+  state.put("count", (previous) => {
+    next = Number(previous ?? "0") + 1;
+    return String(next);
+  });
+  return next;
+}
+
+export function readCount(state) {
+  return String(state.get("count") ?? "0");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName("hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/seed") {
+      await actor.atomic(seed);
+      return new Response("ok");
+    }
+    if (url.pathname === "/get") {
+      return new Response(String(await actor.atomic(readCount)));
+    }
+    return new Response(String(await actor.atomic(increment)));
   },
 };
 "#;
@@ -175,6 +237,7 @@ async fn main() -> Result<(), String> {
             ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE,
             true,
             "/read",
+            1,
             None,
         )
         .await?;
@@ -186,6 +249,7 @@ async fn main() -> Result<(), String> {
             ACTOR_READ_ASYNC_MEMORY_WORKER_SOURCE,
             false,
             "/read",
+            1,
             None,
         )
         .await?;
@@ -197,6 +261,31 @@ async fn main() -> Result<(), String> {
             ACTOR_READ_SYNC_MEMORY_WORKER_SOURCE,
             false,
             "/read",
+            1,
+            None,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory") {
+        run_and_print(
+            &service,
+            "actor-atomic-read-memory",
+            ACTOR_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+            true,
+            "/read",
+            1,
+            None,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory-multikey") {
+        run_and_print(
+            &service,
+            "actor-atomic-read-memory-multikey",
+            ACTOR_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+            false,
+            "/read",
+            env_usize("DD_BENCH_KEY_SPACE", 256),
             None,
         )
         .await?;
@@ -208,6 +297,19 @@ async fn main() -> Result<(), String> {
             ACTOR_STM_INCREMENT_WORKER_SOURCE,
             true,
             "/inc",
+            1,
+            Some("/get"),
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-put-inc") {
+        run_and_print(
+            &service,
+            "actor-atomic-put-inc",
+            ACTOR_ATOMIC_PUT_INCREMENT_WORKER_SOURCE,
+            true,
+            "/inc",
+            1,
             Some("/get"),
         )
         .await?;
@@ -226,6 +328,7 @@ async fn run_and_print(
     source: &str,
     seed: bool,
     path: &'static str,
+    key_space: usize,
     verify_path: Option<&'static str>,
 ) -> Result<(), String> {
     let requests = env_usize("DD_BENCH_REQUESTS", 1_000);
@@ -248,7 +351,7 @@ async fn run_and_print(
 
     if seed {
         service
-            .invoke(worker_name.clone(), invocation("/seed", 0))
+            .invoke(worker_name.clone(), invocation("/seed", 0, 1))
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -260,13 +363,17 @@ async fn run_and_print(
             requests,
             concurrency,
             path,
+            key_space,
         },
     )
     .await
     .map_err(|error| error.to_string())?;
     if let Some(verify_path) = verify_path {
         let verify = service
-            .invoke(worker_name.clone(), invocation(verify_path, requests + 1))
+            .invoke(
+                worker_name.clone(),
+                invocation(verify_path, requests + 1, 1),
+            )
             .await
             .map_err(|error| error.to_string())?;
         let observed = String::from_utf8(verify.body).map_err(|error| error.to_string())?;
@@ -318,7 +425,10 @@ async fn run_scenario(
                 }
                 let invoke_started = Instant::now();
                 let output = service
-                    .invoke(worker_name.clone(), invocation(&path, idx + 1))
+                    .invoke(
+                        worker_name.clone(),
+                        invocation(&path, idx + 1, scenario.key_space),
+                    )
                     .await?;
                 if output.status != 200 {
                     return Err(common::PlatformError::runtime(format!(
@@ -375,10 +485,17 @@ fn percentile_ms(latencies: &[Duration], quantile: f64) -> f64 {
     latencies[index].as_secs_f64() * 1000.0
 }
 
-fn invocation(path: &str, idx: usize) -> WorkerInvocation {
+fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvocation {
+    let url = if key_space > 1 {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let actor_idx = idx % key_space;
+        format!("http://worker{path}{separator}key=bench-{actor_idx}")
+    } else {
+        format!("http://worker{path}")
+    };
     WorkerInvocation {
         method: "GET".to_string(),
-        url: format!("http://worker{path}"),
+        url,
         headers: Vec::new(),
         body: Vec::new(),
         request_id: format!("bench-actor-{idx}"),

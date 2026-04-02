@@ -27,7 +27,7 @@ function html(pageUser) {
 </head><body>
   <h1>hello-traced</h1>
   <p>Demo user: <code>${safeUser}</code></p>
-  <p>Features: KV, actor namespace fetch, cache API, stream response, websocket status endpoint.</p>
+  <p>Features: KV, actor stub.run, cache API, stream response, websocket status endpoint.</p>
   <div class="row"><a href="/api/state?user=${encodedUser}">GET /api/state</a><a href="/api/cache">GET /api/cache</a><a href="/api/actor/ping?user=${encodedUser}">GET /api/actor/ping</a></div>
   <div class="row"><a href="/api/stream">GET /api/stream</a><a href="/api/ws">GET /api/ws</a></div>
   <form method="post" action="/api/hit?user=${encodedUser}"><button type="submit">POST /api/hit</button></form>
@@ -66,6 +66,17 @@ async function writeCacheSnapshot(cache, payload) {
   });
   await cache.put(key, response.clone());
   return response;
+}
+
+export function pingActor(state) {
+  const count = Number(state.get("pings") || 0) + 1;
+  state.set("pings", String(count));
+  return {
+    ok: true,
+    feature: "actor-atomic",
+    actorId: String(state.id),
+    pings: count,
+  };
 }
 
 export default {
@@ -111,11 +122,7 @@ export default {
 
     if (url.pathname === "/api/actor/ping" && request.method === "GET") {
       const actor = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(user));
-      const response = await actor.fetch("http://actor/ping");
-      if (response instanceof Response) {
-        return response;
-      }
-      return json({ ok: false, error: "actor did not return a Response" }, 500);
+      return json(await actor.atomic(pingActor));
     }
 
     if (url.pathname === "/api/cache" && request.method === "GET") {
@@ -171,25 +178,3 @@ export default {
     return json({ ok: false, error: "not found" }, 404);
   },
 };
-
-export class UserActor {
-  constructor(state) {
-    this.state = state;
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname === "/ping") {
-      const current = this.state.storage.get("pings");
-      const count = Number(current?.value || 0) + 1;
-      this.state.storage.put("pings", String(count));
-      return json({
-        ok: true,
-        feature: "actor-fetch",
-        actorId: String(this.state.id),
-        pings: count,
-      });
-    }
-    return json({ ok: false, error: "not found" }, 404);
-  }
-}
