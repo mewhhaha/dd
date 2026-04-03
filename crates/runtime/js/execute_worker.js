@@ -66,6 +66,26 @@
     return activeRequestId() || runtimeRequestId;
   };
 
+  const withActorTxnScope = (scope, callback) => {
+    const asyncContext = globalThis.__dd_async_context;
+    if (!asyncContext || typeof asyncContext.run !== "function") {
+      throw new Error("dd async context store is unavailable");
+    }
+    return asyncContext.run(scope, callback);
+  };
+
+  const actorTxnScopeFor = (binding, actorKey) => {
+    const currentActorTxnScope = globalThis.__dd_async_context?.getStore?.() ?? null;
+    if (
+      currentActorTxnScope
+      && currentActorTxnScope.binding === binding
+      && currentActorTxnScope.actorKey === actorKey
+    ) {
+      return currentActorTxnScope;
+    }
+    return null;
+  };
+
   const sleep = (millis) => callOp("op_sleep", Number(millis) || 0);
 
   const normalizeBoundaryValue = (value) => {
@@ -1302,19 +1322,49 @@
         },
         async send(value, kind) {
           const payload = encodeSocketSendPayload(value, kind);
-          await sendSocketFrame(boundRequestId, normalizedHandle, payload, true);
+          const scope = actorTxnScopeFor(entry.binding, entry.actorKey);
+          const perform = async () => {
+            if (this.readyState !== 1) {
+              return;
+            }
+            try {
+              await sendSocketFrame(boundRequestId, normalizedHandle, payload, false);
+            } catch {
+              // Best-effort delivery; drop if the handle closed during flush.
+            }
+          };
+          if (scope) {
+            scope.state.defer(perform);
+            return;
+          }
+          await perform();
         },
         async close(code, reason) {
           const normalizedCode = Number.isFinite(Number(code))
             ? Math.trunc(Number(code))
             : 1000;
-          await closeSocketFrame(
-            boundRequestId,
-            normalizedHandle,
-            normalizedCode,
-            reason == null ? "" : String(reason),
-            true,
-          );
+          const perform = async () => {
+            if (this.readyState !== 1) {
+              return;
+            }
+            try {
+              await closeSocketFrame(
+                boundRequestId,
+                normalizedHandle,
+                normalizedCode,
+                reason == null ? "" : String(reason),
+                false,
+              );
+            } catch {
+              // Best-effort close; ignore races with already-closed handles.
+            }
+          };
+          const scope = actorTxnScopeFor(entry.binding, entry.actorKey);
+          if (scope) {
+            scope.state.defer(perform);
+            return;
+          }
+          await perform();
         },
         async __dd_dispatch(type, event) {
           const current = listeners.get(type);
@@ -1899,9 +1949,39 @@
       ).toUpperCase();
       return requestMethod === "CONNECT";
     };
+    const createTxnVar = (key, defaultValue = null) => {
+      const normalizedKey = String(key);
+      return {
+        key: normalizedKey,
+        read(options) {
+          const record = runtimeState.storage.get(normalizedKey, options);
+          return record ? record.value : defaultValue;
+        },
+        write(value) {
+          runtimeState.storage.put(normalizedKey, value);
+          return value;
+        },
+        modify(updater) {
+          if (typeof updater !== "function") {
+            throw new Error("state.var(key).modify(updater) requires a function updater");
+          }
+          const record = runtimeState.storage.get(normalizedKey, { strict: true });
+          const previous = record ? record.value : defaultValue;
+          const next = updater(previous);
+          runtimeState.storage.put(normalizedKey, next);
+          return next;
+        },
+        delete() {
+          return runtimeState.storage.delete(normalizedKey);
+        },
+      };
+    };
     return {
       id: runtimeState.id,
       stub,
+      storage: runtimeState.storage,
+      __dd_socket_runtime: runtimeState.__dd_socket_runtime,
+      __dd_transport_runtime: runtimeState.__dd_transport_runtime,
       get(key, options) {
         return runtimeState.storage.get(key, options)?.value ?? null;
       },
@@ -1927,6 +2007,12 @@
           value: entryValue.value,
           version: entryValue.version,
         }));
+      },
+      var(key) {
+        return createTxnVar(key);
+      },
+      tvar(key, defaultValue = null) {
+        return createTxnVar(key, defaultValue);
       },
       defer(callback) {
         if (!txn) {
@@ -2252,11 +2338,67 @@
     },
   });
 
+  const createActorStubVarApi = (bindingName, actorKey, key, defaultValue = null) => {
+    const normalizedKey = String(key);
+    const requireScope = (operation) => {
+      const scope = actorTxnScopeFor(bindingName, actorKey);
+      if (!scope) {
+        throw new Error(`stub.var(${JSON.stringify(normalizedKey)}).${operation}() requires stub.atomic(...)`);
+      }
+      return scope;
+    };
+    return {
+      key: normalizedKey,
+      read(options) {
+        const scope = actorTxnScopeFor(bindingName, actorKey);
+        if (scope) {
+          const record = scope.state.storage.get(normalizedKey, options);
+          return record ? record.value : defaultValue;
+        }
+        return (async () => {
+          const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+          const state = createActorRuntimeState(entry, requestId, false, false);
+          const record = state.storage.get(normalizedKey, options);
+          return record ? record.value : defaultValue;
+        })();
+      },
+      write(value) {
+        return requireScope("write").state.set(normalizedKey, value);
+      },
+      modify(updater) {
+        return requireScope("modify").state.put(normalizedKey, updater);
+      },
+      delete() {
+        return requireScope("delete").state.delete(normalizedKey);
+      },
+    };
+  };
+
   const createActorStub = (namespace, actorKey) => ({
     id: createActorId(namespace, actorKey),
     binding: namespace,
     sockets: createActorStubSocketApi(namespace, actorKey),
     transports: createActorStubTransportApi(namespace, actorKey),
+    var(key) {
+      return createActorStubVarApi(namespace, actorKey, key);
+    },
+    tvar(key, defaultValue = null) {
+      return createActorStubVarApi(namespace, actorKey, key, defaultValue);
+    },
+    defer(callback) {
+      const scope = actorTxnScopeFor(namespace, actorKey);
+      if (!scope) {
+        throw new Error("stub.defer(callback) requires stub.atomic(...)");
+      }
+      return scope.state.defer(callback);
+    },
+    accept(request, options) {
+      const scope = actorTxnScopeFor(namespace, actorKey);
+      if (!scope) {
+        throw new Error("stub.accept(request) requires stub.atomic(...)");
+      }
+      return scope.state.accept(request, options);
+    },
     async atomic(executable, ...args) {
       return await invokeActorExecutable(
         namespace,
@@ -2977,8 +3119,20 @@
         true,
         txn,
       );
+      const previousWebSocket = globalThis.WebSocket;
+      const previousWebTransport = globalThis.WebTransportSession;
+      globalThis.WebSocket = scopedState.__dd_socket_runtime.WebSocket;
+      globalThis.WebTransportSession = scopedState.__dd_transport_runtime.WebTransportSession;
       try {
-        const value = executable(scopedState, ...args);
+        const value = withActorTxnScope(
+          {
+            binding: entry.binding,
+            actorKey: entry.actorKey,
+            state: scopedState,
+            stub: scopedState.stub,
+          },
+          () => executable(scopedState, ...args),
+        );
         if (value instanceof Promise) {
           throw new Error("stub.atomic callback must be synchronous");
         }
@@ -3008,6 +3162,17 @@
           continue;
         }
         throw error;
+      } finally {
+        if (previousWebSocket === undefined) {
+          delete globalThis.WebSocket;
+        } else {
+          globalThis.WebSocket = previousWebSocket;
+        }
+        if (previousWebTransport === undefined) {
+          delete globalThis.WebTransportSession;
+        } else {
+          globalThis.WebTransportSession = previousWebTransport;
+        }
       }
     }
     throw lastConflict ?? new Error("actor transaction exceeded retry limit");

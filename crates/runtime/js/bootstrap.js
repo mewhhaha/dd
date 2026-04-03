@@ -261,6 +261,40 @@ function ensureStructuredCloneGlobal() {
   define("structuredClone", denoStructuredClone);
 }
 
+function ensureAsyncContextGlobal() {
+  const core = globalThis.Deno?.core;
+  const getAsyncContext = typeof core?.getAsyncContext === "function"
+    ? () => core.getAsyncContext()
+    : () => globalThis.__dd_fallback_async_context ?? null;
+  const setAsyncContext = typeof core?.setAsyncContext === "function"
+    ? (value) => core.setAsyncContext(value ?? null)
+    : (value) => {
+      globalThis.__dd_fallback_async_context = value ?? null;
+    };
+
+  define("__dd_async_context", {
+    getStore() {
+      return getAsyncContext() ?? null;
+    },
+    enterWith(store) {
+      setAsyncContext(store ?? null);
+      return store ?? null;
+    },
+    run(store, callback, ...args) {
+      if (typeof callback !== "function") {
+        throw new TypeError("__dd_async_context.run(store, callback) requires a function");
+      }
+      const previous = getAsyncContext() ?? null;
+      setAsyncContext(store ?? null);
+      try {
+        return callback(...args);
+      } finally {
+        setAsyncContext(previous);
+      }
+    },
+  });
+}
+
 function ensureCryptoGlobals() {
   define("Crypto", Crypto);
   define("CryptoKey", DenoCryptoKey);
@@ -420,6 +454,7 @@ ensureFrozenTimeGlobals();
 ensureTimerGlobals();
 ensureEncodingGlobals();
 ensureStructuredCloneGlobal();
+ensureAsyncContextGlobal();
 ensureCryptoGlobals();
 define("DOMException", DOMException);
 define("Event", Event);

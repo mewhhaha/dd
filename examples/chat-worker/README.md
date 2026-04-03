@@ -4,7 +4,7 @@ This example is a small browser chat built with:
 
 - plain HTML forms/buttons (no custom styling)
 - vendored `fixi.js` plus a tiny websocket plugin for UI updates
-- a room actor for per-room websocket fanout and persisted message history
+- a keyed room memory for per-room websocket fanout and persisted message history
 
 ## Build (optional)
 
@@ -33,6 +33,8 @@ just fly-worker-deploy chat examples/chat-worker/dist/worker.js --actor-binding 
 
 ## Notes
 
-- the actor stores room state in actor storage as structured JS values
-- actor storage reads and writes are synchronous inside the actor
+- the room uses smaller transactional vars (`room_id`, `next_seq`, `messages`, `participants`, `connections`) instead of one monolithic room blob
+- `room.atomic(...)` is the retryable STM region; `room.tvar("key", default)` gives lazy defaults without persisting on read
+- the room accepts sockets transactionally with `room.accept(request)` and then uses handle-backed `new WebSocket(handle)` objects for send/close behavior
+- `room.defer(...)` is still available for arbitrary post-commit work, but ordinary websocket sends are staged automatically inside `atomic(...)`
 - this simplified version keeps the last 200 messages per room

@@ -27,7 +27,7 @@ function html(pageUser) {
 </head><body>
   <h1>hello-traced</h1>
   <p>Demo user: <code>${safeUser}</code></p>
-  <p>Features: KV, actor stub.run, cache API, stream response, websocket status endpoint.</p>
+  <p>Features: KV, keyed memory atomic vars, cache API, stream response, websocket status endpoint.</p>
   <div class="row"><a href="/api/state?user=${encodedUser}">GET /api/state</a><a href="/api/cache">GET /api/cache</a><a href="/api/actor/ping?user=${encodedUser}">GET /api/actor/ping</a></div>
   <div class="row"><a href="/api/stream">GET /api/stream</a><a href="/api/ws">GET /api/ws</a></div>
   <form method="post" action="/api/hit?user=${encodedUser}"><button type="submit">POST /api/hit</button></form>
@@ -66,17 +66,6 @@ async function writeCacheSnapshot(cache, payload) {
   });
   await cache.put(key, response.clone());
   return response;
-}
-
-export function pingActor(state) {
-  const count = Number(state.get("pings") || 0) + 1;
-  state.set("pings", String(count));
-  return {
-    ok: true,
-    feature: "actor-atomic",
-    actorId: String(state.id),
-    pings: count,
-  };
 }
 
 export default {
@@ -121,8 +110,18 @@ export default {
     }
 
     if (url.pathname === "/api/actor/ping" && request.method === "GET") {
-      const actor = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(user));
-      return json(await actor.atomic(pingActor));
+      const memory = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(user));
+      const pings = memory.tvar("pings", 0);
+      return json(await memory.atomic(() => {
+        const next = Number(pings.read()) + 1;
+        pings.write(next);
+        return {
+          ok: true,
+          feature: "memory-atomic",
+          memoryId: String(memory.id),
+          pings: next,
+        };
+      }));
     }
 
     if (url.pathname === "/api/cache" && request.method === "GET") {

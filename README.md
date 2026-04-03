@@ -15,7 +15,7 @@ This MVP supports:
 - isolate reuse (module/global state is preserved for warm isolates)
 - `ctx.waitUntil()` with a 30s cap
 - optional Turso KV bindings injected in `env`
-- optional actor namespace bindings in `env` (`idFromName()` + `get()`)
+- optional keyed memory namespace bindings in `env` (`idFromName()` + `get()`)
 - optional dynamic namespace bindings in `env` (`get(id, factory)`, `list()`, `delete(id)`)
 - private dynamic worker deploys (`POST /v1/dynamic/deploy`) for ephemeral LLM-style code execution
 - global in-process Cache API (`caches.default` + `caches.open(name)`) shared across workers
@@ -166,7 +166,7 @@ Run the runtime benchmark with:
 cargo run -p runtime --bin bench --release
 ```
 
-Run the actor storage sync-vs-async comparison benchmark with:
+Run the keyed-memory STM benchmark with:
 
 ```bash
 cargo run -p runtime --bin bench_actor_storage
@@ -180,14 +180,16 @@ Current baseline results are in `BENCHMARKS.md`.
 - per-worker pool min=0, max=8, idle TTL=30s
 - unlimited per-worker FIFO queue
 - up to 4 inflight requests per isolate by default
-- actor routing is opt-in; by default workers stay pooled
-- same actor key can run with multiple in-flight requests on its owner isolate
+- keyed memory routing is opt-in; by default workers stay pooled
+- same memory key can run with multiple in-flight transactions across isolates
 - KV `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
-- actor storage is only available inside actor classes via `constructor(state, env)`
-- actor storage `get/put/delete/list` are synchronous inside actor classes
-- actor storage writes are write-last with monotonic versions
+- keyed memory is available through namespace stubs like `env.USER_ACTOR.get(id)`
+- `memory.atomic(() => ...)` is the retryable STM region
+- `memory.tvar("count", 0)` gives a lazy default; `memory.var("key").read()` is a snapshot read outside `atomic` and becomes transactional inside it
+- websocket handles can be reopened with `new WebSocket(handle)` inside keyed-memory code
+- memory writes are write-last with monotonic versions
 - structured values use V8 storage serialization (`forStorage: true`) and reject unsupported host/function types
-- actor storage uses namespace shards (default 64 shards per namespace)
+- keyed memory uses namespace shards (default 64 shards per namespace)
 - dropped invokes are canceled and signaled via `ctx.signal`
 - Spectre-style timer mitigation is enabled: `Date.now()` / `performance.now()` stay frozen between host I/O boundaries
 - cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure
@@ -210,7 +212,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/kv-counter.js` - tiny counter API (`/value`, `/inc`, `/reset`)
 - `examples/wait-until.js` - respond now, finish async work in `ctx.waitUntil`
 - `examples/wait-until-kv.js` - `waitUntil` background write into KV
-- `examples/actor.js` - class-based actor namespace (`env.USER_ACTOR.idFromName/get`)
+- `examples/actor.js` - keyed memory namespace (`env.USER_ACTOR.idFromName/get`, `atomic`, `tvar`)
 - `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
 - `examples/trace-hub.js` - minimal internal trace receiver and web view
 - `examples/dynamic-namespace.js` - spawn + invoke dynamic workers from `env.SANDBOX`

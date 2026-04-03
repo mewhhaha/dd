@@ -6451,19 +6451,16 @@ export function onSocketMessage(state, event) {
   const text = typeof event.data === "string"
     ? event.data
     : new TextDecoder().decode(event.data);
-  const next = {
-    count: Number(state.get("chat")?.count ?? 0) + 1,
+  const chat = state.tvar("chat", { count: 0, last: null });
+  const next = chat.modify((previous) => ({
+    count: Number(previous?.count ?? 0) + 1,
     last: text,
-  };
-  state.set("chat", next);
-  state.defer(() => state.stub.sockets.send(
-    event.handle,
-    JSON.stringify({
-      seen: next.last,
-      count: next.count,
-    }),
-    "text",
-  ));
+  }));
+  const socket = new WebSocket(event.handle);
+  socket.send(JSON.stringify({
+    seen: next.last,
+    count: next.count,
+  }), "text");
   return next;
 }
 
@@ -6471,7 +6468,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/state") {
-      const stored = await env.CHAT.get(env.CHAT.idFromName("global")).atomic((state) => state.get("chat") ?? { count: 0, last: null });
+      const stored = await env.CHAT.get(env.CHAT.idFromName("global")).atomic((state) => state.tvar("chat", { count: 0, last: null }).read());
       return Response.json(stored ?? { count: 0, last: null });
     }
     return await env.CHAT.get(env.CHAT.idFromName("global")).atomic(openSocket, { request });
@@ -7102,6 +7099,69 @@ export default {
 
     if (url.pathname === "/stm/read-pair-snapshot") {
       return new Response(String(await actor.atomic(readPairSnapshot)));
+    }
+
+    if (url.pathname === "/stm/tvar-default/read") {
+      const count = actor.tvar("count", 7);
+      return new Response(String(await actor.atomic(() => count.read())));
+    }
+
+    if (url.pathname === "/stm/tvar-default/raw") {
+      return new Response(String(await actor.atomic((state) => state.get("count") ?? "missing")));
+    }
+
+    if (url.pathname === "/stm/tvar-default/write") {
+      const count = actor.tvar("count", 7);
+      return new Response(String(await actor.atomic(() => {
+        const next = Number(count.read()) + 1;
+        count.write(String(next));
+        return next;
+      })));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn async_context_worker() -> String {
+        r#"
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const ctx = globalThis.__dd_async_context;
+    if (!ctx) {
+      return new Response("missing", { status: 500 });
+    }
+
+    if (url.pathname === "/promise") {
+      return await ctx.run({ label: "outer" }, async () => {
+        await Promise.resolve();
+        return new Response(String(ctx.getStore()?.label ?? "missing"));
+      });
+    }
+
+    if (url.pathname === "/nested") {
+      return await ctx.run({ label: "outer" }, async () => {
+        const before = String(ctx.getStore()?.label ?? "missing");
+        const inner = await ctx.run({ label: "inner" }, async () => {
+          await Promise.resolve();
+          return String(ctx.getStore()?.label ?? "missing");
+        });
+        const after = String(ctx.getStore()?.label ?? "missing");
+        return new Response(`${before}:${inner}:${after}`);
+      });
+    }
+
+    if (url.pathname === "/restore") {
+      const before = String(ctx.getStore()?.label ?? "missing");
+      await ctx.run({ label: "temp" }, async () => {
+        await Promise.resolve();
+      });
+      const after = String(ctx.getStore()?.label ?? "missing");
+      return new Response(`${before}:${after}`);
     }
 
     return new Response("not found", { status: 404 });
@@ -9542,6 +9602,133 @@ export default {
             .expect("join")
             .expect("invoke should succeed");
         assert_eq!(String::from_utf8(pair.body).expect("utf8"), "0:0");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_actor_tvar_default_is_lazy_until_written() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "hosted-actor".to_string(),
+                hosted_actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let default_read = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/tvar-default/read?key=user-1",
+                    "hosted-actor-tvar-default-read",
+                ),
+            )
+            .await
+            .expect("default read should succeed");
+        assert_eq!(String::from_utf8(default_read.body).expect("utf8"), "7");
+
+        let raw_before_write = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/tvar-default/raw?key=user-1",
+                    "hosted-actor-tvar-default-raw-before-write",
+                ),
+            )
+            .await
+            .expect("raw read before write should succeed");
+        assert_eq!(
+            String::from_utf8(raw_before_write.body).expect("utf8"),
+            "missing"
+        );
+
+        let write = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/tvar-default/write?key=user-1",
+                    "hosted-actor-tvar-default-write",
+                ),
+            )
+            .await
+            .expect("write should succeed");
+        assert_eq!(String::from_utf8(write.body).expect("utf8"), "8");
+
+        let raw_after_write = service
+            .invoke(
+                "hosted-actor".to_string(),
+                test_invocation_with_path(
+                    "/stm/tvar-default/raw?key=user-1",
+                    "hosted-actor-tvar-default-raw-after-write",
+                ),
+            )
+            .await
+            .expect("raw read after write should succeed");
+        assert_eq!(String::from_utf8(raw_after_write.body).expect("utf8"), "8");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn async_context_store_survives_promise_boundaries_and_nested_runs() {
+        let service = test_service(RuntimeConfig::default()).await;
+
+        service
+            .deploy_with_config(
+                "async-context".to_string(),
+                async_context_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: Vec::new(),
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let promise = service
+            .invoke(
+                "async-context".to_string(),
+                test_invocation_with_path("/promise", "async-context-promise"),
+            )
+            .await
+            .expect("promise request should succeed");
+        assert_eq!(String::from_utf8(promise.body).expect("utf8"), "outer");
+
+        let nested = service
+            .invoke(
+                "async-context".to_string(),
+                test_invocation_with_path("/nested", "async-context-nested"),
+            )
+            .await
+            .expect("nested request should succeed");
+        assert_eq!(String::from_utf8(nested.body).expect("utf8"), "outer:inner:outer");
+
+        let restore = service
+            .invoke(
+                "async-context".to_string(),
+                test_invocation_with_path("/restore", "async-context-restore"),
+            )
+            .await
+            .expect("restore request should succeed");
+        assert_eq!(String::from_utf8(restore.body).expect("utf8"), "missing:missing");
     }
 
     #[tokio::test]

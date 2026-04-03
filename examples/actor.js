@@ -23,45 +23,19 @@ function userKey(url) {
   return "anonymous";
 }
 
-export function incrementUser(state, by = 1) {
-  const currentValue = Number(state.get("count") || 0) || 0;
-  state.set("count", String(currentValue + Number(by || 0)));
-  return currentValue + Number(by || 0);
-}
-
-export function readUserValue(state) {
-  return Number(state.get("count") || 0) || 0;
-}
-
-export function updateUserProfile(state, profile) {
-  state.set("profile", profile);
-  return state.get("profile") ?? null;
-}
-
-export function readUserProfile(state) {
-  return state.get("profile") ?? null;
-}
-
-export function pingUser(state) {
-  const count = Number(state.get("pings") || 0) + 1;
-  state.set("pings", String(count));
-  return {
-    ok: true,
-    actorId: String(state.id),
-    pings: count,
-  };
-}
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const key = userKey(url);
-    const actor = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(key));
+    const memory = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(key));
+    const count = memory.tvar("count", 0);
+    const profile = memory.var("profile");
+    const pings = memory.tvar("pings", 0);
 
     if (url.pathname === "/" && request.method === "GET") {
       return json({
         ok: true,
-        worker: "actor",
+        worker: "memory",
         routes: [
           "GET /ping?user={name}",
           "POST /inc?user={name}",
@@ -73,29 +47,57 @@ export default {
     }
 
     if (url.pathname === "/inc" && request.method === "POST") {
-      return json({ ok: true, user: key, value: await actor.atomic(incrementUser, 1) });
+      return json({
+        ok: true,
+        user: key,
+        value: await memory.atomic(() => {
+          const next = Number(count.read()) + 1;
+          count.write(next);
+          return next;
+        }),
+      });
     }
 
     if (url.pathname === "/value" && request.method === "GET") {
-      return json({ ok: true, user: key, value: await actor.atomic(readUserValue) });
+      return json({
+        ok: true,
+        user: key,
+        value: await memory.atomic(() => Number(count.read()) || 0),
+      });
     }
 
     if (url.pathname === "/profile" && request.method === "POST") {
-      const profile = await actor.atomic(updateUserProfile, {
+      const nextProfile = {
         user: key,
         createdAt: new Date("2026-01-02T03:04:05.000Z"),
         flags: new Set(["paid", "beta"]),
         prefs: new Map([["theme", "light"]]),
+      };
+      const stored = await memory.atomic(() => {
+        profile.write(nextProfile);
+        return profile.read();
       });
-      return json({ ok: true, user: key, profile });
+      return json({ ok: true, user: key, profile: stored });
     }
 
     if (url.pathname === "/profile" && request.method === "GET") {
-      return json({ ok: true, user: key, profile: await actor.atomic(readUserProfile) });
+      return json({
+        ok: true,
+        user: key,
+        profile: await memory.atomic(() => profile.read()),
+      });
     }
 
     if (url.pathname === "/ping" && request.method === "GET") {
-      return json(await actor.atomic(pingUser));
+      return json(await memory.atomic(() => {
+        const next = Number(pings.read()) + 1;
+        pings.write(next);
+        return {
+          ok: true,
+          memoryId: String(memory.id),
+          pings: next,
+        };
+      }));
     }
 
     return json({ ok: false, error: "route not found" }, 404);
