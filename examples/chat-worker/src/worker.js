@@ -240,50 +240,6 @@ function roomSnapshot(state) {
   return state.get("room") ?? initialRoom(String(state.id));
 }
 
-export function openRoomSocket(state, payload) {
-  const { handle, response } = state.accept(payload.request);
-  let nextRoom = null;
-  let replacedHandles = [];
-  state.put("room", (previous) => {
-    const room = previous ?? initialRoom(payload.roomId);
-    room.roomId = payload.roomId;
-    replacedHandles = roomConnectionHandles(room).filter(
-      (existingHandle) => (
-        existingHandle !== handle
-        && room.connections[existingHandle] === payload.participantId
-      ),
-    );
-    room.participants[payload.participantId] = {
-      id: payload.participantId,
-      username: payload.username,
-      joinedAt: room.participants[payload.participantId]?.joinedAt ?? nowIso(),
-    };
-    for (const existingHandle of replacedHandles) {
-      delete room.connections[existingHandle];
-    }
-    room.connections[handle] = payload.participantId;
-    nextRoom = structuredClone(room);
-    return nextRoom;
-  });
-  const participantPayload = JSON.stringify(
-    fixiSwap(
-      "#participants",
-      "innerHTML",
-      renderParticipantsItems(nextRoom, roomConnectionHandles(nextRoom)),
-    ),
-  );
-  for (const existingHandle of replacedHandles) {
-    state.defer(() => state.stub.sockets.close(existingHandle, 1001, "replaced"));
-  }
-  for (const existingHandle of roomConnectionHandles(nextRoom)) {
-    if (existingHandle === handle) {
-      continue;
-    }
-    state.defer(() => state.stub.sockets.send(existingHandle, participantPayload, "text"));
-  }
-  return response;
-}
-
 export function roomStateResponse(state) {
   const room = roomSnapshot(state);
   return {
@@ -293,96 +249,187 @@ export function roomStateResponse(state) {
   };
 }
 
+function deferRoomEvents(state, events) {
+  for (const event of events) {
+    if (!event || typeof event !== "object") {
+      continue;
+    }
+    switch (event.type) {
+      case "session_replaced": {
+        for (const handle of event.handles ?? []) {
+          state.defer(() => state.stub.sockets.close(handle, 1001, "replaced"));
+        }
+        break;
+      }
+      case "participants_changed": {
+        const payload = JSON.stringify(
+          fixiSwap(
+            "#participants",
+            "innerHTML",
+            renderParticipantsItems(event.room, roomConnectionHandles(event.room)),
+          ),
+        );
+        for (const handle of event.handles ?? []) {
+          state.defer(() => state.stub.sockets.send(handle, payload, "text"));
+        }
+        break;
+      }
+      case "room_snapshot": {
+        const payload = JSON.stringify([
+          fixiSwap("#messages", "innerHTML", renderMessagesItems(event.room)),
+          fixiSwap(
+            "#participants",
+            "innerHTML",
+            renderParticipantsItems(event.room, roomConnectionHandles(event.room)),
+          ),
+        ]);
+        state.defer(() => state.stub.sockets.send(event.handle, payload, "text"));
+        break;
+      }
+      case "message_posted": {
+        const payload = JSON.stringify(
+          fixiSwap("#messages", "beforeend", renderMessageItem(event.message)),
+        );
+        for (const handle of event.handles ?? []) {
+          state.defer(() => state.stub.sockets.send(handle, payload, "text"));
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
+function roomProcess(state) {
+  return {
+    openSocket(payload) {
+      const { handle, response } = state.accept(payload.request);
+      let nextRoom = null;
+      let replacedHandles = [];
+      state.put("room", (previous) => {
+        const room = previous ?? initialRoom(payload.roomId);
+        room.roomId = payload.roomId;
+        replacedHandles = roomConnectionHandles(room).filter(
+          (existingHandle) => (
+            existingHandle !== handle
+            && room.connections[existingHandle] === payload.participantId
+          ),
+        );
+        room.participants[payload.participantId] = {
+          id: payload.participantId,
+          username: payload.username,
+          joinedAt: room.participants[payload.participantId]?.joinedAt ?? nowIso(),
+        };
+        for (const existingHandle of replacedHandles) {
+          delete room.connections[existingHandle];
+        }
+        room.connections[handle] = payload.participantId;
+        nextRoom = structuredClone(room);
+        return nextRoom;
+      });
+      deferRoomEvents(state, [
+        { type: "session_replaced", handles: replacedHandles },
+        {
+          type: "participants_changed",
+          handles: roomConnectionHandles(nextRoom).filter((existingHandle) => existingHandle !== handle),
+          room: nextRoom,
+        },
+      ]);
+      return response;
+    },
+
+    clientReady(handle) {
+      const room = roomSnapshot(state);
+      deferRoomEvents(state, [{ type: "room_snapshot", handle, room }]);
+      return true;
+    },
+
+    postMessage(handle, text) {
+      const room = roomSnapshot(state);
+      const participantId = room.connections[handle];
+      if (!participantId) {
+        return false;
+      }
+      const participant = room.participants[participantId];
+      if (!participant) {
+        return false;
+      }
+      const body = String(text ?? "").trim();
+      if (!body || body.length > MAX_MESSAGE_LENGTH) {
+        return false;
+      }
+      let nextMessage = null;
+      let handles = [];
+      state.put("room", (previous) => {
+        const nextRoom = previous ?? initialRoom(String(state.id));
+        nextMessage = {
+          seq: nextRoom.nextSeq + 1,
+          participantId,
+          username: participant.username,
+          text: body,
+          timestamp: nowIso(),
+        };
+        nextRoom.nextSeq = nextMessage.seq;
+        nextRoom.messages.push(nextMessage);
+        if (nextRoom.messages.length > MAX_HISTORY) {
+          nextRoom.messages.splice(0, nextRoom.messages.length - MAX_HISTORY);
+        }
+        handles = roomConnectionHandles(nextRoom);
+        return structuredClone(nextRoom);
+      });
+      deferRoomEvents(state, [{ type: "message_posted", handles, message: nextMessage }]);
+      return true;
+    },
+
+    disconnect(handle) {
+      let nextRoom = null;
+      let removed = false;
+      state.put("room", (previous) => {
+        const room = previous ?? initialRoom(String(state.id));
+        if (!room.connections[handle]) {
+          return room;
+        }
+        removed = true;
+        delete room.connections[handle];
+        nextRoom = structuredClone(room);
+        return nextRoom;
+      });
+      if (!removed) {
+        return false;
+      }
+      deferRoomEvents(state, [{
+        type: "participants_changed",
+        handles: roomConnectionHandles(nextRoom),
+        room: nextRoom,
+      }]);
+      return true;
+    },
+  };
+}
+
+export function openRoomSocket(state, payload) {
+  return roomProcess(state).openSocket(payload);
+}
+
 export function handleRoomSocketMessage(state, event) {
-  const room = roomSnapshot(state);
-  const participantId = room.connections[event.handle];
-  if (!participantId) {
-    return false;
-  }
-  const participant = room.participants[participantId];
-  if (!participant) {
-    return false;
-  }
   const payload = parseSocketPayload(event.data);
   if (!payload) {
     return false;
   }
-  const type = String(payload.type ?? "");
-  if (type === "ready") {
-    const readyPayload = [
-      fixiSwap("#messages", "innerHTML", renderMessagesItems(room)),
-      fixiSwap(
-        "#participants",
-        "innerHTML",
-        renderParticipantsItems(room, roomConnectionHandles(room)),
-      ),
-    ];
-    state.defer(() => state.stub.sockets.send(event.handle, JSON.stringify(readyPayload), "text"));
-    return true;
+  const process = roomProcess(state);
+  switch (String(payload.type ?? "")) {
+    case "ready":
+      return process.clientReady(event.handle);
+    case "message":
+      return process.postMessage(event.handle, payload.text);
+    default:
+      return false;
   }
-  if (type !== "message") {
-    return false;
-  }
-  const body = String(payload.text ?? "").trim();
-  if (!body || body.length > MAX_MESSAGE_LENGTH) {
-    return false;
-  }
-  let payloadOut = null;
-  let targets = [];
-  state.put("room", (previous) => {
-    const nextRoom = previous ?? initialRoom(String(state.id));
-    const nextMessage = {
-      seq: nextRoom.nextSeq + 1,
-      participantId,
-      username: participant.username,
-      text: body,
-      timestamp: nowIso(),
-    };
-    nextRoom.nextSeq = nextMessage.seq;
-    nextRoom.messages.push(nextMessage);
-    if (nextRoom.messages.length > MAX_HISTORY) {
-      nextRoom.messages.splice(0, nextRoom.messages.length - MAX_HISTORY);
-    }
-    payloadOut = JSON.stringify(
-      fixiSwap("#messages", "beforeend", renderMessageItem(nextMessage)),
-    );
-    targets = roomConnectionHandles(nextRoom);
-    return structuredClone(nextRoom);
-  });
-  for (const handle of targets) {
-    state.defer(() => state.stub.sockets.send(handle, payloadOut, "text"));
-  }
-  return true;
 }
 
 export function handleRoomSocketClose(state, event) {
-  let payload = null;
-  let targets = [];
-  let removed = false;
-  state.put("room", (previous) => {
-    const room = previous ?? initialRoom(String(state.id));
-    if (!room.connections[event.handle]) {
-      return room;
-    }
-    removed = true;
-    delete room.connections[event.handle];
-    payload = JSON.stringify(
-      fixiSwap(
-        "#participants",
-        "innerHTML",
-        renderParticipantsItems(room, roomConnectionHandles(room)),
-      ),
-    );
-    targets = roomConnectionHandles(room);
-    return structuredClone(room);
-  });
-  if (!removed) {
-    return false;
-  }
-  for (const handle of targets) {
-    state.defer(() => state.stub.sockets.send(handle, payload, "text"));
-  }
-  return true;
+  return roomProcess(state).disconnect(event.handle);
 }
 
 function joinPage(prefillRoom = "") {
