@@ -535,6 +535,7 @@ enum IsolateCommand {
         egress_allow_hosts: Vec<String>,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
+        stream_response: bool,
         actor_call: Option<ActorExecutionCall>,
         host_rpc_call: Option<HostRpcExecutionCall>,
         actor_route: Option<ActorRoute>,
@@ -3953,6 +3954,7 @@ impl WorkerManager {
                     registration.completion_token = Some(completion_token.clone());
                 }
             }
+            let stream_response = self.stream_registrations.contains_key(&runtime_request_id);
             let mut send_failed = false;
             if let Some(pool) = self.get_pool_mut(worker_name, generation) {
                 if isolate_idx >= pool.isolates.len() {
@@ -4013,6 +4015,7 @@ impl WorkerManager {
                     egress_allow_hosts,
                     request: pending_invoke.request,
                     request_body: pending_invoke.request_body,
+                    stream_response,
                     actor_call: pending_invoke.actor_call,
                     host_rpc_call: pending_invoke.host_rpc_call,
                     actor_route: pending_invoke.actor_route,
@@ -5888,6 +5891,7 @@ fn handle_isolate_command(
             egress_allow_hosts,
             request,
             request_body,
+            stream_response,
             actor_call,
             host_rpc_call,
             actor_route,
@@ -6037,6 +6041,7 @@ fn handle_isolate_command(
                 &dynamic_rpc_bindings_json,
                 &dynamic_env_json,
                 has_request_body_stream,
+                stream_response,
                 dispatch_actor_call.as_ref(),
                 dispatch_host_rpc_call.as_ref(),
                 request,

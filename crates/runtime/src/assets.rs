@@ -25,6 +25,7 @@ pub fn execute_worker_js(
     request_id: &str,
     completion_token: &str,
     has_request_body_stream: bool,
+    stream_response: bool,
     request_json: &str,
 ) -> String {
     format!(
@@ -40,6 +41,7 @@ dynamic_env:{dynamic_env_json},\
 actor_call:{actor_call_json},\
 host_rpc_call:{host_rpc_call_json},\
 has_request_body_stream:{has_request_body_stream},\
+stream_response:{stream_response},\
 request:{request_json}\
 }});",
         has_request_body_stream = if has_request_body_stream {
@@ -47,6 +49,7 @@ request:{request_json}\
         } else {
             "false"
         },
+        stream_response = if stream_response { "true" } else { "false" },
     )
 }
 

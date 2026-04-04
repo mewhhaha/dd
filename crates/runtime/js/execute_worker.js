@@ -10,6 +10,7 @@ globalThis.__dd_execute_worker = (payload) => {
   const actorCallConfig = payload?.actor_call ?? null;
   const hostRpcCallConfig = payload?.host_rpc_call ?? null;
   const hasRequestBodyStream = payload?.has_request_body_stream === true;
+  const streamResponse = payload?.stream_response === true;
   const worker = globalThis.__dd_worker;
 
   if (worker === undefined) {
@@ -3756,9 +3757,10 @@ globalThis.__dd_execute_worker = (payload) => {
           ? Number(response.status ?? 200)
           : response.status;
       const headers = Array.from(responseHeaders.entries());
-      await emitResponseStart(status, headers);
-
       const bodyBytes = [];
+      if (streamResponse) {
+        await emitResponseStart(status, headers);
+      }
       if (!isWebSocketAcceptResponse && response.body) {
         const reader = response.body.getReader();
         while (true) {
@@ -3770,8 +3772,12 @@ globalThis.__dd_execute_worker = (payload) => {
           if (chunk.length === 0) {
             continue;
           }
-          const emitted = await emitResponseChunk(chunk);
-          bodyBytes.push(...emitted);
+          if (streamResponse) {
+            const emitted = await emitResponseChunk(chunk);
+            bodyBytes.push(...emitted);
+          } else {
+            bodyBytes.push(...chunk);
+          }
         }
       }
 

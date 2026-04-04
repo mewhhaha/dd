@@ -196,6 +196,7 @@ pub fn dispatch_worker_request(
     dynamic_rpc_bindings_json: &str,
     dynamic_env_json: &str,
     has_request_body_stream: bool,
+    stream_response: bool,
     actor_call: Option<&ExecuteActorCall>,
     host_rpc_call: Option<&ExecuteHostRpcCall>,
     request: WorkerInvocation,
@@ -222,6 +223,7 @@ pub fn dispatch_worker_request(
         &request_id_json,
         &completion_token_json,
         has_request_body_stream,
+        stream_response,
         &request_json,
     );
     runtime
