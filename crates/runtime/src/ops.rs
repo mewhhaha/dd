@@ -665,6 +665,10 @@ struct ActorTransportSendDatagramPayload {
 struct ActorTransportRecvPayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -696,6 +700,10 @@ struct ActorTransportClosePayload {
 #[derive(Debug, Deserialize)]
 struct ActorTransportListPayload {
     request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -709,6 +717,10 @@ struct ActorTransportListResult {
 struct ActorTransportConsumeClosePayload {
     request_id: String,
     handle: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -733,6 +745,12 @@ struct ActorTransportCloseResult {
 #[derive(Debug, Deserialize)]
 struct ActorStateSnapshotPayload {
     request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -770,6 +788,10 @@ struct ActorStateReadDependencyPayload {
 #[derive(Debug, Deserialize)]
 struct ActorStateApplyBatchPayload {
     request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
     expected_base_version: i64,
     #[serde(default)]
     transactional: bool,
@@ -785,6 +807,37 @@ struct ActorStateApplyBatchResult {
     ok: bool,
     conflict: bool,
     max_version: i64,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateValidateReadsPayload {
+    request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    reads: Vec<ActorStateReadDependencyPayload>,
+    #[serde(default)]
+    list_gate_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorScopePayload {
+    request_id: String,
+    binding: String,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorScopeClearPayload {
+    request_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorScopeResult {
+    ok: bool,
     error: String,
 }
 
@@ -1590,7 +1643,7 @@ fn actor_invoke_owner_for_request(
     let request_id = request_id.trim();
     if request_id.is_empty() {
         return Err(PlatformError::bad_request(
-            "actor invoke caller_request_id must not be empty",
+            "memory invoke caller_request_id must not be empty",
         ));
     }
     let (worker_name, generation, isolate_id) = {
@@ -1599,7 +1652,7 @@ fn actor_invoke_owner_for_request(
         let context = contexts
             .contexts
             .get(request_id)
-            .ok_or_else(|| PlatformError::runtime("actor invoke request scope is unavailable"))?;
+            .ok_or_else(|| PlatformError::runtime("memory invoke request scope is unavailable"))?;
         (
             context.worker_name.clone(),
             context.generation,
@@ -2186,7 +2239,7 @@ async fn op_actor_invoke_method(
         return ActorInvokeMethodResult {
             ok: false,
             value: Vec::new(),
-            error: "actor method invoke requires caller_request_id, worker_name, binding, key, method_name, request_id"
+            error: "memory method invoke requires caller_request_id, worker_name, binding, key, method_name, request_id"
                 .to_string(),
         };
     }
@@ -2216,7 +2269,7 @@ async fn op_actor_invoke_method(
             return ActorInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
-                error: format!("actor method invoke encode failed: {error}"),
+                error: format!("memory method invoke encode failed: {error}"),
             };
         }
     };
@@ -2238,7 +2291,7 @@ async fn op_actor_invoke_method(
         return ActorInvokeMethodResult {
             ok: false,
             value: Vec::new(),
-            error: "actor method runtime is unavailable".to_string(),
+            error: "memory method runtime is unavailable".to_string(),
         };
     }
 
@@ -2257,12 +2310,12 @@ async fn op_actor_invoke_method(
             Ok(ActorInvokeResponse::Fetch(_)) => ActorInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
-                error: "actor method invoke received fetch response".to_string(),
+                error: "memory method invoke received fetch response".to_string(),
             },
             Err(error) => ActorInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
-                error: format!("actor method invoke decode failed: {error}"),
+                error: format!("memory method invoke decode failed: {error}"),
             },
         },
         Ok(Err(error)) => ActorInvokeMethodResult {
@@ -2273,7 +2326,7 @@ async fn op_actor_invoke_method(
         Err(_) => ActorInvokeMethodResult {
             ok: false,
             value: Vec::new(),
-            error: "actor method invoke response channel closed".to_string(),
+            error: "memory method invoke response channel closed".to_string(),
         },
     }
 }
@@ -2289,10 +2342,24 @@ fn actor_scope_for_request(
         .get(request_id)
         .cloned()
         .map(|scope| (scope.namespace, scope.actor_key))
-        .ok_or_else(|| PlatformError::runtime("actor storage scope is unavailable"))
+        .ok_or_else(|| PlatformError::runtime("memory storage scope is unavailable"))
 }
 
 fn actor_socket_scope_for_payload(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+    binding: &str,
+    key: &str,
+) -> Result<(String, String)> {
+    let binding = binding.trim();
+    let key = key.trim();
+    if !binding.is_empty() && !key.is_empty() {
+        return Ok((binding.to_string(), key.to_string()));
+    }
+    actor_scope_for_request(state, request_id)
+}
+
+fn actor_storage_scope_for_payload(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
     binding: &str,
@@ -2312,7 +2379,12 @@ async fn op_actor_state_snapshot(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorStateSnapshotPayload,
 ) -> ActorStateSnapshotResult {
-    let (namespace, actor_key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(scope) => scope,
         Err(error) => {
             return ActorStateSnapshotResult {
@@ -2324,7 +2396,17 @@ async fn op_actor_state_snapshot(
         }
     };
     let store = state.borrow().borrow::<ActorStore>().clone();
-    match store.snapshot(&namespace, &actor_key).await {
+    let keys = payload
+        .keys
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    match if keys.is_empty() {
+        store.snapshot(&namespace, &actor_key).await
+    } else {
+        store.snapshot_keys(&namespace, &actor_key, &keys).await
+    } {
         Ok(snapshot) => ActorStateSnapshotResult {
             ok: true,
             entries: snapshot
@@ -2352,11 +2434,71 @@ async fn op_actor_state_snapshot(
 
 #[deno_core::op2]
 #[serde]
+async fn op_actor_state_validate_reads(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateValidateReadsPayload,
+) -> ActorStateApplyBatchResult {
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return ActorStateApplyBatchResult {
+                ok: false,
+                conflict: false,
+                max_version: -1,
+                error: error.to_string(),
+            };
+        }
+    };
+    let reads = payload
+        .reads
+        .into_iter()
+        .map(|dependency| ActorReadDependency {
+            key: dependency.key,
+            version: dependency.version,
+        })
+        .collect::<Vec<_>>();
+    let list_gate_version = if payload.list_gate_version < 0 {
+        None
+    } else {
+        Some(payload.list_gate_version)
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .validate_reads(&namespace, &actor_key, &reads, list_gate_version)
+        .await
+    {
+        Ok(result) => ActorStateApplyBatchResult {
+            ok: true,
+            conflict: result.conflict,
+            max_version: result.max_version,
+            error: String::new(),
+        },
+        Err(error) => ActorStateApplyBatchResult {
+            ok: false,
+            conflict: false,
+            max_version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
 async fn op_actor_state_apply_batch(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorStateApplyBatchPayload,
 ) -> ActorStateApplyBatchResult {
-    let (namespace, actor_key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(scope) => scope,
         Err(error) => {
             return ActorStateApplyBatchResult {
@@ -2433,13 +2575,13 @@ async fn op_actor_socket_send(
     if payload.request_id.trim().is_empty() {
         return ActorSocketSendResult {
             ok: false,
-            error: "actor socket send requires request_id".to_string(),
+            error: "memory socket send requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorSocketSendResult {
             ok: false,
-            error: "actor socket send requires handle".to_string(),
+            error: "memory socket send requires handle".to_string(),
         };
     }
     let normalized_kind = payload.message_kind.as_str();
@@ -2485,7 +2627,7 @@ async fn op_actor_socket_send(
     {
         return ActorSocketSendResult {
             ok: false,
-            error: "actor socket send runtime is unavailable".to_string(),
+            error: "memory socket send runtime is unavailable".to_string(),
         };
     }
 
@@ -2500,7 +2642,7 @@ async fn op_actor_socket_send(
         },
         Err(_) => ActorSocketSendResult {
             ok: false,
-            error: "actor socket send response channel closed".to_string(),
+            error: "memory socket send response channel closed".to_string(),
         },
     }
 }
@@ -2514,13 +2656,13 @@ async fn op_actor_socket_close(
     if payload.request_id.trim().is_empty() {
         return ActorSocketCloseResult {
             ok: false,
-            error: "actor socket close requires request_id".to_string(),
+            error: "memory socket close requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorSocketCloseResult {
             ok: false,
-            error: "actor socket close requires handle".to_string(),
+            error: "memory socket close requires handle".to_string(),
         };
     }
 
@@ -2557,7 +2699,7 @@ async fn op_actor_socket_close(
     {
         return ActorSocketCloseResult {
             ok: false,
-            error: "actor socket close runtime is unavailable".to_string(),
+            error: "memory socket close runtime is unavailable".to_string(),
         };
     }
 
@@ -2572,7 +2714,7 @@ async fn op_actor_socket_close(
         },
         Err(_) => ActorSocketCloseResult {
             ok: false,
-            error: "actor socket close response channel closed".to_string(),
+            error: "memory socket close response channel closed".to_string(),
         },
     }
 }
@@ -2587,7 +2729,7 @@ async fn op_actor_socket_list(
         return ActorSocketListResult {
             ok: false,
             handles: Vec::new(),
-            error: "actor socket list requires request_id".to_string(),
+            error: "memory socket list requires request_id".to_string(),
         };
     }
 
@@ -2621,7 +2763,7 @@ async fn op_actor_socket_list(
         return ActorSocketListResult {
             ok: false,
             handles: Vec::new(),
-            error: "actor socket list runtime is unavailable".to_string(),
+            error: "memory socket list runtime is unavailable".to_string(),
         };
     }
 
@@ -2639,7 +2781,7 @@ async fn op_actor_socket_list(
         Err(_) => ActorSocketListResult {
             ok: false,
             handles: Vec::new(),
-            error: "actor socket list response channel closed".to_string(),
+            error: "memory socket list response channel closed".to_string(),
         },
     }
 }
@@ -2654,14 +2796,14 @@ async fn op_actor_socket_consume_close(
         return ActorSocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor socket consumeClose requires request_id".to_string(),
+            error: "memory socket consumeClose requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorSocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor socket consumeClose requires handle".to_string(),
+            error: "memory socket consumeClose requires handle".to_string(),
         };
     }
 
@@ -2698,7 +2840,7 @@ async fn op_actor_socket_consume_close(
         return ActorSocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor socket consumeClose runtime is unavailable".to_string(),
+            error: "memory socket consumeClose runtime is unavailable".to_string(),
         };
     }
 
@@ -2722,7 +2864,7 @@ async fn op_actor_socket_consume_close(
         Err(_) => ActorSocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor socket consumeClose response channel closed".to_string(),
+            error: "memory socket consumeClose response channel closed".to_string(),
         },
     }
 }
@@ -2743,6 +2885,50 @@ fn actor_transport_scope_for_payload(
 
 #[deno_core::op2]
 #[serde]
+fn op_actor_scope_enter(
+    state: &mut OpState,
+    #[serde] payload: ActorScopePayload,
+) -> ActorScopeResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorScopeResult {
+            ok: false,
+            error: "memory scope enter requires request_id".to_string(),
+        };
+    }
+    if payload.binding.trim().is_empty() || payload.key.trim().is_empty() {
+        return ActorScopeResult {
+            ok: false,
+            error: "memory scope enter requires binding and key".to_string(),
+        };
+    }
+    register_actor_request_scope(state, payload.request_id, payload.binding, payload.key);
+    ActorScopeResult {
+        ok: true,
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_actor_scope_exit(
+    state: &mut OpState,
+    #[serde] payload: ActorScopeClearPayload,
+) -> ActorScopeResult {
+    if payload.request_id.trim().is_empty() {
+        return ActorScopeResult {
+            ok: false,
+            error: "memory scope exit requires request_id".to_string(),
+        };
+    }
+    clear_actor_request_scope(state, &payload.request_id);
+    ActorScopeResult {
+        ok: true,
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2]
+#[serde]
 async fn op_actor_transport_send_stream(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorTransportSendStreamPayload,
@@ -2750,13 +2936,13 @@ async fn op_actor_transport_send_stream(
     if payload.request_id.trim().is_empty() {
         return ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendStream requires request_id".to_string(),
+            error: "memory transport sendStream requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendStream requires handle".to_string(),
+            error: "memory transport sendStream requires handle".to_string(),
         };
     }
 
@@ -2792,7 +2978,7 @@ async fn op_actor_transport_send_stream(
     {
         return ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendStream runtime is unavailable".to_string(),
+            error: "memory transport sendStream runtime is unavailable".to_string(),
         };
     }
 
@@ -2807,7 +2993,7 @@ async fn op_actor_transport_send_stream(
         },
         Err(_) => ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendStream response channel closed".to_string(),
+            error: "memory transport sendStream response channel closed".to_string(),
         },
     }
 }
@@ -2821,13 +3007,13 @@ async fn op_actor_transport_send_datagram(
     if payload.request_id.trim().is_empty() {
         return ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendDatagram requires request_id".to_string(),
+            error: "memory transport sendDatagram requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendDatagram requires handle".to_string(),
+            error: "memory transport sendDatagram requires handle".to_string(),
         };
     }
 
@@ -2863,7 +3049,7 @@ async fn op_actor_transport_send_datagram(
     {
         return ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendDatagram runtime is unavailable".to_string(),
+            error: "memory transport sendDatagram runtime is unavailable".to_string(),
         };
     }
 
@@ -2878,7 +3064,7 @@ async fn op_actor_transport_send_datagram(
         },
         Err(_) => ActorTransportSendResult {
             ok: false,
-            error: "actor transport sendDatagram response channel closed".to_string(),
+            error: "memory transport sendDatagram response channel closed".to_string(),
         },
     }
 }
@@ -2894,7 +3080,7 @@ async fn op_actor_transport_recv_stream(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvStream requires request_id".to_string(),
+            error: "memory transport recvStream requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
@@ -2902,11 +3088,16 @@ async fn op_actor_transport_recv_stream(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvStream requires handle".to_string(),
+            error: "memory transport recvStream requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportRecvResult {
@@ -2936,7 +3127,7 @@ async fn op_actor_transport_recv_stream(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvStream runtime is unavailable".to_string(),
+            error: "memory transport recvStream runtime is unavailable".to_string(),
         };
     }
 
@@ -2957,7 +3148,7 @@ async fn op_actor_transport_recv_stream(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvStream response channel closed".to_string(),
+            error: "memory transport recvStream response channel closed".to_string(),
         },
     }
 }
@@ -2973,7 +3164,7 @@ async fn op_actor_transport_recv_datagram(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvDatagram requires request_id".to_string(),
+            error: "memory transport recvDatagram requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
@@ -2981,11 +3172,16 @@ async fn op_actor_transport_recv_datagram(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvDatagram requires handle".to_string(),
+            error: "memory transport recvDatagram requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportRecvResult {
@@ -3015,7 +3211,7 @@ async fn op_actor_transport_recv_datagram(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvDatagram runtime is unavailable".to_string(),
+            error: "memory transport recvDatagram runtime is unavailable".to_string(),
         };
     }
 
@@ -3036,7 +3232,7 @@ async fn op_actor_transport_recv_datagram(
             ok: false,
             done: true,
             chunk: Vec::new(),
-            error: "actor transport recvDatagram response channel closed".to_string(),
+            error: "memory transport recvDatagram response channel closed".to_string(),
         },
     }
 }
@@ -3050,13 +3246,13 @@ async fn op_actor_transport_close(
     if payload.request_id.trim().is_empty() {
         return ActorTransportCloseResult {
             ok: false,
-            error: "actor transport close requires request_id".to_string(),
+            error: "memory transport close requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorTransportCloseResult {
             ok: false,
-            error: "actor transport close requires handle".to_string(),
+            error: "memory transport close requires handle".to_string(),
         };
     }
 
@@ -3093,7 +3289,7 @@ async fn op_actor_transport_close(
     {
         return ActorTransportCloseResult {
             ok: false,
-            error: "actor transport close runtime is unavailable".to_string(),
+            error: "memory transport close runtime is unavailable".to_string(),
         };
     }
 
@@ -3108,7 +3304,7 @@ async fn op_actor_transport_close(
         },
         Err(_) => ActorTransportCloseResult {
             ok: false,
-            error: "actor transport close response channel closed".to_string(),
+            error: "memory transport close response channel closed".to_string(),
         },
     }
 }
@@ -3123,11 +3319,16 @@ async fn op_actor_transport_list(
         return ActorTransportListResult {
             ok: false,
             handles: Vec::new(),
-            error: "actor transport list requires request_id".to_string(),
+            error: "memory transport list requires request_id".to_string(),
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportListResult {
@@ -3154,7 +3355,7 @@ async fn op_actor_transport_list(
         return ActorTransportListResult {
             ok: false,
             handles: Vec::new(),
-            error: "actor transport list runtime is unavailable".to_string(),
+            error: "memory transport list runtime is unavailable".to_string(),
         };
     }
 
@@ -3172,7 +3373,7 @@ async fn op_actor_transport_list(
         Err(_) => ActorTransportListResult {
             ok: false,
             handles: Vec::new(),
-            error: "actor transport list response channel closed".to_string(),
+            error: "memory transport list response channel closed".to_string(),
         },
     }
 }
@@ -3187,18 +3388,23 @@ async fn op_actor_transport_consume_close(
         return ActorTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor transport consumeClose requires request_id".to_string(),
+            error: "memory transport consumeClose requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
         return ActorTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor transport consumeClose requires handle".to_string(),
+            error: "memory transport consumeClose requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_scope_for_request(&state, &payload.request_id) {
+    let (binding, key) = match actor_transport_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
         Ok(value) => value,
         Err(error) => {
             return ActorTransportConsumeCloseResult {
@@ -3226,7 +3432,7 @@ async fn op_actor_transport_consume_close(
         return ActorTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor transport consumeClose runtime is unavailable".to_string(),
+            error: "memory transport consumeClose runtime is unavailable".to_string(),
         };
     }
 
@@ -3250,7 +3456,7 @@ async fn op_actor_transport_consume_close(
         Err(_) => ActorTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
-            error: "actor transport consumeClose response channel closed".to_string(),
+            error: "memory transport consumeClose response channel closed".to_string(),
         },
     }
 }
@@ -3327,11 +3533,14 @@ deno_core::extension!(
         op_request_body_cancel,
         op_actor_invoke_method,
         op_actor_state_snapshot,
+        op_actor_state_validate_reads,
         op_actor_state_apply_batch,
         op_actor_socket_send,
         op_actor_socket_close,
         op_actor_socket_list,
         op_actor_socket_consume_close,
+        op_actor_scope_enter,
+        op_actor_scope_exit,
         op_actor_transport_send_stream,
         op_actor_transport_send_datagram,
         op_actor_transport_recv_stream,

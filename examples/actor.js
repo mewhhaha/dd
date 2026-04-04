@@ -27,7 +27,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const key = userKey(url);
-    const memory = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(key));
+    const memory = env.USER_MEMORY.get(env.USER_MEMORY.idFromName(key));
     const count = memory.tvar("count", 0);
     const profile = memory.var("profile");
     const pings = memory.tvar("pings", 0);

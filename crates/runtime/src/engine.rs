@@ -5,9 +5,9 @@ use crate::assets::{
 use crate::ops::runtime_extension;
 use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
-    resolve_import, Extension, JsRuntime, JsRuntimeForSnapshot, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, PollEventLoopOptions,
-    RequestedModuleType, ResolutionKind, RuntimeOptions,
+    resolve_import, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot, ModuleLoadResponse,
+    ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
+    PollEventLoopOptions, RequestedModuleType, ResolutionKind, RuntimeOptions,
 };
 use deno_crypto::deno_crypto as deno_crypto_ext;
 use deno_error::JsErrorBox;
@@ -18,9 +18,12 @@ use std::borrow::Cow;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
+
+static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -89,6 +92,39 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     Ok(Box::leak(snapshot))
 }
 
+pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
+    let normalized = flags
+        .iter()
+        .map(|flag| flag.trim())
+        .filter(|flag| !flag.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if let Some(existing) = CONFIGURED_V8_FLAGS.get() {
+        if existing != &normalized {
+            return Err(PlatformError::internal(format!(
+                "v8 flags were already initialized as {:?}; cannot reinitialize with {:?}",
+                existing, normalized
+            )));
+        }
+        return Ok(());
+    }
+
+    let mut argv = Vec::with_capacity(normalized.len() + 1);
+    argv.push("dd-runtime".to_string());
+    argv.extend(normalized.iter().cloned());
+    let leftovers = v8_set_flags(argv);
+    if leftovers.len() > 1 {
+        return Err(PlatformError::internal(format!(
+            "unsupported v8 flags: {:?}",
+            &leftovers[1..]
+        )));
+    }
+
+    let _ = CONFIGURED_V8_FLAGS.set(normalized);
+    Ok(())
+}
+
 pub async fn validate_worker(bootstrap_snapshot: &'static [u8], source: &str) -> Result<()> {
     let mut runtime = new_runtime(bootstrap_snapshot)?;
     load_worker(&mut runtime, source).await
@@ -153,30 +189,18 @@ pub fn dispatch_worker_request(
     runtime: &mut JsRuntime,
     request_id: &str,
     completion_token: &str,
-    worker_name: &str,
-    kv_bindings: &[String],
-    actor_bindings: &[String],
-    dynamic_bindings: &[String],
-    dynamic_rpc_bindings: &[String],
-    dynamic_env: &[(String, String)],
+    worker_name_json: &str,
+    kv_bindings_json: &str,
+    actor_bindings_json: &str,
+    dynamic_bindings_json: &str,
+    dynamic_rpc_bindings_json: &str,
+    dynamic_env_json: &str,
     has_request_body_stream: bool,
     actor_call: Option<&ExecuteActorCall>,
     host_rpc_call: Option<&ExecuteHostRpcCall>,
     request: WorkerInvocation,
 ) -> Result<()> {
     let request_json = crate::json::to_string(&request)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let worker_name_json = crate::json::to_string(worker_name)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let kv_bindings_json = crate::json::to_string(kv_bindings)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let actor_bindings_json = crate::json::to_string(actor_bindings)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let dynamic_bindings_json = crate::json::to_string(dynamic_bindings)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let dynamic_rpc_bindings_json = crate::json::to_string(dynamic_rpc_bindings)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let dynamic_env_json = crate::json::to_string(dynamic_env)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let actor_call_json = crate::json::to_string(&actor_call)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
@@ -187,12 +211,12 @@ pub fn dispatch_worker_request(
     let completion_token_json = crate::json::to_string(completion_token)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let entry_code = execute_worker_js(
-        &worker_name_json,
-        &kv_bindings_json,
-        &actor_bindings_json,
-        &dynamic_bindings_json,
-        &dynamic_rpc_bindings_json,
-        &dynamic_env_json,
+        worker_name_json,
+        kv_bindings_json,
+        actor_bindings_json,
+        dynamic_bindings_json,
+        dynamic_rpc_bindings_json,
+        dynamic_env_json,
         &actor_call_json,
         &host_rpc_call_json,
         &request_id_json,

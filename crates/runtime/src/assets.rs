@@ -9,7 +9,8 @@ const EXECUTE_WORKER_TEMPLATE: &str = include_str!("../js/execute_worker.js");
 const ABORT_WORKER_TEMPLATE: &str = include_str!("../js/abort_worker.js");
 
 pub fn install_worker_js() -> String {
-    INSTALL_WORKER_TEMPLATE.replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER)
+    let install = INSTALL_WORKER_TEMPLATE.replace("__WORKER_SPECIFIER__", WORKER_SPECIFIER);
+    format!("{install}\n{EXECUTE_WORKER_TEMPLATE}")
 }
 
 pub fn execute_worker_js(
@@ -26,26 +27,27 @@ pub fn execute_worker_js(
     has_request_body_stream: bool,
     request_json: &str,
 ) -> String {
-    EXECUTE_WORKER_TEMPLATE
-        .replace("__WORKER_NAME__", worker_name)
-        .replace("__KV_BINDINGS_JSON__", kv_bindings_json)
-        .replace("__ACTOR_BINDINGS_JSON__", actor_bindings_json)
-        .replace("__DYNAMIC_BINDINGS_JSON__", dynamic_bindings_json)
-        .replace("__DYNAMIC_RPC_BINDINGS_JSON__", dynamic_rpc_bindings_json)
-        .replace("__DYNAMIC_ENV_JSON__", dynamic_env_json)
-        .replace("__ACTOR_CALL_JSON__", actor_call_json)
-        .replace("__HOST_RPC_CALL_JSON__", host_rpc_call_json)
-        .replace("__REQUEST_ID__", request_id)
-        .replace("__COMPLETION_TOKEN__", completion_token)
-        .replace(
-            "__HAS_REQUEST_BODY_STREAM__",
-            if has_request_body_stream {
-                "true"
-            } else {
-                "false"
-            },
-        )
-        .replace("__REQUEST_JSON__", request_json)
+    format!(
+        "globalThis.__dd_execute_worker({{\
+request_id:{request_id},\
+completion_token:{completion_token},\
+worker_name:{worker_name},\
+kv_bindings:{kv_bindings_json},\
+actor_bindings:{actor_bindings_json},\
+dynamic_bindings:{dynamic_bindings_json},\
+dynamic_rpc_bindings:{dynamic_rpc_bindings_json},\
+dynamic_env:{dynamic_env_json},\
+actor_call:{actor_call_json},\
+host_rpc_call:{host_rpc_call_json},\
+has_request_body_stream:{has_request_body_stream},\
+request:{request_json}\
+}});",
+        has_request_body_stream = if has_request_body_stream {
+            "true"
+        } else {
+            "false"
+        },
+    )
 }
 
 pub fn abort_worker_js(request_id: &str) -> String {

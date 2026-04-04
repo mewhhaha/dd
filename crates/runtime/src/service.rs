@@ -6,8 +6,8 @@ use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
-    load_worker, new_runtime_from_snapshot, pump_event_loop_once, validate_loaded_worker_runtime,
-    validate_worker, ExecuteActorCall, ExecuteHostRpcCall,
+    ensure_v8_flags, load_worker, new_runtime_from_snapshot, pump_event_loop_once,
+    validate_loaded_worker_runtime, validate_worker, ExecuteActorCall, ExecuteHostRpcCall,
 };
 use crate::kv::KvStore;
 use crate::ops::{
@@ -21,14 +21,17 @@ use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{info, warn, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
@@ -55,6 +58,8 @@ const CONTENT_TYPE_HEADER: &str = "content-type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const ACTOR_ATOMIC_METHOD: &str = "__dd_atomic";
 
+static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub min_isolates: usize,
@@ -66,6 +71,7 @@ pub struct RuntimeConfig {
     pub cache_max_entries: usize,
     pub cache_max_bytes: usize,
     pub cache_default_ttl: Duration,
+    pub v8_flags: Vec<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -80,6 +86,7 @@ impl Default for RuntimeConfig {
             cache_max_entries: 2048,
             cache_max_bytes: 64 * 1024 * 1024,
             cache_default_ttl: Duration::from_secs(60),
+            v8_flags: Vec::new(),
         }
     }
 }
@@ -290,6 +297,9 @@ struct WorkerManager {
     dynamic_worker_handles: HashMap<String, DynamicWorkerHandle>,
     dynamic_worker_ids: HashMap<DynamicWorkerIdKey, HashMap<String, String>>,
     host_rpc_providers: HashMap<String, HostRpcProvider>,
+    runtime_batch_depth: usize,
+    pending_dispatches: HashSet<(String, u64)>,
+    pending_cleanup_workers: HashSet<String>,
     next_generation: u64,
     next_isolate_id: u64,
 }
@@ -387,6 +397,7 @@ struct InternalTraceDestination {
 
 struct WorkerPool {
     worker_name: String,
+    worker_name_json: Arc<str>,
     generation: u64,
     deployment_id: String,
     internal_trace: Option<InternalTraceDestination>,
@@ -394,11 +405,14 @@ struct WorkerPool {
     snapshot: &'static [u8],
     snapshot_preloaded: bool,
     source: Arc<str>,
-    kv_bindings: Vec<String>,
+    kv_bindings_json: Arc<str>,
     actor_bindings: Vec<String>,
+    actor_bindings_json: Arc<str>,
     dynamic_bindings: Vec<String>,
+    dynamic_bindings_json: Arc<str>,
     dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
-    dynamic_env: Vec<(String, String)>,
+    dynamic_rpc_bindings_json: Arc<str>,
+    dynamic_env_json: Arc<str>,
     secret_replacements: Vec<(String, String)>,
     egress_allow_hosts: Vec<String>,
     strict_request_isolation: bool,
@@ -456,13 +470,17 @@ struct PendingReply {
     canceled: bool,
     actor_key: Option<String>,
     internal_origin: bool,
-    method: String,
-    url: String,
     reply: oneshot::Sender<Result<WorkerOutput>>,
-    traceparent: Option<String>,
-    user_request_id: String,
+    completion_meta: Option<PendingReplyMeta>,
     kind: PendingReplyKind,
     dispatched_at: Instant,
+}
+
+struct PendingReplyMeta {
+    method: String,
+    url: String,
+    traceparent: Option<String>,
+    user_request_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +502,11 @@ struct DispatchCandidate {
     assign_owner: bool,
 }
 
+enum DispatchSelection {
+    Dispatch(DispatchCandidate),
+    DropStaleTarget { queue_idx: usize },
+}
+
 struct IsolateHandle {
     id: u64,
     sender: mpsc::UnboundedSender<IsolateCommand>,
@@ -500,12 +523,14 @@ enum IsolateCommand {
     Execute {
         runtime_request_id: String,
         completion_token: String,
-        worker_name: String,
-        kv_bindings: Vec<String>,
-        actor_bindings: Vec<String>,
+        worker_name_json: Arc<str>,
+        kv_bindings_json: Arc<str>,
+        actor_bindings_json: Arc<str>,
+        dynamic_bindings_json: Arc<str>,
+        dynamic_rpc_bindings_json: Arc<str>,
+        dynamic_env_json: Arc<str>,
         dynamic_bindings: Vec<String>,
         dynamic_rpc_bindings: Vec<String>,
-        dynamic_env: Vec<(String, String)>,
         secret_replacements: Vec<(String, String)>,
         egress_allow_hosts: Vec<String>,
         request: WorkerInvocation,
@@ -770,6 +795,7 @@ impl RuntimeService {
         ensure_rustls_crypto_provider();
         let RuntimeServiceConfig { runtime, storage } = config;
         validate_runtime_config(&runtime)?;
+        ensure_v8_flags(&runtime.v8_flags)?;
         if storage.actor_shards_per_namespace == 0 {
             return Err(PlatformError::internal(
                 "actor_shards_per_namespace must be greater than 0",
@@ -1000,18 +1026,23 @@ impl RuntimeService {
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
     ) -> Result<WorkerOutput> {
-        let runtime_request_id = Uuid::new_v4().to_string();
-        let invoke_span = tracing::info_span!(
-            "runtime.invoke",
-            worker.name = %worker_name,
-            runtime.request_id = %runtime_request_id,
-            request.id = %request.request_id
-        );
-        set_span_parent_from_traceparent(
-            &invoke_span,
-            traceparent_from_headers(&request.headers).as_deref(),
-        );
-        let _invoke_guard = invoke_span.enter();
+        let runtime_request_id = next_runtime_token("req");
+        let invoke_span = if tracing::enabled!(Level::INFO) {
+            let span = tracing::info_span!(
+                "runtime.invoke",
+                worker.name = %worker_name,
+                runtime.request_id = %runtime_request_id,
+                request.id = %request.request_id
+            );
+            set_span_parent_from_traceparent(
+                &span,
+                traceparent_from_headers(&request.headers).as_deref(),
+            );
+            Some(span)
+        } else {
+            None
+        };
+        let _invoke_guard = invoke_span.as_ref().map(|span| span.enter());
         let mut cancel_guard = InvokeCancelGuard::new(
             self.cancel_sender.clone(),
             worker_name.clone(),
@@ -1049,18 +1080,23 @@ impl RuntimeService {
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
     ) -> Result<WorkerStreamOutput> {
-        let runtime_request_id = Uuid::new_v4().to_string();
-        let stream_span = tracing::info_span!(
-            "runtime.invoke_stream",
-            worker.name = %worker_name,
-            runtime.request_id = %runtime_request_id,
-            request.id = %request.request_id
-        );
-        set_span_parent_from_traceparent(
-            &stream_span,
-            traceparent_from_headers(&request.headers).as_deref(),
-        );
-        let _stream_guard = stream_span.enter();
+        let runtime_request_id = next_runtime_token("req");
+        let stream_span = if tracing::enabled!(Level::INFO) {
+            let span = tracing::info_span!(
+                "runtime.invoke_stream",
+                worker.name = %worker_name,
+                runtime.request_id = %runtime_request_id,
+                request.id = %request.request_id
+            );
+            set_span_parent_from_traceparent(
+                &span,
+                traceparent_from_headers(&request.headers).as_deref(),
+            );
+            Some(span)
+        } else {
+            None
+        };
+        let _stream_guard = stream_span.as_ref().map(|span| span.enter());
         let mut cancel_guard = InvokeCancelGuard::new(
             self.cancel_sender.clone(),
             worker_name.clone(),
@@ -1410,8 +1446,41 @@ impl WorkerManager {
             dynamic_worker_handles: HashMap::new(),
             dynamic_worker_ids: HashMap::new(),
             host_rpc_providers: HashMap::new(),
+            runtime_batch_depth: 0,
+            pending_dispatches: HashSet::new(),
+            pending_cleanup_workers: HashSet::new(),
             next_generation: 1,
             next_isolate_id: 1,
+        }
+    }
+
+    fn begin_runtime_batch(&mut self) {
+        self.runtime_batch_depth += 1;
+    }
+
+    fn finish_runtime_batch(&mut self, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+        debug_assert!(self.runtime_batch_depth > 0);
+        if self.runtime_batch_depth == 0 {
+            return;
+        }
+        self.runtime_batch_depth -= 1;
+        if self.runtime_batch_depth > 0 {
+            return;
+        }
+
+        loop {
+            let pending_dispatches = mem::take(&mut self.pending_dispatches);
+            let pending_cleanup_workers = mem::take(&mut self.pending_cleanup_workers);
+            if pending_dispatches.is_empty() && pending_cleanup_workers.is_empty() {
+                break;
+            }
+
+            for (worker_name, generation) in pending_dispatches {
+                self.dispatch_pool(&worker_name, generation, event_tx);
+            }
+            for worker_name in pending_cleanup_workers {
+                self.cleanup_drained_generations_for(&worker_name);
+            }
         }
     }
 
@@ -3267,6 +3336,30 @@ impl WorkerManager {
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
+        let worker_name_json = Arc::<str>::from(
+            crate::json::to_string(&worker_name)
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
+        let kv_bindings_json = Arc::<str>::from(
+            crate::json::to_string(&bindings.kv)
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
+        let actor_bindings_json = Arc::<str>::from(
+            crate::json::to_string(&bindings.actor)
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
+        let dynamic_bindings_json = Arc::<str>::from(
+            crate::json::to_string(&bindings.dynamic)
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
+        let dynamic_rpc_bindings_json = Arc::<str>::from(
+            crate::json::to_string(&Vec::<String>::new())
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
+        let dynamic_env_json = Arc::<str>::from(
+            crate::json::to_string(&Vec::<(String, String)>::new())
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
         if persist {
             persist_worker_deployment(
                 &self.storage,
@@ -3280,6 +3373,7 @@ impl WorkerManager {
         let pool =
             WorkerPool {
                 worker_name: worker_name.clone(),
+                worker_name_json,
                 generation,
                 deployment_id: deployment_id.clone(),
                 internal_trace: config.internal.trace.as_ref().map(|trace| {
@@ -3292,11 +3386,14 @@ impl WorkerManager {
                 snapshot,
                 snapshot_preloaded,
                 source: Arc::<str>::from(source.clone()),
-                kv_bindings: bindings.kv,
+                kv_bindings_json,
                 actor_bindings: bindings.actor,
+                actor_bindings_json,
                 dynamic_bindings: bindings.dynamic,
+                dynamic_bindings_json,
                 dynamic_rpc_bindings: Vec::new(),
-                dynamic_env: Vec::new(),
+                dynamic_rpc_bindings_json,
+                dynamic_env_json,
                 secret_replacements: Vec::new(),
                 egress_allow_hosts: Vec::new(),
                 strict_request_isolation: has_dynamic_bindings,
@@ -3336,9 +3433,18 @@ impl WorkerManager {
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
+        let dynamic_binding_names = dynamic_config
+            .dynamic_rpc_bindings
+            .iter()
+            .map(|binding| binding.binding.clone())
+            .collect::<Vec<_>>();
 
         let pool = WorkerPool {
             worker_name: worker_name.clone(),
+            worker_name_json: Arc::<str>::from(
+                crate::json::to_string(&worker_name)
+                    .map_err(|error| PlatformError::internal(error.to_string()))?,
+            ),
             generation,
             deployment_id: deployment_id.clone(),
             internal_trace: None,
@@ -3346,11 +3452,29 @@ impl WorkerManager {
             snapshot: self.bootstrap_snapshot,
             snapshot_preloaded: false,
             source: Arc::<str>::from(source),
-            kv_bindings: Vec::new(),
+            kv_bindings_json: Arc::<str>::from(
+                crate::json::to_string(&Vec::<String>::new())
+                    .map_err(|error| PlatformError::internal(error.to_string()))?,
+            ),
             actor_bindings: Vec::new(),
+            actor_bindings_json: Arc::<str>::from(
+                crate::json::to_string(&Vec::<String>::new())
+                    .map_err(|error| PlatformError::internal(error.to_string()))?,
+            ),
             dynamic_bindings: Vec::new(),
+            dynamic_bindings_json: Arc::<str>::from(
+                crate::json::to_string(&Vec::<String>::new())
+                    .map_err(|error| PlatformError::internal(error.to_string()))?,
+            ),
             dynamic_rpc_bindings: dynamic_config.dynamic_rpc_bindings.clone(),
-            dynamic_env: dynamic_config.dynamic_env.clone(),
+            dynamic_rpc_bindings_json: Arc::<str>::from(
+                crate::json::to_string(&dynamic_binding_names)
+                    .map_err(|error| PlatformError::internal(error.to_string()))?,
+            ),
+            dynamic_env_json: Arc::<str>::from(
+                crate::json::to_string(&dynamic_config.dynamic_env)
+                    .map_err(|error| PlatformError::internal(error.to_string()))?,
+            ),
             secret_replacements: dynamic_config.secret_replacements.clone(),
             egress_allow_hosts: dynamic_config.egress_allow_hosts.clone(),
             strict_request_isolation: true,
@@ -3723,30 +3847,21 @@ impl WorkerManager {
         generation: u64,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
+        if self.runtime_batch_depth > 0 {
+            self.pending_dispatches
+                .insert((worker_name.to_string(), generation));
+            return;
+        }
         let max_inflight_per_isolate = self.config.max_inflight_per_isolate;
         let max_isolates = self.config.max_isolates;
         loop {
-            let (candidate, spawn_needed) = {
+            let (selection, spawn_needed) = {
                 let Some(pool) = self.get_pool_mut(worker_name, generation) else {
                     return;
                 };
                 if pool.queue.is_empty() {
                     pool.log_stats("dispatch");
                     return;
-                }
-                if let Some(stale_idx) = pool.queue.iter().position(|pending| {
-                    pending.target_isolate_id.is_some()
-                        && pending
-                            .target_isolate_id
-                            .map(|target| !pool.isolates.iter().any(|isolate| isolate.id == target))
-                            .unwrap_or(false)
-                }) {
-                    if let Some(stale) = pool.queue.remove(stale_idx) {
-                        let _ = stale
-                            .reply
-                            .send(Err(PlatformError::runtime("target isolate is unavailable")));
-                    }
-                    continue;
                 }
                 let max_inflight = if pool.strict_request_isolation {
                     1
@@ -3757,11 +3872,11 @@ impl WorkerManager {
                     isolate.inflight_count < max_inflight
                         && (!pool.strict_request_isolation || isolate.pending_wait_until.is_empty())
                 });
-                let candidate =
+                let selection =
                     select_dispatch_candidate(pool, max_inflight, pool.strict_request_isolation);
                 let spawn_needed =
-                    candidate.is_none() && !has_capacity && pool.isolates.len() < max_isolates;
-                (candidate, spawn_needed)
+                    selection.is_none() && !has_capacity && pool.isolates.len() < max_isolates;
+                (selection, spawn_needed)
             };
 
             if spawn_needed {
@@ -3776,8 +3891,21 @@ impl WorkerManager {
                 continue;
             }
 
-            let Some(candidate) = candidate else {
+            let Some(selection) = selection else {
                 return;
+            };
+            let candidate = match selection {
+                DispatchSelection::Dispatch(candidate) => candidate,
+                DispatchSelection::DropStaleTarget { queue_idx } => {
+                    if let Some(pool) = self.get_pool_mut(worker_name, generation) {
+                        if let Some(stale) = pool.queue.remove(queue_idx) {
+                            let _ = stale
+                                .reply
+                                .send(Err(PlatformError::runtime("target isolate is unavailable")));
+                        }
+                    }
+                    continue;
+                }
             };
             let isolate_idx = candidate.isolate_idx;
             let Some(pending_invoke) = self
@@ -3787,27 +3915,39 @@ impl WorkerManager {
                 return;
             };
 
-            let queue_wait_ms = pending_invoke.enqueued_at.elapsed().as_millis() as u64;
             let runtime_request_id = pending_invoke.runtime_request_id.clone();
-            let user_request_id = pending_invoke.request.request_id.clone();
-            let request_method = pending_invoke.request.method.clone();
-            let request_url = pending_invoke.request.url.clone();
             let internal_origin = pending_invoke.internal_origin;
-            let traceparent = traceparent_from_headers(&pending_invoke.request.headers);
-            let span = tracing::info_span!(
-                "runtime.dispatch",
-                worker.name = %worker_name,
-                worker.generation = generation,
-                runtime.request_id = %runtime_request_id,
-                request.id = %user_request_id,
-                queue.wait_ms = queue_wait_ms
-            );
-            set_span_parent_from_traceparent(&span, traceparent.as_deref());
-            let _dispatch_guard = span.enter();
-            tracing::info!("dispatching request to isolate");
+            let info_tracing_enabled = tracing::enabled!(Level::INFO);
+            let needs_completion_meta = info_tracing_enabled
+                || self
+                    .get_pool_mut(worker_name, generation)
+                    .and_then(|pool| pool.internal_trace.as_ref())
+                    .is_some();
+            let traceparent = if needs_completion_meta {
+                traceparent_from_headers(&pending_invoke.request.headers)
+            } else {
+                None
+            };
+            let dispatch_span = if info_tracing_enabled {
+                let queue_wait_ms = pending_invoke.enqueued_at.elapsed().as_millis() as u64;
+                Some(tracing::info_span!(
+                    "runtime.dispatch",
+                    worker.name = %worker_name,
+                    worker.generation = generation,
+                    runtime.request_id = %runtime_request_id,
+                    request.id = %pending_invoke.request.request_id,
+                    queue.wait_ms = queue_wait_ms
+                ))
+            } else {
+                None
+            };
+            if let Some(span) = dispatch_span.as_ref() {
+                set_span_parent_from_traceparent(span, traceparent.as_deref());
+            }
+            let _dispatch_guard = dispatch_span.as_ref().map(|span| span.enter());
 
             let mut pending_reply = Some(pending_invoke.reply);
-            let completion_token = Uuid::new_v4().to_string();
+            let completion_token = next_runtime_token("done");
             if let Some(registration) = self.stream_registrations.get_mut(&runtime_request_id) {
                 if registration.worker_name == worker_name {
                     registration.completion_token = Some(completion_token.clone());
@@ -3819,15 +3959,18 @@ impl WorkerManager {
                     continue;
                 }
 
-                let kv_bindings = pool.kv_bindings.clone();
-                let actor_bindings = pool.actor_bindings.clone();
+                let worker_name_json = Arc::clone(&pool.worker_name_json);
+                let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
+                let actor_bindings_json = Arc::clone(&pool.actor_bindings_json);
+                let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
+                let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
+                let dynamic_env_json = Arc::clone(&pool.dynamic_env_json);
                 let dynamic_bindings = pool.dynamic_bindings.clone();
                 let dynamic_rpc_bindings = pool
                     .dynamic_rpc_bindings
                     .iter()
                     .map(|binding| binding.binding.clone())
                     .collect::<Vec<_>>();
-                let dynamic_env = pool.dynamic_env.clone();
                 let secret_replacements = pool.secret_replacements.clone();
                 let egress_allow_hosts = pool.egress_allow_hosts.clone();
                 let should_count_reuse = pool.isolates[isolate_idx].served_requests > 0;
@@ -3845,15 +3988,27 @@ impl WorkerManager {
                 }
                 let isolate = &mut pool.isolates[isolate_idx];
                 isolate.served_requests += 1;
+                let completion_meta = if needs_completion_meta {
+                    Some(PendingReplyMeta {
+                        method: pending_invoke.request.method.clone(),
+                        url: pending_invoke.request.url.clone(),
+                        traceparent: traceparent.clone(),
+                        user_request_id: pending_invoke.request.request_id.clone(),
+                    })
+                } else {
+                    None
+                };
                 let command = IsolateCommand::Execute {
                     runtime_request_id: runtime_request_id.clone(),
                     completion_token: completion_token.clone(),
-                    worker_name: worker_name.to_string(),
-                    kv_bindings,
-                    actor_bindings,
+                    worker_name_json,
+                    kv_bindings_json,
+                    actor_bindings_json,
+                    dynamic_bindings_json,
+                    dynamic_rpc_bindings_json,
+                    dynamic_env_json,
                     dynamic_bindings,
                     dynamic_rpc_bindings,
-                    dynamic_env,
                     secret_replacements,
                     egress_allow_hosts,
                     request: pending_invoke.request,
@@ -3862,7 +4017,6 @@ impl WorkerManager {
                     host_rpc_call: pending_invoke.host_rpc_call,
                     actor_route: pending_invoke.actor_route,
                 };
-
                 if isolate.sender.send(command).is_err() {
                     send_failed = true;
                 } else {
@@ -3874,13 +4028,10 @@ impl WorkerManager {
                             canceled: false,
                             actor_key: candidate.actor_key.clone(),
                             internal_origin,
-                            method: request_method,
-                            url: request_url,
                             reply: pending_reply
                                 .take()
                                 .expect("pending reply must exist before dispatch"),
-                            traceparent: traceparent.clone(),
-                            user_request_id: user_request_id.clone(),
+                            completion_meta,
                             kind: pending_kind,
                             dispatched_at: Instant::now(),
                         },
@@ -3958,8 +4109,6 @@ impl WorkerManager {
         result: Result<WorkerOutput>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let stream_result = result.clone();
-        let trace_result = result.clone();
         let mut reply = None;
         let mut canceled = false;
         let mut clear_revalidation = false;
@@ -3973,6 +4122,8 @@ impl WorkerManager {
         let trace_destination = self
             .get_pool_mut(worker_name, generation)
             .and_then(|pool| pool.internal_trace.clone());
+        let info_tracing_enabled = tracing::enabled!(Level::INFO);
+        let stream_registered = self.stream_registrations.contains_key(request_id);
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool
                 .isolates
@@ -4010,16 +4161,18 @@ impl WorkerManager {
                     }
                     canceled = pending.canceled;
                     internal_origin = pending.internal_origin;
-                    request_method = pending.method;
-                    request_url = pending.url;
+                    if let Some(meta) = pending.completion_meta {
+                        request_method = meta.method;
+                        request_url = meta.url;
+                        completion_traceparent = meta.traceparent;
+                        user_request_id = meta.user_request_id;
+                    }
                     if wait_until_count > 0 {
                         isolate
                             .pending_wait_until
                             .insert(request_id.to_string(), completion_token.to_string());
                     }
                     clear_revalidation = true;
-                    completion_traceparent = pending.traceparent;
-                    user_request_id = pending.user_request_id;
                     execution_ms = Some(pending.dispatched_at.elapsed().as_millis() as u64);
                     pending_kind = pending.kind;
                     reply = Some(pending.reply);
@@ -4030,25 +4183,41 @@ impl WorkerManager {
         if clear_revalidation {
             self.clear_revalidation_for_request(request_id);
         }
-        let result_status = match &result {
-            Ok(output) => output.status as i64,
-            Err(_) => -1,
+        let complete_span = if info_tracing_enabled {
+            let result_status = match &result {
+                Ok(output) => output.status as i64,
+                Err(_) => -1,
+            };
+            let result_ok = result.is_ok();
+            let span = tracing::info_span!(
+                "runtime.complete",
+                worker.name = %worker_name,
+                worker.generation = generation,
+                isolate.id = isolate_id,
+                runtime.request_id = %request_id,
+                request.id = %user_request_id,
+                request.ok = result_ok,
+                response.status = result_status,
+                request.execution_ms = execution_ms.unwrap_or_default(),
+                request.wait_until_count = wait_until_count as u64
+            );
+            set_span_parent_from_traceparent(&span, completion_traceparent.as_deref());
+            Some(span)
+        } else {
+            None
         };
-        let result_ok = result.is_ok();
-        let complete_span = tracing::info_span!(
-            "runtime.complete",
-            worker.name = %worker_name,
-            worker.generation = generation,
-            isolate.id = isolate_id,
-            runtime.request_id = %request_id,
-            request.id = %user_request_id,
-            request.ok = result_ok,
-            response.status = result_status,
-            request.execution_ms = execution_ms.unwrap_or_default(),
-            request.wait_until_count = wait_until_count as u64
-        );
-        set_span_parent_from_traceparent(&complete_span, completion_traceparent.as_deref());
-        let _complete_guard = complete_span.enter();
+        let _complete_guard = complete_span.as_ref().map(|span| span.enter());
+
+        let stream_result = if stream_registered {
+            Some(result.clone())
+        } else {
+            None
+        };
+        let trace_result = if trace_destination.is_some() {
+            Some(result.clone())
+        } else {
+            None
+        };
 
         if !canceled {
             match pending_kind {
@@ -4079,31 +4248,46 @@ impl WorkerManager {
                     );
                 }
             }
-            tracing::info!("request completion delivered");
+            if info_tracing_enabled {
+                tracing::info!("request completion delivered");
+            }
         } else {
-            info!(
-                worker = %worker_name,
+            if info_tracing_enabled {
+                info!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    request_id,
+                    "dropped completion for canceled request"
+                );
+            }
+        }
+        if let (Some(trace_destination), Some(trace_result)) =
+            (trace_destination, trace_result.as_ref())
+        {
+            self.enqueue_trace_forward(
+                worker_name,
                 generation,
-                isolate_id,
+                &request_method,
+                &request_url,
                 request_id,
-                "dropped completion for canceled request"
+                &user_request_id,
+                trace_result,
+                execution_ms.unwrap_or_default(),
+                wait_until_count,
+                internal_origin,
+                Some(trace_destination),
+                event_tx,
             );
         }
-        self.enqueue_trace_forward(
-            worker_name,
-            generation,
-            &request_method,
-            &request_url,
-            request_id,
-            &user_request_id,
-            &trace_result,
-            execution_ms.unwrap_or_default(),
-            wait_until_count,
-            internal_origin,
-            trace_destination,
-            event_tx,
-        );
-        self.complete_stream_registration(worker_name, request_id, completion_token, stream_result);
+        if let Some(stream_result) = stream_result {
+            self.complete_stream_registration(
+                worker_name,
+                request_id,
+                completion_token,
+                stream_result,
+            );
+        }
     }
 
     fn enqueue_trace_forward(
@@ -4679,6 +4863,10 @@ impl WorkerManager {
     }
 
     fn cleanup_drained_generations_for(&mut self, worker_name: &str) {
+        if self.runtime_batch_depth > 0 {
+            self.pending_cleanup_workers.insert(worker_name.to_string());
+            return;
+        }
         let mut clear_request_ids = Vec::new();
         let mut retired_generations = HashSet::new();
         let live_websocket_generations: HashSet<u64> = self
@@ -4823,7 +5011,7 @@ fn select_dispatch_candidate(
     pool: &mut WorkerPool,
     max_inflight: usize,
     require_wait_until_idle: bool,
-) -> Option<DispatchCandidate> {
+) -> Option<DispatchSelection> {
     for (queue_idx, pending) in pool.queue.iter().enumerate() {
         if let Some(target_isolate_id) = pending.target_isolate_id {
             if let Some((isolate_idx, isolate)) = pool
@@ -4840,24 +5028,28 @@ fn select_dispatch_candidate(
                         || !require_wait_until_idle
                         || isolate.pending_wait_until.is_empty())
                 {
-                    return Some(DispatchCandidate {
+                    return Some(DispatchSelection::Dispatch(DispatchCandidate {
                         queue_idx,
                         isolate_idx,
                         actor_key,
                         assign_owner: false,
-                    });
+                    }));
                 }
+            } else {
+                return Some(DispatchSelection::DropStaleTarget { queue_idx });
             }
             continue;
         }
 
         let Some(route) = &pending.actor_route else {
             return least_loaded_isolate_idx(&pool.isolates, max_inflight, require_wait_until_idle)
-                .map(|isolate_idx| DispatchCandidate {
-                    queue_idx,
-                    isolate_idx,
-                    actor_key: None,
-                    assign_owner: false,
+                .map(|isolate_idx| {
+                    DispatchSelection::Dispatch(DispatchCandidate {
+                        queue_idx,
+                        isolate_idx,
+                        actor_key: None,
+                        assign_owner: false,
+                    })
                 });
         };
 
@@ -4866,12 +5058,12 @@ fn select_dispatch_candidate(
         if let Some(isolate_idx) =
             least_loaded_isolate_any_idx(&pool.isolates, require_wait_until_idle)
         {
-            return Some(DispatchCandidate {
+            return Some(DispatchSelection::Dispatch(DispatchCandidate {
                 queue_idx,
                 isolate_idx,
                 actor_key: Some(actor_key),
                 assign_owner: false,
-            });
+            }));
         }
     }
     None
@@ -5004,6 +5196,9 @@ impl WorkerPool {
     }
 
     fn log_stats(&self, event: &str) {
+        if !tracing::enabled!(Level::INFO) {
+            return;
+        }
         let snapshot = self.stats_snapshot();
         info!(
             worker = %self.worker_name,
@@ -5237,13 +5432,43 @@ fn spawn_runtime_thread(
                 loop {
                     tokio::select! {
                         Some(command) = receiver.recv() => {
+                            manager.begin_runtime_batch();
                             manager.handle_command(command, &event_tx).await;
+                            drain_ready_runtime_work(
+                                &mut manager,
+                                &mut receiver,
+                                &mut cancel_receiver,
+                                &mut event_rx,
+                                &event_tx,
+                            )
+                            .await;
+                            manager.finish_runtime_batch(&event_tx);
                         }
                         Some(command) = cancel_receiver.recv() => {
+                            manager.begin_runtime_batch();
                             manager.handle_command(command, &event_tx).await;
+                            drain_ready_runtime_work(
+                                &mut manager,
+                                &mut receiver,
+                                &mut cancel_receiver,
+                                &mut event_rx,
+                                &event_tx,
+                            )
+                            .await;
+                            manager.finish_runtime_batch(&event_tx);
                         }
                         Some(event) = event_rx.recv() => {
+                            manager.begin_runtime_batch();
                             manager.handle_event(event, &event_tx).await;
+                            drain_ready_runtime_work(
+                                &mut manager,
+                                &mut receiver,
+                                &mut cancel_receiver,
+                                &mut event_rx,
+                                &event_tx,
+                            )
+                            .await;
+                            manager.finish_runtime_batch(&event_tx);
                         }
                         _ = ticker.tick() => {
                             manager.scale_down_idle();
@@ -5260,6 +5485,46 @@ fn spawn_runtime_thread(
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
     Ok(())
+}
+
+async fn drain_ready_runtime_work(
+    manager: &mut WorkerManager,
+    receiver: &mut mpsc::Receiver<RuntimeCommand>,
+    cancel_receiver: &mut mpsc::UnboundedReceiver<RuntimeCommand>,
+    event_rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+) {
+    loop {
+        let mut made_progress = false;
+
+        match receiver.try_recv() {
+            Ok(command) => {
+                manager.handle_command(command, event_tx).await;
+                made_progress = true;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+
+        match cancel_receiver.try_recv() {
+            Ok(command) => {
+                manager.handle_command(command, event_tx).await;
+                made_progress = true;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+
+        match event_rx.try_recv() {
+            Ok(event) => {
+                manager.handle_event(event, event_tx).await;
+                made_progress = true;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+
+        if !made_progress {
+            break;
+        }
+    }
 }
 
 fn spawn_isolate_thread(
@@ -5505,229 +5770,50 @@ fn spawn_isolate_thread(
                             }
                         }
                         Some(command) = command_rx.recv() => {
-                            match command {
-                                IsolateCommand::Execute {
-                                    runtime_request_id,
-                                    completion_token,
-                                    worker_name: worker_name_for_env,
-                                    kv_bindings,
-                                    actor_bindings,
-                                    dynamic_bindings,
-                                    dynamic_rpc_bindings,
-                                    dynamic_env,
-                                    secret_replacements,
-                                    egress_allow_hosts,
-                                    request,
-                                    request_body,
-                                    actor_call,
-                                    host_rpc_call,
-                                    actor_route,
-                                } => {
-                                    let request_id = request.request_id.clone();
-                                    let has_request_body_stream = request_body.is_some();
-                                    if let Some(request_body) = request_body {
-                                        let op_state = js_runtime.op_state();
-                                        let mut op_state = op_state.borrow_mut();
-                                        register_request_body_stream(
-                                            &mut op_state,
-                                            runtime_request_id.clone(),
-                                            request_body,
-                                        );
-                                    }
-                                    if let Some(route) = actor_route.as_ref() {
-                                        let op_state = js_runtime.op_state();
-                                        let mut op_state = op_state.borrow_mut();
-                                        register_actor_request_scope(
-                                            &mut op_state,
-                                            runtime_request_id.clone(),
-                                            route.binding.clone(),
-                                            route.key.clone(),
-                                        );
-                                    }
-                                    {
-                                        let op_state = js_runtime.op_state();
-                                        let mut op_state = op_state.borrow_mut();
-                                        register_request_secret_context(
-                                            &mut op_state,
-                                            runtime_request_id.clone(),
-                                            worker_name_for_env.clone(),
-                                            generation,
-                                            isolate_id,
-                                            dynamic_bindings.clone(),
-                                            dynamic_rpc_bindings.clone(),
-                                            secret_replacements,
-                                            egress_allow_hosts,
-                                        );
-                                    }
-                                    let execute_span = tracing::info_span!(
-                                        "runtime.isolate.execute",
-                                        worker.name = %worker_name,
-                                        worker.generation = generation,
-                                        isolate.id = isolate_id,
-                                        runtime.request_id = %runtime_request_id,
-                                        request.id = %request_id
-                                    );
-                                    set_span_parent_from_traceparent(
-                                        &execute_span,
-                                        traceparent_from_headers(&request.headers).as_deref(),
-                                    );
-                                    let _execute_guard = execute_span.enter();
-                                    let started_at = Instant::now();
-                                    let dispatch_actor_call = actor_call.as_ref().map(|call| match call {
-                                        ActorExecutionCall::Method {
-                                            binding,
-                                            key,
-                                            name,
-                                            args,
-                                        } => ExecuteActorCall::Method {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                            name: name.clone(),
-                                            args: args.clone(),
-                                        },
-                                        ActorExecutionCall::Message {
-                                            binding,
-                                            key,
-                                            handle,
-                                            is_text,
-                                            data,
-                                        } => ExecuteActorCall::Message {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                            handle: handle.clone(),
-                                            is_text: *is_text,
-                                            data: data.clone(),
-                                        },
-                                        ActorExecutionCall::Close {
-                                            binding,
-                                            key,
-                                            handle,
-                                            code,
-                                            reason,
-                                        } => ExecuteActorCall::Close {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                            handle: handle.clone(),
-                                            code: *code,
-                                            reason: reason.clone(),
-                                        },
-                                        ActorExecutionCall::TransportDatagram {
-                                            binding,
-                                            key,
-                                            handle,
-                                            data,
-                                        } => ExecuteActorCall::TransportDatagram {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                            handle: handle.clone(),
-                                            data: data.clone(),
-                                        },
-                                        ActorExecutionCall::TransportStream {
-                                            binding,
-                                            key,
-                                            handle,
-                                            data,
-                                        } => ExecuteActorCall::TransportStream {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                            handle: handle.clone(),
-                                            data: data.clone(),
-                                        },
-                                        ActorExecutionCall::TransportClose {
-                                            binding,
-                                            key,
-                                            handle,
-                                            code,
-                                            reason,
-                                        } => ExecuteActorCall::TransportClose {
-                                            binding: binding.clone(),
-                                            key: key.clone(),
-                                            handle: handle.clone(),
-                                            code: *code,
-                                            reason: reason.clone(),
-                                        },
-                                    });
-                                    let dispatch_host_rpc_call = host_rpc_call.as_ref().map(|call| {
-                                        ExecuteHostRpcCall {
-                                            target_id: call.target_id.clone(),
-                                            method: call.method.clone(),
-                                            args: call.args.clone(),
+                            match handle_isolate_command(
+                                &mut js_runtime,
+                                &event_tx,
+                                &worker_name,
+                                generation,
+                                isolate_id,
+                                command,
+                            ) {
+                                Ok(true) => {
+                                    loop {
+                                        match command_rx.try_recv() {
+                                            Ok(command) => match handle_isolate_command(
+                                                &mut js_runtime,
+                                                &event_tx,
+                                                &worker_name,
+                                                generation,
+                                                isolate_id,
+                                                command,
+                                            ) {
+                                                Ok(true) => {}
+                                                Ok(false) => return,
+                                                Err(error) => {
+                                                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                                        worker_name: worker_name.clone(),
+                                                        generation,
+                                                        isolate_id,
+                                                        error,
+                                                    });
+                                                    return;
+                                                }
+                                            },
+                                            Err(TryRecvError::Empty) => break,
+                                            Err(TryRecvError::Disconnected) => return,
                                         }
-                                    });
-                                    if let Err(error) = dispatch_worker_request(
-                                        &mut js_runtime,
-                                        &runtime_request_id,
-                                        &completion_token,
-                                        &worker_name_for_env,
-                                        &kv_bindings,
-                                        &actor_bindings,
-                                        &dynamic_bindings,
-                                        &dynamic_rpc_bindings,
-                                        &dynamic_env,
-                                        has_request_body_stream,
-                                        dispatch_actor_call.as_ref(),
-                                        dispatch_host_rpc_call.as_ref(),
-                                        request,
-                                    ) {
-                                        {
-                                            let op_state = js_runtime.op_state();
-                                            let mut op_state = op_state.borrow_mut();
-                                            clear_request_body_stream(&mut op_state, &runtime_request_id);
-                                            crate::ops::clear_actor_request_scope(
-                                                &mut op_state,
-                                                &runtime_request_id,
-                                            );
-                                            clear_request_secret_context(
-                                                &mut op_state,
-                                                &runtime_request_id,
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            dispatch_ms = started_at.elapsed().as_millis() as u64,
-                                            error = %error,
-                                            "failed to dispatch request into isolate"
-                                        );
-                                        let _ = event_tx.send(RuntimeEvent::RequestFinished {
-                                            worker_name: worker_name.clone(),
-                                            generation,
-                                            isolate_id,
-                                            request_id: runtime_request_id,
-                                            completion_token,
-                                            wait_until_count: 0,
-                                            result: Err(error),
-                                        });
-                                    } else {
-                                        tracing::info!(
-                                            dispatch_ms = started_at.elapsed().as_millis() as u64,
-                                            "request dispatched into isolate event loop"
-                                        );
                                     }
                                 }
-                                IsolateCommand::Abort { runtime_request_id } => {
-                                    {
-                                        let op_state = js_runtime.op_state();
-                                        let mut op_state = op_state.borrow_mut();
-                                        cancel_request_body_stream(&mut op_state, &runtime_request_id);
-                                        clear_request_body_stream(&mut op_state, &runtime_request_id);
-                                        crate::ops::clear_actor_request_scope(
-                                            &mut op_state,
-                                            &runtime_request_id,
-                                        );
-                                        clear_request_secret_context(&mut op_state, &runtime_request_id);
-                                    }
-                                    if let Err(error) =
-                                        abort_worker_request(&mut js_runtime, &runtime_request_id)
-                                    {
-                                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                                            worker_name: worker_name.clone(),
-                                            generation,
-                                            isolate_id,
-                                            error,
-                                        });
-                                        break;
-                                    }
-                                }
-                                IsolateCommand::Shutdown => {
+                                Ok(false) => break,
+                                Err(error) => {
+                                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        isolate_id,
+                                        error,
+                                    });
                                     break;
                                 }
                             }
@@ -5766,6 +5852,228 @@ fn spawn_isolate_thread(
         }),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(PlatformError::internal("isolate startup timed out")),
+    }
+}
+
+fn handle_isolate_command(
+    js_runtime: &mut deno_core::JsRuntime,
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    worker_name: &str,
+    generation: u64,
+    isolate_id: u64,
+    command: IsolateCommand,
+) -> Result<bool> {
+    match command {
+        IsolateCommand::Execute {
+            runtime_request_id,
+            completion_token,
+            worker_name_json,
+            kv_bindings_json,
+            actor_bindings_json,
+            dynamic_bindings_json,
+            dynamic_rpc_bindings_json,
+            dynamic_env_json,
+            dynamic_bindings,
+            dynamic_rpc_bindings,
+            secret_replacements,
+            egress_allow_hosts,
+            request,
+            request_body,
+            actor_call,
+            host_rpc_call,
+            actor_route,
+        } => {
+            let request_id = request.request_id.clone();
+            let has_request_body_stream = request_body.is_some();
+            if let Some(request_body) = request_body {
+                let op_state = js_runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                register_request_body_stream(
+                    &mut op_state,
+                    runtime_request_id.clone(),
+                    request_body,
+                );
+            }
+            if let Some(route) = actor_route.as_ref() {
+                let op_state = js_runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                register_actor_request_scope(
+                    &mut op_state,
+                    runtime_request_id.clone(),
+                    route.binding.clone(),
+                    route.key.clone(),
+                );
+            }
+            {
+                let op_state = js_runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                register_request_secret_context(
+                    &mut op_state,
+                    runtime_request_id.clone(),
+                    worker_name.to_string(),
+                    generation,
+                    isolate_id,
+                    dynamic_bindings.clone(),
+                    dynamic_rpc_bindings.clone(),
+                    secret_replacements,
+                    egress_allow_hosts,
+                );
+            }
+            let execute_span = if tracing::enabled!(Level::INFO) {
+                let span = tracing::info_span!(
+                    "runtime.isolate.execute",
+                    worker.name = %worker_name,
+                    worker.generation = generation,
+                    isolate.id = isolate_id,
+                    runtime.request_id = %runtime_request_id,
+                    request.id = %request_id
+                );
+                set_span_parent_from_traceparent(
+                    &span,
+                    traceparent_from_headers(&request.headers).as_deref(),
+                );
+                Some(span)
+            } else {
+                None
+            };
+            let _execute_guard = execute_span.as_ref().map(|span| span.enter());
+            let started_at = Instant::now();
+            let dispatch_actor_call = actor_call.as_ref().map(|call| match call {
+                ActorExecutionCall::Method {
+                    binding,
+                    key,
+                    name,
+                    args,
+                } => ExecuteActorCall::Method {
+                    binding: binding.clone(),
+                    key: key.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                },
+                ActorExecutionCall::Message {
+                    binding,
+                    key,
+                    handle,
+                    is_text,
+                    data,
+                } => ExecuteActorCall::Message {
+                    binding: binding.clone(),
+                    key: key.clone(),
+                    handle: handle.clone(),
+                    is_text: *is_text,
+                    data: data.clone(),
+                },
+                ActorExecutionCall::Close {
+                    binding,
+                    key,
+                    handle,
+                    code,
+                    reason,
+                } => ExecuteActorCall::Close {
+                    binding: binding.clone(),
+                    key: key.clone(),
+                    handle: handle.clone(),
+                    code: *code,
+                    reason: reason.clone(),
+                },
+                ActorExecutionCall::TransportDatagram {
+                    binding,
+                    key,
+                    handle,
+                    data,
+                } => ExecuteActorCall::TransportDatagram {
+                    binding: binding.clone(),
+                    key: key.clone(),
+                    handle: handle.clone(),
+                    data: data.clone(),
+                },
+                ActorExecutionCall::TransportStream {
+                    binding,
+                    key,
+                    handle,
+                    data,
+                } => ExecuteActorCall::TransportStream {
+                    binding: binding.clone(),
+                    key: key.clone(),
+                    handle: handle.clone(),
+                    data: data.clone(),
+                },
+                ActorExecutionCall::TransportClose {
+                    binding,
+                    key,
+                    handle,
+                    code,
+                    reason,
+                } => ExecuteActorCall::TransportClose {
+                    binding: binding.clone(),
+                    key: key.clone(),
+                    handle: handle.clone(),
+                    code: *code,
+                    reason: reason.clone(),
+                },
+            });
+            let dispatch_host_rpc_call = host_rpc_call.as_ref().map(|call| ExecuteHostRpcCall {
+                target_id: call.target_id.clone(),
+                method: call.method.clone(),
+                args: call.args.clone(),
+            });
+            if let Err(error) = dispatch_worker_request(
+                js_runtime,
+                &runtime_request_id,
+                &completion_token,
+                &worker_name_json,
+                &kv_bindings_json,
+                &actor_bindings_json,
+                &dynamic_bindings_json,
+                &dynamic_rpc_bindings_json,
+                &dynamic_env_json,
+                has_request_body_stream,
+                dispatch_actor_call.as_ref(),
+                dispatch_host_rpc_call.as_ref(),
+                request,
+            ) {
+                {
+                    let op_state = js_runtime.op_state();
+                    let mut op_state = op_state.borrow_mut();
+                    clear_request_body_stream(&mut op_state, &runtime_request_id);
+                    crate::ops::clear_actor_request_scope(&mut op_state, &runtime_request_id);
+                    clear_request_secret_context(&mut op_state, &runtime_request_id);
+                }
+                tracing::warn!(
+                    dispatch_ms = started_at.elapsed().as_millis() as u64,
+                    error = %error,
+                    "failed to dispatch request into isolate"
+                );
+                let _ = event_tx.send(RuntimeEvent::RequestFinished {
+                    worker_name: worker_name.to_string(),
+                    generation,
+                    isolate_id,
+                    request_id: runtime_request_id,
+                    completion_token,
+                    wait_until_count: 0,
+                    result: Err(error),
+                });
+            } else {
+                tracing::info!(
+                    dispatch_ms = started_at.elapsed().as_millis() as u64,
+                    "request dispatched into isolate event loop"
+                );
+            }
+            Ok(true)
+        }
+        IsolateCommand::Abort { runtime_request_id } => {
+            {
+                let op_state = js_runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                cancel_request_body_stream(&mut op_state, &runtime_request_id);
+                clear_request_body_stream(&mut op_state, &runtime_request_id);
+                crate::ops::clear_actor_request_scope(&mut op_state, &runtime_request_id);
+                clear_request_secret_context(&mut op_state, &runtime_request_id);
+            }
+            abort_worker_request(js_runtime, &runtime_request_id)?;
+            Ok(true)
+        }
+        IsolateCommand::Shutdown => Ok(false),
     }
 }
 
@@ -6119,6 +6427,13 @@ impl Extractor for TraceparentExtractor<'_> {
     fn keys(&self) -> Vec<&str> {
         vec!["traceparent"]
     }
+}
+
+fn next_runtime_token(prefix: &str) -> String {
+    format!(
+        "{prefix}-{:x}",
+        NEXT_RUNTIME_TOKEN.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]
@@ -9719,7 +10034,10 @@ export default {
             )
             .await
             .expect("nested request should succeed");
-        assert_eq!(String::from_utf8(nested.body).expect("utf8"), "outer:inner:outer");
+        assert_eq!(
+            String::from_utf8(nested.body).expect("utf8"),
+            "outer:inner:outer"
+        );
 
         let restore = service
             .invoke(
@@ -9728,7 +10046,10 @@ export default {
             )
             .await
             .expect("restore request should succeed");
-        assert_eq!(String::from_utf8(restore.body).expect("utf8"), "missing:missing");
+        assert_eq!(
+            String::from_utf8(restore.body).expect("utf8"),
+            "missing:missing"
+        );
     }
 
     #[tokio::test]

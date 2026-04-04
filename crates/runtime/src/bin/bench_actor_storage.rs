@@ -125,6 +125,30 @@ export default {
 };
 "#;
 
+const ACTOR_ATOMIC_READ_STRICT_MEMORY_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.set("payload", "1");
+  return true;
+}
+
+export function read(state) {
+  return String(state.get("payload", { strict: true }) ?? "1");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/seed") {
+      await actor.atomic(seed);
+      return new Response("ok");
+    }
+    return new Response(String(await actor.atomic(read)));
+  },
+};
+"#;
+
 const ACTOR_STM_INCREMENT_WORKER_SOURCE: &str = r#"
 export function seed(state) {
   state.set("count", "0");
@@ -220,8 +244,10 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
 
-    println!("# actor storage benchmark");
-    println!("# compares hosted actor paths under configurable isolate and inflight settings.");
+    println!("# keyed memory benchmark");
+    println!(
+        "# compares hosted keyed-memory paths under configurable isolate and inflight settings."
+    );
     println!(
         "# runtime min_isolates={} max_isolates={} max_inflight_per_isolate={}",
         env_usize("DD_BENCH_MIN_ISOLATES", 1),
@@ -269,8 +295,20 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory") {
         run_and_print(
             &service,
-            "actor-atomic-read-memory",
+            "memory-atomic-read-memory",
             ACTOR_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+            true,
+            "/read",
+            1,
+            None,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory-strict") {
+        run_and_print(
+            &service,
+            "memory-atomic-read-memory-strict",
+            ACTOR_ATOMIC_READ_STRICT_MEMORY_WORKER_SOURCE,
             true,
             "/read",
             1,
@@ -281,7 +319,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory-multikey") {
         run_and_print(
             &service,
-            "actor-atomic-read-memory-multikey",
+            "memory-atomic-read-memory-multikey",
             ACTOR_ATOMIC_READ_MEMORY_WORKER_SOURCE,
             false,
             "/read",

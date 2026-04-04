@@ -212,7 +212,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/kv-counter.js` - tiny counter API (`/value`, `/inc`, `/reset`)
 - `examples/wait-until.js` - respond now, finish async work in `ctx.waitUntil`
 - `examples/wait-until-kv.js` - `waitUntil` background write into KV
-- `examples/actor.js` - keyed memory namespace (`env.USER_ACTOR.idFromName/get`, `atomic`, `tvar`)
+- `examples/actor.js` - keyed memory namespace (`env.USER_MEMORY.idFromName/get`, `atomic`, `tvar`)
 - `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
 - `examples/trace-hub.js` - minimal internal trace receiver and web view
 - `examples/dynamic-namespace.js` - spawn + invoke dynamic workers from `env.SANDBOX`
@@ -233,7 +233,7 @@ cargo run -p cli -- deploy kv examples/kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy kv-counter examples/kv-counter.js --kv-binding MY_KV
 cargo run -p cli -- deploy bg examples/wait-until.js
 cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
-cargo run -p cli -- deploy actor examples/actor.js --actor-binding USER_ACTOR
+cargo run -p cli -- deploy memory examples/actor.js --actor-binding USER_MEMORY
 cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
 cargo run -p cli -- deploy trace-hub examples/trace-hub.js
 cargo run -p cli -- deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
@@ -264,9 +264,9 @@ cargo run -p cli -- invoke kv-counter --method POST --path /inc
 cargo run -p cli -- invoke kv-counter --method GET --path /value
 printf "req-123" | xargs -I{} cargo run -p cli -- invoke bg-kv --method GET --path / --header "x-request-id: {}"
 cargo run -p cli -- invoke bg-kv --method GET --path / --header "x-request-id: verify-root"
-cargo run -p cli -- invoke actor --method GET --path /
-cargo run -p cli -- invoke actor --method POST --path /inc?user=alice
-cargo run -p cli -- invoke actor --method GET --path /value?user=alice
+cargo run -p cli -- invoke memory --method GET --path /
+cargo run -p cli -- invoke memory --method POST --path /inc?user=alice
+cargo run -p cli -- invoke memory --method GET --path /value?user=alice
 cargo run -p cli -- invoke receipts --method POST --path /receipts --header "content-type: application/json" --body-file -
 cargo run -p cli -- invoke receipts --method GET --path /receipts
 cargo run -p cli -- invoke dynamic --method GET --path /run?path=/hello
@@ -279,7 +279,7 @@ cargo run -p cli -- invoke preview-dynamic --method GET --path /preview/pr-123/a
 Primary public route notes:
 
 - `kv-counter`: use `/` for docs, then `/value`, `/inc`, `/reset`.
-- `actor`: use `/` for docs, then `/ping`, `/inc?user=...`, `/value?user=...`.
+- `memory`: use `/` for docs, then `/ping`, `/inc?user=...`, `/value?user=...`.
 - `bg-kv`: use `/` for docs, then repeat `/` with an `x-request-id` header for the queued write path.
 - `dynamic`, `llm-dynamic`, `preview-dynamic`: use `/` for docs, then their explicit `/run` or `/preview/{id}` paths.
 - `trace-hub` includes a root summary; cache examples are best verified on their primary behavior routes.

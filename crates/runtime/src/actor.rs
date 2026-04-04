@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use turso::{Builder, Connection, Database};
+use turso::{Builder, Connection, Database, Value};
 
 #[derive(Clone)]
 pub struct ActorStore {
@@ -102,6 +102,144 @@ impl ActorStore {
         Ok(ActorSnapshot {
             entries,
             max_version,
+        })
+    }
+
+    pub async fn snapshot_keys(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        keys: &[String],
+    ) -> Result<ActorSnapshot> {
+        if keys.is_empty() {
+            return self.snapshot(namespace, actor_key).await;
+        }
+        let conn = self.connect(namespace, actor_key).await?;
+        let filtered_keys = keys
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .collect::<Vec<_>>();
+        if filtered_keys.is_empty() {
+            let max_version = self
+                .max_version_for_actor(&conn, actor_key)
+                .await?
+                .unwrap_or(-1);
+            self.observe_version(max_version);
+            return Ok(ActorSnapshot {
+                entries: Vec::new(),
+                max_version,
+            });
+        }
+        let placeholders = (0..filtered_keys.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT item_key, value_blob, encoding, value, version, deleted
+             FROM actor_state
+             WHERE entity_key = ?1 AND item_key IN ({placeholders})
+             ORDER BY item_key ASC"
+        );
+        let mut params = Vec::with_capacity(filtered_keys.len() + 1);
+        params.push(Value::Text(actor_key.to_string()));
+        params.extend(
+            filtered_keys
+                .iter()
+                .map(|key| Value::Text((*key).to_string())),
+        );
+        let mut entries = Vec::new();
+        let mut rows = conn.query(&sql, params).await.map_err(actor_error)?;
+        while let Some(row) = rows.next().await.map_err(actor_error)? {
+            let key: String = row.get::<String>(0).map_err(actor_error)?;
+            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(1).map_err(actor_error)?;
+            let encoding: String = row.get::<String>(2).map_err(actor_error)?;
+            let legacy_value: String = row.get::<String>(3).map_err(actor_error)?;
+            let version: i64 = row.get::<i64>(4).map_err(actor_error)?;
+            let deleted: i64 = row.get::<i64>(5).map_err(actor_error)?;
+            entries.push(ActorSnapshotEntry {
+                key,
+                value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
+                encoding: normalize_encoding(&encoding),
+                version,
+                deleted: deleted != 0,
+            });
+        }
+        let max_version = self
+            .max_version_for_actor(&conn, actor_key)
+            .await?
+            .unwrap_or(-1);
+        self.observe_version(max_version);
+        Ok(ActorSnapshot {
+            entries,
+            max_version,
+        })
+    }
+
+    pub async fn validate_reads(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        reads: &[ActorReadDependency],
+        list_gate_version: Option<i64>,
+    ) -> Result<ActorBatchApplyResult> {
+        let conn = self.connect(namespace, actor_key).await?;
+        let current = self
+            .max_version_for_actor(&conn, actor_key)
+            .await?
+            .unwrap_or(-1);
+        if let Some(expected_list_version) = list_gate_version {
+            if current != expected_list_version {
+                return Ok(ActorBatchApplyResult {
+                    conflict: true,
+                    max_version: current,
+                });
+            }
+        }
+        if reads.is_empty() {
+            return Ok(ActorBatchApplyResult {
+                conflict: false,
+                max_version: current,
+            });
+        }
+        let placeholders = (0..reads.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT item_key, version
+             FROM actor_state
+             WHERE entity_key = ?1 AND item_key IN ({placeholders})"
+        );
+        let mut params = Vec::with_capacity(reads.len() + 1);
+        params.push(Value::Text(actor_key.to_string()));
+        params.extend(
+            reads
+                .iter()
+                .map(|dependency| Value::Text(dependency.key.clone())),
+        );
+        let mut rows = conn.query(&sql, params).await.map_err(actor_error)?;
+        let mut observed_versions = HashMap::with_capacity(reads.len());
+        while let Some(row) = rows.next().await.map_err(actor_error)? {
+            let key: String = row.get::<String>(0).map_err(actor_error)?;
+            let version: i64 = row.get::<i64>(1).map_err(actor_error)?;
+            observed_versions.insert(key, version);
+        }
+        for dependency in reads {
+            let observed = observed_versions
+                .get(&dependency.key)
+                .copied()
+                .unwrap_or(-1);
+            if observed != dependency.version {
+                return Ok(ActorBatchApplyResult {
+                    conflict: true,
+                    max_version: current.max(observed),
+                });
+            }
+        }
+        Ok(ActorBatchApplyResult {
+            conflict: false,
+            max_version: current,
         })
     }
 

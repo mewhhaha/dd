@@ -16,17 +16,38 @@ fn main() {
 }
 
 fn compile_actor_rpc_schema() {
-    match capnpc::CompilerCommand::new()
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"));
+    let generated = out_dir.join("actor_rpc_capnp.rs");
+    let compile_result = capnpc::CompilerCommand::new()
         .src_prefix("schema")
         .file("schema/actor_rpc.capnp")
-        .run()
+        .run();
+
+    if generated.is_file()
+        && fs::metadata(&generated)
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
     {
-        Ok(()) => {}
-        Err(error) => {
-            if try_reuse_generated_actor_rpc().is_none() {
-                panic!("failed to compile Cap'n Proto schema for actor_rpc: {error}");
-            }
-        }
+        return;
+    }
+
+    if try_reuse_generated_actor_rpc().is_some() {
+        return;
+    }
+
+    if let Err(error) = compile_result {
+        panic!("failed to compile Cap'n Proto schema for actor_rpc: {error}");
+    }
+
+    if !generated.is_file()
+        || fs::metadata(&generated)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(true)
+    {
+        panic!(
+            "actor_rpc Cap'n Proto generation produced no usable output at {}",
+            generated.display()
+        );
     }
 }
 

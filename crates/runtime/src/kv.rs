@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use turso::{Builder, Connection, Database};
 
@@ -12,7 +13,34 @@ const ENCODING_V8SC: &str = "v8sc";
 #[derive(Clone)]
 pub struct KvStore {
     database: Arc<Database>,
+    connections: Arc<Mutex<Vec<Connection>>>,
     version: Arc<AtomicU64>,
+}
+
+struct KvConnectionGuard {
+    connections: Arc<Mutex<Vec<Connection>>>,
+    conn: Option<Connection>,
+}
+
+impl std::ops::Deref for KvConnectionGuard {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn
+            .as_ref()
+            .expect("kv pooled connection must be present")
+    }
+}
+
+impl Drop for KvConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.connections
+                .lock()
+                .expect("kv connection pool lock poisoned")
+                .push(conn);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +69,7 @@ impl KvStore {
             .map_err(kv_error)?;
         let store = Self {
             database: Arc::new(database),
+            connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
         };
         store.ensure_schema().await?;
@@ -300,10 +329,24 @@ impl KvStore {
         Ok(max_version.saturating_add(1).max(1) as u64)
     }
 
-    async fn connect(&self) -> Result<Connection> {
+    async fn connect(&self) -> Result<KvConnectionGuard> {
+        if let Some(conn) = self
+            .connections
+            .lock()
+            .expect("kv connection pool lock poisoned")
+            .pop()
+        {
+            return Ok(KvConnectionGuard {
+                connections: Arc::clone(&self.connections),
+                conn: Some(conn),
+            });
+        }
         let conn = self.database.connect().map_err(kv_error)?;
         configure_connection(&conn).await?;
-        Ok(conn)
+        Ok(KvConnectionGuard {
+            connections: Arc::clone(&self.connections),
+            conn: Some(conn),
+        })
     }
 
     fn next_version(&self) -> i64 {
@@ -428,6 +471,7 @@ mod tests {
             .map_err(kv_error)?;
         let store = KvStore {
             database: Arc::new(database),
+            connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
         };
         store.ensure_schema().await?;

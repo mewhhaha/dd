@@ -4,7 +4,7 @@ This example is a small browser chat built with:
 
 - plain HTML forms/buttons (no custom styling)
 - vendored `fixi.js` plus a tiny websocket plugin for UI updates
-- a keyed room memory for per-room websocket fanout and persisted message history
+- a keyed room memory namespace for per-room websocket fanout and persisted message history
 
 ## Build (optional)
 

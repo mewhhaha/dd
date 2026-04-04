@@ -1,15 +1,15 @@
-(() => {
-  const requestId = __REQUEST_ID__;
-  const completionToken = __COMPLETION_TOKEN__;
-  const workerName = __WORKER_NAME__;
-  const kvBindingsConfig = __KV_BINDINGS_JSON__;
-  const actorBindingsConfig = __ACTOR_BINDINGS_JSON__;
-  const dynamicBindingsConfig = __DYNAMIC_BINDINGS_JSON__;
-  const dynamicRpcBindingsConfig = __DYNAMIC_RPC_BINDINGS_JSON__;
-  const dynamicEnvConfig = __DYNAMIC_ENV_JSON__;
-  const actorCallConfig = __ACTOR_CALL_JSON__;
-  const hostRpcCallConfig = __HOST_RPC_CALL_JSON__;
-  const hasRequestBodyStream = __HAS_REQUEST_BODY_STREAM__;
+globalThis.__dd_execute_worker = (payload) => {
+  const requestId = String(payload?.request_id ?? "");
+  const completionToken = String(payload?.completion_token ?? "");
+  const workerName = String(payload?.worker_name ?? "");
+  const kvBindingsConfig = payload?.kv_bindings ?? [];
+  const actorBindingsConfig = payload?.actor_bindings ?? [];
+  const dynamicBindingsConfig = payload?.dynamic_bindings ?? [];
+  const dynamicRpcBindingsConfig = payload?.dynamic_rpc_bindings ?? [];
+  const dynamicEnvConfig = payload?.dynamic_env ?? [];
+  const actorCallConfig = payload?.actor_call ?? null;
+  const hostRpcCallConfig = payload?.host_rpc_call ?? null;
+  const hasRequestBodyStream = payload?.has_request_body_stream === true;
   const worker = globalThis.__dd_worker;
 
   if (worker === undefined) {
@@ -22,14 +22,38 @@
   if (globalThis.RpcTarget !== RpcTarget) {
     globalThis.RpcTarget = RpcTarget;
   }
-  const input = __REQUEST_JSON__;
+  const input = payload?.request ?? null;
   const controller = new AbortController();
   const waitUntilPromises = [];
   let waitUntilDoneSent = false;
   let actorInvokeSeq = 0;
   let currentActorEntry = null;
   let currentActorRequestId = null;
+  let currentMemoryTxnScope = null;
+  let currentSocketRuntimeProvider = null;
+  let currentTransportRuntimeProvider = null;
   globalThis.__dd_active_request_id = requestId;
+
+  const originalWebSocket = globalThis.WebSocket;
+  const originalWebTransportSession = globalThis.WebTransportSession;
+  globalThis.WebSocket = function WebSocket(handle) {
+    if (currentSocketRuntimeProvider) {
+      return currentSocketRuntimeProvider().WebSocket(handle);
+    }
+    if (typeof originalWebSocket === "function") {
+      return new originalWebSocket(handle);
+    }
+    throw new Error("handle-backed WebSocket is unavailable outside keyed memory scope");
+  };
+  globalThis.WebTransportSession = function WebTransportSession(handle) {
+    if (currentTransportRuntimeProvider) {
+      return currentTransportRuntimeProvider().WebTransportSession(handle);
+    }
+    if (typeof originalWebTransportSession === "function") {
+      return new originalWebTransportSession(handle);
+    }
+    throw new Error("handle-backed WebTransportSession is unavailable outside keyed memory scope");
+  };
 
   inflightRequests.set(requestId, controller);
 
@@ -67,15 +91,17 @@
   };
 
   const withActorTxnScope = (scope, callback) => {
-    const asyncContext = globalThis.__dd_async_context;
-    if (!asyncContext || typeof asyncContext.run !== "function") {
-      throw new Error("dd async context store is unavailable");
+    const previousScope = currentMemoryTxnScope;
+    currentMemoryTxnScope = scope;
+    try {
+      return callback();
+    } finally {
+      currentMemoryTxnScope = previousScope;
     }
-    return asyncContext.run(scope, callback);
   };
 
   const actorTxnScopeFor = (binding, actorKey) => {
-    const currentActorTxnScope = globalThis.__dd_async_context?.getStore?.() ?? null;
+    const currentActorTxnScope = currentMemoryTxnScope;
     if (
       currentActorTxnScope
       && currentActorTxnScope.binding === binding
@@ -230,17 +256,35 @@
   const createKvBinding = (bindingName) => ({
     async get(key, options = {}) {
       const _ = options;
+      const normalizedKey = String(key);
+      const utf8Result = await callOp(
+        "op_kv_get",
+        workerName,
+        bindingName,
+        normalizedKey,
+      );
+      await syncFrozenTime();
+      if (utf8Result && typeof utf8Result === "object" && utf8Result.ok === true) {
+        if (utf8Result.found !== true) {
+          return null;
+        }
+        return String(utf8Result.value ?? "");
+      }
+      const utf8Error = String(utf8Result?.error ?? "");
+      if (utf8Error && !utf8Error.includes("use env.KV.get() for JS value decoding")) {
+        throw new Error(utf8Error || "kv get failed");
+      }
       const result = await callOp(
         "op_kv_get_value",
         JSON.stringify({
           worker_name: workerName,
           binding: bindingName,
-          key: String(key),
+          key: normalizedKey,
         }),
       );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "kv get failed"));
+        throw new Error(String((result.error ?? utf8Error) || "kv get failed"));
       }
       if (result?.found !== true) {
         return null;
@@ -735,7 +779,7 @@
     if (encoding === "v8sc") {
       return Deno.core.deserialize(bytes, { forStorage: true });
     }
-    throw new Error(`actor storage get unsupported encoding: ${encoding}`);
+    throw new Error(`memory storage get unsupported encoding: ${encoding}`);
   };
 
   const ensureActorStorageState = (entry) => {
@@ -744,6 +788,7 @@
         hydrated: false,
         hydrating: null,
         mirror: new Map(),
+        loadedKeys: new Set(),
         committedVersion: -1,
         nextVersion: 0,
         pendingMutations: [],
@@ -780,9 +825,82 @@
     deferred: [],
     listGateVersion: null,
     stagedVersionSeed: null,
+    accepted: false,
     committed: false,
     committedVersion: null,
   });
+
+  const actorTxnIsSnapshotOnly = (txn) => !!txn
+    && txn.reads.size === 0
+    && txn.writes.size === 0
+    && txn.deferred.length === 0
+    && txn.listGateVersion == null
+    && txn.accepted !== true;
+
+  class MemoryHydrationNeeded extends Error {
+    constructor(mode, keys = []) {
+      super(mode === "full" ? "memory hydration requires full snapshot" : "memory hydration requires keys");
+      this.name = "MemoryHydrationNeeded";
+      this.__dd_memory_hydration_needed = true;
+      this.mode = mode;
+      this.keys = Array.isArray(keys)
+        ? keys.map((value) => String(value)).filter((value) => value.length > 0)
+        : [];
+    }
+  }
+
+  const mergeActorSnapshotEntries = (storageState, entries, maxVersion, mode, requestedKeys = []) => {
+    if (mode === "full") {
+      storageState.mirror.clear();
+      storageState.loadedKeys.clear();
+    }
+    const seenKeys = new Set();
+    for (const entryValue of Array.isArray(entries) ? entries : []) {
+      const key = String(entryValue?.key ?? "");
+      if (!key) {
+        continue;
+      }
+      seenKeys.add(key);
+      storageState.loadedKeys.add(key);
+      storageState.mirror.set(key, {
+        key,
+        value: toArrayBytes(entryValue?.value ?? []),
+        encoding: String(entryValue?.encoding ?? "utf8"),
+        version: Number(entryValue?.version ?? -1),
+        deleted: entryValue?.deleted === true,
+      });
+    }
+    if (mode !== "full") {
+      for (const key of requestedKeys) {
+        const normalizedKey = String(key ?? "");
+        if (!normalizedKey || storageState.loadedKeys.has(normalizedKey)) {
+          continue;
+        }
+        storageState.loadedKeys.add(normalizedKey);
+        if (!seenKeys.has(normalizedKey) && !storageState.mirror.has(normalizedKey)) {
+          storageState.mirror.set(normalizedKey, {
+            key: normalizedKey,
+            value: new Uint8Array(),
+            encoding: "utf8",
+            version: -1,
+            deleted: true,
+          });
+        }
+      }
+    }
+    const nextCommittedVersion = Number(maxVersion ?? storageState.committedVersion ?? -1);
+    storageState.committedVersion = Math.max(
+      Number(storageState.committedVersion ?? -1),
+      nextCommittedVersion,
+    );
+    storageState.nextVersion = Math.max(
+      Number(storageState.nextVersion ?? 0),
+      Number(storageState.committedVersion ?? -1) + 1,
+    );
+    if (mode === "full") {
+      storageState.hydrated = true;
+    }
+  };
 
   const actorTxnReadRecord = (txn, key) => {
     const normalizedKey = String(key);
@@ -825,11 +943,11 @@
           request_id: runtimeRequestId,
           handle,
           code: 1011,
-          reason: "actor storage flush failed",
+          reason: "memory storage flush failed",
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
-          console.warn(String(result.error ?? "actor socket close failed"));
+          console.warn(String(result.error ?? "memory socket close failed"));
         }
       } catch {
         // Ignore follow-up close failures after the actor has already failed.
@@ -848,12 +966,12 @@
             request_id: runtimeRequestId,
             handle,
             code: 1011,
-            reason: "actor storage flush failed",
+          reason: "memory storage flush failed",
           },
         );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
-          console.warn(String(result.error ?? "actor transport close failed"));
+          console.warn(String(result.error ?? "memory transport close failed"));
         }
       } catch {
         // Ignore follow-up close failures after the actor has already failed.
@@ -866,7 +984,7 @@
     if (storageState.failedError) {
       throw storageState.failedError;
     }
-    const failure = error instanceof Error ? error : new Error(String(error ?? "actor failed"));
+    const failure = error instanceof Error ? error : new Error(String(error ?? "memory namespace failed"));
     storageState.failedError = failure;
     if (entry.cacheKey) {
       actorStateEntries.delete(entry.cacheKey);
@@ -888,6 +1006,8 @@
           "op_actor_state_apply_batch",
           {
             request_id: runtimeRequestId,
+            binding: entry.binding,
+            key: entry.actorKey,
             expected_base_version: storageState.committedVersion,
             mutations: mutations.map((mutation) => ({
               key: mutation.key,
@@ -900,10 +1020,10 @@
         );
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "actor storage batch flush failed"));
+          throw new Error(String(result?.error ?? "memory storage batch flush failed"));
         }
         if (result.conflict === true) {
-          throw new Error("actor storage batch flush conflicted");
+          throw new Error("memory storage batch flush conflicted");
         }
         storageState.committedVersion = Number(result.max_version ?? storageState.committedVersion);
       }
@@ -960,28 +1080,19 @@
       storageState.hydrating = (async () => {
         const result = await callOp("op_actor_state_snapshot", {
           request_id: runtimeRequestId,
+          binding: entry.binding,
+          key: entry.actorKey,
         });
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "actor storage snapshot failed"));
+          throw new Error(String(result?.error ?? "memory storage snapshot failed"));
         }
-        storageState.mirror.clear();
-        const entries = Array.isArray(result.entries) ? result.entries : [];
-        let maxVersion = Number(result.max_version ?? -1);
-        for (const entryValue of entries) {
-          const version = Number(entryValue?.version ?? -1);
-          maxVersion = Math.max(maxVersion, version);
-          storageState.mirror.set(String(entryValue?.key ?? ""), {
-            key: String(entryValue?.key ?? ""),
-            value: toArrayBytes(entryValue?.value ?? []),
-            encoding: String(entryValue?.encoding ?? "utf8"),
-            version,
-            deleted: entryValue?.deleted === true,
-          });
-        }
-        storageState.committedVersion = maxVersion;
-        storageState.nextVersion = maxVersion + 1;
-        storageState.hydrated = true;
+        mergeActorSnapshotEntries(
+          storageState,
+          result.entries,
+          result.max_version,
+          "full",
+        );
         storageState.hydrating = null;
         return storageState;
       })().catch(async (error) => {
@@ -992,6 +1103,41 @@
     return await storageState.hydrating;
   };
 
+  const ensureActorStorageKeysHydrated = async (entry, runtimeRequestId, keys, options = {}) => {
+    const storageState = ensureActorStorageState(entry);
+    const force = options?.force === true;
+    if (storageState.hydrated) {
+      return storageState;
+    }
+    const pendingKeys = Array.from(new Set(
+      (Array.isArray(keys) ? keys : [])
+        .map((value) => String(value ?? ""))
+        .filter((value) => value.length > 0)
+        .filter((value) => force || !storageState.loadedKeys.has(value)),
+    ));
+    if (pendingKeys.length === 0) {
+      return storageState;
+    }
+    const result = await callOp("op_actor_state_snapshot", {
+      request_id: runtimeRequestId,
+      binding: entry.binding,
+      key: entry.actorKey,
+      keys: pendingKeys,
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory storage point snapshot failed"));
+    }
+    mergeActorSnapshotEntries(
+      storageState,
+      result.entries,
+      result.max_version,
+      "keys",
+      pendingKeys,
+    );
+    return storageState;
+  };
+
   const stageActorTxnWrite = (txn, record) => {
     txn.writes.set(String(record.key ?? ""), cloneActorRecord(record));
   };
@@ -1000,6 +1146,7 @@
     const storageState = ensureActorStorageState(entry);
     storageState.hydrated = false;
     storageState.hydrating = null;
+    storageState.loadedKeys.clear();
     await ensureActorStorageHydrated(entry, runtimeRequestId);
   };
 
@@ -1015,6 +1162,8 @@
     }));
     const result = await callOp("op_actor_state_apply_batch", {
       request_id: runtimeRequestId,
+      binding: txn.entry.binding,
+      key: txn.entry.actorKey,
       transactional: true,
       expected_base_version: -1,
       reads,
@@ -1029,7 +1178,7 @@
     });
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "actor transaction commit failed"));
+      throw new Error(String(result?.error ?? "memory transaction commit failed"));
     }
     if (result.conflict === true) {
       await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
@@ -1053,6 +1202,51 @@
     return true;
   };
 
+  const validateActorTxnReads = async (txn, runtimeRequestId) => {
+    if (!txn) {
+      return true;
+    }
+    const storageState = ensureActorStorageState(txn.entry);
+    const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
+      key,
+      version: Number(version ?? -1),
+    }));
+    const result = await callOp("op_actor_state_validate_reads", {
+      request_id: runtimeRequestId,
+      binding: txn.entry.binding,
+      key: txn.entry.actorKey,
+      reads,
+      list_gate_version: txn.listGateVersion == null ? -1 : Number(txn.listGateVersion),
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory transaction validation failed"));
+    }
+    if (result.conflict === true) {
+      await ensureActorStorageKeysHydrated(
+        txn.entry,
+        runtimeRequestId,
+        reads.map((entry) => entry.key),
+        { force: true },
+      );
+      if (txn.listGateVersion != null) {
+        await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
+      }
+      return false;
+    }
+    storageState.committedVersion = Math.max(
+      Number(storageState.committedVersion ?? -1),
+      Number(result.max_version ?? storageState.committedVersion ?? -1),
+    );
+    storageState.nextVersion = Math.max(
+      Number(storageState.nextVersion ?? 0),
+      Number(storageState.committedVersion ?? -1) + 1,
+    );
+    txn.committed = true;
+    txn.committedVersion = Number(result.max_version ?? storageState.committedVersion);
+    return true;
+  };
+
   const createActorStorageBinding = (entry, runtimeRequestId, txn = null) => {
     const currentStorageRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
     return {
@@ -1062,6 +1256,9 @@
           throw storageState.failedError;
         }
         const normalizedKey = String(key);
+        if (txn && !storageState.hydrated && !storageState.loadedKeys.has(normalizedKey)) {
+          throw new MemoryHydrationNeeded("keys", [normalizedKey]);
+        }
         const record = txn
           ? actorTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
@@ -1163,6 +1360,9 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
+        if (txn && !storageState.hydrated) {
+          throw new MemoryHydrationNeeded("full");
+        }
         const prefix = String(options?.prefix ?? "");
         const limitInput = Number(options?.limit ?? 100);
         const limit = Number.isFinite(limitInput)
@@ -1201,6 +1401,8 @@
       const perform = async () => {
         const result = await callOp("op_actor_socket_send", {
           request_id: requestIdForOp,
+          binding: entry.binding,
+          key: entry.actorKey,
           handle: normalizedHandle,
           message_kind: payload.kind,
           message: payload.value,
@@ -1221,6 +1423,8 @@
       const perform = async () => {
         const result = await callOp("op_actor_socket_close", {
           request_id: requestIdForOp,
+          binding: entry.binding,
+          key: entry.actorKey,
           handle: normalizedHandle,
           code,
           reason,
@@ -1240,6 +1444,8 @@
     const consumeCloseEvents = async (target) => {
       const result = await callOp("op_actor_socket_consume_close", {
         request_id: currentSocketRequestId(),
+        binding: entry.binding,
+        key: entry.actorKey,
         handle: target.__dd_handle,
       });
       await syncFrozenTime();
@@ -1375,7 +1581,7 @@
               } catch (error) {
                 try {
                   console.warn(
-                    "actor websocket listener failed",
+                    "memory websocket listener failed",
                     String((error && (error.stack || error.message)) || error),
                   );
                 } catch {
@@ -1395,7 +1601,7 @@
             } catch (error) {
               try {
                 console.warn(
-                  "actor websocket onmessage failed",
+                  "memory websocket onmessage failed",
                   String((error && (error.stack || error.message)) || error),
                 );
               } catch {
@@ -1452,7 +1658,7 @@
       accept(request, options = {}) {
         const _ = options;
         if (!allowSocketAccept) {
-          throw new Error("state.sockets.accept is only available during actor fetch()");
+          throw new Error("state.sockets.accept is only available during a keyed memory request");
         }
         if (upgradeAccepted.used) {
           throw new Error("state.sockets.accept can only be called once per request");
@@ -1533,6 +1739,8 @@
       async refreshOpenHandles() {
         const result = await callOp("op_actor_socket_list", {
           request_id: currentSocketRequestId(),
+          binding: entry.binding,
+          key: entry.actorKey,
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -1601,6 +1809,8 @@
     const consumeCloseEvents = async (target) => {
       const result = await callOp("op_actor_transport_consume_close", {
         request_id: currentTransportRequestId(),
+        binding: entry.binding,
+        key: entry.actorKey,
         handle: target.__dd_handle,
       });
       await syncFrozenTime();
@@ -1789,7 +1999,7 @@
       accept(request, options = {}) {
         const _ = options;
         if (!allowTransportAccept) {
-          throw new Error("state.transports.accept is only available during actor fetch()");
+          throw new Error("state.transports.accept is only available during a keyed memory request");
         }
         if (transportAccepted.used) {
           throw new Error("state.transports.accept can only be called once per request");
@@ -1858,6 +2068,8 @@
           "op_actor_transport_handles",
         ], {
           request_id: currentTransportRequestId(),
+          binding: entry.binding,
+          key: entry.actorKey,
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -1883,20 +2095,31 @@
     allowTransportAccept,
     txn = null,
   ) => {
-    const socketRuntime = createActorSocketRuntime(
-      entry,
-      runtimeRequestId,
-      allowSocketAccept,
-    );
-    const transportRuntime = createActorTransportRuntime(
-      entry,
-      runtimeRequestId,
-      allowTransportAccept,
-    );
     const storage = createActorStorageBinding(entry, runtimeRequestId, txn);
-    const sockets = socketRuntime.sockets;
-    entry.socketRuntime = socketRuntime;
-    entry.transportRuntime = transportRuntime;
+    let socketRuntime = null;
+    let transportRuntime = null;
+    const ensureSocketRuntime = () => {
+      if (!socketRuntime) {
+        socketRuntime = createActorSocketRuntime(
+          entry,
+          runtimeRequestId,
+          allowSocketAccept,
+        );
+        entry.socketRuntime = socketRuntime;
+      }
+      return socketRuntime;
+    };
+    const ensureTransportRuntime = () => {
+      if (!transportRuntime) {
+        transportRuntime = createActorTransportRuntime(
+          entry,
+          runtimeRequestId,
+          allowTransportAccept,
+        );
+        entry.transportRuntime = transportRuntime;
+      }
+      return transportRuntime;
+    };
     return {
       id: {
         toString() {
@@ -1916,10 +2139,18 @@
         return storage.list(options);
       },
       storage,
-      sockets,
-      transports: transportRuntime.transports,
-      __dd_socket_runtime: socketRuntime,
-      __dd_transport_runtime: transportRuntime,
+      get sockets() {
+        return ensureSocketRuntime().sockets;
+      },
+      get transports() {
+        return ensureTransportRuntime().transports;
+      },
+      get __dd_socket_runtime() {
+        return ensureSocketRuntime();
+      },
+      get __dd_transport_runtime() {
+        return ensureTransportRuntime();
+      },
     };
   };
 
@@ -1937,7 +2168,13 @@
       allowTransportAccept,
       txn,
     );
-    const stub = createActorStub(entry.binding, entry.actorKey);
+    let stub = null;
+    const ensureStub = () => {
+      if (!stub) {
+        stub = createActorStub(entry.binding, entry.actorKey);
+      }
+      return stub;
+    };
     const isTransportRequest = (request) => {
       if (!(request instanceof Request)) {
         return false;
@@ -1978,7 +2215,9 @@
     };
     return {
       id: runtimeState.id,
-      stub,
+      get stub() {
+        return ensureStub();
+      },
       storage: runtimeState.storage,
       __dd_socket_runtime: runtimeState.__dd_socket_runtime,
       __dd_transport_runtime: runtimeState.__dd_transport_runtime,
@@ -2025,6 +2264,9 @@
         return callback;
       },
       accept(request, options = {}) {
+        if (txn) {
+          txn.accepted = true;
+        }
         if (isTransportRequest(request)) {
           const accepted = runtimeState.transports.accept(request, options);
           return {
@@ -2356,7 +2598,8 @@
           return record ? record.value : defaultValue;
         }
         return (async () => {
-          const entry = await ensureActorEntry(bindingName, actorKey, requestId);
+          const entry = await ensureActorEntry(bindingName, actorKey, requestId, { hydrate: false });
+          await ensureActorStorageKeysHydrated(entry, requestId, [normalizedKey]);
           const state = createActorRuntimeState(entry, requestId, false, false);
           const record = state.storage.get(normalizedKey, options);
           return record ? record.value : defaultValue;
@@ -2461,7 +2704,7 @@
           await session.close(Number(effect.code ?? 0), String(effect.reason ?? ""));
           continue;
         }
-        throw new Error(`unsupported actor effect type: ${type}`);
+        throw new Error(`unsupported memory effect type: ${type}`);
       }
     },
   });
@@ -2474,6 +2717,16 @@
     args,
   ) => {
       actorInvokeSeq += 1;
+      const localRuntimeRequestId = `${activeRequestId() || requestId}:actor-run:${actorInvokeSeq}`;
+      if (methodName === ACTOR_ATOMIC_METHOD && typeof executable === "function") {
+        const entry = await ensureActorEntry(namespace, actorKey, localRuntimeRequestId, { hydrate: false });
+        return await executeActorTransaction(
+          entry,
+          localRuntimeRequestId,
+          executable,
+          args,
+        );
+      }
       const descriptor = extractExecDescriptor(executable);
       const payload = [
         {
@@ -2494,12 +2747,12 @@
             prefer_caller_isolate: preferCallerIsolate,
             args: Array.from(argsBytes),
             caller_request_id: activeRequestId() || requestId,
-            request_id: `${requestId}:actor-run:${actorInvokeSeq}`,
+            request_id: localRuntimeRequestId,
           },
         );
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "actor run failed"));
+          throw new Error(String(result?.error ?? "memory operation failed"));
         }
         return decodeRpcResult(toArrayBytes(result.value));
       } finally {
@@ -2528,7 +2781,7 @@
     idFromName(name) {
       const key = String(name ?? "").trim();
       if (!key) {
-        throw new Error("actor idFromName requires a non-empty name");
+        throw new Error("memory idFromName requires a non-empty name");
       }
       return createActorId(bindingName, key);
     },
@@ -2540,12 +2793,12 @@
         && String(id.__dd_actor_binding) !== bindingName
       ) {
         throw new Error(
-          `actor id belongs to namespace ${String(id.__dd_actor_binding)}, not ${bindingName}`,
+          `memory id belongs to namespace ${String(id.__dd_actor_binding)}, not ${bindingName}`,
         );
       }
       const actorKey = actorIdKey(id).trim();
       if (!actorKey) {
-        throw new Error("actor namespace get() requires a valid actor id");
+        throw new Error("memory namespace get() requires a valid memory id");
       }
       return createActorStub(bindingName, actorKey);
     },
@@ -3058,14 +3311,14 @@
   const decodeExecPayload = (rawArgs) => {
     const values = decodeRpcArgs(toArrayBytes(rawArgs));
     if (!Array.isArray(values) || values.length === 0) {
-      throw new Error("actor run requires an executable payload");
+      throw new Error("memory operation requires an executable payload");
     }
     const [descriptor, ...args] = values;
     const exportName = String(descriptor?.export_name ?? descriptor?.exportName ?? "").trim();
     const liveToken = String(descriptor?.live_token ?? descriptor?.liveToken ?? "").trim();
     const source = String(descriptor?.source ?? "").trim();
     if (!liveToken && !exportName && !source) {
-      throw new Error("actor run executable descriptor must not be empty");
+      throw new Error("memory operation executable descriptor must not be empty");
     }
     return {
       descriptor: { liveToken, exportName, source },
@@ -3094,11 +3347,11 @@
     try {
       const executable = (0, eval)(`(${source})`);
       if (typeof executable !== "function") {
-        throw new Error("actor executable did not evaluate to a function");
+        throw new Error("memory executable did not evaluate to a function");
       }
       return executable;
     } catch (error) {
-      throw new Error(`actor executable compile failed: ${String(error?.message ?? error)}`);
+      throw new Error(`memory executable compile failed: ${String(error?.message ?? error)}`);
     }
   };
 
@@ -3111,71 +3364,78 @@
     const maxRetries = 256;
     let lastConflict = null;
     for (let attempt = 0; attempt < maxRetries; attempt += 1) {
-      const txn = createActorTxn(entry);
-      const scopedState = createActorAtomicState(
-        entry,
-        runtimeRequestId,
-        true,
-        true,
-        txn,
-      );
-      const previousWebSocket = globalThis.WebSocket;
-      const previousWebTransport = globalThis.WebTransportSession;
-      globalThis.WebSocket = scopedState.__dd_socket_runtime.WebSocket;
-      globalThis.WebTransportSession = scopedState.__dd_transport_runtime.WebTransportSession;
-      try {
-        const value = withActorTxnScope(
-          {
-            binding: entry.binding,
-            actorKey: entry.actorKey,
-            state: scopedState,
-            stub: scopedState.stub,
-          },
-          () => executable(scopedState, ...args),
+      for (;;) {
+        const txn = createActorTxn(entry);
+        const scopedState = createActorAtomicState(
+          entry,
+          runtimeRequestId,
+          true,
+          true,
+          txn,
         );
-        if (value instanceof Promise) {
-          throw new Error("stub.atomic callback must be synchronous");
-        }
-        const committed = await commitActorTxn(txn, runtimeRequestId);
-        if (!committed) {
-          lastConflict = new Error("actor transaction conflicted");
-          await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
-          continue;
-        }
-        for (const deferred of txn.deferred) {
-          const deferredResult = deferred();
-          if (deferredResult instanceof Promise) {
-            await deferredResult;
+        const previousSocketRuntimeProvider = currentSocketRuntimeProvider;
+        const previousTransportRuntimeProvider = currentTransportRuntimeProvider;
+        currentSocketRuntimeProvider = () => scopedState.__dd_socket_runtime;
+        currentTransportRuntimeProvider = () => scopedState.__dd_transport_runtime;
+        try {
+          const value = withActorTxnScope(
+            {
+              binding: entry.binding,
+              actorKey: entry.actorKey,
+              state: scopedState,
+              stub: scopedState.stub,
+            },
+            () => executable(scopedState, ...args),
+          );
+          if (value instanceof Promise) {
+            throw new Error("stub.atomic callback must be synchronous");
           }
-        }
-        return value;
-      } catch (error) {
-        if (txn.committed) {
+          if (actorTxnIsSnapshotOnly(txn)) {
+            return value;
+          }
+          const committed = txn.writes.size === 0 && txn.accepted !== true
+            ? await validateActorTxnReads(txn, runtimeRequestId)
+            : await commitActorTxn(txn, runtimeRequestId);
+          if (!committed) {
+            lastConflict = new Error("memory transaction conflicted");
+            await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
+            break;
+          }
+          for (const deferred of txn.deferred) {
+            const deferredResult = deferred();
+            if (deferredResult instanceof Promise) {
+              await deferredResult;
+            }
+          }
+          return value;
+        } catch (error) {
+          if (error instanceof MemoryHydrationNeeded && error.__dd_memory_hydration_needed === true) {
+            if (error.mode === "full") {
+              await ensureActorStorageHydrated(entry, runtimeRequestId);
+            } else {
+              await ensureActorStorageKeysHydrated(entry, runtimeRequestId, error.keys);
+            }
+            continue;
+          }
+          if (txn.committed) {
+            throw error;
+          }
+          if (
+            error instanceof Error
+            && String(error.message ?? "").includes("conflicted")
+          ) {
+            lastConflict = error;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
+            break;
+          }
           throw error;
-        }
-        if (
-          error instanceof Error
-          && String(error.message ?? "").includes("conflicted")
-        ) {
-          lastConflict = error;
-          await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
-          continue;
-        }
-        throw error;
-      } finally {
-        if (previousWebSocket === undefined) {
-          delete globalThis.WebSocket;
-        } else {
-          globalThis.WebSocket = previousWebSocket;
-        }
-        if (previousWebTransport === undefined) {
-          delete globalThis.WebTransportSession;
-        } else {
-          globalThis.WebTransportSession = previousWebTransport;
+        } finally {
+          currentSocketRuntimeProvider = previousSocketRuntimeProvider;
+          currentTransportRuntimeProvider = previousTransportRuntimeProvider;
         }
       }
     }
-    throw lastConflict ?? new Error("actor transaction exceeded retry limit");
+    throw lastConflict ?? new Error("memory transaction exceeded retry limit");
   };
 
   const buildWakeEvent = (actorCall, stub) => {
@@ -3219,45 +3479,43 @@
 
   const invokeActorCall = async (actorCall, request, env) => {
     if (!actorCall || typeof actorCall !== "object") {
-      throw new Error("actor invoke config is missing");
+      throw new Error("memory invoke config is missing");
     }
     const binding = String(actorCall.binding ?? "").trim();
     const actorKey = String(actorCall.key ?? "").trim();
     if (!binding || !actorKey) {
-      throw new Error("actor invoke requires binding and key");
+      throw new Error("memory invoke requires binding and key");
     }
     if (!Object.prototype.hasOwnProperty.call(env, binding)) {
-      throw new Error(`actor binding not declared for worker: ${binding}`);
+      throw new Error(`memory binding not declared for worker: ${binding}`);
     }
-    const entry = await ensureActorEntry(binding, actorKey, requestId);
+    const entry = await ensureActorEntry(binding, actorKey, requestId, { hydrate: false });
     const kind = String(actorCall.kind ?? "");
-    await ensureActorStorageHydrated(entry, requestId);
     const scopedState = createActorRuntimeState(entry, requestId, false, false);
-    const previousWebSocket = globalThis.WebSocket;
-    const previousWebTransport = globalThis.WebTransportSession;
     const previousActorEntry = currentActorEntry;
     const previousActorRequestId = currentActorRequestId;
-    globalThis.WebSocket = scopedState.__dd_socket_runtime.WebSocket;
-    globalThis.WebTransportSession = scopedState.__dd_transport_runtime.WebTransportSession;
+    const previousSocketRuntimeProvider = currentSocketRuntimeProvider;
+    const previousTransportRuntimeProvider = currentTransportRuntimeProvider;
+    currentSocketRuntimeProvider = () => scopedState.__dd_socket_runtime;
+    currentTransportRuntimeProvider = () => scopedState.__dd_transport_runtime;
     currentActorEntry = entry;
     currentActorRequestId = requestId;
     try {
-      await ensureActorStorageHydrated(entry, requestId);
       await scopedState.__dd_socket_runtime.refreshOpenHandles();
       await scopedState.__dd_transport_runtime.refreshOpenHandles();
       if (kind === "method") {
         const methodName = String(actorCall.name ?? "").trim();
         if (!methodName) {
-          throw new Error("actor method invoke requires a method name");
+          throw new Error("memory method invoke requires a method name");
         }
         if (
           actorMethodNameIsBlocked(methodName)
           && methodName !== ACTOR_ATOMIC_METHOD
         ) {
-          throw new Error(`actor method is blocked: ${methodName}`);
+          throw new Error(`memory method is blocked: ${methodName}`);
         }
         if (methodName !== ACTOR_ATOMIC_METHOD) {
-          throw new Error(`unsupported actor method: ${methodName}`);
+          throw new Error(`unsupported memory method: ${methodName}`);
         }
         const { descriptor, args } = decodeExecPayload(actorCall.args);
         const executable = instantiateExecutable(descriptor);
@@ -3292,20 +3550,12 @@
         await gateActorOutput(entry, requestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
-      throw new Error(`unsupported actor invoke kind: ${kind}`);
+      throw new Error(`unsupported memory invoke kind: ${kind}`);
     } finally {
       currentActorEntry = previousActorEntry;
       currentActorRequestId = previousActorRequestId;
-      if (previousWebSocket === undefined) {
-        delete globalThis.WebSocket;
-      } else {
-        globalThis.WebSocket = previousWebSocket;
-      }
-      if (previousWebTransport === undefined) {
-        delete globalThis.WebTransportSession;
-      } else {
-        globalThis.WebTransportSession = previousWebTransport;
-      }
+      currentSocketRuntimeProvider = previousSocketRuntimeProvider;
+      currentTransportRuntimeProvider = previousTransportRuntimeProvider;
     }
   };
 
@@ -3566,4 +3816,4 @@
 
       await emitWaitUntilDone(!(await waitForWaitUntils()));
     });
-})();
+};
