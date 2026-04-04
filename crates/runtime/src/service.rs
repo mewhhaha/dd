@@ -509,7 +509,7 @@ enum DispatchSelection {
 
 struct IsolateHandle {
     id: u64,
-    sender: mpsc::UnboundedSender<IsolateCommand>,
+    sender: std_mpsc::Sender<IsolateCommand>,
     inflight_count: usize,
     active_websocket_sessions: usize,
     active_transport_sessions: usize,
@@ -5527,6 +5527,175 @@ async fn drain_ready_runtime_work(
     }
 }
 
+fn handle_isolate_event_payload(
+    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    worker_name: &str,
+    generation: u64,
+    isolate_id: u64,
+    payload: IsolateEventPayload,
+) {
+    match payload {
+        IsolateEventPayload::Completion(payload) => match decode_completion_payload(payload) {
+            Ok((request_id, completion_token, wait_until_count, result)) => {
+                let _ = event_tx.send(RuntimeEvent::RequestFinished {
+                    worker_name: worker_name.to_string(),
+                    generation,
+                    isolate_id,
+                    request_id,
+                    completion_token,
+                    wait_until_count,
+                    result,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    error = %error,
+                    "ignoring invalid completion payload"
+                );
+            }
+        },
+        IsolateEventPayload::WaitUntilDone(payload) => match decode_wait_until_payload(payload) {
+            Ok((request_id, completion_token)) => {
+                let _ = event_tx.send(RuntimeEvent::WaitUntilFinished {
+                    worker_name: worker_name.to_string(),
+                    generation,
+                    isolate_id,
+                    request_id,
+                    completion_token,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    error = %error,
+                    "ignoring invalid waitUntil payload"
+                );
+            }
+        },
+        IsolateEventPayload::ResponseStart(payload) => match decode_response_start_payload(payload) {
+            Ok((request_id, completion_token, status, headers)) => {
+                let _ = event_tx.send(RuntimeEvent::ResponseStart {
+                    worker_name: worker_name.to_string(),
+                    request_id,
+                    completion_token,
+                    status,
+                    headers,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    error = %error,
+                    "ignoring invalid response start payload"
+                );
+            }
+        },
+        IsolateEventPayload::ResponseChunk(payload) => match decode_response_chunk_payload(payload) {
+            Ok((request_id, completion_token, chunk)) => {
+                let _ = event_tx.send(RuntimeEvent::ResponseChunk {
+                    worker_name: worker_name.to_string(),
+                    request_id,
+                    completion_token,
+                    chunk,
+                });
+            }
+            Err(error) => {
+                warn!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    error = %error,
+                    "ignoring invalid response chunk payload"
+                );
+            }
+        },
+        IsolateEventPayload::CacheRevalidate(payload) => {
+            let _ = event_tx.send(RuntimeEvent::CacheRevalidate {
+                worker_name: worker_name.to_string(),
+                generation,
+                payload,
+            });
+        }
+        IsolateEventPayload::ActorInvoke(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorInvoke(payload));
+        }
+        IsolateEventPayload::ActorSocketSend(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorSocketSend(payload));
+        }
+        IsolateEventPayload::ActorSocketClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorSocketClose(payload));
+        }
+        IsolateEventPayload::ActorSocketList(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorSocketList {
+                worker_name: worker_name.to_string(),
+                generation,
+                payload,
+            });
+        }
+        IsolateEventPayload::ActorSocketConsumeClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorSocketConsumeClose {
+                worker_name: worker_name.to_string(),
+                generation,
+                payload,
+            });
+        }
+        IsolateEventPayload::ActorTransportSendStream(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportSendStream(payload));
+        }
+        IsolateEventPayload::ActorTransportSendDatagram(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportSendDatagram(payload));
+        }
+        IsolateEventPayload::ActorTransportRecvStream(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportRecvStream(payload));
+        }
+        IsolateEventPayload::ActorTransportRecvDatagram(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportRecvDatagram(payload));
+        }
+        IsolateEventPayload::ActorTransportClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportClose(payload));
+        }
+        IsolateEventPayload::ActorTransportList(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportList {
+                worker_name: worker_name.to_string(),
+                generation,
+                payload,
+            });
+        }
+        IsolateEventPayload::ActorTransportConsumeClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::ActorTransportConsumeClose {
+                worker_name: worker_name.to_string(),
+                generation,
+                payload,
+            });
+        }
+        IsolateEventPayload::DynamicWorkerCreate(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicWorkerCreate(payload));
+        }
+        IsolateEventPayload::DynamicWorkerLookup(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicWorkerLookup(payload));
+        }
+        IsolateEventPayload::DynamicWorkerList(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicWorkerList(payload));
+        }
+        IsolateEventPayload::DynamicWorkerDelete(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicWorkerDelete(payload));
+        }
+        IsolateEventPayload::DynamicWorkerInvoke(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicWorkerInvoke(payload));
+        }
+        IsolateEventPayload::DynamicHostRpcInvoke(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicHostRpcInvoke(payload));
+        }
+    }
+}
+
 fn spawn_isolate_thread(
     snapshot: &'static [u8],
     snapshot_preloaded: bool,
@@ -5539,7 +5708,7 @@ fn spawn_isolate_thread(
     isolate_id: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
 ) -> Result<IsolateHandle> {
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let (command_tx, command_rx) = std_mpsc::channel();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
     let thread_name = format!("dd-isolate-{worker_name}-{generation}-{isolate_id}");
 
@@ -5563,8 +5732,8 @@ fn spawn_isolate_thread(
                     }
                 };
 
-                let (event_payload_tx, mut event_payload_rx) =
-                    mpsc::unbounded_channel::<IsolateEventPayload>();
+                let (event_payload_tx, event_payload_rx) =
+                    std_mpsc::channel::<IsolateEventPayload>();
                 {
                     let op_state = js_runtime.op_state();
                     let mut op_state = op_state.borrow_mut();
@@ -5585,242 +5754,53 @@ fn spawn_isolate_thread(
                 }
                 let _ = init_tx.send(Ok(()));
 
-                let mut ticker = tokio::time::interval(Duration::from_millis(1));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
                 loop {
-                    tokio::select! {
-                        Some(payload) = event_payload_rx.recv() => {
-                            match payload {
-                                IsolateEventPayload::Completion(payload) => {
-                                    match decode_completion_payload(payload) {
-                                        Ok((request_id, completion_token, wait_until_count, result)) => {
-                                            let _ = event_tx.send(RuntimeEvent::RequestFinished {
-                                                worker_name: worker_name.clone(),
-                                                generation,
-                                                isolate_id,
-                                                request_id,
-                                                completion_token,
-                                                wait_until_count,
-                                                result,
-                                            });
-                                        }
-                                        Err(error) => {
-                                            warn!(
-                                                worker = %worker_name,
-                                                generation,
-                                                isolate_id,
-                                                error = %error,
-                                                "ignoring invalid completion payload"
-                                            );
-                                        }
+                    let mut made_progress = false;
+
+                    loop {
+                        match event_payload_rx.try_recv() {
+                            Ok(payload) => {
+                                made_progress = true;
+                                handle_isolate_event_payload(
+                                    &event_tx,
+                                    &worker_name,
+                                    generation,
+                                    isolate_id,
+                                    payload,
+                                );
+                            }
+                            Err(std_mpsc::TryRecvError::Empty) => break,
+                            Err(std_mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+
+                    loop {
+                        match command_rx.try_recv() {
+                            Ok(command) => {
+                                made_progress = true;
+                                match handle_isolate_command(
+                                    &mut js_runtime,
+                                    &event_tx,
+                                    &worker_name,
+                                    generation,
+                                    isolate_id,
+                                    command,
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => return,
+                                    Err(error) => {
+                                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                            worker_name: worker_name.clone(),
+                                            generation,
+                                            isolate_id,
+                                            error,
+                                        });
+                                        return;
                                     }
-                                }
-                                IsolateEventPayload::WaitUntilDone(payload) => {
-                                    match decode_wait_until_payload(payload) {
-                                        Ok((request_id, completion_token)) => {
-                                            let _ = event_tx.send(RuntimeEvent::WaitUntilFinished {
-                                                worker_name: worker_name.clone(),
-                                                generation,
-                                                isolate_id,
-                                                request_id,
-                                                completion_token,
-                                            });
-                                        }
-                                        Err(error) => {
-                                            warn!(
-                                                worker = %worker_name,
-                                                generation,
-                                                isolate_id,
-                                                error = %error,
-                                                "ignoring invalid waitUntil payload"
-                                            );
-                                        }
-                                    }
-                                }
-                                IsolateEventPayload::ResponseStart(payload) => {
-                                    match decode_response_start_payload(payload) {
-                                        Ok((request_id, completion_token, status, headers)) => {
-                                            let _ = event_tx.send(RuntimeEvent::ResponseStart {
-                                                worker_name: worker_name.clone(),
-                                                request_id,
-                                                completion_token,
-                                                status,
-                                                headers,
-                                            });
-                                        }
-                                        Err(error) => {
-                                            warn!(
-                                                worker = %worker_name,
-                                                generation,
-                                                isolate_id,
-                                                error = %error,
-                                                "ignoring invalid response start payload"
-                                            );
-                                        }
-                                    }
-                                }
-                                IsolateEventPayload::ResponseChunk(payload) => {
-                                    match decode_response_chunk_payload(payload) {
-                                        Ok((request_id, completion_token, chunk)) => {
-                                            let _ = event_tx.send(RuntimeEvent::ResponseChunk {
-                                                worker_name: worker_name.clone(),
-                                                request_id,
-                                                completion_token,
-                                                chunk,
-                                            });
-                                        }
-                                        Err(error) => {
-                                            warn!(
-                                                worker = %worker_name,
-                                                generation,
-                                                isolate_id,
-                                                error = %error,
-                                                "ignoring invalid response chunk payload"
-                                            );
-                                        }
-                                    }
-                                }
-                                IsolateEventPayload::CacheRevalidate(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::CacheRevalidate {
-                                        worker_name: worker_name.clone(),
-                                        generation,
-                                        payload,
-                                    });
-                                }
-                                IsolateEventPayload::ActorInvoke(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorInvoke(payload));
-                                }
-                                IsolateEventPayload::ActorSocketSend(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorSocketSend(payload));
-                                }
-                                IsolateEventPayload::ActorSocketClose(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorSocketClose(payload));
-                                }
-                                IsolateEventPayload::ActorSocketList(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorSocketList {
-                                        worker_name: worker_name.clone(),
-                                        generation,
-                                        payload,
-                                    });
-                                }
-                                IsolateEventPayload::ActorSocketConsumeClose(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorSocketConsumeClose {
-                                        worker_name: worker_name.clone(),
-                                        generation,
-                                        payload,
-                                    });
-                                }
-                                IsolateEventPayload::ActorTransportSendStream(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorTransportSendStream(
-                                        payload,
-                                    ));
-                                }
-                                IsolateEventPayload::ActorTransportSendDatagram(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorTransportSendDatagram(
-                                        payload,
-                                    ));
-                                }
-                                IsolateEventPayload::ActorTransportRecvStream(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorTransportRecvStream(
-                                        payload,
-                                    ));
-                                }
-                                IsolateEventPayload::ActorTransportRecvDatagram(payload) => {
-                                    let _ =
-                                        event_tx.send(RuntimeEvent::ActorTransportRecvDatagram(
-                                            payload,
-                                        ));
-                                }
-                                IsolateEventPayload::ActorTransportClose(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorTransportClose(payload));
-                                }
-                                IsolateEventPayload::ActorTransportList(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorTransportList {
-                                        worker_name: worker_name.clone(),
-                                        generation,
-                                        payload,
-                                    });
-                                }
-                                IsolateEventPayload::ActorTransportConsumeClose(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::ActorTransportConsumeClose {
-                                        worker_name: worker_name.clone(),
-                                        generation,
-                                        payload,
-                                    });
-                                }
-                                IsolateEventPayload::DynamicWorkerCreate(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerCreate(payload));
-                                }
-                                IsolateEventPayload::DynamicWorkerLookup(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerLookup(payload));
-                                }
-                                IsolateEventPayload::DynamicWorkerList(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerList(payload));
-                                }
-                                IsolateEventPayload::DynamicWorkerDelete(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerDelete(payload));
-                                }
-                                IsolateEventPayload::DynamicWorkerInvoke(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::DynamicWorkerInvoke(payload));
-                                }
-                                IsolateEventPayload::DynamicHostRpcInvoke(payload) => {
-                                    let _ = event_tx.send(RuntimeEvent::DynamicHostRpcInvoke(payload));
                                 }
                             }
-                        }
-                        Some(command) = command_rx.recv() => {
-                            match handle_isolate_command(
-                                &mut js_runtime,
-                                &event_tx,
-                                &worker_name,
-                                generation,
-                                isolate_id,
-                                command,
-                            ) {
-                                Ok(true) => {
-                                    loop {
-                                        match command_rx.try_recv() {
-                                            Ok(command) => match handle_isolate_command(
-                                                &mut js_runtime,
-                                                &event_tx,
-                                                &worker_name,
-                                                generation,
-                                                isolate_id,
-                                                command,
-                                            ) {
-                                                Ok(true) => {}
-                                                Ok(false) => return,
-                                                Err(error) => {
-                                                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                                                        worker_name: worker_name.clone(),
-                                                        generation,
-                                                        isolate_id,
-                                                        error,
-                                                    });
-                                                    return;
-                                                }
-                                            },
-                                            Err(TryRecvError::Empty) => break,
-                                            Err(TryRecvError::Disconnected) => return,
-                                        }
-                                    }
-                                }
-                                Ok(false) => break,
-                                Err(error) => {
-                                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                                        worker_name: worker_name.clone(),
-                                        generation,
-                                        isolate_id,
-                                        error,
-                                    });
-                                    break;
-                                }
-                            }
-                        }
-                        _ = ticker.tick() => {}
-                        else => {
-                            break;
+                            Err(std_mpsc::TryRecvError::Empty) => break,
+                            Err(std_mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
 
@@ -5832,6 +5812,35 @@ fn spawn_isolate_thread(
                             error,
                         });
                         break;
+                    }
+
+                    if made_progress {
+                        continue;
+                    }
+
+                    match command_rx.recv_timeout(Duration::from_millis(1)) {
+                        Ok(command) => match handle_isolate_command(
+                            &mut js_runtime,
+                            &event_tx,
+                            &worker_name,
+                            generation,
+                            isolate_id,
+                            command,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => return,
+                            Err(error) => {
+                                let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                    worker_name: worker_name.clone(),
+                                    generation,
+                                    isolate_id,
+                                    error,
+                                });
+                                return;
+                            }
+                        },
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
             });

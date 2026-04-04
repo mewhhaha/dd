@@ -25,7 +25,7 @@ use sys_traits::impls::RealSys;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 #[derive(Clone)]
-pub struct IsolateEventSender(pub tokio::sync::mpsc::UnboundedSender<IsolateEventPayload>);
+pub struct IsolateEventSender(pub std::sync::mpsc::Sender<IsolateEventPayload>);
 
 pub enum IsolateEventPayload {
     Completion(String),
