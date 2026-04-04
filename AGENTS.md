@@ -3,6 +3,7 @@
 ## Terminology
 
 - When we say `Turso`, we mean only the project at `https://github.com/tursodatabase/turso`.
+- This is a greenfield project. Radical improvements, large refactors, and breaking changes are encouraged when they simplify the system or materially improve the outcome.
 
 ## Storage Rules
 
