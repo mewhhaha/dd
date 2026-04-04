@@ -41,6 +41,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_optional_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 fn env_v8_flags() -> Vec<String> {
     std::env::var("DD_BENCH_V8_FLAGS")
         .unwrap_or_default()
@@ -65,6 +72,33 @@ fn env_scenario_name() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn env_custom_config(max_inflight: usize, v8_flags: &[String]) -> Option<BenchConfig> {
+    let min_isolates = env_optional_usize("DD_BENCH_MIN_ISOLATES");
+    let max_isolates = env_optional_usize("DD_BENCH_MAX_ISOLATES");
+    let Some(max_isolates) = max_isolates.or(min_isolates) else {
+        return None;
+    };
+    let min_isolates = min_isolates.unwrap_or(max_isolates).min(max_isolates);
+    let name = std::env::var("DD_BENCH_CUSTOM_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("custom-{}-{}", min_isolates, max_isolates));
+    let leaked_name: &'static str = Box::leak(name.into_boxed_str());
+    Some(BenchConfig {
+        name: leaked_name,
+        runtime: RuntimeConfig {
+            min_isolates,
+            max_isolates,
+            max_inflight_per_isolate: max_inflight,
+            idle_ttl: Duration::from_secs(30),
+            scale_tick: Duration::from_secs(1),
+            v8_flags: v8_flags.to_vec(),
+            ..RuntimeConfig::default()
+        },
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let requests = env_usize("DD_BENCH_REQUESTS", 4_000);
@@ -72,7 +106,7 @@ async fn main() -> Result<(), String> {
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 16);
     let v8_flags = env_v8_flags();
 
-    let configs = [
+    let mut configs = vec![
         BenchConfig {
             name: "single-isolate",
             runtime: RuntimeConfig {
@@ -110,6 +144,9 @@ async fn main() -> Result<(), String> {
             },
         },
     ];
+    if let Some(custom) = env_custom_config(max_inflight, &v8_flags) {
+        configs.push(custom);
+    }
 
     let scenarios = [
         Scenario {
