@@ -72,6 +72,7 @@ pub struct RuntimeConfig {
     pub cache_max_bytes: usize,
     pub cache_default_ttl: Duration,
     pub v8_flags: Vec<String>,
+    pub kv_profile_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -87,6 +88,7 @@ impl Default for RuntimeConfig {
             cache_max_bytes: 64 * 1024 * 1024,
             cache_default_ttl: Duration::from_secs(60),
             v8_flags: Vec::new(),
+            kv_profile_enabled: false,
         }
     }
 }
@@ -813,6 +815,7 @@ impl RuntimeService {
 
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
         let kv_store = KvStore::from_database_url(&storage.database_url).await?;
+        kv_store.set_profile_enabled(runtime.kv_profile_enabled);
         let actor_store = ActorStore::new(
             storage.store_dir.join("actors"),
             storage.actor_shards_per_namespace,
@@ -7110,6 +7113,33 @@ export default {{
         )
     }
 
+    fn reusable_env_worker() -> String {
+        r#"
+let previousEnv = null;
+let previousKv = null;
+
+export default {
+  async fetch(_request, env) {
+    const kv = env.MY_KV;
+    const payload = {
+      sameEnv: previousEnv === env,
+      sameKv: previousKv === kv,
+      envExtensible: Object.isExtensible(env),
+      kvExtensible: Object.isExtensible(kv),
+      envMutationResult: Reflect.set(env, "TEMP", "value"),
+      kvMutationResult: Reflect.set(kv, "TEMP", "value"),
+      envHasTemp: Object.prototype.hasOwnProperty.call(env, "TEMP"),
+      kvHasTemp: Object.prototype.hasOwnProperty.call(kv, "TEMP"),
+    };
+    previousEnv = env;
+    previousKv = kv;
+    return Response.json(payload);
+  },
+};
+"#
+        .to_string()
+    }
+
     fn abort_aware_worker() -> String {
         r#"
 let abortCount = 0;
@@ -8066,6 +8096,74 @@ export default {
         assert_eq!(right_values.len(), 10);
         assert!(left_values.iter().all(|value| value == "L"));
         assert!(right_values.iter().all(|value| value == "R"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn shared_env_is_reused_safely_across_requests() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "shared-env-reuse".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                reusable_env_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let first = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/", "shared-env-first-request"),
+            )
+            .await
+            .expect("first invoke should succeed");
+        let second = service
+            .invoke(
+                worker_name,
+                test_invocation_with_path("/", "shared-env-second-request"),
+            )
+            .await
+            .expect("second invoke should succeed");
+
+        let first_payload: Value = crate::json::from_string(
+            String::from_utf8(first.body).expect("first body should be utf8"),
+        )
+        .expect("first response should parse");
+        let second_payload: Value = crate::json::from_string(
+            String::from_utf8(second.body).expect("second body should be utf8"),
+        )
+        .expect("second response should parse");
+
+        assert_eq!(first_payload["sameEnv"], Value::Bool(false));
+        assert_eq!(first_payload["sameKv"], Value::Bool(false));
+        assert_eq!(second_payload["sameEnv"], Value::Bool(true));
+        assert_eq!(second_payload["sameKv"], Value::Bool(true));
+
+        for payload in [&first_payload, &second_payload] {
+            assert_eq!(payload["envExtensible"], Value::Bool(false));
+            assert_eq!(payload["kvExtensible"], Value::Bool(false));
+            assert_eq!(payload["envMutationResult"], Value::Bool(false));
+            assert_eq!(payload["kvMutationResult"], Value::Bool(false));
+            assert_eq!(payload["envHasTemp"], Value::Bool(false));
+            assert_eq!(payload["kvHasTemp"], Value::Bool(false));
+        }
     }
 
     #[tokio::test]

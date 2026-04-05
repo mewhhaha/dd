@@ -4,7 +4,7 @@ use crate::actor_rpc::{
     ActorInvokeResponse,
 };
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
-use crate::kv::{KvEntry, KvStore, KvUtf8Lookup};
+use crate::kv::{KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
@@ -310,6 +310,7 @@ struct KvListItem {
 struct KvGetResult {
     ok: bool,
     found: bool,
+    wrong_encoding: bool,
     value: String,
     error: String,
 }
@@ -332,6 +333,13 @@ struct KvGetManyItem {
 struct KvGetManyResult {
     ok: bool,
     values: Vec<KvGetManyItem>,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KvProfileResult {
+    ok: bool,
+    snapshot: Option<KvProfileSnapshot>,
     error: String,
 }
 
@@ -1142,34 +1150,44 @@ async fn op_kv_get(
     #[string] binding: String,
     #[string] key: String,
 ) -> KvGetResult {
+    let started = Instant::now();
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store.get_utf8(&worker_name, &binding, &key).await {
+    let result = match store.get_utf8(&worker_name, &binding, &key).await {
         Ok(Ok(decoded)) => KvGetResult {
             ok: true,
             found: true,
+            wrong_encoding: false,
             value: decoded,
             error: String::new(),
         },
         Ok(Err(KvUtf8Lookup::Missing)) => KvGetResult {
             ok: true,
             found: false,
+            wrong_encoding: false,
             value: String::new(),
             error: String::new(),
         },
         Ok(Err(KvUtf8Lookup::WrongEncoding)) => KvGetResult {
             ok: false,
             found: true,
+            wrong_encoding: true,
             value: String::new(),
-            error: "kv value is encoded as v8sc; use env.KV.get() for JS value decoding"
-                .to_string(),
+            error: String::new(),
         },
         Err(error) => KvGetResult {
             ok: false,
             found: false,
+            wrong_encoding: false,
             value: String::new(),
             error: error.to_string(),
         },
-    }
+    };
+    store.record_profile(
+        KvProfileMetricKind::OpGet,
+        started.elapsed().as_micros() as u64,
+        1,
+    );
+    result
 }
 
 #[deno_core::op2]
@@ -1178,6 +1196,7 @@ async fn op_kv_get_many_utf8(
     state: Rc<RefCell<OpState>>,
     #[string] payload: String,
 ) -> KvGetManyResult {
+    let started = Instant::now();
     let payload: KvGetManyPayload = match crate::json::from_string(payload) {
         Ok(value) => value,
         Err(error) => {
@@ -1189,7 +1208,8 @@ async fn op_kv_get_many_utf8(
         }
     };
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store
+    let item_count = payload.keys.len() as u64;
+    let result = match store
         .get_utf8_many(&payload.worker_name, &payload.binding, &payload.keys)
         .await
     {
@@ -1222,7 +1242,13 @@ async fn op_kv_get_many_utf8(
             values: Vec::new(),
             error: error.to_string(),
         },
-    }
+    };
+    store.record_profile(
+        KvProfileMetricKind::OpGetManyUtf8,
+        started.elapsed().as_micros() as u64,
+        item_count,
+    );
+    result
 }
 
 #[deno_core::op2]
@@ -1231,6 +1257,7 @@ async fn op_kv_get_value(
     state: Rc<RefCell<OpState>>,
     #[string] payload: String,
 ) -> KvGetValueResult {
+    let started = Instant::now();
     let payload: KvGetValuePayload = match crate::json::from_string(payload) {
         Ok(value) => value,
         Err(error) => {
@@ -1244,7 +1271,7 @@ async fn op_kv_get_value(
         }
     };
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store
+    let result = match store
         .get(&payload.worker_name, &payload.binding, &payload.key)
         .await
     {
@@ -1269,7 +1296,46 @@ async fn op_kv_get_value(
             encoding: "utf8".to_string(),
             error: error.to_string(),
         },
+    };
+    store.record_profile(
+        KvProfileMetricKind::OpGetValue,
+        started.elapsed().as_micros() as u64,
+        1,
+    );
+    result
+}
+
+#[deno_core::op2(fast)]
+fn op_kv_profile_record_js(
+    state: &mut OpState,
+    #[string] metric: String,
+    duration_us: u32,
+    items: u32,
+) {
+    let kind = match metric.as_str() {
+        "js_request_total" => KvProfileMetricKind::JsRequestTotal,
+        "js_batch_flush" => KvProfileMetricKind::JsBatchFlush,
+        _ => return,
+    };
+    let store = state.borrow::<KvStore>().clone();
+    store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_kv_profile_take(state: &mut OpState) -> KvProfileResult {
+    let store = state.borrow::<KvStore>().clone();
+    KvProfileResult {
+        ok: true,
+        snapshot: Some(store.take_profile_snapshot_and_reset()),
+        error: String::new(),
     }
+}
+
+#[deno_core::op2(fast)]
+fn op_kv_profile_reset(state: &mut OpState) {
+    let store = state.borrow::<KvStore>().clone();
+    store.reset_profile();
 }
 
 #[deno_core::op2]
@@ -3578,6 +3644,9 @@ deno_core::extension!(
         op_kv_get,
         op_kv_get_many_utf8,
         op_kv_get_value,
+        op_kv_profile_record_js,
+        op_kv_profile_take,
+        op_kv_profile_reset,
         op_kv_set,
         op_kv_set_value,
         op_kv_delete,

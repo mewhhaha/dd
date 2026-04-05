@@ -25,36 +25,66 @@ globalThis.__dd_execute_worker = (payload) => {
   }
   const input = payload?.request ?? null;
   const controller = new AbortController();
-  const waitUntilPromises = [];
-  let waitUntilDoneSent = false;
-  let actorInvokeSeq = 0;
-  let currentActorEntry = null;
-  let currentActorRequestId = null;
-  let currentMemoryTxnScope = null;
-  let currentSocketRuntimeProvider = null;
-  let currentTransportRuntimeProvider = null;
-  globalThis.__dd_active_request_id = requestId;
+  const asyncContext = globalThis.__dd_async_context;
+  const requestContext = {
+    requestId,
+    controller,
+    waitUntilPromises: [],
+    waitUntilDoneSent: false,
+    actorInvokeSeq: 0,
+    actorEntry: null,
+    actorRequestId: null,
+    memoryTxnScope: null,
+    socketRuntimeProvider: null,
+    transportRuntimeProvider: null,
+    kvGetBatches: new Map(),
+  };
 
-  const originalWebSocket = globalThis.WebSocket;
-  const originalWebTransportSession = globalThis.WebTransportSession;
-  globalThis.WebSocket = function WebSocket(handle) {
-    if (currentSocketRuntimeProvider) {
-      return currentSocketRuntimeProvider().WebSocket(handle);
+  const currentRequestContext = (required = true) => {
+    const current = asyncContext?.getStore?.() ?? null;
+    if (!current && required) {
+      throw new Error("request scope is unavailable");
     }
-    if (typeof originalWebSocket === "function") {
-      return new originalWebSocket(handle);
-    }
-    throw new Error("handle-backed WebSocket is unavailable outside keyed memory scope");
+    return current;
   };
-  globalThis.WebTransportSession = function WebTransportSession(handle) {
-    if (currentTransportRuntimeProvider) {
-      return currentTransportRuntimeProvider().WebTransportSession(handle);
-    }
-    if (typeof originalWebTransportSession === "function") {
-      return new originalWebTransportSession(handle);
-    }
-    throw new Error("handle-backed WebTransportSession is unavailable outside keyed memory scope");
+
+  const nextActorInvokeSeq = () => {
+    const current = currentRequestContext();
+    current.actorInvokeSeq = Number(current.actorInvokeSeq ?? 0) + 1;
+    return current.actorInvokeSeq;
   };
+
+  if (!globalThis.__dd_handle_websocket_wrapped) {
+    globalThis.__dd_handle_websocket_wrapped = true;
+    globalThis.__dd_original_websocket = globalThis.WebSocket;
+    globalThis.WebSocket = function WebSocket(handle) {
+      const current = currentRequestContext(false);
+      if (current?.socketRuntimeProvider) {
+        return current.socketRuntimeProvider().WebSocket(handle);
+      }
+      const originalWebSocket = globalThis.__dd_original_websocket;
+      if (typeof originalWebSocket === "function") {
+        return new originalWebSocket(handle);
+      }
+      throw new Error("handle-backed WebSocket is unavailable outside keyed memory scope");
+    };
+  }
+
+  if (!globalThis.__dd_handle_transport_wrapped) {
+    globalThis.__dd_handle_transport_wrapped = true;
+    globalThis.__dd_original_webtransport_session = globalThis.WebTransportSession;
+    globalThis.WebTransportSession = function WebTransportSession(handle) {
+      const current = currentRequestContext(false);
+      if (current?.transportRuntimeProvider) {
+        return current.transportRuntimeProvider().WebTransportSession(handle);
+      }
+      const originalWebTransportSession = globalThis.__dd_original_webtransport_session;
+      if (typeof originalWebTransportSession === "function") {
+        return new originalWebTransportSession(handle);
+      }
+      throw new Error("handle-backed WebTransportSession is unavailable outside keyed memory scope");
+    };
+  }
 
   inflightRequests.set(requestId, controller);
 
@@ -76,8 +106,20 @@ globalThis.__dd_execute_worker = (payload) => {
     return undefined;
   };
 
+  const recordKvProfile = (metric, durationMs, items = 1) => {
+    const op = Deno?.core?.ops?.op_kv_profile_record_js;
+    if (typeof op !== "function") {
+      return;
+    }
+    op(
+      String(metric),
+      Math.max(0, Math.round(Number(durationMs ?? 0) * 1000)),
+      Math.max(1, Math.trunc(Number(items ?? 1) || 1)),
+    );
+  };
+
   const activeRequestId = () => {
-    const scoped = String(globalThis.__dd_active_request_id ?? requestId).trim();
+    const scoped = String(currentRequestContext().requestId ?? "").trim();
     if (!scoped) {
       throw new Error("dynamic worker request scope is unavailable");
     }
@@ -85,24 +127,26 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const actorScopedRequestId = (entry, runtimeRequestId) => {
-    if (currentActorEntry === entry && currentActorRequestId) {
-      return currentActorRequestId;
+    const current = currentRequestContext(false);
+    if (current?.actorEntry === entry && current.actorRequestId) {
+      return current.actorRequestId;
     }
     return activeRequestId() || runtimeRequestId;
   };
 
   const withActorTxnScope = (scope, callback) => {
-    const previousScope = currentMemoryTxnScope;
-    currentMemoryTxnScope = scope;
+    const current = currentRequestContext();
+    const previousScope = current.memoryTxnScope;
+    current.memoryTxnScope = scope;
     try {
       return callback();
     } finally {
-      currentMemoryTxnScope = previousScope;
+      current.memoryTxnScope = previousScope;
     }
   };
 
   const actorTxnScopeFor = (binding, actorKey) => {
-    const currentActorTxnScope = currentMemoryTxnScope;
+    const currentActorTxnScope = currentRequestContext(false)?.memoryTxnScope ?? null;
     if (
       currentActorTxnScope
       && currentActorTxnScope.binding === binding
@@ -213,7 +257,7 @@ globalThis.__dd_execute_worker = (payload) => {
       };
     };
 
-    return {
+    return Object.freeze({
       getReader() {
         return {
           read,
@@ -243,7 +287,7 @@ globalThis.__dd_execute_worker = (payload) => {
           },
         };
       },
-    };
+    });
   };
 
   const decodeStoredValue = (encoding, rawValue, context) => {
@@ -262,8 +306,6 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const createKvBinding = (bindingName) => {
-    let pendingGetBatch = null;
-
     const loadKvValues = async (normalizedKeys, contextLabel) => {
       if (normalizedKeys.length === 0) {
         return [];
@@ -289,9 +331,8 @@ globalThis.__dd_execute_worker = (payload) => {
           const value = utf8Result.found === true ? String(utf8Result.value ?? "") : null;
           return normalizedToUnique.map(() => value);
         }
-        const utf8Error = String(utf8Result?.error ?? "");
-        if (utf8Error && !utf8Error.includes("use env.KV.get() for JS value decoding")) {
-          throw new Error(utf8Error || `${contextLabel} failed`);
+        if (utf8Result?.wrong_encoding !== true && utf8Result?.error) {
+          throw new Error(String(utf8Result.error || `${contextLabel} failed`));
         }
         const result = await callOp(
           "op_kv_get_value",
@@ -303,7 +344,7 @@ globalThis.__dd_execute_worker = (payload) => {
         );
         syncFrozenTimeNow();
         if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String((result.error ?? utf8Error) || `${contextLabel} failed`));
+          throw new Error(String(result.error ?? `${contextLabel} failed`));
         }
         const value = result?.found === true
           ? decodeStoredValue(String(result.encoding ?? "utf8"), result.value, contextLabel)
@@ -365,26 +406,34 @@ globalThis.__dd_execute_worker = (payload) => {
     };
 
     const flushPendingGetBatch = async (batch) => {
+      const started = performance.now();
       const uniqueKeys = Array.from(batch.requestsByKey.keys());
-      const values = await loadKvValues(uniqueKeys, "kv get");
-      for (let index = 0; index < uniqueKeys.length; index += 1) {
-        const key = uniqueKeys[index];
-        const value = values[index];
-        const waiters = batch.requestsByKey.get(key) ?? [];
-        for (const waiter of waiters) {
-          waiter.resolve(value);
+      try {
+        const values = await loadKvValues(uniqueKeys, "kv get");
+        for (let index = 0; index < uniqueKeys.length; index += 1) {
+          const key = uniqueKeys[index];
+          const value = values[index];
+          const waiters = batch.requestsByKey.get(key) ?? [];
+          for (const waiter of waiters) {
+            waiter.resolve(value);
+          }
         }
+      } finally {
+        recordKvProfile("js_batch_flush", performance.now() - started, uniqueKeys.length);
       }
     };
 
     const queueKvGet = (normalizedKey) => new Promise((resolve, reject) => {
+      const current = currentRequestContext();
+      let pendingGetBatch = current.kvGetBatches.get(bindingName) ?? null;
       if (!pendingGetBatch) {
         pendingGetBatch = {
           requestsByKey: new Map(),
         };
+        current.kvGetBatches.set(bindingName, pendingGetBatch);
         queueMicrotask(() => {
-          const batch = pendingGetBatch;
-          pendingGetBatch = null;
+          const batch = current.kvGetBatches.get(bindingName);
+          current.kvGetBatches.delete(bindingName);
           if (!batch) {
             return;
           }
@@ -402,89 +451,89 @@ globalThis.__dd_execute_worker = (payload) => {
       pendingGetBatch.requestsByKey.set(normalizedKey, waiters);
     });
 
-    return {
-    async get(key, options = {}) {
-      const _ = options;
-      return await queueKvGet(String(key));
-    },
-    async set(key, value, options = {}) {
-      const _ = options;
-      if (typeof value === "string") {
+    return Object.freeze({
+      async get(key, options = {}) {
+        const _ = options;
+        return await queueKvGet(String(key));
+      },
+      async set(key, value, options = {}) {
+        const _ = options;
+        if (typeof value === "string") {
+          const result = await callOp(
+            "op_kv_set",
+            workerName,
+            bindingName,
+            String(key),
+            value,
+          );
+          syncFrozenTimeNow();
+          if (result && typeof result === "object" && result.ok === false) {
+            throw new Error(String(result.error ?? "kv set failed"));
+          }
+          return;
+        }
+        let encoded;
+        try {
+          encoded = Deno.core.serialize(value, { forStorage: true });
+        } catch (error) {
+          throw new Error(`kv set serialize failed: ${String(error?.message ?? error)}`);
+        }
         const result = await callOp(
-          "op_kv_set",
-          workerName,
-          bindingName,
-          String(key),
-          value,
+          "op_kv_set_value",
+          JSON.stringify({
+            worker_name: workerName,
+            binding: bindingName,
+            key: String(key),
+            encoding: "v8sc",
+            value: Array.from(new Uint8Array(encoded)),
+          }),
         );
         syncFrozenTimeNow();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "kv set failed"));
         }
-        return;
-      }
-      let encoded;
-      try {
-        encoded = Deno.core.serialize(value, { forStorage: true });
-      } catch (error) {
-        throw new Error(`kv set serialize failed: ${String(error?.message ?? error)}`);
-      }
-      const result = await callOp(
-        "op_kv_set_value",
-        JSON.stringify({
-          worker_name: workerName,
-          binding: bindingName,
-          key: String(key),
-          encoding: "v8sc",
-          value: Array.from(new Uint8Array(encoded)),
-        }),
-      );
-      syncFrozenTimeNow();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "kv set failed"));
-      }
-    },
-    async delete(key, options = {}) {
-      const _ = options;
-      const result = await callOp(
-        "op_kv_delete",
-        workerName,
-        bindingName,
-        String(key),
-      );
-      syncFrozenTimeNow();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "kv delete failed"));
-      }
-    },
-    async list(options = {}) {
-      const prefix = String(options?.prefix ?? "");
-      const limitInput = Number(options?.limit ?? 100);
-      const limit = Number.isFinite(limitInput)
-        ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
-        : 100;
-      const result = await callOp(
-        "op_kv_list",
-        workerName,
-        bindingName,
-        prefix,
-        limit,
-      );
-      syncFrozenTimeNow();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "kv list failed"));
-      }
-      const entries = Array.isArray(result?.entries) ? result.entries : [];
-      return entries.map((entry) => {
-        const encoding = String(entry?.encoding ?? "utf8");
-        return {
-          key: String(entry?.key ?? ""),
-          value: decodeStoredValue(encoding, entry?.value, "kv list"),
-          encoding,
-        };
-      });
-    },
-  };
+      },
+      async delete(key, options = {}) {
+        const _ = options;
+        const result = await callOp(
+          "op_kv_delete",
+          workerName,
+          bindingName,
+          String(key),
+        );
+        syncFrozenTimeNow();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "kv delete failed"));
+        }
+      },
+      async list(options = {}) {
+        const prefix = String(options?.prefix ?? "");
+        const limitInput = Number(options?.limit ?? 100);
+        const limit = Number.isFinite(limitInput)
+          ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
+          : 100;
+        const result = await callOp(
+          "op_kv_list",
+          workerName,
+          bindingName,
+          prefix,
+          limit,
+        );
+        syncFrozenTimeNow();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "kv list failed"));
+        }
+        const entries = Array.isArray(result?.entries) ? result.entries : [];
+        return entries.map((entry) => {
+          const encoding = String(entry?.encoding ?? "utf8");
+          return {
+            key: String(entry?.key ?? ""),
+            value: decodeStoredValue(encoding, entry?.value, "kv list"),
+            encoding,
+          };
+        });
+      },
+    });
   };
 
   const toHeaderEntries = (headersInput) => {
@@ -591,11 +640,12 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     const scopedFetch = async (inputValue, initValue = undefined) => {
       const run = async () => {
+        const current = currentRequestContext();
         const normalized = await normalizeHostFetchInput(inputValue, initValue);
         const prepared = await callOp(
           "op_http_prepare",
           JSON.stringify({
-            request_id: requestId,
+            request_id: current.requestId,
             method: normalized.method,
             url: normalized.url,
             headers: normalized.headers,
@@ -606,7 +656,7 @@ globalThis.__dd_execute_worker = (payload) => {
         if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
           throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
         }
-        const signal = composeAbortSignal([controller.signal, normalized.signal]);
+        const signal = composeAbortSignal([current.controller.signal, normalized.signal]);
         const body = Array.isArray(prepared.body) && prepared.body.length > 0
           ? toArrayBytes(prepared.body)
           : undefined;
@@ -617,8 +667,9 @@ globalThis.__dd_execute_worker = (payload) => {
           signal,
         }));
       };
-      if (currentActorEntry) {
-        return gateActorOutput(currentActorEntry, currentActorRequestId || requestId, run);
+      const current = currentRequestContext(false);
+      if (current?.actorEntry) {
+        return gateActorOutput(current.actorEntry, current.actorRequestId || current.requestId, run);
       }
       return run();
     };
@@ -2528,7 +2579,7 @@ globalThis.__dd_execute_worker = (payload) => {
     return Array.from(methods.values()).sort();
   };
 
-  const createDynamicHostRpcNamespace = (bindingName) => new Proxy({}, {
+  const createDynamicHostRpcNamespace = (bindingName) => new Proxy(Object.freeze({}), {
     get(_target, prop) {
       if (typeof prop === "symbol") {
         return undefined;
@@ -2543,7 +2594,7 @@ globalThis.__dd_execute_worker = (payload) => {
       return async (...args) => {
         const argsBytes = await encodeRpcArgs(args);
         const result = await callOp("op_dynamic_host_rpc_invoke", {
-          request_id: requestId,
+          request_id: activeRequestId(),
           binding: bindingName,
           method_name: methodName,
           args: Array.from(argsBytes),
@@ -2554,6 +2605,15 @@ globalThis.__dd_execute_worker = (payload) => {
         }
         return decodeRpcResult(toArrayBytes(result.value));
       };
+    },
+    set() {
+      return false;
+    },
+    defineProperty() {
+      return false;
+    },
+    deleteProperty() {
+      return false;
     },
   });
 
@@ -2601,7 +2661,7 @@ globalThis.__dd_execute_worker = (payload) => {
   const registerLiveActorExecutable = (executable) => {
     liveActorExecutableSeq += 1;
     globalThis.__dd_live_actor_executable_seq = liveActorExecutableSeq;
-    const token = `${requestId}:live-actor:${liveActorExecutableSeq}`;
+    const token = `${activeRequestId()}:live-actor:${liveActorExecutableSeq}`;
     liveActorExecutables.set(token, executable);
     return token;
   };
@@ -2624,7 +2684,7 @@ globalThis.__dd_execute_worker = (payload) => {
     return { live_token: liveToken, source };
   };
 
-  const createActorStubSocketApi = (bindingName, actorKey) => ({
+  const createActorStubSocketApi = (bindingName, actorKey) => Object.freeze({
     async send(handle, value, kind) {
       const normalizedHandle = String(handle ?? "").trim();
       if (!normalizedHandle) {
@@ -2632,7 +2692,7 @@ globalThis.__dd_execute_worker = (payload) => {
       }
       const payload = encodeSocketSendPayload(value, kind);
       const result = await callOp("op_actor_socket_send", {
-        request_id: activeRequestId() || requestId,
+        request_id: activeRequestId(),
         binding: bindingName,
         key: actorKey,
         handle: normalizedHandle,
@@ -2653,7 +2713,7 @@ globalThis.__dd_execute_worker = (payload) => {
         ? Math.trunc(Number(code))
         : 1000;
       const result = await callOp("op_actor_socket_close", {
-        request_id: activeRequestId() || requestId,
+        request_id: activeRequestId(),
         binding: bindingName,
         key: actorKey,
         handle: normalizedHandle,
@@ -2667,7 +2727,7 @@ globalThis.__dd_execute_worker = (payload) => {
     },
     async values() {
       const result = await callOp("op_actor_socket_list", {
-        request_id: activeRequestId() || requestId,
+        request_id: activeRequestId(),
         binding: bindingName,
         key: actorKey,
       });
@@ -2681,16 +2741,18 @@ globalThis.__dd_execute_worker = (payload) => {
     },
   });
 
-  const createActorStubTransportApi = (bindingName, actorKey) => ({
+  const createActorStubTransportApi = (bindingName, actorKey) => Object.freeze({
     async values() {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, false, false);
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId);
+      const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
       await state.__dd_transport_runtime.refreshOpenHandles();
       return state.transports.values();
     },
     async session(handle) {
-      const entry = await ensureActorEntry(bindingName, actorKey, requestId);
-      const state = createActorRuntimeState(entry, requestId, false, false);
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId);
+      const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
       await state.__dd_transport_runtime.refreshOpenHandles();
       return state.transports.session(handle);
     },
@@ -2714,9 +2776,10 @@ globalThis.__dd_execute_worker = (payload) => {
           return record ? record.value : defaultValue;
         }
         return (async () => {
-          const entry = await ensureActorEntry(bindingName, actorKey, requestId, { hydrate: false });
-          await ensureActorStorageKeysHydrated(entry, requestId, [normalizedKey]);
-          const state = createActorRuntimeState(entry, requestId, false, false);
+          const runtimeRequestId = activeRequestId();
+          const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId, { hydrate: false });
+          await ensureActorStorageKeysHydrated(entry, runtimeRequestId, [normalizedKey]);
+          const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
           const record = state.storage.get(normalizedKey, options);
           return record ? record.value : defaultValue;
         })();
@@ -2733,7 +2796,7 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   };
 
-  const createActorStub = (namespace, actorKey) => ({
+  const createActorStub = (namespace, actorKey) => Object.freeze({
     id: createActorId(namespace, actorKey),
     binding: namespace,
     sockets: createActorStubSocketApi(namespace, actorKey),
@@ -2832,8 +2895,8 @@ globalThis.__dd_execute_worker = (payload) => {
     executable,
     args,
   ) => {
-      actorInvokeSeq += 1;
-      const localRuntimeRequestId = `${activeRequestId() || requestId}:actor-run:${actorInvokeSeq}`;
+      const scopedRequestId = activeRequestId();
+      const localRuntimeRequestId = `${scopedRequestId}:actor-run:${nextActorInvokeSeq()}`;
       if (methodName === ACTOR_ATOMIC_METHOD && typeof executable === "function") {
         const entry = await ensureActorEntry(namespace, actorKey, localRuntimeRequestId, { hydrate: false });
         return await executeActorTransaction(
@@ -2862,7 +2925,7 @@ globalThis.__dd_execute_worker = (payload) => {
             method_name: methodName,
             prefer_caller_isolate: preferCallerIsolate,
             args: Array.from(argsBytes),
-            caller_request_id: activeRequestId() || requestId,
+            caller_request_id: scopedRequestId,
             request_id: localRuntimeRequestId,
           },
         );
@@ -2893,7 +2956,7 @@ globalThis.__dd_execute_worker = (payload) => {
     return "";
   };
 
-  const createActorNamespace = (bindingName) => ({
+  const createActorNamespace = (bindingName) => Object.freeze({
     idFromName(name) {
       const key = String(name ?? "").trim();
       if (!key) {
@@ -3163,7 +3226,7 @@ globalThis.__dd_execute_worker = (payload) => {
     async fetch(inputValue, initValue = undefined) {
       const request = await normalizeActorFetchInput(inputValue, initValue);
       const scopedRequestId = activeRequestId();
-      actorInvokeSeq += 1;
+      const invokeSeq = nextActorInvokeSeq();
       let timeoutId = 0;
       const timeoutError = new Promise((_, reject) => {
         timeoutId = setTimeout(
@@ -3174,7 +3237,7 @@ globalThis.__dd_execute_worker = (payload) => {
       const result = await Promise.race([
         callOp("op_dynamic_worker_invoke", {
           request_id: scopedRequestId,
-          subrequest_id: `${scopedRequestId}:dynamic:${actorInvokeSeq}`,
+          subrequest_id: `${scopedRequestId}:dynamic:${invokeSeq}`,
           binding: bindingName,
           handle,
           method: request.method,
@@ -3222,7 +3285,7 @@ globalThis.__dd_execute_worker = (payload) => {
    * @property {(input: Request|string, init?: RequestInit) => Promise<Response>} fetch Invoke the dynamic worker over HTTP-style fetch.
    */
 
-  const createDynamicNamespace = (bindingName) => ({
+  const createDynamicNamespace = (bindingName) => Object.freeze({
     /**
      * Get or lazily create a dynamic worker by stable id.
      *
@@ -3321,29 +3384,31 @@ globalThis.__dd_execute_worker = (payload) => {
     },
   });
 
-  const buildEnv = () => {
+  const getSharedEnv = () => {
+    const cache = globalThis.__dd_shared_env_cache ??= new WeakMap();
+    const cacheableWorker = worker && (typeof worker === "object" || typeof worker === "function")
+      ? worker
+      : null;
+    const fallbackCache = globalThis.__dd_shared_env_fallback_cache ??= new Map();
+    const cached = cacheableWorker
+      ? cache.get(cacheableWorker)
+      : fallbackCache.get(workerName);
+    if (cached) {
+      return cached;
+    }
     const env = {};
     const defineLazyValue = (target, propertyName, factory) => {
+      let initialized = false;
+      let cachedValue;
       Object.defineProperty(target, propertyName, {
         enumerable: true,
         configurable: true,
         get() {
-          const value = factory();
-          Object.defineProperty(target, propertyName, {
-            value,
-            enumerable: true,
-            configurable: true,
-            writable: true,
-          });
-          return value;
-        },
-        set(value) {
-          Object.defineProperty(target, propertyName, {
-            value,
-            enumerable: true,
-            configurable: true,
-            writable: true,
-          });
+          if (!initialized) {
+            cachedValue = factory();
+            initialized = true;
+          }
+          return cachedValue;
         },
       });
     };
@@ -3375,12 +3440,11 @@ globalThis.__dd_execute_worker = (payload) => {
       if (typeof envName !== "string" || envName.trim().length === 0) {
         continue;
       }
-      Object.defineProperty(env, envName.trim(), {
-        value: createDynamicNamespace(String(bindingName ?? envName).trim()),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+      defineLazyValue(
+        env,
+        envName.trim(),
+        () => createDynamicNamespace(String(bindingName ?? envName).trim()),
+      );
     }
 
     const dynamicRpcBindings = Array.isArray(dynamicRpcBindingsConfig)
@@ -3395,12 +3459,11 @@ globalThis.__dd_execute_worker = (payload) => {
       if (typeof envName !== "string" || envName.trim().length === 0) {
         continue;
       }
-      Object.defineProperty(env, envName.trim(), {
-        value: createDynamicHostRpcNamespace(String(bindingName ?? envName).trim()),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+      defineLazyValue(
+        env,
+        envName.trim(),
+        () => createDynamicHostRpcNamespace(String(bindingName ?? envName).trim()),
+      );
     }
 
     const dynamicEnv = Array.isArray(dynamicEnvConfig)
@@ -3432,15 +3495,16 @@ globalThis.__dd_execute_worker = (payload) => {
         continue;
       }
       const envName = bindingName;
-      Object.defineProperty(env, envName, {
-        value: createActorNamespace(bindingName),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+      defineLazyValue(env, envName, () => createActorNamespace(bindingName));
     }
 
-    return { env };
+    Object.freeze(env);
+    if (cacheableWorker) {
+      cache.set(cacheableWorker, env);
+    } else {
+      fallbackCache.set(workerName, env);
+    }
+    return env;
   };
 
   const decodeExecPayload = (rawArgs) => {
@@ -3508,10 +3572,11 @@ globalThis.__dd_execute_worker = (payload) => {
           true,
           txn,
         );
-        const previousSocketRuntimeProvider = currentSocketRuntimeProvider;
-        const previousTransportRuntimeProvider = currentTransportRuntimeProvider;
-        currentSocketRuntimeProvider = () => scopedState.__dd_socket_runtime;
-        currentTransportRuntimeProvider = () => scopedState.__dd_transport_runtime;
+        const current = currentRequestContext();
+        const previousSocketRuntimeProvider = current.socketRuntimeProvider;
+        const previousTransportRuntimeProvider = current.transportRuntimeProvider;
+        current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
+        current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
         try {
           const value = withActorTxnScope(
             {
@@ -3565,8 +3630,8 @@ globalThis.__dd_execute_worker = (payload) => {
           }
           throw error;
         } finally {
-          currentSocketRuntimeProvider = previousSocketRuntimeProvider;
-          currentTransportRuntimeProvider = previousTransportRuntimeProvider;
+          current.socketRuntimeProvider = previousSocketRuntimeProvider;
+          current.transportRuntimeProvider = previousTransportRuntimeProvider;
         }
       }
     }
@@ -3624,17 +3689,19 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!Object.prototype.hasOwnProperty.call(env, binding)) {
       throw new Error(`memory binding not declared for worker: ${binding}`);
     }
-    const entry = await ensureActorEntry(binding, actorKey, requestId, { hydrate: false });
+    const runtimeRequestId = activeRequestId();
+    const entry = await ensureActorEntry(binding, actorKey, runtimeRequestId, { hydrate: false });
     const kind = String(actorCall.kind ?? "");
-    const scopedState = createActorRuntimeState(entry, requestId, false, false);
-    const previousActorEntry = currentActorEntry;
-    const previousActorRequestId = currentActorRequestId;
-    const previousSocketRuntimeProvider = currentSocketRuntimeProvider;
-    const previousTransportRuntimeProvider = currentTransportRuntimeProvider;
-    currentSocketRuntimeProvider = () => scopedState.__dd_socket_runtime;
-    currentTransportRuntimeProvider = () => scopedState.__dd_transport_runtime;
-    currentActorEntry = entry;
-    currentActorRequestId = requestId;
+    const scopedState = createActorRuntimeState(entry, runtimeRequestId, false, false);
+    const current = currentRequestContext();
+    const previousActorEntry = current.actorEntry;
+    const previousActorRequestId = current.actorRequestId;
+    const previousSocketRuntimeProvider = current.socketRuntimeProvider;
+    const previousTransportRuntimeProvider = current.transportRuntimeProvider;
+    current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
+    current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
+    current.actorEntry = entry;
+    current.actorRequestId = runtimeRequestId;
     try {
       await scopedState.__dd_socket_runtime.refreshOpenHandles();
       await scopedState.__dd_transport_runtime.refreshOpenHandles();
@@ -3656,7 +3723,7 @@ globalThis.__dd_execute_worker = (payload) => {
         const executable = instantiateExecutable(descriptor);
         const value = await executeActorTransaction(
           entry,
-          requestId,
+          runtimeRequestId,
           executable,
           args,
         );
@@ -3682,15 +3749,15 @@ globalThis.__dd_execute_worker = (payload) => {
         }
         const event = buildWakeEvent(actorCall, createActorStub(binding, actorKey));
         await wakeMethod.call(worker, event, env);
-        await gateActorOutput(entry, requestId, async () => undefined);
+        await gateActorOutput(entry, runtimeRequestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       throw new Error(`unsupported memory invoke kind: ${kind}`);
     } finally {
-      currentActorEntry = previousActorEntry;
-      currentActorRequestId = previousActorRequestId;
-      currentSocketRuntimeProvider = previousSocketRuntimeProvider;
-      currentTransportRuntimeProvider = previousTransportRuntimeProvider;
+      current.actorEntry = previousActorEntry;
+      current.actorRequestId = previousActorRequestId;
+      current.socketRuntimeProvider = previousSocketRuntimeProvider;
+      current.transportRuntimeProvider = previousTransportRuntimeProvider;
     }
   };
 
@@ -3727,17 +3794,17 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const emitWaitUntilDone = async (timedOut) => {
-    if (waitUntilDoneSent) {
+    if (requestContext.waitUntilDoneSent) {
       return;
     }
-    waitUntilDoneSent = true;
+    requestContext.waitUntilDoneSent = true;
     await syncFrozenTime();
     callOp(
       "op_emit_wait_until_done",
       JSON.stringify({
         request_id: requestId,
         completion_token: completionToken,
-        wait_until_count: waitUntilPromises.length,
+        wait_until_count: requestContext.waitUntilPromises.length,
         timed_out: timedOut,
       }),
     );
@@ -3771,7 +3838,7 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const waitForWaitUntils = async () => {
-    if (waitUntilPromises.length === 0) {
+    if (requestContext.waitUntilPromises.length === 0) {
       return true;
     }
 
@@ -3779,7 +3846,7 @@ globalThis.__dd_execute_worker = (payload) => {
     const timeout = new Promise((resolve) => {
       timeoutId = setTimeout(() => resolve(false), 30_000);
     });
-    const settled = Promise.allSettled(waitUntilPromises).then(() => true);
+    const settled = Promise.allSettled(requestContext.waitUntilPromises).then(() => true);
     try {
       return await Promise.race([settled, timeout]);
     } finally {
@@ -3806,11 +3873,11 @@ globalThis.__dd_execute_worker = (payload) => {
         return { ok: false, error: String((error && (error.stack || error.message)) || error) };
       },
     );
-    waitUntilPromises.push(tracked);
+    requestContext.waitUntilPromises.push(tracked);
     return tracked;
   };
 
-  (async () => {
+  asyncContext.run(requestContext, () => (async () => {
     let restoreHostFetch = null;
     try {
       await syncFrozenTime();
@@ -3835,7 +3902,7 @@ globalThis.__dd_execute_worker = (payload) => {
         method: requestMethod,
         headers: requestHeaders,
         body: requestBody,
-        signal: controller.signal,
+        signal: requestContext.controller.signal,
       });
       const workerRequest = isTransportConnect
         ? new Proxy(request, {
@@ -3847,11 +3914,10 @@ globalThis.__dd_execute_worker = (payload) => {
           },
         })
         : request;
-      const envResult = buildEnv();
-      const env = envResult.env;
+      const env = getSharedEnv();
       const ctx = {
         requestId: input.request_id,
-        signal: controller.signal,
+        signal: requestContext.controller.signal,
         waitUntil(promise) {
           return trackWaitUntil(promise);
         },
@@ -3926,7 +3992,7 @@ globalThis.__dd_execute_worker = (payload) => {
       }
       inflightRequests.delete(requestId);
     }
-  })()
+  })())
     .then(async (result) => {
       callOp(
         "op_emit_completion",
@@ -3934,7 +4000,7 @@ globalThis.__dd_execute_worker = (payload) => {
           request_id: requestId,
           completion_token: completionToken,
           ok: true,
-          wait_until_count: waitUntilPromises.length,
+          wait_until_count: requestContext.waitUntilPromises.length,
           result,
         }),
       );
@@ -3949,7 +4015,7 @@ globalThis.__dd_execute_worker = (payload) => {
           request_id: requestId,
           completion_token: completionToken,
           ok: false,
-          wait_until_count: waitUntilPromises.length,
+          wait_until_count: requestContext.waitUntilPromises.length,
           error: message,
         }),
       );

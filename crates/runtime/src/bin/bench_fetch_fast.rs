@@ -1,4 +1,4 @@
-use common::{PlatformError, WorkerInvocation};
+use common::{DeployBinding, DeployConfig, PlatformError, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -21,6 +21,8 @@ struct Scenario {
     name: &'static str,
     worker_source: &'static str,
     path: &'static str,
+    use_kv_binding: bool,
+    seed_path: Option<&'static str>,
 }
 
 struct ScenarioResult {
@@ -159,6 +161,8 @@ export default {
 };
 "#,
             path: "/",
+            use_kv_binding: false,
+            seed_path: None,
         },
         Scenario {
             name: "instant-json",
@@ -170,6 +174,8 @@ export default {
 };
 "#,
             path: "/",
+            use_kv_binding: false,
+            seed_path: None,
         },
         Scenario {
             name: "instant-html",
@@ -183,6 +189,54 @@ export default {
 };
 "#,
             path: "/",
+            use_kv_binding: false,
+            seed_path: None,
+        },
+        Scenario {
+            name: "instant-text-kv-bound",
+            worker_source: r#"
+export default {
+  fetch() {
+    return new Response("ok");
+  },
+};
+"#,
+            path: "/",
+            use_kv_binding: true,
+            seed_path: None,
+        },
+        Scenario {
+            name: "instant-text-kv-read",
+            worker_source: r#"
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/seed") {
+      await env.MY_KV.set("hot", "ok");
+      return new Response("seeded");
+    }
+    return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+  },
+};
+"#,
+            path: "/",
+            use_kv_binding: true,
+            seed_path: Some("/seed"),
+        },
+        Scenario {
+            name: "instant-text-kv-write",
+            worker_source: r#"
+export default {
+  async fetch(request, env) {
+    const key = request.headers.get("x-bench-request") ?? "0";
+    await env.MY_KV.set("hot:" + key, "ok");
+    return new Response("ok");
+  },
+};
+"#,
+            path: "/",
+            use_kv_binding: true,
+            seed_path: None,
         },
     ];
 
@@ -293,9 +347,28 @@ async fn run_config_scenario(
     .map_err(|error| error.to_string())?;
     let worker_name = format!("{}-{}", config.name, scenario.name);
     service
-        .deploy(worker_name.clone(), scenario.worker_source.to_string())
+        .deploy_with_config(
+            worker_name.clone(),
+            scenario.worker_source.to_string(),
+            DeployConfig {
+                bindings: if scenario.use_kv_binding {
+                    vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..DeployConfig::default()
+            },
+        )
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(seed_path) = scenario.seed_path {
+        service
+            .invoke(worker_name.clone(), invocation(seed_path, usize::MAX))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let result = run_scenario(&service, &worker_name, *scenario, requests, concurrency)
         .await
         .map_err(|error| error.to_string())?;

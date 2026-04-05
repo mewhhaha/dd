@@ -2,7 +2,9 @@ use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
     BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
 };
+use serde::Deserialize;
 use std::env;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -18,6 +20,8 @@ struct Scenario {
     requests: usize,
     concurrency: usize,
     path: &'static str,
+    worker_source: &'static str,
+    use_kv_binding: bool,
 }
 
 struct ScenarioResult {
@@ -34,10 +38,76 @@ struct BenchConfig {
     runtime: RuntimeConfig,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct KvProfileMetric {
+    calls: u64,
+    total_us: u64,
+    total_items: u64,
+    max_us: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct KvProfileSnapshot {
+    enabled: bool,
+    js_request_total: KvProfileMetric,
+    js_batch_flush: KvProfileMetric,
+    op_get: KvProfileMetric,
+    op_get_many_utf8: KvProfileMetric,
+    op_get_value: KvProfileMetric,
+    store_get_utf8: KvProfileMetric,
+    store_get_utf8_many: KvProfileMetric,
+    store_get_value: KvProfileMetric,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct KvProfileEnvelope {
+    ok: bool,
+    snapshot: Option<KvProfileSnapshot>,
+    error: String,
+}
+
+const FETCH_BASELINE_WORKER_SOURCE: &str = r#"
+export default {
+  fetch() {
+    return new Response("ok");
+  },
+};
+"#;
+
+const FETCH_URL_BASELINE_WORKER_SOURCE: &str = r#"
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/noop") {
+      return new Response("ok");
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
 const KV_WORKER_SOURCE: &str = r#"
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_kv_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_kv_profile_reset?.();
+      return new Response("ok");
+    }
+    const requestStart = performance.now();
+    const finish = () => {
+      Deno.core.ops.op_kv_profile_record_js?.(
+        "js_request_total",
+        Math.max(0, Math.round((performance.now() - requestStart) * 1000)),
+        1,
+      );
+    };
+    try {
     if (url.pathname === "/seed") {
       await env.MY_KV.set("hot", "1");
       return new Response("ok");
@@ -74,6 +144,9 @@ export default {
       return new Response(String(next));
     }
     return new Response("not found", { status: 404 });
+    } finally {
+      finish();
+    }
   },
 };
 "#;
@@ -83,6 +156,9 @@ async fn main() -> Result<(), String> {
     let requests = env_usize("DD_BENCH_REQUESTS", 200);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 32);
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 4);
+    let write_requests = env_usize("DD_BENCH_WRITE_REQUESTS", requests.min(5_000));
+    let write_concurrency = env_usize("DD_BENCH_WRITE_CONCURRENCY", concurrency.min(256));
+    let profile_enabled = env_bool("DD_BENCH_PROFILE_KV", false);
 
     let configs = [
         BenchConfig {
@@ -94,6 +170,7 @@ async fn main() -> Result<(), String> {
                 idle_ttl: Duration::from_secs(60),
                 scale_tick: Duration::from_secs(1),
                 queue_warn_thresholds: vec![10, 100, 1000],
+                kv_profile_enabled: profile_enabled,
                 ..RuntimeConfig::default()
             },
         },
@@ -106,6 +183,7 @@ async fn main() -> Result<(), String> {
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
                 queue_warn_thresholds: vec![10, 100, 1000],
+                kv_profile_enabled: profile_enabled,
                 ..RuntimeConfig::default()
             },
         },
@@ -113,40 +191,68 @@ async fn main() -> Result<(), String> {
 
     let scenarios = [
         Scenario {
+            label: "fetch-noop",
+            requests,
+            concurrency,
+            path: "/",
+            worker_source: FETCH_BASELINE_WORKER_SOURCE,
+            use_kv_binding: false,
+        },
+        Scenario {
+            label: "fetch-url-noop",
+            requests,
+            concurrency,
+            path: "/noop",
+            worker_source: FETCH_URL_BASELINE_WORKER_SOURCE,
+            use_kv_binding: false,
+        },
+        Scenario {
             label: "kv-noop",
             requests,
             concurrency,
             path: "/noop",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
         },
         Scenario {
             label: "kv-read",
             requests,
             concurrency,
             path: "/read",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
         },
         Scenario {
             label: "kv-read10",
             requests,
             concurrency,
             path: "/read10",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
         },
         Scenario {
             label: "kv-readqueue10",
             requests,
             concurrency,
             path: "/readqueue10",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
         },
         Scenario {
             label: "kv-write",
-            requests,
-            concurrency,
+            requests: write_requests,
+            concurrency: write_concurrency,
             path: "/write",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
         },
         Scenario {
             label: "kv-readwrite",
-            requests,
-            concurrency,
+            requests: write_requests,
+            concurrency: write_concurrency,
             path: "/readwrite",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
         },
     ];
 
@@ -173,6 +279,10 @@ async fn main() -> Result<(), String> {
         "# config: requests={} concurrency={} max_inflight={}",
         requests, concurrency, max_inflight
     );
+    println!(
+        "# write-config: requests={} concurrency={}",
+        write_requests, write_concurrency
+    );
     for config in &configs {
         run_config(config, &scenarios).await?;
     }
@@ -182,14 +292,28 @@ async fn main() -> Result<(), String> {
 
 async fn run_config(config: &BenchConfig, scenarios: &[Scenario]) -> Result<(), String> {
     println!("== {} ==", config.name);
+    let mut results = HashMap::new();
     for scenario in scenarios {
-        run_config_scenario(config, scenario).await?;
+        let result = run_config_scenario(config, scenario).await?;
+        results.insert(scenario.label, result);
+    }
+    if let (Some(sequential), Some(queued)) = (
+        results.get("kv-read10"),
+        results.get("kv-readqueue10"),
+    ) {
+        println!(
+            "batching gain  kv-readqueue10/kv-read10 = {:.2}x",
+            queued.throughput_rps / sequential.throughput_rps
+        );
     }
     println!();
     Ok(())
 }
 
-async fn run_config_scenario(config: &BenchConfig, scenario: &Scenario) -> Result<(), String> {
+async fn run_config_scenario(
+    config: &BenchConfig,
+    scenario: &Scenario,
+) -> Result<ScenarioResult, String> {
     let label = config.name;
     let runtime = config.runtime.clone();
     let root = PathBuf::from(format!("/tmp/dd-bench-kv-{label}-{}", Uuid::new_v4()));
@@ -214,21 +338,33 @@ async fn run_config_scenario(config: &BenchConfig, scenario: &Scenario) -> Resul
     service
         .deploy_with_config(
             worker_name.clone(),
-            KV_WORKER_SOURCE.to_string(),
+            scenario.worker_source.to_string(),
             DeployConfig {
                 public: false,
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
+                bindings: if scenario.use_kv_binding {
+                    vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }]
+                } else {
+                    Vec::new()
+                },
                 ..DeployConfig::default()
             },
         )
         .await
         .map_err(|error| error.to_string())?;
-    service
-        .invoke(worker_name.clone(), invocation("/seed", 0))
-        .await
-        .map_err(|error| error.to_string())?;
+    if scenario.use_kv_binding {
+        service
+            .invoke(worker_name.clone(), invocation("/seed", 0))
+            .await
+            .map_err(|error| error.to_string())?;
+        if config.runtime.kv_profile_enabled {
+            service
+                .invoke(worker_name.clone(), invocation("/__profile_reset", 0))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
 
     let result = run_scenario(&service, &worker_name, *scenario)
         .await
@@ -245,7 +381,48 @@ async fn run_config_scenario(config: &BenchConfig, scenario: &Scenario) -> Resul
         result.p95_ms,
         result.p99_ms,
     );
-    Ok(())
+    if scenario.use_kv_binding && config.runtime.kv_profile_enabled {
+        let profile = take_profile(&service, &worker_name).await?;
+        print_profile(&profile);
+    }
+    Ok(result)
+}
+
+async fn take_profile(service: &RuntimeService, worker_name: &str) -> Result<KvProfileSnapshot, String> {
+    let response = service
+        .invoke(worker_name.to_string(), invocation("/__profile", 0))
+        .await
+        .map_err(|error| error.to_string())?;
+    let body = String::from_utf8(response.body).map_err(|error| error.to_string())?;
+    let profile: KvProfileEnvelope =
+        serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    if !profile.ok {
+        return Err(if profile.error.is_empty() {
+            "kv profile collection failed".to_string()
+        } else {
+            profile.error
+        });
+    }
+    Ok(profile.snapshot.unwrap_or_default())
+}
+
+fn print_profile(profile: &KvProfileSnapshot) {
+    if !profile.enabled {
+        return;
+    }
+    println!(
+        "profile       js_request={:.2}ms js_batch={:.2}ms (keys {:.1}) op_get={:.2}ms op_many={:.2}ms op_value={:.2}ms store_get={:.2}ms store_many={:.2}ms store_value={:.2}ms max_batch={:.2}ms",
+        metric_mean_ms(&profile.js_request_total),
+        metric_mean_ms(&profile.js_batch_flush),
+        metric_mean_items(&profile.js_batch_flush),
+        metric_mean_ms(&profile.op_get),
+        metric_mean_ms(&profile.op_get_many_utf8),
+        metric_mean_ms(&profile.op_get_value),
+        metric_mean_ms(&profile.store_get_utf8),
+        metric_mean_ms(&profile.store_get_utf8_many),
+        metric_mean_ms(&profile.store_get_value),
+        profile.js_batch_flush.max_us as f64 / 1000.0,
+    );
 }
 
 fn env_name(name: &str) -> Option<String> {
@@ -253,6 +430,32 @@ fn env_name(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn metric_mean_ms(metric: &KvProfileMetric) -> f64 {
+    if metric.calls == 0 {
+        return 0.0;
+    }
+    (metric.total_us as f64 / metric.calls as f64) / 1000.0
+}
+
+fn metric_mean_items(metric: &KvProfileMetric) -> f64 {
+    if metric.calls == 0 {
+        return 0.0;
+    }
+    metric.total_items as f64 / metric.calls as f64
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

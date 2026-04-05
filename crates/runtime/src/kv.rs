@@ -1,10 +1,11 @@
 use common::{PlatformError, Result};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use turso::{Builder, Connection, Database, Value};
 
 const ENCODING_UTF8: &str = "utf8";
@@ -15,6 +16,7 @@ pub struct KvStore {
     database: Arc<Database>,
     connections: Arc<Mutex<Vec<Connection>>>,
     version: Arc<AtomicU64>,
+    profile: Arc<KvProfile>,
 }
 
 struct KvConnectionGuard {
@@ -62,6 +64,160 @@ pub enum KvUtf8Lookup {
     WrongEncoding,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvProfileMetricKind {
+    JsRequestTotal,
+    JsBatchFlush,
+    OpGet,
+    OpGetManyUtf8,
+    OpGetValue,
+    StoreGetUtf8,
+    StoreGetUtf8Many,
+    StoreGetValue,
+}
+
+#[derive(Default)]
+struct KvProfileMetric {
+    calls: AtomicU64,
+    total_us: AtomicU64,
+    total_items: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KvProfileMetricSnapshot {
+    pub calls: u64,
+    pub total_us: u64,
+    pub total_items: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KvProfileSnapshot {
+    pub enabled: bool,
+    pub js_request_total: KvProfileMetricSnapshot,
+    pub js_batch_flush: KvProfileMetricSnapshot,
+    pub op_get: KvProfileMetricSnapshot,
+    pub op_get_many_utf8: KvProfileMetricSnapshot,
+    pub op_get_value: KvProfileMetricSnapshot,
+    pub store_get_utf8: KvProfileMetricSnapshot,
+    pub store_get_utf8_many: KvProfileMetricSnapshot,
+    pub store_get_value: KvProfileMetricSnapshot,
+}
+
+#[derive(Default)]
+pub struct KvProfile {
+    enabled: AtomicBool,
+    js_request_total: KvProfileMetric,
+    js_batch_flush: KvProfileMetric,
+    op_get: KvProfileMetric,
+    op_get_many_utf8: KvProfileMetric,
+    op_get_value: KvProfileMetric,
+    store_get_utf8: KvProfileMetric,
+    store_get_utf8_many: KvProfileMetric,
+    store_get_value: KvProfileMetric,
+}
+
+impl KvProfileMetric {
+    fn record(&self, duration_us: u64, items: u64) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.total_items.fetch_add(items, Ordering::Relaxed);
+        let mut current = self.max_us.load(Ordering::Relaxed);
+        while duration_us > current {
+            match self.max_us.compare_exchange(
+                current,
+                duration_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn snapshot(&self) -> KvProfileMetricSnapshot {
+        KvProfileMetricSnapshot {
+            calls: self.calls.load(Ordering::Relaxed),
+            total_us: self.total_us.load(Ordering::Relaxed),
+            total_items: self.total_items.load(Ordering::Relaxed),
+            max_us: self.max_us.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.total_us.store(0, Ordering::Relaxed);
+        self.total_items.store(0, Ordering::Relaxed);
+        self.max_us.store(0, Ordering::Relaxed);
+    }
+}
+
+impl KvProfile {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.reset();
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn record(&self, metric: KvProfileMetricKind, duration_us: u64, items: u64) {
+        if !self.enabled() {
+            return;
+        }
+        self.metric(metric).record(duration_us, items.max(1));
+    }
+
+    pub fn snapshot(&self) -> KvProfileSnapshot {
+        KvProfileSnapshot {
+            enabled: self.enabled(),
+            js_request_total: self.js_request_total.snapshot(),
+            js_batch_flush: self.js_batch_flush.snapshot(),
+            op_get: self.op_get.snapshot(),
+            op_get_many_utf8: self.op_get_many_utf8.snapshot(),
+            op_get_value: self.op_get_value.snapshot(),
+            store_get_utf8: self.store_get_utf8.snapshot(),
+            store_get_utf8_many: self.store_get_utf8_many.snapshot(),
+            store_get_value: self.store_get_value.snapshot(),
+        }
+    }
+
+    pub fn take_snapshot_and_reset(&self) -> KvProfileSnapshot {
+        let snapshot = self.snapshot();
+        self.reset();
+        snapshot
+    }
+
+    pub fn reset(&self) {
+        self.js_request_total.reset();
+        self.js_batch_flush.reset();
+        self.op_get.reset();
+        self.op_get_many_utf8.reset();
+        self.op_get_value.reset();
+        self.store_get_utf8.reset();
+        self.store_get_utf8_many.reset();
+        self.store_get_value.reset();
+    }
+
+    fn metric(&self, metric: KvProfileMetricKind) -> &KvProfileMetric {
+        match metric {
+            KvProfileMetricKind::JsRequestTotal => &self.js_request_total,
+            KvProfileMetricKind::JsBatchFlush => &self.js_batch_flush,
+            KvProfileMetricKind::OpGet => &self.op_get,
+            KvProfileMetricKind::OpGetManyUtf8 => &self.op_get_many_utf8,
+            KvProfileMetricKind::OpGetValue => &self.op_get_value,
+            KvProfileMetricKind::StoreGetUtf8 => &self.store_get_utf8,
+            KvProfileMetricKind::StoreGetUtf8Many => &self.store_get_utf8_many,
+            KvProfileMetricKind::StoreGetValue => &self.store_get_value,
+        }
+    }
+}
+
 impl KvStore {
     pub async fn from_database_url(database_url: &str) -> Result<Self> {
         let local_path = database_url
@@ -77,10 +233,27 @@ impl KvStore {
             database: Arc::new(database),
             connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
+            profile: Arc::new(KvProfile::default()),
         };
         store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;
         Ok(store)
+    }
+
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        self.profile.set_enabled(enabled);
+    }
+
+    pub fn record_profile(&self, metric: KvProfileMetricKind, duration_us: u64, items: u64) {
+        self.profile.record(metric, duration_us, items);
+    }
+
+    pub fn take_profile_snapshot_and_reset(&self) -> KvProfileSnapshot {
+        self.profile.take_snapshot_and_reset()
+    }
+
+    pub fn reset_profile(&self) {
+        self.profile.reset();
     }
 
     pub async fn get(
@@ -89,6 +262,7 @@ impl KvStore {
         binding: &str,
         key: &str,
     ) -> Result<Option<KvValue>> {
+        let started = Instant::now();
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
@@ -108,11 +282,21 @@ impl KvStore {
             let encoding: String = row.get::<String>(1).map_err(kv_error)?;
             let legacy_value: String = row.get::<String>(2).map_err(kv_error)?;
             let value = value_blob.unwrap_or_else(|| legacy_value.into_bytes());
+            self.record_profile(
+                KvProfileMetricKind::StoreGetValue,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
             return Ok(Some(KvValue {
                 value,
                 encoding: normalize_encoding(&encoding),
             }));
         }
+        self.record_profile(
+            KvProfileMetricKind::StoreGetValue,
+            started.elapsed().as_micros() as u64,
+            1,
+        );
         Ok(None)
     }
 
@@ -122,6 +306,7 @@ impl KvStore {
         binding: &str,
         key: &str,
     ) -> Result<std::result::Result<String, KvUtf8Lookup>> {
+        let started = Instant::now();
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
@@ -139,10 +324,26 @@ impl KvStore {
             }
             let encoding: String = row.get::<String>(1).map_err(kv_error)?;
             if normalize_encoding(&encoding) != ENCODING_UTF8 {
+                self.record_profile(
+                    KvProfileMetricKind::StoreGetUtf8,
+                    started.elapsed().as_micros() as u64,
+                    1,
+                );
                 return Ok(Err(KvUtf8Lookup::WrongEncoding));
             }
-            return Ok(Ok(row.get::<String>(0).map_err(kv_error)?));
+            let value = row.get::<String>(0).map_err(kv_error)?;
+            self.record_profile(
+                KvProfileMetricKind::StoreGetUtf8,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
+            return Ok(Ok(value));
         }
+        self.record_profile(
+            KvProfileMetricKind::StoreGetUtf8,
+            started.elapsed().as_micros() as u64,
+            1,
+        );
         Ok(Err(KvUtf8Lookup::Missing))
     }
 
@@ -155,6 +356,7 @@ impl KvStore {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let started = Instant::now();
         let conn = self.connect().await?;
         let placeholders = (0..keys.len())
             .map(|index| format!("?{}", index + 3))
@@ -178,7 +380,7 @@ impl KvStore {
             let deleted: i64 = row.get::<i64>(3).map_err(kv_error)?;
             values.insert(key, (value, normalize_encoding(&encoding), deleted != 0));
         }
-        Ok(keys
+        let result = keys
             .iter()
             .map(|key| match values.get(key) {
                 None => Err(KvUtf8Lookup::Missing),
@@ -188,7 +390,13 @@ impl KvStore {
                 }
                 Some((value, _, false)) => Ok(value.clone()),
             })
-            .collect())
+            .collect();
+        self.record_profile(
+            KvProfileMetricKind::StoreGetUtf8Many,
+            started.elapsed().as_micros() as u64,
+            keys.len() as u64,
+        );
+        Ok(result)
     }
 
     pub async fn set(
@@ -572,6 +780,7 @@ mod tests {
             database: Arc::new(database),
             connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
+            profile: Arc::new(KvProfile::default()),
         };
         store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;
