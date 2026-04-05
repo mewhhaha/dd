@@ -4,7 +4,9 @@ use crate::actor_rpc::{
     ActorInvokeResponse,
 };
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
-use crate::kv::{KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup};
+use crate::kv::{
+    KvBatchMutation, KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup,
+};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
@@ -366,6 +368,21 @@ struct KvSetValuePayload {
     key: String,
     encoding: String,
     value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KvApplyBatchPayload {
+    worker_name: String,
+    binding: String,
+    mutations: Vec<KvApplyBatchMutationPayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KvApplyBatchMutationPayload {
+    key: String,
+    encoding: String,
+    value: Vec<u8>,
+    deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1404,6 +1421,44 @@ async fn op_kv_delete(
 ) -> KvOpResult {
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.delete(&worker_name, &binding, &key).await {
+        Ok(()) => KvOpResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => KvOpResult {
+            ok: false,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_kv_apply_batch(state: Rc<RefCell<OpState>>, #[string] payload: String) -> KvOpResult {
+    let payload: KvApplyBatchPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return KvOpResult {
+                ok: false,
+                error: format!("invalid kv apply batch payload: {error}"),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<KvStore>().clone();
+    let mutations = payload
+        .mutations
+        .into_iter()
+        .map(|mutation| KvBatchMutation {
+            key: mutation.key,
+            value: mutation.value,
+            encoding: mutation.encoding,
+            deleted: mutation.deleted,
+        })
+        .collect::<Vec<_>>();
+    match store
+        .apply_batch(&payload.worker_name, &payload.binding, &mutations)
+        .await
+    {
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
@@ -3650,6 +3705,7 @@ deno_core::extension!(
         op_kv_set,
         op_kv_set_value,
         op_kv_delete,
+        op_kv_apply_batch,
         op_kv_list,
         op_cache_match,
         op_cache_put,

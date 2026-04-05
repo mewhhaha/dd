@@ -7035,7 +7035,7 @@ export default {
         format!(
             r#"
 export default {{
-  async fetch(request, env) {{
+  async fetch(request, env, ctx) {{
     const url = new URL(request.url);
 
     if (url.pathname === "/seed") {{
@@ -7104,6 +7104,59 @@ export default {{
       }} catch (error) {{
         return new Response(String(error?.message ?? error), {{ status: 500 }});
       }}
+    }}
+
+    if (url.pathname === "/write-batch") {{
+      await Promise.all([
+        env.MY_KV.set("hot", "2"),
+        env.MY_KV.set("hot", "3"),
+        env.MY_KV.set("hot", "4"),
+      ]);
+      return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+    }}
+
+    if (url.pathname === "/write-overlay") {{
+      const pending = env.MY_KV.set("hot", "9");
+      const observed = await env.MY_KV.get("hot");
+      await pending;
+      return new Response(String(observed ?? "missing"));
+    }}
+
+    if (url.pathname === "/read") {{
+      return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+    }}
+
+    if (url.pathname === "/write-fire-and-forget") {{
+      env.MY_KV.set("hot", "7");
+      return new Response("queued");
+    }}
+
+    if (url.pathname === "/write-wait-until") {{
+      ctx.waitUntil((async () => {{
+        try {{
+          await env.MY_KV.set("hot", "8");
+          globalThis.__dd_wait_until_kv_write = "ok";
+        }} catch (error) {{
+          globalThis.__dd_wait_until_kv_write = "error:" + String(error?.message ?? error);
+        }}
+      }})());
+      return new Response("queued");
+    }}
+
+    if (url.pathname === "/write-wait-until-result") {{
+      return new Response(String(globalThis.__dd_wait_until_kv_write ?? "unset"));
+    }}
+
+    if (url.pathname === "/read-wait-until") {{
+      ctx.waitUntil((async () => {{
+        const value = await env.MY_KV.get("hot");
+        globalThis.__dd_wait_until_kv_read = String(value ?? "missing");
+      }})());
+      return new Response("queued");
+    }}
+
+    if (url.pathname === "/read-wait-until-result") {{
+      return new Response(String(globalThis.__dd_wait_until_kv_read ?? "unset"));
     }}
 
     return new Response("not found", {{ status: 404 }});
@@ -7619,6 +7672,30 @@ export default {
 export default {
   async fetch(request) {
     return new Response("ok");
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn wait_until_worker() -> String {
+        r#"
+globalThis.__dd_wait_until_value = globalThis.__dd_wait_until_value ?? "idle";
+
+export default {
+  async fetch(request, _env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/trigger") {
+      ctx.waitUntil((async () => {
+        await Promise.resolve();
+        globalThis.__dd_wait_until_value = "done";
+      })());
+      return new Response("queued");
+    }
+    if (url.pathname === "/read") {
+      return new Response(String(globalThis.__dd_wait_until_value));
+    }
+    return new Response("not found", { status: 404 });
   },
 };
 "#
@@ -8164,6 +8241,369 @@ export default {
             assert_eq!(payload["envHasTemp"], Value::Bool(false));
             assert_eq!(payload["kvHasTemp"], Value::Bool(false));
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_write_batching_preserves_last_write_wins() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-write-batching".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-write-batch-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let output = service
+            .invoke(
+                worker_name,
+                test_invocation_with_path("/write-batch", "kv-write-batch-request"),
+            )
+            .await
+            .expect("write batch should succeed");
+        assert_eq!(
+            String::from_utf8(output.body).expect("body should be utf8"),
+            "4"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_write_overlay_makes_same_request_reads_predictable() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-write-overlay".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-write-overlay-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let output = service
+            .invoke(
+                worker_name,
+                test_invocation_with_path("/write-overlay", "kv-write-overlay-request"),
+            )
+            .await
+            .expect("write overlay should succeed");
+        assert_eq!(
+            String::from_utf8(output.body).expect("body should be utf8"),
+            "9"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_unawaited_write_flushes_after_response() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-write-fire-and-forget".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-write-fire-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path(
+                    "/write-fire-and-forget",
+                    "kv-write-fire-request",
+                ),
+            )
+            .await
+            .expect("fire-and-forget request should succeed");
+
+        let mut observed = None;
+        for _ in 0..20 {
+            let output = service
+                .invoke(
+                    worker_name.clone(),
+                    test_invocation_with_path("/read", "kv-write-fire-read-request"),
+                )
+                .await
+                .expect("read request should succeed");
+            let body = String::from_utf8(output.body).expect("read body should be utf8");
+            if body == "7" {
+                observed = Some(body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(observed.as_deref(), Some("7"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_wait_until_write_flushes_after_response() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-write-wait-until".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-write-wait-until-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path(
+                    "/write-wait-until",
+                    "kv-write-wait-until-request",
+                ),
+            )
+            .await
+            .expect("wait-until request should succeed");
+
+        let mut observed = None;
+        for _ in 0..20 {
+            let output = service
+                .invoke(
+                    worker_name.clone(),
+                    test_invocation_with_path("/read", "kv-write-wait-until-read-request"),
+                )
+                .await
+                .expect("read request should succeed");
+            let body = String::from_utf8(output.body).expect("read body should be utf8");
+            if body == "8" {
+                observed = Some(body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let status = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path(
+                    "/write-wait-until-result",
+                    "kv-write-wait-until-status-request",
+                ),
+            )
+            .await
+            .expect("status request should succeed");
+        let status_body = String::from_utf8(status.body).expect("status body should be utf8");
+
+        assert_eq!(status_body, "ok");
+        assert_eq!(observed.as_deref(), Some("8"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_wait_until_read_runs_after_response() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-read-wait-until".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-read-wait-until-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path(
+                    "/read-wait-until",
+                    "kv-read-wait-until-request",
+                ),
+            )
+            .await
+            .expect("wait-until read request should succeed");
+
+        let mut observed = None;
+        for _ in 0..20 {
+            let output = service
+                .invoke(
+                    worker_name.clone(),
+                    test_invocation_with_path(
+                        "/read-wait-until-result",
+                        "kv-read-wait-until-result-request",
+                    ),
+                )
+                .await
+                .expect("result request should succeed");
+            let body = String::from_utf8(output.body).expect("result body should be utf8");
+            if body == "1" {
+                observed = Some(body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(observed.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn wait_until_background_work_runs_after_response() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "wait-until-basic".to_string();
+        service
+            .deploy(worker_name.clone(), wait_until_worker())
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/trigger", "wait-until-trigger-request"),
+            )
+            .await
+            .expect("trigger request should succeed");
+
+        let mut observed = None;
+        for _ in 0..20 {
+            let output = service
+                .invoke(
+                    worker_name.clone(),
+                    test_invocation_with_path("/read", "wait-until-read-request"),
+                )
+                .await
+                .expect("read request should succeed");
+            let body = String::from_utf8(output.body).expect("read body should be utf8");
+            if body == "done" {
+                observed = Some(body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(observed.as_deref(), Some("done"));
     }
 
     #[tokio::test]

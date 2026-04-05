@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use turso::{Builder, Connection, Database, Value};
+use turso::{transaction::TransactionBehavior, Builder, Connection, Database, Value};
 
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
@@ -34,6 +34,14 @@ impl std::ops::Deref for KvConnectionGuard {
     }
 }
 
+impl std::ops::DerefMut for KvConnectionGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn
+            .as_mut()
+            .expect("kv pooled connection must be present")
+    }
+}
+
 impl Drop for KvConnectionGuard {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
@@ -56,6 +64,14 @@ pub struct KvEntry {
     pub key: String,
     pub value: Vec<u8>,
     pub encoding: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvBatchMutation {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub encoding: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,6 +547,87 @@ impl KvStore {
         }
         Err(PlatformError::runtime(
             "kv delete conflict: failed to resolve version race",
+        ))
+    }
+
+    pub async fn apply_batch(
+        &self,
+        worker_name: &str,
+        binding: &str,
+        mutations: &[KvBatchMutation],
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connect().await?;
+        const MAX_VERSION_RETRIES: usize = 8;
+        for _ in 0..MAX_VERSION_RETRIES {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+                .map_err(kv_error)?;
+            let mut conflicted = false;
+            for mutation in mutations {
+                let version = self.next_version();
+                let now_ms = epoch_ms_i64()?;
+                let encoding = normalize_encoding(&mutation.encoding);
+                let value_text = if !mutation.deleted && encoding == ENCODING_UTF8 {
+                    std::str::from_utf8(&mutation.value)
+                        .map_err(|error| {
+                            PlatformError::bad_request(format!("invalid utf8 value: {error}"))
+                        })?
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let value_blob = if mutation.deleted {
+                    None
+                } else if encoding == ENCODING_UTF8 {
+                    None
+                } else {
+                    Some(mutation.value.clone())
+                };
+                let affected = tx
+                    .execute(
+                        "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         ON CONFLICT(worker_name, binding, key) DO UPDATE SET
+                           value = excluded.value,
+                           value_blob = excluded.value_blob,
+                           encoding = excluded.encoding,
+                           deleted = excluded.deleted,
+                           version = excluded.version,
+                           updated_at_ms = excluded.updated_at_ms
+                         WHERE excluded.version > worker_kv.version",
+                        (
+                            worker_name,
+                            binding,
+                            mutation.key.as_str(),
+                            value_text.as_str(),
+                            value_blob.as_deref(),
+                            encoding.as_str(),
+                            if mutation.deleted { 1 } else { 0 },
+                            version,
+                            now_ms,
+                        ),
+                    )
+                    .await
+                    .map_err(kv_error)?;
+                if affected == 0 {
+                    conflicted = true;
+                    break;
+                }
+            }
+            if conflicted {
+                let _ = tx.rollback().await;
+                self.sync_version_floor_from_conn(&conn).await?;
+                continue;
+            }
+            tx.commit().await.map_err(kv_error)?;
+            return Ok(());
+        }
+        Err(PlatformError::runtime(
+            "kv write batch conflict: failed to resolve version race",
         ))
     }
 

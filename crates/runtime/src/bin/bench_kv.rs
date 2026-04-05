@@ -148,6 +148,20 @@ export default {
       await env.MY_KV.set("hot", "1");
       return new Response("ok");
     }
+    if (url.pathname === "/write10") {
+      for (let i = 0; i < 10; i++) {
+        await env.MY_KV.set("hot", String(i));
+      }
+      return new Response("ok");
+    }
+    if (url.pathname === "/writequeue10") {
+      const tasks = [];
+      for (let i = 0; i < 10; i++) {
+        tasks.push(env.MY_KV.set("hot", String(i)));
+      }
+      await Promise.all(tasks);
+      return new Response("ok");
+    }
     if (url.pathname === "/readwrite") {
       const current = Number((await env.MY_KV.get("hot")) ?? "0") || 0;
       const next = current + 1;
@@ -262,6 +276,22 @@ async fn main() -> Result<(), String> {
             requests: write_requests,
             concurrency: write_concurrency,
             path: "/write",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
+        },
+        Scenario {
+            label: "kv-write10",
+            requests: write_requests,
+            concurrency: write_concurrency,
+            path: "/write10",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
+        },
+        Scenario {
+            label: "kv-writequeue10",
+            requests: write_requests,
+            concurrency: write_concurrency,
+            path: "/writequeue10",
             worker_source: KV_WORKER_SOURCE,
             use_kv_binding: true,
         },

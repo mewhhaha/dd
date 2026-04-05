@@ -39,6 +39,7 @@ globalThis.__dd_execute_worker = (payload) => {
     transportRuntimeProvider: null,
     kvGetBatches: new Map(),
     kvGetResults: new Map(),
+    kvWriteBatches: new Map(),
   };
 
   const currentRequestContext = (required = true) => {
@@ -307,6 +308,74 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const createKvBinding = (bindingName) => {
+    const ensureKvWriteBatch = () => {
+      const current = currentRequestContext();
+      let batch = current.kvWriteBatches.get(bindingName) ?? null;
+      if (!batch) {
+        batch = {
+          mutationsByKey: new Map(),
+          flushPromise: null,
+          trackedFlushPromise: null,
+        };
+        current.kvWriteBatches.set(bindingName, batch);
+      }
+      return batch;
+    };
+
+    const setKvOverlayValue = (normalizedKey, value) => {
+      const current = currentRequestContext(false);
+      const bindingCache = current?.kvGetResults?.get(bindingName) ?? null;
+      bindingCache?.set(normalizedKey, Promise.resolve(value));
+    };
+
+    const clearKvOverlayValue = (normalizedKey) => {
+      const current = currentRequestContext(false);
+      current?.kvGetResults?.get(bindingName)?.delete(normalizedKey);
+    };
+
+    const flushPendingWriteBatch = async (batch) => {
+      while (batch.mutationsByKey.size > 0) {
+        const mutations = Array.from(batch.mutationsByKey.values());
+        batch.mutationsByKey.clear();
+        const result = await callOp(
+          "op_kv_apply_batch",
+          JSON.stringify({
+            worker_name: workerName,
+            binding: bindingName,
+            mutations: mutations.map((mutation) => ({
+              key: mutation.key,
+              encoding: mutation.encoding,
+              value: Array.from(mutation.value),
+              deleted: mutation.deleted === true,
+            })),
+          }),
+        );
+        syncFrozenTimeNow();
+        if (result && typeof result === "object" && result.ok === false) {
+          for (const mutation of mutations) {
+            clearKvOverlayValue(mutation.key);
+          }
+          batch.mutationsByKey.clear();
+          throw new Error(String(result.error ?? "kv batch apply failed"));
+        }
+      }
+    };
+
+    const queueKvWrite = (mutation) => {
+      const batch = ensureKvWriteBatch();
+      batch.mutationsByKey.set(mutation.key, mutation);
+      if (!batch.flushPromise) {
+        batch.flushPromise = Promise.resolve()
+          .then(() => flushPendingWriteBatch(batch))
+          .finally(() => {
+            batch.flushPromise = null;
+            batch.trackedFlushPromise = null;
+          });
+        batch.trackedFlushPromise = trackWaitUntil(batch.flushPromise);
+      }
+      return batch.flushPromise;
+    };
+
     const loadKvValues = async (normalizedKeys, contextLabel) => {
       if (normalizedKeys.length === 0) {
         return [];
@@ -468,62 +537,58 @@ globalThis.__dd_execute_worker = (payload) => {
     return Object.freeze({
       async get(key, options = {}) {
         const _ = options;
-        return await queueKvGet(String(key));
+        const normalizedKey = String(key);
+        const pendingWrite = currentRequestContext(false)?.kvWriteBatches?.get(bindingName)
+          ?.mutationsByKey?.get(normalizedKey);
+        if (pendingWrite) {
+          if (pendingWrite.deleted === true) {
+            return null;
+          }
+          if (pendingWrite.encoding === "utf8") {
+            return Deno.core.decode(pendingWrite.value);
+          }
+          return Deno.core.deserialize(pendingWrite.value, { forStorage: true });
+        }
+        return await queueKvGet(normalizedKey);
       },
       async set(key, value, options = {}) {
         const _ = options;
         const normalizedKey = String(key);
+        let mutation;
         if (typeof value === "string") {
-          const result = await callOp(
-            "op_kv_set",
-            workerName,
-            bindingName,
-            normalizedKey,
-            value,
-          );
-          syncFrozenTimeNow();
-          if (result && typeof result === "object" && result.ok === false) {
-            throw new Error(String(result.error ?? "kv set failed"));
+          mutation = {
+            key: normalizedKey,
+            encoding: "utf8",
+            value: toUtf8Bytes(value),
+            deleted: false,
+          };
+        } else {
+          let encoded;
+          try {
+            encoded = Deno.core.serialize(value, { forStorage: true });
+          } catch (error) {
+            throw new Error(`kv set serialize failed: ${String(error?.message ?? error)}`);
           }
-          currentRequestContext(false)?.kvGetResults?.get(bindingName)?.set(normalizedKey, Promise.resolve(value));
-          return;
-        }
-        let encoded;
-        try {
-          encoded = Deno.core.serialize(value, { forStorage: true });
-        } catch (error) {
-          throw new Error(`kv set serialize failed: ${String(error?.message ?? error)}`);
-        }
-        const result = await callOp(
-          "op_kv_set_value",
-          JSON.stringify({
-            worker_name: workerName,
-            binding: bindingName,
+          mutation = {
             key: normalizedKey,
             encoding: "v8sc",
-            value: Array.from(new Uint8Array(encoded)),
-          }),
-        );
-        syncFrozenTimeNow();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? "kv set failed"));
+            value: new Uint8Array(encoded),
+            deleted: false,
+          };
         }
-        currentRequestContext(false)?.kvGetResults?.get(bindingName)?.set(normalizedKey, Promise.resolve(value));
+        setKvOverlayValue(normalizedKey, value);
+        await queueKvWrite(mutation);
       },
       async delete(key, options = {}) {
         const _ = options;
         const normalizedKey = String(key);
-        const result = await callOp(
-          "op_kv_delete",
-          workerName,
-          bindingName,
-          normalizedKey,
-        );
-        syncFrozenTimeNow();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? "kv delete failed"));
-        }
-        currentRequestContext(false)?.kvGetResults?.get(bindingName)?.set(normalizedKey, Promise.resolve(null));
+        setKvOverlayValue(normalizedKey, null);
+        await queueKvWrite({
+          key: normalizedKey,
+          encoding: "utf8",
+          value: new Uint8Array(),
+          deleted: true,
+        });
       },
       async list(options = {}) {
         const prefix = String(options?.prefix ?? "");
@@ -3873,7 +3938,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
   };
 
-  const trackWaitUntil = (promise) => {
+  function trackWaitUntil(promise) {
     const tracked = Promise.resolve(promise).then(
       async (value) => {
         await syncFrozenTime();
@@ -3894,6 +3959,13 @@ globalThis.__dd_execute_worker = (payload) => {
     );
     requestContext.waitUntilPromises.push(tracked);
     return tracked;
+  }
+
+  const settlePendingKvWriteScheduling = async () => {
+    if (requestContext.kvWriteBatches.size === 0) {
+      return;
+    }
+    await Promise.resolve();
   };
 
   asyncContext.run(requestContext, () => (async () => {
@@ -4013,6 +4085,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
   })())
     .then(async (result) => {
+      await settlePendingKvWriteScheduling();
       callOp(
         "op_emit_completion",
         JSON.stringify({
@@ -4027,6 +4100,7 @@ globalThis.__dd_execute_worker = (payload) => {
       await emitWaitUntilDone(!(await waitForWaitUntils()));
     })
     .catch(async (error) => {
+      await settlePendingKvWriteScheduling();
       const message = String((error && (error.stack || error.message)) || error);
       callOp(
         "op_emit_completion",
