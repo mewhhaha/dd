@@ -3323,6 +3323,30 @@ globalThis.__dd_execute_worker = (payload) => {
 
   const buildEnv = () => {
     const env = {};
+    const defineLazyValue = (target, propertyName, factory) => {
+      Object.defineProperty(target, propertyName, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          const value = factory();
+          Object.defineProperty(target, propertyName, {
+            value,
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          });
+          return value;
+        },
+        set(value) {
+          Object.defineProperty(target, propertyName, {
+            value,
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          });
+        },
+      });
+    };
     const kvBindings = Array.isArray(kvBindingsConfig)
       ? kvBindingsConfig
       : kvBindingsConfig && typeof kvBindingsConfig === "object"
@@ -3336,12 +3360,7 @@ globalThis.__dd_execute_worker = (payload) => {
       if (typeof envName !== "string" || envName.length === 0) {
         continue;
       }
-      Object.defineProperty(env, envName, {
-        value: createKvBinding(bindingName),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+      defineLazyValue(env, envName, () => createKvBinding(bindingName));
     }
 
     const dynamicBindings = Array.isArray(dynamicBindingsConfig)
