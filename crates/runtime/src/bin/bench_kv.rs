@@ -2,6 +2,7 @@ use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
     BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
 };
+use std::env;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -26,6 +27,11 @@ struct ScenarioResult {
     p95_ms: f64,
     p99_ms: f64,
     total_ms: f64,
+}
+
+struct BenchConfig {
+    name: &'static str,
+    runtime: RuntimeConfig,
 }
 
 const KV_WORKER_SOURCE: &str = r#"
@@ -56,10 +62,14 @@ export default {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    let requests = env_usize("DD_BENCH_REQUESTS", 200);
+    let concurrency = env_usize("DD_BENCH_CONCURRENCY", 32);
+    let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 4);
+
     let configs = [
-        (
-            "single-isolate",
-            RuntimeConfig {
+        BenchConfig {
+            name: "single-isolate",
+            runtime: RuntimeConfig {
                 min_isolates: 1,
                 max_isolates: 1,
                 max_inflight_per_isolate: 1,
@@ -68,105 +78,153 @@ async fn main() -> Result<(), String> {
                 queue_warn_thresholds: vec![10, 100, 1000],
                 ..RuntimeConfig::default()
             },
-        ),
-        (
-            "autoscaling-8",
-            RuntimeConfig {
+        },
+        BenchConfig {
+            name: "autoscaling-8",
+            runtime: RuntimeConfig {
                 min_isolates: 0,
                 max_isolates: 8,
-                max_inflight_per_isolate: 4,
+                max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
                 queue_warn_thresholds: vec![10, 100, 1000],
                 ..RuntimeConfig::default()
             },
-        ),
+        },
     ];
 
     let scenarios = [
         Scenario {
             label: "kv-read",
-            requests: 200,
-            concurrency: 32,
+            requests,
+            concurrency,
             path: "/read",
         },
         Scenario {
             label: "kv-write",
-            requests: 200,
-            concurrency: 32,
+            requests,
+            concurrency,
             path: "/write",
         },
         Scenario {
             label: "kv-readwrite",
-            requests: 200,
-            concurrency: 32,
+            requests,
+            concurrency,
             path: "/readwrite",
         },
     ];
 
+    if let Some(config_name) = env_name("DD_BENCH_INTERNAL_CONFIG") {
+        let config = configs
+            .iter()
+            .find(|config| config.name == config_name)
+            .ok_or_else(|| format!("unknown kv config: {config_name}"))?;
+        if let Some(scenario_name) = env_name("DD_BENCH_INTERNAL_SCENARIO") {
+            let scenario = scenarios
+                .iter()
+                .find(|scenario| scenario.label == scenario_name)
+                .ok_or_else(|| format!("unknown kv scenario: {scenario_name}"))?;
+            run_config_scenario(config, scenario).await?;
+        } else {
+            run_config(config, &scenarios).await?;
+        }
+        return Ok(());
+    }
+
     println!("# kv benchmark");
     println!("# runtime service only, without external HTTP overhead.");
-    for (label, runtime) in configs {
-        let root = PathBuf::from(format!("/tmp/dd-bench-kv-{label}-{}", Uuid::new_v4()));
-        let store_dir = root.join("store");
-        tokio::fs::create_dir_all(&store_dir)
-            .await
-            .map_err(|error| error.to_string())?;
-        let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
-            runtime,
-            storage: RuntimeStorageConfig {
-                store_dir: store_dir.clone(),
-                database_url: format!("file:{}", root.join("dd-kv.db").display()),
-                actor_shards_per_namespace: 64,
-                worker_store_enabled: true,
-                blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
-            },
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-
-        let worker_name = format!("bench-kv-{}", Uuid::new_v4());
-        service
-            .deploy_with_config(
-                worker_name.clone(),
-                KV_WORKER_SOURCE.to_string(),
-                DeployConfig {
-                    public: false,
-                    bindings: vec![DeployBinding::Kv {
-                        binding: "MY_KV".to_string(),
-                    }],
-                    ..DeployConfig::default()
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        service
-            .invoke(worker_name.clone(), invocation("/seed", 0))
-            .await
-            .map_err(|error| error.to_string())?;
-
-        println!("== {} ==", label);
-        for scenario in scenarios {
-            let result = run_scenario(&service, &worker_name, scenario)
-                .await
-                .map_err(|error| error.to_string())?;
-            println!(
-                "{:<12} requests={} concurrency={} total={:.2}ms throughput={:.0} req/s mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
-                scenario.label,
-                scenario.requests,
-                scenario.concurrency,
-                result.total_ms,
-                result.throughput_rps,
-                result.mean_ms,
-                result.p50_ms,
-                result.p95_ms,
-                result.p99_ms,
-            );
-        }
-        println!();
+    println!(
+        "# config: requests={} concurrency={} max_inflight={}",
+        requests, concurrency, max_inflight
+    );
+    for config in &configs {
+        run_config(config, &scenarios).await?;
     }
 
     Ok(())
+}
+
+async fn run_config(config: &BenchConfig, scenarios: &[Scenario]) -> Result<(), String> {
+    println!("== {} ==", config.name);
+    for scenario in scenarios {
+        run_config_scenario(config, scenario).await?;
+    }
+    println!();
+    Ok(())
+}
+
+async fn run_config_scenario(config: &BenchConfig, scenario: &Scenario) -> Result<(), String> {
+    let label = config.name;
+    let runtime = config.runtime.clone();
+    let root = PathBuf::from(format!("/tmp/dd-bench-kv-{label}-{}", Uuid::new_v4()));
+    let store_dir = root.join("store");
+    tokio::fs::create_dir_all(&store_dir)
+        .await
+        .map_err(|error| error.to_string())?;
+    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+        runtime,
+        storage: RuntimeStorageConfig {
+            store_dir: store_dir.clone(),
+            database_url: format!("file:{}", root.join("dd-kv.db").display()),
+            actor_shards_per_namespace: 64,
+            worker_store_enabled: true,
+            blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
+        },
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let worker_name = format!("bench-kv-{}", Uuid::new_v4());
+    service
+        .deploy_with_config(
+            worker_name.clone(),
+            KV_WORKER_SOURCE.to_string(),
+            DeployConfig {
+                public: false,
+                bindings: vec![DeployBinding::Kv {
+                    binding: "MY_KV".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    service
+        .invoke(worker_name.clone(), invocation("/seed", 0))
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let result = run_scenario(&service, &worker_name, *scenario)
+        .await
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{:<12} requests={} concurrency={} total={:.2}ms throughput={:.0} req/s mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+        scenario.label,
+        scenario.requests,
+        scenario.concurrency,
+        result.total_ms,
+        result.throughput_rps,
+        result.mean_ms,
+        result.p50_ms,
+        result.p95_ms,
+        result.p99_ms,
+    );
+    Ok(())
+}
+
+fn env_name(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 async fn run_scenario(

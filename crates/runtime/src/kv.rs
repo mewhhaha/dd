@@ -56,6 +56,12 @@ pub struct KvEntry {
     pub encoding: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvUtf8Lookup {
+    Missing,
+    WrongEncoding,
+}
+
 impl KvStore {
     pub async fn from_database_url(database_url: &str) -> Result<Self> {
         let local_path = database_url
@@ -110,6 +116,36 @@ impl KvStore {
         Ok(None)
     }
 
+    pub async fn get_utf8(
+        &self,
+        worker_name: &str,
+        binding: &str,
+        key: &str,
+    ) -> Result<std::result::Result<String, KvUtf8Lookup>> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT value, encoding, deleted
+                 FROM worker_kv
+                 WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
+                (worker_name, binding, key),
+            )
+            .await
+            .map_err(kv_error)?;
+        if let Some(row) = rows.next().await.map_err(kv_error)? {
+            let deleted: i64 = row.get::<i64>(2).map_err(kv_error)?;
+            if deleted != 0 {
+                return Ok(Err(KvUtf8Lookup::Missing));
+            }
+            let encoding: String = row.get::<String>(1).map_err(kv_error)?;
+            if normalize_encoding(&encoding) != ENCODING_UTF8 {
+                return Ok(Err(KvUtf8Lookup::WrongEncoding));
+            }
+            return Ok(Ok(row.get::<String>(0).map_err(kv_error)?));
+        }
+        Ok(Err(KvUtf8Lookup::Missing))
+    }
+
     pub async fn set(
         &self,
         worker_name: &str,
@@ -117,8 +153,35 @@ impl KvStore {
         key: &str,
         value: &str,
     ) -> Result<()> {
-        self.set_value(worker_name, binding, key, value.as_bytes(), ENCODING_UTF8)
-            .await
+        let conn = self.connect().await?;
+        const MAX_VERSION_RETRIES: usize = 8;
+        for _ in 0..MAX_VERSION_RETRIES {
+            let version = self.next_version();
+            let now_ms = epoch_ms_i64()?;
+            let affected = execute_with_retry(|| {
+                conn.execute(
+                    "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, ?6, ?7)
+                     ON CONFLICT(worker_name, binding, key) DO UPDATE SET
+                       value = excluded.value,
+                       value_blob = excluded.value_blob,
+                       encoding = excluded.encoding,
+                       deleted = 0,
+                       version = excluded.version,
+                       updated_at_ms = excluded.updated_at_ms
+                     WHERE excluded.version > worker_kv.version",
+                    (worker_name, binding, key, value, ENCODING_UTF8, version, now_ms),
+                )
+            })
+            .await?;
+            if affected > 0 {
+                return Ok(());
+            }
+            self.sync_version_floor_from_conn(&conn).await?;
+        }
+        Err(PlatformError::runtime(
+            "kv write conflict: failed to resolve version race",
+        ))
     }
 
     pub async fn set_value(
@@ -193,11 +256,10 @@ impl KvStore {
         for _ in 0..MAX_VERSION_RETRIES {
             let version = self.next_version();
             let now_ms = epoch_ms_i64()?;
-            let empty_blob: &[u8] = &[];
             let affected = execute_with_retry(|| {
                 conn.execute(
                     "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                     VALUES (?1, ?2, ?3, '', ?4, ?5, 1, ?6, ?7)
+                     VALUES (?1, ?2, ?3, '', NULL, ?4, 1, ?5, ?6)
                      ON CONFLICT(worker_name, binding, key) DO UPDATE SET
                        value = excluded.value,
                        value_blob = excluded.value_blob,
@@ -206,15 +268,7 @@ impl KvStore {
                        version = excluded.version,
                        updated_at_ms = excluded.updated_at_ms
                      WHERE excluded.version > worker_kv.version",
-                    (
-                        worker_name,
-                        binding,
-                        key,
-                        empty_blob,
-                        ENCODING_UTF8,
-                        version,
-                        now_ms,
-                    ),
+                    (worker_name, binding, key, ENCODING_UTF8, version, now_ms),
                 )
             })
             .await?;
@@ -577,6 +631,46 @@ mod tests {
             .expect("typed value should exist");
         assert_eq!(value.encoding, ENCODING_V8SC);
         assert_eq!(value.value, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn utf8_set_uses_text_fast_path_without_blob_duplication() -> Result<()> {
+        let path = temp_db_path("utf8-fast-path");
+        let store = test_store(&path).await?;
+        store.set("worker-a", "MY_KV", "greeting", "hello").await?;
+
+        let conn = store.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT value, value_blob, encoding FROM worker_kv WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
+                ("worker-a", "MY_KV", "greeting"),
+            )
+            .await
+            .map_err(kv_error)?;
+        let row = rows.next().await.map_err(kv_error)?.expect("row");
+        let value = row.get::<String>(0).map_err(kv_error)?;
+        let value_blob = row.get::<Option<Vec<u8>>>(1).map_err(kv_error)?;
+        let encoding = row.get::<String>(2).map_err(kv_error)?;
+        assert_eq!(value, "hello");
+        assert!(
+            value_blob.is_none(),
+            "utf8 fast path should not duplicate blob storage"
+        );
+        assert_eq!(encoding, ENCODING_UTF8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_utf8_reports_wrong_encoding_for_serialized_values() -> Result<()> {
+        let path = temp_db_path("utf8-lookup-wrong-encoding");
+        let store = test_store(&path).await?;
+        store
+            .set_value("worker-a", "MY_KV", "obj", &[1, 2, 3], ENCODING_V8SC)
+            .await?;
+
+        let lookup = store.get_utf8("worker-a", "MY_KV", "obj").await?;
+        assert_eq!(lookup, Err(KvUtf8Lookup::WrongEncoding));
         Ok(())
     }
 }

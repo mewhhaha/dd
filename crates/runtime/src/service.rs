@@ -5580,7 +5580,8 @@ fn handle_isolate_event_payload(
                 );
             }
         },
-        IsolateEventPayload::ResponseStart(payload) => match decode_response_start_payload(payload) {
+        IsolateEventPayload::ResponseStart(payload) => match decode_response_start_payload(payload)
+        {
             Ok((request_id, completion_token, status, headers)) => {
                 let _ = event_tx.send(RuntimeEvent::ResponseStart {
                     worker_name: worker_name.to_string(),
@@ -5600,7 +5601,8 @@ fn handle_isolate_event_payload(
                 );
             }
         },
-        IsolateEventPayload::ResponseChunk(payload) => match decode_response_chunk_payload(payload) {
+        IsolateEventPayload::ResponseChunk(payload) => match decode_response_chunk_payload(payload)
+        {
             Ok((request_id, completion_token, chunk)) => {
                 let _ = event_tx.send(RuntimeEvent::ResponseChunk {
                     worker_name: worker_name.to_string(),
@@ -5749,8 +5751,7 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::RequestSecretContexts::default());
                 }
                 if !snapshot_preloaded {
-                    if let Err(error) = load_worker(&mut js_runtime, &source).await
-                    {
+                    if let Err(error) = load_worker(&mut js_runtime, &source).await {
                         let _ = init_tx.send(Err(error));
                         return;
                     }

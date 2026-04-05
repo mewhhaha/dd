@@ -4,7 +4,7 @@ use crate::actor_rpc::{
     ActorInvokeResponse,
 };
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
-use crate::kv::{KvEntry, KvStore};
+use crate::kv::{KvEntry, KvStore, KvUtf8Lookup};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
@@ -1122,37 +1122,25 @@ async fn op_kv_get(
     #[string] key: String,
 ) -> KvGetResult {
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store.get(&worker_name, &binding, &key).await {
-        Ok(Some(value)) => {
-            if value.encoding != "utf8" {
-                return KvGetResult {
-                    ok: false,
-                    found: true,
-                    value: String::new(),
-                    error: "kv value is encoded as v8sc; use env.KV.get() for JS value decoding"
-                        .to_string(),
-                };
-            }
-            match String::from_utf8(value.value) {
-                Ok(decoded) => KvGetResult {
-                    ok: true,
-                    found: true,
-                    value: decoded,
-                    error: String::new(),
-                },
-                Err(error) => KvGetResult {
-                    ok: false,
-                    found: true,
-                    value: String::new(),
-                    error: format!("kv utf8 decode failed: {error}"),
-                },
-            }
-        }
-        Ok(None) => KvGetResult {
+    match store.get_utf8(&worker_name, &binding, &key).await {
+        Ok(Ok(decoded)) => KvGetResult {
+            ok: true,
+            found: true,
+            value: decoded,
+            error: String::new(),
+        },
+        Ok(Err(KvUtf8Lookup::Missing)) => KvGetResult {
             ok: true,
             found: false,
             value: String::new(),
             error: String::new(),
+        },
+        Ok(Err(KvUtf8Lookup::WrongEncoding)) => KvGetResult {
+            ok: false,
+            found: true,
+            value: String::new(),
+            error: "kv value is encoded as v8sc; use env.KV.get() for JS value decoding"
+                .to_string(),
         },
         Err(error) => KvGetResult {
             ok: false,
