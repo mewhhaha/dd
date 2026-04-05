@@ -38,6 +38,7 @@ globalThis.__dd_execute_worker = (payload) => {
     socketRuntimeProvider: null,
     transportRuntimeProvider: null,
     kvGetBatches: new Map(),
+    kvGetResults: new Map(),
   };
 
   const currentRequestContext = (required = true) => {
@@ -423,8 +424,17 @@ globalThis.__dd_execute_worker = (payload) => {
       }
     };
 
-    const queueKvGet = (normalizedKey) => new Promise((resolve, reject) => {
+    const queueKvGet = (normalizedKey) => {
       const current = currentRequestContext();
+      let cachedByKey = current.kvGetResults.get(bindingName) ?? null;
+      if (!cachedByKey) {
+        cachedByKey = new Map();
+        current.kvGetResults.set(bindingName, cachedByKey);
+      }
+      const cached = cachedByKey.get(normalizedKey);
+      if (cached) {
+        return cached;
+      }
       let pendingGetBatch = current.kvGetBatches.get(bindingName) ?? null;
       if (!pendingGetBatch) {
         pendingGetBatch = {
@@ -438,7 +448,9 @@ globalThis.__dd_execute_worker = (payload) => {
             return;
           }
           flushPendingGetBatch(batch).catch((error) => {
-            for (const waiters of batch.requestsByKey.values()) {
+            const bindingCache = current.kvGetResults.get(bindingName) ?? null;
+            for (const [key, waiters] of batch.requestsByKey.entries()) {
+              bindingCache?.delete(key);
               for (const waiter of waiters) {
                 waiter.reject(error);
               }
@@ -446,10 +458,12 @@ globalThis.__dd_execute_worker = (payload) => {
           });
         });
       }
-      const waiters = pendingGetBatch.requestsByKey.get(normalizedKey) ?? [];
-      waiters.push({ resolve, reject });
-      pendingGetBatch.requestsByKey.set(normalizedKey, waiters);
-    });
+      const sharedPromise = new Promise((resolve, reject) => {
+        pendingGetBatch.requestsByKey.set(normalizedKey, [{ resolve, reject }]);
+      });
+      cachedByKey.set(normalizedKey, sharedPromise);
+      return sharedPromise;
+    };
 
     return Object.freeze({
       async get(key, options = {}) {
@@ -458,18 +472,20 @@ globalThis.__dd_execute_worker = (payload) => {
       },
       async set(key, value, options = {}) {
         const _ = options;
+        const normalizedKey = String(key);
         if (typeof value === "string") {
           const result = await callOp(
             "op_kv_set",
             workerName,
             bindingName,
-            String(key),
+            normalizedKey,
             value,
           );
           syncFrozenTimeNow();
           if (result && typeof result === "object" && result.ok === false) {
             throw new Error(String(result.error ?? "kv set failed"));
           }
+          currentRequestContext(false)?.kvGetResults?.get(bindingName)?.set(normalizedKey, Promise.resolve(value));
           return;
         }
         let encoded;
@@ -483,7 +499,7 @@ globalThis.__dd_execute_worker = (payload) => {
           JSON.stringify({
             worker_name: workerName,
             binding: bindingName,
-            key: String(key),
+            key: normalizedKey,
             encoding: "v8sc",
             value: Array.from(new Uint8Array(encoded)),
           }),
@@ -492,19 +508,22 @@ globalThis.__dd_execute_worker = (payload) => {
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "kv set failed"));
         }
+        currentRequestContext(false)?.kvGetResults?.get(bindingName)?.set(normalizedKey, Promise.resolve(value));
       },
       async delete(key, options = {}) {
         const _ = options;
+        const normalizedKey = String(key);
         const result = await callOp(
           "op_kv_delete",
           workerName,
           bindingName,
-          String(key),
+          normalizedKey,
         );
         syncFrozenTimeNow();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "kv delete failed"));
         }
+        currentRequestContext(false)?.kvGetResults?.get(bindingName)?.set(normalizedKey, Promise.resolve(null));
       },
       async list(options = {}) {
         const prefix = String(options?.prefix ?? "");

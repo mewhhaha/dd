@@ -110,6 +110,9 @@ export default {
     try {
     if (url.pathname === "/seed") {
       await env.MY_KV.set("hot", "1");
+      for (let i = 0; i < 10; i++) {
+        await env.MY_KV.set(`hot-${i}`, String(i));
+      }
       return new Response("ok");
     }
     if (url.pathname === "/noop") {
@@ -129,6 +132,14 @@ export default {
       const tasks = [];
       for (let i = 0; i < 10; i++) {
         tasks.push(env.MY_KV.get("hot"));
+      }
+      const values = await Promise.all(tasks);
+      return new Response(String(values.at(-1) ?? "0"));
+    }
+    if (url.pathname === "/readqueue10distinct") {
+      const tasks = [];
+      for (let i = 0; i < 10; i++) {
+        tasks.push(env.MY_KV.get(`hot-${i}`));
       }
       const values = await Promise.all(tasks);
       return new Response(String(values.at(-1) ?? "0"));
@@ -235,6 +246,14 @@ async fn main() -> Result<(), String> {
             requests,
             concurrency,
             path: "/readqueue10",
+            worker_source: KV_WORKER_SOURCE,
+            use_kv_binding: true,
+        },
+        Scenario {
+            label: "kv-readqueue10distinct",
+            requests,
+            concurrency,
+            path: "/readqueue10distinct",
             worker_source: KV_WORKER_SOURCE,
             use_kv_binding: true,
         },
