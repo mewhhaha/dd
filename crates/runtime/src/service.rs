@@ -6460,6 +6460,7 @@ mod tests {
         DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination, WorkerInvocation,
     };
     use serde::Deserialize;
+    use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -7025,6 +7026,88 @@ export default {
 };
 "#
         .to_string()
+    }
+
+    fn kv_batching_worker(worker_name: &str) -> String {
+        format!(
+            r#"
+export default {{
+  async fetch(request, env) {{
+    const url = new URL(request.url);
+
+    if (url.pathname === "/seed") {{
+      await env.MY_KV.set("hot", "1");
+      await env.MY_KV.set("utf8", "plain");
+      await env.MY_KV.set("obj", {{ ok: true, n: 7 }});
+      await env.MY_KV.set("left", "L");
+      await env.MY_KV.set("right", "R");
+      const bad = await Deno.core.ops.op_kv_set_value(JSON.stringify({{
+        worker_name: "{worker_name}",
+        binding: "MY_KV",
+        key: "broken",
+        encoding: "v8sc",
+        value: [1, 2, 3],
+      }}));
+      if (bad && bad.ok === false) {{
+        throw new Error(String(bad.error ?? "seed broken failed"));
+      }}
+      return new Response("ok");
+    }}
+
+    if (url.pathname === "/sequential") {{
+      const values = [];
+      for (let i = 0; i < 10; i++) {{
+        values.push(await env.MY_KV.get("hot"));
+      }}
+      return Response.json(values);
+    }}
+
+    if (url.pathname === "/queued") {{
+      const tasks = [];
+      for (let i = 0; i < 10; i++) {{
+        tasks.push(env.MY_KV.get("hot"));
+      }}
+      return Response.json(await Promise.all(tasks));
+    }}
+
+    if (url.pathname === "/mixed") {{
+      const values = await Promise.all([
+        env.MY_KV.get("utf8"),
+        env.MY_KV.get("obj"),
+        env.MY_KV.get("missing"),
+        env.MY_KV.get("utf8"),
+        env.MY_KV.get("obj"),
+      ]);
+      return Response.json(values);
+    }}
+
+    if (url.pathname === "/scoped") {{
+      const key = String(url.searchParams.get("key") ?? "left");
+      const tasks = [];
+      for (let i = 0; i < 10; i++) {{
+        tasks.push(env.MY_KV.get(key));
+      }}
+      return Response.json(await Promise.all(tasks));
+    }}
+
+    if (url.pathname === "/reject") {{
+      try {{
+        await Promise.all([
+          env.MY_KV.get("hot"),
+          env.MY_KV.get("broken"),
+          env.MY_KV.get("hot"),
+        ]);
+        return new Response("unexpected-success", {{ status: 500 }});
+      }} catch (error) {{
+        return new Response(String(error?.message ?? error), {{ status: 500 }});
+      }}
+    }}
+
+    return new Response("not found", {{ status: 404 }});
+  }},
+}};
+"#
+        )
     }
 
     fn abort_aware_worker() -> String {
@@ -7782,6 +7865,207 @@ export default {
         );
         assert_eq!(payload.digest_length, 32);
         assert_eq!(payload.uuid.len(), 36, "uuid should be canonical v4 length");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_kv_get_batching_matches_sequential_reads_and_preserves_duplicates() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-batching-equality".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let sequential = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/sequential", "kv-sequential-request"),
+            )
+            .await
+            .expect("sequential read should succeed");
+        let queued = service
+            .invoke(
+                worker_name,
+                test_invocation_with_path("/queued", "kv-queued-request"),
+            )
+            .await
+            .expect("queued read should succeed");
+
+        let sequential_values: Vec<Value> = crate::json::from_string(
+            String::from_utf8(sequential.body).expect("sequential body should be utf8"),
+        )
+        .expect("sequential response should parse");
+        let queued_values: Vec<Value> = crate::json::from_string(
+            String::from_utf8(queued.body).expect("queued body should be utf8"),
+        )
+        .expect("queued response should parse");
+
+        assert_eq!(queued_values, sequential_values);
+        assert_eq!(queued_values.len(), 10);
+        assert!(queued_values.iter().all(|value| value == "1"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_kv_get_batching_decodes_mixed_values_and_rejects_whole_batch_on_failure() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-batching-mixed".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-mixed-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let mixed = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/mixed", "kv-mixed-request"),
+            )
+            .await
+            .expect("mixed read should succeed");
+        let mixed_values: Vec<Value> = crate::json::from_string(
+            String::from_utf8(mixed.body).expect("mixed body should be utf8"),
+        )
+        .expect("mixed response should parse");
+        assert_eq!(
+            mixed_values,
+            vec![
+                Value::String("plain".to_string()),
+                crate::json::from_string::<Value>(r#"{"ok":true,"n":7}"#.to_string())
+                    .expect("object value should parse"),
+                Value::Null,
+                Value::String("plain".to_string()),
+                crate::json::from_string::<Value>(r#"{"ok":true,"n":7}"#.to_string())
+                    .expect("object value should parse"),
+            ]
+        );
+
+        let rejected = service
+            .invoke(
+                worker_name,
+                test_invocation_with_path("/reject", "kv-reject-request"),
+            )
+            .await
+            .expect("reject route should return response");
+        assert_eq!(rejected.status, 500);
+        let body = String::from_utf8(rejected.body).expect("reject body should be utf8");
+        assert!(
+            body.contains("deserialize failed"),
+            "expected queued batch rejection body, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lazy_kv_get_batching_is_scoped_to_each_request() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 16,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-batching-scope".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_batching_worker(&worker_name),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-scope-seed-request"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let left_request =
+            test_invocation_with_path("/scoped?key=left", "kv-scope-left-request");
+        let right_request =
+            test_invocation_with_path("/scoped?key=right", "kv-scope-right-request");
+        let (left, right) = tokio::join!(
+            service.invoke(worker_name.clone(), left_request),
+            service.invoke(worker_name, right_request)
+        );
+        let left_values: Vec<Value> = crate::json::from_string(
+            String::from_utf8(left.expect("left invoke should succeed").body)
+                .expect("left body should be utf8"),
+        )
+        .expect("left response should parse");
+        let right_values: Vec<Value> = crate::json::from_string(
+            String::from_utf8(right.expect("right invoke should succeed").body)
+                .expect("right body should be utf8"),
+        )
+        .expect("right response should parse");
+
+        assert_eq!(left_values.len(), 10);
+        assert_eq!(right_values.len(), 10);
+        assert!(left_values.iter().all(|value| value == "L"));
+        assert!(right_values.iter().all(|value| value == "R"));
     }
 
     #[tokio::test]

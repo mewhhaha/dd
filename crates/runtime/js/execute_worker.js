@@ -277,6 +277,39 @@ globalThis.__dd_execute_worker = (payload) => {
         }
         return keyIndexes.get(key);
       });
+      if (uniqueKeys.length === 1) {
+        const utf8Result = await callOp(
+          "op_kv_get",
+          workerName,
+          bindingName,
+          uniqueKeys[0],
+        );
+        syncFrozenTimeNow();
+        if (utf8Result && typeof utf8Result === "object" && utf8Result.ok === true) {
+          const value = utf8Result.found === true ? String(utf8Result.value ?? "") : null;
+          return normalizedToUnique.map(() => value);
+        }
+        const utf8Error = String(utf8Result?.error ?? "");
+        if (utf8Error && !utf8Error.includes("use env.KV.get() for JS value decoding")) {
+          throw new Error(utf8Error || `${contextLabel} failed`);
+        }
+        const result = await callOp(
+          "op_kv_get_value",
+          JSON.stringify({
+            worker_name: workerName,
+            binding: bindingName,
+            key: uniqueKeys[0],
+          }),
+        );
+        syncFrozenTimeNow();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String((result.error ?? utf8Error) || `${contextLabel} failed`));
+        }
+        const value = result?.found === true
+          ? decodeStoredValue(String(result.encoding ?? "utf8"), result.value, contextLabel)
+          : null;
+        return normalizedToUnique.map(() => value);
+      }
       const utf8Result = await callOp(
         "op_kv_get_many_utf8",
         JSON.stringify({
