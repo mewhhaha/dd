@@ -12,6 +12,7 @@ mod service;
 
 pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
+pub use kv::{KvStore, KvUtf8Lookup};
 pub use service::{
     DynamicDeployResult, InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService,
     RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerStats,
