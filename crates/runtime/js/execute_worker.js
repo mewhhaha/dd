@@ -261,44 +261,118 @@ globalThis.__dd_execute_worker = (payload) => {
     throw new Error(`${context} unsupported encoding: ${encoding}`);
   };
 
-  const createKvBinding = (bindingName) => ({
-    async get(key, options = {}) {
-      const _ = options;
-      const normalizedKey = String(key);
-      const utf8Result = await callOp(
-        "op_kv_get",
-        workerName,
-        bindingName,
-        normalizedKey,
-      );
-      syncFrozenTimeNow();
-      if (utf8Result && typeof utf8Result === "object" && utf8Result.ok === true) {
-        if (utf8Result.found !== true) {
-          return null;
+  const createKvBinding = (bindingName) => {
+    let pendingGetBatch = null;
+
+    const loadKvValues = async (normalizedKeys, contextLabel) => {
+      if (normalizedKeys.length === 0) {
+        return [];
+      }
+      const uniqueKeys = [];
+      const keyIndexes = new Map();
+      const normalizedToUnique = normalizedKeys.map((key) => {
+        if (!keyIndexes.has(key)) {
+          keyIndexes.set(key, uniqueKeys.length);
+          uniqueKeys.push(key);
         }
-        return String(utf8Result.value ?? "");
-      }
-      const utf8Error = String(utf8Result?.error ?? "");
-      if (utf8Error && !utf8Error.includes("use env.KV.get() for JS value decoding")) {
-        throw new Error(utf8Error || "kv get failed");
-      }
-      const result = await callOp(
-        "op_kv_get_value",
+        return keyIndexes.get(key);
+      });
+      const utf8Result = await callOp(
+        "op_kv_get_many_utf8",
         JSON.stringify({
           worker_name: workerName,
           binding: bindingName,
-          key: normalizedKey,
+          keys: uniqueKeys,
         }),
       );
       syncFrozenTimeNow();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String((result.error ?? utf8Error) || "kv get failed"));
+      if (!utf8Result || typeof utf8Result !== "object" || utf8Result.ok === false) {
+        throw new Error(String(utf8Result?.error ?? `${contextLabel} failed`));
       }
-      if (result?.found !== true) {
-        return null;
+      const items = Array.isArray(utf8Result.values) ? utf8Result.values : [];
+      const uniqueValues = new Array(uniqueKeys.length);
+      const fallbackIndexes = [];
+      for (let index = 0; index < uniqueKeys.length; index += 1) {
+        const item = items[index];
+        if (!item || item.found !== true) {
+          uniqueValues[index] = null;
+          continue;
+        }
+        if (item.wrong_encoding === true) {
+          fallbackIndexes.push(index);
+          continue;
+        }
+        uniqueValues[index] = String(item.value ?? "");
       }
-      const encoding = String(result.encoding ?? "utf8");
-      return decodeStoredValue(encoding, result.value, "kv get");
+      if (fallbackIndexes.length === 0) {
+        return normalizedToUnique.map((index) => uniqueValues[index]);
+      }
+      const fallbackValues = await Promise.all(fallbackIndexes.map(async (index) => {
+        const result = await callOp(
+          "op_kv_get_value",
+          JSON.stringify({
+            worker_name: workerName,
+            binding: bindingName,
+            key: uniqueKeys[index],
+          }),
+        );
+        syncFrozenTimeNow();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? `${contextLabel} failed`));
+        }
+        if (result?.found !== true) {
+          return null;
+        }
+        return decodeStoredValue(String(result.encoding ?? "utf8"), result.value, contextLabel);
+      }));
+      for (let index = 0; index < fallbackIndexes.length; index += 1) {
+        uniqueValues[fallbackIndexes[index]] = fallbackValues[index];
+      }
+      return normalizedToUnique.map((index) => uniqueValues[index]);
+    };
+
+    const flushPendingGetBatch = async (batch) => {
+      const uniqueKeys = Array.from(batch.requestsByKey.keys());
+      const values = await loadKvValues(uniqueKeys, "kv get");
+      for (let index = 0; index < uniqueKeys.length; index += 1) {
+        const key = uniqueKeys[index];
+        const value = values[index];
+        const waiters = batch.requestsByKey.get(key) ?? [];
+        for (const waiter of waiters) {
+          waiter.resolve(value);
+        }
+      }
+    };
+
+    const queueKvGet = (normalizedKey) => new Promise((resolve, reject) => {
+      if (!pendingGetBatch) {
+        pendingGetBatch = {
+          requestsByKey: new Map(),
+        };
+        queueMicrotask(() => {
+          const batch = pendingGetBatch;
+          pendingGetBatch = null;
+          if (!batch) {
+            return;
+          }
+          flushPendingGetBatch(batch).catch((error) => {
+            for (const waiters of batch.requestsByKey.values()) {
+              for (const waiter of waiters) {
+                waiter.reject(error);
+              }
+            }
+          });
+        });
+      }
+      const waiters = pendingGetBatch.requestsByKey.get(normalizedKey) ?? [];
+      waiters.push({ resolve, reject });
+      pendingGetBatch.requestsByKey.set(normalizedKey, waiters);
+    });
+
+    return {
+    async get(key, options = {}) {
+      const _ = options;
+      return await queueKvGet(String(key));
     },
     async set(key, value, options = {}) {
       const _ = options;
@@ -377,7 +451,8 @@ globalThis.__dd_execute_worker = (payload) => {
         };
       });
     },
-  });
+  };
+  };
 
   const toHeaderEntries = (headersInput) => {
     if (!headersInput) {

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use turso::{Builder, Connection, Database};
+use turso::{Builder, Connection, Database, Value};
 
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
@@ -146,6 +146,51 @@ impl KvStore {
         Ok(Err(KvUtf8Lookup::Missing))
     }
 
+    pub async fn get_utf8_many(
+        &self,
+        worker_name: &str,
+        binding: &str,
+        keys: &[String],
+    ) -> Result<Vec<std::result::Result<String, KvUtf8Lookup>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect().await?;
+        let placeholders = (0..keys.len())
+            .map(|index| format!("?{}", index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT key, value, encoding, deleted
+             FROM worker_kv
+             WHERE worker_name = ?1 AND binding = ?2 AND key IN ({placeholders})"
+        );
+        let mut params = Vec::with_capacity(keys.len() + 2);
+        params.push(Value::Text(worker_name.to_string()));
+        params.push(Value::Text(binding.to_string()));
+        params.extend(keys.iter().cloned().map(Value::Text));
+        let mut rows = conn.query(&sql, params).await.map_err(kv_error)?;
+        let mut values = std::collections::HashMap::with_capacity(keys.len());
+        while let Some(row) = rows.next().await.map_err(kv_error)? {
+            let key: String = row.get::<String>(0).map_err(kv_error)?;
+            let value: String = row.get::<String>(1).map_err(kv_error)?;
+            let encoding: String = row.get::<String>(2).map_err(kv_error)?;
+            let deleted: i64 = row.get::<i64>(3).map_err(kv_error)?;
+            values.insert(key, (value, normalize_encoding(&encoding), deleted != 0));
+        }
+        Ok(keys
+            .iter()
+            .map(|key| match values.get(key) {
+                None => Err(KvUtf8Lookup::Missing),
+                Some((_, _, true)) => Err(KvUtf8Lookup::Missing),
+                Some((_, encoding, false)) if encoding != ENCODING_UTF8 => {
+                    Err(KvUtf8Lookup::WrongEncoding)
+                }
+                Some((value, _, false)) => Ok(value.clone()),
+            })
+            .collect())
+    }
+
     pub async fn set(
         &self,
         worker_name: &str,
@@ -197,7 +242,6 @@ impl KvStore {
                 "unsupported kv encoding: {encoding}"
             )));
         }
-
         let conn = self.connect().await?;
         const MAX_VERSION_RETRIES: usize = 8;
         let value_blob = value.to_vec();
@@ -419,6 +463,7 @@ impl KvStore {
             }
         }
     }
+
 }
 
 fn normalize_encoding(raw: &str) -> String {
@@ -671,6 +716,39 @@ mod tests {
 
         let lookup = store.get_utf8("worker-a", "MY_KV", "obj").await?;
         assert_eq!(lookup, Err(KvUtf8Lookup::WrongEncoding));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_utf8_many_preserves_order_and_encoding_state() -> Result<()> {
+        let path = temp_db_path("utf8-many");
+        let store = test_store(&path).await?;
+        store.set("worker-a", "MY_KV", "a", "one").await?;
+        store
+            .set_value("worker-a", "MY_KV", "b", &[1, 2, 3], ENCODING_V8SC)
+            .await?;
+
+        let values = store
+            .get_utf8_many(
+                "worker-a",
+                "MY_KV",
+                &[
+                    "missing".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                    "a".to_string(),
+                ],
+            )
+            .await?;
+        assert_eq!(
+            values,
+            vec![
+                Err(KvUtf8Lookup::Missing),
+                Ok("one".to_string()),
+                Err(KvUtf8Lookup::WrongEncoding),
+                Ok("one".to_string()),
+            ]
+        );
         Ok(())
     }
 }

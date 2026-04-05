@@ -315,6 +315,27 @@ struct KvGetResult {
 }
 
 #[derive(Debug, Deserialize)]
+struct KvGetManyPayload {
+    worker_name: String,
+    binding: String,
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct KvGetManyItem {
+    found: bool,
+    wrong_encoding: bool,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KvGetManyResult {
+    ok: bool,
+    values: Vec<KvGetManyItem>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct KvGetValuePayload {
     worker_name: String,
     binding: String,
@@ -1146,6 +1167,59 @@ async fn op_kv_get(
             ok: false,
             found: false,
             value: String::new(),
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_kv_get_many_utf8(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> KvGetManyResult {
+    let payload: KvGetManyPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return KvGetManyResult {
+                ok: false,
+                values: Vec::new(),
+                error: format!("invalid kv get many payload: {error}"),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<KvStore>().clone();
+    match store
+        .get_utf8_many(&payload.worker_name, &payload.binding, &payload.keys)
+        .await
+    {
+        Ok(values) => KvGetManyResult {
+            ok: true,
+            values: values
+                .into_iter()
+                .map(|value| match value {
+                    Ok(decoded) => KvGetManyItem {
+                        found: true,
+                        wrong_encoding: false,
+                        value: decoded,
+                    },
+                    Err(KvUtf8Lookup::Missing) => KvGetManyItem {
+                        found: false,
+                        wrong_encoding: false,
+                        value: String::new(),
+                    },
+                    Err(KvUtf8Lookup::WrongEncoding) => KvGetManyItem {
+                        found: true,
+                        wrong_encoding: true,
+                        value: String::new(),
+                    },
+                })
+                .collect(),
+            error: String::new(),
+        },
+        Err(error) => KvGetManyResult {
+            ok: false,
+            values: Vec::new(),
             error: error.to_string(),
         },
     }
@@ -3502,6 +3576,7 @@ deno_core::extension!(
         op_crypto_aes_gcm_encrypt,
         op_crypto_aes_gcm_decrypt,
         op_kv_get,
+        op_kv_get_many_utf8,
         op_kv_get_value,
         op_kv_set,
         op_kv_set_value,

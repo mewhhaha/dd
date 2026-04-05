@@ -42,8 +42,26 @@ export default {
       await env.MY_KV.set("hot", "1");
       return new Response("ok");
     }
+    if (url.pathname === "/noop") {
+      return new Response("ok");
+    }
     if (url.pathname === "/read") {
       return new Response(String((await env.MY_KV.get("hot")) ?? "0"));
+    }
+    if (url.pathname === "/read10") {
+      let current = "0";
+      for (let i = 0; i < 10; i++) {
+        current = String((await env.MY_KV.get("hot")) ?? "0");
+      }
+      return new Response(current);
+    }
+    if (url.pathname === "/readqueue10") {
+      const tasks = [];
+      for (let i = 0; i < 10; i++) {
+        tasks.push(env.MY_KV.get("hot"));
+      }
+      const values = await Promise.all(tasks);
+      return new Response(String(values.at(-1) ?? "0"));
     }
     if (url.pathname === "/write") {
       await env.MY_KV.set("hot", "1");
@@ -95,10 +113,28 @@ async fn main() -> Result<(), String> {
 
     let scenarios = [
         Scenario {
+            label: "kv-noop",
+            requests,
+            concurrency,
+            path: "/noop",
+        },
+        Scenario {
             label: "kv-read",
             requests,
             concurrency,
             path: "/read",
+        },
+        Scenario {
+            label: "kv-read10",
+            requests,
+            concurrency,
+            path: "/read10",
+        },
+        Scenario {
+            label: "kv-readqueue10",
+            requests,
+            concurrency,
+            path: "/readqueue10",
         },
         Scenario {
             label: "kv-write",
