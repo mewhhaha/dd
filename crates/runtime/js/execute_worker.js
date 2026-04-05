@@ -147,6 +147,13 @@ globalThis.__dd_execute_worker = (payload) => {
       globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
     }
   };
+  const syncFrozenTimeNow = () => {
+    const value = callOp("op_time_boundary_now");
+    const boundary = normalizeBoundaryValue(value);
+    if (boundary && typeof globalThis.__dd_set_time === "function") {
+      globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+    }
+  };
   globalThis.__dd_sync_time_boundary = syncFrozenTime;
   globalThis.__dd_cache_bypass_stale = Array.isArray(input.headers)
     && input.headers.some(([name, value]) => {
@@ -264,7 +271,7 @@ globalThis.__dd_execute_worker = (payload) => {
         bindingName,
         normalizedKey,
       );
-      await syncFrozenTime();
+      syncFrozenTimeNow();
       if (utf8Result && typeof utf8Result === "object" && utf8Result.ok === true) {
         if (utf8Result.found !== true) {
           return null;
@@ -283,7 +290,7 @@ globalThis.__dd_execute_worker = (payload) => {
           key: normalizedKey,
         }),
       );
-      await syncFrozenTime();
+      syncFrozenTimeNow();
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String((result.error ?? utf8Error) || "kv get failed"));
       }
@@ -303,7 +310,7 @@ globalThis.__dd_execute_worker = (payload) => {
           String(key),
           value,
         );
-        await syncFrozenTime();
+        syncFrozenTimeNow();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "kv set failed"));
         }
@@ -325,7 +332,7 @@ globalThis.__dd_execute_worker = (payload) => {
           value: Array.from(new Uint8Array(encoded)),
         }),
       );
-      await syncFrozenTime();
+      syncFrozenTimeNow();
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String(result.error ?? "kv set failed"));
       }
@@ -338,7 +345,7 @@ globalThis.__dd_execute_worker = (payload) => {
         bindingName,
         String(key),
       );
-      await syncFrozenTime();
+      syncFrozenTimeNow();
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String(result.error ?? "kv delete failed"));
       }
@@ -356,7 +363,7 @@ globalThis.__dd_execute_worker = (payload) => {
         prefix,
         limit,
       );
-      await syncFrozenTime();
+      syncFrozenTimeNow();
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String(result.error ?? "kv list failed"));
       }

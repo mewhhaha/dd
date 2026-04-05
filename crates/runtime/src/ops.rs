@@ -914,7 +914,7 @@ async fn op_sleep(millis: u32) {
 
 #[deno_core::op2]
 #[serde]
-async fn op_time_boundary_now() -> TimeBoundary {
+fn op_time_boundary_now() -> TimeBoundary {
     let now_ms = wall_ms();
     let perf_ms = PROCESS_MONO_START
         .get_or_init(Instant::now)
