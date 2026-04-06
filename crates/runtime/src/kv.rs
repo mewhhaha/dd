@@ -197,6 +197,7 @@ struct KvWriteSchedulerInner {
     max_pending_bytes: usize,
     flush_interval: Duration,
     flush_threshold: usize,
+    flush_gate: Arc<Mutex<()>>,
     database: Arc<Database>,
     profile: Arc<KvProfile>,
 }
@@ -383,6 +384,7 @@ impl KvWriteScheduler {
             max_pending_bytes: 16 * 1024 * 1024,
             flush_interval: Duration::from_millis(2),
             flush_threshold: 128,
+            flush_gate: Arc::new(Mutex::new(())),
             database,
             profile,
         });
@@ -505,10 +507,18 @@ impl KvWriteSchedulerInner {
             let profile = Arc::clone(&self.profile);
             let flush_interval = self.flush_interval;
             let flush_threshold = self.flush_threshold;
+            let flush_gate = Arc::clone(&self.flush_gate);
             let handle = std::thread::Builder::new()
                 .name(format!("kv-write-shard-{shard_index}"))
                 .spawn(move || {
-                    Self::run_shard_loop(database, profile, flush_interval, flush_threshold, shard)
+                    Self::run_shard_loop(
+                        database,
+                        profile,
+                        flush_interval,
+                        flush_threshold,
+                        flush_gate,
+                        shard,
+                    )
                 })
                 .expect("kv write shard thread should start");
             handles.push(handle);
@@ -526,6 +536,7 @@ impl KvWriteSchedulerInner {
         profile: Arc<KvProfile>,
         flush_interval: Duration,
         flush_threshold: usize,
+        flush_gate: Arc<Mutex<()>>,
         shard: Arc<KvWriteShard>,
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -571,7 +582,12 @@ impl KvWriteSchedulerInner {
                 oldest.elapsed().as_micros() as u64,
                 batch.len() as u64,
             );
-            match runtime.block_on(Self::flush_batch(&database, &profile, &batch)) {
+            let flush_guard = flush_gate
+                .lock()
+                .expect("kv write flush gate lock poisoned");
+            let flush_result = runtime.block_on(Self::flush_batch(&database, &profile, &batch));
+            drop(flush_guard);
+            match flush_result {
                 Ok(()) => {}
                 Err(_) => {
                     let mut state = shard.state.lock().expect("kv write shard lock poisoned");
