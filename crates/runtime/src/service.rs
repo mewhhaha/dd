@@ -71,6 +71,10 @@ pub struct RuntimeConfig {
     pub cache_max_entries: usize,
     pub cache_max_bytes: usize,
     pub cache_default_ttl: Duration,
+    pub kv_read_cache_max_entries: usize,
+    pub kv_read_cache_max_bytes: usize,
+    pub kv_read_cache_hit_ttl: Duration,
+    pub kv_read_cache_miss_ttl: Duration,
     pub v8_flags: Vec<String>,
     pub kv_profile_enabled: bool,
 }
@@ -87,6 +91,10 @@ impl Default for RuntimeConfig {
             cache_max_entries: 2048,
             cache_max_bytes: 64 * 1024 * 1024,
             cache_default_ttl: Duration::from_secs(60),
+            kv_read_cache_max_entries: 16_384,
+            kv_read_cache_max_bytes: 16 * 1024 * 1024,
+            kv_read_cache_hit_ttl: Duration::from_secs(300),
+            kv_read_cache_miss_ttl: Duration::from_secs(30),
             v8_flags: Vec::new(),
             kv_profile_enabled: false,
         }
@@ -408,6 +416,7 @@ struct WorkerPool {
     snapshot_preloaded: bool,
     source: Arc<str>,
     kv_bindings_json: Arc<str>,
+    kv_read_cache_config_json: Arc<str>,
     actor_bindings: Vec<String>,
     actor_bindings_json: Arc<str>,
     dynamic_bindings: Vec<String>,
@@ -527,6 +536,7 @@ enum IsolateCommand {
         completion_token: String,
         worker_name_json: Arc<str>,
         kv_bindings_json: Arc<str>,
+        kv_read_cache_config_json: Arc<str>,
         actor_bindings_json: Arc<str>,
         dynamic_bindings_json: Arc<str>,
         dynamic_rpc_bindings_json: Arc<str>,
@@ -779,6 +789,14 @@ struct StoredWorkerDeployment {
     config: DeployConfig,
     deployment_id: String,
     updated_at_ms: i64,
+}
+
+#[derive(Serialize)]
+struct KvReadCacheConfigPayload {
+    max_entries: usize,
+    max_bytes: usize,
+    hit_ttl_ms: u64,
+    miss_ttl_ms: u64,
 }
 
 impl RuntimeService {
@@ -3364,6 +3382,15 @@ impl WorkerManager {
             crate::json::to_string(&Vec::<(String, String)>::new())
                 .map_err(|error| PlatformError::internal(error.to_string()))?,
         );
+        let kv_read_cache_config_json = Arc::<str>::from(
+            crate::json::to_string(&KvReadCacheConfigPayload {
+                max_entries: self.config.kv_read_cache_max_entries,
+                max_bytes: self.config.kv_read_cache_max_bytes,
+                hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
+                miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
+            })
+            .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
         if persist {
             persist_worker_deployment(
                 &self.storage,
@@ -3391,6 +3418,7 @@ impl WorkerManager {
                 snapshot_preloaded,
                 source: Arc::<str>::from(source.clone()),
                 kv_bindings_json,
+                kv_read_cache_config_json,
                 actor_bindings: bindings.actor,
                 actor_bindings_json,
                 dynamic_bindings: bindings.dynamic,
@@ -3442,6 +3470,15 @@ impl WorkerManager {
             .iter()
             .map(|binding| binding.binding.clone())
             .collect::<Vec<_>>();
+        let kv_read_cache_config_json = Arc::<str>::from(
+            crate::json::to_string(&KvReadCacheConfigPayload {
+                max_entries: self.config.kv_read_cache_max_entries,
+                max_bytes: self.config.kv_read_cache_max_bytes,
+                hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
+                miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
+            })
+            .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
 
         let pool = WorkerPool {
             worker_name: worker_name.clone(),
@@ -3460,6 +3497,7 @@ impl WorkerManager {
                 crate::json::to_string(&Vec::<String>::new())
                     .map_err(|error| PlatformError::internal(error.to_string()))?,
             ),
+            kv_read_cache_config_json,
             actor_bindings: Vec::new(),
             actor_bindings_json: Arc::<str>::from(
                 crate::json::to_string(&Vec::<String>::new())
@@ -3966,6 +4004,7 @@ impl WorkerManager {
 
                 let worker_name_json = Arc::clone(&pool.worker_name_json);
                 let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
+                let kv_read_cache_config_json = Arc::clone(&pool.kv_read_cache_config_json);
                 let actor_bindings_json = Arc::clone(&pool.actor_bindings_json);
                 let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
                 let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
@@ -4008,6 +4047,7 @@ impl WorkerManager {
                     completion_token: completion_token.clone(),
                     worker_name_json,
                     kv_bindings_json,
+                    kv_read_cache_config_json,
                     actor_bindings_json,
                     dynamic_bindings_json,
                     dynamic_rpc_bindings_json,
@@ -5401,6 +5441,26 @@ fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
             "cache_default_ttl must be greater than 0",
         ));
     }
+    if config.kv_read_cache_max_entries == 0 {
+        return Err(PlatformError::internal(
+            "kv_read_cache_max_entries must be greater than 0",
+        ));
+    }
+    if config.kv_read_cache_max_bytes == 0 {
+        return Err(PlatformError::internal(
+            "kv_read_cache_max_bytes must be greater than 0",
+        ));
+    }
+    if config.kv_read_cache_hit_ttl.is_zero() {
+        return Err(PlatformError::internal(
+            "kv_read_cache_hit_ttl must be greater than 0",
+        ));
+    }
+    if config.kv_read_cache_miss_ttl.is_zero() {
+        return Err(PlatformError::internal(
+            "kv_read_cache_miss_ttl must be greater than 0",
+        ));
+    }
     Ok(())
 }
 
@@ -5885,6 +5945,7 @@ fn handle_isolate_command(
             completion_token,
             worker_name_json,
             kv_bindings_json,
+            kv_read_cache_config_json,
             actor_bindings_json,
             dynamic_bindings_json,
             dynamic_rpc_bindings_json,
@@ -6040,6 +6101,7 @@ fn handle_isolate_command(
                 &completion_token,
                 &worker_name_json,
                 &kv_bindings_json,
+                &kv_read_cache_config_json,
                 &actor_bindings_json,
                 &dynamic_bindings_json,
                 &dynamic_rpc_bindings_json,
@@ -6460,7 +6522,8 @@ mod tests {
         BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
     };
     use common::{
-        DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination, WorkerInvocation,
+        DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination,
+        WorkerInvocation, WorkerOutput,
     };
     use serde::Deserialize;
     use serde_json::Value;
@@ -6471,6 +6534,49 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct TestKvProfileMetric {
+        calls: u64,
+        total_us: u64,
+        total_items: u64,
+        max_us: u64,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct TestKvProfileSnapshot {
+        enabled: bool,
+        op_get: TestKvProfileMetric,
+        js_cache_hit: TestKvProfileMetric,
+        js_cache_miss: TestKvProfileMetric,
+        js_cache_stale: TestKvProfileMetric,
+        js_cache_fill: TestKvProfileMetric,
+        js_cache_invalidate: TestKvProfileMetric,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Default)]
+    struct TestKvProfileEnvelope {
+        ok: bool,
+        snapshot: Option<TestKvProfileSnapshot>,
+        error: String,
+    }
+
+    fn decode_kv_profile(output: WorkerOutput) -> TestKvProfileSnapshot {
+        let envelope: TestKvProfileEnvelope = crate::json::from_string(
+            String::from_utf8(output.body).expect("profile body should be utf8"),
+        )
+        .expect("profile response should parse");
+        assert!(
+            envelope.ok,
+            "profile route should succeed: {}",
+            envelope.error
+        );
+        envelope
+            .snapshot
+            .expect("profile snapshot should be present")
+    }
     use tokio::time::{sleep, timeout};
     use uuid::Uuid;
 
@@ -7172,6 +7278,17 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_kv_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_kv_profile_reset?.();
+      return new Response("ok");
+    }
+
     if (url.pathname === "/seed") {
       await env.MY_KV.put("hot", "1");
       return new Response("ok");
@@ -7197,9 +7314,28 @@ export default {
       return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
     }
 
+    if (url.pathname === "/read-missing") {
+      return new Response(String((await env.MY_KV.get("ghost")) ?? "missing"));
+    }
+
     if (url.pathname === "/write-fire-and-forget") {
       env.MY_KV.put("hot", "7");
       return new Response("queued");
+    }
+
+    if (url.pathname === "/delete-fire-and-forget") {
+      env.MY_KV.delete("hot");
+      return new Response("queued");
+    }
+
+    if (url.pathname === "/put-read") {
+      await env.MY_KV.put("hot", "11");
+      return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+    }
+
+    if (url.pathname === "/delete-read") {
+      await env.MY_KV.delete("hot");
+      return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
     }
 
     if (url.pathname === "/write-wait-until") {
@@ -8081,7 +8217,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_wait_until_read_worker(),
+                kv_batching_worker(&worker_name),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8146,7 +8282,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_write_worker(),
+                kv_batching_worker(&worker_name),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8426,6 +8562,294 @@ export default {
         assert_eq!(
             String::from_utf8(output.body).expect("body should be utf8"),
             "9"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_read_cache_hits_across_requests_in_same_isolate() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            kv_profile_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-read-cache-hit".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_write_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-read-cache-hit-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/__profile_reset", "kv-read-cache-hit-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let first = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read", "kv-read-cache-hit-read-1"),
+            )
+            .await
+            .expect("first read should succeed");
+        let second = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read", "kv-read-cache-hit-read-2"),
+            )
+            .await
+            .expect("second read should succeed");
+        let profile = decode_kv_profile(
+            service
+                .invoke(
+                    worker_name,
+                    test_invocation_with_path("/__profile", "kv-read-cache-hit-profile"),
+                )
+                .await
+                .expect("profile should succeed"),
+        );
+
+        assert_eq!(String::from_utf8(first.body).expect("utf8"), "1");
+        assert_eq!(String::from_utf8(second.body).expect("utf8"), "1");
+        assert_eq!(profile.op_get.calls, 0);
+        assert!(profile.js_cache_hit.calls >= 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_read_cache_caches_missing_keys_across_requests() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            kv_profile_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-read-cache-miss".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_write_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/__profile_reset", "kv-read-cache-miss-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let first = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read-missing", "kv-read-cache-miss-read-1"),
+            )
+            .await
+            .expect("first missing read should succeed");
+        let second = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read-missing", "kv-read-cache-miss-read-2"),
+            )
+            .await
+            .expect("second missing read should succeed");
+        let profile = decode_kv_profile(
+            service
+                .invoke(
+                    worker_name,
+                    test_invocation_with_path("/__profile", "kv-read-cache-miss-profile"),
+                )
+                .await
+                .expect("profile should succeed"),
+        );
+
+        assert_eq!(String::from_utf8(first.body).expect("utf8"), "missing");
+        assert_eq!(String::from_utf8(second.body).expect("utf8"), "missing");
+        assert_eq!(profile.op_get.calls, 1);
+        assert!(profile.js_cache_miss.calls >= 1);
+        assert!(profile.js_cache_hit.calls >= 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_read_cache_expires_and_refills_after_ttl() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            kv_profile_enabled: true,
+            kv_read_cache_hit_ttl: Duration::from_millis(20),
+            kv_read_cache_miss_ttl: Duration::from_millis(20),
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-read-cache-expiry".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_write_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/__profile_reset", "kv-read-cache-expiry-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let first = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read-missing", "kv-read-cache-expiry-read-1"),
+            )
+            .await
+            .expect("first read should succeed");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let second = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read-missing", "kv-read-cache-expiry-read-2"),
+            )
+            .await
+            .expect("second read should succeed");
+        let profile = decode_kv_profile(
+            service
+                .invoke(
+                    worker_name,
+                    test_invocation_with_path("/__profile", "kv-read-cache-expiry-profile"),
+                )
+                .await
+                .expect("profile should succeed"),
+        );
+
+        assert_eq!(String::from_utf8(first.body).expect("utf8"), "missing");
+        assert_eq!(String::from_utf8(second.body).expect("utf8"), "missing");
+        assert!(profile.op_get.calls >= 2);
+        assert!(profile.js_cache_stale.calls >= 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kv_local_cache_updates_immediately_after_put_and_delete() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let worker_name = "kv-local-cache-updates".to_string();
+        service
+            .deploy_with_config(
+                worker_name.clone(),
+                kv_write_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Kv {
+                        binding: "MY_KV".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/seed", "kv-local-cache-updates-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/write-fire-and-forget", "kv-local-cache-updates-put"),
+            )
+            .await
+            .expect("put should enqueue");
+        let read_after_put = service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path("/read", "kv-local-cache-updates-read-after-put"),
+            )
+            .await
+            .expect("read after put should succeed");
+
+        service
+            .invoke(
+                worker_name.clone(),
+                test_invocation_with_path(
+                    "/delete-fire-and-forget",
+                    "kv-local-cache-updates-delete",
+                ),
+            )
+            .await
+            .expect("delete should enqueue");
+        let read_after_delete = service
+            .invoke(
+                worker_name,
+                test_invocation_with_path("/read", "kv-local-cache-updates-read-after-delete"),
+            )
+            .await
+            .expect("read after delete should succeed");
+
+        assert_eq!(String::from_utf8(read_after_put.body).expect("utf8"), "7");
+        assert_eq!(
+            String::from_utf8(read_after_delete.body).expect("utf8"),
+            "missing"
         );
     }
 

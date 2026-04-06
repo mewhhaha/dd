@@ -191,6 +191,7 @@ pub fn dispatch_worker_request(
     completion_token: &str,
     worker_name_json: &str,
     kv_bindings_json: &str,
+    kv_read_cache_config_json: &str,
     actor_bindings_json: &str,
     dynamic_bindings_json: &str,
     dynamic_rpc_bindings_json: &str,
@@ -214,6 +215,7 @@ pub fn dispatch_worker_request(
     let entry_code = execute_worker_js(
         worker_name_json,
         kv_bindings_json,
+        kv_read_cache_config_json,
         actor_bindings_json,
         dynamic_bindings_json,
         dynamic_rpc_bindings_json,

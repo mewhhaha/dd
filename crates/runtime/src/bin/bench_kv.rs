@@ -63,6 +63,11 @@ struct KvProfileSnapshot {
     write_flush: KvProfileMetric,
     write_retry: KvProfileMetric,
     write_queue_wait: KvProfileMetric,
+    js_cache_hit: KvProfileMetric,
+    js_cache_miss: KvProfileMetric,
+    js_cache_stale: KvProfileMetric,
+    js_cache_fill: KvProfileMetric,
+    js_cache_invalidate: KvProfileMetric,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -494,6 +499,15 @@ fn print_profile(profile: &KvProfileSnapshot) {
         metric_mean_ms(&profile.write_queue_wait),
         metric_mean_items(&profile.write_flush),
     );
+    println!(
+        "profile-cache hit={} miss={} stale={} fill={} invalidate={} hit_ratio={:.1}%",
+        profile.js_cache_hit.calls,
+        profile.js_cache_miss.calls,
+        profile.js_cache_stale.calls,
+        profile.js_cache_fill.calls,
+        profile.js_cache_invalidate.calls,
+        cache_hit_ratio(profile),
+    );
 }
 
 fn env_name(name: &str) -> Option<String> {
@@ -527,6 +541,17 @@ fn metric_mean_items(metric: &KvProfileMetric) -> f64 {
         return 0.0;
     }
     metric.total_items as f64 / metric.calls as f64
+}
+
+fn cache_hit_ratio(profile: &KvProfileSnapshot) -> f64 {
+    let hits = profile.js_cache_hit.calls as f64;
+    let misses = profile.js_cache_miss.calls as f64;
+    let stale = profile.js_cache_stale.calls as f64;
+    let total = hits + misses + stale;
+    if total == 0.0 {
+        return 0.0;
+    }
+    (hits / total) * 100.0
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

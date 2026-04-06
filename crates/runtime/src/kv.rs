@@ -20,6 +20,7 @@ pub struct KvStore {
     version: Arc<AtomicU64>,
     profile: Arc<KvProfile>,
     write_scheduler: KvWriteScheduler,
+    failed_versions: Arc<Mutex<HashSet<i64>>>,
 }
 
 struct KvConnectionGuard {
@@ -99,6 +100,11 @@ pub enum KvProfileMetricKind {
     WriteFlush,
     WriteRetry,
     WriteQueueWait,
+    JsCacheHit,
+    JsCacheMiss,
+    JsCacheStale,
+    JsCacheFill,
+    JsCacheInvalidate,
 }
 
 #[derive(Default)]
@@ -134,6 +140,11 @@ pub struct KvProfileSnapshot {
     pub write_flush: KvProfileMetricSnapshot,
     pub write_retry: KvProfileMetricSnapshot,
     pub write_queue_wait: KvProfileMetricSnapshot,
+    pub js_cache_hit: KvProfileMetricSnapshot,
+    pub js_cache_miss: KvProfileMetricSnapshot,
+    pub js_cache_stale: KvProfileMetricSnapshot,
+    pub js_cache_fill: KvProfileMetricSnapshot,
+    pub js_cache_invalidate: KvProfileMetricSnapshot,
 }
 
 #[derive(Default)]
@@ -153,6 +164,11 @@ pub struct KvProfile {
     write_flush: KvProfileMetric,
     write_retry: KvProfileMetric,
     write_queue_wait: KvProfileMetric,
+    js_cache_hit: KvProfileMetric,
+    js_cache_miss: KvProfileMetric,
+    js_cache_stale: KvProfileMetric,
+    js_cache_fill: KvProfileMetric,
+    js_cache_invalidate: KvProfileMetric,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +216,7 @@ struct KvWriteSchedulerInner {
     flush_gate: Arc<Mutex<()>>,
     database: Arc<Database>,
     profile: Arc<KvProfile>,
+    failed_versions: Arc<Mutex<HashSet<i64>>>,
 }
 
 #[derive(Clone)]
@@ -279,6 +296,11 @@ impl KvProfile {
             write_flush: self.write_flush.snapshot(),
             write_retry: self.write_retry.snapshot(),
             write_queue_wait: self.write_queue_wait.snapshot(),
+            js_cache_hit: self.js_cache_hit.snapshot(),
+            js_cache_miss: self.js_cache_miss.snapshot(),
+            js_cache_stale: self.js_cache_stale.snapshot(),
+            js_cache_fill: self.js_cache_fill.snapshot(),
+            js_cache_invalidate: self.js_cache_invalidate.snapshot(),
         }
     }
 
@@ -303,6 +325,11 @@ impl KvProfile {
         self.write_flush.reset();
         self.write_retry.reset();
         self.write_queue_wait.reset();
+        self.js_cache_hit.reset();
+        self.js_cache_miss.reset();
+        self.js_cache_stale.reset();
+        self.js_cache_fill.reset();
+        self.js_cache_invalidate.reset();
     }
 
     fn metric(&self, metric: KvProfileMetricKind) -> &KvProfileMetric {
@@ -321,6 +348,11 @@ impl KvProfile {
             KvProfileMetricKind::WriteFlush => &self.write_flush,
             KvProfileMetricKind::WriteRetry => &self.write_retry,
             KvProfileMetricKind::WriteQueueWait => &self.write_queue_wait,
+            KvProfileMetricKind::JsCacheHit => &self.js_cache_hit,
+            KvProfileMetricKind::JsCacheMiss => &self.js_cache_miss,
+            KvProfileMetricKind::JsCacheStale => &self.js_cache_stale,
+            KvProfileMetricKind::JsCacheFill => &self.js_cache_fill,
+            KvProfileMetricKind::JsCacheInvalidate => &self.js_cache_invalidate,
         }
     }
 }
@@ -367,7 +399,11 @@ impl KvScheduledMutation {
 }
 
 impl KvWriteScheduler {
-    fn new(database: Arc<Database>, profile: Arc<KvProfile>) -> Self {
+    fn new(
+        database: Arc<Database>,
+        profile: Arc<KvProfile>,
+        failed_versions: Arc<Mutex<HashSet<i64>>>,
+    ) -> Self {
         const SHARD_COUNT: usize = 16;
         let shards = (0..SHARD_COUNT)
             .map(|_| {
@@ -387,6 +423,7 @@ impl KvWriteScheduler {
             flush_gate: Arc::new(Mutex::new(())),
             database,
             profile,
+            failed_versions,
         });
         inner.spawn_flushers();
         Self { inner }
@@ -398,19 +435,18 @@ impl KvWriteScheduler {
         worker_name: &str,
         binding: &str,
         mutations: &[KvBatchMutation],
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         if mutations.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let started = Instant::now();
+        let mut versions = Vec::with_capacity(mutations.len());
         let mut grouped = HashMap::<usize, HashMap<KvWriteKey, KvScheduledMutation>>::new();
         for mutation in mutations.iter().cloned() {
-            let scheduled = KvScheduledMutation::from_batch_mutation(
-                worker_name,
-                binding,
-                mutation,
-                next_version(),
-            )?;
+            let version = next_version();
+            let scheduled =
+                KvScheduledMutation::from_batch_mutation(worker_name, binding, mutation, version)?;
+            versions.push(version);
             let shard_index = self.inner.shard_index(&scheduled.key);
             grouped
                 .entry(shard_index)
@@ -491,7 +527,7 @@ impl KvWriteScheduler {
                 .profile
                 .record(KvProfileMetricKind::WriteSuperseded, 0, superseded);
         }
-        Ok(())
+        Ok(versions)
     }
 }
 
@@ -508,6 +544,7 @@ impl KvWriteSchedulerInner {
             let flush_interval = self.flush_interval;
             let flush_threshold = self.flush_threshold;
             let flush_gate = Arc::clone(&self.flush_gate);
+            let failed_versions = Arc::clone(&self.failed_versions);
             let handle = std::thread::Builder::new()
                 .name(format!("kv-write-shard-{shard_index}"))
                 .spawn(move || {
@@ -517,6 +554,7 @@ impl KvWriteSchedulerInner {
                         flush_interval,
                         flush_threshold,
                         flush_gate,
+                        failed_versions,
                         shard,
                     )
                 })
@@ -537,6 +575,7 @@ impl KvWriteSchedulerInner {
         flush_interval: Duration,
         flush_threshold: usize,
         flush_gate: Arc<Mutex<()>>,
+        failed_versions: Arc<Mutex<HashSet<i64>>>,
         shard: Arc<KvWriteShard>,
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -590,19 +629,12 @@ impl KvWriteSchedulerInner {
             match flush_result {
                 Ok(()) => {}
                 Err(_) => {
-                    let mut state = shard.state.lock().expect("kv write shard lock poisoned");
-                    for mutation in batch {
-                        if let Some(existing) =
-                            state.pending.insert(mutation.key.clone(), mutation.clone())
-                        {
-                            state.pending_bytes =
-                                state.pending_bytes.saturating_sub(existing.size_bytes);
-                        }
-                        state.pending_bytes =
-                            state.pending_bytes.saturating_add(mutation.size_bytes);
+                    let mut failed = failed_versions
+                        .lock()
+                        .expect("kv failed versions lock poisoned");
+                    for mutation in &batch {
+                        failed.insert(mutation.version);
                     }
-                    shard.wake.notify_one();
-                    std::thread::sleep(flush_interval);
                 }
             }
         }
@@ -740,16 +772,25 @@ impl KvStore {
             .map_err(kv_error)?;
         let database = Arc::new(database);
         let profile = Arc::new(KvProfile::default());
+        let failed_versions = Arc::new(Mutex::new(HashSet::new()));
         let store = Self {
             database: Arc::clone(&database),
             connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
             profile: Arc::clone(&profile),
-            write_scheduler: KvWriteScheduler::new(database, profile),
+            write_scheduler: KvWriteScheduler::new(database, profile, Arc::clone(&failed_versions)),
+            failed_versions,
         };
         store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;
         Ok(store)
+    }
+
+    pub fn take_failed_write_version(&self, version: i64) -> bool {
+        self.failed_versions
+            .lock()
+            .expect("kv failed versions lock poisoned")
+            .remove(&version)
     }
 
     pub fn set_profile_enabled(&self, enabled: bool) {
@@ -1058,6 +1099,17 @@ impl KvStore {
     ) -> Result<()> {
         self.write_scheduler
             .enqueue_batch(|| self.next_version(), worker_name, binding, mutations)
+            .map(|_| ())
+    }
+
+    pub fn enqueue_batch_versions(
+        &self,
+        worker_name: &str,
+        binding: &str,
+        mutations: &[KvBatchMutation],
+    ) -> Result<Vec<i64>> {
+        self.write_scheduler
+            .enqueue_batch(|| self.next_version(), worker_name, binding, mutations)
     }
 
     pub async fn list(
@@ -1309,12 +1361,14 @@ mod tests {
             .map_err(kv_error)?;
         let database = Arc::new(database);
         let profile = Arc::new(KvProfile::default());
+        let failed_versions = Arc::new(Mutex::new(HashSet::new()));
         let store = KvStore {
             database: Arc::clone(&database),
             connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
             profile: Arc::clone(&profile),
-            write_scheduler: KvWriteScheduler::new(database, profile),
+            write_scheduler: KvWriteScheduler::new(database, profile, Arc::clone(&failed_versions)),
+            failed_versions,
         };
         store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;

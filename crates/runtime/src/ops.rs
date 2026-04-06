@@ -389,6 +389,8 @@ struct KvApplyBatchMutationPayload {
 struct KvOpResult {
     ok: bool,
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1332,6 +1334,11 @@ fn op_kv_profile_record_js(
     let kind = match metric.as_str() {
         "js_request_total" => KvProfileMetricKind::JsRequestTotal,
         "js_batch_flush" => KvProfileMetricKind::JsBatchFlush,
+        "kv_cache_hit" => KvProfileMetricKind::JsCacheHit,
+        "kv_cache_miss" => KvProfileMetricKind::JsCacheMiss,
+        "kv_cache_stale" => KvProfileMetricKind::JsCacheStale,
+        "kv_cache_fill" => KvProfileMetricKind::JsCacheFill,
+        "kv_cache_invalidate" => KvProfileMetricKind::JsCacheInvalidate,
         _ => return,
     };
     let store = state.borrow::<KvStore>().clone();
@@ -1355,6 +1362,12 @@ fn op_kv_profile_reset(state: &mut OpState) {
     store.reset_profile();
 }
 
+#[deno_core::op2(fast)]
+fn op_kv_take_failed_write_version(state: &mut OpState, #[bigint] version: i64) -> bool {
+    let store = state.borrow::<KvStore>().clone();
+    store.take_failed_write_version(version)
+}
+
 #[deno_core::op2]
 #[serde]
 async fn op_kv_put(
@@ -1369,10 +1382,12 @@ async fn op_kv_put(
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: None,
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1386,6 +1401,7 @@ async fn op_kv_put_value(state: Rc<RefCell<OpState>>, #[string] payload: String)
             return KvOpResult {
                 ok: false,
                 error: format!("invalid kv put payload: {error}"),
+                version: None,
             };
         }
     };
@@ -1403,10 +1419,12 @@ async fn op_kv_put_value(state: Rc<RefCell<OpState>>, #[string] payload: String)
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: None,
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1424,10 +1442,12 @@ async fn op_kv_delete(
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: None,
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1442,7 +1462,7 @@ fn op_kv_enqueue_put(
     #[string] value: String,
 ) -> KvOpResult {
     let store = state.borrow::<KvStore>().clone();
-    match store.apply_batch(
+    match store.enqueue_batch_versions(
         &worker_name,
         &binding,
         &[KvBatchMutation {
@@ -1452,13 +1472,15 @@ fn op_kv_enqueue_put(
             deleted: false,
         }],
     ) {
-        Ok(()) => KvOpResult {
+        Ok(versions) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: versions.first().copied(),
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1472,11 +1494,12 @@ fn op_kv_enqueue_put_value(state: &mut OpState, #[string] payload: String) -> Kv
             return KvOpResult {
                 ok: false,
                 error: format!("invalid kv enqueue payload: {error}"),
+                version: None,
             };
         }
     };
     let store = state.borrow::<KvStore>().clone();
-    match store.apply_batch(
+    match store.enqueue_batch_versions(
         &payload.worker_name,
         &payload.binding,
         &[KvBatchMutation {
@@ -1486,13 +1509,15 @@ fn op_kv_enqueue_put_value(state: &mut OpState, #[string] payload: String) -> Kv
             deleted: false,
         }],
     ) {
-        Ok(()) => KvOpResult {
+        Ok(versions) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: versions.first().copied(),
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1506,7 +1531,7 @@ fn op_kv_enqueue_delete(
     #[string] key: String,
 ) -> KvOpResult {
     let store = state.borrow::<KvStore>().clone();
-    match store.apply_batch(
+    match store.enqueue_batch_versions(
         &worker_name,
         &binding,
         &[KvBatchMutation {
@@ -1516,13 +1541,15 @@ fn op_kv_enqueue_delete(
             deleted: true,
         }],
     ) {
-        Ok(()) => KvOpResult {
+        Ok(versions) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: versions.first().copied(),
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1536,6 +1563,7 @@ fn op_kv_apply_batch(state: &mut OpState, #[string] payload: String) -> KvOpResu
             return KvOpResult {
                 ok: false,
                 error: format!("invalid kv apply batch payload: {error}"),
+                version: None,
             };
         }
     };
@@ -1554,10 +1582,12 @@ fn op_kv_apply_batch(state: &mut OpState, #[string] payload: String) -> KvOpResu
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: None,
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -1676,6 +1706,7 @@ async fn op_cache_put(state: Rc<RefCell<OpState>>, #[string] payload: String) ->
             return KvOpResult {
                 ok: false,
                 error: error.to_string(),
+                version: None,
             };
         }
     };
@@ -1684,10 +1715,12 @@ async fn op_cache_put(state: Rc<RefCell<OpState>>, #[string] payload: String) ->
         Ok(_) => KvOpResult {
             ok: true,
             error: String::new(),
+            version: None,
         },
         Err(error) => KvOpResult {
             ok: false,
             error: error.to_string(),
+            version: None,
         },
     }
 }
@@ -3794,6 +3827,7 @@ deno_core::extension!(
         op_kv_profile_record_js,
         op_kv_profile_take,
         op_kv_profile_reset,
+        op_kv_take_failed_write_version,
         op_kv_put,
         op_kv_put_value,
         op_kv_delete,

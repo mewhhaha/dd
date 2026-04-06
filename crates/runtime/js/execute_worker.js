@@ -3,6 +3,7 @@ globalThis.__dd_execute_worker = (payload) => {
   const completionToken = String(payload?.completion_token ?? "");
   const workerName = String(payload?.worker_name ?? "");
   const kvBindingsConfig = payload?.kv_bindings ?? [];
+  const kvReadCacheConfigInput = payload?.kv_read_cache_config ?? null;
   const actorBindingsConfig = payload?.actor_bindings ?? [];
   const dynamicBindingsConfig = payload?.dynamic_bindings ?? [];
   const dynamicRpcBindingsConfig = payload?.dynamic_rpc_bindings ?? [];
@@ -26,6 +27,30 @@ globalThis.__dd_execute_worker = (payload) => {
   const input = payload?.request ?? null;
   const controller = new AbortController();
   const asyncContext = globalThis.__dd_async_context;
+  const kvReadCacheConfig = (() => {
+    const maxEntries = Math.max(
+      1,
+      Math.trunc(Number(kvReadCacheConfigInput?.max_entries ?? 16384) || 16384),
+    );
+    const maxBytes = Math.max(
+      1024,
+      Math.trunc(Number(kvReadCacheConfigInput?.max_bytes ?? 16 * 1024 * 1024) || (16 * 1024 * 1024)),
+    );
+    const hitTtlMs = Math.max(
+      1,
+      Math.trunc(Number(kvReadCacheConfigInput?.hit_ttl_ms ?? 300_000) || 300_000),
+    );
+    const missTtlMs = Math.max(
+      1,
+      Math.trunc(Number(kvReadCacheConfigInput?.miss_ttl_ms ?? 30_000) || 30_000),
+    );
+    return Object.freeze({
+      maxEntries,
+      maxBytes,
+      hitTtlMs,
+      missTtlMs,
+    });
+  })();
   const requestContext = {
     requestId,
     controller,
@@ -307,7 +332,110 @@ globalThis.__dd_execute_worker = (payload) => {
     throw new Error(`${context} unsupported encoding: ${encoding}`);
   };
 
+  const kvCacheNowMs = () => performance.now();
+
+  const estimateKvCachedValueBytes = (value, encoding) => {
+    if (value == null) {
+      return 8;
+    }
+    if (encoding === "utf8" && typeof value === "string") {
+      return value.length * 2;
+    }
+    try {
+      return JSON.stringify(value).length * 2;
+    } catch {
+      return 128;
+    }
+  };
+
   const createKvBinding = (bindingName) => {
+    const persistentReadCache = {
+      entries: new Map(),
+      totalBytes: 0,
+    };
+
+    const deletePersistentCacheEntry = (normalizedKey, metric = "kv_cache_invalidate") => {
+      const existing = persistentReadCache.entries.get(normalizedKey);
+      if (!existing) {
+        return false;
+      }
+      persistentReadCache.entries.delete(normalizedKey);
+      persistentReadCache.totalBytes = Math.max(0, persistentReadCache.totalBytes - existing.sizeBytes);
+      recordKvProfile(metric, 0, 1);
+      return true;
+    };
+
+    const trimPersistentCache = () => {
+      while (
+        persistentReadCache.entries.size > kvReadCacheConfig.maxEntries
+        || persistentReadCache.totalBytes > kvReadCacheConfig.maxBytes
+      ) {
+        const oldestKey = persistentReadCache.entries.keys().next().value;
+        if (oldestKey === undefined) {
+          break;
+        }
+        deletePersistentCacheEntry(oldestKey);
+      }
+    };
+
+    const setPersistentCacheEntry = (
+      normalizedKey,
+      value,
+      encoding,
+      optimisticWriteVersion = null,
+    ) => {
+      const existing = persistentReadCache.entries.get(normalizedKey);
+      if (existing) {
+        persistentReadCache.totalBytes = Math.max(0, persistentReadCache.totalBytes - existing.sizeBytes);
+        persistentReadCache.entries.delete(normalizedKey);
+      }
+      const missing = value == null;
+      const expiresAtMs = kvCacheNowMs()
+        + (missing ? kvReadCacheConfig.missTtlMs : kvReadCacheConfig.hitTtlMs);
+      const sizeBytes = normalizedKey.length * 2
+        + 64
+        + estimateKvCachedValueBytes(value, encoding);
+      persistentReadCache.entries.set(normalizedKey, {
+        value,
+        missing,
+        encoding,
+        optimisticWriteVersion,
+        expiresAtMs,
+        sizeBytes,
+      });
+      persistentReadCache.totalBytes += sizeBytes;
+      trimPersistentCache();
+      recordKvProfile("kv_cache_fill", 0, 1);
+    };
+
+    const getPersistentCacheEntry = (normalizedKey) => {
+      const cached = persistentReadCache.entries.get(normalizedKey);
+      if (!cached) {
+        recordKvProfile("kv_cache_miss", 0, 1);
+        return { found: false, value: null };
+      }
+      if (cached.optimisticWriteVersion != null) {
+        const failed = callOp(
+          "op_kv_take_failed_write_version",
+          BigInt(cached.optimisticWriteVersion),
+        );
+        if (failed === true) {
+          deletePersistentCacheEntry(normalizedKey);
+          recordKvProfile("kv_cache_miss", 0, 1);
+          return { found: false, value: null };
+        }
+      }
+      if (cached.expiresAtMs <= kvCacheNowMs()) {
+        deletePersistentCacheEntry(normalizedKey, "kv_cache_stale");
+        recordKvProfile("kv_cache_miss", 0, 1);
+        return { found: false, value: null };
+      }
+      persistentReadCache.entries.delete(normalizedKey);
+      persistentReadCache.entries.set(normalizedKey, cached);
+      recordKvProfile("kv_cache_hit", 0, 1);
+      return { found: true, value: cached.missing ? null : cached.value };
+    };
+
     const ensureKvWriteOverlay = () => {
       const current = currentRequestContext();
       let overlay = current.kvWriteOverlay.get(bindingName) ?? null;
@@ -359,6 +487,12 @@ globalThis.__dd_execute_worker = (payload) => {
         clearKvOverlayValue(mutation.key);
         throw new Error(String(result.error ?? "kv enqueue failed"));
       }
+      setPersistentCacheEntry(
+        mutation.key,
+        mutation.deleted === true ? null : mutation.resolvedValue,
+        mutation.encoding,
+        Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
+      );
     };
 
     const loadKvValues = async (normalizedKeys, contextLabel) => {
@@ -468,6 +602,12 @@ globalThis.__dd_execute_worker = (payload) => {
         for (let index = 0; index < uniqueKeys.length; index += 1) {
           const key = uniqueKeys[index];
           const value = values[index];
+          setPersistentCacheEntry(
+            key,
+            value,
+            value == null ? "missing" : (typeof value === "string" ? "utf8" : "v8sc"),
+            null,
+          );
           const waiters = batch.requestsByKey.get(key) ?? [];
           for (const waiter of waiters) {
             waiter.resolve(value);
@@ -531,6 +671,10 @@ globalThis.__dd_execute_worker = (payload) => {
           }
           return pendingWrite.resolvedValue;
         }
+        const persistentCached = getPersistentCacheEntry(normalizedKey);
+        if (persistentCached.found) {
+          return persistentCached.value;
+        }
         const cachedValue = currentRequestContext(false)?.kvGetResults?.get(bindingName)
           ?.get(normalizedKey);
         if (cachedValue) {
@@ -549,6 +693,7 @@ globalThis.__dd_execute_worker = (payload) => {
             encoding: "utf8",
             value: toUtf8Bytes(value),
             deleted: false,
+            resolvedValue,
           };
         } else {
           let encoded;
@@ -562,6 +707,7 @@ globalThis.__dd_execute_worker = (payload) => {
             encoding: "v8sc",
             value: new Uint8Array(encoded),
             deleted: false,
+            resolvedValue,
           };
         }
         setKvOverlayValue(normalizedKey, {
@@ -582,6 +728,7 @@ globalThis.__dd_execute_worker = (payload) => {
           encoding: "utf8",
           value: new Uint8Array(),
           deleted: true,
+          resolvedValue: null,
         });
       },
       async list(options = {}) {

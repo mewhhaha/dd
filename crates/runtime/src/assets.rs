@@ -16,6 +16,7 @@ pub fn install_worker_js() -> String {
 pub fn execute_worker_js(
     worker_name: &str,
     kv_bindings_json: &str,
+    kv_read_cache_config_json: &str,
     actor_bindings_json: &str,
     dynamic_bindings_json: &str,
     dynamic_rpc_bindings_json: &str,
@@ -34,6 +35,7 @@ request_id:{request_id},\
 completion_token:{completion_token},\
 worker_name:{worker_name},\
 kv_bindings:{kv_bindings_json},\
+kv_read_cache_config:{kv_read_cache_config_json},\
 actor_bindings:{actor_bindings_json},\
 dynamic_bindings:{dynamic_bindings_json},\
 dynamic_rpc_bindings:{dynamic_rpc_bindings_json},\
