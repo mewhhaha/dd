@@ -389,7 +389,8 @@ async fn run_config_scenario(
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             database_url: format!("file:{}", root.join("dd-kv.db").display()),
-            actor_shards_per_namespace: 64,
+            actor_db_cache_max_open: 4096,
+            actor_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
             blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
         },

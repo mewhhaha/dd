@@ -145,6 +145,18 @@ globalThis.__dd_execute_worker = (payload) => {
     );
   };
 
+  const recordActorProfile = (metric, durationMs, items = 1) => {
+    const op = Deno?.core?.ops?.op_actor_profile_record_js;
+    if (typeof op !== "function") {
+      return;
+    }
+    op(
+      String(metric),
+      Math.max(0, Math.round(Number(durationMs ?? 0) * 1000)),
+      Math.max(1, Math.trunc(Number(items ?? 1) || 1)),
+    );
+  };
+
   const activeRequestId = () => {
     const scoped = String(currentRequestContext().requestId ?? "").trim();
     if (!scoped) {
@@ -1178,11 +1190,16 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!entry.storageState) {
       entry.storageState = {
         hydrated: false,
+        fullSnapshotLoaded: false,
         hydrating: null,
         mirror: new Map(),
         loadedKeys: new Set(),
         committedVersion: -1,
+        snapshotVersion: -1,
         nextVersion: 0,
+        freshnessCheckedRequestId: "",
+        freshnessCheckedVersion: -1,
+        stale: false,
         pendingMutations: [],
         flushRunning: false,
         flushTail: Promise.resolve(),
@@ -1218,6 +1235,7 @@ globalThis.__dd_execute_worker = (payload) => {
     listGateVersion: null,
     stagedVersionSeed: null,
     accepted: false,
+    sideEffects: false,
     committed: false,
     committedVersion: null,
   });
@@ -1227,7 +1245,14 @@ globalThis.__dd_execute_worker = (payload) => {
     && txn.writes.size === 0
     && txn.deferred.length === 0
     && txn.listGateVersion == null
-    && txn.accepted !== true;
+    && txn.accepted !== true
+    && txn.sideEffects !== true;
+
+  const actorTxnIsReadOnly = (txn) => !!txn
+    && txn.writes.size === 0
+    && txn.deferred.length === 0
+    && txn.accepted !== true
+    && txn.sideEffects !== true;
 
   class MemoryHydrationNeeded extends Error {
     constructor(mode, keys = []) {
@@ -1289,10 +1314,44 @@ globalThis.__dd_execute_worker = (payload) => {
       Number(storageState.nextVersion ?? 0),
       Number(storageState.committedVersion ?? -1) + 1,
     );
+    storageState.snapshotVersion = Number(storageState.committedVersion ?? -1);
+    storageState.stale = false;
     if (mode === "full") {
       storageState.hydrated = true;
+      storageState.fullSnapshotLoaded = true;
+    } else {
+      storageState.fullSnapshotLoaded = false;
     }
   };
+
+  const invalidateActorSnapshot = (entry, knownVersion = null) => {
+    const storageState = ensureActorStorageState(entry);
+    storageState.mirror.clear();
+    storageState.loadedKeys.clear();
+    storageState.hydrated = false;
+    storageState.fullSnapshotLoaded = false;
+    storageState.hydrating = null;
+    storageState.stale = true;
+    if (Number.isFinite(Number(knownVersion))) {
+      storageState.committedVersion = Math.max(
+        Number(storageState.committedVersion ?? -1),
+        Number(knownVersion),
+      );
+      storageState.snapshotVersion = Math.max(
+        Number(storageState.snapshotVersion ?? -1),
+        Number(knownVersion),
+      );
+      storageState.nextVersion = Math.max(
+        Number(storageState.nextVersion ?? 0),
+        Number(storageState.committedVersion ?? -1) + 1,
+      );
+    }
+    return storageState;
+  };
+
+  const actorSnapshotHasCache = (storageState) => storageState.fullSnapshotLoaded === true
+    || storageState.loadedKeys.size > 0
+    || storageState.mirror.size > 0;
 
   const actorTxnReadRecord = (txn, key) => {
     const normalizedKey = String(key);
@@ -1303,8 +1362,8 @@ globalThis.__dd_execute_worker = (payload) => {
     return storageState.mirror.get(normalizedKey) ?? null;
   };
 
-  const actorTxnTrackRead = (txn, key, record, strict) => {
-    if (!txn || strict !== true) {
+  const actorTxnTrackRead = (txn, key, record, allowConcurrency) => {
+    if (!txn || allowConcurrency === true) {
       return;
     }
     const normalizedKey = String(key);
@@ -1465,11 +1524,12 @@ globalThis.__dd_execute_worker = (payload) => {
 
   const ensureActorStorageHydrated = async (entry, runtimeRequestId) => {
     const storageState = ensureActorStorageState(entry);
-    if (storageState.hydrated) {
+    if (storageState.fullSnapshotLoaded) {
       return storageState;
     }
     if (!storageState.hydrating) {
       storageState.hydrating = (async () => {
+        const started = performance.now();
         const result = await callOp("op_actor_state_snapshot", {
           request_id: runtimeRequestId,
           binding: entry.binding,
@@ -1485,6 +1545,9 @@ globalThis.__dd_execute_worker = (payload) => {
           result.max_version,
           "full",
         );
+        storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+        storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+        recordActorProfile("js_hydrate_full", performance.now() - started, result.entries?.length ?? 1);
         storageState.hydrating = null;
         return storageState;
       })().catch(async (error) => {
@@ -1498,7 +1561,7 @@ globalThis.__dd_execute_worker = (payload) => {
   const ensureActorStorageKeysHydrated = async (entry, runtimeRequestId, keys, options = {}) => {
     const storageState = ensureActorStorageState(entry);
     const force = options?.force === true;
-    if (storageState.hydrated) {
+    if (storageState.fullSnapshotLoaded && !force) {
       return storageState;
     }
     const pendingKeys = Array.from(new Set(
@@ -1510,6 +1573,7 @@ globalThis.__dd_execute_worker = (payload) => {
     if (pendingKeys.length === 0) {
       return storageState;
     }
+    const started = performance.now();
     const result = await callOp("op_actor_state_snapshot", {
       request_id: runtimeRequestId,
       binding: entry.binding,
@@ -1527,6 +1591,9 @@ globalThis.__dd_execute_worker = (payload) => {
       "keys",
       pendingKeys,
     );
+    storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+    storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+    recordActorProfile("js_hydrate_keys", performance.now() - started, pendingKeys.length);
     return storageState;
   };
 
@@ -1535,11 +1602,57 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const refreshActorEntrySnapshot = async (entry, runtimeRequestId) => {
-    const storageState = ensureActorStorageState(entry);
-    storageState.hydrated = false;
-    storageState.hydrating = null;
-    storageState.loadedKeys.clear();
+    invalidateActorSnapshot(entry);
     await ensureActorStorageHydrated(entry, runtimeRequestId);
+  };
+
+  const ensureActorReadSnapshotFresh = async (entry, runtimeRequestId) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
+    if (storageState.pendingMutations.length > 0 || storageState.flushRunning) {
+      return storageState;
+    }
+    if (!actorSnapshotHasCache(storageState)) {
+      recordActorProfile("actor_cache_miss", 0, 1);
+      storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+      storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+      return storageState;
+    }
+    const requestId = String(runtimeRequestId ?? "");
+    const committedVersion = Number(storageState.committedVersion ?? -1);
+    if (
+      storageState.freshnessCheckedRequestId === requestId
+      && Number(storageState.freshnessCheckedVersion ?? -1) === committedVersion
+    ) {
+      recordActorProfile("actor_cache_hit", 0, 1);
+      return storageState;
+    }
+    const started = performance.now();
+    const result = await callOp("op_actor_state_version_if_newer", {
+      request_id: runtimeRequestId,
+      binding: entry.binding,
+      key: entry.actorKey,
+      known_version: committedVersion,
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory storage freshness check failed"));
+    }
+    const knownVersion = Number(
+      result.stale === true ? result.max_version : committedVersion,
+    );
+    if (result.stale === true) {
+      recordActorProfile("actor_cache_stale", 0, 1);
+      invalidateActorSnapshot(entry, knownVersion);
+    } else {
+      recordActorProfile("actor_cache_hit", 0, 1);
+    }
+    storageState.freshnessCheckedRequestId = requestId;
+    storageState.freshnessCheckedVersion = knownVersion;
+    recordActorProfile("js_freshness_check", performance.now() - started, 1);
+    return storageState;
   };
 
   const commitActorTxn = async (txn, runtimeRequestId) => {
@@ -1578,6 +1691,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     const committedVersion = Number(result.max_version ?? storageState.committedVersion);
     for (const mutation of writes) {
+      storageState.loadedKeys.add(mutation.key);
       storageState.mirror.set(mutation.key, {
         ...cloneActorRecord(mutation),
         version: committedVersion,
@@ -1588,6 +1702,10 @@ globalThis.__dd_execute_worker = (payload) => {
       Number(storageState.nextVersion ?? 0),
       Number(storageState.committedVersion ?? -1) + 1,
     );
+    storageState.snapshotVersion = committedVersion;
+    storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+    storageState.freshnessCheckedVersion = committedVersion;
+    storageState.stale = false;
     txn.committed = true;
     txn.committedVersion = committedVersion;
     await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
@@ -1648,13 +1766,14 @@ globalThis.__dd_execute_worker = (payload) => {
           throw storageState.failedError;
         }
         const normalizedKey = String(key);
-        if (txn && !storageState.hydrated && !storageState.loadedKeys.has(normalizedKey)) {
+        if (txn && !storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(normalizedKey)) {
+          recordActorProfile("actor_cache_miss", 0, 1);
           throw new MemoryHydrationNeeded("keys", [normalizedKey]);
         }
         const record = txn
           ? actorTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
-        actorTxnTrackRead(txn, normalizedKey, record, options?.strict === true);
+        actorTxnTrackRead(txn, normalizedKey, record, options?.allowConcurrency === true);
         if (!record || record.deleted) {
           return null;
         }
@@ -1697,6 +1816,7 @@ globalThis.__dd_execute_worker = (payload) => {
         if (txn) {
           stageActorTxnWrite(txn, record);
         } else {
+          storageState.loadedKeys.add(normalizedKey);
           storageState.mirror.set(normalizedKey, record);
           queueActorMutation(entry, currentStorageRequestId(), record);
         }
@@ -1738,6 +1858,7 @@ globalThis.__dd_execute_worker = (payload) => {
         if (txn) {
           stageActorTxnWrite(txn, record);
         } else {
+          storageState.loadedKeys.add(normalizedKey);
           storageState.mirror.set(normalizedKey, record);
           queueActorMutation(entry, currentStorageRequestId(), record);
         }
@@ -1752,7 +1873,7 @@ globalThis.__dd_execute_worker = (payload) => {
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        if (txn && !storageState.hydrated) {
+        if (txn && !storageState.fullSnapshotLoaded) {
           throw new MemoryHydrationNeeded("full");
         }
         const prefix = String(options?.prefix ?? "");
@@ -1765,7 +1886,7 @@ globalThis.__dd_execute_worker = (payload) => {
           for (const [key, record] of txn.writes.entries()) {
             merged.set(key, cloneActorRecord(record));
           }
-          if (options?.strict === true) {
+          if (options?.allowConcurrency !== true) {
             txn.listGateVersion = Number(storageState.committedVersion ?? -1);
           }
         }
@@ -2594,7 +2715,7 @@ globalThis.__dd_execute_worker = (payload) => {
           if (typeof updater !== "function") {
             throw new Error("state.var(key).modify(updater) requires a function updater");
           }
-          const record = runtimeState.storage.get(normalizedKey, { strict: true });
+          const record = runtimeState.storage.get(normalizedKey);
           const previous = record ? record.value : defaultValue;
           const next = updater(previous);
           runtimeState.storage.put(normalizedKey, next);
@@ -2624,7 +2745,7 @@ globalThis.__dd_execute_worker = (payload) => {
         if (typeof updater !== "function") {
           throw new Error("state.put(key, updater) requires a function updater");
         }
-        const previous = runtimeState.storage.get(key, { strict: true })?.value ?? null;
+        const previous = runtimeState.storage.get(key)?.value ?? null;
         const next = updater(previous);
         runtimeState.storage.put(key, next);
         return next;
@@ -3790,6 +3911,7 @@ globalThis.__dd_execute_worker = (payload) => {
     for (let attempt = 0; attempt < maxRetries; attempt += 1) {
       for (;;) {
         const txn = createActorTxn(entry);
+        const txnStarted = performance.now();
         const scopedState = createActorAtomicState(
           entry,
           runtimeRequestId,
@@ -3803,6 +3925,7 @@ globalThis.__dd_execute_worker = (payload) => {
         current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
         current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
         try {
+          await ensureActorReadSnapshotFresh(entry, runtimeRequestId);
           const value = withActorTxnScope(
             {
               binding: entry.binding,
@@ -3816,6 +3939,11 @@ globalThis.__dd_execute_worker = (payload) => {
             throw new Error("stub.atomic callback must be synchronous");
           }
           if (actorTxnIsSnapshotOnly(txn)) {
+            recordActorProfile("js_read_only_total", performance.now() - txnStarted, 1);
+            return value;
+          }
+          if (actorTxnIsReadOnly(txn)) {
+            recordActorProfile("js_read_only_total", performance.now() - txnStarted, 1);
             return value;
           }
           const committed = txn.writes.size === 0 && txn.accepted !== true

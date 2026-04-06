@@ -1,4 +1,4 @@
-use crate::actor::{ActorBatchMutation, ActorReadDependency, ActorStore};
+use crate::actor::{ActorBatchMutation, ActorProfileMetricKind, ActorReadDependency, ActorStore};
 use crate::actor_rpc::{
     decode_actor_invoke_response, encode_actor_invoke_request, ActorInvokeCall, ActorInvokeRequest,
     ActorInvokeResponse,
@@ -814,6 +814,31 @@ struct ActorStateSnapshotEntry {
 struct ActorStateSnapshotResult {
     ok: bool,
     entries: Vec<ActorStateSnapshotEntry>,
+    max_version: i64,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorProfileResult {
+    ok: bool,
+    snapshot: Option<crate::actor::ActorProfileSnapshot>,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateVersionIfNewerPayload {
+    request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
+    known_version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateVersionIfNewerResult {
+    ok: bool,
+    stale: bool,
     max_version: i64,
     error: String,
 }
@@ -2687,6 +2712,7 @@ async fn op_actor_state_snapshot(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorStateSnapshotPayload,
 ) -> ActorStateSnapshotResult {
+    let started = Instant::now();
     let (namespace, actor_key) = match actor_storage_scope_for_payload(
         &state,
         &payload.request_id,
@@ -2715,25 +2741,95 @@ async fn op_actor_state_snapshot(
     } else {
         store.snapshot_keys(&namespace, &actor_key, &keys).await
     } {
-        Ok(snapshot) => ActorStateSnapshotResult {
-            ok: true,
-            entries: snapshot
-                .entries
-                .into_iter()
-                .map(|entry| ActorStateSnapshotEntry {
-                    key: entry.key,
-                    value: entry.value,
-                    encoding: entry.encoding,
-                    version: entry.version,
-                    deleted: entry.deleted,
-                })
-                .collect(),
-            max_version: snapshot.max_version,
-            error: String::new(),
-        },
+        Ok(snapshot) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpSnapshot,
+                started.elapsed().as_micros() as u64,
+                keys.len().max(1) as u64,
+            );
+            ActorStateSnapshotResult {
+                ok: true,
+                entries: snapshot
+                    .entries
+                    .into_iter()
+                    .map(|entry| ActorStateSnapshotEntry {
+                        key: entry.key,
+                        value: entry.value,
+                        encoding: entry.encoding,
+                        version: entry.version,
+                        deleted: entry.deleted,
+                    })
+                    .collect(),
+                max_version: snapshot.max_version,
+                error: String::new(),
+            }
+        }
         Err(error) => ActorStateSnapshotResult {
             ok: false,
             entries: Vec::new(),
+            max_version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_version_if_newer(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateVersionIfNewerPayload,
+) -> ActorStateVersionIfNewerResult {
+    let started = Instant::now();
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return ActorStateVersionIfNewerResult {
+                ok: false,
+                stale: false,
+                max_version: -1,
+                error: error.to_string(),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .version_if_newer(&namespace, &actor_key, payload.known_version)
+        .await
+    {
+        Ok(Some(max_version)) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpVersionIfNewer,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
+            ActorStateVersionIfNewerResult {
+                ok: true,
+                stale: true,
+                max_version,
+                error: String::new(),
+            }
+        }
+        Ok(None) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpVersionIfNewer,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
+            ActorStateVersionIfNewerResult {
+                ok: true,
+                stale: false,
+                max_version: payload.known_version,
+                error: String::new(),
+            }
+        }
+        Err(error) => ActorStateVersionIfNewerResult {
+            ok: false,
+            stale: false,
             max_version: -1,
             error: error.to_string(),
         },
@@ -2746,6 +2842,7 @@ async fn op_actor_state_validate_reads(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorStateValidateReadsPayload,
 ) -> ActorStateApplyBatchResult {
+    let started = Instant::now();
     let (namespace, actor_key) = match actor_storage_scope_for_payload(
         &state,
         &payload.request_id,
@@ -2780,12 +2877,19 @@ async fn op_actor_state_validate_reads(
         .validate_reads(&namespace, &actor_key, &reads, list_gate_version)
         .await
     {
-        Ok(result) => ActorStateApplyBatchResult {
-            ok: true,
-            conflict: result.conflict,
-            max_version: result.max_version,
-            error: String::new(),
-        },
+        Ok(result) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpValidateReads,
+                started.elapsed().as_micros() as u64,
+                reads.len().max(1) as u64,
+            );
+            ActorStateApplyBatchResult {
+                ok: true,
+                conflict: result.conflict,
+                max_version: result.max_version,
+                error: String::new(),
+            }
+        }
         Err(error) => ActorStateApplyBatchResult {
             ok: false,
             conflict: false,
@@ -2793,6 +2897,44 @@ async fn op_actor_state_validate_reads(
             error: error.to_string(),
         },
     }
+}
+
+#[deno_core::op2(fast)]
+fn op_actor_profile_record_js(
+    state: &mut OpState,
+    #[string] metric: String,
+    duration_us: u32,
+    items: u32,
+) {
+    let kind = match metric.as_str() {
+        "js_read_only_total" => ActorProfileMetricKind::JsReadOnlyTotal,
+        "js_freshness_check" => ActorProfileMetricKind::JsFreshnessCheck,
+        "js_hydrate_full" => ActorProfileMetricKind::JsHydrateFull,
+        "js_hydrate_keys" => ActorProfileMetricKind::JsHydrateKeys,
+        "actor_cache_hit" => ActorProfileMetricKind::JsCacheHit,
+        "actor_cache_miss" => ActorProfileMetricKind::JsCacheMiss,
+        "actor_cache_stale" => ActorProfileMetricKind::JsCacheStale,
+        _ => return,
+    };
+    let store = state.borrow::<ActorStore>().clone();
+    store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_actor_profile_take(state: &mut OpState) -> ActorProfileResult {
+    let store = state.borrow::<ActorStore>().clone();
+    ActorProfileResult {
+        ok: true,
+        snapshot: Some(store.take_profile_snapshot_and_reset()),
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2(fast)]
+fn op_actor_profile_reset(state: &mut OpState) {
+    let store = state.borrow::<ActorStore>().clone();
+    store.reset_profile();
 }
 
 #[deno_core::op2]
@@ -3849,8 +3991,12 @@ deno_core::extension!(
         op_request_body_read,
         op_request_body_cancel,
         op_actor_invoke_method,
+        op_actor_profile_record_js,
+        op_actor_profile_take,
+        op_actor_profile_reset,
         op_actor_state_snapshot,
         op_actor_state_validate_reads,
+        op_actor_state_version_if_newer,
         op_actor_state_apply_batch,
         op_actor_socket_send,
         op_actor_socket_close,
