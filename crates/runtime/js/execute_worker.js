@@ -3956,6 +3956,9 @@ globalThis.__dd_execute_worker = (payload) => {
         current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
         try {
           await ensureActorReadSnapshotFresh(entry, runtimeRequestId);
+          if (!actorSnapshotHasCache(ensureActorStorageState(entry))) {
+            await ensureActorStorageHydrated(entry, runtimeRequestId);
+          }
           const value = withActorTxnScope(
             {
               binding: entry.binding,
