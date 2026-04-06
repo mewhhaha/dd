@@ -144,6 +144,26 @@ export default {
 };
 "#;
 
+const ACTOR_DIRECT_READ_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.set("payload", "1");
+  return true;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/seed") {
+      await actor.atomic(seed);
+      return new Response("ok");
+    }
+    return new Response(String(await actor.var("payload").read() ?? "0"));
+  },
+};
+"#;
+
 const ACTOR_ATOMIC_READ_MEMORY_WORKER_SOURCE: &str = r#"
 export function seed(state) {
   state.set("payload", "1");
@@ -480,6 +500,32 @@ async fn main() -> Result<(), String> {
             false,
             "/read",
             1,
+            None,
+            false,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory") {
+        run_and_print(
+            &service,
+            "actor-direct-read-memory",
+            ACTOR_DIRECT_READ_WORKER_SOURCE,
+            true,
+            "/read",
+            1,
+            None,
+            false,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory-multikey") {
+        run_and_print(
+            &service,
+            "actor-direct-read-memory-multikey",
+            ACTOR_DIRECT_READ_WORKER_SOURCE,
+            false,
+            "/read",
+            env_usize("DD_BENCH_KEY_SPACE", 256),
             None,
             false,
         )

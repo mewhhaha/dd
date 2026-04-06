@@ -1621,6 +1621,19 @@ globalThis.__dd_execute_worker = (payload) => {
     await ensureActorStorageHydrated(entry, runtimeRequestId);
   };
 
+  const ensureActorDirectReadReady = async (entry, runtimeRequestId, key) => {
+    await ensureActorReadSnapshotFresh(entry, runtimeRequestId);
+    const storageState = ensureActorStorageState(entry);
+    if (!actorSnapshotHasCache(storageState)) {
+      await ensureActorStorageHydrated(entry, runtimeRequestId);
+      return storageState;
+    }
+    if (!storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(String(key ?? ""))) {
+      await ensureActorStorageHydrated(entry, runtimeRequestId);
+    }
+    return storageState;
+  };
+
   const ensureActorReadSnapshotFresh = async (entry, runtimeRequestId) => {
     const storageState = ensureActorStorageState(entry);
     if (storageState.failedError) {
@@ -3154,10 +3167,20 @@ globalThis.__dd_execute_worker = (payload) => {
         return (async () => {
           const runtimeRequestId = activeRequestId();
           const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId, { hydrate: false });
-          await ensureActorStorageKeysHydrated(entry, runtimeRequestId, [normalizedKey]);
-          const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
-          const record = state.storage.get(normalizedKey, options);
-          return record ? record.value : defaultValue;
+          const storageState = await ensureActorDirectReadReady(entry, runtimeRequestId, normalizedKey);
+          const record = storageState.mirror.get(normalizedKey) ?? null;
+          if (!record || record.deleted) {
+            return defaultValue;
+          }
+          const value = decodeActorStorageValue(record);
+          if (options && typeof options === "object" && options.withVersion === true) {
+            return {
+              value,
+              version: Number(record.version ?? -1),
+              encoding: String(record.encoding ?? "utf8"),
+            };
+          }
+          return value;
         })();
       },
       write(value) {
