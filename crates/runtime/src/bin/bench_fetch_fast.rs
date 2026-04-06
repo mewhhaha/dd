@@ -22,6 +22,7 @@ struct Scenario {
     worker_source: &'static str,
     path: &'static str,
     use_kv_binding: bool,
+    use_actor_binding: bool,
     seed_path: Option<&'static str>,
 }
 
@@ -167,6 +168,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
+            use_actor_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -180,6 +182,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
+            use_actor_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -195,6 +198,21 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
+            use_actor_binding: false,
+            seed_path: None,
+        },
+        Scenario {
+            name: "instant-text-actor-bound",
+            worker_source: r#"
+export default {
+  fetch() {
+    return new Response("ok");
+  },
+};
+"#,
+            path: "/",
+            use_kv_binding: false,
+            use_actor_binding: true,
             seed_path: None,
         },
         Scenario {
@@ -208,6 +226,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
+            use_actor_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -226,6 +245,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
+            use_actor_binding: false,
             seed_path: Some("/seed"),
         },
         Scenario {
@@ -241,6 +261,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
+            use_actor_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -256,6 +277,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
+            use_actor_binding: false,
             seed_path: None,
         },
     ];
@@ -374,6 +396,10 @@ async fn run_config_scenario(
                 bindings: if scenario.use_kv_binding {
                     vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
+                    }]
+                } else if scenario.use_actor_binding {
+                    vec![DeployBinding::Actor {
+                        binding: "BENCH_ACTOR".to_string(),
                     }]
                 } else {
                     Vec::new()
