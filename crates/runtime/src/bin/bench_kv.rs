@@ -3,8 +3,8 @@ use runtime::{
     BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
 };
 use serde::Deserialize;
-use std::env;
 use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -57,6 +57,12 @@ struct KvProfileSnapshot {
     store_get_utf8: KvProfileMetric,
     store_get_utf8_many: KvProfileMetric,
     store_get_value: KvProfileMetric,
+    write_enqueue: KvProfileMetric,
+    write_superseded: KvProfileMetric,
+    write_rejected: KvProfileMetric,
+    write_flush: KvProfileMetric,
+    write_retry: KvProfileMetric,
+    write_queue_wait: KvProfileMetric,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -109,9 +115,9 @@ export default {
     };
     try {
     if (url.pathname === "/seed") {
-      await env.MY_KV.set("hot", "1");
+      await env.MY_KV.put("hot", "1");
       for (let i = 0; i < 10; i++) {
-        await env.MY_KV.set(`hot-${i}`, String(i));
+        await env.MY_KV.put(`hot-${i}`, String(i));
       }
       return new Response("ok");
     }
@@ -145,19 +151,19 @@ export default {
       return new Response(String(values.at(-1) ?? "0"));
     }
     if (url.pathname === "/write") {
-      await env.MY_KV.set("hot", "1");
+      await env.MY_KV.put("hot", "1");
       return new Response("ok");
     }
     if (url.pathname === "/write10") {
       for (let i = 0; i < 10; i++) {
-        await env.MY_KV.set("hot", String(i));
+        await env.MY_KV.put("hot", String(i));
       }
       return new Response("ok");
     }
     if (url.pathname === "/writequeue10") {
       const tasks = [];
       for (let i = 0; i < 10; i++) {
-        tasks.push(env.MY_KV.set("hot", String(i)));
+        tasks.push(env.MY_KV.put("hot", String(i)));
       }
       await Promise.all(tasks);
       return new Response("ok");
@@ -165,7 +171,7 @@ export default {
     if (url.pathname === "/readwrite") {
       const current = Number((await env.MY_KV.get("hot")) ?? "0") || 0;
       const next = current + 1;
-      await env.MY_KV.set("hot", String(next));
+      await env.MY_KV.put("hot", String(next));
       return new Response(String(next));
     }
     return new Response("not found", { status: 404 });
@@ -181,6 +187,7 @@ async fn main() -> Result<(), String> {
     let requests = env_usize("DD_BENCH_REQUESTS", 200);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 32);
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 4);
+    let single_max_inflight = env_usize("DD_BENCH_SINGLE_MAX_INFLIGHT", 1);
     let write_requests = env_usize("DD_BENCH_WRITE_REQUESTS", requests.min(5_000));
     let write_concurrency = env_usize("DD_BENCH_WRITE_CONCURRENCY", concurrency.min(256));
     let profile_enabled = env_bool("DD_BENCH_PROFILE_KV", false);
@@ -191,7 +198,7 @@ async fn main() -> Result<(), String> {
             runtime: RuntimeConfig {
                 min_isolates: 1,
                 max_isolates: 1,
-                max_inflight_per_isolate: 1,
+                max_inflight_per_isolate: single_max_inflight,
                 idle_ttl: Duration::from_secs(60),
                 scale_tick: Duration::from_secs(1),
                 queue_warn_thresholds: vec![10, 100, 1000],
@@ -346,10 +353,9 @@ async fn run_config(config: &BenchConfig, scenarios: &[Scenario]) -> Result<(), 
         let result = run_config_scenario(config, scenario).await?;
         results.insert(scenario.label, result);
     }
-    if let (Some(sequential), Some(queued)) = (
-        results.get("kv-read10"),
-        results.get("kv-readqueue10"),
-    ) {
+    if let (Some(sequential), Some(queued)) =
+        (results.get("kv-read10"), results.get("kv-readqueue10"))
+    {
         println!(
             "batching gain  kv-readqueue10/kv-read10 = {:.2}x",
             queued.throughput_rps / sequential.throughput_rps
@@ -437,7 +443,10 @@ async fn run_config_scenario(
     Ok(result)
 }
 
-async fn take_profile(service: &RuntimeService, worker_name: &str) -> Result<KvProfileSnapshot, String> {
+async fn take_profile(
+    service: &RuntimeService,
+    worker_name: &str,
+) -> Result<KvProfileSnapshot, String> {
     let response = service
         .invoke(worker_name.to_string(), invocation("/__profile", 0))
         .await
@@ -471,6 +480,16 @@ fn print_profile(profile: &KvProfileSnapshot) {
         metric_mean_ms(&profile.store_get_utf8_many),
         metric_mean_ms(&profile.store_get_value),
         profile.js_batch_flush.max_us as f64 / 1000.0,
+    );
+    println!(
+        "profile-write enqueue={:.2}ms superseded={:.1} rejected={:.1} flush={:.2}ms retries={:.1} wait={:.2}ms batch={:.1}",
+        metric_mean_ms(&profile.write_enqueue),
+        metric_mean_items(&profile.write_superseded),
+        metric_mean_items(&profile.write_rejected),
+        metric_mean_ms(&profile.write_flush),
+        metric_mean_items(&profile.write_retry),
+        metric_mean_ms(&profile.write_queue_wait),
+        metric_mean_items(&profile.write_flush),
     );
 }
 

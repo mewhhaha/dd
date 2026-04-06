@@ -358,7 +358,7 @@ export default {
 const KV_WRITE_WORKER_SOURCE: &str = r#"
 export default {
   async fetch(request, env) {
-    await env.MY_KV.set("hot", "1");
+    await env.MY_KV.put("hot", "1");
     return new Response("ok");
   },
 };

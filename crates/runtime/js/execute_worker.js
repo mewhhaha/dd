@@ -315,7 +315,6 @@ globalThis.__dd_execute_worker = (payload) => {
         batch = {
           mutationsByKey: new Map(),
           flushPromise: null,
-          trackedFlushPromise: null,
         };
         current.kvWriteBatches.set(bindingName, batch);
       }
@@ -324,8 +323,15 @@ globalThis.__dd_execute_worker = (payload) => {
 
     const setKvOverlayValue = (normalizedKey, value) => {
       const current = currentRequestContext(false);
-      const bindingCache = current?.kvGetResults?.get(bindingName) ?? null;
-      bindingCache?.set(normalizedKey, Promise.resolve(value));
+      if (!current) {
+        return;
+      }
+      let bindingCache = current.kvGetResults.get(bindingName) ?? null;
+      if (!bindingCache) {
+        bindingCache = new Map();
+        current.kvGetResults.set(bindingName, bindingCache);
+      }
+      bindingCache.set(normalizedKey, Promise.resolve(value));
     };
 
     const clearKvOverlayValue = (normalizedKey) => {
@@ -369,9 +375,7 @@ globalThis.__dd_execute_worker = (payload) => {
           .then(() => flushPendingWriteBatch(batch))
           .finally(() => {
             batch.flushPromise = null;
-            batch.trackedFlushPromise = null;
           });
-        batch.trackedFlushPromise = trackWaitUntil(batch.flushPromise);
       }
       return batch.flushPromise;
     };
@@ -549,9 +553,14 @@ globalThis.__dd_execute_worker = (payload) => {
           }
           return Deno.core.deserialize(pendingWrite.value, { forStorage: true });
         }
+        const cachedValue = currentRequestContext(false)?.kvGetResults?.get(bindingName)
+          ?.get(normalizedKey);
+        if (cachedValue) {
+          return await cachedValue;
+        }
         return await queueKvGet(normalizedKey);
       },
-      async set(key, value, options = {}) {
+      async put(key, value, options = {}) {
         const _ = options;
         const normalizedKey = String(key);
         let mutation;
@@ -567,7 +576,7 @@ globalThis.__dd_execute_worker = (payload) => {
           try {
             encoded = Deno.core.serialize(value, { forStorage: true });
           } catch (error) {
-            throw new Error(`kv set serialize failed: ${String(error?.message ?? error)}`);
+            throw new Error(`kv put serialize failed: ${String(error?.message ?? error)}`);
           }
           mutation = {
             key: normalizedKey,

@@ -71,7 +71,7 @@ async fn run_scenario(scenario: Scenario) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     store
-        .set("worker-a", "MY_KV", "hot", "1")
+        .put("worker-a", "MY_KV", "hot", "1")
         .await
         .map_err(|error| error.to_string())?;
 
@@ -96,7 +96,7 @@ async fn run_scenario(scenario: Scenario) -> Result<(), String> {
                         let _ = store.get_utf8("worker-a", "MY_KV", "hot").await?;
                     }
                     "set-utf8" => {
-                        store.set("worker-a", "MY_KV", "hot", "1").await?;
+                        store.put("worker-a", "MY_KV", "hot", "1").await?;
                     }
                     _ => {}
                 }

@@ -362,7 +362,7 @@ struct KvGetValueResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct KvSetValuePayload {
+struct KvPutValuePayload {
     worker_name: String,
     binding: String,
     key: String,
@@ -1357,7 +1357,7 @@ fn op_kv_profile_reset(state: &mut OpState) {
 
 #[deno_core::op2]
 #[serde]
-async fn op_kv_set(
+async fn op_kv_put(
     state: Rc<RefCell<OpState>>,
     #[string] worker_name: String,
     #[string] binding: String,
@@ -1365,7 +1365,7 @@ async fn op_kv_set(
     #[string] value: String,
 ) -> KvOpResult {
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store.set(&worker_name, &binding, &key, &value).await {
+    match store.put(&worker_name, &binding, &key, &value).await {
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
@@ -1379,19 +1379,19 @@ async fn op_kv_set(
 
 #[deno_core::op2]
 #[serde]
-async fn op_kv_set_value(state: Rc<RefCell<OpState>>, #[string] payload: String) -> KvOpResult {
-    let payload: KvSetValuePayload = match crate::json::from_string(payload) {
+async fn op_kv_put_value(state: Rc<RefCell<OpState>>, #[string] payload: String) -> KvOpResult {
+    let payload: KvPutValuePayload = match crate::json::from_string(payload) {
         Ok(value) => value,
         Err(error) => {
             return KvOpResult {
                 ok: false,
-                error: format!("invalid kv set payload: {error}"),
+                error: format!("invalid kv put payload: {error}"),
             };
         }
     };
     let store = state.borrow().borrow::<KvStore>().clone();
     match store
-        .set_value(
+        .put_value(
             &payload.worker_name,
             &payload.binding,
             &payload.key,
@@ -1434,7 +1434,7 @@ async fn op_kv_delete(
 
 #[deno_core::op2]
 #[serde]
-async fn op_kv_apply_batch(state: Rc<RefCell<OpState>>, #[string] payload: String) -> KvOpResult {
+fn op_kv_apply_batch(state: &mut OpState, #[string] payload: String) -> KvOpResult {
     let payload: KvApplyBatchPayload = match crate::json::from_string(payload) {
         Ok(value) => value,
         Err(error) => {
@@ -1444,7 +1444,7 @@ async fn op_kv_apply_batch(state: Rc<RefCell<OpState>>, #[string] payload: Strin
             };
         }
     };
-    let store = state.borrow().borrow::<KvStore>().clone();
+    let store = state.borrow::<KvStore>().clone();
     let mutations = payload
         .mutations
         .into_iter()
@@ -1455,10 +1455,7 @@ async fn op_kv_apply_batch(state: Rc<RefCell<OpState>>, #[string] payload: Strin
             deleted: mutation.deleted,
         })
         .collect::<Vec<_>>();
-    match store
-        .apply_batch(&payload.worker_name, &payload.binding, &mutations)
-        .await
-    {
+    match store.apply_batch(&payload.worker_name, &payload.binding, &mutations) {
         Ok(()) => KvOpResult {
             ok: true,
             error: String::new(),
@@ -3702,8 +3699,8 @@ deno_core::extension!(
         op_kv_profile_record_js,
         op_kv_profile_take,
         op_kv_profile_reset,
-        op_kv_set,
-        op_kv_set_value,
+        op_kv_put,
+        op_kv_put_value,
         op_kv_delete,
         op_kv_apply_batch,
         op_kv_list,

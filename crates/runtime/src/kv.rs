@@ -1,11 +1,13 @@
 use common::{PlatformError, Result};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use turso::{transaction::TransactionBehavior, Builder, Connection, Database, Value};
 
 const ENCODING_UTF8: &str = "utf8";
@@ -17,6 +19,7 @@ pub struct KvStore {
     connections: Arc<Mutex<Vec<Connection>>>,
     version: Arc<AtomicU64>,
     profile: Arc<KvProfile>,
+    write_scheduler: KvWriteScheduler,
 }
 
 struct KvConnectionGuard {
@@ -90,6 +93,12 @@ pub enum KvProfileMetricKind {
     StoreGetUtf8,
     StoreGetUtf8Many,
     StoreGetValue,
+    WriteEnqueue,
+    WriteSuperseded,
+    WriteRejected,
+    WriteFlush,
+    WriteRetry,
+    WriteQueueWait,
 }
 
 #[derive(Default)]
@@ -119,6 +128,12 @@ pub struct KvProfileSnapshot {
     pub store_get_utf8: KvProfileMetricSnapshot,
     pub store_get_utf8_many: KvProfileMetricSnapshot,
     pub store_get_value: KvProfileMetricSnapshot,
+    pub write_enqueue: KvProfileMetricSnapshot,
+    pub write_superseded: KvProfileMetricSnapshot,
+    pub write_rejected: KvProfileMetricSnapshot,
+    pub write_flush: KvProfileMetricSnapshot,
+    pub write_retry: KvProfileMetricSnapshot,
+    pub write_queue_wait: KvProfileMetricSnapshot,
 }
 
 #[derive(Default)]
@@ -132,6 +147,63 @@ pub struct KvProfile {
     store_get_utf8: KvProfileMetric,
     store_get_utf8_many: KvProfileMetric,
     store_get_value: KvProfileMetric,
+    write_enqueue: KvProfileMetric,
+    write_superseded: KvProfileMetric,
+    write_rejected: KvProfileMetric,
+    write_flush: KvProfileMetric,
+    write_retry: KvProfileMetric,
+    write_queue_wait: KvProfileMetric,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvWriteMode {
+    EnqueueBestEffort,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct KvWriteKey {
+    worker_name: String,
+    binding: String,
+    key: String,
+}
+
+#[derive(Debug, Clone)]
+struct KvScheduledMutation {
+    key: KvWriteKey,
+    value: Vec<u8>,
+    encoding: String,
+    deleted: bool,
+    version: i64,
+    enqueued_at: Instant,
+    size_bytes: usize,
+}
+
+#[derive(Default)]
+struct KvWriteShardState {
+    pending: HashMap<KvWriteKey, KvScheduledMutation>,
+    pending_bytes: usize,
+    shutting_down: bool,
+}
+
+struct KvWriteShard {
+    state: Mutex<KvWriteShardState>,
+    wake: Condvar,
+}
+
+struct KvWriteSchedulerInner {
+    shards: Vec<Arc<KvWriteShard>>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
+    max_pending_keys: usize,
+    max_pending_bytes: usize,
+    flush_interval: Duration,
+    flush_threshold: usize,
+    database: Arc<Database>,
+    profile: Arc<KvProfile>,
+}
+
+#[derive(Clone)]
+struct KvWriteScheduler {
+    inner: Arc<KvWriteSchedulerInner>,
 }
 
 impl KvProfileMetric {
@@ -200,6 +272,12 @@ impl KvProfile {
             store_get_utf8: self.store_get_utf8.snapshot(),
             store_get_utf8_many: self.store_get_utf8_many.snapshot(),
             store_get_value: self.store_get_value.snapshot(),
+            write_enqueue: self.write_enqueue.snapshot(),
+            write_superseded: self.write_superseded.snapshot(),
+            write_rejected: self.write_rejected.snapshot(),
+            write_flush: self.write_flush.snapshot(),
+            write_retry: self.write_retry.snapshot(),
+            write_queue_wait: self.write_queue_wait.snapshot(),
         }
     }
 
@@ -218,6 +296,12 @@ impl KvProfile {
         self.store_get_utf8.reset();
         self.store_get_utf8_many.reset();
         self.store_get_value.reset();
+        self.write_enqueue.reset();
+        self.write_superseded.reset();
+        self.write_rejected.reset();
+        self.write_flush.reset();
+        self.write_retry.reset();
+        self.write_queue_wait.reset();
     }
 
     fn metric(&self, metric: KvProfileMetricKind) -> &KvProfileMetric {
@@ -230,7 +314,400 @@ impl KvProfile {
             KvProfileMetricKind::StoreGetUtf8 => &self.store_get_utf8,
             KvProfileMetricKind::StoreGetUtf8Many => &self.store_get_utf8_many,
             KvProfileMetricKind::StoreGetValue => &self.store_get_value,
+            KvProfileMetricKind::WriteEnqueue => &self.write_enqueue,
+            KvProfileMetricKind::WriteSuperseded => &self.write_superseded,
+            KvProfileMetricKind::WriteRejected => &self.write_rejected,
+            KvProfileMetricKind::WriteFlush => &self.write_flush,
+            KvProfileMetricKind::WriteRetry => &self.write_retry,
+            KvProfileMetricKind::WriteQueueWait => &self.write_queue_wait,
         }
+    }
+}
+
+impl KvScheduledMutation {
+    fn from_batch_mutation(
+        worker_name: &str,
+        binding: &str,
+        mutation: KvBatchMutation,
+        version: i64,
+    ) -> Result<Self> {
+        let encoding = normalize_encoding(&mutation.encoding);
+        if encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
+            return Err(PlatformError::bad_request(format!(
+                "unsupported kv encoding: {}",
+                mutation.encoding
+            )));
+        }
+        if !mutation.deleted && encoding == ENCODING_UTF8 {
+            std::str::from_utf8(&mutation.value).map_err(|error| {
+                PlatformError::bad_request(format!("invalid utf8 value: {error}"))
+            })?;
+        }
+        let size_bytes = worker_name.len()
+            + binding.len()
+            + mutation.key.len()
+            + mutation.value.len()
+            + encoding.len()
+            + 64;
+        Ok(Self {
+            key: KvWriteKey {
+                worker_name: worker_name.to_string(),
+                binding: binding.to_string(),
+                key: mutation.key,
+            },
+            value: mutation.value,
+            encoding,
+            deleted: mutation.deleted,
+            version,
+            enqueued_at: Instant::now(),
+            size_bytes,
+        })
+    }
+}
+
+impl KvWriteScheduler {
+    fn new(database: Arc<Database>, profile: Arc<KvProfile>) -> Self {
+        const SHARD_COUNT: usize = 16;
+        let shards = (0..SHARD_COUNT)
+            .map(|_| {
+                Arc::new(KvWriteShard {
+                    state: Mutex::new(KvWriteShardState::default()),
+                    wake: Condvar::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let inner = Arc::new(KvWriteSchedulerInner {
+            shards,
+            handles: Mutex::new(Vec::new()),
+            max_pending_keys: 4_096,
+            max_pending_bytes: 16 * 1024 * 1024,
+            flush_interval: Duration::from_millis(2),
+            flush_threshold: 128,
+            database,
+            profile,
+        });
+        inner.spawn_flushers();
+        Self { inner }
+    }
+
+    fn enqueue_batch(
+        &self,
+        next_version: impl Fn() -> i64,
+        worker_name: &str,
+        binding: &str,
+        mutations: &[KvBatchMutation],
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut grouped = HashMap::<usize, HashMap<KvWriteKey, KvScheduledMutation>>::new();
+        for mutation in mutations.iter().cloned() {
+            let scheduled = KvScheduledMutation::from_batch_mutation(
+                worker_name,
+                binding,
+                mutation,
+                next_version(),
+            )?;
+            let shard_index = self.inner.shard_index(&scheduled.key);
+            grouped
+                .entry(shard_index)
+                .or_default()
+                .insert(scheduled.key.clone(), scheduled);
+        }
+
+        let mut shard_indexes = grouped.keys().copied().collect::<Vec<_>>();
+        shard_indexes.sort_unstable();
+
+        let mut guards = Vec::with_capacity(shard_indexes.len());
+        for shard_index in &shard_indexes {
+            let guard = self.inner.shards[*shard_index]
+                .state
+                .lock()
+                .expect("kv write shard lock poisoned");
+            guards.push((*shard_index, guard));
+        }
+
+        for (shard_index, state) in &guards {
+            let shard_mutations = grouped
+                .get(shard_index)
+                .expect("grouped mutations should exist for locked shard");
+            let mut pending_keys = state.pending.len();
+            let mut pending_bytes = state.pending_bytes;
+            for mutation in shard_mutations.values() {
+                match state.pending.get(&mutation.key) {
+                    Some(existing) => {
+                        pending_bytes = pending_bytes
+                            .saturating_sub(existing.size_bytes)
+                            .saturating_add(mutation.size_bytes);
+                    }
+                    None => {
+                        pending_keys += 1;
+                        pending_bytes = pending_bytes.saturating_add(mutation.size_bytes);
+                    }
+                }
+            }
+            if pending_keys > self.inner.max_pending_keys
+                || pending_bytes > self.inner.max_pending_bytes
+            {
+                self.inner.profile.record(
+                    KvProfileMetricKind::WriteRejected,
+                    0,
+                    mutations.len() as u64,
+                );
+                return Err(PlatformError::runtime(
+                    "kv write queue overloaded: enqueue rejected",
+                ));
+            }
+        }
+
+        let mut superseded = 0u64;
+        for (shard_index, mut state) in guards {
+            let shard_mutations = grouped
+                .remove(&shard_index)
+                .expect("grouped mutations should exist for locked shard");
+            for mutation in shard_mutations.into_values() {
+                if let Some(existing) = state.pending.insert(mutation.key.clone(), mutation.clone())
+                {
+                    superseded += 1;
+                    state.pending_bytes = state.pending_bytes.saturating_sub(existing.size_bytes);
+                }
+                state.pending_bytes = state.pending_bytes.saturating_add(mutation.size_bytes);
+            }
+        }
+
+        for shard_index in shard_indexes {
+            self.inner.shards[shard_index].wake.notify_one();
+        }
+        self.inner.profile.record(
+            KvProfileMetricKind::WriteEnqueue,
+            started.elapsed().as_micros() as u64,
+            mutations.len() as u64,
+        );
+        if superseded > 0 {
+            self.inner
+                .profile
+                .record(KvProfileMetricKind::WriteSuperseded, 0, superseded);
+        }
+        Ok(())
+    }
+}
+
+impl KvWriteSchedulerInner {
+    fn spawn_flushers(self: &Arc<Self>) {
+        let mut handles = self
+            .handles
+            .lock()
+            .expect("kv write scheduler handles lock poisoned");
+        for shard_index in 0..self.shards.len() {
+            let shard = Arc::clone(&self.shards[shard_index]);
+            let database = Arc::clone(&self.database);
+            let profile = Arc::clone(&self.profile);
+            let flush_interval = self.flush_interval;
+            let flush_threshold = self.flush_threshold;
+            let handle = std::thread::Builder::new()
+                .name(format!("kv-write-shard-{shard_index}"))
+                .spawn(move || {
+                    Self::run_shard_loop(database, profile, flush_interval, flush_threshold, shard)
+                })
+                .expect("kv write shard thread should start");
+            handles.push(handle);
+        }
+    }
+
+    fn shard_index(&self, key: &KvWriteKey) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn run_shard_loop(
+        database: Arc<Database>,
+        profile: Arc<KvProfile>,
+        flush_interval: Duration,
+        flush_threshold: usize,
+        shard: Arc<KvWriteShard>,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("kv write shard runtime should build");
+        loop {
+            let batch = {
+                let mut state = shard.state.lock().expect("kv write shard lock poisoned");
+                while state.pending.is_empty() && !state.shutting_down {
+                    state = shard
+                        .wake
+                        .wait(state)
+                        .expect("kv write shard condvar wait should succeed");
+                }
+                if state.shutting_down && state.pending.is_empty() {
+                    return;
+                }
+                if state.pending.len() < flush_threshold && !state.shutting_down {
+                    let (next_state, _) = shard
+                        .wake
+                        .wait_timeout(state, flush_interval)
+                        .expect("kv write shard timed wait should succeed");
+                    state = next_state;
+                    if state.pending.is_empty() && !state.shutting_down {
+                        continue;
+                    }
+                }
+                let pending = std::mem::take(&mut state.pending);
+                state.pending_bytes = 0;
+                pending.into_values().collect::<Vec<_>>()
+            };
+            if batch.is_empty() {
+                continue;
+            }
+            let oldest = batch
+                .iter()
+                .map(|mutation| mutation.enqueued_at)
+                .min()
+                .unwrap_or_else(Instant::now);
+            profile.record(
+                KvProfileMetricKind::WriteQueueWait,
+                oldest.elapsed().as_micros() as u64,
+                batch.len() as u64,
+            );
+            match runtime.block_on(Self::flush_batch(&database, &profile, &batch)) {
+                Ok(()) => {}
+                Err(_) => {
+                    let mut state = shard.state.lock().expect("kv write shard lock poisoned");
+                    for mutation in batch {
+                        if let Some(existing) =
+                            state.pending.insert(mutation.key.clone(), mutation.clone())
+                        {
+                            state.pending_bytes =
+                                state.pending_bytes.saturating_sub(existing.size_bytes);
+                        }
+                        state.pending_bytes =
+                            state.pending_bytes.saturating_add(mutation.size_bytes);
+                    }
+                    shard.wake.notify_one();
+                    std::thread::sleep(flush_interval);
+                }
+            }
+        }
+    }
+
+    async fn flush_batch(
+        database: &Arc<Database>,
+        profile: &Arc<KvProfile>,
+        batch: &[KvScheduledMutation],
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 8;
+        let started = Instant::now();
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut conn = database.connect().map_err(kv_error)?;
+            configure_connection(&conn).await?;
+            let mut tx = Some(
+                conn.transaction_with_behavior(TransactionBehavior::Immediate)
+                    .await
+                    .map_err(kv_error)?,
+            );
+            let now_ms = epoch_ms_i64()?;
+            let mut should_retry = false;
+            for mutation in batch {
+                let value_text = if !mutation.deleted && mutation.encoding == ENCODING_UTF8 {
+                    std::str::from_utf8(&mutation.value)
+                        .map_err(|error| {
+                            PlatformError::bad_request(format!("invalid utf8 value: {error}"))
+                        })?
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let value_blob = if mutation.deleted || mutation.encoding == ENCODING_UTF8 {
+                    None
+                } else {
+                    Some(mutation.value.clone())
+                };
+                match tx
+                    .as_ref()
+                    .expect("kv write transaction should be present")
+                    .execute(
+                        "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         ON CONFLICT(worker_name, binding, key) DO UPDATE SET
+                           value = excluded.value,
+                           value_blob = excluded.value_blob,
+                           encoding = excluded.encoding,
+                           deleted = excluded.deleted,
+                           version = excluded.version,
+                           updated_at_ms = excluded.updated_at_ms
+                         WHERE excluded.version > worker_kv.version",
+                        (
+                            mutation.key.worker_name.as_str(),
+                            mutation.key.binding.as_str(),
+                            mutation.key.key.as_str(),
+                            value_text.as_str(),
+                            value_blob.as_deref(),
+                            mutation.encoding.as_str(),
+                            if mutation.deleted { 1 } else { 0 },
+                            mutation.version,
+                            now_ms,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.rollback().await;
+                        }
+                        if is_retryable_kv_error(&error) && attempt + 1 < MAX_ATTEMPTS {
+                            profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
+                            tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64))
+                                .await;
+                            should_retry = true;
+                            break;
+                        }
+                        return Err(kv_error(error));
+                    }
+                }
+            }
+            if should_retry {
+                continue;
+            }
+            if let Err(error) = tx
+                .take()
+                .expect("kv write transaction should be present")
+                .commit()
+                .await
+            {
+                if is_retryable_kv_error(&error) && attempt + 1 < MAX_ATTEMPTS {
+                    profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
+                    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
+                    continue;
+                }
+                return Err(kv_error(error));
+            }
+            profile.record(
+                KvProfileMetricKind::WriteFlush,
+                started.elapsed().as_micros() as u64,
+                batch.len() as u64,
+            );
+            return Ok(());
+        }
+        Err(PlatformError::runtime(
+            "kv background flush failed after retries",
+        ))
+    }
+}
+
+impl Drop for KvWriteSchedulerInner {
+    fn drop(&mut self) {
+        for shard in &self.shards {
+            let mut state = shard.state.lock().expect("kv write shard lock poisoned");
+            state.shutting_down = true;
+            shard.wake.notify_all();
+        }
+        self.handles
+            .lock()
+            .expect("kv write scheduler handles lock poisoned")
+            .clear();
     }
 }
 
@@ -245,11 +722,14 @@ impl KvStore {
             .build()
             .await
             .map_err(kv_error)?;
+        let database = Arc::new(database);
+        let profile = Arc::new(KvProfile::default());
         let store = Self {
-            database: Arc::new(database),
+            database: Arc::clone(&database),
             connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
-            profile: Arc::new(KvProfile::default()),
+            profile: Arc::clone(&profile),
+            write_scheduler: KvWriteScheduler::new(database, profile),
         };
         store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;
@@ -270,6 +750,10 @@ impl KvStore {
 
     pub fn reset_profile(&self) {
         self.profile.reset();
+    }
+
+    pub fn write_mode(&self) -> KvWriteMode {
+        KvWriteMode::EnqueueBestEffort
     }
 
     pub async fn get(
@@ -415,7 +899,7 @@ impl KvStore {
         Ok(result)
     }
 
-    pub async fn set(
+    pub async fn put(
         &self,
         worker_name: &str,
         binding: &str,
@@ -453,7 +937,7 @@ impl KvStore {
         ))
     }
 
-    pub async fn set_value(
+    pub async fn put_value(
         &self,
         worker_name: &str,
         binding: &str,
@@ -550,85 +1034,14 @@ impl KvStore {
         ))
     }
 
-    pub async fn apply_batch(
+    pub fn apply_batch(
         &self,
         worker_name: &str,
         binding: &str,
         mutations: &[KvBatchMutation],
     ) -> Result<()> {
-        if mutations.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.connect().await?;
-        const MAX_VERSION_RETRIES: usize = 8;
-        for _ in 0..MAX_VERSION_RETRIES {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .await
-                .map_err(kv_error)?;
-            let mut conflicted = false;
-            for mutation in mutations {
-                let version = self.next_version();
-                let now_ms = epoch_ms_i64()?;
-                let encoding = normalize_encoding(&mutation.encoding);
-                let value_text = if !mutation.deleted && encoding == ENCODING_UTF8 {
-                    std::str::from_utf8(&mutation.value)
-                        .map_err(|error| {
-                            PlatformError::bad_request(format!("invalid utf8 value: {error}"))
-                        })?
-                        .to_string()
-                } else {
-                    String::new()
-                };
-                let value_blob = if mutation.deleted {
-                    None
-                } else if encoding == ENCODING_UTF8 {
-                    None
-                } else {
-                    Some(mutation.value.clone())
-                };
-                let affected = tx
-                    .execute(
-                        "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                         ON CONFLICT(worker_name, binding, key) DO UPDATE SET
-                           value = excluded.value,
-                           value_blob = excluded.value_blob,
-                           encoding = excluded.encoding,
-                           deleted = excluded.deleted,
-                           version = excluded.version,
-                           updated_at_ms = excluded.updated_at_ms
-                         WHERE excluded.version > worker_kv.version",
-                        (
-                            worker_name,
-                            binding,
-                            mutation.key.as_str(),
-                            value_text.as_str(),
-                            value_blob.as_deref(),
-                            encoding.as_str(),
-                            if mutation.deleted { 1 } else { 0 },
-                            version,
-                            now_ms,
-                        ),
-                    )
-                    .await
-                    .map_err(kv_error)?;
-                if affected == 0 {
-                    conflicted = true;
-                    break;
-                }
-            }
-            if conflicted {
-                let _ = tx.rollback().await;
-                self.sync_version_floor_from_conn(&conn).await?;
-                continue;
-            }
-            tx.commit().await.map_err(kv_error)?;
-            return Ok(());
-        }
-        Err(PlatformError::runtime(
-            "kv write batch conflict: failed to resolve version race",
-        ))
+        self.write_scheduler
+            .enqueue_batch(|| self.next_version(), worker_name, binding, mutations)
     }
 
     pub async fn list(
@@ -768,7 +1181,6 @@ impl KvStore {
             }
         }
     }
-
 }
 
 fn normalize_encoding(raw: &str) -> String {
@@ -835,10 +1247,7 @@ where
             Ok(affected) => return Ok(affected),
             Err(error) => {
                 attempt += 1;
-                let message = error.to_string().to_ascii_lowercase();
-                let is_locked = message.contains("database is locked")
-                    || message.contains("database table is locked")
-                    || message.contains("database is busy");
+                let is_locked = is_retryable_kv_error(&error);
                 if is_locked && attempt < MAX_ATTEMPTS {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
@@ -847,6 +1256,15 @@ where
             }
         }
     }
+}
+
+fn is_retryable_kv_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
+        || message.contains("busy")
+        || message.contains("conflict")
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -873,11 +1291,14 @@ mod tests {
             .build()
             .await
             .map_err(kv_error)?;
+        let database = Arc::new(database);
+        let profile = Arc::new(KvProfile::default());
         let store = KvStore {
-            database: Arc::new(database),
+            database: Arc::clone(&database),
             connections: Arc::new(Mutex::new(Vec::new())),
             version: Arc::new(AtomicU64::new(1)),
-            profile: Arc::new(KvProfile::default()),
+            profile: Arc::clone(&profile),
+            write_scheduler: KvWriteScheduler::new(database, profile),
         };
         store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;
@@ -894,7 +1315,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_set_writes_succeed() -> Result<()> {
+    async fn concurrent_put_writes_succeed() -> Result<()> {
         let path = temp_db_path("concurrent-set");
         let store = test_store(&path).await?;
 
@@ -903,13 +1324,13 @@ mod tests {
             let store = store.clone();
             tasks.push(tokio::spawn(async move {
                 store
-                    .set("worker-a", "MY_KV", "hot-key", &format!("value-{idx}"))
+                    .put("worker-a", "MY_KV", "hot-key", &format!("value-{idx}"))
                     .await
             }));
         }
         for task in tasks {
             let result = task.await.expect("task join should succeed");
-            assert!(result.is_ok(), "kv set should succeed under contention");
+            assert!(result.is_ok(), "kv put should succeed under contention");
         }
 
         let value = store.get("worker-a", "MY_KV", "hot-key").await?;
@@ -924,12 +1345,12 @@ mod tests {
     async fn version_counter_is_restored_from_disk() -> Result<()> {
         let path = temp_db_path("version-restore");
         let store = test_store(&path).await?;
-        store.set("worker-a", "MY_KV", "k", "v1").await?;
-        store.set("worker-a", "MY_KV", "k", "v2").await?;
+        store.put("worker-a", "MY_KV", "k", "v1").await?;
+        store.put("worker-a", "MY_KV", "k", "v2").await?;
         drop(store);
 
         let restored = test_store(&path).await?;
-        restored.set("worker-a", "MY_KV", "k", "v3").await?;
+        restored.put("worker-a", "MY_KV", "k", "v3").await?;
         let value = restored.get("worker-a", "MY_KV", "k").await?;
         assert_eq!(value.map(decode_utf8), Some("v3".to_string()));
         Ok(())
@@ -945,12 +1366,12 @@ mod tests {
         for idx in 0..32usize {
             let a = store_a.clone();
             tasks.push(tokio::spawn(async move {
-                a.set("worker-a", "MY_KV", "same-key", &format!("a-{idx}"))
+                a.put("worker-a", "MY_KV", "same-key", &format!("a-{idx}"))
                     .await
             }));
             let b = store_b.clone();
             tasks.push(tokio::spawn(async move {
-                b.set("worker-a", "MY_KV", "same-key", &format!("b-{idx}"))
+                b.put("worker-a", "MY_KV", "same-key", &format!("b-{idx}"))
                     .await
             }));
         }
@@ -969,12 +1390,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_value_roundtrips_structured_payload() -> Result<()> {
+    async fn put_value_roundtrips_structured_payload() -> Result<()> {
         let path = temp_db_path("typed-roundtrip");
         let store = test_store(&path).await?;
         let payload = vec![1u8, 7, 9, 11];
         store
-            .set_value("worker-a", "MY_KV", "typed", &payload, ENCODING_V8SC)
+            .put_value("worker-a", "MY_KV", "typed", &payload, ENCODING_V8SC)
             .await?;
         let value = store
             .get("worker-a", "MY_KV", "typed")
@@ -986,10 +1407,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn utf8_set_uses_text_fast_path_without_blob_duplication() -> Result<()> {
+    async fn utf8_put_uses_text_fast_path_without_blob_duplication() -> Result<()> {
         let path = temp_db_path("utf8-fast-path");
         let store = test_store(&path).await?;
-        store.set("worker-a", "MY_KV", "greeting", "hello").await?;
+        store.put("worker-a", "MY_KV", "greeting", "hello").await?;
 
         let conn = store.connect().await?;
         let mut rows = conn
@@ -1017,7 +1438,7 @@ mod tests {
         let path = temp_db_path("utf8-lookup-wrong-encoding");
         let store = test_store(&path).await?;
         store
-            .set_value("worker-a", "MY_KV", "obj", &[1, 2, 3], ENCODING_V8SC)
+            .put_value("worker-a", "MY_KV", "obj", &[1, 2, 3], ENCODING_V8SC)
             .await?;
 
         let lookup = store.get_utf8("worker-a", "MY_KV", "obj").await?;
@@ -1029,9 +1450,9 @@ mod tests {
     async fn get_utf8_many_preserves_order_and_encoding_state() -> Result<()> {
         let path = temp_db_path("utf8-many");
         let store = test_store(&path).await?;
-        store.set("worker-a", "MY_KV", "a", "one").await?;
+        store.put("worker-a", "MY_KV", "a", "one").await?;
         store
-            .set_value("worker-a", "MY_KV", "b", &[1, 2, 3], ENCODING_V8SC)
+            .put_value("worker-a", "MY_KV", "b", &[1, 2, 3], ENCODING_V8SC)
             .await?;
 
         let values = store

@@ -212,7 +212,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/seed") {
-      await env.MY_KV.set("hot", "ok");
+      await env.MY_KV.put("hot", "ok");
       return new Response("seeded");
     }
     return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
@@ -229,7 +229,22 @@ export default {
 export default {
   async fetch(request, env) {
     const key = request.headers.get("x-bench-request") ?? "0";
-    await env.MY_KV.set("hot:" + key, "ok");
+    await env.MY_KV.put("hot:" + key, "ok");
+    return new Response("ok");
+  },
+};
+"#,
+            path: "/",
+            use_kv_binding: true,
+            seed_path: None,
+        },
+        Scenario {
+            name: "instant-text-kv-write-unawaited",
+            worker_source: r#"
+export default {
+  fetch(request, env) {
+    const key = request.headers.get("x-bench-request") ?? "0";
+    env.MY_KV.put("hot:" + key, "ok");
     return new Response("ok");
   },
 };

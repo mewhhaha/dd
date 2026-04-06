@@ -7039,12 +7039,12 @@ export default {{
     const url = new URL(request.url);
 
     if (url.pathname === "/seed") {{
-      await env.MY_KV.set("hot", "1");
-      await env.MY_KV.set("utf8", "plain");
-      await env.MY_KV.set("obj", {{ ok: true, n: 7 }});
-      await env.MY_KV.set("left", "L");
-      await env.MY_KV.set("right", "R");
-      const bad = await Deno.core.ops.op_kv_set_value(JSON.stringify({{
+      await env.MY_KV.put("hot", "1");
+      await env.MY_KV.put("utf8", "plain");
+      await env.MY_KV.put("obj", {{ ok: true, n: 7 }});
+      await env.MY_KV.put("left", "L");
+      await env.MY_KV.put("right", "R");
+      const bad = await Deno.core.ops.op_kv_put_value(JSON.stringify({{
         worker_name: "{worker_name}",
         binding: "MY_KV",
         key: "broken",
@@ -7108,15 +7108,15 @@ export default {{
 
     if (url.pathname === "/write-batch") {{
       await Promise.all([
-        env.MY_KV.set("hot", "2"),
-        env.MY_KV.set("hot", "3"),
-        env.MY_KV.set("hot", "4"),
+        env.MY_KV.put("hot", "2"),
+        env.MY_KV.put("hot", "3"),
+        env.MY_KV.put("hot", "4"),
       ]);
       return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
     }}
 
     if (url.pathname === "/write-overlay") {{
-      const pending = env.MY_KV.set("hot", "9");
+      const pending = env.MY_KV.put("hot", "9");
       const observed = await env.MY_KV.get("hot");
       await pending;
       return new Response(String(observed ?? "missing"));
@@ -7127,14 +7127,14 @@ export default {{
     }}
 
     if (url.pathname === "/write-fire-and-forget") {{
-      env.MY_KV.set("hot", "7");
+      env.MY_KV.put("hot", "7");
       return new Response("queued");
     }}
 
     if (url.pathname === "/write-wait-until") {{
       ctx.waitUntil((async () => {{
         try {{
-          await env.MY_KV.set("hot", "8");
+          await env.MY_KV.put("hot", "8");
           globalThis.__dd_wait_until_kv_write = "ok";
         }} catch (error) {{
           globalThis.__dd_wait_until_kv_write = "error:" + String(error?.message ?? error);
@@ -7164,6 +7164,95 @@ export default {{
 }};
 "#
         )
+    }
+
+    fn kv_write_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/seed") {
+      await env.MY_KV.put("hot", "1");
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/write-batch") {
+      await Promise.all([
+        env.MY_KV.put("hot", "2"),
+        env.MY_KV.put("hot", "3"),
+        env.MY_KV.put("hot", "4"),
+      ]);
+      return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+    }
+
+    if (url.pathname === "/write-overlay") {
+      const pending = env.MY_KV.put("hot", "9");
+      const observed = await env.MY_KV.get("hot");
+      await pending;
+      return new Response(String(observed ?? "missing"));
+    }
+
+    if (url.pathname === "/read") {
+      return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+    }
+
+    if (url.pathname === "/write-fire-and-forget") {
+      env.MY_KV.put("hot", "7");
+      return new Response("queued");
+    }
+
+    if (url.pathname === "/write-wait-until") {
+      ctx.waitUntil((async () => {
+        try {
+          await env.MY_KV.put("hot", "8");
+          globalThis.__dd_wait_until_kv_write = "ok";
+        } catch (error) {
+          globalThis.__dd_wait_until_kv_write = "error:" + String(error?.message ?? error);
+        }
+      })());
+      return new Response("queued");
+    }
+
+    if (url.pathname === "/write-wait-until-result") {
+      return new Response(String(globalThis.__dd_wait_until_kv_write ?? "unset"));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn kv_wait_until_read_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/seed") {
+      await env.MY_KV.put("hot", "1");
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/read-wait-until") {
+      ctx.waitUntil((async () => {
+        const value = await env.MY_KV.get("hot");
+        globalThis.__dd_wait_until_kv_read = String(value ?? "missing");
+      })());
+      return new Response("queued");
+    }
+
+    if (url.pathname === "/read-wait-until-result") {
+      return new Response(String(globalThis.__dd_wait_until_kv_read ?? "unset"));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
     }
 
     fn reusable_env_worker() -> String {
@@ -7992,7 +8081,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_wait_until_read_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8057,7 +8146,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_write_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8150,8 +8239,7 @@ export default {
             .await
             .expect("seed should succeed");
 
-        let left_request =
-            test_invocation_with_path("/scoped?key=left", "kv-scope-left-request");
+        let left_request = test_invocation_with_path("/scoped?key=left", "kv-scope-left-request");
         let right_request =
             test_invocation_with_path("/scoped?key=right", "kv-scope-right-request");
         let (left, right) = tokio::join!(
@@ -8261,7 +8349,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_write_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8310,7 +8398,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_write_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8359,7 +8447,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_write_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8380,10 +8468,7 @@ export default {
         service
             .invoke(
                 worker_name.clone(),
-                test_invocation_with_path(
-                    "/write-fire-and-forget",
-                    "kv-write-fire-request",
-                ),
+                test_invocation_with_path("/write-fire-and-forget", "kv-write-fire-request"),
             )
             .await
             .expect("fire-and-forget request should succeed");
@@ -8426,7 +8511,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_write_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8447,10 +8532,7 @@ export default {
         service
             .invoke(
                 worker_name.clone(),
-                test_invocation_with_path(
-                    "/write-wait-until",
-                    "kv-write-wait-until-request",
-                ),
+                test_invocation_with_path("/write-wait-until", "kv-write-wait-until-request"),
             )
             .await
             .expect("wait-until request should succeed");
@@ -8506,7 +8588,7 @@ export default {
         service
             .deploy_with_config(
                 worker_name.clone(),
-                kv_batching_worker(&worker_name),
+                kv_wait_until_read_worker(),
                 DeployConfig {
                     bindings: vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
@@ -8527,10 +8609,7 @@ export default {
         service
             .invoke(
                 worker_name.clone(),
-                test_invocation_with_path(
-                    "/read-wait-until",
-                    "kv-read-wait-until-request",
-                ),
+                test_invocation_with_path("/read-wait-until", "kv-read-wait-until-request"),
             )
             .await
             .expect("wait-until read request should succeed");
