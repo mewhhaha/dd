@@ -1434,6 +1434,101 @@ async fn op_kv_delete(
 
 #[deno_core::op2]
 #[serde]
+fn op_kv_enqueue_put(
+    state: &mut OpState,
+    #[string] worker_name: String,
+    #[string] binding: String,
+    #[string] key: String,
+    #[string] value: String,
+) -> KvOpResult {
+    let store = state.borrow::<KvStore>().clone();
+    match store.apply_batch(
+        &worker_name,
+        &binding,
+        &[KvBatchMutation {
+            key,
+            value: value.into_bytes(),
+            encoding: "utf8".to_string(),
+            deleted: false,
+        }],
+    ) {
+        Ok(()) => KvOpResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => KvOpResult {
+            ok: false,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_kv_enqueue_put_value(state: &mut OpState, #[string] payload: String) -> KvOpResult {
+    let payload: KvPutValuePayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return KvOpResult {
+                ok: false,
+                error: format!("invalid kv enqueue payload: {error}"),
+            };
+        }
+    };
+    let store = state.borrow::<KvStore>().clone();
+    match store.apply_batch(
+        &payload.worker_name,
+        &payload.binding,
+        &[KvBatchMutation {
+            key: payload.key,
+            value: payload.value,
+            encoding: payload.encoding,
+            deleted: false,
+        }],
+    ) {
+        Ok(()) => KvOpResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => KvOpResult {
+            ok: false,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_kv_enqueue_delete(
+    state: &mut OpState,
+    #[string] worker_name: String,
+    #[string] binding: String,
+    #[string] key: String,
+) -> KvOpResult {
+    let store = state.borrow::<KvStore>().clone();
+    match store.apply_batch(
+        &worker_name,
+        &binding,
+        &[KvBatchMutation {
+            key,
+            value: Vec::new(),
+            encoding: "utf8".to_string(),
+            deleted: true,
+        }],
+    ) {
+        Ok(()) => KvOpResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => KvOpResult {
+            ok: false,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
 fn op_kv_apply_batch(state: &mut OpState, #[string] payload: String) -> KvOpResult {
     let payload: KvApplyBatchPayload = match crate::json::from_string(payload) {
         Ok(value) => value,
@@ -3702,6 +3797,9 @@ deno_core::extension!(
         op_kv_put,
         op_kv_put_value,
         op_kv_delete,
+        op_kv_enqueue_put,
+        op_kv_enqueue_put_value,
+        op_kv_enqueue_delete,
         op_kv_apply_batch,
         op_kv_list,
         op_cache_match,
