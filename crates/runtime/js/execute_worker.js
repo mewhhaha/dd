@@ -51,6 +51,7 @@ globalThis.__dd_execute_worker = (payload) => {
       missTtlMs,
     });
   })();
+  const actorReadSnapshotFreshTtlMs = 1_000;
   const requestContext = {
     requestId,
     controller,
@@ -1199,6 +1200,7 @@ globalThis.__dd_execute_worker = (payload) => {
         nextVersion: 0,
         freshnessCheckedRequestId: "",
         freshnessCheckedVersion: -1,
+        freshnessCheckedAtMs: 0,
         stale: false,
         pendingMutations: [],
         flushRunning: false,
@@ -1315,6 +1317,7 @@ globalThis.__dd_execute_worker = (payload) => {
       Number(storageState.committedVersion ?? -1) + 1,
     );
     storageState.snapshotVersion = Number(storageState.committedVersion ?? -1);
+    storageState.freshnessCheckedAtMs = performance.now();
     storageState.stale = false;
     if (mode === "full") {
       storageState.hydrated = true;
@@ -1332,6 +1335,7 @@ globalThis.__dd_execute_worker = (payload) => {
     storageState.fullSnapshotLoaded = false;
     storageState.hydrating = null;
     storageState.stale = true;
+    storageState.freshnessCheckedAtMs = 0;
     if (Number.isFinite(Number(knownVersion))) {
       storageState.committedVersion = Math.max(
         Number(storageState.committedVersion ?? -1),
@@ -1477,6 +1481,9 @@ globalThis.__dd_execute_worker = (payload) => {
           throw new Error("memory storage batch flush conflicted");
         }
         storageState.committedVersion = Number(result.max_version ?? storageState.committedVersion);
+        storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+        storageState.freshnessCheckedAtMs = performance.now();
+        storageState.stale = false;
       }
     })()
       .catch(async (error) => failActorEntry(entry, runtimeRequestId, error))
@@ -1547,6 +1554,7 @@ globalThis.__dd_execute_worker = (payload) => {
         );
         storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
         storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+        storageState.freshnessCheckedAtMs = performance.now();
         recordActorProfile("js_hydrate_full", performance.now() - started, result.entries?.length ?? 1);
         storageState.hydrating = null;
         return storageState;
@@ -1593,6 +1601,7 @@ globalThis.__dd_execute_worker = (payload) => {
     );
     storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
     storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+    storageState.freshnessCheckedAtMs = performance.now();
     recordActorProfile("js_hydrate_keys", performance.now() - started, pendingKeys.length);
     return storageState;
   };
@@ -1622,11 +1631,21 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     const requestId = String(runtimeRequestId ?? "");
     const committedVersion = Number(storageState.committedVersion ?? -1);
+    const now = performance.now();
     if (
       storageState.freshnessCheckedRequestId === requestId
       && Number(storageState.freshnessCheckedVersion ?? -1) === committedVersion
     ) {
       recordActorProfile("actor_cache_hit", 0, 1);
+      return storageState;
+    }
+    if (
+      storageState.stale !== true
+      && Number(storageState.freshnessCheckedVersion ?? -1) === committedVersion
+      && now - Number(storageState.freshnessCheckedAtMs ?? 0) <= actorReadSnapshotFreshTtlMs
+    ) {
+      recordActorProfile("actor_cache_hit", 0, 1);
+      storageState.freshnessCheckedRequestId = requestId;
       return storageState;
     }
     const started = performance.now();
@@ -1651,6 +1670,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     storageState.freshnessCheckedRequestId = requestId;
     storageState.freshnessCheckedVersion = knownVersion;
+    storageState.freshnessCheckedAtMs = performance.now();
     recordActorProfile("js_freshness_check", performance.now() - started, 1);
     return storageState;
   };
@@ -1705,6 +1725,7 @@ globalThis.__dd_execute_worker = (payload) => {
     storageState.snapshotVersion = committedVersion;
     storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
     storageState.freshnessCheckedVersion = committedVersion;
+    storageState.freshnessCheckedAtMs = performance.now();
     storageState.stale = false;
     txn.committed = true;
     txn.committedVersion = committedVersion;
