@@ -1256,6 +1256,12 @@ globalThis.__dd_execute_worker = (payload) => {
     && txn.accepted !== true
     && txn.sideEffects !== true;
 
+  const actorTxnShouldHydrateFullyOnMiss = (txn, storageState) => !!txn
+    && actorTxnIsReadOnly(txn)
+    && !storageState.fullSnapshotLoaded
+    && storageState.loadedKeys.size === 0
+    && storageState.mirror.size === 0;
+
   class MemoryHydrationNeeded extends Error {
     constructor(mode, keys = []) {
       super(mode === "full" ? "memory hydration requires full snapshot" : "memory hydration requires keys");
@@ -1789,6 +1795,9 @@ globalThis.__dd_execute_worker = (payload) => {
         const normalizedKey = String(key);
         if (txn && !storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(normalizedKey)) {
           recordActorProfile("actor_cache_miss", 0, 1);
+          if (actorTxnShouldHydrateFullyOnMiss(txn, storageState)) {
+            throw new MemoryHydrationNeeded("full");
+          }
           throw new MemoryHydrationNeeded("keys", [normalizedKey]);
         }
         const record = txn
