@@ -106,7 +106,12 @@ async fn main() -> Result<(), String> {
     let requests = env_usize("DD_BENCH_REQUESTS", 4_000);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 128);
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 16);
+    let autoscaling_isolates = env_usize("DD_BENCH_AUTOSCALING_ISOLATES", 8);
+    let prewarmed_isolates = env_usize("DD_BENCH_PREWARMED_ISOLATES", autoscaling_isolates);
     let v8_flags = env_v8_flags();
+    let autoscaling_name =
+        Box::leak(format!("autoscaling-{autoscaling_isolates}").into_boxed_str());
+    let prewarmed_name = Box::leak(format!("prewarmed-{prewarmed_isolates}").into_boxed_str());
 
     let mut configs = vec![
         BenchConfig {
@@ -122,10 +127,10 @@ async fn main() -> Result<(), String> {
             },
         },
         BenchConfig {
-            name: "autoscaling-8",
+            name: autoscaling_name,
             runtime: RuntimeConfig {
                 min_isolates: 0,
-                max_isolates: 8,
+                max_isolates: autoscaling_isolates,
                 max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
@@ -134,10 +139,10 @@ async fn main() -> Result<(), String> {
             },
         },
         BenchConfig {
-            name: "prewarmed-8",
+            name: prewarmed_name,
             runtime: RuntimeConfig {
-                min_isolates: 8,
-                max_isolates: 8,
+                min_isolates: prewarmed_isolates,
+                max_isolates: prewarmed_isolates,
                 max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),

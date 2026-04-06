@@ -188,9 +188,12 @@ async fn main() -> Result<(), String> {
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 32);
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 4);
     let single_max_inflight = env_usize("DD_BENCH_SINGLE_MAX_INFLIGHT", 1);
+    let autoscaling_isolates = env_usize("DD_BENCH_AUTOSCALING_ISOLATES", 8);
     let write_requests = env_usize("DD_BENCH_WRITE_REQUESTS", requests.min(5_000));
     let write_concurrency = env_usize("DD_BENCH_WRITE_CONCURRENCY", concurrency.min(256));
     let profile_enabled = env_bool("DD_BENCH_PROFILE_KV", false);
+    let autoscaling_name =
+        Box::leak(format!("autoscaling-{autoscaling_isolates}").into_boxed_str());
 
     let configs = [
         BenchConfig {
@@ -207,10 +210,10 @@ async fn main() -> Result<(), String> {
             },
         },
         BenchConfig {
-            name: "autoscaling-8",
+            name: autoscaling_name,
             runtime: RuntimeConfig {
                 min_isolates: 0,
-                max_isolates: 8,
+                max_isolates: autoscaling_isolates,
                 max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
