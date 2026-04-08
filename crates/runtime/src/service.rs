@@ -7815,6 +7815,72 @@ export default {
         .to_string()
     }
 
+    fn actor_multi_key_storage_worker() -> String {
+        r#"
+export function seedCount(state) {
+  state.set("count", "1");
+  return true;
+}
+
+export function readCount(state) {
+  return Number(state.get("count") ?? "0");
+}
+
+export function incrementCount(state) {
+  const next = Number(state.get("count") ?? "0") + 1;
+  state.set("count", String(next));
+  return next;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const keys = Math.max(1, Number(url.searchParams.get("keys") ?? "1") || 1);
+    const key = String(url.searchParams.get("key") ?? "bench-0");
+
+    if (url.pathname === "/seed-all") {
+      for (let i = 0; i < keys; i++) {
+        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(`bench-${i}`));
+        await actor.atomic(seedCount);
+      }
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/direct-sum") {
+      let total = 0;
+      for (let i = 0; i < keys; i++) {
+        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(`bench-${i}`));
+        total += Number(await actor.read("count") ?? "0");
+      }
+      return new Response(String(total));
+    }
+
+    if (url.pathname === "/stm-sum") {
+      let total = 0;
+      for (let i = 0; i < keys; i++) {
+        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(`bench-${i}`));
+        total += Number(await actor.atomic(readCount));
+      }
+      return new Response(String(total));
+    }
+
+    if (url.pathname === "/inc") {
+      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
+      return new Response(String(await actor.atomic(incrementCount)));
+    }
+
+    if (url.pathname === "/get") {
+      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
+      return new Response(String(await actor.atomic(readCount)));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
     fn hosted_actor_worker() -> String {
         r#"
 globalThis.__hosted_shared_global = globalThis.__hosted_shared_global ?? 0;
@@ -11581,6 +11647,216 @@ export default {
         .expect("sum invoke should succeed");
         assert_eq!(output.status, 200);
         assert_eq!(String::from_utf8(output.body).expect("utf8"), "1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_multikey_direct_reads_complete_after_warmup() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 4,
+            max_isolates: 4,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-multi-key".to_string(),
+                actor_multi_key_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor-multi-key".to_string(),
+                test_invocation_with_path("/seed-all?keys=8", "multi-key-direct-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let warmed = service
+            .invoke(
+                "actor-multi-key".to_string(),
+                test_invocation_with_path("/direct-sum?keys=8", "multi-key-direct-warm"),
+            )
+            .await
+            .expect("warm direct sum should succeed");
+        assert_eq!(String::from_utf8(warmed.body).expect("utf8"), "8");
+
+        let mut tasks = Vec::new();
+        for idx in 0..4 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(2),
+                    service.invoke(
+                        "actor-multi-key".to_string(),
+                        test_invocation_with_path(
+                            "/direct-sum?keys=8",
+                            &format!("multi-key-direct-{idx}"),
+                        ),
+                    ),
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            let output = task
+                .await
+                .expect("join")
+                .expect("direct sum should not hang")
+                .expect("direct sum invoke should succeed");
+            assert_eq!(output.status, 200);
+            assert_eq!(String::from_utf8(output.body).expect("utf8"), "8");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_multikey_stm_reads_complete_after_warmup() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 4,
+            max_isolates: 4,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-multi-key".to_string(),
+                actor_multi_key_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor-multi-key".to_string(),
+                test_invocation_with_path("/seed-all?keys=8", "multi-key-stm-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        let warmed = service
+            .invoke(
+                "actor-multi-key".to_string(),
+                test_invocation_with_path("/stm-sum?keys=8", "multi-key-stm-warm"),
+            )
+            .await
+            .expect("warm stm sum should succeed");
+        assert_eq!(String::from_utf8(warmed.body).expect("utf8"), "8");
+
+        let mut tasks = Vec::new();
+        for idx in 0..4 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                timeout(
+                    Duration::from_secs(2),
+                    service.invoke(
+                        "actor-multi-key".to_string(),
+                        test_invocation_with_path(
+                            "/stm-sum?keys=8",
+                            &format!("multi-key-stm-{idx}"),
+                        ),
+                    ),
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            let output = task
+                .await
+                .expect("join")
+                .expect("stm sum should not hang")
+                .expect("stm sum invoke should succeed");
+            assert_eq!(output.status, 200);
+            assert_eq!(String::from_utf8(output.body).expect("utf8"), "8");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_stm_benchmark_worker_returns_correct_total() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 2,
+            max_isolates: 2,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-multi-key".to_string(),
+                actor_multi_key_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor-multi-key".to_string(),
+                test_invocation_with_path("/seed-all?keys=1", "multi-key-write-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        for idx in 0..8 {
+            let output = timeout(
+                Duration::from_secs(2),
+                service.invoke(
+                    "actor-multi-key".to_string(),
+                    test_invocation_with_path("/inc?key=bench-0", &format!("multi-key-inc-{idx}")),
+                ),
+            )
+            .await
+            .expect("increment should not hang")
+            .expect("increment invoke should succeed");
+            assert_eq!(output.status, 200);
+        }
+
+        let total = service
+            .invoke(
+                "actor-multi-key".to_string(),
+                test_invocation_with_path("/get?key=bench-0", "multi-key-write-total"),
+            )
+            .await
+            .expect("total should succeed");
+        assert_eq!(total.status, 200);
+        assert_eq!(String::from_utf8(total.body).expect("utf8"), "9");
     }
 
     #[tokio::test]

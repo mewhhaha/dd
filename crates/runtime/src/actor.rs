@@ -1862,11 +1862,13 @@ impl ActorStore {
             )
             .await
             .map_err(actor_error)?;
-        if let Some(row) = rows.next().await.map_err(actor_error)? {
-            let version = row.get::<Option<i64>>(0).map_err(actor_error)?;
-            return Ok(version);
-        }
-        Ok(None)
+        let version = if let Some(row) = rows.next().await.map_err(actor_error)? {
+            row.get::<Option<i64>>(0).map_err(actor_error)?
+        } else {
+            return Ok(None);
+        };
+        let _ = rows.next().await.map_err(actor_error)?;
+        Ok(version)
     }
 
     async fn version_for_key(
@@ -1884,12 +1886,14 @@ impl ActorStore {
             )
             .await
             .map_err(actor_error)?;
-        if let Some(row) = rows.next().await.map_err(actor_error)? {
-            let version = row.get::<i64>(0).map_err(actor_error)?;
-            self.observe_version(version);
-            return Ok(Some(version));
-        }
-        Ok(None)
+        let version = if let Some(row) = rows.next().await.map_err(actor_error)? {
+            row.get::<i64>(0).map_err(actor_error)?
+        } else {
+            return Ok(None);
+        };
+        let _ = rows.next().await.map_err(actor_error)?;
+        self.observe_version(version);
+        Ok(Some(version))
     }
 
     async fn record_for_key(
@@ -1916,6 +1920,7 @@ impl ActorStore {
         let legacy_value: String = row.get::<String>(2).map_err(actor_error)?;
         let version: i64 = row.get::<i64>(3).map_err(actor_error)?;
         let deleted: i64 = row.get::<i64>(4).map_err(actor_error)?;
+        let _ = rows.next().await.map_err(actor_error)?;
         Ok(Some(ActorSnapshotEntry {
             key: item_key.to_string(),
             value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
@@ -1934,6 +1939,7 @@ impl ActorStore {
             return Ok(0);
         };
         let count = row.get::<i64>(0).map_err(actor_error)?;
+        let _ = rows.next().await.map_err(actor_error)?;
         Ok(count.max(0) as usize)
     }
 
@@ -2562,11 +2568,13 @@ async fn read_single_i64(conn: &Connection, sql: &str) -> Result<i64> {
     let Some(row) = rows.next().await.map_err(actor_error)? else {
         return Ok(0);
     };
-    Ok(row
+    let value = row
         .get::<Option<i64>>(0)
         .map_err(actor_error)?
         .unwrap_or(0)
-        .max(0))
+        .max(0);
+    let _ = rows.next().await.map_err(actor_error)?;
+    Ok(value)
 }
 
 async fn configure_connection(conn: &Connection) -> Result<()> {
@@ -2589,6 +2597,7 @@ async fn ensure_mvcc_mode(conn: &Connection) -> Result<()> {
         ));
     };
     let mode = row.get::<String>(0).map_err(actor_error)?;
+    let _ = rows.next().await.map_err(actor_error)?;
     if !mode.eq_ignore_ascii_case("mvcc") {
         return Err(PlatformError::runtime(format!(
             "actor store error: expected mvcc journal mode, got {mode}",
@@ -3063,6 +3072,113 @@ mod tests {
             .expect("utf8"),
             "2"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_transactional_writes_complete_past_repeated_commit_threshold() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let store = ActorStore::new(
+                temp_root("transactional-write-threshold"),
+                16,
+                4,
+                Duration::from_secs(60),
+            )
+            .await?;
+
+            let mut observed_version = -1;
+            for idx in 0..64 {
+                let next_value = (idx + 1).to_string();
+                let reads = if observed_version < 0 {
+                    Vec::new()
+                } else {
+                    vec![ActorReadDependency {
+                        key: "count".to_string(),
+                        version: observed_version,
+                    }]
+                };
+                let result = store
+                    .apply_batch(
+                        "ns",
+                        "actor-a",
+                        &reads,
+                        &[utf8_mutation("count", &next_value, idx as i64 + 1)],
+                        Some(-1),
+                        None,
+                        true,
+                    )
+                    .await?;
+                assert!(!result.conflict, "unexpected conflict at iteration {idx}");
+                observed_version = result.max_version;
+            }
+
+            let final_value = store.point_read("ns", "actor-a", "count").await?;
+            assert_eq!(
+                String::from_utf8(
+                    final_value
+                        .record
+                        .expect("count should be present after repeated transactional writes")
+                        .value
+                )
+                .expect("utf8"),
+                "64"
+            );
+            Ok::<(), PlatformError>(())
+        })
+        .await
+        .map_err(|_| {
+            PlatformError::runtime(
+                "transactional write threshold test timed out before completing 64 commits",
+            )
+        })??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_blind_writes_complete_past_repeated_commit_threshold() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let store = ActorStore::new(
+                temp_root("blind-write-threshold"),
+                16,
+                4,
+                Duration::from_secs(60),
+            )
+            .await?;
+
+            for idx in 0..64 {
+                let next_value = (idx + 1).to_string();
+                let result = store
+                    .apply_blind_batch(
+                        "ns",
+                        "actor-a",
+                        &[utf8_mutation("count", &next_value, idx as i64 + 1)],
+                    )
+                    .await?;
+                assert!(
+                    !result.conflict,
+                    "unexpected blind-write conflict at iteration {idx}"
+                );
+            }
+
+            let final_value = store.point_read("ns", "actor-a", "count").await?;
+            assert_eq!(
+                String::from_utf8(
+                    final_value
+                        .record
+                        .expect("count should be present after repeated blind writes")
+                        .value
+                )
+                .expect("utf8"),
+                "64"
+            );
+            Ok::<(), PlatformError>(())
+        })
+        .await
+        .map_err(|_| {
+            PlatformError::runtime(
+                "blind write threshold test timed out before completing 64 commits",
+            )
+        })??;
         Ok(())
     }
 
