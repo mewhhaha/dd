@@ -1,11 +1,12 @@
 use common::{PlatformError, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use turso::{Builder, Connection, Database, Value};
 
 struct ActorDatabaseEntry {
@@ -13,13 +14,84 @@ struct ActorDatabaseEntry {
     last_used_at: Instant,
 }
 
+struct ActorSharedSnapshotEntry {
+    records: Arc<HashMap<String, ActorSnapshotEntry>>,
+    loaded_keys: Arc<HashSet<String>>,
+    complete: bool,
+    max_version: i64,
+    last_used_at: Instant,
+}
+
+#[derive(Default)]
+struct ActorWriteShardState {
+    pending_namespaces: HashSet<String>,
+    token_waiters: HashMap<u64, Vec<u64>>,
+}
+
+struct ActorWriteShard {
+    state: Mutex<ActorWriteShardState>,
+    notify: Notify,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorDirectMutation {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub encoding: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ActorQueuedMutationKey {
+    actor_key: String,
+    item_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActorPendingMutationEntry {
+    actor_key: String,
+    mutation: ActorDirectMutation,
+    token: u64,
+    queue_ids: Vec<i64>,
+    completion_tokens: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct ActorWriteSubmission {
+    remaining_parts: usize,
+    max_version: i64,
+    result: Option<Result<i64>>,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug, Clone)]
+struct ActorDirectQueueRow {
+    queue_id: i64,
+    actor_key: String,
+    item_key: String,
+    value: Vec<u8>,
+    encoding: String,
+    deleted: bool,
+    token: u64,
+}
+
 #[derive(Clone)]
 pub struct ActorStore {
     root_dir: Arc<PathBuf>,
     databases: Arc<Mutex<HashMap<String, ActorDatabaseEntry>>>,
     actor_versions: Arc<Mutex<HashMap<String, i64>>>,
+    shared_snapshots: Arc<Mutex<HashMap<String, ActorSharedSnapshotEntry>>>,
+    write_shards: Arc<Vec<Arc<ActorWriteShard>>>,
+    write_submissions: Arc<Mutex<HashMap<u64, ActorWriteSubmission>>>,
     db_cache_max_open: usize,
     db_idle_ttl: Duration,
+    namespace_shards: usize,
+    snapshot_cache_max_entries: usize,
+    write_flush_delay: Duration,
+    write_flush_batch_size: usize,
+    write_max_pending_keys: usize,
+    next_write_submission_id: Arc<AtomicU64>,
+    next_write_token: Arc<AtomicU64>,
     version: Arc<AtomicU64>,
     profile: Arc<ActorProfile>,
 }
@@ -30,15 +102,27 @@ pub enum ActorProfileMetricKind {
     JsFreshnessCheck,
     JsHydrateFull,
     JsHydrateKeys,
+    JsTxnCommit,
+    JsTxnBlindCommit,
+    JsTxnValidate,
     JsCacheHit,
     JsCacheMiss,
     JsCacheStale,
+    OpRead,
     OpSnapshot,
     OpVersionIfNewer,
     OpValidateReads,
+    OpApplyBatch,
+    OpApplyBlindBatch,
+    StoreRead,
     StoreSnapshot,
     StoreSnapshotKeys,
     StoreVersionIfNewer,
+    StoreApplyBatch,
+    StoreApplyBatchValidate,
+    StoreApplyBatchWrite,
+    StoreApplyBlindBatch,
+    StoreApplyBlindBatchWrite,
 }
 
 #[derive(Default)]
@@ -64,15 +148,27 @@ pub struct ActorProfileSnapshot {
     pub js_freshness_check: ActorProfileMetricSnapshot,
     pub js_hydrate_full: ActorProfileMetricSnapshot,
     pub js_hydrate_keys: ActorProfileMetricSnapshot,
+    pub js_txn_commit: ActorProfileMetricSnapshot,
+    pub js_txn_blind_commit: ActorProfileMetricSnapshot,
+    pub js_txn_validate: ActorProfileMetricSnapshot,
     pub js_cache_hit: ActorProfileMetricSnapshot,
     pub js_cache_miss: ActorProfileMetricSnapshot,
     pub js_cache_stale: ActorProfileMetricSnapshot,
+    pub op_read: ActorProfileMetricSnapshot,
     pub op_snapshot: ActorProfileMetricSnapshot,
     pub op_version_if_newer: ActorProfileMetricSnapshot,
     pub op_validate_reads: ActorProfileMetricSnapshot,
+    pub op_apply_batch: ActorProfileMetricSnapshot,
+    pub op_apply_blind_batch: ActorProfileMetricSnapshot,
+    pub store_read: ActorProfileMetricSnapshot,
     pub store_snapshot: ActorProfileMetricSnapshot,
     pub store_snapshot_keys: ActorProfileMetricSnapshot,
     pub store_version_if_newer: ActorProfileMetricSnapshot,
+    pub store_apply_batch: ActorProfileMetricSnapshot,
+    pub store_apply_batch_validate: ActorProfileMetricSnapshot,
+    pub store_apply_batch_write: ActorProfileMetricSnapshot,
+    pub store_apply_blind_batch: ActorProfileMetricSnapshot,
+    pub store_apply_blind_batch_write: ActorProfileMetricSnapshot,
 }
 
 #[derive(Default)]
@@ -82,15 +178,27 @@ pub struct ActorProfile {
     js_freshness_check: ActorProfileMetric,
     js_hydrate_full: ActorProfileMetric,
     js_hydrate_keys: ActorProfileMetric,
+    js_txn_commit: ActorProfileMetric,
+    js_txn_blind_commit: ActorProfileMetric,
+    js_txn_validate: ActorProfileMetric,
     js_cache_hit: ActorProfileMetric,
     js_cache_miss: ActorProfileMetric,
     js_cache_stale: ActorProfileMetric,
+    op_read: ActorProfileMetric,
     op_snapshot: ActorProfileMetric,
     op_version_if_newer: ActorProfileMetric,
     op_validate_reads: ActorProfileMetric,
+    op_apply_batch: ActorProfileMetric,
+    op_apply_blind_batch: ActorProfileMetric,
+    store_read: ActorProfileMetric,
     store_snapshot: ActorProfileMetric,
     store_snapshot_keys: ActorProfileMetric,
     store_version_if_newer: ActorProfileMetric,
+    store_apply_batch: ActorProfileMetric,
+    store_apply_batch_validate: ActorProfileMetric,
+    store_apply_batch_write: ActorProfileMetric,
+    store_apply_blind_batch: ActorProfileMetric,
+    store_apply_blind_batch_write: ActorProfileMetric,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +213,12 @@ pub struct ActorSnapshotEntry {
 #[derive(Debug, Clone)]
 pub struct ActorSnapshot {
     pub entries: Vec<ActorSnapshotEntry>,
+    pub max_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActorPointRead {
+    pub record: Option<ActorSnapshotEntry>,
     pub max_version: i64,
 }
 
@@ -132,10 +246,16 @@ pub struct ActorBatchApplyResult {
 impl ActorStore {
     pub async fn new(
         root_dir: PathBuf,
+        namespace_shards: usize,
         db_cache_max_open: usize,
         db_idle_ttl: Duration,
     ) -> Result<Self> {
         std::fs::create_dir_all(&root_dir).map_err(actor_error)?;
+        if namespace_shards == 0 {
+            return Err(PlatformError::internal(
+                "actor_namespace_shards must be greater than 0",
+            ));
+        }
         if db_cache_max_open == 0 {
             return Err(PlatformError::internal(
                 "actor_db_cache_max_open must be greater than 0",
@@ -146,15 +266,43 @@ impl ActorStore {
                 "actor_db_idle_ttl must be greater than 0",
             ));
         }
-        Ok(Self {
+        let bootstrapped_version = detect_actor_version_floor(&root_dir).await?;
+        let write_shards = Arc::new(
+            (0..namespace_shards)
+                .map(|_| {
+                    Arc::new(ActorWriteShard {
+                        state: Mutex::new(ActorWriteShardState::default()),
+                        notify: Notify::new(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        let store = Self {
             root_dir: Arc::new(root_dir),
             databases: Arc::new(Mutex::new(HashMap::new())),
             actor_versions: Arc::new(Mutex::new(HashMap::new())),
+            shared_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            write_shards,
+            write_submissions: Arc::new(Mutex::new(HashMap::new())),
             db_cache_max_open,
             db_idle_ttl,
-            version: Arc::new(AtomicU64::new(1)),
+            namespace_shards,
+            snapshot_cache_max_entries: db_cache_max_open.max(64),
+            write_flush_delay: Duration::from_millis(2),
+            write_flush_batch_size: 128,
+            write_max_pending_keys: 8_192,
+            next_write_submission_id: Arc::new(AtomicU64::new(1)),
+            next_write_token: Arc::new(AtomicU64::new(bootstrapped_version.max(1))),
+            version: Arc::new(AtomicU64::new(bootstrapped_version.max(1))),
             profile: Arc::new(ActorProfile::default()),
-        })
+        };
+        for shard_index in 0..namespace_shards {
+            let store_clone = store.clone();
+            tokio::spawn(async move {
+                store_clone.run_write_shard(shard_index).await;
+            });
+        }
+        Ok(store)
     }
 
     pub fn set_profile_enabled(&self, enabled: bool) {
@@ -175,6 +323,17 @@ impl ActorStore {
 
     pub async fn snapshot(&self, namespace: &str, actor_key: &str) -> Result<ActorSnapshot> {
         let started = Instant::now();
+        if let Some(snapshot) = self.cached_full_snapshot(namespace, actor_key).await {
+            self.observe_version(snapshot.max_version);
+            self.observe_actor_version(namespace, actor_key, snapshot.max_version)
+                .await;
+            self.record_profile(
+                ActorProfileMetricKind::StoreSnapshot,
+                started.elapsed().as_micros() as u64,
+                snapshot.entries.len() as u64,
+            );
+            return Ok(snapshot);
+        }
         let conn = self.connect(namespace, actor_key).await?;
         let mut rows = conn
             .query(
@@ -208,13 +367,68 @@ impl ActorStore {
         self.observe_version(max_version);
         self.observe_actor_version(namespace, actor_key, max_version)
             .await;
+        let snapshot = ActorSnapshot {
+            entries,
+            max_version,
+        };
+        self.put_full_snapshot(namespace, actor_key, &snapshot)
+            .await;
         self.record_profile(
             ActorProfileMetricKind::StoreSnapshot,
             started.elapsed().as_micros() as u64,
-            entries.len() as u64,
+            snapshot.entries.len() as u64,
         );
-        Ok(ActorSnapshot {
-            entries,
+        Ok(snapshot)
+    }
+
+    pub async fn point_read(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        item_key: &str,
+    ) -> Result<ActorPointRead> {
+        let started = Instant::now();
+        let item_key = item_key.trim();
+        if item_key.is_empty() {
+            return Err(PlatformError::runtime("actor item key must not be empty"));
+        }
+        if let Some(point) = self.cached_point_read(namespace, actor_key, item_key).await {
+            self.observe_version(point.max_version);
+            self.observe_actor_version(namespace, actor_key, point.max_version)
+                .await;
+            self.record_profile(
+                ActorProfileMetricKind::StoreRead,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
+            return Ok(point);
+        }
+
+        let conn = self.connect(namespace, actor_key).await?;
+        let record = self.record_for_key(&conn, actor_key, item_key).await?;
+        let max_version = self
+            .max_version_for_actor(&conn, actor_key)
+            .await?
+            .unwrap_or(-1);
+        self.observe_version(max_version);
+        self.observe_actor_version(namespace, actor_key, max_version)
+            .await;
+        self.put_partial_snapshot(
+            namespace,
+            actor_key,
+            max_version,
+            record.clone().into_iter().collect::<Vec<_>>(),
+            std::iter::once(item_key.to_string()),
+            false,
+        )
+        .await;
+        self.record_profile(
+            ActorProfileMetricKind::StoreRead,
+            started.elapsed().as_micros() as u64,
+            1,
+        );
+        Ok(ActorPointRead {
+            record,
             max_version,
         })
     }
@@ -229,13 +443,13 @@ impl ActorStore {
             return self.snapshot(namespace, actor_key).await;
         }
         let started = Instant::now();
-        let conn = self.connect(namespace, actor_key).await?;
         let filtered_keys = keys
             .iter()
-            .map(|key| key.trim())
+            .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty())
             .collect::<Vec<_>>();
         if filtered_keys.is_empty() {
+            let conn = self.connect(namespace, actor_key).await?;
             let max_version = self
                 .max_version_for_actor(&conn, actor_key)
                 .await?
@@ -246,6 +460,18 @@ impl ActorStore {
                 max_version,
             });
         }
+        if let Some(snapshot) = self
+            .cached_keys_snapshot(namespace, actor_key, &filtered_keys)
+            .await
+        {
+            self.record_profile(
+                ActorProfileMetricKind::StoreSnapshotKeys,
+                started.elapsed().as_micros() as u64,
+                filtered_keys.len() as u64,
+            );
+            return Ok(snapshot);
+        }
+        let conn = self.connect(namespace, actor_key).await?;
         let placeholders = (0..filtered_keys.len())
             .map(|index| format!("?{}", index + 2))
             .collect::<Vec<_>>()
@@ -287,6 +513,15 @@ impl ActorStore {
         self.observe_version(max_version);
         self.observe_actor_version(namespace, actor_key, max_version)
             .await;
+        self.put_partial_snapshot(
+            namespace,
+            actor_key,
+            max_version,
+            entries.clone(),
+            filtered_keys.iter().cloned(),
+            false,
+        )
+        .await;
         self.record_profile(
             ActorProfileMetricKind::StoreSnapshotKeys,
             started.elapsed().as_micros() as u64,
@@ -414,6 +649,157 @@ impl ActorStore {
         Ok((current > known_version).then_some(current))
     }
 
+    pub async fn enqueue_direct_batch(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        mutations: &[ActorDirectMutation],
+    ) -> Result<u64> {
+        let namespace = namespace.trim();
+        if namespace.is_empty() {
+            return Err(PlatformError::runtime("actor namespace must not be empty"));
+        }
+        let actor_key = actor_key.trim();
+        if actor_key.is_empty() {
+            return Err(PlatformError::runtime("actor key must not be empty"));
+        }
+        let coalesced = coalesce_direct_mutations(mutations)?;
+        let submission_id = self.next_write_submission_id.fetch_add(1, Ordering::SeqCst);
+        let notify = Arc::new(Notify::new());
+        if coalesced.is_empty() {
+            self.write_submissions.lock().await.insert(
+                submission_id,
+                ActorWriteSubmission {
+                    remaining_parts: 0,
+                    max_version: self
+                        .actor_versions
+                        .lock()
+                        .await
+                        .get(&Self::actor_version_key(namespace, actor_key))
+                        .copied()
+                        .unwrap_or(-1),
+                    result: Some(Ok(-1)),
+                    notify,
+                },
+            );
+            return Ok(submission_id);
+        }
+
+        let shard_index = self.shard_index(actor_key);
+        let shard = self.write_shards[shard_index].clone();
+        let queued = coalesced
+            .into_iter()
+            .map(|mutation| {
+                (
+                    self.next_write_token.fetch_add(1, Ordering::SeqCst),
+                    mutation,
+                )
+            })
+            .collect::<Vec<_>>();
+        let conn = self.connect_shard(namespace, shard_index).await?;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match conn.execute("BEGIN IMMEDIATE", ()).await {
+                Ok(_) => {}
+                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(actor_error(error)),
+            }
+            let outcome = async {
+                let queued_rows = self.direct_queue_len(&conn).await?;
+                if queued_rows.saturating_add(queued.len()) > self.write_max_pending_keys {
+                    return Err(PlatformError::runtime(
+                        "actor direct write queue overloaded",
+                    ));
+                }
+                for (token, mutation) in &queued {
+                    let now_ms = epoch_ms_i64()?;
+                    conn.execute(
+                        "INSERT INTO actor_direct_queue (entity_key, item_key, value_blob, encoding, deleted, token, enqueued_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        (
+                            actor_key,
+                            mutation.key.as_str(),
+                            mutation.value.as_slice(),
+                            mutation.encoding.as_str(),
+                            if mutation.deleted { 1 } else { 0 },
+                            *token as i64,
+                            now_ms,
+                        ),
+                    )
+                    .await
+                    .map_err(actor_error)?;
+                }
+                Ok::<(), PlatformError>(())
+            }
+            .await;
+            match outcome {
+                Ok(()) => match conn.execute("COMMIT", ()).await {
+                    Ok(_) => break,
+                    Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(actor_error(error));
+                    }
+                },
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+        }
+        self.write_submissions.lock().await.insert(
+            submission_id,
+            ActorWriteSubmission {
+                remaining_parts: queued.len(),
+                max_version: -1,
+                result: None,
+                notify,
+            },
+        );
+        {
+            let mut state = shard.state.lock().await;
+            state.pending_namespaces.insert(namespace.to_string());
+            for (token, _) in &queued {
+                state
+                    .token_waiters
+                    .entry(*token)
+                    .or_default()
+                    .push(submission_id);
+            }
+        }
+        shard.notify.notify_one();
+        Ok(submission_id)
+    }
+
+    pub async fn wait_direct_submission(&self, submission_id: u64) -> Result<i64> {
+        loop {
+            let notify = {
+                let mut submissions = self.write_submissions.lock().await;
+                let Some(entry) = submissions.get(&submission_id) else {
+                    return Err(PlatformError::runtime(format!(
+                        "unknown actor write submission {submission_id}"
+                    )));
+                };
+                if let Some(result) = &entry.result {
+                    let result = result.clone();
+                    submissions.remove(&submission_id);
+                    return result;
+                }
+                entry.notify.clone()
+            };
+            notify.notified().await;
+        }
+    }
+
     pub async fn apply_batch(
         &self,
         namespace: &str,
@@ -424,6 +810,7 @@ impl ActorStore {
         list_gate_version: Option<i64>,
         transactional: bool,
     ) -> Result<ActorBatchApplyResult> {
+        let started = Instant::now();
         let conn = self.connect(namespace, actor_key).await?;
         if mutations.is_empty() && reads.is_empty() && list_gate_version.is_none() {
             let max_version = self
@@ -431,6 +818,11 @@ impl ActorStore {
                 .await?
                 .unwrap_or(-1);
             self.observe_version(max_version);
+            self.record_profile(
+                ActorProfileMetricKind::StoreApplyBatch,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
             return Ok(ActorBatchApplyResult {
                 conflict: false,
                 max_version,
@@ -484,10 +876,16 @@ impl ActorStore {
             }
 
             let outcome = async {
+                let validate_started = Instant::now();
                 let current = self.max_version_for_actor(&conn, actor_key).await?.unwrap_or(-1);
                 if let Some(expected_list_version) = list_gate_version {
                     if current != expected_list_version {
                         self.observe_actor_version(namespace, actor_key, current).await;
+                        self.record_profile(
+                            ActorProfileMetricKind::StoreApplyBatchValidate,
+                            validate_started.elapsed().as_micros() as u64,
+                            reads.len() as u64 + 1,
+                        );
                         return Ok(ActorBatchApplyResult {
                             conflict: true,
                             max_version: current,
@@ -498,6 +896,11 @@ impl ActorStore {
                     if let Some(expected) = expected_base_version {
                         if current != expected {
                             self.observe_actor_version(namespace, actor_key, current).await;
+                            self.record_profile(
+                                ActorProfileMetricKind::StoreApplyBatchValidate,
+                                validate_started.elapsed().as_micros() as u64,
+                                reads.len() as u64 + 1,
+                            );
                             return Ok(ActorBatchApplyResult {
                                 conflict: true,
                                 max_version: current,
@@ -513,13 +916,24 @@ impl ActorStore {
                     if observed != dependency.version {
                         self.observe_actor_version(namespace, actor_key, current.max(observed))
                             .await;
+                        self.record_profile(
+                            ActorProfileMetricKind::StoreApplyBatchValidate,
+                            validate_started.elapsed().as_micros() as u64,
+                            reads.len() as u64 + 1,
+                        );
                         return Ok(ActorBatchApplyResult {
                             conflict: true,
                             max_version: current.max(observed),
                         });
                     }
                 }
+                self.record_profile(
+                    ActorProfileMetricKind::StoreApplyBatchValidate,
+                    validate_started.elapsed().as_micros() as u64,
+                    reads.len() as u64 + 1,
+                );
 
+                let write_started = Instant::now();
                 let commit_version = if transactional && !mutations.is_empty() {
                     Some(self.reserve_version_after(current))
                 } else {
@@ -609,7 +1023,13 @@ impl ActorStore {
                     .await
                     .map_err(actor_error)?;
                 }
-                self.observe_actor_version(namespace, actor_key, max_version).await;
+                self.update_cached_snapshot_after_commit(namespace, actor_key, max_version, mutations)
+                    .await;
+                self.record_profile(
+                    ActorProfileMetricKind::StoreApplyBatchWrite,
+                    write_started.elapsed().as_micros() as u64,
+                    mutations.len() as u64 + 1,
+                );
                 Ok(ActorBatchApplyResult {
                     conflict: false,
                     max_version,
@@ -639,6 +1059,13 @@ impl ActorStore {
                         }
                     }
                     self.observe_version(result.max_version);
+                    self.observe_actor_version(namespace, actor_key, result.max_version)
+                        .await;
+                    self.record_profile(
+                        ActorProfileMetricKind::StoreApplyBatch,
+                        started.elapsed().as_micros() as u64,
+                        mutations.len() as u64 + reads.len() as u64 + 1,
+                    );
                     return Ok(result);
                 }
                 Err(error) => {
@@ -647,6 +1074,701 @@ impl ActorStore {
                 }
             }
         }
+    }
+
+    pub async fn apply_blind_batch(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        mutations: &[ActorBatchMutation],
+    ) -> Result<ActorBatchApplyResult> {
+        let started = Instant::now();
+        let conn = self.connect(namespace, actor_key).await?;
+        if mutations.is_empty() {
+            let max_version = self
+                .max_version_for_actor(&conn, actor_key)
+                .await?
+                .unwrap_or(-1);
+            self.observe_version(max_version);
+            self.record_profile(
+                ActorProfileMetricKind::StoreApplyBlindBatch,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
+            return Ok(ActorBatchApplyResult {
+                conflict: false,
+                max_version,
+            });
+        }
+
+        for mutation in mutations {
+            if mutation.key.trim().is_empty() {
+                return Err(PlatformError::bad_request(
+                    "actor batch mutation key must not be empty",
+                ));
+            }
+            if !mutation.deleted
+                && mutation.encoding != ENCODING_UTF8
+                && mutation.encoding != ENCODING_V8SC
+            {
+                return Err(PlatformError::bad_request(format!(
+                    "unsupported actor storage encoding: {}",
+                    mutation.encoding
+                )));
+            }
+        }
+
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match conn.execute("BEGIN CONCURRENT", ()).await {
+                Ok(_) => {}
+                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(actor_error(error)),
+            }
+
+            let outcome = async {
+                let current = self.max_version_for_actor(&conn, actor_key).await?.unwrap_or(-1);
+                let write_started = Instant::now();
+                let commit_version = self.reserve_version_after(current);
+                for mutation in mutations {
+                    let now_ms = epoch_ms_i64()?;
+                    if mutation.deleted {
+                        let empty_blob: &[u8] = &[];
+                        conn.execute(
+                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                             VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
+                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                               value = excluded.value,
+                               value_blob = excluded.value_blob,
+                               encoding = excluded.encoding,
+                               deleted = 1,
+                               version = excluded.version,
+                               updated_at_ms = excluded.updated_at_ms",
+                            (
+                                actor_key,
+                                mutation.key.as_str(),
+                                empty_blob,
+                                ENCODING_UTF8,
+                                commit_version,
+                                now_ms,
+                            ),
+                        )
+                        .await
+                        .map_err(actor_error)?;
+                    } else {
+                        let value_text = if mutation.encoding == ENCODING_UTF8 {
+                            std::str::from_utf8(&mutation.value)
+                                .map_err(|error| {
+                                    PlatformError::bad_request(format!(
+                                        "invalid utf8 value: {error}"
+                                    ))
+                                })?
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                        conn.execute(
+                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                               value = excluded.value,
+                               value_blob = excluded.value_blob,
+                               encoding = excluded.encoding,
+                               deleted = 0,
+                               version = excluded.version,
+                               updated_at_ms = excluded.updated_at_ms",
+                            (
+                                actor_key,
+                                mutation.key.as_str(),
+                                value_text.as_str(),
+                                mutation.value.as_slice(),
+                                mutation.encoding.as_str(),
+                                commit_version,
+                                now_ms,
+                            ),
+                        )
+                        .await
+                        .map_err(actor_error)?;
+                    }
+                }
+                let now_ms = epoch_ms_i64()?;
+                conn.execute(
+                    "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(entity_key) DO UPDATE SET
+                       max_version = excluded.max_version,
+                       updated_at_ms = excluded.updated_at_ms",
+                    (actor_key, commit_version, now_ms),
+                )
+                .await
+                .map_err(actor_error)?;
+
+                let committed_mutations = mutations
+                    .iter()
+                    .map(|mutation| ActorBatchMutation {
+                        key: mutation.key.clone(),
+                        value: mutation.value.clone(),
+                        encoding: mutation.encoding.clone(),
+                        version: commit_version,
+                        deleted: mutation.deleted,
+                    })
+                    .collect::<Vec<_>>();
+                self.update_cached_snapshot_after_commit(
+                    namespace,
+                    actor_key,
+                    commit_version,
+                    &committed_mutations,
+                )
+                .await;
+                self.record_profile(
+                    ActorProfileMetricKind::StoreApplyBlindBatchWrite,
+                    write_started.elapsed().as_micros() as u64,
+                    mutations.len() as u64 + 1,
+                );
+                Ok::<ActorBatchApplyResult, PlatformError>(ActorBatchApplyResult {
+                    conflict: false,
+                    max_version: commit_version,
+                })
+            }
+            .await;
+
+            match outcome {
+                Ok(result) => {
+                    match conn.execute("COMMIT", ()).await {
+                        Ok(_) => {}
+                        Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                            let _ = conn.execute("ROLLBACK", ()).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                5 * attempt as u64,
+                            ))
+                            .await;
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = conn.execute("ROLLBACK", ()).await;
+                            return Err(actor_error(error));
+                        }
+                    }
+                    self.observe_version(result.max_version);
+                    self.observe_actor_version(namespace, actor_key, result.max_version)
+                        .await;
+                    self.record_profile(
+                        ActorProfileMetricKind::StoreApplyBlindBatch,
+                        started.elapsed().as_micros() as u64,
+                        mutations.len() as u64 + 1,
+                    );
+                    return Ok(result);
+                }
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn run_write_shard(&self, shard_index: usize) {
+        let shard = self.write_shards[shard_index].clone();
+        if let Ok(namespaces) = self.discover_namespaces_for_shard(shard_index).await {
+            let mut state = shard.state.lock().await;
+            state.pending_namespaces.extend(namespaces);
+        }
+        shard.notify.notify_one();
+        loop {
+            shard.notify.notified().await;
+            tokio::time::sleep(self.write_flush_delay).await;
+            loop {
+                let namespaces = {
+                    let mut state = shard.state.lock().await;
+                    if state.pending_namespaces.is_empty() {
+                        if let Ok(namespaces) =
+                            self.discover_namespaces_for_shard(shard_index).await
+                        {
+                            state.pending_namespaces.extend(namespaces);
+                        }
+                    }
+                    state.pending_namespaces.iter().cloned().collect::<Vec<_>>()
+                };
+                if namespaces.is_empty() {
+                    break;
+                }
+                let mut did_work = false;
+                for namespace in namespaces {
+                    let batch = match self
+                        .load_direct_queue_batch(
+                            &namespace,
+                            shard_index,
+                            self.write_flush_batch_size,
+                        )
+                        .await
+                    {
+                        Ok(batch) => batch,
+                        Err(_) => {
+                            let mut state = shard.state.lock().await;
+                            state.pending_namespaces.remove(&namespace);
+                            continue;
+                        }
+                    };
+                    if batch.is_empty() {
+                        let mut state = shard.state.lock().await;
+                        state.pending_namespaces.remove(&namespace);
+                        continue;
+                    }
+                    did_work = true;
+                    if let Err(error) = self
+                        .flush_namespace_direct_group(&namespace, shard_index, batch.clone(), true)
+                        .await
+                    {
+                        let message = error.to_string();
+                        self.fail_pending_batch(shard_index, &batch, &message).await;
+                    }
+                }
+                if !did_work {
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn flush_namespace_direct_group(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+        entries: Vec<ActorPendingMutationEntry>,
+        allow_split: bool,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut actor_groups = HashMap::<String, Vec<ActorPendingMutationEntry>>::new();
+        for entry in entries {
+            actor_groups
+                .entry(entry.actor_key.clone())
+                .or_default()
+                .push(entry);
+        }
+        let conn = self.connect_shard(namespace, shard_index).await?;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match conn.execute("BEGIN CONCURRENT", ()).await {
+                Ok(_) => {}
+                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(actor_error(error)),
+            }
+
+            let outcome = async {
+                for (actor_key, entries) in &actor_groups {
+                    let mut actor_max_version = -1i64;
+                    for entry in entries {
+                        let version = entry.token as i64;
+                        actor_max_version = actor_max_version.max(version);
+                        let now_ms = epoch_ms_i64()?;
+                        if entry.mutation.deleted {
+                            let empty_blob: &[u8] = &[];
+                            conn.execute(
+                                "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                                 VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
+                                 ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                                   value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
+                                   value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
+                                   encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
+                                   deleted = CASE WHEN excluded.version > actor_state.version THEN 1 ELSE actor_state.deleted END,
+                                   version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
+                                   updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                                (
+                                    actor_key.as_str(),
+                                    entry.mutation.key.as_str(),
+                                    empty_blob,
+                                    ENCODING_UTF8,
+                                    version,
+                                    now_ms,
+                                ),
+                            )
+                            .await
+                            .map_err(actor_error)?;
+                        } else {
+                            let value_text = if entry.mutation.encoding == ENCODING_UTF8 {
+                                std::str::from_utf8(&entry.mutation.value)
+                                    .map_err(|error| {
+                                        PlatformError::bad_request(format!(
+                                            "invalid utf8 value: {error}"
+                                        ))
+                                    })?
+                                    .to_string()
+                            } else {
+                                String::new()
+                            };
+                            conn.execute(
+                                "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+                                 ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                                   value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
+                                   value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
+                                   encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
+                                   deleted = CASE WHEN excluded.version > actor_state.version THEN 0 ELSE actor_state.deleted END,
+                                   version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
+                                   updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                                (
+                                    actor_key.as_str(),
+                                    entry.mutation.key.as_str(),
+                                    value_text.as_str(),
+                                    entry.mutation.value.as_slice(),
+                                    entry.mutation.encoding.as_str(),
+                                    version,
+                                    now_ms,
+                                ),
+                            )
+                            .await
+                            .map_err(actor_error)?;
+                        }
+                    }
+                    let now_ms = epoch_ms_i64()?;
+                    conn.execute(
+                        "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(entity_key) DO UPDATE SET
+                           max_version = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.max_version ELSE actor_meta.max_version END,
+                           updated_at_ms = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.updated_at_ms ELSE actor_meta.updated_at_ms END",
+                        (actor_key.as_str(), actor_max_version, now_ms),
+                    )
+                    .await
+                    .map_err(actor_error)?;
+                }
+                for queue_id in actor_groups
+                    .values()
+                    .flat_map(|entries| entries.iter())
+                    .flat_map(|entry| entry.queue_ids.iter().copied())
+                {
+                    conn.execute(
+                        "DELETE FROM actor_direct_queue WHERE queue_id = ?1",
+                        (queue_id,),
+                    )
+                    .await
+                    .map_err(actor_error)?;
+                }
+                Ok::<(), PlatformError>(())
+            }
+            .await;
+
+            match outcome {
+                Ok(()) => match conn.execute("COMMIT", ()).await {
+                    Ok(_) => {
+                        for (actor_key, entries) in actor_groups {
+                            let version = entries
+                                .iter()
+                                .map(|entry| entry.token as i64)
+                                .max()
+                                .unwrap_or(-1);
+                            self.observe_version(version);
+                            self.observe_actor_version(namespace, &actor_key, version)
+                                .await;
+                            let mutations = entries
+                                .iter()
+                                .map(|entry| ActorBatchMutation {
+                                    key: entry.mutation.key.clone(),
+                                    value: entry.mutation.value.clone(),
+                                    encoding: entry.mutation.encoding.clone(),
+                                    version: entry.token as i64,
+                                    deleted: entry.mutation.deleted,
+                                })
+                                .collect::<Vec<_>>();
+                            self.update_cached_snapshot_after_commit(
+                                namespace, &actor_key, version, &mutations,
+                            )
+                            .await;
+                            self.complete_waiters_for_tokens(
+                                shard_index,
+                                entries
+                                    .into_iter()
+                                    .flat_map(|entry| entry.completion_tokens.into_iter())
+                                    .collect::<Vec<_>>(),
+                                version,
+                            )
+                            .await;
+                        }
+                        return Ok(());
+                    }
+                    Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        if allow_split && actor_groups.len() > 1 && attempt >= 3 {
+                            for (actor_key, entries) in actor_groups {
+                                self.flush_single_actor_direct_group(
+                                    namespace,
+                                    shard_index,
+                                    actor_key,
+                                    entries,
+                                )
+                                .await?;
+                            }
+                            return Ok(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(actor_error(error));
+                    }
+                },
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn flush_single_actor_direct_group(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+        actor_key: String,
+        entries: Vec<ActorPendingMutationEntry>,
+    ) -> Result<()> {
+        let conn = self.connect_shard(namespace, shard_index).await?;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match conn.execute("BEGIN CONCURRENT", ()).await {
+                Ok(_) => {}
+                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(actor_error(error)),
+            }
+            let outcome = async {
+                let mut actor_max_version = -1i64;
+                for entry in &entries {
+                    let version = entry.token as i64;
+                    actor_max_version = actor_max_version.max(version);
+                    let now_ms = epoch_ms_i64()?;
+                    if entry.mutation.deleted {
+                        let empty_blob: &[u8] = &[];
+                        conn.execute(
+                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                             VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
+                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                               value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
+                               value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
+                               encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
+                               deleted = CASE WHEN excluded.version > actor_state.version THEN 1 ELSE actor_state.deleted END,
+                               version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
+                               updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                            (
+                                actor_key.as_str(),
+                                entry.mutation.key.as_str(),
+                                empty_blob,
+                                ENCODING_UTF8,
+                                version,
+                                now_ms,
+                            ),
+                        )
+                        .await
+                        .map_err(actor_error)?;
+                    } else {
+                        let value_text = if entry.mutation.encoding == ENCODING_UTF8 {
+                            std::str::from_utf8(&entry.mutation.value)
+                                .map_err(|error| {
+                                    PlatformError::bad_request(format!(
+                                        "invalid utf8 value: {error}"
+                                    ))
+                                })?
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+                        conn.execute(
+                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                               value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
+                               value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
+                               encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
+                               deleted = CASE WHEN excluded.version > actor_state.version THEN 0 ELSE actor_state.deleted END,
+                               version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
+                               updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                            (
+                                actor_key.as_str(),
+                                entry.mutation.key.as_str(),
+                                value_text.as_str(),
+                                entry.mutation.value.as_slice(),
+                                entry.mutation.encoding.as_str(),
+                                version,
+                                now_ms,
+                            ),
+                        )
+                        .await
+                        .map_err(actor_error)?;
+                    }
+                }
+                let now_ms = epoch_ms_i64()?;
+                conn.execute(
+                    "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(entity_key) DO UPDATE SET
+                       max_version = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.max_version ELSE actor_meta.max_version END,
+                       updated_at_ms = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.updated_at_ms ELSE actor_meta.updated_at_ms END",
+                    (actor_key.as_str(), actor_max_version, now_ms),
+                )
+                .await
+                .map_err(actor_error)?;
+                for queue_id in entries.iter().flat_map(|entry| entry.queue_ids.iter().copied()) {
+                    conn.execute(
+                        "DELETE FROM actor_direct_queue WHERE queue_id = ?1",
+                        (queue_id,),
+                    )
+                    .await
+                    .map_err(actor_error)?;
+                }
+                Ok::<(), PlatformError>(())
+            }
+            .await;
+
+            match outcome {
+                Ok(()) => match conn.execute("COMMIT", ()).await {
+                    Ok(_) => {
+                        let version = entries
+                            .iter()
+                            .map(|entry| entry.token as i64)
+                            .max()
+                            .unwrap_or(-1);
+                        self.observe_version(version);
+                        self.observe_actor_version(namespace, &actor_key, version)
+                            .await;
+                        let mutations = entries
+                            .iter()
+                            .map(|entry| ActorBatchMutation {
+                                key: entry.mutation.key.clone(),
+                                value: entry.mutation.value.clone(),
+                                encoding: entry.mutation.encoding.clone(),
+                                version: entry.token as i64,
+                                deleted: entry.mutation.deleted,
+                            })
+                            .collect::<Vec<_>>();
+                        self.update_cached_snapshot_after_commit(
+                            namespace, &actor_key, version, &mutations,
+                        )
+                        .await;
+                        self.complete_waiters_for_tokens(
+                            shard_index,
+                            entries
+                                .into_iter()
+                                .flat_map(|entry| entry.completion_tokens.into_iter())
+                                .collect::<Vec<_>>(),
+                            version,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = conn.execute("ROLLBACK", ()).await;
+                        return Err(actor_error(error));
+                    }
+                },
+                Err(error) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn fail_pending_batch(
+        &self,
+        shard_index: usize,
+        batch: &[ActorPendingMutationEntry],
+        error: &str,
+    ) {
+        let tokens = batch
+            .iter()
+            .flat_map(|entry| entry.completion_tokens.iter().copied())
+            .collect::<Vec<_>>();
+        self.fail_waiters_for_tokens(shard_index, &tokens, error)
+            .await;
+    }
+
+    async fn fail_submission_ids(&self, submission_ids: &[u64], error: &str) {
+        let error = PlatformError::runtime(error.to_string());
+        let mut submissions = self.write_submissions.lock().await;
+        for submission_id in submission_ids {
+            if let Some(entry) = submissions.get_mut(submission_id) {
+                if entry.result.is_none() {
+                    entry.result = Some(Err(error.clone()));
+                    entry.notify.notify_waiters();
+                }
+            }
+        }
+    }
+
+    async fn complete_waiters(&self, waiters: Vec<u64>, version: i64) {
+        let mut submissions = self.write_submissions.lock().await;
+        for submission_id in waiters {
+            let Some(entry) = submissions.get_mut(&submission_id) else {
+                continue;
+            };
+            if entry.result.is_some() {
+                continue;
+            }
+            entry.max_version = entry.max_version.max(version);
+            if entry.remaining_parts > 0 {
+                entry.remaining_parts -= 1;
+            }
+            if entry.remaining_parts == 0 {
+                entry.result = Some(Ok(entry.max_version));
+                entry.notify.notify_waiters();
+            }
+        }
+    }
+
+    async fn complete_waiters_for_tokens(
+        &self,
+        shard_index: usize,
+        tokens: Vec<u64>,
+        version: i64,
+    ) {
+        let waiters = {
+            let shard = self.write_shards[shard_index].clone();
+            let mut state = shard.state.lock().await;
+            let mut waiters = Vec::new();
+            for token in tokens {
+                if let Some(token_waiters) = state.token_waiters.remove(&token) {
+                    waiters.extend(token_waiters);
+                }
+            }
+            waiters
+        };
+        self.complete_waiters(waiters, version).await;
+    }
+
+    async fn fail_waiters_for_tokens(&self, shard_index: usize, tokens: &[u64], error: &str) {
+        let waiters = {
+            let shard = self.write_shards[shard_index].clone();
+            let mut state = shard.state.lock().await;
+            let mut waiters = Vec::new();
+            for token in tokens {
+                if let Some(token_waiters) = state.token_waiters.remove(token) {
+                    waiters.extend(token_waiters);
+                }
+            }
+            waiters
+        };
+        self.fail_submission_ids(&waiters, error).await;
     }
 
     fn reserve_version_after(&self, floor: i64) -> i64 {
@@ -676,7 +1798,12 @@ impl ActorStore {
             return Err(PlatformError::runtime("actor key must not be empty"));
         }
 
-        let db_key = Self::database_key(namespace);
+        self.connect_shard(namespace, self.shard_index(actor_key))
+            .await
+    }
+
+    async fn connect_shard(&self, namespace: &str, shard_index: usize) -> Result<Connection> {
+        let db_key = self.database_key(namespace, shard_index);
         let now = Instant::now();
         let existing = {
             let mut databases = self.databases.lock().await;
@@ -692,7 +1819,7 @@ impl ActorStore {
             return Ok(conn);
         }
 
-        let path = self.db_path(namespace);
+        let path = self.db_path(namespace, shard_index);
         ensure_parent_dir(&path)?;
         let path_str = path.to_string_lossy().to_string();
         let database = Builder::new_local(&path_str)
@@ -765,17 +1892,137 @@ impl ActorStore {
         Ok(None)
     }
 
-    fn database_key(namespace: &str) -> String {
-        namespace.to_string()
+    async fn record_for_key(
+        &self,
+        conn: &Connection,
+        actor_key: &str,
+        item_key: &str,
+    ) -> Result<Option<ActorSnapshotEntry>> {
+        let mut rows = conn
+            .query(
+                "SELECT value_blob, encoding, value, version, deleted
+                 FROM actor_state
+                 WHERE entity_key = ?1 AND item_key = ?2
+                 LIMIT 1",
+                (actor_key, item_key),
+            )
+            .await
+            .map_err(actor_error)?;
+        let Some(row) = rows.next().await.map_err(actor_error)? else {
+            return Ok(None);
+        };
+        let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(actor_error)?;
+        let encoding: String = row.get::<String>(1).map_err(actor_error)?;
+        let legacy_value: String = row.get::<String>(2).map_err(actor_error)?;
+        let version: i64 = row.get::<i64>(3).map_err(actor_error)?;
+        let deleted: i64 = row.get::<i64>(4).map_err(actor_error)?;
+        Ok(Some(ActorSnapshotEntry {
+            key: item_key.to_string(),
+            value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
+            encoding: normalize_encoding(&encoding),
+            version,
+            deleted: deleted != 0,
+        }))
+    }
+
+    async fn direct_queue_len(&self, conn: &Connection) -> Result<usize> {
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM actor_direct_queue", ())
+            .await
+            .map_err(actor_error)?;
+        let Some(row) = rows.next().await.map_err(actor_error)? else {
+            return Ok(0);
+        };
+        let count = row.get::<i64>(0).map_err(actor_error)?;
+        Ok(count.max(0) as usize)
+    }
+
+    async fn load_direct_queue_batch(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+        limit: usize,
+    ) -> Result<Vec<ActorPendingMutationEntry>> {
+        let conn = self.connect_shard(namespace, shard_index).await?;
+        let mut rows = conn
+            .query(
+                "SELECT queue_id, entity_key, item_key, value_blob, encoding, deleted, token
+                 FROM actor_direct_queue
+                 ORDER BY queue_id ASC
+                 LIMIT ?1",
+                (limit as i64,),
+            )
+            .await
+            .map_err(actor_error)?;
+        let mut loaded = Vec::new();
+        while let Some(row) = rows.next().await.map_err(actor_error)? {
+            loaded.push(ActorDirectQueueRow {
+                queue_id: row.get::<i64>(0).map_err(actor_error)?,
+                actor_key: row.get::<String>(1).map_err(actor_error)?,
+                item_key: row.get::<String>(2).map_err(actor_error)?,
+                value: row.get::<Vec<u8>>(3).map_err(actor_error)?,
+                encoding: row.get::<String>(4).map_err(actor_error)?,
+                deleted: row.get::<i64>(5).map_err(actor_error)? != 0,
+                token: row.get::<i64>(6).map_err(actor_error)? as u64,
+            });
+        }
+        Ok(coalesce_direct_queue_rows(loaded))
+    }
+
+    async fn discover_namespaces_for_shard(&self, shard_index: usize) -> Result<Vec<String>> {
+        let mut namespaces = Vec::new();
+        let entries = match std::fs::read_dir(self.root_dir.as_ref()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(namespaces),
+            Err(error) => return Err(actor_error(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(actor_error)?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let shard_path = path.join(format!("shard-{shard_index:04}.db"));
+            if !shard_path.exists() {
+                continue;
+            }
+            let raw = entry.file_name();
+            let Some(namespace) = hex_decode_to_utf8(raw.to_string_lossy().as_ref()) else {
+                continue;
+            };
+            namespaces.push(namespace);
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        Ok(namespaces)
+    }
+
+    fn database_key(&self, namespace: &str, shard_index: usize) -> String {
+        format!("{namespace}\u{1f}{shard_index}")
     }
 
     fn actor_version_key(namespace: &str, actor_key: &str) -> String {
         format!("{namespace}\u{1f}{actor_key}")
     }
 
-    fn db_path(&self, namespace: &str) -> PathBuf {
+    fn actor_snapshot_key(namespace: &str, actor_key: &str) -> String {
+        format!("{namespace}\u{1f}{actor_key}")
+    }
+
+    fn db_path(&self, namespace: &str, shard_index: usize) -> PathBuf {
         let encoded_namespace = hex_encode(namespace.as_bytes());
-        self.root_dir.join(format!("{encoded_namespace}.db"))
+        self.root_dir
+            .join(encoded_namespace)
+            .join(format!("shard-{shard_index:04}.db"))
+    }
+
+    fn shard_index(&self, actor_key: &str) -> usize {
+        if self.namespace_shards == 1 {
+            return 0;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        actor_key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.namespace_shards
     }
 
     fn observe_version(&self, version: i64) {
@@ -805,6 +2052,205 @@ impl ActorStore {
             .insert(Self::actor_version_key(namespace, actor_key), version);
     }
 
+    async fn cached_full_snapshot(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+    ) -> Option<ActorSnapshot> {
+        let entry = self.cached_snapshot_entry(namespace, actor_key).await?;
+        if !entry.complete {
+            return None;
+        }
+        Some(ActorSnapshot {
+            entries: snapshot_entries_from_records(entry.records.as_ref()),
+            max_version: entry.max_version,
+        })
+    }
+
+    async fn cached_point_read(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        item_key: &str,
+    ) -> Option<ActorPointRead> {
+        let entry = self.cached_snapshot_entry(namespace, actor_key).await?;
+        if !entry.complete && !entry.loaded_keys.contains(item_key) {
+            return None;
+        }
+        Some(ActorPointRead {
+            record: entry.records.get(item_key).cloned(),
+            max_version: entry.max_version,
+        })
+    }
+
+    async fn cached_keys_snapshot(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        keys: &[String],
+    ) -> Option<ActorSnapshot> {
+        let entry = self.cached_snapshot_entry(namespace, actor_key).await?;
+        if !entry.complete
+            && keys
+                .iter()
+                .any(|key| !entry.loaded_keys.contains(key.as_str()))
+        {
+            return None;
+        }
+        let mut entries = keys
+            .iter()
+            .filter_map(|key| entry.records.get(key).cloned())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        Some(ActorSnapshot {
+            entries,
+            max_version: entry.max_version,
+        })
+    }
+
+    async fn cached_snapshot_entry(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+    ) -> Option<ActorSharedSnapshotEntry> {
+        let key = Self::actor_snapshot_key(namespace, actor_key);
+        let current_version = self
+            .actor_versions
+            .lock()
+            .await
+            .get(&Self::actor_version_key(namespace, actor_key))
+            .copied();
+        let now = Instant::now();
+        let mut snapshots = self.shared_snapshots.lock().await;
+        self.prune_snapshots_locked(&mut snapshots, now);
+        let entry = snapshots.get_mut(&key)?;
+        if current_version.is_some_and(|current| current > entry.max_version) {
+            snapshots.remove(&key);
+            return None;
+        }
+        entry.last_used_at = now;
+        Some(ActorSharedSnapshotEntry {
+            records: entry.records.clone(),
+            loaded_keys: entry.loaded_keys.clone(),
+            complete: entry.complete,
+            max_version: entry.max_version,
+            last_used_at: entry.last_used_at,
+        })
+    }
+
+    async fn put_full_snapshot(&self, namespace: &str, actor_key: &str, snapshot: &ActorSnapshot) {
+        self.put_partial_snapshot(
+            namespace,
+            actor_key,
+            snapshot.max_version,
+            snapshot.entries.clone(),
+            snapshot.entries.iter().map(|entry| entry.key.clone()),
+            true,
+        )
+        .await;
+    }
+
+    async fn put_partial_snapshot<I>(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        max_version: i64,
+        entries: Vec<ActorSnapshotEntry>,
+        loaded_keys: I,
+        complete: bool,
+    ) where
+        I: IntoIterator<Item = String>,
+    {
+        let key = Self::actor_snapshot_key(namespace, actor_key);
+        let now = Instant::now();
+        let mut snapshots = self.shared_snapshots.lock().await;
+        self.prune_snapshots_locked(&mut snapshots, now);
+        let entry = snapshots
+            .entry(key)
+            .or_insert_with(|| ActorSharedSnapshotEntry {
+                records: Arc::new(HashMap::new()),
+                loaded_keys: Arc::new(HashSet::new()),
+                complete: false,
+                max_version,
+                last_used_at: now,
+            });
+
+        if entry.max_version > max_version {
+            entry.last_used_at = now;
+            return;
+        }
+
+        let mut next_records = if complete || entry.max_version < max_version {
+            HashMap::new()
+        } else {
+            entry.records.as_ref().clone()
+        };
+        let mut next_loaded_keys = if complete || entry.max_version < max_version {
+            HashSet::new()
+        } else {
+            entry.loaded_keys.as_ref().clone()
+        };
+
+        for loaded_key in loaded_keys {
+            let normalized_key = loaded_key.trim();
+            if !normalized_key.is_empty() {
+                next_loaded_keys.insert(normalized_key.to_string());
+            }
+        }
+        for snapshot_entry in entries {
+            let normalized_key = snapshot_entry.key.trim();
+            if normalized_key.is_empty() {
+                continue;
+            }
+            next_loaded_keys.insert(normalized_key.to_string());
+            next_records.insert(normalized_key.to_string(), snapshot_entry);
+        }
+
+        entry.records = Arc::new(next_records);
+        entry.loaded_keys = Arc::new(next_loaded_keys);
+        entry.complete = complete;
+        entry.max_version = max_version;
+        entry.last_used_at = now;
+        self.prune_snapshots_locked(&mut snapshots, now);
+    }
+
+    async fn update_cached_snapshot_after_commit(
+        &self,
+        namespace: &str,
+        actor_key: &str,
+        max_version: i64,
+        mutations: &[ActorBatchMutation],
+    ) {
+        let key = Self::actor_snapshot_key(namespace, actor_key);
+        let now = Instant::now();
+        let mut snapshots = self.shared_snapshots.lock().await;
+        self.prune_snapshots_locked(&mut snapshots, now);
+        let Some(entry) = snapshots.get_mut(&key) else {
+            return;
+        };
+        let mut next_records = entry.records.as_ref().clone();
+        let mut next_loaded_keys = entry.loaded_keys.as_ref().clone();
+        for mutation in mutations {
+            let normalized_key = mutation.key.trim();
+            if normalized_key.is_empty() {
+                continue;
+            }
+            let record = ActorSnapshotEntry {
+                key: normalized_key.to_string(),
+                value: mutation.value.clone(),
+                encoding: mutation.encoding.clone(),
+                version: mutation.version,
+                deleted: mutation.deleted,
+            };
+            next_loaded_keys.insert(normalized_key.to_string());
+            next_records.insert(normalized_key.to_string(), record);
+        }
+        entry.records = Arc::new(next_records);
+        entry.loaded_keys = Arc::new(next_loaded_keys);
+        entry.max_version = max_version;
+        entry.last_used_at = now;
+    }
+
     fn prune_databases_locked(
         &self,
         databases: &mut HashMap<String, ActorDatabaseEntry>,
@@ -822,6 +2268,28 @@ impl ActorStore {
         let excess = databases.len().saturating_sub(self.db_cache_max_open);
         for (key, _) in keys_by_age.into_iter().take(excess) {
             databases.remove(&key);
+        }
+    }
+
+    fn prune_snapshots_locked(
+        &self,
+        snapshots: &mut HashMap<String, ActorSharedSnapshotEntry>,
+        now: Instant,
+    ) {
+        snapshots.retain(|_, entry| now.duration_since(entry.last_used_at) < self.db_idle_ttl);
+        if snapshots.len() <= self.snapshot_cache_max_entries {
+            return;
+        }
+        let mut keys_by_age = snapshots
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.last_used_at))
+            .collect::<Vec<_>>();
+        keys_by_age.sort_by_key(|(_, last_used_at)| *last_used_at);
+        let excess = snapshots
+            .len()
+            .saturating_sub(self.snapshot_cache_max_entries);
+        for (key, _) in keys_by_age.into_iter().take(excess) {
+            snapshots.remove(&key);
         }
     }
 }
@@ -876,15 +2344,29 @@ impl ActorProfile {
             ActorProfileMetricKind::JsFreshnessCheck => &self.js_freshness_check,
             ActorProfileMetricKind::JsHydrateFull => &self.js_hydrate_full,
             ActorProfileMetricKind::JsHydrateKeys => &self.js_hydrate_keys,
+            ActorProfileMetricKind::JsTxnCommit => &self.js_txn_commit,
+            ActorProfileMetricKind::JsTxnBlindCommit => &self.js_txn_blind_commit,
+            ActorProfileMetricKind::JsTxnValidate => &self.js_txn_validate,
             ActorProfileMetricKind::JsCacheHit => &self.js_cache_hit,
             ActorProfileMetricKind::JsCacheMiss => &self.js_cache_miss,
             ActorProfileMetricKind::JsCacheStale => &self.js_cache_stale,
+            ActorProfileMetricKind::OpRead => &self.op_read,
             ActorProfileMetricKind::OpSnapshot => &self.op_snapshot,
             ActorProfileMetricKind::OpVersionIfNewer => &self.op_version_if_newer,
             ActorProfileMetricKind::OpValidateReads => &self.op_validate_reads,
+            ActorProfileMetricKind::OpApplyBatch => &self.op_apply_batch,
+            ActorProfileMetricKind::OpApplyBlindBatch => &self.op_apply_blind_batch,
+            ActorProfileMetricKind::StoreRead => &self.store_read,
             ActorProfileMetricKind::StoreSnapshot => &self.store_snapshot,
             ActorProfileMetricKind::StoreSnapshotKeys => &self.store_snapshot_keys,
             ActorProfileMetricKind::StoreVersionIfNewer => &self.store_version_if_newer,
+            ActorProfileMetricKind::StoreApplyBatch => &self.store_apply_batch,
+            ActorProfileMetricKind::StoreApplyBatchValidate => &self.store_apply_batch_validate,
+            ActorProfileMetricKind::StoreApplyBatchWrite => &self.store_apply_batch_write,
+            ActorProfileMetricKind::StoreApplyBlindBatch => &self.store_apply_blind_batch,
+            ActorProfileMetricKind::StoreApplyBlindBatchWrite => {
+                &self.store_apply_blind_batch_write
+            }
         };
         target.record(duration_us, items.max(1));
     }
@@ -896,15 +2378,27 @@ impl ActorProfile {
             js_freshness_check: self.js_freshness_check.snapshot(),
             js_hydrate_full: self.js_hydrate_full.snapshot(),
             js_hydrate_keys: self.js_hydrate_keys.snapshot(),
+            js_txn_commit: self.js_txn_commit.snapshot(),
+            js_txn_blind_commit: self.js_txn_blind_commit.snapshot(),
+            js_txn_validate: self.js_txn_validate.snapshot(),
             js_cache_hit: self.js_cache_hit.snapshot(),
             js_cache_miss: self.js_cache_miss.snapshot(),
             js_cache_stale: self.js_cache_stale.snapshot(),
+            op_read: self.op_read.snapshot(),
             op_snapshot: self.op_snapshot.snapshot(),
             op_version_if_newer: self.op_version_if_newer.snapshot(),
             op_validate_reads: self.op_validate_reads.snapshot(),
+            op_apply_batch: self.op_apply_batch.snapshot(),
+            op_apply_blind_batch: self.op_apply_blind_batch.snapshot(),
+            store_read: self.store_read.snapshot(),
             store_snapshot: self.store_snapshot.snapshot(),
             store_snapshot_keys: self.store_snapshot_keys.snapshot(),
             store_version_if_newer: self.store_version_if_newer.snapshot(),
+            store_apply_batch: self.store_apply_batch.snapshot(),
+            store_apply_batch_validate: self.store_apply_batch_validate.snapshot(),
+            store_apply_batch_write: self.store_apply_batch_write.snapshot(),
+            store_apply_blind_batch: self.store_apply_blind_batch.snapshot(),
+            store_apply_blind_batch_write: self.store_apply_blind_batch_write.snapshot(),
         };
         self.reset();
         snapshot
@@ -915,15 +2409,27 @@ impl ActorProfile {
         self.js_freshness_check.reset();
         self.js_hydrate_full.reset();
         self.js_hydrate_keys.reset();
+        self.js_txn_commit.reset();
+        self.js_txn_blind_commit.reset();
+        self.js_txn_validate.reset();
         self.js_cache_hit.reset();
         self.js_cache_miss.reset();
         self.js_cache_stale.reset();
+        self.op_read.reset();
         self.op_snapshot.reset();
         self.op_version_if_newer.reset();
         self.op_validate_reads.reset();
+        self.op_apply_batch.reset();
+        self.op_apply_blind_batch.reset();
+        self.store_read.reset();
         self.store_snapshot.reset();
         self.store_snapshot_keys.reset();
         self.store_version_if_newer.reset();
+        self.store_apply_batch.reset();
+        self.store_apply_batch_validate.reset();
+        self.store_apply_batch_write.reset();
+        self.store_apply_blind_batch.reset();
+        self.store_apply_blind_batch_write.reset();
     }
 }
 
@@ -972,7 +2478,95 @@ async fn ensure_schema(database: &Database) -> Result<()> {
     )
     .await
     .map_err(actor_error)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS actor_direct_queue (
+          queue_id INTEGER PRIMARY KEY,
+          entity_key TEXT NOT NULL,
+          item_key TEXT NOT NULL,
+          value_blob BLOB NOT NULL,
+          encoding TEXT NOT NULL DEFAULT 'utf8',
+          deleted INTEGER NOT NULL DEFAULT 0,
+          token INTEGER NOT NULL,
+          enqueued_at_ms INTEGER NOT NULL
+        )",
+        (),
+    )
+    .await
+    .map_err(actor_error)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_actor_direct_queue_order
+         ON actor_direct_queue(queue_id)",
+        (),
+    )
+    .await
+    .map_err(actor_error)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_actor_direct_queue_key
+         ON actor_direct_queue(entity_key, item_key, queue_id)",
+        (),
+    )
+    .await
+    .map_err(actor_error)?;
     Ok(())
+}
+
+async fn detect_actor_version_floor(root_dir: &Path) -> Result<u64> {
+    let mut max_version = 0u64;
+    let entries = match std::fs::read_dir(root_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(error) => return Err(actor_error(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(actor_error)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let shard_entries = std::fs::read_dir(&path).map_err(actor_error)?;
+        for shard_entry in shard_entries {
+            let shard_entry = shard_entry.map_err(actor_error)?;
+            let shard_path = shard_entry.path();
+            if shard_path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+                continue;
+            }
+            let path_str = shard_path.to_string_lossy().to_string();
+            let database = Builder::new_local(&path_str)
+                .build()
+                .await
+                .map_err(actor_error)?;
+            let conn = database.connect().map_err(actor_error)?;
+            configure_connection(&conn).await?;
+            max_version = max_version.max(
+                read_single_i64(&conn, "SELECT MAX(max_version) FROM actor_meta").await? as u64,
+            );
+            max_version = max_version.max(
+                read_single_i64(&conn, "SELECT MAX(token) FROM actor_direct_queue").await? as u64,
+            );
+        }
+    }
+    Ok(max_version.saturating_add(1).max(1))
+}
+
+async fn read_single_i64(conn: &Connection, sql: &str) -> Result<i64> {
+    let mut rows = match conn.query(sql, ()).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("no such table") {
+                return Ok(0);
+            }
+            return Err(actor_error(error));
+        }
+    };
+    let Some(row) = rows.next().await.map_err(actor_error)? else {
+        return Ok(0);
+    };
+    Ok(row
+        .get::<Option<i64>>(0)
+        .map_err(actor_error)?
+        .unwrap_or(0)
+        .max(0))
 }
 
 async fn configure_connection(conn: &Connection) -> Result<()> {
@@ -1082,6 +2676,97 @@ fn normalize_encoding(raw: &str) -> String {
     }
 }
 
+fn snapshot_entries_from_records(
+    records: &HashMap<String, ActorSnapshotEntry>,
+) -> Vec<ActorSnapshotEntry> {
+    let mut entries = records.values().cloned().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    entries
+}
+
+fn coalesce_direct_mutations(
+    mutations: &[ActorDirectMutation],
+) -> Result<Vec<ActorDirectMutation>> {
+    let mut coalesced = HashMap::<String, ActorDirectMutation>::new();
+    for mutation in mutations {
+        let key = mutation.key.trim();
+        if key.is_empty() {
+            return Err(PlatformError::bad_request(
+                "actor direct mutation key must not be empty",
+            ));
+        }
+        let encoding = normalize_encoding(&mutation.encoding);
+        if !mutation.deleted && encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
+            return Err(PlatformError::bad_request(format!(
+                "unsupported actor storage encoding: {}",
+                mutation.encoding
+            )));
+        }
+        coalesced.insert(
+            key.to_string(),
+            ActorDirectMutation {
+                key: key.to_string(),
+                value: mutation.value.clone(),
+                encoding,
+                deleted: mutation.deleted,
+            },
+        );
+    }
+    Ok(coalesced.into_values().collect())
+}
+
+fn coalesce_direct_queue_rows(rows: Vec<ActorDirectQueueRow>) -> Vec<ActorPendingMutationEntry> {
+    let mut coalesced = HashMap::<ActorQueuedMutationKey, ActorPendingMutationEntry>::new();
+    for row in rows {
+        let key = ActorQueuedMutationKey {
+            actor_key: row.actor_key.clone(),
+            item_key: row.item_key.clone(),
+        };
+        let mutation = ActorDirectMutation {
+            key: row.item_key.clone(),
+            value: row.value.clone(),
+            encoding: normalize_encoding(&row.encoding),
+            deleted: row.deleted,
+        };
+        if let Some(entry) = coalesced.get_mut(&key) {
+            entry.queue_ids.push(row.queue_id);
+            entry.completion_tokens.push(row.token);
+            if row.token >= entry.token {
+                entry.token = row.token;
+                entry.mutation = mutation;
+            }
+        } else {
+            coalesced.insert(
+                key,
+                ActorPendingMutationEntry {
+                    actor_key: row.actor_key,
+                    mutation,
+                    token: row.token,
+                    queue_ids: vec![row.queue_id],
+                    completion_tokens: vec![row.token],
+                },
+            );
+        }
+    }
+    coalesced.into_values().collect()
+}
+
+fn hex_decode_to_utf8(input: &str) -> Option<String> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(input.len() / 2);
+    let chars = input.as_bytes();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let hi = char::from(chars[index]).to_digit(16)?;
+        let lo = char::from(chars[index + 1]).to_digit(16)?;
+        bytes.push(((hi << 4) | lo) as u8);
+        index += 2;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
 
@@ -1104,12 +2789,67 @@ mod tests {
         }
     }
 
+    async fn seed_direct_queue_row(
+        root: &Path,
+        namespace: &str,
+        shard_index: usize,
+        actor_key: &str,
+        item_key: &str,
+        value: &str,
+        token: i64,
+    ) -> Result<()> {
+        let path = root
+            .join(hex_encode(namespace.as_bytes()))
+            .join(format!("shard-{shard_index:04}.db"));
+        ensure_parent_dir(&path)?;
+        let path_str = path.to_string_lossy().to_string();
+        let database = Builder::new_local(&path_str)
+            .build()
+            .await
+            .map_err(actor_error)?;
+        ensure_schema(&database).await?;
+        let conn = database.connect().map_err(actor_error)?;
+        configure_connection(&conn).await?;
+        conn.execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(actor_error)?;
+        let outcome = async {
+            conn.execute(
+                "INSERT INTO actor_direct_queue (entity_key, item_key, value_blob, encoding, deleted, token, enqueued_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                (
+                    actor_key,
+                    item_key,
+                    value.as_bytes(),
+                    ENCODING_UTF8,
+                    token,
+                    epoch_ms_i64()?,
+                ),
+            )
+            .await
+            .map_err(actor_error)?;
+            Ok::<(), PlatformError>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await.map_err(actor_error)?;
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn actor_db_paths_are_stable_per_namespace() -> Result<()> {
-        let store = ActorStore::new(temp_root("paths"), 4, Duration::from_secs(60)).await?;
-        let ns_a = store.db_path("ns");
-        let ns_a_again = store.db_path("ns");
-        let ns_b = store.db_path("other");
+        let store = ActorStore::new(temp_root("paths"), 16, 4, Duration::from_secs(60)).await?;
+        let shard = store.shard_index("actor-a");
+        let ns_a = store.db_path("ns", shard);
+        let ns_a_again = store.db_path("ns", shard);
+        let ns_b = store.db_path("other", shard);
 
         assert_eq!(ns_a, ns_a_again);
         assert_ne!(ns_a, ns_b);
@@ -1118,7 +2858,7 @@ mod tests {
 
     #[tokio::test]
     async fn actor_db_cache_eviction_keeps_persisted_state() -> Result<()> {
-        let store = ActorStore::new(temp_root("eviction"), 1, Duration::from_secs(60)).await?;
+        let store = ActorStore::new(temp_root("eviction"), 1, 1, Duration::from_secs(60)).await?;
         store
             .apply_batch(
                 "ns",
@@ -1155,8 +2895,13 @@ mod tests {
 
     #[tokio::test]
     async fn actor_version_if_newer_observes_commits() -> Result<()> {
-        let store =
-            ActorStore::new(temp_root("version-if-newer"), 4, Duration::from_secs(60)).await?;
+        let store = ActorStore::new(
+            temp_root("version-if-newer"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
         assert_eq!(store.version_if_newer("ns", "actor-a", -1).await?, None);
         store
             .apply_batch(
@@ -1172,5 +2917,193 @@ mod tests {
         assert_eq!(store.version_if_newer("ns", "actor-a", -1).await?, Some(1));
         assert_eq!(store.version_if_newer("ns", "actor-a", 1).await?, None);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_snapshot_cache_updates_after_transactional_commit() -> Result<()> {
+        let store =
+            ActorStore::new(temp_root("snapshot-cache"), 16, 4, Duration::from_secs(60)).await?;
+
+        let initial = store.snapshot("ns", "actor-a").await?;
+        assert_eq!(initial.max_version, -1);
+
+        store
+            .apply_batch(
+                "ns",
+                "actor-a",
+                &[],
+                &[utf8_mutation("count", "1", 1)],
+                Some(-1),
+                None,
+                true,
+            )
+            .await?;
+
+        let snapshot = store.snapshot("ns", "actor-a").await?;
+        assert_eq!(snapshot.max_version, 1);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].key, "count");
+        assert_eq!(
+            String::from_utf8(snapshot.entries[0].value.clone()).expect("utf8"),
+            "1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_point_read_populates_partial_shared_cache_and_tracks_misses() -> Result<()> {
+        let store = ActorStore::new(
+            temp_root("point-read-cache"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        store
+            .apply_batch(
+                "ns",
+                "actor-a",
+                &[],
+                &[utf8_mutation("count", "1", 1)],
+                Some(-1),
+                None,
+                true,
+            )
+            .await?;
+
+        let hit = store.point_read("ns", "actor-a", "count").await?;
+        assert_eq!(hit.max_version, 1);
+        assert_eq!(
+            String::from_utf8(
+                hit.record
+                    .as_ref()
+                    .expect("count record should be present")
+                    .value
+                    .clone()
+            )
+            .expect("utf8"),
+            "1"
+        );
+
+        let key = ActorStore::actor_snapshot_key("ns", "actor-a");
+        {
+            let snapshots = store.shared_snapshots.lock().await;
+            let entry = snapshots
+                .get(&key)
+                .expect("shared cache entry should exist");
+            assert!(!entry.complete);
+            assert!(entry.loaded_keys.contains("count"));
+            assert!(entry.records.contains_key("count"));
+        }
+
+        let miss = store.point_read("ns", "actor-a", "missing").await?;
+        assert_eq!(miss.max_version, 1);
+        assert!(miss.record.is_none());
+
+        let snapshots = store.shared_snapshots.lock().await;
+        let entry = snapshots
+            .get(&key)
+            .expect("shared cache entry should exist");
+        assert!(entry.loaded_keys.contains("missing"));
+        assert!(!entry.records.contains_key("missing"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_point_read_cache_updates_after_commit() -> Result<()> {
+        let store = ActorStore::new(
+            temp_root("point-read-commit"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        store
+            .apply_batch(
+                "ns",
+                "actor-a",
+                &[],
+                &[utf8_mutation("count", "1", 1)],
+                Some(-1),
+                None,
+                true,
+            )
+            .await?;
+        let first = store.point_read("ns", "actor-a", "count").await?;
+        assert_eq!(first.max_version, 1);
+
+        store
+            .apply_batch(
+                "ns",
+                "actor-a",
+                &[ActorReadDependency {
+                    key: "count".to_string(),
+                    version: 1,
+                }],
+                &[utf8_mutation("count", "2", 2)],
+                Some(-1),
+                None,
+                true,
+            )
+            .await?;
+
+        let updated = store.point_read("ns", "actor-a", "count").await?;
+        assert_eq!(updated.max_version, 2);
+        assert_eq!(
+            String::from_utf8(
+                updated
+                    .record
+                    .as_ref()
+                    .expect("count record should still be present")
+                    .value
+                    .clone()
+            )
+            .expect("utf8"),
+            "2"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_version_floor_bootstraps_from_direct_queue_tokens() -> Result<()> {
+        let root = temp_root("version-floor");
+        seed_direct_queue_row(&root, "ns", 0, "actor-a", "count", "9", 41).await?;
+
+        let store = ActorStore::new(root, 1, 4, Duration::from_secs(60)).await?;
+        assert_eq!(store.next_write_token.load(Ordering::SeqCst), 42);
+        assert_eq!(store.version.load(Ordering::SeqCst), 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_direct_queue_replays_on_store_startup() -> Result<()> {
+        let root = temp_root("queue-replay");
+        seed_direct_queue_row(&root, "ns", 0, "actor-a", "count", "9", 7).await?;
+
+        let store = ActorStore::new(root, 1, 4, Duration::from_secs(60)).await?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = store.snapshot("ns", "actor-a").await?;
+            let current = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.key == "count" && !entry.deleted)
+                .map(|entry| String::from_utf8(entry.value.clone()).expect("utf8"));
+            if snapshot.max_version == 7 && current.as_deref() == Some("9") {
+                let conn = store.connect_shard("ns", 0).await?;
+                assert_eq!(store.direct_queue_len(&conn).await?, 0);
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(PlatformError::runtime(format!(
+                    "expected queued write to replay before timeout, got snapshot version {} and value {:?}",
+                    snapshot.max_version,
+                    current
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

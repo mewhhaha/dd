@@ -1,4 +1,7 @@
-use crate::actor::{ActorBatchMutation, ActorProfileMetricKind, ActorReadDependency, ActorStore};
+use crate::actor::{
+    ActorBatchMutation, ActorDirectMutation, ActorProfileMetricKind, ActorReadDependency,
+    ActorStore,
+};
 use crate::actor_rpc::{
     decode_actor_invoke_response, encode_actor_invoke_request, ActorInvokeCall, ActorInvokeRequest,
     ActorInvokeResponse,
@@ -801,6 +804,33 @@ struct ActorStateSnapshotPayload {
     keys: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ActorStateGetPayload {
+    request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
+    item_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateGetEntry {
+    key: String,
+    value: Vec<u8>,
+    encoding: String,
+    version: i64,
+    deleted: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateGetResult {
+    ok: bool,
+    record: Option<ActorStateGetEntry>,
+    max_version: i64,
+    error: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ActorStateSnapshotEntry {
     key: String,
@@ -875,10 +905,57 @@ struct ActorStateApplyBatchPayload {
     mutations: Vec<ActorStateBatchMutationPayload>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ActorStateApplyBlindBatchPayload {
+    request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
+    mutations: Vec<ActorStateBatchMutationPayload>,
+}
+
 #[derive(Debug, Serialize)]
 struct ActorStateApplyBatchResult {
     ok: bool,
     conflict: bool,
+    max_version: i64,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateEnqueueBatchMutationPayload {
+    key: String,
+    value: Vec<u8>,
+    encoding: String,
+    deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateEnqueueBatchPayload {
+    request_id: String,
+    #[serde(default)]
+    binding: String,
+    #[serde(default)]
+    key: String,
+    mutations: Vec<ActorStateEnqueueBatchMutationPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateEnqueueBatchResult {
+    ok: bool,
+    submission_id: u64,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActorStateAwaitSubmissionPayload {
+    submission_id: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorStateAwaitSubmissionResult {
+    ok: bool,
     max_version: i64,
     error: String,
 }
@@ -2708,6 +2785,62 @@ fn actor_storage_scope_for_payload(
 
 #[deno_core::op2]
 #[serde]
+async fn op_actor_state_get(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateGetPayload,
+) -> ActorStateGetResult {
+    let started = Instant::now();
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return ActorStateGetResult {
+                ok: false,
+                record: None,
+                max_version: -1,
+                error: error.to_string(),
+            };
+        }
+    };
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .point_read(&namespace, &actor_key, &payload.item_key)
+        .await
+    {
+        Ok(point) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpRead,
+                started.elapsed().as_micros() as u64,
+                1,
+            );
+            ActorStateGetResult {
+                ok: true,
+                record: point.record.map(|entry| ActorStateGetEntry {
+                    key: entry.key,
+                    value: entry.value,
+                    encoding: entry.encoding,
+                    version: entry.version,
+                    deleted: entry.deleted,
+                }),
+                max_version: point.max_version,
+                error: String::new(),
+            }
+        }
+        Err(error) => ActorStateGetResult {
+            ok: false,
+            record: None,
+            max_version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
 async fn op_actor_state_snapshot(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorStateSnapshotPayload,
@@ -2911,6 +3044,9 @@ fn op_actor_profile_record_js(
         "js_freshness_check" => ActorProfileMetricKind::JsFreshnessCheck,
         "js_hydrate_full" => ActorProfileMetricKind::JsHydrateFull,
         "js_hydrate_keys" => ActorProfileMetricKind::JsHydrateKeys,
+        "js_txn_commit" => ActorProfileMetricKind::JsTxnCommit,
+        "js_txn_blind_commit" => ActorProfileMetricKind::JsTxnBlindCommit,
+        "js_txn_validate" => ActorProfileMetricKind::JsTxnValidate,
         "actor_cache_hit" => ActorProfileMetricKind::JsCacheHit,
         "actor_cache_miss" => ActorProfileMetricKind::JsCacheMiss,
         "actor_cache_stale" => ActorProfileMetricKind::JsCacheStale,
@@ -2943,6 +3079,9 @@ async fn op_actor_state_apply_batch(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: ActorStateApplyBatchPayload,
 ) -> ActorStateApplyBatchResult {
+    let started = std::time::Instant::now();
+    let mutation_count = payload.mutations.len() as u64;
+    let read_count = payload.reads.len() as u64;
     let (namespace, actor_key) = match actor_storage_scope_for_payload(
         &state,
         &payload.request_id,
@@ -3001,15 +3140,154 @@ async fn op_actor_state_apply_batch(
         )
         .await
     {
-        Ok(result) => ActorStateApplyBatchResult {
-            ok: true,
-            conflict: result.conflict,
-            max_version: result.max_version,
-            error: String::new(),
-        },
+        Ok(result) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpApplyBatch,
+                started.elapsed().as_micros() as u64,
+                mutation_count + read_count + 1,
+            );
+            ActorStateApplyBatchResult {
+                ok: true,
+                conflict: result.conflict,
+                max_version: result.max_version,
+                error: String::new(),
+            }
+        }
         Err(error) => ActorStateApplyBatchResult {
             ok: false,
             conflict: false,
+            max_version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_apply_blind_batch(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateApplyBlindBatchPayload,
+) -> ActorStateApplyBatchResult {
+    let started = std::time::Instant::now();
+    let mutation_count = payload.mutations.len() as u64;
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return ActorStateApplyBatchResult {
+                ok: false,
+                conflict: false,
+                max_version: -1,
+                error: error.to_string(),
+            };
+        }
+    };
+    let mutations = payload
+        .mutations
+        .into_iter()
+        .map(|mutation| ActorBatchMutation {
+            key: mutation.key,
+            value: mutation.value,
+            encoding: mutation.encoding,
+            version: mutation.version,
+            deleted: mutation.deleted,
+        })
+        .collect::<Vec<_>>();
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .apply_blind_batch(&namespace, &actor_key, &mutations)
+        .await
+    {
+        Ok(result) => {
+            store.record_profile(
+                ActorProfileMetricKind::OpApplyBlindBatch,
+                started.elapsed().as_micros() as u64,
+                mutation_count + 1,
+            );
+            ActorStateApplyBatchResult {
+                ok: true,
+                conflict: result.conflict,
+                max_version: result.max_version,
+                error: String::new(),
+            }
+        }
+        Err(error) => ActorStateApplyBatchResult {
+            ok: false,
+            conflict: false,
+            max_version: -1,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_enqueue_batch(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateEnqueueBatchPayload,
+) -> ActorStateEnqueueBatchResult {
+    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+        &state,
+        &payload.request_id,
+        &payload.binding,
+        &payload.key,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return ActorStateEnqueueBatchResult {
+                ok: false,
+                submission_id: 0,
+                error: error.to_string(),
+            };
+        }
+    };
+    let mutations = payload
+        .mutations
+        .into_iter()
+        .map(|mutation| ActorDirectMutation {
+            key: mutation.key,
+            value: mutation.value,
+            encoding: mutation.encoding,
+            deleted: mutation.deleted,
+        })
+        .collect::<Vec<_>>();
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store
+        .enqueue_direct_batch(&namespace, &actor_key, &mutations)
+        .await
+    {
+        Ok(submission_id) => ActorStateEnqueueBatchResult {
+            ok: true,
+            submission_id,
+            error: String::new(),
+        },
+        Err(error) => ActorStateEnqueueBatchResult {
+            ok: false,
+            submission_id: 0,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_actor_state_await_submission(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: ActorStateAwaitSubmissionPayload,
+) -> ActorStateAwaitSubmissionResult {
+    let store = state.borrow().borrow::<ActorStore>().clone();
+    match store.wait_direct_submission(payload.submission_id).await {
+        Ok(max_version) => ActorStateAwaitSubmissionResult {
+            ok: true,
+            max_version,
+            error: String::new(),
+        },
+        Err(error) => ActorStateAwaitSubmissionResult {
+            ok: false,
             max_version: -1,
             error: error.to_string(),
         },
@@ -3994,10 +4272,14 @@ deno_core::extension!(
         op_actor_profile_record_js,
         op_actor_profile_take,
         op_actor_profile_reset,
+        op_actor_state_get,
         op_actor_state_snapshot,
         op_actor_state_validate_reads,
         op_actor_state_version_if_newer,
         op_actor_state_apply_batch,
+        op_actor_state_apply_blind_batch,
+        op_actor_state_enqueue_batch,
+        op_actor_state_await_submission,
         op_actor_socket_send,
         op_actor_socket_close,
         op_actor_socket_list,

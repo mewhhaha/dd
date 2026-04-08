@@ -171,7 +171,14 @@ globalThis.__dd_execute_worker = (payload) => {
     if (current?.actorEntry === entry && current.actorRequestId) {
       return current.actorRequestId;
     }
-    return activeRequestId() || runtimeRequestId;
+    if (current?.requestId) {
+      return String(current.requestId);
+    }
+    const fallback = String(runtimeRequestId ?? "").trim();
+    if (fallback) {
+      return fallback;
+    }
+    return activeRequestId();
   };
 
   const withActorTxnScope = (scope, callback) => {
@@ -1205,6 +1212,7 @@ globalThis.__dd_execute_worker = (payload) => {
         pendingMutations: [],
         flushRunning: false,
         flushTail: Promise.resolve(),
+        pendingSubmissionCount: 0,
         failedError: null,
         outputGate: Promise.resolve(),
       };
@@ -1256,11 +1264,13 @@ globalThis.__dd_execute_worker = (payload) => {
     && txn.accepted !== true
     && txn.sideEffects !== true;
 
-  const actorTxnShouldHydrateFullyOnMiss = (txn, storageState) => !!txn
-    && actorTxnIsReadOnly(txn)
-    && !storageState.fullSnapshotLoaded
-    && storageState.loadedKeys.size === 0
-    && storageState.mirror.size === 0;
+  const actorTxnIsBlindWrite = (txn) => !!txn
+    && txn.writes.size > 0
+    && txn.reads.size === 0
+    && txn.deferred.length === 0
+    && txn.listGateVersion == null
+    && txn.accepted !== true
+    && txn.sideEffects !== true;
 
   class MemoryHydrationNeeded extends Error {
     constructor(mode, keys = []) {
@@ -1359,10 +1369,6 @@ globalThis.__dd_execute_worker = (payload) => {
     return storageState;
   };
 
-  const actorSnapshotHasCache = (storageState) => storageState.fullSnapshotLoaded === true
-    || storageState.loadedKeys.size > 0
-    || storageState.mirror.size > 0;
-
   const actorTxnReadRecord = (txn, key) => {
     const normalizedKey = String(key);
     if (txn?.writes?.has(normalizedKey)) {
@@ -1454,6 +1460,46 @@ globalThis.__dd_execute_worker = (payload) => {
     throw failure;
   };
 
+  const handleActorDirectWriteFailure = (entry, error) => {
+    const storageState = ensureActorStorageState(entry);
+    console.warn(String(error?.message ?? error ?? "memory direct write failed"));
+    invalidateActorSnapshot(entry);
+    storageState.freshnessCheckedRequestId = "";
+  };
+
+  const waitForActorDirectSubmission = async (entry, submissionId) => {
+    const storageState = ensureActorStorageState(entry);
+    try {
+      const result = await callOp("op_actor_state_await_submission", {
+        submission_id: Number(submissionId),
+      });
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "memory direct write submission failed"));
+      }
+      storageState.committedVersion = Math.max(
+        Number(storageState.committedVersion ?? -1),
+        Number(result.max_version ?? -1),
+      );
+      storageState.nextVersion = Math.max(
+        Number(storageState.nextVersion ?? 0),
+        Number(storageState.committedVersion ?? -1) + 1,
+      );
+      if (storageState.pendingSubmissionCount <= 1) {
+        storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+        storageState.freshnessCheckedAtMs = performance.now();
+        storageState.stale = false;
+      }
+    } catch (error) {
+      handleActorDirectWriteFailure(entry, error);
+    } finally {
+      storageState.pendingSubmissionCount = Math.max(
+        0,
+        Number(storageState.pendingSubmissionCount ?? 0) - 1,
+      );
+    }
+  };
+
   const flushActorStorage = (entry, runtimeRequestId) => {
     const storageState = ensureActorStorageState(entry);
     if (storageState.flushRunning) {
@@ -1464,17 +1510,15 @@ globalThis.__dd_execute_worker = (payload) => {
       while (storageState.pendingMutations.length > 0) {
         const mutations = storageState.pendingMutations.splice(0, storageState.pendingMutations.length);
         const result = await callOp(
-          "op_actor_state_apply_batch",
+          "op_actor_state_enqueue_batch",
           {
             request_id: runtimeRequestId,
             binding: entry.binding,
             key: entry.actorKey,
-            expected_base_version: storageState.committedVersion,
             mutations: mutations.map((mutation) => ({
               key: mutation.key,
               value: Array.from(mutation.value),
               encoding: mutation.encoding,
-              version: mutation.version,
               deleted: mutation.deleted,
             })),
           },
@@ -1483,16 +1527,16 @@ globalThis.__dd_execute_worker = (payload) => {
         if (!result || typeof result !== "object" || result.ok === false) {
           throw new Error(String(result?.error ?? "memory storage batch flush failed"));
         }
-        if (result.conflict === true) {
-          throw new Error("memory storage batch flush conflicted");
-        }
-        storageState.committedVersion = Number(result.max_version ?? storageState.committedVersion);
-        storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
-        storageState.freshnessCheckedAtMs = performance.now();
-        storageState.stale = false;
+        storageState.pendingSubmissionCount += 1;
+        waitForActorDirectSubmission(entry, Number(result.submission_id ?? 0)).catch((error) => {
+          handleActorDirectWriteFailure(entry, error);
+        });
       }
     })()
-      .catch(async (error) => failActorEntry(entry, runtimeRequestId, error))
+      .catch((error) => {
+        handleActorDirectWriteFailure(entry, error);
+        throw error;
+      })
       .finally(() => {
         storageState.flushRunning = false;
       });
@@ -1506,6 +1550,16 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     storageState.pendingMutations.push(mutation);
     flushActorStorage(entry, runtimeRequestId).catch(() => {});
+  };
+
+  const ensureActorStorageQueued = async (entry, runtimeRequestId) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
+    if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
+      await flushActorStorage(entry, runtimeRequestId);
+    }
   };
 
   const waitForActorFlush = async (entry, runtimeRequestId) => {
@@ -1535,9 +1589,44 @@ globalThis.__dd_execute_worker = (payload) => {
     return gated;
   };
 
-  const ensureActorStorageHydrated = async (entry, runtimeRequestId) => {
+  const ensureActorStoragePointHydrated = async (entry, runtimeRequestId, key, options = {}) => {
     const storageState = ensureActorStorageState(entry);
-    if (storageState.fullSnapshotLoaded) {
+    const normalizedKey = String(key ?? "");
+    if (!normalizedKey) {
+      return storageState;
+    }
+    const force = options?.force === true;
+    if (!force && (storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey))) {
+      return storageState;
+    }
+    const started = performance.now();
+    const result = await callOp("op_actor_state_get", {
+      request_id: runtimeRequestId,
+      binding: entry.binding,
+      key: entry.actorKey,
+      item_key: normalizedKey,
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory storage point read failed"));
+    }
+    mergeActorSnapshotEntries(
+      storageState,
+      result.record ? [result.record] : [],
+      result.max_version,
+      "keys",
+      [normalizedKey],
+    );
+    storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+    storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
+    storageState.freshnessCheckedAtMs = performance.now();
+    recordActorProfile("js_hydrate_keys", performance.now() - started, 1);
+    return storageState;
+  };
+
+  const ensureActorStorageHydrated = async (entry, runtimeRequestId, options = {}) => {
+    const storageState = ensureActorStorageState(entry);
+    if (storageState.fullSnapshotLoaded && options?.force !== true) {
       return storageState;
     }
     if (!storageState.hydrating) {
@@ -1587,6 +1676,9 @@ globalThis.__dd_execute_worker = (payload) => {
     if (pendingKeys.length === 0) {
       return storageState;
     }
+    if (pendingKeys.length === 1) {
+      return ensureActorStoragePointHydrated(entry, runtimeRequestId, pendingKeys[0], { force });
+    }
     const started = performance.now();
     const result = await callOp("op_actor_state_snapshot", {
       request_id: runtimeRequestId,
@@ -1618,79 +1710,46 @@ globalThis.__dd_execute_worker = (payload) => {
 
   const refreshActorEntrySnapshot = async (entry, runtimeRequestId) => {
     invalidateActorSnapshot(entry);
-    await ensureActorStorageHydrated(entry, runtimeRequestId);
+    await ensureActorStorageHydrated(entry, runtimeRequestId, { force: true });
   };
+
+  const actorSnapshotTtlExpired = (storageState) => (
+    performance.now() - Number(storageState.freshnessCheckedAtMs ?? 0) > actorReadSnapshotFreshTtlMs
+  );
 
   const ensureActorDirectReadReady = async (entry, runtimeRequestId, key) => {
-    await ensureActorReadSnapshotFresh(entry, runtimeRequestId);
+    const normalizedKey = String(key ?? "");
     const storageState = ensureActorStorageState(entry);
-    if (!actorSnapshotHasCache(storageState)) {
-      await ensureActorStorageHydrated(entry, runtimeRequestId);
-      return storageState;
-    }
-    if (!storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(String(key ?? ""))) {
-      await ensureActorStorageHydrated(entry, runtimeRequestId);
-    }
-    return storageState;
-  };
-
-  const ensureActorReadSnapshotFresh = async (entry, runtimeRequestId) => {
-    const storageState = ensureActorStorageState(entry);
-    if (storageState.failedError) {
-      throw storageState.failedError;
-    }
-    if (storageState.pendingMutations.length > 0 || storageState.flushRunning) {
-      return storageState;
-    }
-    if (!actorSnapshotHasCache(storageState)) {
-      recordActorProfile("actor_cache_miss", 0, 1);
-      storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
-      storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
-      return storageState;
-    }
-    const requestId = String(runtimeRequestId ?? "");
-    const committedVersion = Number(storageState.committedVersion ?? -1);
-    const now = performance.now();
     if (
-      storageState.freshnessCheckedRequestId === requestId
-      && Number(storageState.freshnessCheckedVersion ?? -1) === committedVersion
+      (
+        storageState.pendingMutations.length > 0
+        || storageState.flushRunning
+        || Number(storageState.pendingSubmissionCount ?? 0) > 0
+      )
+      && (
+        storageState.fullSnapshotLoaded
+        || storageState.loadedKeys.has(normalizedKey)
+        || storageState.mirror.has(normalizedKey)
+      )
+    ) {
+      return storageState;
+    }
+    if (
+      (storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey))
+      && storageState.stale !== true
+      && !actorSnapshotTtlExpired(storageState)
     ) {
       recordActorProfile("actor_cache_hit", 0, 1);
       return storageState;
     }
-    if (
-      storageState.stale !== true
-      && Number(storageState.freshnessCheckedVersion ?? -1) === committedVersion
-      && now - Number(storageState.freshnessCheckedAtMs ?? 0) <= actorReadSnapshotFreshTtlMs
-    ) {
-      recordActorProfile("actor_cache_hit", 0, 1);
-      storageState.freshnessCheckedRequestId = requestId;
-      return storageState;
-    }
-    const started = performance.now();
-    const result = await callOp("op_actor_state_version_if_newer", {
-      request_id: runtimeRequestId,
-      binding: entry.binding,
-      key: entry.actorKey,
-      known_version: committedVersion,
-    });
-    await syncFrozenTime();
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory storage freshness check failed"));
-    }
-    const knownVersion = Number(
-      result.stale === true ? result.max_version : committedVersion,
-    );
-    if (result.stale === true) {
+    if (storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey)) {
       recordActorProfile("actor_cache_stale", 0, 1);
-      invalidateActorSnapshot(entry, knownVersion);
     } else {
-      recordActorProfile("actor_cache_hit", 0, 1);
+      recordActorProfile("actor_cache_miss", 0, 1);
     }
-    storageState.freshnessCheckedRequestId = requestId;
-    storageState.freshnessCheckedVersion = knownVersion;
-    storageState.freshnessCheckedAtMs = performance.now();
-    recordActorProfile("js_freshness_check", performance.now() - started, 1);
+    await ensureActorStoragePointHydrated(entry, runtimeRequestId, normalizedKey, {
+      force: storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey),
+    });
     return storageState;
   };
 
@@ -1698,6 +1757,7 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!txn) {
       return;
     }
+    const started = performance.now();
     const storageState = ensureActorStorageState(txn.entry);
     const writes = Array.from(txn.writes.values());
     const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
@@ -1749,6 +1809,58 @@ globalThis.__dd_execute_worker = (payload) => {
     txn.committed = true;
     txn.committedVersion = committedVersion;
     await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
+    recordActorProfile("js_txn_commit", performance.now() - started, writes.length + reads.length + 1);
+    return true;
+  };
+
+  const commitActorBlindTxn = async (txn, runtimeRequestId) => {
+    if (!txn) {
+      return;
+    }
+    const started = performance.now();
+    const storageState = ensureActorStorageState(txn.entry);
+    const writes = Array.from(txn.writes.values());
+    const result = await callOp("op_actor_state_apply_blind_batch", {
+      request_id: runtimeRequestId,
+      binding: txn.entry.binding,
+      key: txn.entry.actorKey,
+      mutations: writes.map((mutation) => ({
+        key: mutation.key,
+        value: Array.from(mutation.value),
+        encoding: mutation.encoding,
+        version: mutation.version,
+        deleted: mutation.deleted,
+      })),
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory blind transaction commit failed"));
+    }
+    if (result.conflict === true) {
+      await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
+      return false;
+    }
+    const committedVersion = Number(result.max_version ?? storageState.committedVersion);
+    for (const mutation of writes) {
+      storageState.loadedKeys.add(mutation.key);
+      storageState.mirror.set(mutation.key, {
+        ...cloneActorRecord(mutation),
+        version: committedVersion,
+      });
+    }
+    storageState.committedVersion = committedVersion;
+    storageState.nextVersion = Math.max(
+      Number(storageState.nextVersion ?? 0),
+      Number(storageState.committedVersion ?? -1) + 1,
+    );
+    storageState.snapshotVersion = committedVersion;
+    storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+    storageState.freshnessCheckedVersion = committedVersion;
+    storageState.freshnessCheckedAtMs = performance.now();
+    storageState.stale = false;
+    txn.committed = true;
+    txn.committedVersion = committedVersion;
+    recordActorProfile("js_txn_blind_commit", performance.now() - started, writes.length + 1);
     return true;
   };
 
@@ -1756,6 +1868,7 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!txn) {
       return true;
     }
+    const started = performance.now();
     const storageState = ensureActorStorageState(txn.entry);
     const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
       key,
@@ -1794,6 +1907,7 @@ globalThis.__dd_execute_worker = (payload) => {
     );
     txn.committed = true;
     txn.committedVersion = Number(result.max_version ?? storageState.committedVersion);
+    recordActorProfile("js_txn_validate", performance.now() - started, reads.length + 1);
     return true;
   };
 
@@ -1808,9 +1922,6 @@ globalThis.__dd_execute_worker = (payload) => {
         const normalizedKey = String(key);
         if (txn && !storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(normalizedKey)) {
           recordActorProfile("actor_cache_miss", 0, 1);
-          if (actorTxnShouldHydrateFullyOnMiss(txn, storageState)) {
-            throw new MemoryHydrationNeeded("full");
-          }
           throw new MemoryHydrationNeeded("keys", [normalizedKey]);
         }
         const record = txn
@@ -1848,7 +1959,9 @@ globalThis.__dd_execute_worker = (payload) => {
           };
         }
         const encoded = encodeActorStorageValue(value);
-        const version = txn ? actorTxnNextVersion(txn) : storageState.nextVersion++;
+        const version = txn
+          ? actorTxnNextVersion(txn)
+          : Number(storageState.committedVersion ?? -1);
         const record = {
           key: normalizedKey,
           value: encoded.value,
@@ -1890,7 +2003,9 @@ globalThis.__dd_execute_worker = (payload) => {
             version: currentVersion,
           };
         }
-        const version = txn ? actorTxnNextVersion(txn) : storageState.nextVersion++;
+        const version = txn
+          ? actorTxnNextVersion(txn)
+          : Number(storageState.committedVersion ?? -1);
         const record = {
           key: normalizedKey,
           value: new Uint8Array(),
@@ -3195,11 +3310,87 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   };
 
+  const normalizeActorWriteManyEntries = (entries) => {
+    if (!Array.isArray(entries)) {
+      throw new Error("stub.writeMany(entries) requires an array");
+    }
+    return entries.map((entry) => {
+      if (Array.isArray(entry)) {
+        return {
+          key: String(entry[0] ?? ""),
+          value: entry[1],
+        };
+      }
+      if (entry && typeof entry === "object") {
+        return {
+          key: String(entry.key ?? ""),
+          value: entry.value,
+        };
+      }
+      throw new Error("stub.writeMany entries must be [key, value] or { key, value }");
+    });
+  };
+
   const createActorStub = (namespace, actorKey) => Object.freeze({
     id: createActorId(namespace, actorKey),
     binding: namespace,
     sockets: createActorStubSocketApi(namespace, actorKey),
     transports: createActorStubTransportApi(namespace, actorKey),
+    read(key, options) {
+      return createActorStubVarApi(namespace, actorKey, key).read(options);
+    },
+    async write(key, value) {
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
+      const state = createActorStorageBinding(entry, runtimeRequestId);
+      state.put(String(key ?? ""), value);
+      await ensureActorStorageQueued(entry, runtimeRequestId);
+      return value;
+    },
+    async delete(key) {
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
+      const state = createActorStorageBinding(entry, runtimeRequestId);
+      state.delete(String(key ?? ""));
+      await ensureActorStorageQueued(entry, runtimeRequestId);
+      return true;
+    },
+    async writeMany(entries) {
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
+      const state = createActorStorageBinding(entry, runtimeRequestId);
+      const normalizedEntries = normalizeActorWriteManyEntries(entries);
+      for (const item of normalizedEntries) {
+        state.put(item.key, item.value);
+      }
+      await ensureActorStorageQueued(entry, runtimeRequestId);
+      return normalizedEntries.length;
+    },
+    async list(options = {}) {
+      const scope = actorTxnScopeFor(namespace, actorKey);
+      if (scope) {
+        return scope.state.list(options);
+      }
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
+      const storageState = ensureActorStorageState(entry);
+      if (
+        !storageState.fullSnapshotLoaded
+        || storageState.stale === true
+        || actorSnapshotTtlExpired(storageState)
+      ) {
+        await ensureActorStorageHydrated(entry, runtimeRequestId, {
+          force: storageState.fullSnapshotLoaded,
+        });
+      } else {
+        recordActorProfile("actor_cache_hit", 0, 1);
+      }
+      return createActorStorageBinding(entry, runtimeRequestId).list(options).map((entryValue) => ({
+        key: entryValue.key,
+        value: entryValue.value,
+        version: entryValue.version,
+      }));
+    },
     var(key) {
       return createActorStubVarApi(namespace, actorKey, key);
     },
@@ -3978,10 +4169,6 @@ globalThis.__dd_execute_worker = (payload) => {
         current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
         current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
         try {
-          await ensureActorReadSnapshotFresh(entry, runtimeRequestId);
-          if (!actorSnapshotHasCache(ensureActorStorageState(entry))) {
-            await ensureActorStorageHydrated(entry, runtimeRequestId);
-          }
           const value = withActorTxnScope(
             {
               binding: entry.binding,
@@ -4002,7 +4189,9 @@ globalThis.__dd_execute_worker = (payload) => {
             recordActorProfile("js_read_only_total", performance.now() - txnStarted, 1);
             return value;
           }
-          const committed = txn.writes.size === 0 && txn.accepted !== true
+          const committed = actorTxnIsBlindWrite(txn)
+            ? await commitActorBlindTxn(txn, runtimeRequestId)
+            : txn.writes.size === 0 && txn.accepted !== true
             ? await validateActorTxnReads(txn, runtimeRequestId)
             : await commitActorTxn(txn, runtimeRequestId);
           if (!committed) {

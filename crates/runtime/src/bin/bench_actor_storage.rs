@@ -1,12 +1,15 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
 use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
+use tokio::time::{sleep, Instant as TokioInstant};
 use uuid::Uuid;
 
 #[derive(Clone, Copy)]
@@ -43,15 +46,27 @@ struct ActorProfileSnapshot {
     js_freshness_check: ActorProfileMetric,
     js_hydrate_full: ActorProfileMetric,
     js_hydrate_keys: ActorProfileMetric,
+    js_txn_commit: ActorProfileMetric,
+    js_txn_blind_commit: ActorProfileMetric,
+    js_txn_validate: ActorProfileMetric,
     js_cache_hit: ActorProfileMetric,
     js_cache_miss: ActorProfileMetric,
     js_cache_stale: ActorProfileMetric,
+    op_read: ActorProfileMetric,
     op_snapshot: ActorProfileMetric,
     op_version_if_newer: ActorProfileMetric,
     op_validate_reads: ActorProfileMetric,
+    op_apply_batch: ActorProfileMetric,
+    op_apply_blind_batch: ActorProfileMetric,
+    store_read: ActorProfileMetric,
     store_snapshot: ActorProfileMetric,
     store_snapshot_keys: ActorProfileMetric,
     store_version_if_newer: ActorProfileMetric,
+    store_apply_batch: ActorProfileMetric,
+    store_apply_batch_validate: ActorProfileMetric,
+    store_apply_batch_write: ActorProfileMetric,
+    store_apply_blind_batch: ActorProfileMetric,
+    store_apply_blind_batch_write: ActorProfileMetric,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -76,12 +91,39 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone, Copy)]
+enum ActorKeyMode {
+    Pool,
+    Unique,
+    SameShard,
+    CrossShard,
+}
+
+impl ActorKeyMode {
+    fn from_env() -> Self {
+        match std::env::var("DD_BENCH_ACTOR_KEY_MODE")
+            .ok()
+            .unwrap_or_else(|| "pool".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "pool" => Self::Pool,
+            "unique" => Self::Unique,
+            "same-shard" => Self::SameShard,
+            "cross-shard" => Self::CrossShard,
+            _ => Self::Pool,
+        }
+    }
+}
+
 fn env_mode() -> Option<String> {
     std::env::var("DD_BENCH_MODE")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
+
+const ACTOR_NAMESPACE_SHARDS: usize = 16;
 
 const ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE: &str = r#"
 export function seed(state) {
@@ -155,11 +197,53 @@ export default {
     const url = new URL(request.url);
     const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
     const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_actor_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_actor_profile_reset?.();
+      return new Response("ok");
+    }
     if (url.pathname === "/seed") {
       await actor.atomic(seed);
       return new Response("ok");
     }
-    return new Response(String(await actor.var("payload").read() ?? "0"));
+    return new Response(String(await actor.read("payload") ?? "0"));
+  },
+};
+"#;
+
+const ACTOR_DIRECT_WRITE_WORKER_SOURCE: &str = r#"
+export function readStrong(state) {
+  return String(state.get("payload") ?? "0");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/seed") {
+      await actor.write("payload", "0");
+      return new Response("ok");
+    }
+    if (url.pathname === "/read") {
+      return new Response(String(await actor.read("payload") ?? "0"));
+    }
+    if (url.pathname === "/get-strong") {
+      return new Response(String(await actor.atomic(readStrong)));
+    }
+    if (url.pathname === "/write") {
+      await actor.write("payload", "1");
+      return new Response("ok");
+    }
+    if (url.pathname === "/delete") {
+      await actor.delete("payload");
+      return new Response("ok");
+    }
+    return new Response("not found", { status: 404 });
   },
 };
 "#;
@@ -392,6 +476,50 @@ export default {
 };
 "#;
 
+const ACTOR_STM_BLIND_WRITE_WORKER_SOURCE: &str = r#"
+export function seed(state) {
+  state.set("count", "0");
+  return true;
+}
+
+export function readCount(state) {
+  return String(state.get("count") ?? "0");
+}
+
+export function blindWrite(state) {
+  state.set("count", "1");
+  return "1";
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_ACTOR.idFromName(url.searchParams.get("key") ?? "hot");
+    const actor = env.BENCH_ACTOR.get(id);
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_actor_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_actor_profile_reset?.();
+      return new Response("ok");
+    }
+    if (url.pathname === "/seed") {
+      await actor.atomic(seed);
+      return new Response("ok");
+    }
+    if (url.pathname === "/get") {
+      return new Response(String(await actor.atomic(readCount)));
+    }
+    if (url.pathname === "/write") {
+      return new Response(String(await actor.atomic(blindWrite)));
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
 const ACTOR_ATOMIC_PUT_INCREMENT_WORKER_SOURCE: &str = r#"
 export function seed(state) {
   state.set("count", "0");
@@ -514,6 +642,32 @@ async fn main() -> Result<(), String> {
             "/read",
             1,
             None,
+            false,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-write-memory") {
+        run_and_print(
+            &service,
+            "actor-direct-write-memory",
+            ACTOR_DIRECT_WRITE_WORKER_SOURCE,
+            true,
+            "/write",
+            1,
+            Some("/get-strong"),
+            false,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-write-memory-multikey") {
+        run_and_print(
+            &service,
+            "actor-direct-write-memory-multikey",
+            ACTOR_DIRECT_WRITE_WORKER_SOURCE,
+            false,
+            "/write",
+            env_usize("DD_BENCH_KEY_SPACE", 256),
+            Some("/sum-read"),
             false,
         )
         .await?;
@@ -662,6 +816,32 @@ async fn main() -> Result<(), String> {
         )
         .await?;
     }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-blind-write") {
+        run_and_print(
+            &service,
+            "actor-stm-blind-write",
+            ACTOR_STM_BLIND_WRITE_WORKER_SOURCE,
+            true,
+            "/write",
+            1,
+            Some("/get-blind"),
+            profile_enabled,
+        )
+        .await?;
+    }
+    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-blind-write-multikey") {
+        run_and_print(
+            &service,
+            "actor-stm-blind-write-multikey",
+            ACTOR_STM_BLIND_WRITE_WORKER_SOURCE,
+            true,
+            "/write",
+            env_usize("DD_BENCH_KEY_SPACE", 256),
+            Some("/sum-blind"),
+            profile_enabled,
+        )
+        .await?;
+    }
     if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-put-inc") {
         run_and_print(
             &service,
@@ -737,20 +917,29 @@ async fn run_and_print(
     .await
     .map_err(|error| error.to_string())?;
     if let Some(verify_path) = verify_path {
-        let verify_invocation = if verify_path == "/sum" {
-            invocation(&format!("/sum?keys={}", key_space.max(1)), requests + 1, 1)
-        } else {
-            invocation(verify_path, requests + 1, 1)
-        };
-        let verify = service
-            .invoke(worker_name.clone(), verify_invocation)
-            .await
-            .map_err(|error| error.to_string())?;
-        let observed = String::from_utf8(verify.body).map_err(|error| error.to_string())?;
-        if observed.trim() != requests.to_string() {
+        let expected =
+            if verify_path == "/sum" || verify_path == "/sum-read" || verify_path == "/sum-blind" {
+                distinct_actor_keys(requests, key_space).len().to_string()
+            } else if verify_path == "/read" || verify_path == "/get-strong" {
+                "1".to_string()
+            } else if verify_path == "/get-blind" {
+                "1".to_string()
+            } else {
+                requests.to_string()
+            };
+        let observed = verify_expected_value(
+            service,
+            &worker_name,
+            requests,
+            key_space,
+            verify_path,
+            &expected,
+        )
+        .await?;
+        if observed.trim() != expected {
             return Err(format!(
                 "{label} verification failed: expected final count {}, got {}",
-                requests, observed
+                expected, observed
             ));
         }
     }
@@ -771,6 +960,87 @@ async fn run_and_print(
         print_profile(&profile);
     }
     Ok(())
+}
+
+async fn verify_expected_value(
+    service: &RuntimeService,
+    worker_name: &str,
+    requests: usize,
+    key_space: usize,
+    verify_path: &str,
+    expected: &str,
+) -> Result<String, String> {
+    let deadline = TokioInstant::now() + Duration::from_secs(2);
+    loop {
+        let observed =
+            if verify_path == "/sum" || verify_path == "/sum-read" || verify_path == "/sum-blind" {
+                verify_distinct_actor_sum(service, worker_name, requests, key_space, verify_path)
+                    .await?
+            } else {
+                let verify = service
+                    .invoke(
+                        worker_name.to_string(),
+                        invocation(
+                            if verify_path == "/get-blind" {
+                                "/get"
+                            } else {
+                                verify_path
+                            },
+                            requests + 1,
+                            1,
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                String::from_utf8(verify.body).map_err(|error| error.to_string())?
+            };
+        if observed.trim() == expected {
+            return Ok(observed);
+        }
+        if TokioInstant::now() >= deadline {
+            return Ok(observed);
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn verify_distinct_actor_sum(
+    service: &RuntimeService,
+    worker_name: &str,
+    requests: usize,
+    key_space: usize,
+    path: &str,
+) -> Result<String, String> {
+    let read_path = if path == "/sum-read" {
+        "/get-strong"
+    } else {
+        "/get"
+    };
+    let mut total = 0usize;
+    for (offset, actor_key) in distinct_actor_keys(requests, key_space)
+        .into_iter()
+        .enumerate()
+    {
+        let verify = service
+            .invoke(
+                worker_name.to_string(),
+                WorkerInvocation {
+                    method: "GET".to_string(),
+                    url: format!("http://worker{read_path}?key={actor_key}"),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    request_id: format!("bench-verify-{offset}"),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        total += String::from_utf8(verify.body)
+            .map_err(|error| error.to_string())?
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(total.to_string())
 }
 
 async fn take_profile(
@@ -799,8 +1069,11 @@ fn print_profile(profile: &ActorProfileSnapshot) {
         return;
     }
     println!(
-        "profile-actor js_read={:.2}ms freshness={:.2}ms hydrate_full={:.2}ms hydrate_keys={:.2}ms cache hit={} miss={} stale={}",
+        "profile-actor js_read={:.2}ms js_commit={:.2}ms js_blind_commit={:.2}ms js_validate={:.2}ms freshness={:.2}ms hydrate_full={:.2}ms hydrate_keys={:.2}ms cache hit={} miss={} stale={}",
         metric_mean_ms(&profile.js_read_only_total),
+        metric_mean_ms(&profile.js_txn_commit),
+        metric_mean_ms(&profile.js_txn_blind_commit),
+        metric_mean_ms(&profile.js_txn_validate),
         metric_mean_ms(&profile.js_freshness_check),
         metric_mean_ms(&profile.js_hydrate_full),
         metric_mean_ms(&profile.js_hydrate_keys),
@@ -809,13 +1082,22 @@ fn print_profile(profile: &ActorProfileSnapshot) {
         profile.js_cache_stale.calls,
     );
     println!(
-        "profile-actor-op snapshot={:.2}ms version={:.2}ms validate={:.2}ms store_snapshot={:.2}ms store_keys={:.2}ms store_version={:.2}ms",
+        "profile-actor-op read={:.2}ms snapshot={:.2}ms version={:.2}ms validate={:.2}ms apply={:.2}ms blind_apply={:.2}ms store_read={:.2}ms store_snapshot={:.2}ms store_keys={:.2}ms store_version={:.2}ms store_apply={:.2}ms store_validate={:.2}ms store_write={:.2}ms store_blind_apply={:.2}ms store_blind_write={:.2}ms",
+        metric_mean_ms(&profile.op_read),
         metric_mean_ms(&profile.op_snapshot),
         metric_mean_ms(&profile.op_version_if_newer),
         metric_mean_ms(&profile.op_validate_reads),
+        metric_mean_ms(&profile.op_apply_batch),
+        metric_mean_ms(&profile.op_apply_blind_batch),
+        metric_mean_ms(&profile.store_read),
         metric_mean_ms(&profile.store_snapshot),
         metric_mean_ms(&profile.store_snapshot_keys),
         metric_mean_ms(&profile.store_version_if_newer),
+        metric_mean_ms(&profile.store_apply_batch),
+        metric_mean_ms(&profile.store_apply_batch_validate),
+        metric_mean_ms(&profile.store_apply_batch_write),
+        metric_mean_ms(&profile.store_apply_blind_batch),
+        metric_mean_ms(&profile.store_apply_blind_batch_write),
     );
 }
 
@@ -914,10 +1196,12 @@ fn percentile_ms(latencies: &[Duration], quantile: f64) -> f64 {
 }
 
 fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvocation {
+    let actor_key_mode = ActorKeyMode::from_env();
+    let actor_key = actor_key(idx, key_space, actor_key_mode, ACTOR_NAMESPACE_SHARDS);
+
     let url = if key_space > 1 {
         let separator = if path.contains('?') { '&' } else { '?' };
-        let actor_idx = idx % key_space;
-        format!("http://worker{path}{separator}key=bench-{actor_idx}")
+        format!("http://worker{path}{separator}key={actor_key}")
     } else {
         format!("http://worker{path}")
     };
@@ -927,6 +1211,82 @@ fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvocation {
         headers: Vec::new(),
         body: Vec::new(),
         request_id: format!("bench-actor-{idx}"),
+    }
+}
+
+fn actor_shard(actor_key: &str, namespace_shards: usize) -> usize {
+    if namespace_shards <= 1 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    actor_key.hash(&mut hasher);
+    (hasher.finish() as usize) % namespace_shards
+}
+
+fn actor_key(idx: usize, key_space: usize, mode: ActorKeyMode, namespace_shards: usize) -> String {
+    if key_space == 1 {
+        return "hot".to_string();
+    }
+
+    let actor_slot = idx % key_space;
+    match mode {
+        ActorKeyMode::Pool => format!("bench-{actor_slot}"),
+        ActorKeyMode::Unique => format!("bench-{idx}"),
+        ActorKeyMode::SameShard => {
+            let shard = actor_shard("bench-direct-same-shard-anchor", namespace_shards);
+            actor_key_for_shard_occurrence(
+                shard,
+                actor_slot,
+                namespace_shards,
+                "bench-direct-sameshard",
+            )
+        }
+        ActorKeyMode::CrossShard => {
+            let target_shard = actor_slot % namespace_shards;
+            let occurrence = actor_slot / namespace_shards;
+            actor_key_for_shard_occurrence(
+                target_shard,
+                occurrence,
+                namespace_shards,
+                "bench-direct-cross-shard",
+            )
+        }
+    }
+}
+
+fn distinct_actor_keys(requests: usize, key_space: usize) -> Vec<String> {
+    let actor_key_mode = ActorKeyMode::from_env();
+    let mut keys = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for idx in 1..=requests {
+        let key = actor_key(idx, key_space, actor_key_mode, ACTOR_NAMESPACE_SHARDS);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn actor_key_for_shard_occurrence(
+    target_shard: usize,
+    occurrence: usize,
+    namespace_shards: usize,
+    prefix: &str,
+) -> String {
+    if namespace_shards <= 1 {
+        return format!("{prefix}-{occurrence}");
+    }
+    let mut sequence = 0;
+    let mut seen = 0;
+    loop {
+        let candidate = format!("{prefix}-{sequence}");
+        if actor_shard(&candidate, namespace_shards) == target_shard {
+            if seen == occurrence {
+                return candidate;
+            }
+            seen += 1;
+        }
+        sequence += 1;
     }
 }
 
@@ -966,6 +1326,7 @@ fn runtime_service_config(
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
             database_url: format!("file:{}", db_path.display()),
+            actor_namespace_shards: 16,
             actor_db_cache_max_open: 4096,
             actor_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,

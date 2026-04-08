@@ -107,6 +107,7 @@ impl Default for RuntimeConfig {
 pub struct RuntimeStorageConfig {
     pub store_dir: PathBuf,
     pub database_url: String,
+    pub actor_namespace_shards: usize,
     pub actor_db_cache_max_open: usize,
     pub actor_db_idle_ttl: Duration,
     pub worker_store_enabled: bool,
@@ -121,6 +122,7 @@ impl Default for RuntimeStorageConfig {
         Self {
             store_dir,
             database_url,
+            actor_namespace_shards: 16,
             actor_db_cache_max_open: 4096,
             actor_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: !cfg!(test),
@@ -826,6 +828,11 @@ impl RuntimeService {
                 "actor_db_cache_max_open must be greater than 0",
             ));
         }
+        if storage.actor_namespace_shards == 0 {
+            return Err(PlatformError::internal(
+                "actor_namespace_shards must be greater than 0",
+            ));
+        }
         if storage.actor_db_idle_ttl.is_zero() {
             return Err(PlatformError::internal(
                 "actor_db_idle_ttl must be greater than 0",
@@ -845,6 +852,7 @@ impl RuntimeService {
         kv_store.set_profile_enabled(runtime.kv_profile_enabled);
         let actor_store = ActorStore::new(
             storage.store_dir.join("actors"),
+            storage.actor_namespace_shards,
             storage.actor_db_cache_max_open,
             storage.actor_db_idle_ttl,
         )
@@ -7595,6 +7603,17 @@ export default {
     const id = env.MY_ACTOR.idFromName(key);
     const actor = env.MY_ACTOR.get(id);
 
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_actor_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_actor_profile_reset?.();
+      return new Response("ok");
+    }
+
     if (url.pathname === "/run") {
       await actor.atomic((state) => {
         const slot = String(state.id);
@@ -7683,6 +7702,39 @@ export default {
       return new Response("ok");
     }
 
+    if (url.pathname === "/stm-blind-write") {
+      const value = String(url.searchParams.get("value") ?? "1");
+      const committed = await actor.atomic((state) => {
+        state.set("count", value);
+        return value;
+      });
+      return new Response(String(committed));
+    }
+
+    if (url.pathname === "/stm-read-write") {
+      const value = String(url.searchParams.get("value") ?? "1");
+      const committed = await actor.atomic((state) => {
+        const previous = String(state.get("count") ?? "0");
+        state.set("count", value);
+        return previous + "->" + String(state.get("count") ?? "missing");
+      });
+      return new Response(String(committed));
+    }
+
+    if (url.pathname === "/direct-set") {
+      await actor.write("count", "5");
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/direct-delete") {
+      await actor.delete("count");
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/direct-get") {
+      return new Response(String(await actor.read("count") ?? "0"));
+    }
+
     if (url.pathname === "/get") {
       return new Response(String(await actor.atomic(readCount)));
     }
@@ -7713,10 +7765,49 @@ export default {
       return new Response(String(await actor.atomic((state) => state.get("count") ?? "missing")));
     }
 
+    if (url.pathname === "/direct-value") {
+      return new Response(String(await actor.read("count") ?? "missing"));
+    }
+
     if (url.pathname === "/current-value") {
       return new Response(String(await actor.atomic((state) => state.get("count") ?? "missing")));
     }
 
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn actor_multi_atomic_read_worker() -> String {
+        r#"
+export function seedOne(state) {
+  state.set("count", "1");
+  return true;
+}
+
+export function readCount(state) {
+  return String(state.get("count") ?? "0");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/seed") {
+      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName("bench-1"));
+      await actor.atomic(seedOne);
+      return new Response("ok");
+    }
+    if (url.pathname === "/sum") {
+      const keys = Math.max(1, Number(url.searchParams.get("keys") ?? "1") || 1);
+      let total = 0;
+      for (let i = 0; i < keys; i++) {
+        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(keys === 1 ? "hot" : `bench-${i}`));
+        total += Number(await actor.atomic(readCount));
+      }
+      return new Response(String(total));
+    }
     return new Response("not found", { status: 404 });
   },
 };
@@ -7774,6 +7865,17 @@ export default {
     const id = env.MY_ACTOR.idFromName(url.searchParams.get("key") ?? "default");
     const actor = env.MY_ACTOR.get(id);
 
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_actor_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_actor_profile_reset?.();
+      return new Response("ok");
+    }
+
     if (url.pathname === "/alpha/inc") {
       return new Response(String(await actor.atomic((state) => {
         const current = Number(state.get("count") ?? 0);
@@ -7823,6 +7925,10 @@ export default {
 
     if (url.pathname === "/stm/read-once") {
       return new Response(String(await actor.atomic(readOnce)));
+    }
+
+    if (url.pathname === "/read-direct") {
+      return new Response(String(await actor.read("a") ?? "missing"));
     }
 
     if (url.pathname === "/stm/read-pair") {
@@ -7997,6 +8103,7 @@ export default {
             storage: RuntimeStorageConfig {
                 store_dir: PathBuf::from(&store_dir),
                 database_url: format!("file:{db_path}"),
+                actor_namespace_shards: 16,
                 actor_db_cache_max_open: 4096,
                 actor_db_idle_ttl: Duration::from_secs(60),
                 worker_store_enabled: false,
@@ -10934,6 +11041,550 @@ export default {
 
     #[tokio::test]
     #[serial]
+    async fn actor_direct_write_visibility_roundtrip_works() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let set = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/direct-set?key=user-direct-1", "direct-set"),
+            )
+            .await
+            .expect("direct set should succeed");
+        assert_eq!(set.status, 200);
+
+        let after_set = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/direct-get?key=user-direct-1", "direct-get-set"),
+            )
+            .await
+            .expect("direct get after set should succeed");
+        assert_eq!(after_set.status, 200);
+        assert_eq!(String::from_utf8(after_set.body).expect("utf8"), "5");
+
+        let delete = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/direct-delete?key=user-direct-1", "direct-delete"),
+            )
+            .await
+            .expect("direct delete should succeed");
+        assert_eq!(delete.status, 200);
+
+        let after_delete = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/direct-get?key=user-direct-1", "direct-get-delete"),
+            )
+            .await
+            .expect("direct get after delete should succeed");
+        assert_eq!(after_delete.status, 200);
+        assert_eq!(String::from_utf8(after_delete.body).expect("utf8"), "0");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_direct_writes_preserve_distinct_actor_updates() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 8,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let keys = (0..5)
+            .map(|idx| format!("user-direct-distinct-{idx}"))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            let set = service
+                .invoke(
+                    "actor".to_string(),
+                    test_invocation_with_path(
+                        &format!("/direct-set?key={key}"),
+                        &format!("direct-set-{key}"),
+                    ),
+                )
+                .await
+                .expect("direct set should succeed");
+            assert_eq!(set.status, 200);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut observed_total;
+        loop {
+            observed_total = 0;
+            for key in &keys {
+                let output = service
+                    .invoke(
+                        "actor".to_string(),
+                        test_invocation_with_path(
+                            &format!("/direct-get?key={key}"),
+                            &format!("direct-get-{key}"),
+                        ),
+                    )
+                    .await
+                    .expect("direct get should succeed");
+                assert_eq!(output.status, 200);
+                observed_total += String::from_utf8(output.body)
+                    .expect("utf8")
+                    .parse::<usize>()
+                    .expect("direct value should parse");
+            }
+            if observed_total == keys.len() * 5 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(observed_total, keys.len() * 5);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_blind_stm_write_uses_blind_apply_path() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            actor_profile_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile_reset", "actor-blind-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let write = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path(
+                    "/stm-blind-write?key=user-blind-stm&value=7",
+                    "actor-blind-write",
+                ),
+            )
+            .await
+            .expect("blind stm write should succeed");
+        assert_eq!(write.status, 200);
+        assert_eq!(String::from_utf8(write.body).expect("utf8"), "7");
+
+        let output = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile", "actor-blind-profile"),
+            )
+            .await
+            .expect("profile should succeed");
+        let profile: Value = crate::json::from_string(
+            String::from_utf8(output.body).expect("profile body should be utf8"),
+        )
+        .expect("profile should parse");
+        assert!(
+            profile["snapshot"]["op_apply_blind_batch"]["calls"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(
+            profile["snapshot"]["op_apply_batch"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert!(
+            profile["snapshot"]["js_txn_blind_commit"]["calls"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_mixed_stm_write_stays_on_full_apply_path() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            actor_profile_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/seed?key=user-mixed-stm", "actor-mixed-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile_reset", "actor-mixed-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let write = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path(
+                    "/stm-read-write?key=user-mixed-stm&value=9",
+                    "actor-mixed-write",
+                ),
+            )
+            .await
+            .expect("mixed stm write should succeed");
+        assert_eq!(write.status, 200);
+        assert_eq!(String::from_utf8(write.body).expect("utf8"), "0->9");
+
+        let output = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile", "actor-mixed-profile"),
+            )
+            .await
+            .expect("profile should succeed");
+        let profile: Value = crate::json::from_string(
+            String::from_utf8(output.body).expect("profile body should be utf8"),
+        )
+        .expect("profile should parse");
+        assert!(
+            profile["snapshot"]["op_apply_batch"]["calls"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(
+            profile["snapshot"]["op_apply_blind_batch"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert!(
+            profile["snapshot"]["js_txn_commit"]["calls"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_direct_read_uses_point_read_lane() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            actor_profile_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile_reset", "actor-direct-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let read = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path(
+                    "/direct-get?key=user-direct-fast-read",
+                    "actor-direct-read",
+                ),
+            )
+            .await
+            .expect("direct read should succeed");
+        assert_eq!(read.status, 200);
+        assert_eq!(String::from_utf8(read.body).expect("utf8"), "0");
+
+        let output = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile", "actor-direct-profile"),
+            )
+            .await
+            .expect("profile should succeed");
+        let profile: Value = crate::json::from_string(
+            String::from_utf8(output.body).expect("profile body should be utf8"),
+        )
+        .expect("profile should parse");
+        assert!(
+            profile["snapshot"]["op_read"]["calls"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        assert_eq!(
+            profile["snapshot"]["op_snapshot"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile["snapshot"]["op_version_if_newer"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_read_only_atomic_avoids_stm_commit_path() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            actor_profile_enabled: true,
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor".to_string(),
+                actor_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile_reset", "actor-read-only-profile-reset"),
+            )
+            .await
+            .expect("profile reset should succeed");
+
+        let read = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/get?key=user-read-only-fast", "actor-read-only"),
+            )
+            .await
+            .expect("atomic read should succeed");
+        assert_eq!(read.status, 200);
+        assert_eq!(String::from_utf8(read.body).expect("utf8"), "0");
+
+        let output = service
+            .invoke(
+                "actor".to_string(),
+                test_invocation_with_path("/__profile", "actor-read-only-profile"),
+            )
+            .await
+            .expect("profile should succeed");
+        let profile: Value = crate::json::from_string(
+            String::from_utf8(output.body).expect("profile body should be utf8"),
+        )
+        .expect("profile should parse");
+        assert_eq!(
+            profile["snapshot"]["op_snapshot"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile["snapshot"]["op_validate_reads"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile["snapshot"]["op_apply_batch"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile["snapshot"]["js_txn_validate"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            profile["snapshot"]["js_txn_commit"]["calls"]
+                .as_u64()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_multiple_atomic_reads_in_one_request_complete() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-multi-read".to_string(),
+                actor_multi_atomic_read_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let seed = service
+            .invoke(
+                "actor-multi-read".to_string(),
+                test_invocation_with_path("/seed", "multi-read-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+        assert_eq!(seed.status, 200);
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.invoke(
+                "actor-multi-read".to_string(),
+                test_invocation_with_path("/sum?keys=2", "multi-read-sum"),
+            ),
+        )
+        .await
+        .expect("sum should not hang")
+        .expect("sum invoke should succeed");
+        assert_eq!(output.status, 200);
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "1");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
         let service = test_service(RuntimeConfig {
             min_isolates: 0,
@@ -10979,6 +11630,15 @@ export default {
             .expect("warm constructor value should succeed");
         assert_eq!(String::from_utf8(warm_ctor.body).expect("utf8"), "7");
 
+        let warm_direct = service
+            .invoke(
+                "actor-ctor".to_string(),
+                test_invocation_with_path("/direct-value", "ctor-direct-warm"),
+            )
+            .await
+            .expect("warm direct value should succeed");
+        assert_eq!(String::from_utf8(warm_direct.body).expect("utf8"), "7");
+
         timeout(Duration::from_secs(3), async {
             loop {
                 let stats = service
@@ -11002,6 +11662,15 @@ export default {
             .await
             .expect("cold constructor value should succeed");
         assert_eq!(String::from_utf8(cold_ctor.body).expect("utf8"), "7");
+
+        let cold_direct = service
+            .invoke(
+                "actor-ctor".to_string(),
+                test_invocation_with_path("/direct-value", "ctor-direct-cold"),
+            )
+            .await
+            .expect("cold direct value should succeed");
+        assert_eq!(String::from_utf8(cold_direct.body).expect("utf8"), "7");
 
         let current = service
             .invoke(

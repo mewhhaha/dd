@@ -432,6 +432,7 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
         storage: RuntimeStorageConfig {
             store_dir: paths.store_dir.clone(),
             database_url: format!("file:{}", paths.db_path.display()),
+            actor_namespace_shards: 16,
             actor_db_cache_max_open: 4096,
             actor_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
