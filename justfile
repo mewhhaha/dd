@@ -4,15 +4,15 @@ default_app := "dd-private-8956e096"
 default_fly_config := "deploy/fly/fly.toml"
 default_private_server := "http://127.0.0.1:18081"
 
-# Materialize vendor/<crate> from the locked crates.io source and apply patches/<crate>.patch if it exists.
+# Materialize patched-crates/<crate> from crates.io source and apply patches/<crate>.patch if it exists.
 patch crate version='':
   ./scripts/patch-crate.sh {{crate}} {{version}}
 
-# Replace an existing vendored crate from the local cargo registry cache, then apply patches/<crate>.patch.
+# Replace an existing patched crate from crates.io source, then apply patches/<crate>.patch.
 patch-refresh crate version='':
   PATCH_REFRESH=1 ./scripts/patch-crate.sh {{crate}} {{version}}
 
-# Regenerate patches/<crate>.patch from vendor/<crate> versus the locked crates.io source.
+# Regenerate patches/<crate>.patch from patched-crates/<crate> versus the locked crates.io source.
 patch-save crate version='':
   ./scripts/patch-save-crate.sh {{crate}} {{version}}
 

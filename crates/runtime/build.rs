@@ -8,7 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/http_client.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry.ts");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry_util.ts");
-    println!("cargo:rerun-if-changed=../../vendor/deno_crypto/00_crypto.js");
+    println!("cargo:rerun-if-changed=../../patched-crates/deno_crypto/00_crypto.js");
 
     compile_actor_rpc_schema();
 
@@ -155,7 +155,7 @@ fn generate_deno_js_extension() {
         ),
         (
             "ext:deno_crypto/00_crypto.js",
-            PathBuf::from("../../vendor/deno_crypto/00_crypto.js"),
+            PathBuf::from("../../patched-crates/deno_crypto/00_crypto.js"),
         ),
         (
             "ext:dd_deno_runtime/init.js",

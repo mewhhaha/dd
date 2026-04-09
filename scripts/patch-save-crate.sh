@@ -10,10 +10,29 @@ if [[ -z "$crate" ]]; then
 fi
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-dest_dir="$repo_root/vendor/$crate"
+dest_dir="$repo_root/patched-crates/$crate"
+
+download_crate_source() {
+  local crate="$1"
+  local version="$2"
+  local output_dir="$3"
+  local tmp_dir archive extract_dir
+
+  tmp_dir="$(mktemp -d)"
+  archive="$tmp_dir/${crate}-${version}.crate"
+  extract_dir="$tmp_dir/extract"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  mkdir -p "$extract_dir"
+  curl -L --fail --show-error --silent \
+    "https://crates.io/api/v1/crates/${crate}/${version}/download" \
+    -o "$archive"
+  tar -xzf "$archive" -C "$extract_dir"
+  cp -R "$extract_dir/${crate}-${version}" "$output_dir"
+}
 
 if [[ ! -d "$dest_dir" ]]; then
-  echo "vendored crate not found at $dest_dir" >&2
+  echo "patched crate not found at $dest_dir" >&2
   echo "run 'just patch $crate ${version}' first" >&2
   exit 1
 fi
@@ -50,20 +69,29 @@ if [[ -z "$version" ]]; then
 fi
 
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-source_dir="$(
-  find "$cargo_home/registry/src" -mindepth 2 -maxdepth 2 -type d -name "${crate}-${version}" -print -quit 2>/dev/null
-)"
+source_dir=""
+if [[ -d "$cargo_home/registry/src" ]]; then
+  source_dir="$(
+    find "$cargo_home/registry/src" -mindepth 2 -maxdepth 2 -type d -name "${crate}-${version}" -print -quit 2>/dev/null
+  )"
+fi
 
+pristine_tmp_dir=""
+tmp_file=""
 if [[ -z "$source_dir" ]]; then
-  echo "crate source not found for ${crate}@${version} under $cargo_home/registry/src" >&2
-  echo "run 'cargo fetch --locked' first, then retry" >&2
-  exit 1
+  pristine_tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_file" "$pristine_tmp_dir"' EXIT
+  echo "crate source not found under $cargo_home/registry/src; downloading ${crate}@${version}" >&2
+  download_crate_source "$crate" "$version" "$pristine_tmp_dir/${crate}-${version}"
+  source_dir="$pristine_tmp_dir/${crate}-${version}"
 fi
 
 patch_dir="$repo_root/patches"
 patch_file="$patch_dir/${crate}.patch"
 tmp_file="$(mktemp)"
-trap 'rm -f "$tmp_file"' EXIT
+if [[ -z "$pristine_tmp_dir" ]]; then
+  trap 'rm -f "$tmp_file"' EXIT
+fi
 
 mkdir -p "$patch_dir"
 

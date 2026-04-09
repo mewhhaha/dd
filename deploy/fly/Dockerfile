@@ -18,8 +18,10 @@ RUN apt-get update \
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
+COPY scripts ./scripts
+COPY patches ./patches
+RUN ./scripts/patch-crate.sh deno_crypto
 COPY crates ./crates
-COPY vendor ./vendor
 
 RUN cargo build --locked --release -p dd_server
 
