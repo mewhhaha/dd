@@ -1213,6 +1213,7 @@ globalThis.__dd_execute_worker = (payload) => {
         flushRunning: false,
         flushTail: Promise.resolve(),
         pendingSubmissionCount: 0,
+        pendingSubmissionPromises: [],
         failedError: null,
         outputGate: Promise.resolve(),
       };
@@ -1470,12 +1471,19 @@ globalThis.__dd_execute_worker = (payload) => {
   const waitForActorDirectSubmission = async (entry, submissionId) => {
     const storageState = ensureActorStorageState(entry);
     try {
-      const result = await callOp("op_actor_state_await_submission", {
-        submission_id: Number(submissionId),
-      });
-      await syncFrozenTime();
-      if (!result || typeof result !== "object" || result.ok === false) {
-        throw new Error(String(result?.error ?? "memory direct write submission failed"));
+      let result = null;
+      for (;;) {
+        result = await callOp("op_actor_state_await_submission", {
+          submission_id: Number(submissionId),
+        });
+        await syncFrozenTime();
+        if (!result || typeof result !== "object" || result.ok === false) {
+          throw new Error(String(result?.error ?? "memory direct write submission failed"));
+        }
+        if (result.pending !== true) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1));
       }
       storageState.committedVersion = Math.max(
         Number(storageState.committedVersion ?? -1),
@@ -1490,8 +1498,10 @@ globalThis.__dd_execute_worker = (payload) => {
         storageState.freshnessCheckedAtMs = performance.now();
         storageState.stale = false;
       }
+      return Number(result.max_version ?? -1);
     } catch (error) {
       handleActorDirectWriteFailure(entry, error);
+      throw error;
     } finally {
       storageState.pendingSubmissionCount = Math.max(
         0,
@@ -1528,9 +1538,14 @@ globalThis.__dd_execute_worker = (payload) => {
           throw new Error(String(result?.error ?? "memory storage batch flush failed"));
         }
         storageState.pendingSubmissionCount += 1;
-        waitForActorDirectSubmission(entry, Number(result.submission_id ?? 0)).catch((error) => {
-          handleActorDirectWriteFailure(entry, error);
-        });
+        const submission = waitForActorDirectSubmission(entry, Number(result.submission_id ?? 0));
+        storageState.pendingSubmissionPromises.push(submission);
+        submission.finally(() => {
+          const index = storageState.pendingSubmissionPromises.indexOf(submission);
+          if (index >= 0) {
+            storageState.pendingSubmissionPromises.splice(index, 1);
+          }
+        }).catch(() => {});
       }
     })()
       .catch((error) => {
@@ -1549,7 +1564,6 @@ globalThis.__dd_execute_worker = (payload) => {
       throw storageState.failedError;
     }
     storageState.pendingMutations.push(mutation);
-    flushActorStorage(entry, runtimeRequestId).catch(() => {});
   };
 
   const ensureActorStorageQueued = async (entry, runtimeRequestId) => {
@@ -1560,6 +1574,12 @@ globalThis.__dd_execute_worker = (payload) => {
     if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
       await flushActorStorage(entry, runtimeRequestId);
     }
+    if (storageState.pendingSubmissionPromises.length > 0) {
+      await Promise.all(Array.from(storageState.pendingSubmissionPromises));
+    }
+    if (storageState.failedError) {
+      throw storageState.failedError;
+    }
   };
 
   const waitForActorFlush = async (entry, runtimeRequestId) => {
@@ -1569,6 +1589,9 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
       await flushActorStorage(entry, runtimeRequestId);
+    }
+    if (storageState.pendingSubmissionPromises.length > 0) {
+      await Promise.all(Array.from(storageState.pendingSubmissionPromises));
     }
     if (storageState.failedError) {
       throw storageState.failedError;
@@ -1808,7 +1831,9 @@ globalThis.__dd_execute_worker = (payload) => {
     storageState.stale = false;
     txn.committed = true;
     txn.committedVersion = committedVersion;
-    await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
+    if (txn.deferred.length > 0 || txn.accepted === true || txn.sideEffects === true) {
+      await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
+    }
     recordActorProfile("js_txn_commit", performance.now() - started, writes.length + reads.length + 1);
     return true;
   };

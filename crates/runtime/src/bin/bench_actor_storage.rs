@@ -1,5 +1,7 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
-use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
+use runtime::{
+    RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, WorkerDebugDump,
+};
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -33,6 +35,7 @@ struct ScenarioResult {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
 struct ActorProfileMetric {
     calls: u64,
     total_us: u64,
@@ -59,6 +62,12 @@ struct ActorProfileSnapshot {
     op_validate_reads: ActorProfileMetric,
     op_apply_batch: ActorProfileMetric,
     op_apply_blind_batch: ActorProfileMetric,
+    store_direct_enqueue: ActorProfileMetric,
+    store_direct_await: ActorProfileMetric,
+    store_direct_queue_load: ActorProfileMetric,
+    store_direct_queue_flush: ActorProfileMetric,
+    store_direct_queue_delete: ActorProfileMetric,
+    store_direct_waiter_complete: ActorProfileMetric,
     store_read: ActorProfileMetric,
     store_snapshot: ActorProfileMetric,
     store_snapshot_keys: ActorProfileMetric,
@@ -1143,6 +1152,7 @@ async fn run_and_print(
             if profile_enabled {
                 print_profile_on_failure(service, &worker_name, label).await;
             }
+            print_debug_dump_on_failure(service, &worker_name, label).await;
             println!(
                 "bench-final label={} outcome=error phase={} message={}",
                 label,
@@ -1166,6 +1176,7 @@ async fn run_and_print(
             if profile_enabled {
                 print_profile_on_failure(service, &worker_name, label).await;
             }
+            print_debug_dump_on_failure(service, &worker_name, label).await;
             println!(
                 "bench-final label={} outcome=error phase={} message={}",
                 label,
@@ -1203,6 +1214,7 @@ async fn run_and_print(
             if profile_enabled {
                 print_profile_on_failure(service, &worker_name, label).await;
             }
+            print_debug_dump_on_failure(service, &worker_name, label).await;
             println!(
                 "bench-final label={} outcome=error phase={} message={}",
                 label,
@@ -1248,6 +1260,7 @@ async fn run_and_print(
                 if profile_enabled {
                     print_profile_on_failure(service, &worker_name, label).await;
                 }
+                print_debug_dump_on_failure(service, &worker_name, label).await;
                 println!(
                     "bench-final label={} outcome=error phase={} message={}",
                     label,
@@ -1268,6 +1281,7 @@ async fn run_and_print(
                 if profile_enabled {
                     print_profile_on_failure(service, &worker_name, label).await;
                 }
+                print_debug_dump_on_failure(service, &worker_name, label).await;
                 println!(
                     "bench-final label={} outcome=error phase={} message={}",
                     label,
@@ -1288,6 +1302,7 @@ async fn run_and_print(
             if profile_enabled {
                 print_profile_on_failure(service, &worker_name, label).await;
             }
+            print_debug_dump_on_failure(service, &worker_name, label).await;
             println!(
                 "bench-final label={} outcome=error phase={} message={}",
                 label,
@@ -1321,6 +1336,7 @@ async fn run_and_print(
                 if profile_enabled {
                     print_profile_on_failure(service, &worker_name, label).await;
                 }
+                print_debug_dump_on_failure(service, &worker_name, label).await;
                 println!(
                     "bench-final label={} outcome=error phase={} message={}",
                     label,
@@ -1378,6 +1394,92 @@ async fn print_profile_on_failure(service: &RuntimeService, worker_name: &str, l
             print_profile(&profile);
         }
     }
+}
+
+async fn print_debug_dump_on_failure(service: &RuntimeService, worker_name: &str, label: &str) {
+    match timeout(
+        Duration::from_secs(2),
+        service.debug_dump(worker_name.to_string()),
+    )
+    .await
+    {
+        Err(_) => {
+            println!(
+                "bench-dump label={} outcome=error message=debug dump timed out",
+                label
+            );
+        }
+        Ok(None) => {
+            println!(
+                "bench-dump label={} outcome=error message=debug dump unavailable",
+                label
+            );
+        }
+        Ok(Some(dump)) => print_debug_dump(label, &dump),
+    }
+}
+
+fn print_debug_dump(label: &str, dump: &WorkerDebugDump) {
+    let pending_requests = dump
+        .isolates
+        .iter()
+        .flat_map(|isolate| isolate.pending_requests.iter())
+        .take(8)
+        .map(|request| {
+            format!(
+                "{}:{}:{}:{} actor={:?} target={:?}",
+                request.runtime_request_id,
+                request.method,
+                request.user_request_id,
+                request.url,
+                request.actor_key,
+                request.target_isolate_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let queued_requests = dump
+        .queued_requests
+        .iter()
+        .take(8)
+        .map(|request| {
+            format!(
+                "{}:{}:{}:{} actor={:?} target={:?}",
+                request.runtime_request_id,
+                request.method,
+                request.user_request_id,
+                request.url,
+                request.actor_key,
+                request.target_isolate_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let isolate_summary = dump
+        .isolates
+        .iter()
+        .map(|isolate| {
+            format!(
+                "{}:inflight={},wait_until={},pending={}",
+                isolate.id,
+                isolate.inflight_count,
+                isolate.pending_wait_until,
+                isolate.pending_requests.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    println!(
+        "bench-dump label={} outcome=ok generation={} queued={} isolates={} owners={:?} actor_inflight={:?} queued_requests={} pending_requests={}",
+        label,
+        dump.generation,
+        dump.queued,
+        isolate_summary,
+        dump.actor_owners.iter().take(8).collect::<Vec<_>>(),
+        dump.actor_inflight.iter().take(8).collect::<Vec<_>>(),
+        queued_requests,
+        pending_requests,
+    );
 }
 
 async fn verify_expected_value(
@@ -1597,6 +1699,18 @@ fn print_profile(profile: &ActorProfileSnapshot) {
         metric_mean_ms(&profile.store_apply_batch_write),
         metric_mean_ms(&profile.store_apply_blind_batch),
         metric_mean_ms(&profile.store_apply_blind_batch_write),
+    );
+    println!(
+        "profile-actor-direct enqueue={:.2}ms await={:.2}ms queue_load={:.2}ms queue_flush={:.2}ms queue_delete={:.2}ms waiter_complete={:.2}ms enqueue_calls={} await_calls={} flush_calls={}",
+        metric_mean_ms(&profile.store_direct_enqueue),
+        metric_mean_ms(&profile.store_direct_await),
+        metric_mean_ms(&profile.store_direct_queue_load),
+        metric_mean_ms(&profile.store_direct_queue_flush),
+        metric_mean_ms(&profile.store_direct_queue_delete),
+        metric_mean_ms(&profile.store_direct_waiter_complete),
+        profile.store_direct_enqueue.calls,
+        profile.store_direct_await.calls,
+        profile.store_direct_queue_flush.calls,
     );
 }
 

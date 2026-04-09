@@ -15,6 +15,6 @@ pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use kv::{KvStore, KvUtf8Lookup};
 pub use service::{
     DynamicDeployResult, InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService,
-    RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerStats,
-    WorkerStreamOutput,
+    RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump,
+    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamOutput,
 };

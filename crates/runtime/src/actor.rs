@@ -114,6 +114,12 @@ pub enum ActorProfileMetricKind {
     OpValidateReads,
     OpApplyBatch,
     OpApplyBlindBatch,
+    StoreDirectEnqueue,
+    StoreDirectAwait,
+    StoreDirectQueueLoad,
+    StoreDirectQueueFlush,
+    StoreDirectQueueDelete,
+    StoreDirectWaiterComplete,
     StoreRead,
     StoreSnapshot,
     StoreSnapshotKeys,
@@ -160,6 +166,12 @@ pub struct ActorProfileSnapshot {
     pub op_validate_reads: ActorProfileMetricSnapshot,
     pub op_apply_batch: ActorProfileMetricSnapshot,
     pub op_apply_blind_batch: ActorProfileMetricSnapshot,
+    pub store_direct_enqueue: ActorProfileMetricSnapshot,
+    pub store_direct_await: ActorProfileMetricSnapshot,
+    pub store_direct_queue_load: ActorProfileMetricSnapshot,
+    pub store_direct_queue_flush: ActorProfileMetricSnapshot,
+    pub store_direct_queue_delete: ActorProfileMetricSnapshot,
+    pub store_direct_waiter_complete: ActorProfileMetricSnapshot,
     pub store_read: ActorProfileMetricSnapshot,
     pub store_snapshot: ActorProfileMetricSnapshot,
     pub store_snapshot_keys: ActorProfileMetricSnapshot,
@@ -190,6 +202,12 @@ pub struct ActorProfile {
     op_validate_reads: ActorProfileMetric,
     op_apply_batch: ActorProfileMetric,
     op_apply_blind_batch: ActorProfileMetric,
+    store_direct_enqueue: ActorProfileMetric,
+    store_direct_await: ActorProfileMetric,
+    store_direct_queue_load: ActorProfileMetric,
+    store_direct_queue_flush: ActorProfileMetric,
+    store_direct_queue_delete: ActorProfileMetric,
+    store_direct_waiter_complete: ActorProfileMetric,
     store_read: ActorProfileMetric,
     store_snapshot: ActorProfileMetric,
     store_snapshot_keys: ActorProfileMetric,
@@ -655,6 +673,7 @@ impl ActorStore {
         actor_key: &str,
         mutations: &[ActorDirectMutation],
     ) -> Result<u64> {
+        let started = Instant::now();
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return Err(PlatformError::runtime("actor namespace must not be empty"));
@@ -696,7 +715,7 @@ impl ActorStore {
                 )
             })
             .collect::<Vec<_>>();
-        let conn = self.connect_shard(namespace, shard_index).await?;
+        let conn = self.connect_shard_uncached(namespace, shard_index).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -777,10 +796,17 @@ impl ActorStore {
             }
         }
         shard.notify.notify_one();
+        self.record_profile(
+            ActorProfileMetricKind::StoreDirectEnqueue,
+            started.elapsed().as_micros() as u64,
+            queued.len() as u64,
+        );
         Ok(submission_id)
     }
 
+    #[allow(dead_code)]
     pub async fn wait_direct_submission(&self, submission_id: u64) -> Result<i64> {
+        let started = Instant::now();
         loop {
             let notify = {
                 let mut submissions = self.write_submissions.lock().await;
@@ -792,12 +818,44 @@ impl ActorStore {
                 if let Some(result) = &entry.result {
                     let result = result.clone();
                     submissions.remove(&submission_id);
+                    self.record_profile(
+                        ActorProfileMetricKind::StoreDirectAwait,
+                        started.elapsed().as_micros() as u64,
+                        1,
+                    );
                     return result;
                 }
                 entry.notify.clone()
             };
-            notify.notified().await;
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
         }
+    }
+
+    pub fn try_poll_direct_submission(&self, submission_id: u64) -> Result<Option<i64>> {
+        let Ok(mut submissions) = self.write_submissions.try_lock() else {
+            return Ok(None);
+        };
+        Self::poll_direct_submission_locked(&mut submissions, submission_id)
+    }
+
+    fn poll_direct_submission_locked(
+        submissions: &mut HashMap<u64, ActorWriteSubmission>,
+        submission_id: u64,
+    ) -> Result<Option<i64>> {
+        let Some(entry) = submissions.get(&submission_id) else {
+            return Err(PlatformError::runtime(format!(
+                "unknown actor write submission {submission_id}"
+            )));
+        };
+        let Some(result) = &entry.result else {
+            return Ok(None);
+        };
+        let result = result.clone();
+        submissions.remove(&submission_id);
+        result.map(Some)
     }
 
     pub async fn apply_batch(
@@ -811,7 +869,11 @@ impl ActorStore {
         transactional: bool,
     ) -> Result<ActorBatchApplyResult> {
         let started = Instant::now();
-        let conn = self.connect(namespace, actor_key).await?;
+        let conn = if mutations.is_empty() {
+            self.connect(namespace, actor_key).await?
+        } else {
+            self.connect_uncached(namespace, actor_key).await?
+        };
         if mutations.is_empty() && reads.is_empty() && list_gate_version.is_none() {
             let max_version = self
                 .max_version_for_actor(&conn, actor_key)
@@ -1083,7 +1145,11 @@ impl ActorStore {
         mutations: &[ActorBatchMutation],
     ) -> Result<ActorBatchApplyResult> {
         let started = Instant::now();
-        let conn = self.connect(namespace, actor_key).await?;
+        let conn = if mutations.is_empty() {
+            self.connect(namespace, actor_key).await?
+        } else {
+            self.connect_uncached(namespace, actor_key).await?
+        };
         if mutations.is_empty() {
             let max_version = self
                 .max_version_for_actor(&conn, actor_key)
@@ -1308,8 +1374,8 @@ impl ActorStore {
                     {
                         Ok(batch) => batch,
                         Err(_) => {
-                            let mut state = shard.state.lock().await;
-                            state.pending_namespaces.remove(&namespace);
+                            did_work = true;
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                             continue;
                         }
                     };
@@ -1341,6 +1407,7 @@ impl ActorStore {
         entries: Vec<ActorPendingMutationEntry>,
         allow_split: bool,
     ) -> Result<()> {
+        let started = Instant::now();
         if entries.is_empty() {
             return Ok(());
         }
@@ -1351,7 +1418,8 @@ impl ActorStore {
                 .or_default()
                 .push(entry);
         }
-        let conn = self.connect_shard(namespace, shard_index).await?;
+        let actor_group_count = actor_groups.len() as u64;
+        let conn = self.connect_shard_uncached(namespace, shard_index).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -1442,6 +1510,8 @@ impl ActorStore {
                     .await
                     .map_err(actor_error)?;
                 }
+                let delete_started = Instant::now();
+                let mut deleted = 0u64;
                 for queue_id in actor_groups
                     .values()
                     .flat_map(|entries| entries.iter())
@@ -1453,7 +1523,13 @@ impl ActorStore {
                     )
                     .await
                     .map_err(actor_error)?;
+                    deleted += 1;
                 }
+                self.record_profile(
+                    ActorProfileMetricKind::StoreDirectQueueDelete,
+                    delete_started.elapsed().as_micros() as u64,
+                    deleted,
+                );
                 Ok::<(), PlatformError>(())
             }
             .await;
@@ -1461,6 +1537,11 @@ impl ActorStore {
             match outcome {
                 Ok(()) => match conn.execute("COMMIT", ()).await {
                     Ok(_) => {
+                        self.record_profile(
+                            ActorProfileMetricKind::StoreDirectQueueFlush,
+                            started.elapsed().as_micros() as u64,
+                            actor_group_count,
+                        );
                         for (actor_key, entries) in actor_groups {
                             let version = entries
                                 .iter()
@@ -1534,7 +1615,9 @@ impl ActorStore {
         actor_key: String,
         entries: Vec<ActorPendingMutationEntry>,
     ) -> Result<()> {
-        let conn = self.connect_shard(namespace, shard_index).await?;
+        let started = Instant::now();
+        let entry_count = entries.len() as u64;
+        let conn = self.connect_shard_uncached(namespace, shard_index).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -1622,6 +1705,8 @@ impl ActorStore {
                 )
                 .await
                 .map_err(actor_error)?;
+                let delete_started = Instant::now();
+                let mut deleted = 0u64;
                 for queue_id in entries.iter().flat_map(|entry| entry.queue_ids.iter().copied()) {
                     conn.execute(
                         "DELETE FROM actor_direct_queue WHERE queue_id = ?1",
@@ -1629,7 +1714,13 @@ impl ActorStore {
                     )
                     .await
                     .map_err(actor_error)?;
+                    deleted += 1;
                 }
+                self.record_profile(
+                    ActorProfileMetricKind::StoreDirectQueueDelete,
+                    delete_started.elapsed().as_micros() as u64,
+                    deleted,
+                );
                 Ok::<(), PlatformError>(())
             }
             .await;
@@ -1637,6 +1728,11 @@ impl ActorStore {
             match outcome {
                 Ok(()) => match conn.execute("COMMIT", ()).await {
                     Ok(_) => {
+                        self.record_profile(
+                            ActorProfileMetricKind::StoreDirectQueueFlush,
+                            started.elapsed().as_micros() as u64,
+                            entry_count,
+                        );
                         let version = entries
                             .iter()
                             .map(|entry| entry.token as i64)
@@ -1717,6 +1813,8 @@ impl ActorStore {
     }
 
     async fn complete_waiters(&self, waiters: Vec<u64>, version: i64) {
+        let started = Instant::now();
+        let waiter_count = waiters.len() as u64;
         let mut submissions = self.write_submissions.lock().await;
         for submission_id in waiters {
             let Some(entry) = submissions.get_mut(&submission_id) else {
@@ -1734,6 +1832,11 @@ impl ActorStore {
                 entry.notify.notify_waiters();
             }
         }
+        self.record_profile(
+            ActorProfileMetricKind::StoreDirectWaiterComplete,
+            started.elapsed().as_micros() as u64,
+            waiter_count,
+        );
     }
 
     async fn complete_waiters_for_tokens(
@@ -1802,6 +1905,20 @@ impl ActorStore {
             .await
     }
 
+    async fn connect_uncached(&self, namespace: &str, actor_key: &str) -> Result<Connection> {
+        let namespace = namespace.trim();
+        if namespace.is_empty() {
+            return Err(PlatformError::runtime("actor namespace must not be empty"));
+        }
+        let actor_key = actor_key.trim();
+        if actor_key.is_empty() {
+            return Err(PlatformError::runtime("actor key must not be empty"));
+        }
+
+        self.connect_shard_uncached(namespace, self.shard_index(actor_key))
+            .await
+    }
+
     async fn connect_shard(&self, namespace: &str, shard_index: usize) -> Result<Connection> {
         let db_key = self.database_key(namespace, shard_index);
         let now = Instant::now();
@@ -1843,6 +1960,24 @@ impl ActorStore {
             self.prune_databases_locked(&mut databases, now);
             database
         };
+        let conn = database.connect().map_err(actor_error)?;
+        configure_connection(&conn).await?;
+        Ok(conn)
+    }
+
+    async fn connect_shard_uncached(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+    ) -> Result<Connection> {
+        let path = self.db_path(namespace, shard_index);
+        ensure_parent_dir(&path)?;
+        let path_str = path.to_string_lossy().to_string();
+        let database = Builder::new_local(&path_str)
+            .build()
+            .await
+            .map_err(actor_error)?;
+        ensure_schema(&database).await?;
         let conn = database.connect().map_err(actor_error)?;
         configure_connection(&conn).await?;
         Ok(conn)
@@ -1949,6 +2084,7 @@ impl ActorStore {
         shard_index: usize,
         limit: usize,
     ) -> Result<Vec<ActorPendingMutationEntry>> {
+        let started = Instant::now();
         let conn = self.connect_shard(namespace, shard_index).await?;
         let mut rows = conn
             .query(
@@ -1972,7 +2108,14 @@ impl ActorStore {
                 token: row.get::<i64>(6).map_err(actor_error)? as u64,
             });
         }
-        Ok(coalesce_direct_queue_rows(loaded))
+        let loaded_len = loaded.len() as u64;
+        let coalesced = coalesce_direct_queue_rows(loaded);
+        self.record_profile(
+            ActorProfileMetricKind::StoreDirectQueueLoad,
+            started.elapsed().as_micros() as u64,
+            loaded_len,
+        );
+        Ok(coalesced)
     }
 
     async fn discover_namespaces_for_shard(&self, shard_index: usize) -> Result<Vec<String>> {
@@ -2004,7 +2147,10 @@ impl ActorStore {
     }
 
     fn database_key(&self, namespace: &str, shard_index: usize) -> String {
-        format!("{namespace}\u{1f}{shard_index}")
+        format!(
+            "{:?}\u{1e}{namespace}\u{1f}{shard_index}",
+            std::thread::current().id()
+        )
     }
 
     fn actor_version_key(namespace: &str, actor_key: &str) -> String {
@@ -2362,6 +2508,12 @@ impl ActorProfile {
             ActorProfileMetricKind::OpValidateReads => &self.op_validate_reads,
             ActorProfileMetricKind::OpApplyBatch => &self.op_apply_batch,
             ActorProfileMetricKind::OpApplyBlindBatch => &self.op_apply_blind_batch,
+            ActorProfileMetricKind::StoreDirectEnqueue => &self.store_direct_enqueue,
+            ActorProfileMetricKind::StoreDirectAwait => &self.store_direct_await,
+            ActorProfileMetricKind::StoreDirectQueueLoad => &self.store_direct_queue_load,
+            ActorProfileMetricKind::StoreDirectQueueFlush => &self.store_direct_queue_flush,
+            ActorProfileMetricKind::StoreDirectQueueDelete => &self.store_direct_queue_delete,
+            ActorProfileMetricKind::StoreDirectWaiterComplete => &self.store_direct_waiter_complete,
             ActorProfileMetricKind::StoreRead => &self.store_read,
             ActorProfileMetricKind::StoreSnapshot => &self.store_snapshot,
             ActorProfileMetricKind::StoreSnapshotKeys => &self.store_snapshot_keys,
@@ -2396,6 +2548,12 @@ impl ActorProfile {
             op_validate_reads: self.op_validate_reads.snapshot(),
             op_apply_batch: self.op_apply_batch.snapshot(),
             op_apply_blind_batch: self.op_apply_blind_batch.snapshot(),
+            store_direct_enqueue: self.store_direct_enqueue.snapshot(),
+            store_direct_await: self.store_direct_await.snapshot(),
+            store_direct_queue_load: self.store_direct_queue_load.snapshot(),
+            store_direct_queue_flush: self.store_direct_queue_flush.snapshot(),
+            store_direct_queue_delete: self.store_direct_queue_delete.snapshot(),
+            store_direct_waiter_complete: self.store_direct_waiter_complete.snapshot(),
             store_read: self.store_read.snapshot(),
             store_snapshot: self.store_snapshot.snapshot(),
             store_snapshot_keys: self.store_snapshot_keys.snapshot(),
@@ -2427,6 +2585,12 @@ impl ActorProfile {
         self.op_validate_reads.reset();
         self.op_apply_batch.reset();
         self.op_apply_blind_batch.reset();
+        self.store_direct_enqueue.reset();
+        self.store_direct_await.reset();
+        self.store_direct_queue_load.reset();
+        self.store_direct_queue_flush.reset();
+        self.store_direct_queue_delete.reset();
+        self.store_direct_waiter_complete.reset();
         self.store_read.reset();
         self.store_snapshot.reset();
         self.store_snapshot_keys.reset();
@@ -3177,6 +3341,77 @@ mod tests {
         .map_err(|_| {
             PlatformError::runtime(
                 "blind write threshold test timed out before completing 64 commits",
+            )
+        })??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_direct_queue_submissions_complete_past_repeated_threshold() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let store = ActorStore::new(
+                temp_root("direct-queue-threshold"),
+                16,
+                4,
+                Duration::from_secs(60),
+            )
+            .await?;
+
+            let mut observed_version = -1;
+            for idx in 0..64 {
+                let next_value = (idx + 1).to_string();
+                let mutation = ActorDirectMutation {
+                    key: "count".to_string(),
+                    value: next_value.as_bytes().to_vec(),
+                    encoding: ENCODING_UTF8.to_string(),
+                    deleted: false,
+                };
+                let submission_id =
+                    tokio::time::timeout(Duration::from_secs(2), store.enqueue_direct_batch(
+                        "ns",
+                        "actor-a",
+                        &[mutation],
+                    ))
+                    .await
+                    .map_err(|_| {
+                        PlatformError::runtime(format!(
+                            "direct queue enqueue timed out at iteration {idx}"
+                        ))
+                    })??;
+                let version =
+                    tokio::time::timeout(Duration::from_secs(2), store.wait_direct_submission(
+                        submission_id,
+                    ))
+                    .await
+                    .map_err(|_| {
+                        PlatformError::runtime(format!(
+                            "direct queue submission wait timed out at iteration {idx}"
+                        ))
+                    })??;
+                assert!(
+                    version >= observed_version,
+                    "direct queue version regressed at iteration {idx}: {version} < {observed_version}"
+                );
+                observed_version = version;
+            }
+
+            let final_value = store.point_read("ns", "actor-a", "count").await?;
+            assert_eq!(
+                String::from_utf8(
+                    final_value
+                        .record
+                        .expect("count should be present after repeated direct queue writes")
+                        .value
+                )
+                .expect("utf8"),
+                "64"
+            );
+            Ok::<(), PlatformError>(())
+        })
+        .await
+        .map_err(|_| {
+            PlatformError::runtime(
+                "direct queue threshold test timed out before completing 64 submissions",
             )
         })??;
         Ok(())

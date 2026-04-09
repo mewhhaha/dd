@@ -956,6 +956,7 @@ struct ActorStateAwaitSubmissionPayload {
 #[derive(Debug, Serialize)]
 struct ActorStateAwaitSubmissionResult {
     ok: bool,
+    pending: bool,
     max_version: i64,
     error: String,
 }
@@ -2807,10 +2808,18 @@ async fn op_actor_state_get(
         }
     };
     let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .point_read(&namespace, &actor_key, &payload.item_key)
-        .await
-    {
+    let store_for_read = store.clone();
+    let item_key = payload.item_key;
+    let read_result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+        runtime.block_on(store_for_read.point_read(&namespace, &actor_key, &item_key))
+    })
+    .join()
+    .unwrap_or_else(|_| Err(PlatformError::internal("actor point read worker panicked")));
+    match read_result {
         Ok(point) => {
             store.record_profile(
                 ActorProfileMetricKind::OpRead,
@@ -2869,16 +2878,31 @@ async fn op_actor_state_snapshot(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    match if keys.is_empty() {
-        store.snapshot(&namespace, &actor_key).await
-    } else {
-        store.snapshot_keys(&namespace, &actor_key, &keys).await
-    } {
+    let profile_items = keys.len().max(1) as u64;
+    let store_for_snapshot = store.clone();
+    let snapshot_result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+        runtime.block_on(async move {
+            if keys.is_empty() {
+                store_for_snapshot.snapshot(&namespace, &actor_key).await
+            } else {
+                store_for_snapshot
+                    .snapshot_keys(&namespace, &actor_key, &keys)
+                    .await
+            }
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| Err(PlatformError::internal("actor snapshot worker panicked")));
+    match snapshot_result {
         Ok(snapshot) => {
             store.record_profile(
                 ActorProfileMetricKind::OpSnapshot,
                 started.elapsed().as_micros() as u64,
-                keys.len().max(1) as u64,
+                profile_items,
             );
             ActorStateSnapshotResult {
                 ok: true,
@@ -3128,8 +3152,13 @@ async fn op_actor_state_apply_batch(
         Some(payload.list_gate_version)
     };
     let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .apply_batch(
+    let store_for_apply = store.clone();
+    let apply_result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+        runtime.block_on(store_for_apply.apply_batch(
             &namespace,
             &actor_key,
             &reads,
@@ -3137,9 +3166,11 @@ async fn op_actor_state_apply_batch(
             expected_base_version,
             list_gate_version,
             payload.transactional,
-        )
-        .await
-    {
+        ))
+    })
+    .join()
+    .unwrap_or_else(|_| Err(PlatformError::internal("actor apply worker panicked")));
+    match apply_result {
         Ok(result) => {
             store.record_profile(
                 ActorProfileMetricKind::OpApplyBatch,
@@ -3198,10 +3229,17 @@ async fn op_actor_state_apply_blind_batch(
         })
         .collect::<Vec<_>>();
     let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .apply_blind_batch(&namespace, &actor_key, &mutations)
-        .await
-    {
+    let store_for_apply = store.clone();
+    let apply_result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+        runtime.block_on(store_for_apply.apply_blind_batch(&namespace, &actor_key, &mutations))
+    })
+    .join()
+    .unwrap_or_else(|_| Err(PlatformError::internal("actor blind apply worker panicked")));
+    match apply_result {
         Ok(result) => {
             store.record_profile(
                 ActorProfileMetricKind::OpApplyBlindBatch,
@@ -3256,10 +3294,21 @@ async fn op_actor_state_enqueue_batch(
         })
         .collect::<Vec<_>>();
     let store = state.borrow().borrow::<ActorStore>().clone();
-    match store
-        .enqueue_direct_batch(&namespace, &actor_key, &mutations)
-        .await
-    {
+    let store_for_enqueue = store.clone();
+    let enqueue_result = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+        runtime.block_on(store_for_enqueue.enqueue_direct_batch(&namespace, &actor_key, &mutations))
+    })
+    .join()
+    .unwrap_or_else(|_| {
+        Err(PlatformError::internal(
+            "actor direct enqueue worker panicked",
+        ))
+    });
+    match enqueue_result {
         Ok(submission_id) => ActorStateEnqueueBatchResult {
             ok: true,
             submission_id,
@@ -3280,17 +3329,45 @@ async fn op_actor_state_await_submission(
     #[serde] payload: ActorStateAwaitSubmissionPayload,
 ) -> ActorStateAwaitSubmissionResult {
     let store = state.borrow().borrow::<ActorStore>().clone();
-    match store.wait_direct_submission(payload.submission_id).await {
-        Ok(max_version) => ActorStateAwaitSubmissionResult {
-            ok: true,
-            max_version,
-            error: String::new(),
-        },
-        Err(error) => ActorStateAwaitSubmissionResult {
-            ok: false,
-            max_version: -1,
-            error: error.to_string(),
-        },
+    let started = Instant::now();
+    loop {
+        match store.try_poll_direct_submission(payload.submission_id) {
+            Ok(Some(max_version)) => {
+                store.record_profile(
+                    ActorProfileMetricKind::StoreDirectAwait,
+                    started.elapsed().as_micros() as u64,
+                    1,
+                );
+                return ActorStateAwaitSubmissionResult {
+                    ok: true,
+                    pending: false,
+                    max_version,
+                    error: String::new(),
+                };
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None) => {
+                return ActorStateAwaitSubmissionResult {
+                    ok: false,
+                    pending: false,
+                    max_version: -1,
+                    error: format!(
+                        "memory direct write submission {} timed out",
+                        payload.submission_id
+                    ),
+                };
+            }
+            Err(error) => {
+                return ActorStateAwaitSubmissionResult {
+                    ok: false,
+                    pending: false,
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        }
     }
 }
 

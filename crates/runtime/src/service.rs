@@ -151,6 +151,34 @@ pub struct WorkerStats {
     pub scale_down_count: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WorkerDebugDump {
+    pub generation: u64,
+    pub queued: usize,
+    pub actor_owners: Vec<(String, u64)>,
+    pub actor_inflight: Vec<(String, usize)>,
+    pub isolates: Vec<WorkerDebugIsolate>,
+    pub queued_requests: Vec<WorkerDebugRequest>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkerDebugIsolate {
+    pub id: u64,
+    pub inflight_count: usize,
+    pub pending_wait_until: usize,
+    pub pending_requests: Vec<WorkerDebugRequest>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkerDebugRequest {
+    pub runtime_request_id: String,
+    pub user_request_id: String,
+    pub method: String,
+    pub url: String,
+    pub actor_key: Option<String>,
+    pub target_isolate_id: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct WorkerStreamOutput {
     pub status: u16,
@@ -222,6 +250,10 @@ enum RuntimeCommand {
     Stats {
         worker_name: String,
         reply: oneshot::Sender<Option<WorkerStats>>,
+    },
+    DebugDump {
+        worker_name: String,
+        reply: oneshot::Sender<Option<WorkerDebugDump>>,
     },
     OpenWebsocket {
         worker_name: String,
@@ -1417,6 +1449,22 @@ impl RuntimeService {
         reply_rx.await.ok().flatten()
     }
 
+    pub async fn debug_dump(&self, worker_name: String) -> Option<WorkerDebugDump> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RuntimeCommand::DebugDump {
+                worker_name,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok().flatten()
+    }
+
     pub async fn cache_match(&self, request: CacheRequest) -> Result<CacheLookup> {
         let span = tracing::info_span!(
             "runtime.cache.match",
@@ -1756,6 +1804,9 @@ impl WorkerManager {
             }
             RuntimeCommand::Stats { worker_name, reply } => {
                 let _ = reply.send(self.worker_stats(&worker_name));
+            }
+            RuntimeCommand::DebugDump { worker_name, reply } => {
+                let _ = reply.send(self.worker_debug_dump(&worker_name));
             }
         }
     }
@@ -4051,16 +4102,12 @@ impl WorkerManager {
                 }
                 let isolate = &mut pool.isolates[isolate_idx];
                 isolate.served_requests += 1;
-                let completion_meta = if needs_completion_meta {
-                    Some(PendingReplyMeta {
-                        method: pending_invoke.request.method.clone(),
-                        url: pending_invoke.request.url.clone(),
-                        traceparent: traceparent.clone(),
-                        user_request_id: pending_invoke.request.request_id.clone(),
-                    })
-                } else {
-                    None
-                };
+                let completion_meta = Some(PendingReplyMeta {
+                    method: pending_invoke.request.method.clone(),
+                    url: pending_invoke.request.url.clone(),
+                    traceparent: traceparent.clone(),
+                    user_request_id: pending_invoke.request.request_id.clone(),
+                });
                 let command = IsolateCommand::Execute {
                     runtime_request_id: runtime_request_id.clone(),
                     completion_token: completion_token.clone(),
@@ -4171,7 +4218,7 @@ impl WorkerManager {
         request_id: &str,
         completion_token: &str,
         wait_until_count: usize,
-        result: Result<WorkerOutput>,
+        mut result: Result<WorkerOutput>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let mut reply = None;
@@ -4205,7 +4252,8 @@ impl WorkerManager {
                     );
                     return;
                 };
-                if pending.completion_token != completion_token {
+                let token_mismatch = pending.completion_token != completion_token;
+                if token_mismatch {
                     warn!(
                         worker = %worker_name,
                         generation,
@@ -4213,7 +4261,6 @@ impl WorkerManager {
                         request_id,
                         "dropping completion with invalid token"
                     );
-                    return;
                 }
 
                 isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
@@ -4232,7 +4279,11 @@ impl WorkerManager {
                         completion_traceparent = meta.traceparent;
                         user_request_id = meta.user_request_id;
                     }
-                    if wait_until_count > 0 {
+                    if token_mismatch {
+                        result = Err(PlatformError::internal(format!(
+                            "completion token mismatch for runtime request {request_id}"
+                        )));
+                    } else if wait_until_count > 0 {
                         isolate
                             .pending_wait_until
                             .insert(request_id.to_string(), completion_token.to_string());
@@ -5012,6 +5063,12 @@ impl WorkerManager {
         Some(pool.stats_snapshot())
     }
 
+    fn worker_debug_dump(&self, worker_name: &str) -> Option<WorkerDebugDump> {
+        let entry = self.workers.get(worker_name)?;
+        let pool = entry.pools.get(&entry.current_generation)?;
+        Some(pool.debug_dump())
+    }
+
     fn get_pool_mut(&mut self, worker_name: &str, generation: u64) -> Option<&mut WorkerPool> {
         self.workers
             .get_mut(worker_name)
@@ -5257,6 +5314,76 @@ impl WorkerPool {
             spawn_count: self.stats.spawn_count,
             reuse_count: self.stats.reuse_count,
             scale_down_count: self.stats.scale_down_count,
+        }
+    }
+
+    fn debug_dump(&self) -> WorkerDebugDump {
+        let mut actor_owners = self
+            .actor_owners
+            .iter()
+            .map(|(key, isolate_id)| (key.clone(), *isolate_id))
+            .collect::<Vec<_>>();
+        actor_owners.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut actor_inflight = self
+            .actor_inflight
+            .iter()
+            .map(|(key, count)| (key.clone(), *count))
+            .collect::<Vec<_>>();
+        actor_inflight.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let queued_requests = self
+            .queue
+            .iter()
+            .map(|pending| WorkerDebugRequest {
+                runtime_request_id: pending.runtime_request_id.clone(),
+                user_request_id: pending.request.request_id.clone(),
+                method: pending.request.method.clone(),
+                url: pending.request.url.clone(),
+                actor_key: pending.actor_route.as_ref().map(ActorRoute::owner_key),
+                target_isolate_id: pending.target_isolate_id,
+            })
+            .collect::<Vec<_>>();
+
+        let isolates = self
+            .isolates
+            .iter()
+            .map(|isolate| {
+                let mut pending_requests = isolate
+                    .pending_replies
+                    .iter()
+                    .map(|(runtime_request_id, pending)| {
+                        let meta = pending.completion_meta.as_ref();
+                        WorkerDebugRequest {
+                            runtime_request_id: runtime_request_id.clone(),
+                            user_request_id: meta
+                                .map(|meta| meta.user_request_id.clone())
+                                .unwrap_or_default(),
+                            method: meta.map(|meta| meta.method.clone()).unwrap_or_default(),
+                            url: meta.map(|meta| meta.url.clone()).unwrap_or_default(),
+                            actor_key: pending.actor_key.clone(),
+                            target_isolate_id: Some(isolate.id),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                pending_requests
+                    .sort_by(|left, right| left.runtime_request_id.cmp(&right.runtime_request_id));
+                WorkerDebugIsolate {
+                    id: isolate.id,
+                    inflight_count: isolate.inflight_count,
+                    pending_wait_until: isolate.pending_wait_until.len(),
+                    pending_requests,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        WorkerDebugDump {
+            generation: self.generation,
+            queued: self.queue.len(),
+            actor_owners,
+            actor_inflight,
+            isolates,
+            queued_requests,
         }
     }
 
@@ -7867,6 +7994,13 @@ export default {
     if (url.pathname === "/inc") {
       const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
       return new Response(String(await actor.atomic(incrementCount)));
+    }
+
+    if (url.pathname === "/direct-write") {
+      const value = String(url.searchParams.get("value") ?? "1");
+      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
+      await actor.write("count", value);
+      return new Response(value);
     }
 
     if (url.pathname === "/get") {
@@ -11857,6 +11991,148 @@ export default {
             .expect("total should succeed");
         assert_eq!(total.status, 200);
         assert_eq!(String::from_utf8(total.body).expect("utf8"), "9");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-direct-write-threshold".to_string(),
+                actor_multi_key_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        for idx in 0..64 {
+            let path = format!("/direct-write?key=bench-direct&value={}", idx + 1);
+            let result = timeout(
+                Duration::from_secs(10),
+                service.invoke(
+                    "actor-direct-write-threshold".to_string(),
+                    test_invocation_with_path(&path, &format!("direct-write-threshold-{idx}")),
+                ),
+            )
+            .await;
+            let output = match result {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => panic!("direct write {idx} failed: {error}"),
+                Err(_) => {
+                    let dump = service
+                        .debug_dump("actor-direct-write-threshold".to_string())
+                        .await;
+                    panic!("direct write {idx} should not hang; debug dump: {dump:?}");
+                }
+            };
+            assert_eq!(output.status, 200);
+        }
+
+        let total = timeout(
+            Duration::from_secs(10),
+            service.invoke(
+                "actor-direct-write-threshold".to_string(),
+                test_invocation_with_path("/get?key=bench-direct", "direct-write-threshold-total"),
+            ),
+        )
+        .await
+        .expect("direct write total should not hang")
+        .expect("direct write total should succeed");
+        assert_eq!(total.status, 200);
+        assert_eq!(String::from_utf8(total.body).expect("utf8"), "64");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "actor-atomic-write-threshold".to_string(),
+                actor_multi_key_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MY_ACTOR".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        service
+            .invoke(
+                "actor-atomic-write-threshold".to_string(),
+                test_invocation_with_path("/seed-all?keys=1", "atomic-write-threshold-seed"),
+            )
+            .await
+            .expect("seed should succeed");
+
+        for idx in 0..64 {
+            let result = timeout(
+                Duration::from_secs(10),
+                service.invoke(
+                    "actor-atomic-write-threshold".to_string(),
+                    test_invocation_with_path(
+                        "/inc?key=bench-0",
+                        &format!("atomic-write-threshold-{idx}"),
+                    ),
+                ),
+            )
+            .await;
+            let output = match result {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => panic!("atomic write {idx} failed: {error}"),
+                Err(_) => {
+                    let dump = service
+                        .debug_dump("actor-atomic-write-threshold".to_string())
+                        .await;
+                    panic!("atomic write {idx} should not hang; debug dump: {dump:?}");
+                }
+            };
+            assert_eq!(output.status, 200);
+        }
+
+        let total = timeout(
+            Duration::from_secs(10),
+            service.invoke(
+                "actor-atomic-write-threshold".to_string(),
+                test_invocation_with_path("/get?key=bench-0", "atomic-write-threshold-total"),
+            ),
+        )
+        .await
+        .expect("atomic write total should not hang")
+        .expect("atomic write total should succeed");
+        assert_eq!(total.status, 200);
+        assert_eq!(String::from_utf8(total.body).expect("utf8"), "65");
     }
 
     #[tokio::test]
