@@ -227,6 +227,7 @@ The user-facing primitive is the memory namespace. STM gives you transactional r
 - `examples/llm-dynamic-exec.js` - pretend LLM planner that executes via dynamic workers
 - `examples/preview-dynamic.js` - dynamic preview environments (`/preview/{id}`)
 - `examples/chat-worker/` - multi-user chat built on a room memory namespace with deploy-time static assets
+- `examples/static-assets-site/` - tiny website where `/index.html`, `/styles.css`, and `/app.js` come from `--assets-dir`
 
 Try them quickly:
 
@@ -250,6 +251,7 @@ cargo run -p cli -- deploy dynamic examples/dynamic-namespace.js --dynamic-bindi
 cargo run -p cli -- deploy llm-dynamic examples/llm-dynamic-exec.js --dynamic-binding SANDBOX
 cargo run -p cli -- deploy preview-dynamic examples/preview-dynamic.js --dynamic-binding SANDBOX
 cargo run -p cli -- deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
+cargo run -p cli -- deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 
 Build/deploy the bundled TypeScript router:
