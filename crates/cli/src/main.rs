@@ -1,10 +1,13 @@
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use common::{
-    DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse,
+    DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse,
     DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
 };
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::Path;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
@@ -33,6 +36,9 @@ struct DeployCmd {
 
     #[arg(long)]
     public: bool,
+
+    #[arg(long = "assets-dir")]
+    assets_dir: Option<String>,
 
     #[arg(long = "kv-binding")]
     kv_bindings: Vec<String>,
@@ -96,6 +102,7 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
     let source = tokio::fs::read_to_string(&command.file)
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
+    let (assets, asset_headers) = package_assets_dir(command.assets_dir.as_deref())?;
     let mut bindings: Vec<DeployBinding> = command
         .kv_bindings
         .into_iter()
@@ -132,6 +139,8 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
             name: command.name,
             source,
             config,
+            assets,
+            asset_headers,
         })
         .send()
         .await
@@ -330,6 +339,113 @@ fn default_server() -> String {
     env::var("DD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string())
 }
 
+fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<String>), String> {
+    let Some(dir) = dir else {
+        return Ok((Vec::new(), None));
+    };
+
+    let root = Path::new(dir);
+    if !root.exists() {
+        return Err(format!("assets dir not found: {}", root.display()));
+    }
+    if !root.is_dir() {
+        return Err(format!("assets dir is not a directory: {}", root.display()));
+    }
+
+    let mut assets = Vec::new();
+    let mut asset_headers = None;
+    collect_assets_from_dir(root, root, &mut assets, &mut asset_headers)?;
+    assets.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((assets, asset_headers))
+}
+
+fn collect_assets_from_dir(
+    root: &Path,
+    current: &Path,
+    assets: &mut Vec<DeployAsset>,
+    asset_headers: &mut Option<String>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|error| format!("failed to read assets dir {}: {error}", current.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read assets dir {}: {error}", current.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to stat asset path {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "asset symlinks are not supported: {}",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            collect_assets_from_dir(root, &path, assets, asset_headers)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let relative = path.strip_prefix(root).map_err(|error| {
+            format!("failed to normalize asset path {}: {error}", path.display())
+        })?;
+        let relative_path = normalize_asset_relative_path(relative)?;
+        if relative_path == "_headers" {
+            *asset_headers = Some(
+                fs::read_to_string(&path)
+                    .map_err(|error| format!("failed to read {}: {error}", path.display()))?,
+            );
+            continue;
+        }
+
+        let normalized_path = format!("/{relative_path}");
+        if assets.iter().any(|asset| asset.path == normalized_path) {
+            return Err(format!("duplicate asset path: {normalized_path}"));
+        }
+
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        assets.push(DeployAsset {
+            path: normalized_path,
+            content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+    }
+
+    Ok(())
+}
+
+fn normalize_asset_relative_path(path: &Path) -> Result<String, String> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| format!("asset path is not valid UTF-8: {}", path.display()))?;
+                if value.is_empty() || value == "." || value == ".." {
+                    return Err(format!("invalid asset path segment: {value}"));
+                }
+                segments.push(value.to_string());
+            }
+            _ => {
+                return Err(format!(
+                    "asset path must stay within the assets dir: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err("asset path must not be empty".to_string());
+    }
+
+    Ok(segments.join("/"))
+}
+
 fn parse_json_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let mut input = bytes.to_vec();
     simd_json::serde::from_slice(&mut input).map_err(|error| error.to_string())
@@ -337,4 +453,62 @@ fn parse_json_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, S
 
 fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, String> {
     simd_json::serde::to_string(value).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_asset_relative_path, package_assets_dir};
+    use std::fs;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("dd-cli-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn packages_nested_assets_and_extracts_root_headers() {
+        let root = temp_dir("assets");
+        fs::create_dir_all(root.join("nested")).expect("create nested");
+        fs::write(root.join("a.js"), "console.log('a');").expect("write a.js");
+        fs::write(root.join("nested").join("b.css"), "body{}").expect("write b.css");
+        fs::write(
+            root.join("_headers"),
+            "/a.js\n  Cache-Control: public, max-age=60\n",
+        )
+        .expect("write headers");
+
+        let (assets, asset_headers) = package_assets_dir(root.to_str()).expect("package assets");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].path, "/a.js");
+        assert_eq!(assets[1].path, "/nested/b.css");
+        assert!(asset_headers
+            .expect("headers should be present")
+            .contains("Cache-Control"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn normalize_asset_relative_path_rejects_non_normal_segments() {
+        let error = normalize_asset_relative_path(PathBuf::from("../escape.js").as_path())
+            .expect_err("path should fail");
+        assert!(error.contains("within the assets dir"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_assets_dir_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("symlink");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("target.js"), "export{}").expect("write target");
+        symlink(root.join("target.js"), root.join("link.js")).expect("create symlink");
+
+        let error = package_assets_dir(root.to_str()).expect_err("symlink should fail");
+        assert!(error.contains("symlinks"));
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

@@ -9,6 +9,7 @@ mod json;
 mod kv;
 mod ops;
 mod service;
+mod static_assets;
 
 pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};

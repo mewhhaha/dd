@@ -15,7 +15,12 @@ use crate::ops::{
     register_actor_request_scope, register_request_body_stream, register_request_secret_context,
     ActorInvokeEvent, IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
 };
-use common::{DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
+use crate::static_assets::{
+    compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,
+};
+use common::{
+    DeployAsset, DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput,
+};
 use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt;
@@ -222,6 +227,8 @@ enum RuntimeCommand {
         worker_name: String,
         source: String,
         config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        asset_headers: Option<String>,
         persist: bool,
         reply: oneshot::Sender<Result<String>>,
     },
@@ -250,6 +257,14 @@ enum RuntimeCommand {
     Stats {
         worker_name: String,
         reply: oneshot::Sender<Option<WorkerStats>>,
+    },
+    ResolveAsset {
+        worker_name: String,
+        method: String,
+        host: Option<String>,
+        path: String,
+        headers: Vec<(String, String)>,
+        reply: oneshot::Sender<Result<Option<AssetResponse>>>,
     },
     DebugDump {
         worker_name: String,
@@ -464,6 +479,7 @@ struct WorkerPool {
     dynamic_env_json: Arc<str>,
     secret_replacements: Vec<(String, String)>,
     egress_allow_hosts: Vec<String>,
+    assets: AssetBundle,
     strict_request_isolation: bool,
     queue: VecDeque<PendingInvoke>,
     isolates: Vec<IsolateHandle>,
@@ -825,6 +841,10 @@ struct StoredWorkerDeployment {
     name: String,
     source: String,
     config: DeployConfig,
+    #[serde(default)]
+    assets: Vec<DeployAsset>,
+    #[serde(default)]
+    asset_headers: Option<String>,
     deployment_id: String,
     updated_at_ms: i64,
 }
@@ -994,6 +1014,8 @@ impl RuntimeService {
                     stored.name.clone(),
                     stored.source,
                     stored.config,
+                    stored.assets,
+                    stored.asset_headers,
                     false,
                 )
                 .await
@@ -1024,8 +1046,14 @@ impl RuntimeService {
     }
 
     pub async fn deploy(&self, worker_name: String, source: String) -> Result<String> {
-        self.deploy_with_config(worker_name, source, DeployConfig::default())
-            .await
+        self.deploy_with_bundle_config(
+            worker_name,
+            source,
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     pub async fn deploy_with_config(
@@ -1034,7 +1062,19 @@ impl RuntimeService {
         source: String,
         config: DeployConfig,
     ) -> Result<String> {
-        self.deploy_with_config_internal(worker_name, source, config, true)
+        self.deploy_with_bundle_config(worker_name, source, config, Vec::new(), None)
+            .await
+    }
+
+    pub async fn deploy_with_bundle_config(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        asset_headers: Option<String>,
+    ) -> Result<String> {
+        self.deploy_with_config_internal(worker_name, source, config, assets, asset_headers, true)
             .await
     }
 
@@ -1043,6 +1083,8 @@ impl RuntimeService {
         worker_name: String,
         source: String,
         config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        asset_headers: Option<String>,
         persist: bool,
     ) -> Result<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1051,6 +1093,8 @@ impl RuntimeService {
                 worker_name,
                 source,
                 config,
+                assets,
+                asset_headers,
                 persist,
                 reply: reply_tx,
             })
@@ -1449,6 +1493,32 @@ impl RuntimeService {
         reply_rx.await.ok().flatten()
     }
 
+    pub async fn resolve_asset(
+        &self,
+        worker_name: String,
+        method: String,
+        host: Option<String>,
+        path: String,
+        headers: Vec<(String, String)>,
+    ) -> Result<Option<AssetResponse>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::ResolveAsset {
+                worker_name,
+                method,
+                host,
+                path,
+                headers,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| PlatformError::internal("runtime asset channel closed"))?
+    }
+
     pub async fn debug_dump(&self, worker_name: String) -> Option<WorkerDebugDump> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -1583,10 +1653,14 @@ impl WorkerManager {
                 worker_name,
                 source,
                 config,
+                assets,
+                asset_headers,
                 persist,
                 reply,
             } => {
-                let result = self.deploy(worker_name, source, config, persist).await;
+                let result = self
+                    .deploy(worker_name, source, config, assets, asset_headers, persist)
+                    .await;
                 let _ = reply.send(result);
             }
             RuntimeCommand::DeployDynamic {
@@ -1804,6 +1878,22 @@ impl WorkerManager {
             }
             RuntimeCommand::Stats { worker_name, reply } => {
                 let _ = reply.send(self.worker_stats(&worker_name));
+            }
+            RuntimeCommand::ResolveAsset {
+                worker_name,
+                method,
+                host,
+                path,
+                headers,
+                reply,
+            } => {
+                let _ = reply.send(self.resolve_asset(
+                    &worker_name,
+                    &method,
+                    host.as_deref(),
+                    &path,
+                    &headers,
+                ));
             }
             RuntimeCommand::DebugDump { worker_name, reply } => {
                 let _ = reply.send(self.worker_debug_dump(&worker_name));
@@ -3409,6 +3499,8 @@ impl WorkerManager {
         worker_name: String,
         source: String,
         config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        asset_headers: Option<String>,
         persist: bool,
     ) -> Result<String> {
         let worker_name = worker_name.trim().to_string();
@@ -3416,6 +3508,7 @@ impl WorkerManager {
             return Err(PlatformError::bad_request("Worker name must not be empty"));
         }
         let bindings = extract_bindings(&config)?;
+        let compiled_assets = compile_asset_bundle(&assets, asset_headers.as_deref())?;
         validate_worker(self.bootstrap_snapshot, &source).await?;
         let has_dynamic_bindings = !bindings.dynamic.is_empty();
         let (snapshot, snapshot_preloaded) = if has_dynamic_bindings {
@@ -3467,6 +3560,8 @@ impl WorkerManager {
                 &worker_name,
                 &source,
                 &config,
+                &assets,
+                asset_headers.as_deref(),
                 &deployment_id,
             )
             .await?;
@@ -3498,6 +3593,7 @@ impl WorkerManager {
                 dynamic_env_json,
                 secret_replacements: Vec::new(),
                 egress_allow_hosts: Vec::new(),
+                assets: compiled_assets,
                 strict_request_isolation: has_dynamic_bindings,
                 queue: VecDeque::new(),
                 isolates: Vec::new(),
@@ -3589,6 +3685,7 @@ impl WorkerManager {
             ),
             secret_replacements: dynamic_config.secret_replacements.clone(),
             egress_allow_hosts: dynamic_config.egress_allow_hosts.clone(),
+            assets: AssetBundle::default(),
             strict_request_isolation: true,
             queue: VecDeque::new(),
             isolates: Vec::new(),
@@ -5069,6 +5166,31 @@ impl WorkerManager {
         Some(pool.debug_dump())
     }
 
+    fn resolve_asset(
+        &self,
+        worker_name: &str,
+        method: &str,
+        host: Option<&str>,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Result<Option<AssetResponse>> {
+        let Some(entry) = self.workers.get(worker_name) else {
+            return Ok(None);
+        };
+        let Some(pool) = entry.pools.get(&entry.current_generation) else {
+            return Ok(None);
+        };
+        Ok(resolve_asset(
+            &pool.assets,
+            AssetRequest {
+                method,
+                host,
+                path,
+                headers,
+            },
+        ))
+    }
+
     fn get_pool_mut(&mut self, worker_name: &str, generation: u64) -> Option<&mut WorkerPool> {
         self.workers
             .get_mut(worker_name)
@@ -6309,6 +6431,8 @@ async fn persist_worker_deployment(
     worker_name: &str,
     source: &str,
     config: &DeployConfig,
+    assets: &[DeployAsset],
+    asset_headers: Option<&str>,
     deployment_id: &str,
 ) -> Result<()> {
     if !storage.worker_store_enabled {
@@ -6330,6 +6454,8 @@ async fn persist_worker_deployment(
         name: worker_name.to_string(),
         source: source.to_string(),
         config: config.clone(),
+        assets: assets.to_vec(),
+        asset_headers: asset_headers.map(str::to_string),
         deployment_id: deployment_id.to_string(),
         updated_at_ms: epoch_ms_i64()?,
     };
@@ -6669,7 +6795,7 @@ mod tests {
         BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
     };
     use common::{
-        DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination,
+        DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination,
         WorkerInvocation, WorkerOutput,
     };
     use serde::Deserialize;
@@ -8344,6 +8470,67 @@ export default {
         .expect("service should start")
     }
 
+    async fn test_service_with_paths(
+        config: RuntimeConfig,
+        store_dir: PathBuf,
+        database_url: String,
+        worker_store_enabled: bool,
+    ) -> RuntimeService {
+        RuntimeService::start_with_service_config(RuntimeServiceConfig {
+            runtime: config,
+            storage: RuntimeStorageConfig {
+                store_dir: store_dir.clone(),
+                database_url,
+                actor_namespace_shards: 16,
+                actor_db_cache_max_open: 4096,
+                actor_db_idle_ttl: Duration::from_secs(60),
+                worker_store_enabled,
+                blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
+            },
+        })
+        .await
+        .expect("service should start")
+    }
+
+    fn test_assets() -> Vec<DeployAsset> {
+        vec![
+            DeployAsset {
+                path: "/a.js".to_string(),
+                content_base64: "YXNzZXQtYm9keQ==".to_string(),
+            },
+            DeployAsset {
+                path: "/nested/b.css".to_string(),
+                content_base64: "Ym9keXt9".to_string(),
+            },
+        ]
+    }
+
+    fn asset_worker() -> String {
+        r#"
+export default {
+  async fetch() {
+    return new Response("worker-fallback", {
+      headers: [["content-type", "text/plain; charset=utf-8"]],
+    });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn asset_headers_file() -> String {
+        r#"
+/a.js
+  Cache-Control: public, max-age=60
+  X-Exact: yes
+https://:sub.example.com/a.js
+  X-Host: :sub
+/nested/*
+  X-Splat: :splat
+        "#
+        .to_string()
+    }
+
     #[tokio::test]
     #[serial]
     async fn service_starts_with_deno_runtime_bootstrap() {
@@ -8357,6 +8544,146 @@ export default {
             ..RuntimeConfig::default()
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn deployed_assets_resolve_with_headers_and_head_support() {
+        let service = test_service(RuntimeConfig::default()).await;
+        service
+            .deploy_with_bundle_config(
+                "assets".to_string(),
+                asset_worker(),
+                DeployConfig::default(),
+                test_assets(),
+                Some(asset_headers_file()),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let asset = service
+            .resolve_asset(
+                "assets".to_string(),
+                "GET".to_string(),
+                Some("foo.example.com:443".to_string()),
+                "/a.js".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("asset lookup should succeed")
+            .expect("asset should exist");
+        assert_eq!(asset.status, 200);
+        assert_eq!(asset.body, b"asset-body");
+        assert!(asset.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "public, max-age=60"
+        }));
+        assert!(asset
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-host") && value == "foo"));
+
+        let etag = asset
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+            .map(|(_, value)| value.clone())
+            .expect("etag should be present");
+
+        let head = service
+            .resolve_asset(
+                "assets".to_string(),
+                "HEAD".to_string(),
+                Some("foo.example.com".to_string()),
+                "/nested/b.css".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("head lookup should succeed")
+            .expect("asset should exist");
+        assert_eq!(head.status, 200);
+        assert!(head.body.is_empty());
+        assert!(head
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-splat") && value == "b.css"));
+
+        let not_modified = service
+            .resolve_asset(
+                "assets".to_string(),
+                "GET".to_string(),
+                Some("foo.example.com".to_string()),
+                "/a.js".to_string(),
+                vec![("if-none-match".to_string(), etag)],
+            )
+            .await
+            .expect("etag lookup should succeed")
+            .expect("asset should exist");
+        assert_eq!(not_modified.status, 304);
+        assert!(not_modified.body.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn deployed_assets_restore_from_worker_store() {
+        let root = PathBuf::from(format!("/tmp/dd-assets-{}", Uuid::new_v4()));
+        let db_path = root.join("dd-test.db");
+        let database_url = format!("file:{}", db_path.display());
+
+        let service = test_service_with_paths(
+            RuntimeConfig::default(),
+            root.clone(),
+            database_url.clone(),
+            true,
+        )
+        .await;
+        service
+            .deploy_with_bundle_config(
+                "assets".to_string(),
+                asset_worker(),
+                DeployConfig::default(),
+                test_assets(),
+                Some(asset_headers_file()),
+            )
+            .await
+            .expect("deploy should succeed");
+        drop(service);
+
+        let restored =
+            test_service_with_paths(RuntimeConfig::default(), root.clone(), database_url, true)
+                .await;
+        let asset = restored
+            .resolve_asset(
+                "assets".to_string(),
+                "GET".to_string(),
+                Some("foo.example.com".to_string()),
+                "/a.js".to_string(),
+                Vec::new(),
+            )
+            .await
+            .expect("asset lookup should succeed")
+            .expect("asset should exist after restore");
+        assert_eq!(asset.body, b"asset-body");
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invalid_asset_headers_fail_deploy() {
+        let service = test_service(RuntimeConfig::default()).await;
+        let error = service
+            .deploy_with_bundle_config(
+                "assets".to_string(),
+                asset_worker(),
+                DeployConfig::default(),
+                test_assets(),
+                Some("/a.js\n  BadHeader".to_string()),
+            )
+            .await
+            .expect_err("deploy should fail");
+        assert!(error
+            .to_string()
+            .contains("must be `Name: value` or `! Name`"));
     }
 
     #[tokio::test]

@@ -166,7 +166,13 @@ pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult
     validate_internal_config(&payload.config.internal)?;
     let deployment_id = state
         .runtime
-        .deploy_with_config(name.to_string(), payload.source, payload.config)
+        .deploy_with_bundle_config(
+            name.to_string(),
+            payload.source,
+            payload.config,
+            payload.assets,
+            payload.asset_headers,
+        )
         .await?;
     tracing::info!(deployment_id = %deployment_id, "worker deployed");
 
@@ -315,6 +321,18 @@ async fn invoke_worker_from_body_stream(
             PlatformError::bad_request(format!("invalid header value for {name}: {error}"))
         })?;
         headers.push((name.as_str().to_string(), value.to_string()));
+    }
+    if let Some(asset_response) = try_serve_static_asset(
+        &state,
+        &worker_name,
+        &method,
+        request_host_for_matching(&parts.headers, &parts.uri),
+        worker_asset_path(&url)?,
+        headers.clone(),
+    )
+    .await?
+    {
+        return Ok(asset_response);
     }
     inject_current_trace_context(&mut headers);
     let request_id = Uuid::new_v4().to_string();
@@ -1031,6 +1049,52 @@ pub(crate) fn build_worker_url(
     format!("http://worker{}{}", normalized_path, query_suffix)
 }
 
+fn worker_asset_path(url: &str) -> Result<String, PlatformError> {
+    let uri: http::Uri = url
+        .parse()
+        .map_err(|error| PlatformError::internal(format!("invalid worker url {url:?}: {error}")))?;
+    Ok(uri.path().to_string())
+}
+
+fn request_host_for_matching(headers: &HeaderMap, uri: &http::Uri) -> Option<String> {
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_string())
+        })
+}
+
+async fn try_serve_static_asset(
+    state: &AppState,
+    worker_name: &str,
+    method: &str,
+    host: Option<String>,
+    path: String,
+    headers: Vec<(String, String)>,
+) -> Result<Option<Response<ResponseBody>>, PlatformError> {
+    let Some(asset) = state
+        .runtime
+        .resolve_asset(
+            worker_name.to_string(),
+            method.to_string(),
+            host,
+            path,
+            headers,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        build_direct_buffered_response(asset.status, asset.headers, asset.body)
+            .map_err(|error| error.0)?,
+    ))
+}
+
 fn parse_worker_from_host(
     host: impl AsRef<str>,
     public_base_domain: &str,
@@ -1250,6 +1314,28 @@ fn build_worker_buffered_response(
     cache_status: &str,
 ) -> ApiResult<Response<ResponseBody>> {
     build_buffered_response(output.status, output.headers, output.body, cache_status)
+}
+
+fn build_direct_buffered_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> ApiResult<Response<ResponseBody>> {
+    let mut response = Response::builder()
+        .status(status)
+        .body(full_body(body))
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().append(name, value);
+        }
+    }
+    annotate_response_with_trace_id(&mut response);
+    Ok(response)
 }
 
 fn build_buffered_response(
@@ -1520,8 +1606,8 @@ mod tests {
     use crate::state::AppState;
     use bytes::Bytes;
     use common::{
-        DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployTraceDestination,
-        ErrorKind,
+        DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest,
+        DeployTraceDestination, ErrorKind,
     };
     use http::{HeaderMap, Request, StatusCode};
     use http_body_util::{BodyExt, Empty};
@@ -1550,6 +1636,13 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn test_assets() -> Vec<DeployAsset> {
+        vec![DeployAsset {
+            path: "/a.js".to_string(),
+            content_base64: "YXNzZXQtYm9keQ==".to_string(),
+        }]
     }
 
     #[test]
@@ -1717,6 +1810,8 @@ mod tests {
                 bindings: vec![],
                 ..Default::default()
             },
+            assets: Vec::new(),
+            asset_headers: None,
         };
         let response = deploy_worker(state.clone(), deploy).await.expect("deploy");
         assert!(response.ok);
@@ -1803,6 +1898,106 @@ mod tests {
             .await
             .expect_err("private worker should not be public");
         assert_eq!(error.0.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn private_invoke_serves_asset_before_worker_code() {
+        let state = create_test_state("example.com").await;
+        state
+            .runtime
+            .deploy_with_bundle_config(
+                "assets".to_string(),
+                "export default { async fetch() { return new Response('worker-fallback'); } }"
+                    .to_string(),
+                DeployConfig::default(),
+                test_assets(),
+                Some("/a.js\n  Cache-Control: public, max-age=60\n".to_string()),
+            )
+            .await
+            .expect("deploy");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/invoke/assets/a.js")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let response = invoke_worker_private(state.clone(), request, None)
+            .await
+            .expect("invoke");
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"asset-body");
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=60")
+        );
+
+        let fallback_request = Request::builder()
+            .method("GET")
+            .uri("/v1/invoke/assets/missing")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let fallback = invoke_worker_private(state, fallback_request, None)
+            .await
+            .expect("invoke fallback");
+        let fallback_body = fallback
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(fallback_body.as_ref(), b"worker-fallback");
+    }
+
+    #[tokio::test]
+    async fn public_host_invoke_serves_assets_for_public_workers() {
+        let state = create_test_state("example.com").await;
+        state
+            .runtime
+            .deploy_with_bundle_config(
+                "assets".to_string(),
+                "export default { async fetch() { return new Response('worker-fallback'); } }"
+                    .to_string(),
+                DeployConfig {
+                    public: true,
+                    ..DeployConfig::default()
+                },
+                test_assets(),
+                None,
+            )
+            .await
+            .expect("deploy");
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("/a.js")
+            .header("host", "assets.example.com")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let response = invoke_worker_public(state, request, None)
+            .await
+            .expect("invoke");
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert!(body.is_empty());
+        assert_eq!(
+            headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
     }
 
     #[test]

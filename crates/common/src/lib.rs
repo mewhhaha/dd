@@ -75,6 +75,16 @@ pub struct DeployRequest {
     pub source: String,
     #[serde(default)]
     pub config: DeployConfig,
+    #[serde(default)]
+    pub assets: Vec<DeployAsset>,
+    #[serde(default)]
+    pub asset_headers: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployAsset {
+    pub path: String,
+    pub content_base64: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

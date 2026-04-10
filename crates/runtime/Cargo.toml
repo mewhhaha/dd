@@ -21,10 +21,13 @@ opentelemetry.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
 getrandom = "0.3"
+base64.workspace = true
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 aes-gcm = { version = "0.10", features = ["aes"] }
+mime_guess = "2"
+regex = "1"
 deno_webidl = "0.241.0"
 deno_web = "0.272.0"
 deno_fetch = "0.265.0"

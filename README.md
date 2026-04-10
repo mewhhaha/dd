@@ -151,6 +151,7 @@ Workers are not separate Fly apps.
 
 - `flyctl deploy` updates the `dd_server` binary/container.
 - `dd deploy` (`cargo run -p cli -- deploy ...`) uploads worker source into that running app via `/v1/deploy`.
+- `dd deploy ... --assets-dir path/to/assets` bundles exact static files at worker root paths, and a root `_headers` file in that directory applies asset-only headers.
 
 Deploy a new worker to an already running Fly app:
 
@@ -225,7 +226,7 @@ The user-facing primitive is the memory namespace. STM gives you transactional r
 - `examples/dynamic-namespace.js` - spawn + invoke dynamic workers from `env.SANDBOX`
 - `examples/llm-dynamic-exec.js` - pretend LLM planner that executes via dynamic workers
 - `examples/preview-dynamic.js` - dynamic preview environments (`/preview/{id}`)
-- `examples/chat-worker/` - multi-user chat built on a room memory namespace
+- `examples/chat-worker/` - multi-user chat built on a room memory namespace with deploy-time static assets
 
 Try them quickly:
 
@@ -248,6 +249,7 @@ cargo run -p cli -- deploy trace-hub examples/trace-hub.js
 cargo run -p cli -- deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
 cargo run -p cli -- deploy llm-dynamic examples/llm-dynamic-exec.js --dynamic-binding SANDBOX
 cargo run -p cli -- deploy preview-dynamic examples/preview-dynamic.js --dynamic-binding SANDBOX
+cargo run -p cli -- deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
 ```
 
 Build/deploy the bundled TypeScript router:

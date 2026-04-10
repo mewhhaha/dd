@@ -475,6 +475,8 @@ impl ServerHarness {
                 name: name.to_string(),
                 source: source.to_string(),
                 config,
+                assets: Vec::new(),
+                asset_headers: None,
             },
         )
         .await;

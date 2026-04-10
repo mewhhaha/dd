@@ -5,9 +5,11 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 common = { path = "../common" }
 reqwest.workspace = true
 serde.workspace = true
 simd-json.workspace = true
 tokio.workspace = true
+uuid.workspace = true
