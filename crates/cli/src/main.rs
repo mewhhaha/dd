@@ -37,8 +37,8 @@ struct DeployCmd {
     #[arg(long = "kv-binding")]
     kv_bindings: Vec<String>,
 
-    #[arg(long = "actor-binding")]
-    actor_bindings: Vec<String>,
+    #[arg(long = "memory-binding", visible_alias = "actor-binding")]
+    memory_bindings: Vec<String>,
 
     #[arg(long = "dynamic-binding")]
     dynamic_bindings: Vec<String>,
@@ -103,9 +103,9 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
         .collect();
     bindings.extend(
         command
-            .actor_bindings
+            .memory_bindings
             .into_iter()
-            .map(parse_actor_binding)
+            .map(parse_memory_binding)
             .collect::<Result<Vec<_>, _>>()?,
     );
     bindings.extend(
@@ -167,20 +167,20 @@ async fn dynamic_deploy(
     Ok(())
 }
 
-fn parse_actor_binding(value: String) -> Result<DeployBinding, String> {
+fn parse_memory_binding(value: String) -> Result<DeployBinding, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err("actor binding must not be empty".to_string());
+        return Err("memory binding must not be empty".to_string());
     }
     if trimmed.contains('=') {
         return Err(format!(
-            "invalid actor binding {trimmed:?}, expected BINDING"
+            "invalid memory binding {trimmed:?}, expected BINDING"
         ));
     }
     let binding = trimmed.trim();
     if binding.is_empty() {
         return Err(format!(
-            "invalid actor binding {trimmed:?}, expected BINDING"
+            "invalid memory binding {trimmed:?}, expected BINDING"
         ));
     }
     Ok(DeployBinding::Actor {

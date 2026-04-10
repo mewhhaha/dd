@@ -5959,6 +5959,24 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::ActorRequestScopes::default());
                     op_state.put(crate::ops::RequestSecretContexts::default());
                 }
+                {
+                    let event_tx = event_tx.clone();
+                    let worker_name = worker_name.clone();
+                    thread::Builder::new()
+                        .name(format!("dd-isolate-events-{isolate_id}"))
+                        .spawn(move || {
+                            while let Ok(payload) = event_payload_rx.recv() {
+                                handle_isolate_event_payload(
+                                    &event_tx,
+                                    &worker_name,
+                                    generation,
+                                    isolate_id,
+                                    payload,
+                                );
+                            }
+                        })
+                        .expect("isolate event forwarder should spawn");
+                }
                 if !snapshot_preloaded {
                     if let Err(error) = load_worker(&mut js_runtime, &source).await {
                         let _ = init_tx.send(Err(error));
@@ -5969,23 +5987,6 @@ fn spawn_isolate_thread(
 
                 loop {
                     let mut made_progress = false;
-
-                    loop {
-                        match event_payload_rx.try_recv() {
-                            Ok(payload) => {
-                                made_progress = true;
-                                handle_isolate_event_payload(
-                                    &event_tx,
-                                    &worker_name,
-                                    generation,
-                                    isolate_id,
-                                    payload,
-                                );
-                            }
-                            Err(std_mpsc::TryRecvError::Empty) => break,
-                            Err(std_mpsc::TryRecvError::Disconnected) => break,
-                        }
-                    }
 
                     loop {
                         match command_rx.try_recv() {
@@ -7043,6 +7044,10 @@ export function onSocketMessage(state, event) {
     last: text,
   }));
   const socket = new WebSocket(event.handle);
+  if (text === "close-me") {
+    socket.close(1000, "server-close");
+    return next;
+  }
   socket.send(JSON.stringify({
     seen: next.last,
     count: next.count,
@@ -7066,6 +7071,31 @@ export default {
       return;
     }
     await event.stub.atomic(onSocketMessage, event);
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn websocket_socket_surface_worker() -> String {
+        r#"
+function stateSocketSurface(state) {
+  return {
+    accept: typeof state.accept,
+    sockets: typeof state.sockets,
+  };
+}
+
+export default {
+  async fetch(_request, env) {
+    const memory = env.CHAT.get(env.CHAT.idFromName("global"));
+    const stubSurface = {
+      values: typeof memory.sockets.values,
+      send: typeof memory.sockets.send,
+      close: typeof memory.sockets.close,
+    };
+    const stateSurface = await memory.atomic(stateSocketSurface);
+    return Response.json({ stubSurface, stateSurface });
   },
 };
 "#
@@ -9924,6 +9954,112 @@ export default {
             )
             .await
             .expect("websocket close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-surface".to_string(),
+                websocket_socket_surface_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = service
+            .invoke("ws-surface".to_string(), test_invocation())
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(output.status, 200);
+        let surface: serde_json::Value =
+            serde_json::from_slice(&output.body).expect("surface body should be json");
+        assert_eq!(surface["stubSurface"]["values"], "function");
+        assert_eq!(surface["stubSurface"]["send"], "undefined");
+        assert_eq!(surface["stubSurface"]["close"], "undefined");
+        assert_eq!(surface["stateSurface"]["accept"], "function");
+        assert_eq!(surface["stateSurface"]["sockets"], "undefined");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_message_handler_can_close_handle_backed_socket() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-close".to_string(),
+                websocket_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let opened = service
+            .open_websocket(
+                "ws-close".to_string(),
+                test_websocket_invocation("/ws", "ws-close-open"),
+                None,
+            )
+            .await
+            .expect("websocket open should succeed");
+        assert_eq!(opened.output.status, 101);
+
+        let closed = service
+            .websocket_send_frame(
+                "ws-close".to_string(),
+                opened.session_id,
+                b"close-me".to_vec(),
+                false,
+            )
+            .await
+            .expect("websocket close message should succeed");
+        assert_eq!(closed.status, 204);
+        let close_code = closed
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-dd-ws-close-code"))
+            .map(|(_, value)| value.as_str());
+        let close_reason = closed
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-dd-ws-close-reason"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(close_code, Some("1000"));
+        assert_eq!(close_reason, Some("server-close"));
     }
 
     #[tokio::test]

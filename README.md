@@ -105,7 +105,10 @@ cargo run -p cli -- --server http://127.0.0.1:3001 deploy hello examples/hello.j
 cargo run -p cli -- --server http://127.0.0.1:3001 invoke hello --method POST --path /echo --header "content-type: text/plain" --body-file -
 cargo run -p cli -- --server http://127.0.0.1:3001 dynamic-deploy examples/hello.js --env OPENAI_API_KEY=sk-...
 cargo run -p cli -- --server http://127.0.0.1:3001 deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
+cargo run -p cli -- --server http://127.0.0.1:3001 deploy memory examples/memory.js --memory-binding USER_MEMORY
 ```
+
+`--memory-binding` is the canonical user-facing flag. `--actor-binding` is still accepted as a legacy alias while the repo finishes converging on memory-namespace terminology.
 
 `deploy --public` exposes a worker on the public listener. Without `--public`, a worker is private-only and can only be invoked through the private listener.
 
@@ -166,7 +169,7 @@ Run the runtime benchmark with:
 cargo run -p runtime --bin bench --release
 ```
 
-Run the keyed-memory STM benchmark with:
+Run the keyed memory namespace benchmark with:
 
 ```bash
 cargo run -p runtime --bin bench_actor_storage
@@ -180,16 +183,16 @@ Current baseline results are in `BENCHMARKS.md`.
 - per-worker pool min=0, max=8, idle TTL=30s
 - unlimited per-worker FIFO queue
 - up to 4 inflight requests per isolate by default
-- keyed memory routing is opt-in; by default workers stay pooled
+- memory namespace routing is opt-in; by default workers stay pooled
 - same memory key can run with multiple in-flight transactions across isolates
 - KV `get/put` accept JS values (strings stay UTF-8; non-strings use structured storage encoding)
-- keyed memory is available through namespace stubs like `env.USER_ACTOR.get(id)`
+- memory namespaces are available through namespace stubs like `env.USER_MEMORY.get(id)`
 - `memory.atomic(() => ...)` is the retryable STM region
 - `memory.tvar("count", 0)` gives a lazy default; `memory.var("key").read()` is a snapshot read outside `atomic` and becomes transactional inside it
-- websocket handles can be reopened with `new WebSocket(handle)` inside keyed-memory code
+- websocket handles can be reopened with `new WebSocket(handle)` inside memory namespace code; send/close frames through that object, not `stub.sockets`
 - memory writes are write-last with monotonic versions
 - structured values use V8 storage serialization (`forStorage: true`) and reject unsupported host/function types
-- keyed memory uses namespace shards (default 64 shards per namespace)
+- memory namespaces use shards internally (default 64 shards per namespace)
 - dropped invokes are canceled and signaled via `ctx.signal`
 - Spectre-style timer mitigation is enabled: `Date.now()` / `performance.now()` stay frozen between host I/O boundaries
 - cache capacity: 2048 entries, 64 MiB total, LRU-ish eviction on pressure
@@ -197,6 +200,8 @@ Current baseline results are in `BENCHMARKS.md`.
 - local defaults persist into `./store` (`workers`, `dd-kv.db`, `blobs`)
 - W3C `traceparent` is extracted/injected on invoke requests
 - responses include `x-dd-trace-id` for quick correlation
+
+The user-facing primitive is the memory namespace. STM gives you transactional reads/writes inside a namespace, and you can build actor-style coordination on top of that when you need it. The repo still has some internal binary/file names with `actor` in them, but the model exposed to worker authors is memory-first.
 
 ## Example workers
 
@@ -212,12 +217,15 @@ Current baseline results are in `BENCHMARKS.md`.
 - `examples/kv-counter.js` - tiny counter API (`/value`, `/inc`, `/reset`)
 - `examples/wait-until.js` - respond now, finish async work in `ctx.waitUntil`
 - `examples/wait-until-kv.js` - `waitUntil` background write into KV
-- `examples/actor.js` - keyed memory namespace (`env.USER_MEMORY.idFromName/get`, `atomic`, `tvar`)
+- `examples/memory.js` - keyed memory namespace (`env.USER_MEMORY.idFromName/get`, `atomic`, `tvar`)
+- `examples/hello-traced.js` - mixed KV + memory + cache demo with a tiny HTML UI
+- `examples/transport-memory.js` - memory namespace plus transport accept/wake plumbing
 - `examples/receipts.js` - receipt CRUD API (`POST/GET/DELETE /receipts`)
 - `examples/trace-hub.js` - minimal internal trace receiver and web view
 - `examples/dynamic-namespace.js` - spawn + invoke dynamic workers from `env.SANDBOX`
 - `examples/llm-dynamic-exec.js` - pretend LLM planner that executes via dynamic workers
 - `examples/preview-dynamic.js` - dynamic preview environments (`/preview/{id}`)
+- `examples/chat-worker/` - multi-user chat built on a room memory namespace
 
 Try them quickly:
 
@@ -233,7 +241,8 @@ cargo run -p cli -- deploy kv examples/kv.js --kv-binding MY_KV
 cargo run -p cli -- deploy kv-counter examples/kv-counter.js --kv-binding MY_KV
 cargo run -p cli -- deploy bg examples/wait-until.js
 cargo run -p cli -- deploy bg-kv examples/wait-until-kv.js --kv-binding MY_KV
-cargo run -p cli -- deploy memory examples/actor.js --actor-binding USER_MEMORY
+cargo run -p cli -- deploy memory examples/memory.js --memory-binding USER_MEMORY
+cargo run -p cli -- deploy hello-traced examples/hello-traced.js --kv-binding APP_KV --memory-binding USER_MEMORY
 cargo run -p cli -- deploy receipts examples/receipts.js --kv-binding RECEIPTS
 cargo run -p cli -- deploy trace-hub examples/trace-hub.js
 cargo run -p cli -- deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX

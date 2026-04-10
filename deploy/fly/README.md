@@ -53,7 +53,7 @@ Use the Fly app default domain while iterating (`https://<app-name>.fly.dev`) on
 The app keeps persistent data in `/app/store`:
 
 - deployed worker source/config
-- KV/actor/sqlite files
+- KV/memory/sqlite files
 - cache blobs/indexes
 
 ## 3) Private deploy tunnel (no auth, private network only)

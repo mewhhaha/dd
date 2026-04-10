@@ -56,20 +56,20 @@ while [ "$#" -gt 0 ]; do
       )"
       shift 2
       ;;
-    --actor-binding)
+    --memory-binding|--actor-binding)
       if [ "$#" -lt 2 ]; then
-        echo "--actor-binding requires a value" >&2
+        echo "--memory-binding requires a value" >&2
         exit 1
       fi
       binding_value="$2"
       if [ -z "$binding_value" ] || [[ "$binding_value" == *=* ]]; then
-        echo "invalid actor binding: $binding_value (expected BINDING)" >&2
+        echo "invalid memory binding: $binding_value (expected BINDING)" >&2
         exit 1
       fi
       config_json="$(
         printf '%s' "$config_json" \
           | jq --arg binding "$binding_value" \
-            '.bindings += [{type: "actor", binding: $binding}]'
+            '.bindings += [{type: "memory", binding: $binding}]'
       )"
       shift 2
       ;;

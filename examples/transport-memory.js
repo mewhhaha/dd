@@ -9,7 +9,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/") {
-      return text("transport actor: CONNECT /session over public h3");
+      return text("transport memory namespace: CONNECT /session over public h3");
     }
     if (url.pathname !== "/session") {
       return text("not found", 404);

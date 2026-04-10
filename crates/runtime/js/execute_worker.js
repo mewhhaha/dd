@@ -3025,12 +3025,6 @@ globalThis.__dd_execute_worker = (payload) => {
         values(...args) {
           return stateRef.current.sockets.values(...args);
         },
-        send(...args) {
-          return stateRef.current.sockets.send(...args);
-        },
-        close(...args) {
-          return stateRef.current.sockets.close(...args);
-        },
       },
       transports: {
         accept(...args) {
@@ -3214,46 +3208,6 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const createActorStubSocketApi = (bindingName, actorKey) => Object.freeze({
-    async send(handle, value, kind) {
-      const normalizedHandle = String(handle ?? "").trim();
-      if (!normalizedHandle) {
-        throw new Error("stub.sockets.send requires a non-empty handle");
-      }
-      const payload = encodeSocketSendPayload(value, kind);
-      const result = await callOp("op_actor_socket_send", {
-        request_id: activeRequestId(),
-        binding: bindingName,
-        key: actorKey,
-        handle: normalizedHandle,
-        message_kind: payload.kind,
-        message: payload.value,
-      });
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "socket send failed"));
-      }
-    },
-    async close(handle, code, reason) {
-      const normalizedHandle = String(handle ?? "").trim();
-      if (!normalizedHandle) {
-        throw new Error("stub.sockets.close requires a non-empty handle");
-      }
-      const normalizedCode = Number.isFinite(Number(code))
-        ? Math.trunc(Number(code))
-        : 1000;
-      const result = await callOp("op_actor_socket_close", {
-        request_id: activeRequestId(),
-        binding: bindingName,
-        key: actorKey,
-        handle: normalizedHandle,
-        code: normalizedCode,
-        reason: reason == null ? "" : String(reason),
-      });
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "socket close failed"));
-      }
-    },
     async values() {
       const result = await callOp("op_actor_socket_list", {
         request_id: activeRequestId(),
@@ -3458,19 +3412,13 @@ globalThis.__dd_execute_worker = (payload) => {
         }
         const type = String(effect.type ?? "").trim();
         if (type === "socket.send") {
-          await this.sockets.send(
-            String(effect.handle ?? ""),
-            effect.payload,
-            effect.kind == null ? undefined : String(effect.kind),
-          );
+          const socket = new WebSocket(String(effect.handle ?? ""));
+          socket.send(effect.payload, effect.kind == null ? undefined : String(effect.kind));
           continue;
         }
         if (type === "socket.close") {
-          await this.sockets.close(
-            String(effect.handle ?? ""),
-            Number(effect.code ?? 1000),
-            String(effect.reason ?? ""),
-          );
+          const socket = new WebSocket(String(effect.handle ?? ""));
+          socket.close(Number(effect.code ?? 1000), String(effect.reason ?? ""));
           continue;
         }
         if (type === "transport.stream") {
@@ -4326,9 +4274,9 @@ globalThis.__dd_execute_worker = (payload) => {
     current.actorEntry = entry;
     current.actorRequestId = runtimeRequestId;
     try {
-      await scopedState.__dd_socket_runtime.refreshOpenHandles();
-      await scopedState.__dd_transport_runtime.refreshOpenHandles();
       if (kind === "method") {
+        await scopedState.__dd_socket_runtime.refreshOpenHandles();
+        await scopedState.__dd_transport_runtime.refreshOpenHandles();
         const methodName = String(actorCall.name ?? "").trim();
         if (!methodName) {
           throw new Error("memory method invoke requires a method name");

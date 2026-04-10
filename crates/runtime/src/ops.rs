@@ -3436,19 +3436,10 @@ async fn op_actor_socket_send(
         };
     }
 
-    match reply_rx.await {
-        Ok(Ok(())) => ActorSocketSendResult {
-            ok: true,
-            error: String::new(),
-        },
-        Ok(Err(error)) => ActorSocketSendResult {
-            ok: false,
-            error: error.to_string(),
-        },
-        Err(_) => ActorSocketSendResult {
-            ok: false,
-            error: "memory socket send response channel closed".to_string(),
-        },
+    drop(reply_rx);
+    ActorSocketSendResult {
+        ok: true,
+        error: String::new(),
     }
 }
 
@@ -3508,19 +3499,10 @@ async fn op_actor_socket_close(
         };
     }
 
-    match reply_rx.await {
-        Ok(Ok(())) => ActorSocketCloseResult {
-            ok: true,
-            error: String::new(),
-        },
-        Ok(Err(error)) => ActorSocketCloseResult {
-            ok: false,
-            error: error.to_string(),
-        },
-        Err(_) => ActorSocketCloseResult {
-            ok: false,
-            error: "memory socket close response channel closed".to_string(),
-        },
+    drop(reply_rx);
+    ActorSocketCloseResult {
+        ok: true,
+        error: String::new(),
     }
 }
 

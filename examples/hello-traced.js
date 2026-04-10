@@ -27,7 +27,7 @@ function html(pageUser) {
 </head><body>
   <h1>hello-traced</h1>
   <p>Demo user: <code>${safeUser}</code></p>
-  <p>Features: KV, keyed memory atomic vars, cache API, stream response, websocket status endpoint.</p>
+  <p>Features: KV, keyed memory namespaces, cache API, stream response, websocket status endpoint.</p>
   <div class="row"><a href="/api/state?user=${encodedUser}">GET /api/state</a><a href="/api/cache">GET /api/cache</a><a href="/api/memory/ping?user=${encodedUser}">GET /api/memory/ping</a></div>
   <div class="row"><a href="/api/stream">GET /api/stream</a><a href="/api/ws">GET /api/ws</a></div>
   <form method="post" action="/api/hit?user=${encodedUser}"><button type="submit">POST /api/hit</button></form>
@@ -110,15 +110,15 @@ export default {
     }
 
     if (url.pathname === "/api/memory/ping" && request.method === "GET") {
-      const memory = env.USER_ACTOR.get(env.USER_ACTOR.idFromName(user));
+      const memory = env.USER_MEMORY.get(env.USER_MEMORY.idFromName(user));
       const pings = memory.tvar("pings", 0);
       return json(await memory.atomic(() => {
         const next = Number(pings.read()) + 1;
         pings.write(next);
         return {
           ok: true,
-          feature: "memory-atomic",
-          memoryId: String(memory.id),
+          feature: "memory-namespace",
+          namespaceId: String(memory.id),
           pings: next,
         };
       }));

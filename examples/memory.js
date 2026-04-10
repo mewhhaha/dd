@@ -35,7 +35,7 @@ export default {
     if (url.pathname === "/" && request.method === "GET") {
       return json({
         ok: true,
-        worker: "memory",
+        worker: "memory-namespace",
         routes: [
           "GET /ping?user={name}",
           "POST /inc?user={name}",
@@ -94,7 +94,7 @@ export default {
         pings.write(next);
         return {
           ok: true,
-          memoryId: String(memory.id),
+          namespaceId: String(memory.id),
           pings: next,
         };
       }));

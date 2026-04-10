@@ -371,12 +371,13 @@ export function openSocket(state, payload) {
 }
 
 export async function onSocketMessage(stub, event) {
+  const socket = new WebSocket(event.handle);
   if (typeof event.data === "string") {
-    await stub.sockets.send(event.handle, `echo:${event.data}`);
+    socket.send(`echo:${event.data}`);
     return;
   }
 
-  await stub.sockets.send(event.handle, event.data, "binary");
+  socket.send(event.data, "binary");
 }
 
 export default {

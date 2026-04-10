@@ -107,9 +107,16 @@ fn default_trace_path() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DeployBinding {
-    Kv { binding: String },
-    Actor { binding: String },
-    Dynamic { binding: String },
+    Kv {
+        binding: String,
+    },
+    #[serde(rename = "memory", alias = "actor")]
+    Actor {
+        binding: String,
+    },
+    Dynamic {
+        binding: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

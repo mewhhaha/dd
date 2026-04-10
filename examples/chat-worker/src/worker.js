@@ -4,7 +4,7 @@ const MAX_USERNAME_LENGTH = 40;
 const MAX_MESSAGE_LENGTH = 2000;
 const MAX_HISTORY = 200;
 const FIXI_VERSION = "0.9.3";
-const FIXI_WS_PLUGIN_VERSION = "1";
+const FIXI_WS_PLUGIN_VERSION = "2";
 
 // Vendored from https://github.com/bigskysoftware/fixi v0.9.3 (Zero-Clause BSD).
 const FIXI_JS = String.raw`(()=>{ if(document.__fixi_mo) return; document.__fixi_mo = new MutationObserver((recs)=>recs.forEach((r)=>r.type === "childList" && r.addedNodes.forEach((n)=>process(n)))) let send = (elt, type, detail, bub)=>elt.dispatchEvent(new CustomEvent("fx:" + type, {detail, cancelable:true, bubbles:bub !== false, composed:true})) let attr = (elt, name, defaultVal)=>elt.getAttribute(name) || defaultVal let ignore = (elt)=>elt.closest("[fx-ignore]") != null let init = (elt)=>{ let options = {} if (elt.__fixi || ignore(elt) || !send(elt, "init", {options})) return elt.__fixi = async(evt)=>{ let reqs = elt.__fixi.requests ||= new Set() let form = elt.form || elt.closest("form") let body = new FormData(form ?? undefined, evt.submitter) if (elt.name && !evt.submitter && (!form || (elt.form === form && elt.type === 'submit'))) body.append(elt.name, elt.value) let ac = new AbortController() let cfg = { trigger:evt, action:attr(elt, "fx-action"), method:attr(elt, "fx-method", "GET").toUpperCase(), target:document.querySelector(attr(elt, "fx-target")) ?? elt, swap:attr(elt, "fx-swap", "outerHTML"), body, drop:reqs.size, headers:{"FX-Request":"true"}, abort:ac.abort.bind(ac), signal:ac.signal, preventTrigger:true, transition:document.startViewTransition?.bind(document), fetch:fetch.bind(window) } let go = send(elt, "config", {cfg, requests:reqs}) if (cfg.preventTrigger) evt.preventDefault() if (!go || cfg.drop) return if (/GET|DELETE/.test(cfg.method)){ let params = new URLSearchParams(cfg.body) if (params.size) cfg.action += (/\?/.test(cfg.action) ? "&" : "?") + params cfg.body = null } reqs.add(cfg) try { if (cfg.confirm){ let result = await cfg.confirm() if (!result) return } if (!send(elt, "before", {cfg, requests:reqs})) return cfg.response = await cfg.fetch(cfg.action, cfg) cfg.text = await cfg.response.text() if (!send(elt, "after", {cfg})) return } catch(error) { send(elt, "error", {cfg, error}) return } finally { reqs.delete(cfg) send(elt, "finally", {cfg}) } let doSwap = ()=>{ if (cfg.swap instanceof Function) return cfg.swap(cfg) else if (/(before|after)(begin|end)/.test(cfg.swap)) cfg.target.insertAdjacentHTML(cfg.swap, cfg.text) else if(cfg.swap in cfg.target) cfg.target[cfg.swap] = cfg.text else if(cfg.swap !== 'none') throw cfg.swap } if (cfg.transition) await cfg.transition(doSwap).finished else await doSwap() send(elt, "swapped", {cfg}) if (!document.contains(elt)) send(document, "swapped", {cfg}) } elt.__fixi.evt = attr(elt, "fx-trigger", elt.matches("form") ? "submit" : elt.matches("input:not([type=button]),select,textarea") ? "change" : "click") elt.addEventListener(elt.__fixi.evt, elt.__fixi, options) send(elt, "inited", {}, false) } let process = (n)=>{ if (n.matches){ if (ignore(n)) return if (n.matches("[fx-action]")) init(n) } if(n.querySelectorAll) n.querySelectorAll("[fx-action]").forEach(init) } document.addEventListener("fx:process", (evt)=>process(evt.target)) document.addEventListener("DOMContentLoaded", ()=>{ document.__fixi_mo.observe(document.documentElement, {childList:true, subtree:true}) process(document.body) }) })()`;
@@ -59,12 +59,24 @@ const FIXI_WS_JS = String.raw`(()=>{
     const openValue = root.getAttribute("ext-fx-ws-open");
     const shouldReconnect = root.getAttribute("ext-fx-ws-reconnect") !== "false";
     let reconnectDelayMs = 500;
+    let reconnectTimer = 0;
+    let generation = 0;
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = 0;
+      }
+    };
 
     const connect = () => {
+      clearReconnectTimer();
+      const socketGeneration = ++generation;
       setStatus(root, "connecting");
       const socket = new WebSocket(resolveSocketUrl(connectValue));
       root.__fixiWs = socket;
       socket.addEventListener("open", () => {
+        if (root.__fixiWs !== socket || socketGeneration !== generation) return;
         reconnectDelayMs = 500;
         setStatus(root, "open");
         if (!openValue) return;
@@ -75,6 +87,7 @@ const FIXI_WS_JS = String.raw`(()=>{
         }
       });
       socket.addEventListener("message", async (event) => {
+        if (root.__fixiWs !== socket || socketGeneration !== generation) return;
         try {
           await applyPayload(JSON.parse(event.data));
           document.dispatchEvent(new CustomEvent("fx:process", { bubbles: true }));
@@ -82,14 +95,37 @@ const FIXI_WS_JS = String.raw`(()=>{
           setStatus(root, "error");
         }
       });
-      socket.addEventListener("error", () => setStatus(root, "error"));
+      socket.addEventListener("error", () => {
+        if (root.__fixiWs !== socket || socketGeneration !== generation) return;
+        setStatus(root, "error");
+      });
       socket.addEventListener("close", () => {
+        if (root.__fixiWs !== socket || socketGeneration !== generation) return;
         setStatus(root, "closed");
         if (!shouldReconnect) return;
-        window.setTimeout(connect, reconnectDelayMs);
+        reconnectTimer = window.setTimeout(() => {
+          if (socketGeneration !== generation) return;
+          connect();
+        }, reconnectDelayMs);
         reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5000);
       });
     };
+
+    const teardown = () => {
+      clearReconnectTimer();
+      const socket = root.__fixiWs;
+      if (!socket) return;
+      root.__fixiWs = null;
+      generation += 1;
+      try {
+        socket.close(1001, "page-hidden");
+      } catch {
+        // Ignore teardown races on unload.
+      }
+    };
+
+    window.addEventListener("pagehide", teardown, { once: true });
+    window.addEventListener("beforeunload", teardown, { once: true });
 
     connect();
   }
@@ -231,7 +267,7 @@ function externalOrigin(request, fallbackUrl) {
   return new URL(fallbackUrl).origin;
 }
 
-function roomActor(env, roomId) {
+function roomNamespace(env, roomId) {
   const id = env.CHAT_ROOM.idFromName(roomId);
   return env.CHAT_ROOM.get(id);
 }
@@ -264,6 +300,23 @@ function roomStateResponse(room) {
     messages: snapshot.messages,
     participants: listConnectedParticipants(snapshot, roomConnectionHandles(snapshot)),
   };
+}
+
+function roomSnapshotPayload(room) {
+  return JSON.stringify([
+    fixiSwap("#messages", "innerHTML", renderMessagesItems(room)),
+    fixiSwap(
+      "#participants",
+      "innerHTML",
+      renderParticipantsItems(room, roomConnectionHandles(room)),
+    ),
+  ]);
+}
+
+async function sendRoomSnapshot(room, handle, snapshot = null) {
+  const current = snapshot ?? await room.atomic(() => roomSnapshot(room));
+  const socket = new WebSocket(handle);
+  socket.send(roomSnapshotPayload(current), "text");
 }
 
 function modifyRoom(room, updater) {
@@ -313,14 +366,7 @@ function deferRoomEvents(room, events) {
         break;
       }
       case "room_snapshot": {
-        const payload = JSON.stringify([
-          fixiSwap("#messages", "innerHTML", renderMessagesItems(event.room)),
-          fixiSwap(
-            "#participants",
-            "innerHTML",
-            renderParticipantsItems(event.room, roomConnectionHandles(event.room)),
-          ),
-        ]);
+        const payload = roomSnapshotPayload(event.room);
         const socket = new WebSocket(event.handle);
         socket.send(payload, "text");
         break;
@@ -368,7 +414,6 @@ function roomProcess(room) {
         return snapshot;
       });
       deferRoomEvents(room, [
-        { type: "session_replaced", handles: replacedHandles },
         {
           type: "participants_changed",
           handles: roomConnectionHandles(nextRoom).filter((existingHandle) => existingHandle !== handle),
@@ -626,7 +671,7 @@ export default {
         if (!username || !participantId) {
           return json({ ok: false, error: "missing room, username, or participant id" }, 400);
         }
-        const room = roomActor(env, roomId);
+        const room = roomNamespace(env, roomId);
         return await room.atomic(() => roomProcess(room).openSocket({
           request,
           roomId,
@@ -635,7 +680,7 @@ export default {
         }));
       }
       if (action === "state") {
-        const room = roomActor(env, roomId);
+        const room = roomNamespace(env, roomId);
         return json({ ok: true, ...(await room.atomic(() => roomStateResponse(room))) });
       }
       const username = normalizeUsername(url.searchParams.get("username"));
@@ -656,15 +701,18 @@ export default {
       return;
     }
     if (event.type === "socketmessage") {
+      const payload = parseSocketPayload(event.data);
+      if (!payload) {
+        return;
+      }
+      if (String(payload.type ?? "") === "ready") {
+        const snapshot = await stub.atomic(() => roomSnapshot(stub));
+        await sendRoomSnapshot(stub, event.handle, snapshot);
+        return;
+      }
       await stub.atomic(() => {
-        const payload = parseSocketPayload(event.data);
-        if (!payload) {
-          return false;
-        }
         const process = roomProcess(stub);
         switch (String(payload.type ?? "")) {
-          case "ready":
-            return process.clientReady(event.handle);
           case "message":
             return process.postMessage(event.handle, payload.text);
           default:
