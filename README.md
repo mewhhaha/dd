@@ -177,7 +177,7 @@ cargo run -p runtime --bin bench --release
 Run keyed memory namespace benchmark with:
 
 ```bash
-cargo run -p runtime --bin bench_actor_storage
+cargo run -p runtime --bin bench_memory_storage
 ```
 
 Current baseline results are in `BENCHMARKS.md`.

@@ -740,7 +740,7 @@ async fn main() -> Result<(), String> {
         actor_profile_enabled: profile_enabled,
         ..RuntimeConfig::default()
     };
-    let service = start_service("actor-storage", runtime)
+    let service = start_service("memory-storage", runtime)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -759,7 +759,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("async-storage") {
         run_and_print(
             &service,
-            "actor-read-async-storage",
+            "memory-read-async-storage",
             ACTOR_READ_ASYNC_STORAGE_WORKER_SOURCE,
             true,
             "/read",
@@ -773,7 +773,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("async-memory") {
         run_and_print(
             &service,
-            "actor-read-async-memory",
+            "memory-read-async-memory",
             ACTOR_READ_ASYNC_MEMORY_WORKER_SOURCE,
             false,
             "/read",
@@ -787,7 +787,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("sync-memory") {
         run_and_print(
             &service,
-            "actor-read-sync-memory",
+            "memory-read-sync-memory",
             ACTOR_READ_SYNC_MEMORY_WORKER_SOURCE,
             false,
             "/read",
@@ -801,7 +801,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory") {
         run_and_print(
             &service,
-            "actor-direct-read-memory",
+            "memory-direct-read-memory",
             ACTOR_DIRECT_READ_WORKER_SOURCE,
             true,
             "/read",
@@ -815,7 +815,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("direct-write-memory") {
         run_and_print(
             &service,
-            "actor-direct-write-memory",
+            "memory-direct-write-memory",
             ACTOR_DIRECT_WRITE_WORKER_SOURCE,
             true,
             "/write",
@@ -829,7 +829,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("direct-write-memory-multikey") {
         run_and_print(
             &service,
-            "actor-direct-write-memory-multikey",
+            "memory-direct-write-memory-multikey",
             ACTOR_DIRECT_WRITE_WORKER_SOURCE,
             false,
             "/write",
@@ -843,7 +843,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory-multikey") {
         run_and_print(
             &service,
-            "actor-direct-read-memory-multikey",
+            "memory-direct-read-memory-multikey",
             ACTOR_DIRECT_READ_WORKER_SOURCE,
             false,
             "/read",
@@ -857,7 +857,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory-wide") {
         run_and_print(
             &service,
-            "actor-direct-read-memory-wide",
+            "memory-direct-read-memory-wide",
             ACTOR_DIRECT_READ_WORKER_SOURCE,
             true,
             "/read",
@@ -914,7 +914,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-inc") {
         run_and_print(
             &service,
-            "actor-stm-inc",
+            "memory-stm-inc",
             ACTOR_STM_INCREMENT_WORKER_SOURCE,
             true,
             "/inc",
@@ -928,7 +928,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read") {
         run_and_print(
             &service,
-            "actor-stm-read",
+            "memory-stm-read",
             ACTOR_STM_READ_WRITE_WORKER_SOURCE,
             true,
             "/read",
@@ -942,7 +942,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read-multikey") {
         run_and_print(
             &service,
-            "actor-stm-read-multikey",
+            "memory-stm-read-multikey",
             ACTOR_STM_READ_WRITE_WORKER_SOURCE,
             true,
             "/read",
@@ -956,7 +956,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read-allow-concurrency") {
         run_and_print(
             &service,
-            "actor-stm-read-allow-concurrency",
+            "memory-stm-read-allow-concurrency",
             ACTOR_STM_READ_WRITE_ALLOW_CONCURRENCY_WORKER_SOURCE,
             true,
             "/read",
@@ -970,7 +970,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read-multikey-allow-concurrency") {
         run_and_print(
             &service,
-            "actor-stm-read-multikey-allow-concurrency",
+            "memory-stm-read-multikey-allow-concurrency",
             ACTOR_STM_READ_WRITE_ALLOW_CONCURRENCY_WORKER_SOURCE,
             true,
             "/read",
@@ -984,7 +984,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-write") {
         run_and_print(
             &service,
-            "actor-stm-write",
+            "memory-stm-write",
             ACTOR_STM_READ_WRITE_WORKER_SOURCE,
             true,
             "/write",
@@ -998,7 +998,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-write-throughput") {
         run_and_print(
             &service,
-            "actor-stm-write-throughput",
+            "memory-stm-write-throughput",
             ACTOR_STM_READ_WRITE_WORKER_SOURCE,
             true,
             "/write",
@@ -1012,7 +1012,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-write-multikey") {
         run_and_print(
             &service,
-            "actor-stm-write-multikey",
+            "memory-stm-write-multikey",
             ACTOR_STM_READ_WRITE_WORKER_SOURCE,
             true,
             "/write",
@@ -1026,7 +1026,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-blind-write") {
         run_and_print(
             &service,
-            "actor-stm-blind-write",
+            "memory-stm-blind-write",
             ACTOR_STM_BLIND_WRITE_WORKER_SOURCE,
             true,
             "/write",
@@ -1040,7 +1040,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("stm-blind-write-multikey") {
         run_and_print(
             &service,
-            "actor-stm-blind-write-multikey",
+            "memory-stm-blind-write-multikey",
             ACTOR_STM_BLIND_WRITE_WORKER_SOURCE,
             true,
             "/write",
@@ -1054,7 +1054,7 @@ async fn main() -> Result<(), String> {
     if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-put-inc") {
         run_and_print(
             &service,
-            "actor-atomic-put-inc",
+            "memory-atomic-put-inc",
             ACTOR_ATOMIC_PUT_INCREMENT_WORKER_SOURCE,
             true,
             "/inc",
@@ -1657,7 +1657,7 @@ async fn take_profile(
         serde_json::from_str(&body).map_err(|error| error.to_string())?;
     if !profile.ok {
         return Err(if profile.error.is_empty() {
-            "actor profile collection failed".to_string()
+            "memory profile collection failed".to_string()
         } else {
             profile.error
         });
@@ -1670,7 +1670,7 @@ fn print_profile(profile: &ActorProfileSnapshot) {
         return;
     }
     println!(
-        "profile-actor js_read={:.2}ms js_commit={:.2}ms js_blind_commit={:.2}ms js_validate={:.2}ms freshness={:.2}ms hydrate_full={:.2}ms hydrate_keys={:.2}ms cache hit={} miss={} stale={}",
+        "profile-memory js_read={:.2}ms js_commit={:.2}ms js_blind_commit={:.2}ms js_validate={:.2}ms freshness={:.2}ms hydrate_full={:.2}ms hydrate_keys={:.2}ms cache hit={} miss={} stale={}",
         metric_mean_ms(&profile.js_read_only_total),
         metric_mean_ms(&profile.js_txn_commit),
         metric_mean_ms(&profile.js_txn_blind_commit),
@@ -1683,7 +1683,7 @@ fn print_profile(profile: &ActorProfileSnapshot) {
         profile.js_cache_stale.calls,
     );
     println!(
-        "profile-actor-op read={:.2}ms snapshot={:.2}ms version={:.2}ms validate={:.2}ms apply={:.2}ms blind_apply={:.2}ms store_read={:.2}ms store_snapshot={:.2}ms store_keys={:.2}ms store_version={:.2}ms store_apply={:.2}ms store_validate={:.2}ms store_write={:.2}ms store_blind_apply={:.2}ms store_blind_write={:.2}ms",
+        "profile-memory-op read={:.2}ms snapshot={:.2}ms version={:.2}ms validate={:.2}ms apply={:.2}ms blind_apply={:.2}ms store_read={:.2}ms store_snapshot={:.2}ms store_keys={:.2}ms store_version={:.2}ms store_apply={:.2}ms store_validate={:.2}ms store_write={:.2}ms store_blind_apply={:.2}ms store_blind_write={:.2}ms",
         metric_mean_ms(&profile.op_read),
         metric_mean_ms(&profile.op_snapshot),
         metric_mean_ms(&profile.op_version_if_newer),
@@ -1701,7 +1701,7 @@ fn print_profile(profile: &ActorProfileSnapshot) {
         metric_mean_ms(&profile.store_apply_blind_batch_write),
     );
     println!(
-        "profile-actor-direct enqueue={:.2}ms await={:.2}ms queue_load={:.2}ms queue_flush={:.2}ms queue_delete={:.2}ms waiter_complete={:.2}ms enqueue_calls={} await_calls={} flush_calls={}",
+        "profile-memory-direct enqueue={:.2}ms await={:.2}ms queue_load={:.2}ms queue_flush={:.2}ms queue_delete={:.2}ms waiter_complete={:.2}ms enqueue_calls={} await_calls={} flush_calls={}",
         metric_mean_ms(&profile.store_direct_enqueue),
         metric_mean_ms(&profile.store_direct_await),
         metric_mean_ms(&profile.store_direct_queue_load),
@@ -1839,7 +1839,7 @@ fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvocation {
         url,
         headers: Vec::new(),
         body: Vec::new(),
-        request_id: format!("bench-actor-{idx}"),
+        request_id: format!("bench-memory-{idx}"),
     }
 }
 
