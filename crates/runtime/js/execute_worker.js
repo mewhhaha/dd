@@ -3116,15 +3116,17 @@ globalThis.__dd_execute_worker = (payload) => {
       }
       return async (...args) => {
         const argsBytes = await encodeRpcArgs(args);
-        const result = await callOp("op_dynamic_host_rpc_invoke", {
-          request_id: activeRequestId(),
-          binding: bindingName,
-          method_name: methodName,
-          args: Array.from(argsBytes),
-        });
-        await syncFrozenTime();
+        const result = await awaitDynamicReply(
+          `dynamic host rpc invoke (${bindingName}.${methodName})`,
+          () => callOp("op_dynamic_host_rpc_invoke", {
+            request_id: activeRequestId(),
+            binding: bindingName,
+            method_name: methodName,
+            args: Array.from(argsBytes),
+          }),
+        );
         if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? `dynamic host rpc invoke failed: ${methodName}`));
+          throw new Error(formatDynamicFailure(`dynamic host rpc invoke failed: ${methodName}`, result));
         }
         return decodeRpcResult(toArrayBytes(result.value));
       };
@@ -3708,6 +3710,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
 
     const encodedByPath = new Map();
+    const rewrittenByPath = new Map();
     const urlsByPath = new Map();
     const unresolved = new Set();
     const maxRounds = 16;
@@ -3735,6 +3738,7 @@ globalThis.__dd_execute_worker = (payload) => {
             return url;
           },
         );
+        rewrittenByPath.set(modulePath, rewritten);
         const encoded = `data:text/javascript;charset=utf-8,${encodeURIComponent(rewritten)}`;
         if (encodedByPath.get(modulePath) !== encoded) {
           encodedByPath.set(modulePath, encoded);
@@ -3757,11 +3761,11 @@ globalThis.__dd_execute_worker = (payload) => {
       }
     }
 
-    const entryUrl = urlsByPath.get(entrypoint);
-    if (!entryUrl) {
-      throw new Error("dynamic worker entrypoint URL could not be built");
+    const entrySource = rewrittenByPath.get(entrypoint);
+    if (!entrySource) {
+      throw new Error("dynamic worker entrypoint source could not be built");
     }
-    return `export { default } from ${JSON.stringify(entryUrl)};\n`;
+    return `${entrySource}\n`;
   };
 
   const resolveDynamicWorkerSource = (options) => {
@@ -3790,15 +3794,9 @@ globalThis.__dd_execute_worker = (payload) => {
       const request = await normalizeActorFetchInput(inputValue, initValue);
       const scopedRequestId = activeRequestId();
       const invokeSeq = nextActorInvokeSeq();
-      let timeoutId = 0;
-      const timeoutError = new Promise((_, reject) => {
-        timeoutId = setTimeout(
-          () => reject(new Error(`dynamic worker invoke timed out after ${timeout}ms`)),
-          timeout,
-        );
-      });
-      const result = await Promise.race([
-        callOp("op_dynamic_worker_invoke", {
+      const result = await awaitDynamicReply(
+        `dynamic worker invoke (${bindingName}/${handle})`,
+        () => callOp("op_dynamic_worker_invoke", {
           request_id: scopedRequestId,
           subrequest_id: `${scopedRequestId}:dynamic:${invokeSeq}`,
           binding: bindingName,
@@ -3808,11 +3806,10 @@ globalThis.__dd_execute_worker = (payload) => {
           headers: request.headers,
           body: Array.from(request.body),
         }),
-        timeoutError,
-      ]).finally(() => clearTimeout(timeoutId));
-      await syncFrozenTime();
+        timeout,
+      );
       if (!result || typeof result !== "object" || result.ok === false) {
-        throw new Error(String(result?.error ?? "dynamic worker invoke failed"));
+        throw new Error(formatDynamicFailure("dynamic worker invoke failed", result));
       }
       return new Response(toArrayBytes(result.body), {
         status: Number(result.status ?? 200),
@@ -3830,6 +3827,60 @@ globalThis.__dd_execute_worker = (payload) => {
       throw new Error("dynamic worker factory must return an options object");
     }
     return options;
+  };
+
+  const withDynamicStageTimeout = async (label, promise, timeoutMs = 5_000) => {
+    let timeoutId = 0;
+    const timeoutError = new Promise((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+    });
+    return Promise.race([promise, timeoutError]).finally(() => clearTimeout(timeoutId));
+  };
+
+  const awaitDynamicReply = async (label, startOp, timeoutMs = 5_000) => {
+    const started = startOp();
+    if (!started || typeof started !== "object" || started.ok === false) {
+      throw new Error(String(started?.error ?? `${label} failed to start`));
+    }
+    const replyId = String(started.reply_id ?? "").trim();
+    if (!replyId) {
+      throw new Error(`${label} missing reply id`);
+    }
+    try {
+      const maxSpins = Math.max(1024, Math.trunc(timeoutMs * 256));
+      for (let spin = 0; spin < maxSpins; spin += 1) {
+        await drainDynamicLocalHostRpcQueue();
+        const result = callOp("op_dynamic_take_reply", { reply_id: replyId });
+        if (result && typeof result === "object" && result.ready === true) {
+          await syncFrozenTime();
+          return result;
+        }
+        if ((spin & 255) === 255) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    } catch (error) {
+      callOp("op_dynamic_cancel_reply", replyId);
+      throw error;
+    }
+  };
+
+  const formatDynamicFailure = (fallback, result) => {
+    if (result && typeof result === "object") {
+      if (typeof result.error === "string" && result.error) {
+        return result.error;
+      }
+      try {
+        return JSON.stringify(result);
+      } catch {
+        return fallback;
+      }
+    }
+    return String(result ?? fallback);
   };
 
   /**
@@ -3859,14 +3910,16 @@ globalThis.__dd_execute_worker = (payload) => {
     async get(id, factory) {
       const instanceId = normalizeDynamicInstanceId(id);
       const scopedRequestId = activeRequestId();
-      const lookup = await callOp("op_dynamic_worker_lookup", {
-        request_id: scopedRequestId,
-        binding: bindingName,
-        id: instanceId,
-      });
-      await syncFrozenTime();
+      const lookup = await awaitDynamicReply(
+        `dynamic worker lookup (${bindingName}/${instanceId})`,
+        () => callOp("op_dynamic_worker_lookup", {
+          request_id: scopedRequestId,
+          binding: bindingName,
+          id: instanceId,
+        }),
+      );
       if (!lookup || typeof lookup !== "object" || lookup.ok === false) {
-        throw new Error(String(lookup?.error ?? "dynamic worker lookup failed"));
+        throw new Error(formatDynamicFailure("dynamic worker lookup failed", lookup));
       }
       if (lookup.found === true) {
         return createDynamicWorkerStub(
@@ -3882,18 +3935,20 @@ globalThis.__dd_execute_worker = (payload) => {
       const envInput = options.env;
       const envConfig = splitDynamicEnvInput(envInput);
       const timeout = normalizeDynamicTimeout(options.timeout);
-      const result = await callOp("op_dynamic_worker_create", {
-        request_id: scopedRequestId,
-        binding: bindingName,
-        id: instanceId,
-        source,
-        env: envConfig.stringEnv,
-        host_rpc_bindings: envConfig.hostRpcBindings,
-        timeout,
-      });
-      await syncFrozenTime();
+      const result = await awaitDynamicReply(
+        `dynamic worker create (${bindingName}/${instanceId})`,
+        () => callOp("op_dynamic_worker_create", {
+          request_id: scopedRequestId,
+          binding: bindingName,
+          id: instanceId,
+          source,
+          env: envConfig.stringEnv,
+          host_rpc_bindings: envConfig.hostRpcBindings,
+          timeout,
+        }),
+      );
       if (!result || typeof result !== "object" || result.ok === false) {
-        throw new Error(String(result?.error ?? "dynamic worker create failed"));
+        throw new Error(formatDynamicFailure("dynamic worker create failed", result));
       }
       const handle = String(result.handle ?? "").trim();
       if (!handle) {
@@ -3913,13 +3968,15 @@ globalThis.__dd_execute_worker = (payload) => {
      */
     async list() {
       const scopedRequestId = activeRequestId();
-      const result = await callOp("op_dynamic_worker_list", {
-        request_id: scopedRequestId,
-        binding: bindingName,
-      });
-      await syncFrozenTime();
+      const result = await awaitDynamicReply(
+        `dynamic worker list (${bindingName})`,
+        () => callOp("op_dynamic_worker_list", {
+          request_id: scopedRequestId,
+          binding: bindingName,
+        }),
+      );
       if (!result || typeof result !== "object" || result.ok === false) {
-        throw new Error(String(result?.error ?? "dynamic worker list failed"));
+        throw new Error(formatDynamicFailure("dynamic worker list failed", result));
       }
       return Array.isArray(result.ids)
         ? result.ids.map((value) => String(value))
@@ -3934,14 +3991,16 @@ globalThis.__dd_execute_worker = (payload) => {
     async delete(id) {
       const instanceId = normalizeDynamicInstanceId(id);
       const scopedRequestId = activeRequestId();
-      const result = await callOp("op_dynamic_worker_delete", {
-        request_id: scopedRequestId,
-        binding: bindingName,
-        id: instanceId,
-      });
-      await syncFrozenTime();
+      const result = await awaitDynamicReply(
+        `dynamic worker delete (${bindingName}/${instanceId})`,
+        () => callOp("op_dynamic_worker_delete", {
+          request_id: scopedRequestId,
+          binding: bindingName,
+          id: instanceId,
+        }),
+      );
       if (!result || typeof result !== "object" || result.ok === false) {
-        throw new Error(String(result?.error ?? "dynamic worker delete failed"));
+        throw new Error(formatDynamicFailure("dynamic worker delete failed", result));
       }
       return Boolean(result.deleted);
     },
@@ -4362,6 +4421,35 @@ globalThis.__dd_execute_worker = (payload) => {
       status: 200,
       headers: [["content-type", "application/octet-stream"]],
     });
+  };
+
+  const drainDynamicLocalHostRpcQueue = async () => {
+    for (;;) {
+      const task = callOp("op_dynamic_take_local_host_rpc");
+      if (!task || typeof task !== "object" || task.ready !== true) {
+        return;
+      }
+      let ok = true;
+      let value = [];
+      let error = "";
+      try {
+        const response = await invokeHostRpcCall({
+          target_id: task.target_id,
+          method: task.method_name,
+          args: task.args,
+        });
+        value = Array.from(new Uint8Array(await response.arrayBuffer()));
+      } catch (cause) {
+        ok = false;
+        error = String(cause?.message ?? cause ?? "dynamic local host rpc failed");
+      }
+      callOp("op_dynamic_finish_local_host_rpc", {
+        task_id: String(task.task_id ?? ""),
+        ok,
+        value,
+        error,
+      });
+    }
   };
 
   const emitWaitUntilDone = async (timedOut) => {

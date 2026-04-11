@@ -20,10 +20,11 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_traits::impls::RealSys;
@@ -181,7 +182,8 @@ pub struct DynamicWorkerCreateEvent {
     pub env: HashMap<String, String>,
     pub timeout: u64,
     pub host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
-    pub reply: oneshot::Sender<Result<DynamicWorkerCreateReply>>,
+    pub reply_id: String,
+    pub pending_replies: DynamicPendingReplies,
 }
 
 #[derive(Debug, Clone)]
@@ -194,33 +196,41 @@ pub struct DynamicWorkerCreateReply {
 pub struct DynamicWorkerLookupEvent {
     pub owner_worker: String,
     pub owner_generation: u64,
+    pub owner_isolate_id: u64,
     pub binding: String,
     pub id: String,
-    pub reply: oneshot::Sender<Result<Option<DynamicWorkerCreateReply>>>,
+    pub reply_id: String,
+    pub pending_replies: DynamicPendingReplies,
 }
 
 pub struct DynamicWorkerListEvent {
     pub owner_worker: String,
     pub owner_generation: u64,
+    pub owner_isolate_id: u64,
     pub binding: String,
-    pub reply: oneshot::Sender<Result<Vec<String>>>,
+    pub reply_id: String,
+    pub pending_replies: DynamicPendingReplies,
 }
 
 pub struct DynamicWorkerDeleteEvent {
     pub owner_worker: String,
     pub owner_generation: u64,
+    pub owner_isolate_id: u64,
     pub binding: String,
     pub id: String,
-    pub reply: oneshot::Sender<Result<bool>>,
+    pub reply_id: String,
+    pub pending_replies: DynamicPendingReplies,
 }
 
 pub struct DynamicWorkerInvokeEvent {
     pub owner_worker: String,
     pub owner_generation: u64,
+    pub owner_isolate_id: u64,
     pub binding: String,
     pub handle: String,
     pub request: WorkerInvocation,
-    pub reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub reply_id: String,
+    pub pending_replies: DynamicPendingReplies,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,10 +244,373 @@ pub struct DynamicHostRpcBindingSpec {
 pub struct DynamicHostRpcInvokeEvent {
     pub caller_worker: String,
     pub caller_generation: u64,
+    pub caller_isolate_id: u64,
     pub binding: String,
     pub method_name: String,
     pub args: Vec<u8>,
-    pub reply: oneshot::Sender<Result<Vec<u8>>>,
+    pub reply_id: String,
+    pub pending_replies: DynamicPendingReplies,
+}
+
+#[derive(Clone, Default)]
+pub struct DynamicPendingReplies {
+    entries: Arc<StdMutex<HashMap<String, DynamicPendingReplyEntry>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+enum DynamicPendingReplyEntry {
+    Pending,
+    Ready(DynamicPendingReplyPayload),
+}
+
+pub enum DynamicPendingReplyPayload {
+    Create(Result<DynamicWorkerCreateReply>),
+    Lookup(Result<Option<DynamicWorkerCreateReply>>),
+    List(Result<Vec<String>>),
+    Delete(Result<bool>),
+    Invoke(Result<WorkerOutput>),
+    HostRpc(Result<Vec<u8>>),
+}
+
+#[derive(Clone, Default)]
+pub struct DynamicLocalHostRpcQueue {
+    pending: Arc<StdMutex<VecDeque<DynamicLocalHostRpcTask>>>,
+    inflight: Arc<StdMutex<HashMap<String, DynamicLocalHostRpcInflight>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+struct DynamicLocalHostRpcTask {
+    task_id: String,
+    target_id: String,
+    method_name: String,
+    args: Vec<u8>,
+    reply_id: String,
+    pending_replies: DynamicPendingReplies,
+}
+
+struct DynamicLocalHostRpcInflight {
+    reply_id: String,
+    pending_replies: DynamicPendingReplies,
+}
+
+#[derive(Serialize)]
+struct DynamicLocalHostRpcTakeResult {
+    ready: bool,
+    task_id: String,
+    target_id: String,
+    method_name: String,
+    args: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct DynamicLocalHostRpcFinishPayload {
+    task_id: String,
+    ok: bool,
+    #[serde(default)]
+    value: Vec<u8>,
+    #[serde(default)]
+    error: String,
+}
+
+#[derive(Serialize)]
+struct DynamicPendingReplyStartResult {
+    ok: bool,
+    reply_id: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct DynamicPendingReplyPollResult {
+    ready: bool,
+    kind: String,
+    ok: bool,
+    found: bool,
+    deleted: bool,
+    handle: String,
+    worker: String,
+    timeout: u64,
+    ids: Vec<String>,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    value: Vec<u8>,
+    error: String,
+}
+
+impl Default for DynamicPendingReplyPollResult {
+    fn default() -> Self {
+        Self {
+            ready: false,
+            kind: String::new(),
+            ok: false,
+            found: false,
+            deleted: false,
+            handle: String::new(),
+            worker: String::new(),
+            timeout: 0,
+            ids: Vec::new(),
+            status: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+            value: Vec::new(),
+            error: String::new(),
+        }
+    }
+}
+
+impl DynamicPendingReplies {
+    pub fn allocate(&self) -> String {
+        let reply_id = format!("dynr-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("dynamic pending reply lock poisoned");
+        entries.insert(reply_id.clone(), DynamicPendingReplyEntry::Pending);
+        reply_id
+    }
+
+    pub fn cancel(&self, reply_id: &str) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("dynamic pending reply lock poisoned");
+        entries.remove(reply_id);
+    }
+
+    pub fn finish(&self, reply_id: String, payload: DynamicPendingReplyPayload) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("dynamic pending reply lock poisoned");
+        if let Some(entry) = entries.get_mut(&reply_id) {
+            *entry = DynamicPendingReplyEntry::Ready(payload);
+        }
+    }
+
+    fn poll(&self, reply_id: &str) -> DynamicPendingReplyPollResult {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("dynamic pending reply lock poisoned");
+        let Some(entry) = entries.get(reply_id) else {
+            return DynamicPendingReplyPollResult {
+                ready: true,
+                kind: "unknown".to_string(),
+                ok: false,
+                error: "dynamic reply id not found".to_string(),
+                ..DynamicPendingReplyPollResult::default()
+            };
+        };
+        if matches!(entry, DynamicPendingReplyEntry::Pending) {
+            return DynamicPendingReplyPollResult::default();
+        }
+        match entries.remove(reply_id) {
+            Some(DynamicPendingReplyEntry::Ready(payload)) => payload.into_poll_result(),
+            Some(DynamicPendingReplyEntry::Pending) | None => {
+                DynamicPendingReplyPollResult::default()
+            }
+        }
+    }
+}
+
+impl DynamicLocalHostRpcQueue {
+    pub fn enqueue(
+        &self,
+        target_id: String,
+        method_name: String,
+        args: Vec<u8>,
+        reply_id: String,
+        pending_replies: DynamicPendingReplies,
+    ) {
+        let task_id = format!("dlhrpc-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("dynamic local host rpc pending lock poisoned");
+        pending.push_back(DynamicLocalHostRpcTask {
+            task_id,
+            target_id,
+            method_name,
+            args,
+            reply_id,
+            pending_replies,
+        });
+    }
+
+    fn take(&self) -> DynamicLocalHostRpcTakeResult {
+        let task = {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("dynamic local host rpc pending lock poisoned");
+            pending.pop_front()
+        };
+        let Some(task) = task else {
+            return DynamicLocalHostRpcTakeResult {
+                ready: false,
+                task_id: String::new(),
+                target_id: String::new(),
+                method_name: String::new(),
+                args: Vec::new(),
+            };
+        };
+        let mut inflight = self
+            .inflight
+            .lock()
+            .expect("dynamic local host rpc inflight lock poisoned");
+        inflight.insert(
+            task.task_id.clone(),
+            DynamicLocalHostRpcInflight {
+                reply_id: task.reply_id,
+                pending_replies: task.pending_replies,
+            },
+        );
+        DynamicLocalHostRpcTakeResult {
+            ready: true,
+            task_id: task.task_id,
+            target_id: task.target_id,
+            method_name: task.method_name,
+            args: task.args,
+        }
+    }
+
+    fn finish(&self, payload: DynamicLocalHostRpcFinishPayload) {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .expect("dynamic local host rpc inflight lock poisoned");
+        let Some(task) = inflight.remove(payload.task_id.trim()) else {
+            return;
+        };
+        let result = if payload.ok {
+            Ok(payload.value)
+        } else {
+            Err(PlatformError::runtime(if payload.error.trim().is_empty() {
+                "dynamic local host rpc failed".to_string()
+            } else {
+                payload.error
+            }))
+        };
+        task.pending_replies
+            .finish(task.reply_id, DynamicPendingReplyPayload::HostRpc(result));
+    }
+}
+
+impl DynamicPendingReplyPayload {
+    fn into_poll_result(self) -> DynamicPendingReplyPollResult {
+        match self {
+            Self::Create(result) => match result {
+                Ok(created) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "create".to_string(),
+                    ok: true,
+                    handle: created.handle,
+                    worker: created.worker_name,
+                    timeout: created.timeout,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Err(error) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "create".to_string(),
+                    ok: false,
+                    error: error.to_string(),
+                    ..DynamicPendingReplyPollResult::default()
+                },
+            },
+            Self::Lookup(result) => match result {
+                Ok(Some(found)) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "lookup".to_string(),
+                    ok: true,
+                    found: true,
+                    handle: found.handle,
+                    worker: found.worker_name,
+                    timeout: found.timeout,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Ok(None) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "lookup".to_string(),
+                    ok: true,
+                    found: false,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Err(error) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "lookup".to_string(),
+                    ok: false,
+                    error: error.to_string(),
+                    ..DynamicPendingReplyPollResult::default()
+                },
+            },
+            Self::List(result) => match result {
+                Ok(ids) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "list".to_string(),
+                    ok: true,
+                    ids,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Err(error) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "list".to_string(),
+                    ok: false,
+                    error: error.to_string(),
+                    ..DynamicPendingReplyPollResult::default()
+                },
+            },
+            Self::Delete(result) => match result {
+                Ok(deleted) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "delete".to_string(),
+                    ok: true,
+                    deleted,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Err(error) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "delete".to_string(),
+                    ok: false,
+                    error: error.to_string(),
+                    ..DynamicPendingReplyPollResult::default()
+                },
+            },
+            Self::Invoke(result) => match result {
+                Ok(output) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "invoke".to_string(),
+                    ok: true,
+                    status: output.status,
+                    headers: output.headers,
+                    body: output.body,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Err(error) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "invoke".to_string(),
+                    ok: false,
+                    error: error.to_string(),
+                    ..DynamicPendingReplyPollResult::default()
+                },
+            },
+            Self::HostRpc(result) => match result {
+                Ok(value) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "host-rpc".to_string(),
+                    ok: true,
+                    value,
+                    ..DynamicPendingReplyPollResult::default()
+                },
+                Err(error) => DynamicPendingReplyPollResult {
+                    ready: true,
+                    kind: "host-rpc".to_string(),
+                    ok: false,
+                    error: error.to_string(),
+                    ..DynamicPendingReplyPollResult::default()
+                },
+            },
+        }
+    }
 }
 
 #[derive(Default)]
@@ -478,30 +851,11 @@ struct DynamicWorkerCreatePayload {
     host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
 }
 
-#[derive(Debug, Serialize)]
-struct DynamicWorkerCreateResult {
-    ok: bool,
-    handle: String,
-    worker: String,
-    timeout: u64,
-    error: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct DynamicWorkerLookupPayload {
     request_id: String,
     binding: String,
     id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DynamicWorkerLookupResult {
-    ok: bool,
-    found: bool,
-    handle: String,
-    worker: String,
-    timeout: u64,
-    error: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,25 +864,11 @@ struct DynamicWorkerListPayload {
     binding: String,
 }
 
-#[derive(Debug, Serialize)]
-struct DynamicWorkerListResult {
-    ok: bool,
-    ids: Vec<String>,
-    error: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct DynamicWorkerDeletePayload {
     request_id: String,
     binding: String,
     id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DynamicWorkerDeleteResult {
-    ok: bool,
-    deleted: bool,
-    error: String,
 }
 
 fn default_dynamic_worker_timeout() -> u64 {
@@ -549,15 +889,6 @@ struct DynamicWorkerInvokePayload {
     body: Vec<u8>,
 }
 
-#[derive(Debug, Serialize)]
-struct DynamicWorkerInvokeResult {
-    ok: bool,
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    error: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct DynamicHostRpcInvokePayload {
     request_id: String,
@@ -567,11 +898,9 @@ struct DynamicHostRpcInvokePayload {
     args: Vec<u8>,
 }
 
-#[derive(Debug, Serialize)]
-struct DynamicHostRpcInvokeResult {
-    ok: bool,
-    value: Vec<u8>,
-    error: String,
+#[derive(Debug, Deserialize)]
+struct DynamicPendingReplyPayloadInput {
+    reply_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2018,7 +2347,7 @@ fn dynamic_host_rpc_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
     binding: &str,
-) -> Result<(String, u64)> {
+) -> Result<(String, u64, u64)> {
     let request_id = request_id.trim();
     if request_id.is_empty() {
         return Err(PlatformError::bad_request(
@@ -2031,7 +2360,7 @@ fn dynamic_host_rpc_owner_for_request(
             "dynamic host rpc binding must not be empty",
         ));
     }
-    let (worker_name, generation) = {
+    let (worker_name, generation, isolate_id) = {
         let op_state = state.borrow();
         let contexts = op_state.borrow::<RequestSecretContexts>();
         let context = contexts.contexts.get(request_id).ok_or_else(|| {
@@ -2042,9 +2371,13 @@ fn dynamic_host_rpc_owner_for_request(
                 "dynamic host rpc binding is not allowed: {binding}"
             )));
         }
-        (context.worker_name.clone(), context.generation)
+        (
+            context.worker_name.clone(),
+            context.generation,
+            context.isolate_id,
+        )
     };
-    Ok((worker_name, generation))
+    Ok((worker_name, generation, isolate_id))
 }
 
 fn actor_invoke_owner_for_request(
@@ -2075,35 +2408,29 @@ fn actor_invoke_owner_for_request(
 
 #[deno_core::op2]
 #[serde]
-async fn op_dynamic_worker_create(
+fn op_dynamic_worker_create(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicWorkerCreatePayload,
-) -> DynamicWorkerCreateResult {
+) -> DynamicPendingReplyStartResult {
     let id = payload.id.trim();
     if id.is_empty() {
-        return DynamicWorkerCreateResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
+            reply_id: String::new(),
             error: "dynamic worker id must not be empty".to_string(),
         };
     }
     if payload.source.trim().is_empty() {
-        return DynamicWorkerCreateResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
+            reply_id: String::new(),
             error: "dynamic worker source must not be empty".to_string(),
         };
     }
     if payload.timeout == 0 {
-        return DynamicWorkerCreateResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
+            reply_id: String::new(),
             error: "dynamic worker timeout must be greater than 0".to_string(),
         };
     }
@@ -2111,16 +2438,15 @@ async fn op_dynamic_worker_create(
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicWorkerCreateResult {
+                return DynamicPendingReplyStartResult {
                     ok: false,
-                    handle: String::new(),
-                    worker: String::new(),
-                    timeout: 0,
+                    reply_id: String::new(),
                     error: error.to_string(),
                 };
             }
         };
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2135,77 +2461,53 @@ async fn op_dynamic_worker_create(
                 env: payload.env,
                 timeout: payload.timeout,
                 host_rpc_bindings: payload.host_rpc_bindings,
-                reply: reply_tx,
+                reply_id: reply_id.clone(),
+                pending_replies: pending_replies.clone(),
             },
         ))
         .is_err()
     {
-        return DynamicWorkerCreateResult {
+        pending_replies.cancel(&reply_id);
+        return DynamicPendingReplyStartResult {
             ok: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
+            reply_id: String::new(),
             error: "dynamic worker runtime is unavailable".to_string(),
         };
     }
-
-    match reply_rx.await {
-        Ok(Ok(created)) => DynamicWorkerCreateResult {
-            ok: true,
-            handle: created.handle,
-            worker: created.worker_name,
-            timeout: created.timeout,
-            error: String::new(),
-        },
-        Ok(Err(error)) => DynamicWorkerCreateResult {
-            ok: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
-            error: error.to_string(),
-        },
-        Err(_) => DynamicWorkerCreateResult {
-            ok: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
-            error: "dynamic worker create response channel closed".to_string(),
-        },
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
     }
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_dynamic_worker_lookup(
+fn op_dynamic_worker_lookup(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicWorkerLookupPayload,
-) -> DynamicWorkerLookupResult {
+) -> DynamicPendingReplyStartResult {
     let id = payload.id.trim();
     if id.is_empty() {
-        return DynamicWorkerLookupResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            found: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
+            reply_id: String::new(),
             error: "dynamic worker id must not be empty".to_string(),
         };
     }
-    let (owner_worker, owner_generation, _) =
+    let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicWorkerLookupResult {
+                return DynamicPendingReplyStartResult {
                     ok: false,
-                    found: false,
-                    handle: String::new(),
-                    worker: String::new(),
-                    timeout: 0,
+                    reply_id: String::new(),
                     error: error.to_string(),
                 };
             }
         };
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2213,77 +2515,48 @@ async fn op_dynamic_worker_lookup(
             DynamicWorkerLookupEvent {
                 owner_worker,
                 owner_generation,
+                owner_isolate_id,
                 binding: payload.binding,
                 id: id.to_string(),
-                reply: reply_tx,
+                reply_id: reply_id.clone(),
+                pending_replies: pending_replies.clone(),
             },
         ))
         .is_err()
     {
-        return DynamicWorkerLookupResult {
+        pending_replies.cancel(&reply_id);
+        return DynamicPendingReplyStartResult {
             ok: false,
-            found: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
+            reply_id: String::new(),
             error: "dynamic worker runtime is unavailable".to_string(),
         };
     }
-
-    match reply_rx.await {
-        Ok(Ok(Some(found))) => DynamicWorkerLookupResult {
-            ok: true,
-            found: true,
-            handle: found.handle,
-            worker: found.worker_name,
-            timeout: found.timeout,
-            error: String::new(),
-        },
-        Ok(Ok(None)) => DynamicWorkerLookupResult {
-            ok: true,
-            found: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
-            error: String::new(),
-        },
-        Ok(Err(error)) => DynamicWorkerLookupResult {
-            ok: false,
-            found: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
-            error: error.to_string(),
-        },
-        Err(_) => DynamicWorkerLookupResult {
-            ok: false,
-            found: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
-            error: "dynamic worker lookup response channel closed".to_string(),
-        },
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
     }
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_dynamic_worker_list(
+fn op_dynamic_worker_list(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicWorkerListPayload,
-) -> DynamicWorkerListResult {
-    let (owner_worker, owner_generation, _) =
+) -> DynamicPendingReplyStartResult {
+    let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicWorkerListResult {
+                return DynamicPendingReplyStartResult {
                     ok: false,
-                    ids: Vec::new(),
+                    reply_id: String::new(),
                     error: error.to_string(),
                 };
             }
         };
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2291,64 +2564,55 @@ async fn op_dynamic_worker_list(
             DynamicWorkerListEvent {
                 owner_worker,
                 owner_generation,
+                owner_isolate_id,
                 binding: payload.binding,
-                reply: reply_tx,
+                reply_id: reply_id.clone(),
+                pending_replies: pending_replies.clone(),
             },
         ))
         .is_err()
     {
-        return DynamicWorkerListResult {
+        pending_replies.cancel(&reply_id);
+        return DynamicPendingReplyStartResult {
             ok: false,
-            ids: Vec::new(),
+            reply_id: String::new(),
             error: "dynamic worker runtime is unavailable".to_string(),
         };
     }
-
-    match reply_rx.await {
-        Ok(Ok(ids)) => DynamicWorkerListResult {
-            ok: true,
-            ids,
-            error: String::new(),
-        },
-        Ok(Err(error)) => DynamicWorkerListResult {
-            ok: false,
-            ids: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => DynamicWorkerListResult {
-            ok: false,
-            ids: Vec::new(),
-            error: "dynamic worker list response channel closed".to_string(),
-        },
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
     }
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_dynamic_worker_delete(
+fn op_dynamic_worker_delete(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicWorkerDeletePayload,
-) -> DynamicWorkerDeleteResult {
+) -> DynamicPendingReplyStartResult {
     let id = payload.id.trim();
     if id.is_empty() {
-        return DynamicWorkerDeleteResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            deleted: false,
+            reply_id: String::new(),
             error: "dynamic worker id must not be empty".to_string(),
         };
     }
-    let (owner_worker, owner_generation, _) =
+    let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicWorkerDeleteResult {
+                return DynamicPendingReplyStartResult {
                     ok: false,
-                    deleted: false,
+                    reply_id: String::new(),
                     error: error.to_string(),
                 };
             }
         };
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2356,72 +2620,56 @@ async fn op_dynamic_worker_delete(
             DynamicWorkerDeleteEvent {
                 owner_worker,
                 owner_generation,
+                owner_isolate_id,
                 binding: payload.binding,
                 id: id.to_string(),
-                reply: reply_tx,
+                reply_id: reply_id.clone(),
+                pending_replies: pending_replies.clone(),
             },
         ))
         .is_err()
     {
-        return DynamicWorkerDeleteResult {
+        pending_replies.cancel(&reply_id);
+        return DynamicPendingReplyStartResult {
             ok: false,
-            deleted: false,
+            reply_id: String::new(),
             error: "dynamic worker runtime is unavailable".to_string(),
         };
     }
-
-    match reply_rx.await {
-        Ok(Ok(deleted)) => DynamicWorkerDeleteResult {
-            ok: true,
-            deleted,
-            error: String::new(),
-        },
-        Ok(Err(error)) => DynamicWorkerDeleteResult {
-            ok: false,
-            deleted: false,
-            error: error.to_string(),
-        },
-        Err(_) => DynamicWorkerDeleteResult {
-            ok: false,
-            deleted: false,
-            error: "dynamic worker delete response channel closed".to_string(),
-        },
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
     }
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_dynamic_worker_invoke(
+fn op_dynamic_worker_invoke(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicWorkerInvokePayload,
-) -> DynamicWorkerInvokeResult {
+) -> DynamicPendingReplyStartResult {
     if payload.subrequest_id.trim().is_empty() {
-        return DynamicWorkerInvokeResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
+            reply_id: String::new(),
             error: "dynamic worker subrequest_id must not be empty".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return DynamicWorkerInvokeResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
+            reply_id: String::new(),
             error: "dynamic worker handle must not be empty".to_string(),
         };
     }
-    let (owner_worker, owner_generation, _) =
+    let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicWorkerInvokeResult {
+                return DynamicPendingReplyStartResult {
                     ok: false,
-                    status: 500,
-                    headers: Vec::new(),
-                    body: Vec::new(),
+                    reply_id: String::new(),
                     error: error.to_string(),
                 };
             }
@@ -2435,7 +2683,8 @@ async fn op_dynamic_worker_invoke(
         request_id: payload.subrequest_id,
     };
 
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2443,75 +2692,58 @@ async fn op_dynamic_worker_invoke(
             DynamicWorkerInvokeEvent {
                 owner_worker,
                 owner_generation,
+                owner_isolate_id,
                 binding: payload.binding,
                 handle: payload.handle,
                 request,
-                reply: reply_tx,
+                reply_id: reply_id.clone(),
+                pending_replies: pending_replies.clone(),
             },
         ))
         .is_err()
     {
-        return DynamicWorkerInvokeResult {
+        pending_replies.cancel(&reply_id);
+        return DynamicPendingReplyStartResult {
             ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
+            reply_id: String::new(),
             error: "dynamic worker runtime is unavailable".to_string(),
         };
     }
-
-    match reply_rx.await {
-        Ok(Ok(output)) => DynamicWorkerInvokeResult {
-            ok: true,
-            status: output.status,
-            headers: output.headers,
-            body: output.body,
-            error: String::new(),
-        },
-        Ok(Err(error)) => DynamicWorkerInvokeResult {
-            ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => DynamicWorkerInvokeResult {
-            ok: false,
-            status: 500,
-            headers: Vec::new(),
-            body: Vec::new(),
-            error: "dynamic worker invoke response channel closed".to_string(),
-        },
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
     }
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_dynamic_host_rpc_invoke(
+fn op_dynamic_host_rpc_invoke(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicHostRpcInvokePayload,
-) -> DynamicHostRpcInvokeResult {
+) -> DynamicPendingReplyStartResult {
     let method_name = payload.method_name.trim();
     if method_name.is_empty() {
-        return DynamicHostRpcInvokeResult {
+        return DynamicPendingReplyStartResult {
             ok: false,
-            value: Vec::new(),
+            reply_id: String::new(),
             error: "dynamic host rpc method_name must not be empty".to_string(),
         };
     }
-    let (caller_worker, caller_generation) =
+    let (caller_worker, caller_generation, caller_isolate_id) =
         match dynamic_host_rpc_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicHostRpcInvokeResult {
+                return DynamicPendingReplyStartResult {
                     ok: false,
-                    value: Vec::new(),
+                    reply_id: String::new(),
                     error: error.to_string(),
                 };
             }
         };
 
-    let (reply_tx, reply_rx) = oneshot::channel();
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2519,38 +2751,61 @@ async fn op_dynamic_host_rpc_invoke(
             DynamicHostRpcInvokeEvent {
                 caller_worker,
                 caller_generation,
+                caller_isolate_id,
                 binding: payload.binding,
                 method_name: method_name.to_string(),
                 args: payload.args,
-                reply: reply_tx,
+                reply_id: reply_id.clone(),
+                pending_replies: pending_replies.clone(),
             },
         ))
         .is_err()
     {
-        return DynamicHostRpcInvokeResult {
+        pending_replies.cancel(&reply_id);
+        return DynamicPendingReplyStartResult {
             ok: false,
-            value: Vec::new(),
+            reply_id: String::new(),
             error: "dynamic host rpc runtime is unavailable".to_string(),
         };
     }
-
-    match reply_rx.await {
-        Ok(Ok(value)) => DynamicHostRpcInvokeResult {
-            ok: true,
-            value,
-            error: String::new(),
-        },
-        Ok(Err(error)) => DynamicHostRpcInvokeResult {
-            ok: false,
-            value: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => DynamicHostRpcInvokeResult {
-            ok: false,
-            value: Vec::new(),
-            error: "dynamic host rpc invoke response channel closed".to_string(),
-        },
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
     }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_dynamic_take_reply(
+    state: &mut OpState,
+    #[serde] payload: DynamicPendingReplyPayloadInput,
+) -> DynamicPendingReplyPollResult {
+    state
+        .borrow::<DynamicPendingReplies>()
+        .poll(payload.reply_id.trim())
+}
+
+#[deno_core::op2(fast)]
+fn op_dynamic_cancel_reply(state: &mut OpState, #[string] reply_id: String) {
+    state
+        .borrow::<DynamicPendingReplies>()
+        .cancel(reply_id.trim());
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_dynamic_take_local_host_rpc(state: &mut OpState) -> DynamicLocalHostRpcTakeResult {
+    state.borrow::<DynamicLocalHostRpcQueue>().take()
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_dynamic_finish_local_host_rpc(
+    state: &mut OpState,
+    #[serde] payload: DynamicLocalHostRpcFinishPayload,
+) {
+    state.borrow::<DynamicLocalHostRpcQueue>().finish(payload);
 }
 
 #[deno_core::op2]
@@ -4325,6 +4580,10 @@ deno_core::extension!(
         op_dynamic_worker_delete,
         op_dynamic_worker_invoke,
         op_dynamic_host_rpc_invoke,
+        op_dynamic_take_reply,
+        op_dynamic_cancel_reply,
+        op_dynamic_take_local_host_rpc,
+        op_dynamic_finish_local_host_rpc,
         op_request_body_read,
         op_request_body_cancel,
         op_actor_invoke_method,

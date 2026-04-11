@@ -182,6 +182,36 @@ pub struct WorkerDebugRequest {
     pub url: String,
     pub actor_key: Option<String>,
     pub target_isolate_id: Option<u64>,
+    pub internal_origin: bool,
+    pub reply_kind: String,
+    pub host_rpc_target_id: Option<String>,
+    pub host_rpc_method: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DynamicHandleDebug {
+    pub handle: String,
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub binding: String,
+    pub worker_name: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HostRpcProviderDebug {
+    pub provider_id: String,
+    pub owner_worker: String,
+    pub owner_generation: u64,
+    pub owner_isolate_id: u64,
+    pub target_id: String,
+    pub methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DynamicRuntimeDebugDump {
+    pub handles: Vec<DynamicHandleDebug>,
+    pub providers: Vec<HostRpcProviderDebug>,
 }
 
 #[derive(Debug)]
@@ -269,6 +299,9 @@ enum RuntimeCommand {
     DebugDump {
         worker_name: String,
         reply: oneshot::Sender<Option<WorkerDebugDump>>,
+    },
+    DynamicDebugDump {
+        reply: oneshot::Sender<DynamicRuntimeDebugDump>,
     },
     OpenWebsocket {
         worker_name: String,
@@ -390,6 +423,17 @@ struct HostRpcProvider {
     owner_isolate_id: u64,
     target_id: String,
     methods: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicTimeoutDiagnostic {
+    stage: &'static str,
+    owner_worker: String,
+    owner_generation: u64,
+    binding: String,
+    handle: String,
+    target_worker: String,
+    timeout_ms: u64,
 }
 
 #[derive(Clone)]
@@ -530,6 +574,17 @@ impl Default for PendingReplyKind {
     }
 }
 
+impl PendingReplyKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::WebsocketOpen { .. } => "websocket-open",
+            Self::WebsocketFrame { .. } => "websocket-frame",
+            Self::TransportOpen { .. } => "transport-open",
+        }
+    }
+}
+
 struct PendingReply {
     completion_token: String,
     canceled: bool,
@@ -575,6 +630,7 @@ enum DispatchSelection {
 struct IsolateHandle {
     id: u64,
     sender: std_mpsc::Sender<IsolateCommand>,
+    dynamic_host_rpc_queue: crate::ops::DynamicLocalHostRpcQueue,
     inflight_count: usize,
     active_websocket_sessions: usize,
     active_transport_sessions: usize,
@@ -771,6 +827,7 @@ enum RuntimeEvent {
     DynamicWorkerDelete(crate::ops::DynamicWorkerDeleteEvent),
     DynamicWorkerInvoke(crate::ops::DynamicWorkerInvokeEvent),
     DynamicHostRpcInvoke(crate::ops::DynamicHostRpcInvokeEvent),
+    DynamicTimeoutDiagnostic(DynamicTimeoutDiagnostic),
     IsolateFailed {
         worker_name: String,
         generation: u64,
@@ -1535,6 +1592,19 @@ impl RuntimeService {
         reply_rx.await.ok().flatten()
     }
 
+    pub async fn dynamic_debug_dump(&self) -> DynamicRuntimeDebugDump {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RuntimeCommand::DynamicDebugDump { reply: reply_tx })
+            .await
+            .is_err()
+        {
+            return DynamicRuntimeDebugDump::default();
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
     pub async fn cache_match(&self, request: CacheRequest) -> Result<CacheLookup> {
         let span = tracing::info_span!(
             "runtime.cache.match",
@@ -1898,6 +1968,9 @@ impl WorkerManager {
             RuntimeCommand::DebugDump { worker_name, reply } => {
                 let _ = reply.send(self.worker_debug_dump(&worker_name));
             }
+            RuntimeCommand::DynamicDebugDump { reply } => {
+                let _ = reply.send(self.dynamic_debug_dump());
+            }
         }
     }
 
@@ -2044,6 +2117,9 @@ impl WorkerManager {
             }
             RuntimeEvent::DynamicHostRpcInvoke(payload) => {
                 self.handle_dynamic_host_rpc_invoke(payload, event_tx);
+            }
+            RuntimeEvent::DynamicTimeoutDiagnostic(payload) => {
+                self.log_dynamic_timeout_diagnostic(payload);
             }
             RuntimeEvent::IsolateFailed {
                 worker_name,
@@ -3096,13 +3172,17 @@ impl WorkerManager {
             env,
             timeout,
             host_rpc_bindings,
-            reply,
+            reply_id,
+            pending_replies,
         } = payload;
         let normalized_id = id.trim().to_string();
         if normalized_id.is_empty() {
-            let _ = reply.send(Err(PlatformError::bad_request(
-                "dynamic worker id must not be empty",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Create(Err(PlatformError::bad_request(
+                    "dynamic worker id must not be empty",
+                ))),
+            );
             return;
         }
         let timeout = timeout.clamp(1, 60_000);
@@ -3118,11 +3198,16 @@ impl WorkerManager {
             .cloned()
         {
             if let Some(entry) = self.dynamic_worker_handles.get(&handle) {
-                let _ = reply.send(Ok(crate::ops::DynamicWorkerCreateReply {
-                    handle,
-                    worker_name: entry.worker_name.clone(),
-                    timeout: entry.timeout,
-                }));
+                pending_replies.finish(
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Ok(
+                        crate::ops::DynamicWorkerCreateReply {
+                            handle,
+                            worker_name: entry.worker_name.clone(),
+                            timeout: entry.timeout,
+                        },
+                    )),
+                );
                 return;
             }
             if let Some(by_id) = self.dynamic_worker_ids.get_mut(&id_key) {
@@ -3136,21 +3221,32 @@ impl WorkerManager {
             let binding_name = binding_spec.binding.trim().to_string();
             let target_id = binding_spec.target_id.trim().to_string();
             if binding_name.is_empty() {
-                let _ = reply.send(Err(PlatformError::bad_request(
-                    "dynamic host rpc binding must not be empty",
-                )));
+                pending_replies.finish(
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(
+                        PlatformError::bad_request("dynamic host rpc binding must not be empty"),
+                    )),
+                );
                 return;
             }
             if target_id.is_empty() {
-                let _ = reply.send(Err(PlatformError::bad_request(
-                    "dynamic host rpc target_id must not be empty",
-                )));
+                pending_replies.finish(
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(
+                        PlatformError::bad_request("dynamic host rpc target_id must not be empty"),
+                    )),
+                );
                 return;
             }
             if !seen_binding_names.insert(binding_name.clone()) {
-                let _ = reply.send(Err(PlatformError::bad_request(format!(
-                    "duplicate dynamic host rpc binding: {binding_name}"
-                ))));
+                pending_replies.finish(
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(
+                        PlatformError::bad_request(format!(
+                            "duplicate dynamic host rpc binding: {binding_name}"
+                        )),
+                    )),
+                );
                 return;
             }
             let provider_id = format!("hrpc-{}", Uuid::new_v4().simple());
@@ -3177,15 +3273,16 @@ impl WorkerManager {
             });
         }
         let result = self
-            .deploy_dynamic(source, env, Vec::new(), dynamic_rpc_bindings)
+            .deploy_dynamic_internal(source, env, Vec::new(), dynamic_rpc_bindings, false)
             .await;
+        let owner_worker_for_handle = owner_worker.clone();
         let result = result.map(|deployed| {
             let handle = format!("dynh-{}", Uuid::new_v4().simple());
             let worker_name = deployed.worker;
             self.dynamic_worker_handles.insert(
                 handle.clone(),
                 DynamicWorkerHandle {
-                    owner_worker,
+                    owner_worker: owner_worker_for_handle.clone(),
                     owner_generation,
                     binding,
                     worker_name: worker_name.clone(),
@@ -3207,16 +3304,21 @@ impl WorkerManager {
                 self.host_rpc_providers.remove(&provider_id);
             }
         }
-        let _ = reply.send(result);
+        pending_replies.finish(
+            reply_id,
+            crate::ops::DynamicPendingReplyPayload::Create(result),
+        );
     }
 
     fn handle_dynamic_worker_lookup(&mut self, payload: crate::ops::DynamicWorkerLookupEvent) {
         let crate::ops::DynamicWorkerLookupEvent {
             owner_worker,
             owner_generation,
+            owner_isolate_id: _owner_isolate_id,
             binding,
             id,
-            reply,
+            reply_id,
+            pending_replies,
         } = payload;
         let key = DynamicWorkerIdKey {
             owner_worker,
@@ -3225,9 +3327,12 @@ impl WorkerManager {
         };
         let id = id.trim().to_string();
         if id.is_empty() {
-            let _ = reply.send(Err(PlatformError::bad_request(
-                "dynamic worker id must not be empty",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Lookup(Err(PlatformError::bad_request(
+                    "dynamic worker id must not be empty",
+                ))),
+            );
             return;
         }
         let handle = self
@@ -3236,29 +3341,42 @@ impl WorkerManager {
             .and_then(|by_id| by_id.get(&id))
             .cloned();
         let Some(handle) = handle else {
-            let _ = reply.send(Ok(None));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Lookup(Ok(None)),
+            );
             return;
         };
         let Some(entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
             if let Some(by_id) = self.dynamic_worker_ids.get_mut(&key) {
                 by_id.remove(&id);
             }
-            let _ = reply.send(Ok(None));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Lookup(Ok(None)),
+            );
             return;
         };
-        let _ = reply.send(Ok(Some(crate::ops::DynamicWorkerCreateReply {
-            handle,
-            worker_name: entry.worker_name,
-            timeout: entry.timeout,
-        })));
+        pending_replies.finish(
+            reply_id,
+            crate::ops::DynamicPendingReplyPayload::Lookup(Ok(Some(
+                crate::ops::DynamicWorkerCreateReply {
+                    handle,
+                    worker_name: entry.worker_name,
+                    timeout: entry.timeout,
+                },
+            ))),
+        );
     }
 
     fn handle_dynamic_worker_list(&mut self, payload: crate::ops::DynamicWorkerListEvent) {
         let crate::ops::DynamicWorkerListEvent {
             owner_worker,
             owner_generation,
+            owner_isolate_id: _owner_isolate_id,
             binding,
-            reply,
+            reply_id,
+            pending_replies,
         } = payload;
         let key = DynamicWorkerIdKey {
             owner_worker,
@@ -3271,16 +3389,21 @@ impl WorkerManager {
             .map(|by_id| by_id.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         ids.sort();
-        let _ = reply.send(Ok(ids));
+        pending_replies.finish(
+            reply_id,
+            crate::ops::DynamicPendingReplyPayload::List(Ok(ids)),
+        );
     }
 
     fn handle_dynamic_worker_delete(&mut self, payload: crate::ops::DynamicWorkerDeleteEvent) {
         let crate::ops::DynamicWorkerDeleteEvent {
             owner_worker,
             owner_generation,
+            owner_isolate_id: _owner_isolate_id,
             binding,
             id,
-            reply,
+            reply_id,
+            pending_replies,
         } = payload;
         let key = DynamicWorkerIdKey {
             owner_worker,
@@ -3289,9 +3412,12 @@ impl WorkerManager {
         };
         let id = id.trim().to_string();
         if id.is_empty() {
-            let _ = reply.send(Err(PlatformError::bad_request(
-                "dynamic worker id must not be empty",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Delete(Err(PlatformError::bad_request(
+                    "dynamic worker id must not be empty",
+                ))),
+            );
             return;
         }
         let handle = self
@@ -3307,15 +3433,24 @@ impl WorkerManager {
             self.dynamic_worker_ids.remove(&key);
         }
         let Some(handle) = handle else {
-            let _ = reply.send(Ok(false));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Delete(Ok(false)),
+            );
             return;
         };
         let Some(entry) = self.dynamic_worker_handles.remove(&handle) else {
-            let _ = reply.send(Ok(false));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Delete(Ok(false)),
+            );
             return;
         };
         self.retire_worker_completely(&entry.worker_name);
-        let _ = reply.send(Ok(true));
+        pending_replies.finish(
+            reply_id,
+            crate::ops::DynamicPendingReplyPayload::Delete(Ok(true)),
+        );
     }
 
     fn handle_dynamic_worker_invoke(
@@ -3326,39 +3461,62 @@ impl WorkerManager {
         let crate::ops::DynamicWorkerInvokeEvent {
             owner_worker,
             owner_generation,
+            owner_isolate_id: _owner_isolate_id,
             binding,
             handle,
             request,
-            reply,
+            reply_id,
+            pending_replies,
         } = payload;
         let Some(handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
-            let _ = reply.send(Err(PlatformError::not_found(
-                "dynamic worker handle not found",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::not_found(
+                    "dynamic worker handle not found",
+                ))),
+            );
             return;
         };
         if handle_entry.owner_worker != owner_worker {
-            let _ = reply.send(Err(PlatformError::bad_request(
-                "dynamic worker handle owner mismatch",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
+                    "dynamic worker handle owner mismatch",
+                ))),
+            );
             return;
         }
         if handle_entry.owner_generation != owner_generation {
-            let _ = reply.send(Err(PlatformError::bad_request(
-                "dynamic worker handle generation mismatch",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
+                    "dynamic worker handle generation mismatch",
+                ))),
+            );
             return;
         }
         if handle_entry.binding != binding {
-            let _ = reply.send(Err(PlatformError::bad_request(
-                "dynamic worker binding mismatch",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
+                    "dynamic worker binding mismatch",
+                ))),
+            );
             return;
         }
 
         let runtime_request_id = Uuid::new_v4().to_string();
         let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
         let timeout = handle_entry.timeout;
+        let timeout_diagnostic = DynamicTimeoutDiagnostic {
+            stage: "invoke-reply",
+            owner_worker: owner_worker.clone(),
+            owner_generation,
+            binding: binding.clone(),
+            handle: handle.clone(),
+            target_worker: handle_entry.worker_name.clone(),
+            timeout_ms: timeout,
+        };
         self.enqueue_invoke(
             handle_entry.worker_name,
             runtime_request_id,
@@ -3374,6 +3532,7 @@ impl WorkerManager {
             PendingReplyKind::Normal,
             event_tx,
         );
+        let event_tx = event_tx.clone();
         tokio::spawn(async move {
             let result =
                 match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
@@ -3381,39 +3540,54 @@ impl WorkerManager {
                     Ok(Err(_)) => Err(PlatformError::internal(
                         "dynamic worker invoke response channel closed",
                     )),
-                    Err(_) => Err(PlatformError::runtime(format!(
-                        "dynamic worker invoke timed out after {timeout}ms"
-                    ))),
+                    Err(_) => {
+                        let _ = event_tx
+                            .send(RuntimeEvent::DynamicTimeoutDiagnostic(timeout_diagnostic));
+                        Err(PlatformError::runtime(format!(
+                            "dynamic worker invoke timed out after {timeout}ms"
+                        )))
+                    }
                 };
-            let _ = reply.send(result);
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(result),
+            );
         });
     }
 
     fn handle_dynamic_host_rpc_invoke(
         &mut self,
         payload: crate::ops::DynamicHostRpcInvokeEvent,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let crate::ops::DynamicHostRpcInvokeEvent {
             caller_worker,
             caller_generation,
+            caller_isolate_id: _caller_isolate_id,
             binding,
             method_name,
             args,
-            reply,
+            reply_id,
+            pending_replies,
         } = payload;
         if host_rpc_method_blocked(&method_name) {
-            let _ = reply.send(Err(PlatformError::bad_request(format!(
-                "dynamic host rpc method is blocked: {method_name}"
-            ))));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
+                    format!("dynamic host rpc method is blocked: {method_name}"),
+                ))),
+            );
             return;
         }
 
         let provider_id = {
             let Some(pool) = self.get_pool_mut(&caller_worker, caller_generation) else {
-                let _ = reply.send(Err(PlatformError::not_found(
-                    "dynamic worker pool not found",
-                )));
+                pending_replies.finish(
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::not_found(
+                        "dynamic worker pool not found",
+                    ))),
+                );
                 return;
             };
             pool.dynamic_rpc_bindings
@@ -3422,21 +3596,30 @@ impl WorkerManager {
                 .map(|entry| entry.provider_id.clone())
         };
         let Some(provider_id) = provider_id else {
-            let _ = reply.send(Err(PlatformError::bad_request(format!(
-                "dynamic host rpc binding not found: {binding}"
-            ))));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
+                    format!("dynamic host rpc binding not found: {binding}"),
+                ))),
+            );
             return;
         };
         let Some(provider) = self.host_rpc_providers.get(&provider_id).cloned() else {
-            let _ = reply.send(Err(PlatformError::not_found(
-                "dynamic host rpc provider not found",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::not_found(
+                    "dynamic host rpc provider not found",
+                ))),
+            );
             return;
         };
         if !provider.methods.contains(&method_name) {
-            let _ = reply.send(Err(PlatformError::bad_request(format!(
-                "dynamic host rpc method is not allowed: {method_name}"
-            ))));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
+                    format!("dynamic host rpc method is not allowed: {method_name}"),
+                ))),
+            );
             return;
         }
         let owner_isolate_exists = self
@@ -3448,50 +3631,39 @@ impl WorkerManager {
             })
             .unwrap_or(false);
         if !owner_isolate_exists {
-            let _ = reply.send(Err(PlatformError::runtime(
-                "dynamic host rpc provider isolate is unavailable",
-            )));
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
+                    "dynamic host rpc provider isolate is unavailable",
+                ))),
+            );
             return;
         }
 
-        let runtime_request_id = Uuid::new_v4().to_string();
-        let request = WorkerInvocation {
-            method: "RPC".to_string(),
-            url: format!("http://host-rpc/{}", method_name),
-            headers: Vec::new(),
-            body: Vec::new(),
-            request_id: format!("host-rpc-{runtime_request_id}"),
+        let Some(queue) = self
+            .get_pool_mut(&provider.owner_worker, provider.owner_generation)
+            .and_then(|pool| {
+                pool.isolates
+                    .iter()
+                    .find(|isolate| isolate.id == provider.owner_isolate_id)
+                    .map(|isolate| isolate.dynamic_host_rpc_queue.clone())
+            })
+        else {
+            pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
+                    "dynamic host rpc provider queue is unavailable",
+                ))),
+            );
+            return;
         };
-        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
-        self.enqueue_invoke(
-            provider.owner_worker.clone(),
-            runtime_request_id,
-            request,
-            None,
-            None,
-            None,
-            Some(HostRpcExecutionCall {
-                target_id: provider.target_id.clone(),
-                method: method_name,
-                args,
-            }),
-            Some(provider.owner_isolate_id),
-            Some(provider.owner_generation),
-            true,
-            inner_reply_tx,
-            PendingReplyKind::Normal,
-            event_tx,
+        queue.enqueue(
+            provider.target_id.clone(),
+            method_name,
+            args,
+            reply_id,
+            pending_replies,
         );
-        tokio::spawn(async move {
-            let result = match inner_reply_rx.await {
-                Ok(Ok(output)) => Ok(output.body),
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(PlatformError::internal(
-                    "dynamic host rpc invoke response channel closed",
-                )),
-            };
-            let _ = reply.send(result);
-        });
     }
 
     async fn deploy(
@@ -3624,10 +3796,24 @@ impl WorkerManager {
         egress_allow_hosts: Vec<String>,
         dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     ) -> Result<DynamicDeployResult> {
+        self.deploy_dynamic_internal(source, env, egress_allow_hosts, dynamic_rpc_bindings, true)
+            .await
+    }
+
+    async fn deploy_dynamic_internal(
+        &mut self,
+        source: String,
+        env: HashMap<String, String>,
+        egress_allow_hosts: Vec<String>,
+        dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
+        validate_source: bool,
+    ) -> Result<DynamicDeployResult> {
         let worker_name = format!("dyn-{}", Uuid::new_v4().simple());
         let dynamic_config =
             build_dynamic_worker_config(env, egress_allow_hosts, dynamic_rpc_bindings)?;
-        validate_worker(self.bootstrap_snapshot, &source).await?;
+        if validate_source {
+            validate_worker(self.bootstrap_snapshot, &source).await?;
+        }
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
@@ -4226,25 +4412,35 @@ impl WorkerManager {
                     host_rpc_call: pending_invoke.host_rpc_call,
                     actor_route: pending_invoke.actor_route,
                 };
+                isolate.inflight_count += 1;
+                isolate.pending_replies.insert(
+                    runtime_request_id.clone(),
+                    PendingReply {
+                        completion_token,
+                        canceled: false,
+                        actor_key: candidate.actor_key.clone(),
+                        internal_origin,
+                        reply: pending_reply
+                            .take()
+                            .expect("pending reply must exist before dispatch"),
+                        completion_meta,
+                        kind: pending_kind,
+                        dispatched_at: Instant::now(),
+                    },
+                );
                 if isolate.sender.send(command).is_err() {
+                    isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
+                    if let Some(actor_key) = candidate.actor_key.as_ref() {
+                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                        if candidate.assign_owner {
+                            pool.actor_owners.remove(actor_key);
+                        }
+                    }
+                    pending_reply = isolate
+                        .pending_replies
+                        .remove(&runtime_request_id)
+                        .map(|pending| pending.reply);
                     send_failed = true;
-                } else {
-                    isolate.inflight_count += 1;
-                    isolate.pending_replies.insert(
-                        runtime_request_id.clone(),
-                        PendingReply {
-                            completion_token,
-                            canceled: false,
-                            actor_key: candidate.actor_key.clone(),
-                            internal_origin,
-                            reply: pending_reply
-                                .take()
-                                .expect("pending reply must exist before dispatch"),
-                            completion_meta,
-                            kind: pending_kind,
-                            dispatched_at: Instant::now(),
-                        },
-                    );
                 }
             }
 
@@ -5166,6 +5362,92 @@ impl WorkerManager {
         Some(pool.debug_dump())
     }
 
+    fn dynamic_debug_dump(&self) -> DynamicRuntimeDebugDump {
+        let mut handles = self
+            .dynamic_worker_handles
+            .iter()
+            .map(|(handle, entry)| DynamicHandleDebug {
+                handle: handle.clone(),
+                owner_worker: entry.owner_worker.clone(),
+                owner_generation: entry.owner_generation,
+                binding: entry.binding.clone(),
+                worker_name: entry.worker_name.clone(),
+                timeout_ms: entry.timeout,
+            })
+            .collect::<Vec<_>>();
+        handles.sort_by(|left, right| left.handle.cmp(&right.handle));
+
+        let mut providers = self
+            .host_rpc_providers
+            .iter()
+            .map(|(provider_id, provider)| {
+                let mut methods = provider.methods.iter().cloned().collect::<Vec<_>>();
+                methods.sort();
+                HostRpcProviderDebug {
+                    provider_id: provider_id.clone(),
+                    owner_worker: provider.owner_worker.clone(),
+                    owner_generation: provider.owner_generation,
+                    owner_isolate_id: provider.owner_isolate_id,
+                    target_id: provider.target_id.clone(),
+                    methods,
+                }
+            })
+            .collect::<Vec<_>>();
+        providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
+
+        DynamicRuntimeDebugDump { handles, providers }
+    }
+
+    fn log_dynamic_timeout_diagnostic(&self, diagnostic: DynamicTimeoutDiagnostic) {
+        let owner_dump = self.worker_debug_dump(&diagnostic.owner_worker);
+        let target_dump = self.worker_debug_dump(&diagnostic.target_worker);
+        let handle_summary = self
+            .dynamic_worker_handles
+            .get(&diagnostic.handle)
+            .map(|handle| {
+                (
+                    handle.owner_worker.clone(),
+                    handle.owner_generation,
+                    handle.binding.clone(),
+                    handle.worker_name.clone(),
+                    handle.timeout,
+                )
+            });
+        let mut provider_summaries = self
+            .host_rpc_providers
+            .iter()
+            .filter(|(_, provider)| {
+                provider.owner_worker == diagnostic.owner_worker
+                    && provider.owner_generation == diagnostic.owner_generation
+            })
+            .map(|(provider_id, provider)| {
+                let mut methods = provider.methods.iter().cloned().collect::<Vec<_>>();
+                methods.sort();
+                (
+                    provider_id.clone(),
+                    provider.owner_isolate_id,
+                    provider.target_id.clone(),
+                    methods,
+                )
+            })
+            .collect::<Vec<_>>();
+        provider_summaries.sort_by(|left, right| left.0.cmp(&right.0));
+        warn!(
+            stage = diagnostic.stage,
+            owner_worker = %diagnostic.owner_worker,
+            owner_generation = diagnostic.owner_generation,
+            binding = %diagnostic.binding,
+            handle = %diagnostic.handle,
+            target_worker = %diagnostic.target_worker,
+            timeout_ms = diagnostic.timeout_ms,
+            handle_summary = ?handle_summary,
+            host_rpc_providers = ?provider_summaries,
+            owner_dump = ?owner_dump,
+            target_dump = ?target_dump,
+            "dynamic invoke timeout diagnostic"
+        );
+    }
+
     fn resolve_asset(
         &self,
         worker_name: &str,
@@ -5464,6 +5746,16 @@ impl WorkerPool {
                 url: pending.request.url.clone(),
                 actor_key: pending.actor_route.as_ref().map(ActorRoute::owner_key),
                 target_isolate_id: pending.target_isolate_id,
+                internal_origin: pending.internal_origin,
+                reply_kind: pending.reply_kind.label().to_string(),
+                host_rpc_target_id: pending
+                    .host_rpc_call
+                    .as_ref()
+                    .map(|call| call.target_id.clone()),
+                host_rpc_method: pending
+                    .host_rpc_call
+                    .as_ref()
+                    .map(|call| call.method.clone()),
             })
             .collect::<Vec<_>>();
 
@@ -5485,6 +5777,10 @@ impl WorkerPool {
                             url: meta.map(|meta| meta.url.clone()).unwrap_or_default(),
                             actor_key: pending.actor_key.clone(),
                             target_isolate_id: Some(isolate.id),
+                            internal_origin: pending.internal_origin,
+                            reply_kind: pending.kind.label().to_string(),
+                            host_rpc_target_id: None,
+                            host_rpc_method: None,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -6046,6 +6342,8 @@ fn spawn_isolate_thread(
 ) -> Result<IsolateHandle> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
+    let dynamic_host_rpc_queue = crate::ops::DynamicLocalHostRpcQueue::default();
+    let dynamic_host_rpc_queue_for_thread = dynamic_host_rpc_queue.clone();
     let thread_name = format!("dd-isolate-{worker_name}-{generation}-{isolate_id}");
 
     thread::Builder::new()
@@ -6080,6 +6378,8 @@ fn spawn_isolate_thread(
                     op_state.put(RequestBodyStreams::default());
                     op_state.put(crate::ops::ActorRequestScopes::default());
                     op_state.put(crate::ops::RequestSecretContexts::default());
+                    op_state.put(crate::ops::DynamicPendingReplies::default());
+                    op_state.put(dynamic_host_rpc_queue_for_thread.clone());
                 }
                 {
                     let event_tx = event_tx.clone();
@@ -6187,6 +6487,7 @@ fn spawn_isolate_thread(
         Ok(Ok(())) => Ok(IsolateHandle {
             id: isolate_id,
             sender: command_tx,
+            dynamic_host_rpc_queue,
             inflight_count: 0,
             active_websocket_sessions: 0,
             active_transport_sessions: 0,
@@ -6958,6 +7259,99 @@ export default {
     }
     const response = await child.fetch("http://worker/");
     return new Response(await response.text());
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_plain_namespace_worker() -> String {
+        r#"
+let child = null;
+
+export default {
+  async fetch(_request, env) {
+    if (!child) {
+      child = await env.SANDBOX.get("plain:v1", async () => ({
+        source: "let count = 0; export default { async fetch() { count += 1; return new Response(String(count)); } };",
+        timeout: 1_500,
+      }));
+    }
+    return child.fetch("http://worker/");
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_namespace_ops_worker() -> String {
+        r#"
+function childConfig() {
+  return {
+    entrypoint: "worker.js",
+    modules: {
+      "worker.js": "export default { async fetch() { return new Response('ok'); } };",
+    },
+    timeout: 200,
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/list") {
+      const ids = await env.SANDBOX.list();
+      return new Response(JSON.stringify(ids.sort()), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+
+    if (url.pathname === "/get-create") {
+      await env.SANDBOX.delete("control:v1");
+      let factoryCalls = 0;
+      await env.SANDBOX.get("control:v1", async () => {
+        factoryCalls += 1;
+        return childConfig();
+      });
+      return new Response(String(factoryCalls));
+    }
+
+    if (url.pathname === "/get-hit") {
+      let factoryCalls = 0;
+      await env.SANDBOX.get("control:v1", async () => {
+        factoryCalls += 1;
+        return childConfig();
+      });
+      return new Response(String(factoryCalls));
+    }
+
+    if (url.pathname === "/delete") {
+      const deleted = await env.SANDBOX.delete("control:v1");
+      return new Response(String(Boolean(deleted)));
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_repeated_create_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = url.searchParams.get("id") ?? "0";
+    const child = await env.SANDBOX.get(`repeat:${id}`, async () => ({
+      entrypoint: "worker.js",
+      modules: {
+        "worker.js": `export default { async fetch() { return new Response(${JSON.stringify(id)}); } };`,
+      },
+      timeout: 1_500,
+    }));
+    return child.fetch("http://worker/");
   },
 };
 "#
@@ -8492,6 +8886,52 @@ export default {
         .expect("service should start")
     }
 
+    fn dynamic_single_isolate_config() -> RuntimeConfig {
+        RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn dynamic_autoscaling_config() -> RuntimeConfig {
+        RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        }
+    }
+
+    async fn invoke_with_timeout_and_dump(
+        service: &RuntimeService,
+        worker_name: &str,
+        invocation: WorkerInvocation,
+        stage: &str,
+    ) -> WorkerOutput {
+        match timeout(
+            Duration::from_secs(5),
+            service.invoke(worker_name.to_string(), invocation),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => panic!("{stage} failed: {error}"),
+            Err(_) => {
+                let dump = service.debug_dump(worker_name.to_string()).await;
+                let dynamic_dump = service.dynamic_debug_dump().await;
+                panic!("{stage} timed out; debug dump: {dump:?}; dynamic dump: {dynamic_dump:?}");
+            }
+        }
+    }
+
     fn test_assets() -> Vec<DeployAsset> {
         vec![
             DeployAsset {
@@ -9788,16 +10228,7 @@ https://:sub.example.com/a.js
     #[tokio::test]
     #[serial]
     async fn dynamic_namespace_can_create_and_invoke_dynamic_workers() {
-        let service = test_service(RuntimeConfig {
-            min_isolates: 0,
-            max_isolates: 2,
-            max_inflight_per_isolate: 4,
-            idle_ttl: Duration::from_secs(5),
-            scale_tick: Duration::from_millis(50),
-            queue_warn_thresholds: vec![10],
-            ..RuntimeConfig::default()
-        })
-        .await;
+        let service = test_service(dynamic_autoscaling_config()).await;
 
         service
             .deploy_with_config(
@@ -9813,14 +10244,20 @@ https://:sub.example.com/a.js
             .await
             .expect("deploy should succeed");
 
-        let one = service
-            .invoke("dynamic-parent".to_string(), test_invocation())
-            .await
-            .expect("first invoke should succeed");
-        let two = service
-            .invoke("dynamic-parent".to_string(), test_invocation())
-            .await
-            .expect("second invoke should succeed");
+        let one = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-parent",
+            test_invocation(),
+            "dynamic host rpc autoscaling first invoke",
+        )
+        .await;
+        let two = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-parent",
+            test_invocation(),
+            "dynamic host rpc autoscaling second invoke",
+        )
+        .await;
 
         assert_eq!(String::from_utf8(one.body).expect("utf8"), "1:1");
         assert_eq!(String::from_utf8(two.body).expect("utf8"), "2:2");
@@ -9828,17 +10265,161 @@ https://:sub.example.com/a.js
 
     #[tokio::test]
     #[serial]
-    async fn dynamic_namespace_supports_list_delete_and_timeout() {
-        let service = test_service(RuntimeConfig {
-            min_isolates: 0,
-            max_isolates: 2,
-            max_inflight_per_isolate: 2,
-            idle_ttl: Duration::from_secs(5),
-            scale_tick: Duration::from_millis(50),
-            queue_warn_thresholds: vec![10],
-            ..RuntimeConfig::default()
-        })
+    async fn dynamic_namespace_plain_child_fetch_completes_in_single_isolate() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-plain-single".to_string(),
+                dynamic_plain_namespace_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let one = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-plain-single",
+            test_invocation(),
+            "dynamic plain single-isolate first invoke",
+        )
         .await;
+        let two = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-plain-single",
+            test_invocation(),
+            "dynamic plain single-isolate second invoke",
+        )
+        .await;
+
+        assert_eq!(String::from_utf8(one.body).expect("utf8"), "1");
+        assert_eq!(String::from_utf8(two.body).expect("utf8"), "2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_plain_child_fetch_completes_in_autoscaling_config() {
+        let service = test_service(dynamic_autoscaling_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-plain-auto".to_string(),
+                dynamic_plain_namespace_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let one = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-plain-auto",
+            test_invocation(),
+            "dynamic plain autoscaling first invoke",
+        )
+        .await;
+        let two = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-plain-auto",
+            test_invocation(),
+            "dynamic plain autoscaling second invoke",
+        )
+        .await;
+
+        assert_eq!(String::from_utf8(one.body).expect("utf8"), "1");
+        assert_eq!(String::from_utf8(two.body).expect("utf8"), "2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_ops_complete_without_child_fetch_in_single_isolate() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-ops-single".to_string(),
+                dynamic_namespace_ops_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let empty = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-ops-single",
+            test_invocation_with_path("/list", "dyn-ops-list-empty"),
+            "lookup-reply empty list",
+        )
+        .await;
+        assert_eq!(String::from_utf8(empty.body).expect("utf8"), "[]");
+
+        let create = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-ops-single",
+            test_invocation_with_path("/get-create", "dyn-ops-get-create"),
+            "create-reply first get",
+        )
+        .await;
+        assert_eq!(String::from_utf8(create.body).expect("utf8"), "1");
+
+        let hit = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-ops-single",
+            test_invocation_with_path("/get-hit", "dyn-ops-get-hit"),
+            "lookup-reply cached get",
+        )
+        .await;
+        assert_eq!(String::from_utf8(hit.body).expect("utf8"), "0");
+
+        let ids = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-ops-single",
+            test_invocation_with_path("/list", "dyn-ops-list-populated"),
+            "list-reply populated",
+        )
+        .await;
+        assert_eq!(
+            String::from_utf8(ids.body).expect("utf8"),
+            "[\"control:v1\"]"
+        );
+
+        let deleted = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-ops-single",
+            test_invocation_with_path("/delete", "dyn-ops-delete"),
+            "delete-reply control worker",
+        )
+        .await;
+        assert_eq!(String::from_utf8(deleted.body).expect("utf8"), "true");
+
+        let ids_after = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-ops-single",
+            test_invocation_with_path("/list", "dyn-ops-list-final"),
+            "list-reply after delete",
+        )
+        .await;
+        assert_eq!(String::from_utf8(ids_after.body).expect("utf8"), "[]");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_supports_list_delete_and_timeout() {
+        let service = test_service(dynamic_autoscaling_config()).await;
 
         service
             .deploy_with_config(
@@ -9854,65 +10435,114 @@ https://:sub.example.com/a.js
             .await
             .expect("deploy should succeed");
 
-        let ensure = service
-            .invoke(
-                "dynamic-admin".to_string(),
-                test_invocation_with_path("/ensure", "dyn-admin-ensure"),
-            )
-            .await
-            .expect("ensure should succeed");
+        let ensure = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-admin",
+            test_invocation_with_path("/ensure", "dyn-admin-ensure"),
+            "dynamic admin ensure",
+        )
+        .await;
         assert_eq!(ensure.status, 200);
 
-        let ids = service
-            .invoke(
-                "dynamic-admin".to_string(),
-                test_invocation_with_path("/ids", "dyn-admin-ids-1"),
-            )
-            .await
-            .expect("ids should succeed");
+        let ids = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-admin",
+            test_invocation_with_path("/ids", "dyn-admin-ids-1"),
+            "dynamic admin ids before delete",
+        )
+        .await;
         assert_eq!(String::from_utf8(ids.body).expect("utf8"), "[\"admin:v1\"]");
 
-        let deleted = service
-            .invoke(
-                "dynamic-admin".to_string(),
-                test_invocation_with_path("/delete", "dyn-admin-delete"),
-            )
-            .await
-            .expect("delete should succeed");
+        let deleted = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-admin",
+            test_invocation_with_path("/delete", "dyn-admin-delete"),
+            "dynamic admin delete",
+        )
+        .await;
         assert_eq!(String::from_utf8(deleted.body).expect("utf8"), "true");
 
-        let ids_after = service
-            .invoke(
-                "dynamic-admin".to_string(),
-                test_invocation_with_path("/ids", "dyn-admin-ids-2"),
-            )
-            .await
-            .expect("ids after delete should succeed");
+        let ids_after = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-admin",
+            test_invocation_with_path("/ids", "dyn-admin-ids-2"),
+            "dynamic admin ids after delete",
+        )
+        .await;
         assert_eq!(String::from_utf8(ids_after.body).expect("utf8"), "[]");
 
-        let timeout_out = service
-            .invoke(
-                "dynamic-admin".to_string(),
-                test_invocation_with_path("/timeout", "dyn-admin-timeout"),
-            )
-            .await
-            .expect("timeout invoke should succeed");
+        let timeout_out = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-admin",
+            test_invocation_with_path("/timeout", "dyn-admin-timeout"),
+            "dynamic admin timeout route",
+        )
+        .await;
         assert_eq!(timeout_out.status, 504);
     }
 
     #[tokio::test]
     #[serial]
-    async fn dynamic_namespace_child_can_return_json_response() {
-        let service = test_service(RuntimeConfig {
-            min_isolates: 0,
-            max_isolates: 2,
-            max_inflight_per_isolate: 2,
-            idle_ttl: Duration::from_secs(5),
-            scale_tick: Duration::from_millis(50),
-            queue_warn_thresholds: vec![10],
-            ..RuntimeConfig::default()
-        })
+    async fn dynamic_namespace_repeated_list_delete_complete_past_threshold() {
+        let service = test_service(dynamic_autoscaling_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-admin-loop".to_string(),
+                dynamic_namespace_admin_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        for idx in 0..64 {
+            let ensure = invoke_with_timeout_and_dump(
+                &service,
+                "dynamic-admin-loop",
+                test_invocation_with_path("/ensure", &format!("dyn-admin-loop-ensure-{idx}")),
+                &format!("dynamic admin loop ensure {idx}"),
+            )
+            .await;
+            assert_eq!(ensure.status, 200);
+
+            let ids = invoke_with_timeout_and_dump(
+                &service,
+                "dynamic-admin-loop",
+                test_invocation_with_path("/ids", &format!("dyn-admin-loop-ids-{idx}")),
+                &format!("dynamic admin loop ids {idx}"),
+            )
+            .await;
+            assert_eq!(String::from_utf8(ids.body).expect("utf8"), "[\"admin:v1\"]");
+
+            let deleted = invoke_with_timeout_and_dump(
+                &service,
+                "dynamic-admin-loop",
+                test_invocation_with_path("/delete", &format!("dyn-admin-loop-delete-{idx}")),
+                &format!("dynamic admin loop delete {idx}"),
+            )
+            .await;
+            assert_eq!(String::from_utf8(deleted.body).expect("utf8"), "true");
+        }
+
+        let ids_after = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-admin-loop",
+            test_invocation_with_path("/ids", "dyn-admin-loop-final-ids"),
+            "dynamic admin loop final ids",
+        )
         .await;
+        assert_eq!(String::from_utf8(ids_after.body).expect("utf8"), "[]");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_child_can_return_json_response() {
+        let service = test_service(dynamic_autoscaling_config()).await;
 
         service
             .deploy_with_config(
@@ -9946,10 +10576,13 @@ export default {
             .await
             .expect("deploy should succeed");
 
-        let output = service
-            .invoke("dynamic-parent-json".to_string(), test_invocation())
-            .await
-            .expect("invoke should succeed");
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-parent-json",
+            test_invocation(),
+            "dynamic json child invoke",
+        )
+        .await;
 
         assert_eq!(output.status, 201);
         assert_eq!(
@@ -9966,16 +10599,7 @@ export default {
     #[tokio::test]
     #[serial]
     async fn dynamic_namespace_host_rpc_works_with_single_inflight_parent_isolate() {
-        let service = test_service(RuntimeConfig {
-            min_isolates: 1,
-            max_isolates: 1,
-            max_inflight_per_isolate: 1,
-            idle_ttl: Duration::from_secs(5),
-            scale_tick: Duration::from_millis(50),
-            queue_warn_thresholds: vec![10],
-            ..RuntimeConfig::default()
-        })
-        .await;
+        let service = test_service(dynamic_single_isolate_config()).await;
 
         service
             .deploy_with_config(
@@ -9991,16 +10615,50 @@ export default {
             .await
             .expect("deploy should succeed");
 
-        let output = timeout(Duration::from_secs(2), async {
-            service
-                .invoke("dynamic-parent".to_string(), test_invocation())
-                .await
-        })
-        .await
-        .expect("dynamic invoke should not deadlock")
-        .expect("dynamic invoke should succeed");
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-parent",
+            test_invocation(),
+            "dynamic host rpc single-isolate invoke",
+        )
+        .await;
 
         assert_eq!(String::from_utf8(output.body).expect("utf8"), "1:1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_repeated_create_and_invoke_complete_past_threshold() {
+        let service = test_service(dynamic_autoscaling_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-repeat".to_string(),
+                dynamic_repeated_create_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        for idx in 0..64 {
+            let output = invoke_with_timeout_and_dump(
+                &service,
+                "dynamic-repeat",
+                test_invocation_with_path(&format!("/?id={idx}"), &format!("dynamic-repeat-{idx}")),
+                &format!("dynamic repeat create+invoke {idx}"),
+            )
+            .await;
+            assert_eq!(output.status, 200);
+            assert_eq!(
+                String::from_utf8(output.body).expect("utf8"),
+                idx.to_string()
+            );
+        }
     }
 
     #[tokio::test]
