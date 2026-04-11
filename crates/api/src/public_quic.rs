@@ -746,8 +746,8 @@ fn build_h3_transport_response_headers(headers: Vec<(String, String)>) -> Vec<qu
         .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-accept"))
         .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-session"))
         .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-handle"))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-actor-binding"))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-actor-key"))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-memory-binding"))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-memory-key"))
         .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-close-code"))
         .filter(|(name, _)| !name.eq_ignore_ascii_case("x-dd-transport-close-reason"))
         .collect::<Vec<_>>();

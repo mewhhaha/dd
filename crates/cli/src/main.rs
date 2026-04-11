@@ -24,6 +24,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Deploy(DeployCmd),
+    #[command(hide = true)]
+    PackageDeploy(DeployCmd),
     DynamicDeploy(DynamicDeployCmd),
     Invoke(InvokeCmd),
 }
@@ -43,7 +45,7 @@ struct DeployCmd {
     #[arg(long = "kv-binding")]
     kv_bindings: Vec<String>,
 
-    #[arg(long = "memory-binding", visible_alias = "actor-binding")]
+    #[arg(long = "memory-binding")]
     memory_bindings: Vec<String>,
 
     #[arg(long = "dynamic-binding")]
@@ -100,6 +102,10 @@ async fn main() -> Result<(), String> {
             )
             .await?
         }
+        Command::PackageDeploy(command) => {
+            let request = build_deploy_request(command).await?;
+            println!("{}", to_json_string(&request)?);
+        }
         Command::DynamicDeploy(command) => {
             dynamic_deploy(
                 &client,
@@ -129,6 +135,22 @@ async fn deploy(
     private_bearer_token: Option<&str>,
     command: DeployCmd,
 ) -> Result<(), String> {
+    let request = build_deploy_request(command).await?;
+    let response = with_private_auth(
+        client.post(format!("{server}/v1/deploy")),
+        private_bearer_token,
+    )
+    .json(&request)
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let deployment: DeployResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&deployment)?);
+    Ok(())
+}
+
+async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, String> {
     let source = tokio::fs::read_to_string(&command.file)
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
@@ -163,24 +185,13 @@ async fn deploy(
             }),
         },
     };
-    let response = with_private_auth(
-        client.post(format!("{server}/v1/deploy")),
-        private_bearer_token,
-    )
-    .json(&DeployRequest {
+    Ok(DeployRequest {
         name: command.name,
         source,
         config,
         assets,
         asset_headers,
     })
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-
-    let deployment: DeployResponse = decode_json(response).await?;
-    println!("{}", to_json_string(&deployment)?);
-    Ok(())
 }
 
 async fn dynamic_deploy(
@@ -514,7 +525,8 @@ fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_asset_relative_path, package_assets_dir};
+    use super::{normalize_asset_relative_path, package_assets_dir, Cli};
+    use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -567,5 +579,18 @@ mod tests {
         assert!(error.contains("symlinks"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cli_rejects_legacy_actor_binding_flag() {
+        let result = Cli::try_parse_from([
+            "dd",
+            "deploy",
+            "worker",
+            "examples/hello.js",
+            "--actor-binding",
+            "ROOMS",
+        ]);
+        assert!(result.is_err());
     }
 }

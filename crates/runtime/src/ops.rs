@@ -412,89 +412,6 @@ impl DynamicPendingReplies {
     }
 }
 
-impl DynamicLocalHostRpcQueue {
-    pub fn enqueue(
-        &self,
-        target_id: String,
-        method_name: String,
-        args: Vec<u8>,
-        reply_id: String,
-        pending_replies: DynamicPendingReplies,
-    ) {
-        let task_id = format!("dlhrpc-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let mut pending = self
-            .pending
-            .lock()
-            .expect("dynamic local host rpc pending lock poisoned");
-        pending.push_back(DynamicLocalHostRpcTask {
-            task_id,
-            target_id,
-            method_name,
-            args,
-            reply_id,
-            pending_replies,
-        });
-    }
-
-    fn take(&self) -> DynamicLocalHostRpcTakeResult {
-        let task = {
-            let mut pending = self
-                .pending
-                .lock()
-                .expect("dynamic local host rpc pending lock poisoned");
-            pending.pop_front()
-        };
-        let Some(task) = task else {
-            return DynamicLocalHostRpcTakeResult {
-                ready: false,
-                task_id: String::new(),
-                target_id: String::new(),
-                method_name: String::new(),
-                args: Vec::new(),
-            };
-        };
-        let mut inflight = self
-            .inflight
-            .lock()
-            .expect("dynamic local host rpc inflight lock poisoned");
-        inflight.insert(
-            task.task_id.clone(),
-            DynamicLocalHostRpcInflight {
-                reply_id: task.reply_id,
-                pending_replies: task.pending_replies,
-            },
-        );
-        DynamicLocalHostRpcTakeResult {
-            ready: true,
-            task_id: task.task_id,
-            target_id: task.target_id,
-            method_name: task.method_name,
-            args: task.args,
-        }
-    }
-
-    fn finish(&self, payload: DynamicLocalHostRpcFinishPayload) {
-        let mut inflight = self
-            .inflight
-            .lock()
-            .expect("dynamic local host rpc inflight lock poisoned");
-        let Some(task) = inflight.remove(payload.task_id.trim()) else {
-            return;
-        };
-        let result = if payload.ok {
-            Ok(payload.value)
-        } else {
-            Err(PlatformError::runtime(if payload.error.trim().is_empty() {
-                "dynamic local host rpc failed".to_string()
-            } else {
-                payload.error
-            }))
-        };
-        task.pending_replies
-            .finish(task.reply_id, DynamicPendingReplyPayload::HostRpc(result));
-    }
-}
-
 impl DynamicPendingReplyPayload {
     fn into_poll_result(self) -> DynamicPendingReplyPollResult {
         match self {
@@ -609,6 +526,89 @@ impl DynamicPendingReplyPayload {
                 },
             },
         }
+    }
+}
+
+impl DynamicLocalHostRpcQueue {
+    pub fn enqueue(
+        &self,
+        target_id: String,
+        method_name: String,
+        args: Vec<u8>,
+        reply_id: String,
+        pending_replies: DynamicPendingReplies,
+    ) {
+        let task_id = format!("dlhrpc-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("dynamic local host rpc pending lock poisoned");
+        pending.push_back(DynamicLocalHostRpcTask {
+            task_id,
+            target_id,
+            method_name,
+            args,
+            reply_id,
+            pending_replies,
+        });
+    }
+
+    fn take(&self) -> DynamicLocalHostRpcTakeResult {
+        let task = {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("dynamic local host rpc pending lock poisoned");
+            pending.pop_front()
+        };
+        let Some(task) = task else {
+            return DynamicLocalHostRpcTakeResult {
+                ready: false,
+                task_id: String::new(),
+                target_id: String::new(),
+                method_name: String::new(),
+                args: Vec::new(),
+            };
+        };
+        let mut inflight = self
+            .inflight
+            .lock()
+            .expect("dynamic local host rpc inflight lock poisoned");
+        inflight.insert(
+            task.task_id.clone(),
+            DynamicLocalHostRpcInflight {
+                reply_id: task.reply_id,
+                pending_replies: task.pending_replies,
+            },
+        );
+        DynamicLocalHostRpcTakeResult {
+            ready: true,
+            task_id: task.task_id,
+            target_id: task.target_id,
+            method_name: task.method_name,
+            args: task.args,
+        }
+    }
+
+    fn finish(&self, payload: DynamicLocalHostRpcFinishPayload) {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .expect("dynamic local host rpc inflight lock poisoned");
+        let Some(task) = inflight.remove(payload.task_id.trim()) else {
+            return;
+        };
+        let result = if payload.ok {
+            Ok(payload.value)
+        } else {
+            Err(PlatformError::runtime(if payload.error.trim().is_empty() {
+                "dynamic local host rpc failed".to_string()
+            } else {
+                payload.error
+            }))
+        };
+        task.pending_replies
+            .finish(task.reply_id, DynamicPendingReplyPayload::HostRpc(result));
     }
 }
 

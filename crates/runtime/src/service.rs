@@ -1,3 +1,5 @@
+mod config;
+
 use crate::actor::ActorStore;
 use crate::actor_rpc::{
     decode_actor_invoke_request, encode_actor_invoke_response, ActorInvokeCall, ActorInvokeResponse,
@@ -18,9 +20,7 @@ use crate::ops::{
 use crate::static_assets::{
     compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,
 };
-use common::{
-    DeployAsset, DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput,
-};
+use common::{DeployAsset, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
 use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt;
@@ -42,6 +42,8 @@ use tracing::{info, warn, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
+use self::config::{build_dynamic_worker_config, extract_bindings, validate_runtime_config};
+
 const INTERNAL_HEADER: &str = "x-dd-internal";
 const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";
 const TRACE_SOURCE_WORKER_HEADER: &str = "x-dd-trace-source-worker";
@@ -49,16 +51,16 @@ const TRACE_SOURCE_GENERATION_HEADER: &str = "x-dd-trace-source-generation";
 const INTERNAL_WS_ACCEPT_HEADER: &str = "x-dd-ws-accept";
 const INTERNAL_WS_SESSION_HEADER: &str = "x-dd-ws-session";
 const INTERNAL_WS_HANDLE_HEADER: &str = "x-dd-ws-handle";
-const INTERNAL_WS_BINDING_HEADER: &str = "x-dd-ws-actor-binding";
-const INTERNAL_WS_KEY_HEADER: &str = "x-dd-ws-actor-key";
+const INTERNAL_WS_BINDING_HEADER: &str = "x-dd-ws-memory-binding";
+const INTERNAL_WS_KEY_HEADER: &str = "x-dd-ws-memory-key";
 const INTERNAL_WS_BINARY_HEADER: &str = "x-dd-ws-binary";
 const INTERNAL_WS_CLOSE_CODE_HEADER: &str = "x-dd-ws-close-code";
 const INTERNAL_WS_CLOSE_REASON_HEADER: &str = "x-dd-ws-close-reason";
 const INTERNAL_TRANSPORT_ACCEPT_HEADER: &str = "x-dd-transport-accept";
 const INTERNAL_TRANSPORT_SESSION_HEADER: &str = "x-dd-transport-session";
 const INTERNAL_TRANSPORT_HANDLE_HEADER: &str = "x-dd-transport-handle";
-const INTERNAL_TRANSPORT_BINDING_HEADER: &str = "x-dd-transport-actor-binding";
-const INTERNAL_TRANSPORT_KEY_HEADER: &str = "x-dd-transport-actor-key";
+const INTERNAL_TRANSPORT_BINDING_HEADER: &str = "x-dd-transport-memory-binding";
+const INTERNAL_TRANSPORT_KEY_HEADER: &str = "x-dd-transport-memory-key";
 const INTERNAL_TRANSPORT_CLOSE_CODE_HEADER: &str = "x-dd-transport-close-code";
 const INTERNAL_TRANSPORT_CLOSE_REASON_HEADER: &str = "x-dd-transport-close-reason";
 const CONTENT_TYPE_HEADER: &str = "content-type";
@@ -2286,8 +2288,14 @@ impl WorkerManager {
             PendingReplyKind::Normal,
             event_tx,
         );
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let _ = receiver.await;
+            match receiver.await {
+                Ok(Err(error)) => {
+                    warn!(session_id, error = %error, "websocket close wake dispatch failed");
+                }
+                Ok(Ok(_)) | Err(_) => {}
+            }
         });
         Ok(())
     }
@@ -2888,8 +2896,17 @@ impl WorkerManager {
             PendingReplyKind::Normal,
             event_tx,
         );
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let _ = receiver.await;
+            match tokio::time::timeout(Duration::from_secs(1), receiver).await {
+                Ok(Ok(Err(error))) => {
+                    warn!(session_id, error = %error, "transport stream wake dispatch failed");
+                }
+                Ok(Ok(Ok(_))) | Ok(Err(_)) => {}
+                Err(_) => {
+                    warn!(session_id, "transport stream wake dispatch timed out");
+                }
+            }
         });
         Ok(())
     }
@@ -2946,8 +2963,17 @@ impl WorkerManager {
             PendingReplyKind::Normal,
             event_tx,
         );
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let _ = receiver.await;
+            match tokio::time::timeout(Duration::from_secs(1), receiver).await {
+                Ok(Ok(Err(error))) => {
+                    warn!(session_id, error = %error, "transport datagram wake dispatch failed");
+                }
+                Ok(Ok(Ok(_))) | Ok(Err(_)) => {}
+                Err(_) => {
+                    warn!(session_id, "transport datagram wake dispatch timed out");
+                }
+            }
         });
         Ok(())
     }
@@ -3009,8 +3035,17 @@ impl WorkerManager {
             PendingReplyKind::Normal,
             event_tx,
         );
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let _ = receiver.await;
+            match tokio::time::timeout(Duration::from_secs(1), receiver).await {
+                Ok(Ok(Err(error))) => {
+                    warn!(session_id, error = %error, "transport close wake dispatch failed");
+                }
+                Ok(Ok(Ok(_))) | Ok(Err(_)) => {}
+                Err(_) => {
+                    warn!(session_id, "transport close wake dispatch timed out");
+                }
+            }
         });
         Ok(())
     }
@@ -3711,15 +3746,15 @@ impl WorkerManager {
             );
             return;
         }
-        let owner_isolate_exists = self
+        let owner_pool_generation = self
             .get_pool_mut(&provider.owner_worker, provider.owner_generation)
-            .map(|pool| {
+            .and_then(|pool| {
                 pool.isolates
                     .iter()
                     .any(|isolate| isolate.id == provider.owner_isolate_id)
-            })
-            .unwrap_or(false);
-        if !owner_isolate_exists {
+                    .then_some(pool.generation)
+            });
+        let Some(owner_pool_generation) = owner_pool_generation else {
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
@@ -3727,7 +3762,7 @@ impl WorkerManager {
                 ))),
             );
             return;
-        }
+        };
         let Some((queue, sender)) = self
             .get_pool_mut(&provider.owner_worker, provider.owner_generation)
             .and_then(|pool| {
@@ -3750,6 +3785,7 @@ impl WorkerManager {
             );
             return;
         };
+        let _ = owner_pool_generation;
         queue.enqueue(
             provider.target_id.clone(),
             method_name,
@@ -5996,220 +6032,6 @@ impl WorkerPool {
             "worker pool stats"
         );
     }
-}
-
-struct DeployBindings {
-    kv: Vec<String>,
-    actor: Vec<String>,
-    dynamic: Vec<String>,
-}
-
-struct DynamicWorkerConfig {
-    dynamic_env: Vec<(String, String)>,
-    dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
-    secret_replacements: Vec<(String, String)>,
-    egress_allow_hosts: Vec<String>,
-    env_placeholders: HashMap<String, String>,
-}
-
-fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
-    let mut kv = Vec::new();
-    let mut actor = Vec::new();
-    let mut dynamic = Vec::new();
-    let mut seen = HashSet::new();
-    for binding in &config.bindings {
-        match binding {
-            DeployBinding::Kv { binding } => {
-                let name = binding.trim();
-                if name.is_empty() {
-                    return Err(PlatformError::bad_request("binding name must not be empty"));
-                }
-                if !seen.insert(name.to_string()) {
-                    return Err(PlatformError::bad_request(format!(
-                        "duplicate binding name: {name}"
-                    )));
-                }
-                kv.push(name.to_string());
-            }
-            DeployBinding::Actor { binding } => {
-                let name = binding.trim();
-                if name.is_empty() {
-                    return Err(PlatformError::bad_request("binding name must not be empty"));
-                }
-                if !seen.insert(name.to_string()) {
-                    return Err(PlatformError::bad_request(format!(
-                        "duplicate binding name: {name}"
-                    )));
-                }
-                actor.push(name.to_string());
-            }
-            DeployBinding::Dynamic { binding } => {
-                let name = binding.trim();
-                if name.is_empty() {
-                    return Err(PlatformError::bad_request("binding name must not be empty"));
-                }
-                if !seen.insert(name.to_string()) {
-                    return Err(PlatformError::bad_request(format!(
-                        "duplicate binding name: {name}"
-                    )));
-                }
-                dynamic.push(name.to_string());
-            }
-        }
-    }
-    Ok(DeployBindings { kv, actor, dynamic })
-}
-
-fn build_dynamic_worker_config(
-    env: HashMap<String, String>,
-    egress_allow_hosts: Vec<String>,
-    dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
-) -> Result<DynamicWorkerConfig> {
-    let mut dynamic_env = Vec::new();
-    let mut secret_replacements = Vec::new();
-    let mut env_placeholders = HashMap::new();
-
-    for (name, value) in env {
-        let key = name.trim().to_string();
-        if key.is_empty() {
-            return Err(PlatformError::bad_request(
-                "dynamic env variable name must not be empty",
-            ));
-        }
-        if !is_valid_env_name(&key) {
-            return Err(PlatformError::bad_request(format!(
-                "invalid dynamic env variable name: {key}"
-            )));
-        }
-        if env_placeholders.contains_key(&key) {
-            return Err(PlatformError::bad_request(format!(
-                "duplicate dynamic env variable name: {key}"
-            )));
-        }
-
-        let placeholder = format!("__DD_SECRET_{}__", Uuid::new_v4().simple());
-        dynamic_env.push((key.clone(), placeholder.clone()));
-        secret_replacements.push((placeholder.clone(), value));
-        env_placeholders.insert(key, placeholder);
-    }
-
-    let mut normalized_hosts = Vec::new();
-    let mut seen_hosts = HashSet::new();
-    for host in egress_allow_hosts {
-        let normalized = host.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            continue;
-        }
-        if !is_valid_egress_host(&normalized) {
-            return Err(PlatformError::bad_request(format!(
-                "invalid egress allow host: {normalized}"
-            )));
-        }
-        if seen_hosts.insert(normalized.clone()) {
-            normalized_hosts.push(normalized);
-        }
-    }
-
-    Ok(DynamicWorkerConfig {
-        dynamic_env,
-        dynamic_rpc_bindings,
-        secret_replacements,
-        egress_allow_hosts: normalized_hosts,
-        env_placeholders,
-    })
-}
-
-fn is_valid_env_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    chars.all(|char| char == '_' || char.is_ascii_alphanumeric())
-}
-
-fn is_valid_egress_host(host: &str) -> bool {
-    let host = match host.rsplit_once(':') {
-        Some((left, right)) if right.chars().all(|char| char.is_ascii_digit()) => {
-            let Ok(port) = right.parse::<u16>() else {
-                return false;
-            };
-            if port == 0 {
-                return false;
-            }
-            left
-        }
-        _ => host,
-    };
-    if host.is_empty() {
-        return false;
-    }
-    if let Some(rest) = host.strip_prefix("*.") {
-        return !rest.is_empty()
-            && rest
-                .chars()
-                .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '.')
-            && rest.contains('.');
-    }
-    host.chars()
-        .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '.')
-        && host.contains('.')
-}
-
-fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
-    if config.max_isolates == 0 {
-        return Err(PlatformError::internal(
-            "max_isolates must be greater than 0",
-        ));
-    }
-    if config.max_inflight_per_isolate == 0 {
-        return Err(PlatformError::internal(
-            "max_inflight_per_isolate must be greater than 0",
-        ));
-    }
-    if config.min_isolates > config.max_isolates {
-        return Err(PlatformError::internal(
-            "min_isolates cannot exceed max_isolates",
-        ));
-    }
-    if config.cache_max_entries == 0 {
-        return Err(PlatformError::internal(
-            "cache_max_entries must be greater than 0",
-        ));
-    }
-    if config.cache_max_bytes == 0 {
-        return Err(PlatformError::internal(
-            "cache_max_bytes must be greater than 0",
-        ));
-    }
-    if config.cache_default_ttl.is_zero() {
-        return Err(PlatformError::internal(
-            "cache_default_ttl must be greater than 0",
-        ));
-    }
-    if config.kv_read_cache_max_entries == 0 {
-        return Err(PlatformError::internal(
-            "kv_read_cache_max_entries must be greater than 0",
-        ));
-    }
-    if config.kv_read_cache_max_bytes == 0 {
-        return Err(PlatformError::internal(
-            "kv_read_cache_max_bytes must be greater than 0",
-        ));
-    }
-    if config.kv_read_cache_hit_ttl.is_zero() {
-        return Err(PlatformError::internal(
-            "kv_read_cache_hit_ttl must be greater than 0",
-        ));
-    }
-    if config.kv_read_cache_miss_ttl.is_zero() {
-        return Err(PlatformError::internal(
-            "kv_read_cache_miss_ttl must be greater than 0",
-        ));
-    }
-    Ok(())
 }
 
 fn spawn_runtime_thread(

@@ -1207,13 +1207,13 @@ globalThis.__dd_execute_worker = (payload) => {
   const INTERNAL_WS_ACCEPT_HEADER = "x-dd-ws-accept";
   const INTERNAL_WS_SESSION_HEADER = "x-dd-ws-session";
   const INTERNAL_WS_HANDLE_HEADER = "x-dd-ws-handle";
-  const INTERNAL_WS_BINDING_HEADER = "x-dd-ws-actor-binding";
-  const INTERNAL_WS_KEY_HEADER = "x-dd-ws-actor-key";
+  const INTERNAL_WS_BINDING_HEADER = "x-dd-ws-memory-binding";
+  const INTERNAL_WS_KEY_HEADER = "x-dd-ws-memory-key";
   const INTERNAL_TRANSPORT_ACCEPT_HEADER = "x-dd-transport-accept";
   const INTERNAL_TRANSPORT_SESSION_HEADER = "x-dd-transport-session";
   const INTERNAL_TRANSPORT_HANDLE_HEADER = "x-dd-transport-handle";
-  const INTERNAL_TRANSPORT_BINDING_HEADER = "x-dd-transport-actor-binding";
-  const INTERNAL_TRANSPORT_KEY_HEADER = "x-dd-transport-actor-key";
+  const INTERNAL_TRANSPORT_BINDING_HEADER = "x-dd-transport-memory-binding";
+  const INTERNAL_TRANSPORT_KEY_HEADER = "x-dd-transport-memory-key";
   const INTERNAL_TRANSPORT_METHOD_HEADER = "x-dd-transport-method";
 
   const encodeSocketSendPayload = (value, kind) => {
@@ -3307,17 +3307,28 @@ globalThis.__dd_execute_worker = (payload) => {
 
   const createActorStubTransportApi = (bindingName, actorKey) => Object.freeze({
     async values() {
-      const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId);
-      const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
-      await state.__dd_transport_runtime.refreshOpenHandles();
-      return state.transports.values();
+      const result = await callOpAny([
+        "op_actor_transport_list",
+        "op_actor_transport_handles",
+      ], {
+        request_id: activeRequestId(),
+        binding: bindingName,
+        key: actorKey,
+      });
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        throw new Error(String(result.error ?? "transport values failed"));
+      }
+      return Array.isArray(result?.handles)
+        ? result.handles.map((value) => String(value))
+        : Array.isArray(result?.values)
+          ? result.values.map((value) => String(value))
+          : [];
     },
     async session(handle) {
       const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId);
+      const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId, { hydrate: false });
       const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
-      await state.__dd_transport_runtime.refreshOpenHandles();
       return state.transports.session(handle);
     },
   });

@@ -120,7 +120,7 @@ pub enum DeployBinding {
     Kv {
         binding: String,
     },
-    #[serde(rename = "memory", alias = "actor")]
+    #[serde(rename = "memory")]
     Actor {
         binding: String,
     },
@@ -167,4 +167,25 @@ pub struct WorkerOutput {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeployRequest;
+
+    #[test]
+    fn deploy_binding_rejects_legacy_actor_json_type() {
+        let result = serde_json::from_str::<DeployRequest>(
+            r#"{
+                "name": "worker",
+                "source": "export default {}",
+                "config": {
+                    "bindings": [
+                        { "type": "actor", "binding": "ROOMS" }
+                    ]
+                }
+            }"#,
+        );
+        assert!(result.is_err());
+    }
 }

@@ -676,7 +676,7 @@ impl ActorStore {
         let started = Instant::now();
         let namespace = namespace.trim();
         if namespace.is_empty() {
-            return Err(PlatformError::runtime("actor namespace must not be empty"));
+            return Err(PlatformError::runtime("memory namespace must not be empty"));
         }
         let actor_key = actor_key.trim();
         if actor_key.is_empty() {
@@ -1894,7 +1894,7 @@ impl ActorStore {
     async fn connect(&self, namespace: &str, actor_key: &str) -> Result<Connection> {
         let namespace = namespace.trim();
         if namespace.is_empty() {
-            return Err(PlatformError::runtime("actor namespace must not be empty"));
+            return Err(PlatformError::runtime("memory namespace must not be empty"));
         }
         let actor_key = actor_key.trim();
         if actor_key.is_empty() {
@@ -1908,7 +1908,7 @@ impl ActorStore {
     async fn connect_uncached(&self, namespace: &str, actor_key: &str) -> Result<Connection> {
         let namespace = namespace.trim();
         if namespace.is_empty() {
-            return Err(PlatformError::runtime("actor namespace must not be empty"));
+            return Err(PlatformError::runtime("memory namespace must not be empty"));
         }
         let actor_key = actor_key.trim();
         if actor_key.is_empty() {

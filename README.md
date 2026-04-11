@@ -110,7 +110,7 @@ cargo run -p cli -- --server http://127.0.0.1:3001 deploy dynamic examples/dynam
 cargo run -p cli -- --server http://127.0.0.1:3001 deploy memory examples/memory.js --memory-binding USER_MEMORY
 ```
 
-`--memory-binding` is the canonical user-facing flag. `--actor-binding` is still accepted as a legacy alias while the repo finishes converging on memory-namespace terminology.
+`--memory-binding` is the user-facing flag for keyed memory namespaces.
 
 `deploy --public` exposes a worker on the public listener. Without `--public`, a worker is private-only and can only be invoked through the private listener.
 
@@ -206,7 +206,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - W3C `traceparent` is extracted/injected on invoke requests
 - responses include `x-dd-trace-id` for quick correlation
 
-The user-facing primitive is the memory namespace. STM gives you transactional reads/writes inside a namespace, and you can build actor-style coordination on top of that when you need it. The repo still has some internal binary/file names with `actor` in them, but the model exposed to worker authors is memory-first.
+The user-facing primitive is the memory namespace. STM gives you transactional reads/writes inside a namespace, and you can build actor-style coordination on top of that when you need it.
 For public host-routed traffic, workers receive the honest external request URL such as `https://chat.example.com/rooms/test?x=1`. Private `/v1/invoke/:worker/...` requests remain synthetic and use `http://worker/...`.
 
 ## Example workers
