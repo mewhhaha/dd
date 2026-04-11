@@ -19,6 +19,7 @@ pub struct AppState {
     pub edge_revalidations: Arc<Mutex<HashSet<String>>>,
     pub invoke_max_body_bytes: usize,
     pub public_base_domain: String,
+    pub private_bearer_token: Option<String>,
     pub public_tls_cert_path: Option<PathBuf>,
     pub public_tls_key_path: Option<PathBuf>,
     pub websocket_sessions: Arc<Mutex<HashMap<String, WebSocketSession>>>,
@@ -29,6 +30,7 @@ impl AppState {
         runtime: RuntimeService,
         invoke_max_body_bytes: usize,
         public_base_domain: String,
+        private_bearer_token: Option<String>,
         public_tls_cert_path: Option<PathBuf>,
         public_tls_key_path: Option<PathBuf>,
     ) -> Self {
@@ -37,6 +39,7 @@ impl AppState {
             edge_revalidations: Arc::new(Mutex::new(HashSet::new())),
             invoke_max_body_bytes,
             public_base_domain: public_base_domain.trim().to_ascii_lowercase(),
+            private_bearer_token,
             public_tls_cert_path,
             public_tls_key_path,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),

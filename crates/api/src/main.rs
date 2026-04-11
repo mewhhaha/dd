@@ -27,6 +27,11 @@ async fn main() -> Result<()> {
     let private_addr: SocketAddr = bind_private_addr
         .parse()
         .map_err(|error| PlatformError::internal(format!("invalid BIND_PRIVATE_ADDR: {error}")))?;
+    let private_bearer_token = env::var("DD_PRIVATE_TOKEN")
+        .ok()
+        .or_else(|| env::var("PRIVATE_BEARER_TOKEN").ok());
+    let allow_insecure_private_loopback = env_flag("ALLOW_INSECURE_PRIVATE_LOOPBACK")
+        || env_flag("DD_ALLOW_INSECURE_PRIVATE_LOOPBACK");
     let public_base_domain =
         env::var("PUBLIC_BASE_DOMAIN").unwrap_or_else(|_| "example.com".to_string());
     let public_tls_cert_path = env::var("PUBLIC_TLS_CERT_PATH").ok().map(PathBuf::from);
@@ -36,6 +41,8 @@ async fn main() -> Result<()> {
         bind_public_addr: public_addr,
         bind_private_addr: private_addr,
         public_base_domain,
+        private_bearer_token,
+        allow_insecure_private_loopback,
         public_tls_cert_path,
         public_tls_key_path,
         ..ServerConfig::default()
@@ -46,6 +53,18 @@ async fn main() -> Result<()> {
         let _ = provider.shutdown();
     }
     result
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn init_tracing() -> Result<Option<OTelTracerProvider>> {

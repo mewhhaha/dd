@@ -417,6 +417,7 @@ struct ServerHarness {
     _root_dir: PathBuf,
     public_addr: std::net::SocketAddr,
     private_addr: std::net::SocketAddr,
+    private_token: String,
     child: tokio::sync::Mutex<Child>,
 }
 
@@ -444,11 +445,13 @@ impl ServerHarness {
 
         let public_addr = reserve_socket_addr();
         let private_addr = reserve_socket_addr();
+        let private_token = format!("test-token-{}", Uuid::new_v4());
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_dd_server"))
             .current_dir(&root_dir)
             .env("BIND_PUBLIC_ADDR", public_addr.to_string())
             .env("BIND_PRIVATE_ADDR", private_addr.to_string())
+            .env("DD_PRIVATE_TOKEN", &private_token)
             .env("PUBLIC_BASE_DOMAIN", "localhost")
             .env("PUBLIC_TLS_CERT_PATH", &cert_path)
             .env("PUBLIC_TLS_KEY_PATH", &key_path)
@@ -456,13 +459,14 @@ impl ServerHarness {
             .spawn()
             .expect("spawn dd_server");
 
-        wait_for_private_listener(private_addr, &mut child).await;
+        wait_for_private_listener(private_addr, &private_token, &mut child).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         Self {
             _root_dir: root_dir,
             public_addr,
             private_addr,
+            private_token,
             child: tokio::sync::Mutex::new(child),
         }
     }
@@ -470,6 +474,7 @@ impl ServerHarness {
     async fn deploy_public_worker(&self, name: &str, source: &str, config: DeployConfig) {
         let response = post_http_json(
             self.private_addr,
+            Some(&self.private_token),
             "/v1/deploy",
             &DeployRequest {
                 name: name.to_string(),
@@ -492,7 +497,11 @@ impl Drop for ServerHarness {
     }
 }
 
-async fn wait_for_private_listener(private_addr: std::net::SocketAddr, child: &mut Child) {
+async fn wait_for_private_listener(
+    private_addr: std::net::SocketAddr,
+    private_token: &str,
+    child: &mut Child,
+) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().expect("poll child") {
@@ -501,8 +510,10 @@ async fn wait_for_private_listener(private_addr: std::net::SocketAddr, child: &m
 
         match tokio::net::TcpStream::connect(private_addr).await {
             Ok(mut stream) => {
-                let request = b"POST /v1/deploy HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
-                if stream.write_all(request).await.is_ok() {
+                let request = format!(
+                    "POST /v1/deploy HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {private_token}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                if stream.write_all(request.as_bytes()).await.is_ok() {
                     let mut response = Vec::new();
                     let _ = stream.read_to_end(&mut response).await;
                     return;
@@ -518,6 +529,7 @@ async fn wait_for_private_listener(private_addr: std::net::SocketAddr, child: &m
 
 async fn post_http_json<T: serde::Serialize>(
     address: std::net::SocketAddr,
+    private_token: Option<&str>,
     path: &str,
     payload: &T,
 ) -> (u16, String) {
@@ -525,8 +537,11 @@ async fn post_http_json<T: serde::Serialize>(
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("connect http endpoint");
+    let auth_header = private_token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\n{auth_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream

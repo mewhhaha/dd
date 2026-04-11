@@ -798,12 +798,16 @@ globalThis.__dd_execute_worker = (payload) => {
     || value instanceof Uint8Array
   );
 
+  const HOST_FETCH_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+  const HOST_FETCH_MAX_REDIRECTS = 10;
+
   const normalizeHostFetchInput = async (inputValue, initValue = undefined) => {
     let method = "GET";
     let url = "";
     let headers = [];
     let body = new Uint8Array();
     let signal = undefined;
+    let redirect = "follow";
 
     if (inputValue instanceof Request) {
       method = String(inputValue.method || "GET").toUpperCase();
@@ -811,6 +815,7 @@ globalThis.__dd_execute_worker = (payload) => {
       headers = Array.from(inputValue.headers.entries());
       body = new Uint8Array(await inputValue.arrayBuffer());
       signal = inputValue.signal;
+      redirect = String(inputValue.redirect || "follow");
     } else {
       method = String(initValue?.method ?? "GET").toUpperCase();
       const raw = String(inputValue ?? "");
@@ -818,6 +823,7 @@ globalThis.__dd_execute_worker = (payload) => {
       headers = toHeaderEntries(initValue?.headers);
       body = toUtf8Bytes(initValue?.body);
       signal = initValue?.signal;
+      redirect = String(initValue?.redirect ?? "follow");
     }
 
     if (inputValue instanceof Request && initValue) {
@@ -833,6 +839,9 @@ globalThis.__dd_execute_worker = (payload) => {
       if (initValue.signal != null) {
         signal = initValue.signal;
       }
+      if (initValue.redirect != null) {
+        redirect = String(initValue.redirect);
+      }
     }
 
     if (!(url.startsWith("http://") || url.startsWith("https://"))) {
@@ -845,7 +854,43 @@ globalThis.__dd_execute_worker = (payload) => {
       headers,
       body,
       signal,
+      redirect,
     };
+  };
+
+  const rewriteMethodForRedirect = (status, method) => {
+    if (status === 303 && method !== "HEAD") {
+      return "GET";
+    }
+    if ((status === 301 || status === 302) && method !== "GET" && method !== "HEAD") {
+      return "GET";
+    }
+    return method;
+  };
+
+  const stripRedirectBodyHeaders = (headers) => headers.filter(([name]) => {
+    const lower = String(name || "").toLowerCase();
+    return lower !== "content-type"
+      && lower !== "content-length"
+      && lower !== "content-encoding"
+      && lower !== "content-language"
+      && lower !== "content-location"
+      && lower !== "transfer-encoding";
+  });
+
+  const checkHostFetchUrl = async (requestId, url) => {
+    const checked = await callOp(
+      "op_http_check_url",
+      JSON.stringify({
+        request_id: requestId,
+        url,
+      }),
+    );
+    await syncFrozenTime();
+    if (!checked || typeof checked !== "object" || checked.ok === false) {
+      throw new Error(String(checked?.error ?? "host fetch URL check failed"));
+    }
+    return String(checked.url || url);
   };
 
   const composeAbortSignal = (signals) => {
@@ -902,15 +947,49 @@ globalThis.__dd_execute_worker = (payload) => {
           throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
         }
         const signal = composeAbortSignal([current.controller.signal, normalized.signal]);
-        const body = Array.isArray(prepared.body) && prepared.body.length > 0
+        let method = String(prepared.method || "GET");
+        let url = String(prepared.url || normalized.url);
+        let headers = Array.isArray(prepared.headers) ? prepared.headers : [];
+        let body = Array.isArray(prepared.body) && prepared.body.length > 0
           ? toArrayBytes(prepared.body)
           : undefined;
-        return previousFetch(new Request(String(prepared.url), {
-          method: String(prepared.method || "GET"),
-          headers: Array.isArray(prepared.headers) ? prepared.headers : [],
-          body,
-          signal,
-        }));
+        const redirectMode = normalized.redirect === "error"
+          || normalized.redirect === "manual"
+          ? normalized.redirect
+          : "follow";
+        let redirectsRemaining = HOST_FETCH_MAX_REDIRECTS;
+        for (;;) {
+          const response = await previousFetch(new Request(url, {
+            method,
+            headers,
+            body,
+            signal,
+            redirect: "manual",
+          }));
+          if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(response.status)) {
+            return response;
+          }
+          const location = response.headers.get("location");
+          if (!location) {
+            return response;
+          }
+          if (redirectMode === "error") {
+            throw new TypeError(`host fetch redirect blocked: ${response.status}`);
+          }
+          if (redirectsRemaining <= 0) {
+            throw new TypeError("host fetch exceeded redirect limit");
+          }
+          const nextUrl = new URL(location, response.url || url).toString();
+          await response.body?.cancel?.();
+          url = await checkHostFetchUrl(current.requestId, nextUrl);
+          const nextMethod = rewriteMethodForRedirect(response.status, method);
+          if (nextMethod !== method) {
+            headers = stripRedirectBodyHeaders(headers);
+            body = undefined;
+          }
+          method = nextMethod;
+          redirectsRemaining -= 1;
+        }
       };
       const current = currentRequestContext(false);
       if (current?.actorEntry) {

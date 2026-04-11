@@ -88,17 +88,47 @@ struct DynamicDeployCmd {
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
     let client = reqwest::Client::new();
+    let private_bearer_token = private_bearer_token();
 
     match cli.command {
-        Command::Deploy(command) => deploy(&client, &cli.server, command).await?,
-        Command::DynamicDeploy(command) => dynamic_deploy(&client, &cli.server, command).await?,
-        Command::Invoke(command) => invoke(&client, &cli.server, command).await?,
+        Command::Deploy(command) => {
+            deploy(
+                &client,
+                &cli.server,
+                private_bearer_token.as_deref(),
+                command,
+            )
+            .await?
+        }
+        Command::DynamicDeploy(command) => {
+            dynamic_deploy(
+                &client,
+                &cli.server,
+                private_bearer_token.as_deref(),
+                command,
+            )
+            .await?
+        }
+        Command::Invoke(command) => {
+            invoke(
+                &client,
+                &cli.server,
+                private_bearer_token.as_deref(),
+                command,
+            )
+            .await?
+        }
     }
 
     Ok(())
 }
 
-async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> Result<(), String> {
+async fn deploy(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: DeployCmd,
+) -> Result<(), String> {
     let source = tokio::fs::read_to_string(&command.file)
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
@@ -133,18 +163,20 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
             }),
         },
     };
-    let response = client
-        .post(format!("{server}/v1/deploy"))
-        .json(&DeployRequest {
-            name: command.name,
-            source,
-            config,
-            assets,
-            asset_headers,
-        })
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = with_private_auth(
+        client.post(format!("{server}/v1/deploy")),
+        private_bearer_token,
+    )
+    .json(&DeployRequest {
+        name: command.name,
+        source,
+        config,
+        assets,
+        asset_headers,
+    })
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
 
     let deployment: DeployResponse = decode_json(response).await?;
     println!("{}", to_json_string(&deployment)?);
@@ -154,22 +186,25 @@ async fn deploy(client: &reqwest::Client, server: &str, command: DeployCmd) -> R
 async fn dynamic_deploy(
     client: &reqwest::Client,
     server: &str,
+    private_bearer_token: Option<&str>,
     command: DynamicDeployCmd,
 ) -> Result<(), String> {
     let source = tokio::fs::read_to_string(&command.file)
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
     let env = parse_env_vars(&command.env_vars)?;
-    let response = client
-        .post(format!("{server}/v1/dynamic/deploy"))
-        .json(&DynamicDeployRequest {
-            source,
-            env,
-            egress_allow_hosts: command.allow_hosts,
-        })
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = with_private_auth(
+        client.post(format!("{server}/v1/dynamic/deploy")),
+        private_bearer_token,
+    )
+    .json(&DynamicDeployRequest {
+        source,
+        env,
+        egress_allow_hosts: command.allow_hosts,
+    })
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
 
     let deployed: DynamicDeployResponse = decode_json(response).await?;
     println!("{}", to_json_string(&deployed)?);
@@ -213,7 +248,12 @@ fn parse_env_vars(values: &[String]) -> Result<HashMap<String, String>, String> 
     Ok(out)
 }
 
-async fn invoke(client: &reqwest::Client, server: &str, command: InvokeCmd) -> Result<(), String> {
+async fn invoke(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: InvokeCmd,
+) -> Result<(), String> {
     let method = reqwest::Method::from_bytes(command.method.to_uppercase().as_bytes())
         .map_err(|error| format!("invalid HTTP method {}: {error}", command.method))?;
     let headers = parse_headers(&command.headers)?;
@@ -226,8 +266,7 @@ async fn invoke(client: &reqwest::Client, server: &str, command: InvokeCmd) -> R
         path
     );
 
-    let response = client
-        .request(method, url)
+    let response = with_private_auth(client.request(method, url), private_bearer_token)
         .headers(headers)
         .body(body)
         .send()
@@ -337,6 +376,24 @@ fn normalize_path(path: &str) -> String {
 
 fn default_server() -> String {
     env::var("DD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string())
+}
+
+fn private_bearer_token() -> Option<String> {
+    env::var("DD_PRIVATE_TOKEN")
+        .ok()
+        .or_else(|| env::var("PRIVATE_BEARER_TOKEN").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn with_private_auth(
+    request: reqwest::RequestBuilder,
+    private_bearer_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match private_bearer_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<String>), String> {

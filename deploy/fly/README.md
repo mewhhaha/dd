@@ -56,7 +56,13 @@ The app keeps persistent data in `/app/store`:
 - KV/memory/sqlite files
 - cache blobs/indexes
 
-## 3) Private deploy tunnel (no auth, private network only)
+## 3) Private deploy tunnel (bearer auth)
+
+Set shared private token before starting server and before using CLI/helpers:
+
+```bash
+export DD_PRIVATE_TOKEN=replace-me-with-long-random-secret
+```
 
 Use the helper to resolve the active machine IPv6 and proxy local deploy traffic:
 

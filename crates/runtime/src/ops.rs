@@ -837,6 +837,19 @@ struct HttpPrepareResult {
 }
 
 #[derive(Debug, Deserialize)]
+struct HttpUrlCheckPayload {
+    request_id: String,
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpUrlCheckResult {
+    ok: bool,
+    url: String,
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct DynamicWorkerCreatePayload {
     request_id: String,
     binding: String,
@@ -2254,28 +2267,8 @@ fn prepare_http_fetch_request(
     ),
     String,
 > {
-    if payload.request_id.trim().is_empty() {
-        return Err("host fetch request_id must not be empty".to_string());
-    }
-
-    let context = {
-        let state_ref = state.borrow();
-        state_ref
-            .borrow::<RequestSecretContexts>()
-            .contexts
-            .get(payload.request_id.trim())
-            .map(|context| {
-                (
-                    context.replacements.clone(),
-                    context.egress_allow_hosts.clone(),
-                    context.canceled.clone(),
-                    context.canceled_notify.clone(),
-                )
-            })
-    };
-    let Some((replacements, egress_allow_hosts, canceled, canceled_notify)) = context else {
-        return Err("host fetch context is unavailable (request likely canceled)".to_string());
-    };
+    let (replacements, egress_allow_hosts, canceled, canceled_notify) =
+        http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
@@ -2288,12 +2281,11 @@ fn prepare_http_fetch_request(
     let url = replace_placeholders_text(&payload.url, &replacements);
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
-    let host = parsed_url
-        .host_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !is_egress_host_allowed(&host, &egress_allow_hosts) {
-        return Err(format!("egress host is not allowed: {host}"));
+    if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
+        return Err(format!(
+            "egress origin is not allowed: {}",
+            parsed_url.origin().ascii_serialization()
+        ));
     }
 
     let headers = payload
@@ -2314,6 +2306,62 @@ fn prepare_http_fetch_request(
     let body = replace_placeholders_in_body(payload.body, &replacements);
 
     Ok((method, parsed_url, headers, body, canceled, canceled_notify))
+}
+
+fn check_http_fetch_url(
+    state: &Rc<RefCell<OpState>>,
+    payload: HttpUrlCheckPayload,
+) -> std::result::Result<String, String> {
+    let (replacements, egress_allow_hosts, canceled, canceled_notify) =
+        http_fetch_context(state, &payload.request_id)?;
+    if canceled.load(Ordering::SeqCst) {
+        canceled_notify.notify_waiters();
+        return Err("host fetch request canceled".to_string());
+    }
+    let url = replace_placeholders_text(&payload.url, &replacements);
+    let parsed_url =
+        reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
+    if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
+        return Err(format!(
+            "egress origin is not allowed: {}",
+            parsed_url.origin().ascii_serialization()
+        ));
+    }
+    Ok(parsed_url.to_string())
+}
+
+fn http_fetch_context(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+) -> std::result::Result<
+    (
+        HashMap<String, String>,
+        Vec<String>,
+        Arc<AtomicBool>,
+        Arc<Notify>,
+    ),
+    String,
+> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err("host fetch request_id must not be empty".to_string());
+    }
+    let context = {
+        let state_ref = state.borrow();
+        state_ref
+            .borrow::<RequestSecretContexts>()
+            .contexts
+            .get(request_id)
+            .map(|context| {
+                (
+                    context.replacements.clone(),
+                    context.egress_allow_hosts.clone(),
+                    context.canceled.clone(),
+                    context.canceled_notify.clone(),
+                )
+            })
+    };
+    context.ok_or_else(|| "host fetch context is unavailable (request likely canceled)".to_string())
 }
 
 #[deno_core::op2]
@@ -2351,6 +2399,34 @@ async fn op_http_prepare(
             url: String::new(),
             headers: Vec::new(),
             body: Vec::new(),
+            error,
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_http_check_url(state: Rc<RefCell<OpState>>, #[string] payload: String) -> HttpUrlCheckResult {
+    let payload: HttpUrlCheckPayload = match crate::json::from_string(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return HttpUrlCheckResult {
+                ok: false,
+                url: String::new(),
+                error: format!("invalid host fetch URL check payload: {error}"),
+            };
+        }
+    };
+
+    match check_http_fetch_url(&state, payload) {
+        Ok(url) => HttpUrlCheckResult {
+            ok: true,
+            url,
+            error: String::new(),
+        },
+        Err(error) => HttpUrlCheckResult {
+            ok: false,
+            url: String::new(),
             error,
         },
     }
@@ -4643,6 +4719,7 @@ deno_core::extension!(
         op_dynamic_profile_take,
         op_dynamic_profile_reset,
         op_http_prepare,
+        op_http_check_url,
         op_dynamic_take_reply,
         op_dynamic_cancel_reply,
         op_dynamic_take_local_host_rpc,
@@ -4878,24 +4955,66 @@ fn replace_placeholders_in_body(body: Vec<u8>, replacements: &HashMap<String, St
     }
 }
 
-fn is_egress_host_allowed(host: &str, allow_hosts: &[String]) -> bool {
+fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[String]) -> bool {
     if allow_hosts.is_empty() {
         return false;
     }
-    let host = host.trim().to_ascii_lowercase();
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     if host.is_empty() {
         return false;
     }
+    let Some(request_port) = url.port_or_known_default() else {
+        return false;
+    };
+    let Some(default_port) = default_port_for_scheme(url.scheme()) else {
+        return false;
+    };
     allow_hosts.iter().any(|allowed| {
-        let allowed = allowed.trim().to_ascii_lowercase();
-        if allowed.is_empty() {
+        let Some((allowed_host, allowed_port)) = parse_egress_allow_host(allowed) else {
+            return false;
+        };
+        let port_matches = match allowed_port {
+            Some(port) => port == request_port,
+            None => request_port == default_port,
+        };
+        if !port_matches {
             return false;
         }
-        if let Some(suffix) = allowed.strip_prefix("*.") {
+        if let Some(suffix) = allowed_host.strip_prefix("*.") {
             return host == suffix || host.ends_with(&format!(".{suffix}"));
         }
-        host == allowed
+        host == allowed_host
     })
+}
+
+fn parse_egress_allow_host(allowed: &str) -> Option<(String, Option<u16>)> {
+    let allowed = allowed.trim().to_ascii_lowercase();
+    if allowed.is_empty() {
+        return None;
+    }
+    let (host, port) = match allowed.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|char| char.is_ascii_digit()) => {
+            let parsed = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+            (host.to_string(), Some(parsed))
+        }
+        _ => (allowed, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
 }
 
 pub fn register_request_body_stream(
@@ -5077,4 +5196,50 @@ fn decode_cache_put_payload(payload: String) -> common::Result<(CacheRequest, Ca
             body: payload.response_body,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_egress_url_allowed, parse_egress_allow_host};
+
+    #[test]
+    fn parse_egress_allow_host_supports_exact_and_port_rules() {
+        assert_eq!(
+            parse_egress_allow_host("api.example.com"),
+            Some(("api.example.com".to_string(), None))
+        );
+        assert_eq!(
+            parse_egress_allow_host("api.example.com:8443"),
+            Some(("api.example.com".to_string(), Some(8443)))
+        );
+        assert_eq!(
+            parse_egress_allow_host("*.example.com:8443"),
+            Some(("*.example.com".to_string(), Some(8443)))
+        );
+    }
+
+    #[test]
+    fn egress_url_rules_require_matching_port() {
+        let allowed = vec!["api.example.com".to_string()];
+        let https_default = reqwest::Url::parse("https://api.example.com/path").expect("url");
+        let https_alt = reqwest::Url::parse("https://api.example.com:8443/path").expect("url");
+        assert!(is_egress_url_allowed(&https_default, &allowed));
+        assert!(!is_egress_url_allowed(&https_alt, &allowed));
+    }
+
+    #[test]
+    fn egress_url_rules_support_explicit_ports_and_wildcards() {
+        let allowed = vec![
+            "api.example.com:8443".to_string(),
+            "*.internal.example.com".to_string(),
+        ];
+        let exact = reqwest::Url::parse("https://api.example.com:8443/path").expect("url");
+        let wildcard_ok =
+            reqwest::Url::parse("https://svc.internal.example.com/path").expect("url");
+        let wildcard_bad =
+            reqwest::Url::parse("https://svc.internal.example.com:8443/path").expect("url");
+        assert!(is_egress_url_allowed(&exact, &allowed));
+        assert!(is_egress_url_allowed(&wildcard_ok, &allowed));
+        assert!(!is_egress_url_allowed(&wildcard_bad, &allowed));
+    }
 }

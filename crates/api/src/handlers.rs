@@ -5,7 +5,9 @@ use common::{
     DynamicDeployResponse, ErrorBody, ErrorKind, PlatformError, WorkerInvocation, WorkerOutput,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, HOST};
+use http::header::{
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, HOST, WWW_AUTHENTICATE,
+};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body::Body as HttpBody;
 use http_body_util::combinators::BoxBody;
@@ -85,6 +87,11 @@ where
     B::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let path = request.uri().path().to_string();
+    if private_route_requires_auth(&path)
+        && !private_request_is_authorized(&state, request.headers())
+    {
+        return Ok(private_auth_response());
+    }
     if request.method() == Method::POST && path == "/v1/deploy" {
         let payload: DeployRequest =
             read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
@@ -1048,25 +1055,14 @@ pub(crate) fn build_public_request_url(
         .map(|(_, query)| format!("?{query}"))
         .unwrap_or_default();
     let host = headers
-        .get("x-forwarded-host")
+        .get(HOST)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            headers
-                .get(HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
         .or_else(|| uri.authority().map(|authority| authority.as_str()))
         .ok_or_else(|| PlatformError::bad_request("public request is missing a host"))?;
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| uri.scheme_str())
+    let scheme = uri
+        .scheme_str()
         .map(normalize_public_request_scheme)
         .unwrap_or("https");
     Ok(format!("{scheme}://{host}{normalized_path}{query_suffix}"))
@@ -1101,6 +1097,52 @@ fn request_host_for_matching(headers: &HeaderMap, uri: &http::Uri) -> Option<Str
             uri.authority()
                 .map(|authority| authority.as_str().to_string())
         })
+}
+
+fn private_route_requires_auth(path: &str) -> bool {
+    path == "/v1/deploy"
+        || path == "/v1/dynamic/deploy"
+        || path == "/v1/invoke"
+        || path.starts_with("/v1/invoke/")
+}
+
+fn private_request_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected_token) = state.private_bearer_token.as_deref() else {
+        return true;
+    };
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    token.trim() == expected_token
+}
+
+fn private_auth_response() -> Response<ResponseBody> {
+    let mut response = Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header(WWW_AUTHENTICATE, "Bearer")
+        .body(full_body(
+            serde_json::to_vec(&ErrorBody {
+                ok: false,
+                error: "private control plane requires bearer auth".to_string(),
+            })
+            .unwrap_or_else(|_| {
+                b"{\"ok\":false,\"error\":\"private control plane requires bearer auth\"}".to_vec()
+            }),
+        ))
+        .unwrap_or_else(|_| {
+            Response::new(full_body(
+                b"{\"ok\":false,\"error\":\"private control plane requires bearer auth\"}".to_vec(),
+            ))
+        });
+    annotate_response_with_trace_id(&mut response);
+    response
 }
 
 async fn try_serve_static_asset(
@@ -1669,6 +1711,7 @@ mod tests {
             runtime,
             1024 * 1024,
             public_base_domain.to_string(),
+            Some("test-private-token".to_string()),
             None,
             None,
         )
@@ -1698,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn build_public_request_url_prefers_forwarded_host_and_proto() {
+    fn build_public_request_url_ignores_spoofed_forwarded_host_and_proto() {
         let uri: http::Uri = "/rooms/test?x=1".parse().expect("uri");
         let request = Request::builder()
             .uri(uri)
@@ -1708,11 +1751,11 @@ mod tests {
             .body(())
             .expect("request");
         let url = build_public_request_url(request.headers(), request.uri()).expect("url");
-        assert_eq!(url, "https://chat.wdyt.chat/rooms/test?x=1");
+        assert_eq!(url, "https://chat.example.com/rooms/test?x=1");
     }
 
     #[test]
-    fn build_public_request_url_normalizes_websocket_forwarded_proto() {
+    fn build_public_request_url_ignores_spoofed_forwarded_proto() {
         let uri: http::Uri = "/ws".parse().expect("uri");
         let request = Request::builder()
             .uri(uri)
@@ -1882,6 +1925,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/v1/invoke/echo")
+            .header("authorization", "Bearer test-private-token")
             .body(Empty::<Bytes>::new())
             .expect("request");
         let response = invoke_worker_private(state, request, None)
@@ -1934,7 +1978,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "starts full runtime service; run manually in isolation"]
-    async fn public_host_invoke_passes_honest_request_url() {
+    async fn public_host_invoke_ignores_spoofed_forwarded_request_url() {
         let state = create_test_state("example.com").await;
         state
             .runtime
@@ -1968,7 +2012,7 @@ mod tests {
             .await
             .expect("body")
             .to_bytes();
-        assert_eq!(body.as_ref(), b"https://echo.wdyt.chat/rooms/test?x=1");
+        assert_eq!(body.as_ref(), b"https://echo.example.com/rooms/test?x=1");
     }
 
     #[tokio::test]
@@ -2021,6 +2065,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/v1/invoke/assets/a.js")
+            .header("authorization", "Bearer test-private-token")
             .body(Empty::<Bytes>::new())
             .expect("request");
         let response = invoke_worker_private(state.clone(), request, None)
@@ -2044,6 +2089,7 @@ mod tests {
         let fallback_request = Request::builder()
             .method("GET")
             .uri("/v1/invoke/assets/missing")
+            .header("authorization", "Bearer test-private-token")
             .body(Empty::<Bytes>::new())
             .expect("request");
         let fallback = invoke_worker_private(state, fallback_request, None)
@@ -2136,6 +2182,7 @@ mod tests {
         let request = Request::builder()
             .method("GET")
             .uri("/v1/invoke/echo")
+            .header("authorization", "Bearer test-private-token")
             .header("upgrade", "websocket")
             .header("connection", "Upgrade")
             .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
@@ -2145,6 +2192,25 @@ mod tests {
 
         let response = handle_private_request(state, request).await.status();
         assert_eq!(response, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn private_routes_reject_missing_bearer_token() {
+        let state = create_test_state("example.com").await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let response = handle_private_request(state, request).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer")
+        );
     }
 
     #[tokio::test]

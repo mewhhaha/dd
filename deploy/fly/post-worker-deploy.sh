@@ -4,6 +4,7 @@ set -euo pipefail
 SERVER="${1:-http://127.0.0.1:18081}"
 NAME="${2:-}"
 FILE="${3:-}"
+PRIVATE_TOKEN="${DD_PRIVATE_TOKEN:-${PRIVATE_BEARER_TOKEN:-}}"
 shift 3 || true
 
 if [ -z "$NAME" ] || [ -z "$FILE" ]; then
@@ -191,6 +192,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+curl_args=(
+  --fail-with-body
+  -sS
+  -H
+  'content-type: application/json'
+)
+if [ -n "$PRIVATE_TOKEN" ]; then
+  curl_args+=(-H "authorization: Bearer $PRIVATE_TOKEN")
+fi
+
 jq -n \
   --arg name "$NAME" \
   --rawfile source "$FILE" \
@@ -205,8 +216,7 @@ jq -n \
     asset_headers: $asset_headers
   }' > "$temp_payload"
 
-curl --fail-with-body -sS \
-  -H 'content-type: application/json' \
+curl "${curl_args[@]}" \
   --data-binary @"$temp_payload" \
   "${SERVER%/}/v1/deploy"
 echo

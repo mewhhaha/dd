@@ -6131,6 +6131,21 @@ fn is_valid_env_name(name: &str) -> bool {
 }
 
 fn is_valid_egress_host(host: &str) -> bool {
+    let host = match host.rsplit_once(':') {
+        Some((left, right)) if right.chars().all(|char| char.is_ascii_digit()) => {
+            let Ok(port) = right.parse::<u16>() else {
+                return false;
+            };
+            if port == 0 {
+                return false;
+            }
+            left
+        }
+        _ => host,
+    };
+    if host.is_empty() {
+        return false;
+    }
     if let Some(rest) = host.strip_prefix("*.") {
         return !rest.is_empty()
             && rest
@@ -14544,6 +14559,29 @@ export default {
             Vec::new(),
         );
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn dynamic_worker_config_accepts_host_port_and_wildcard_rules() {
+        let config = super::build_dynamic_worker_config(
+            HashMap::new(),
+            vec![
+                "api.example.com:8443".to_string(),
+                "*.example.com".to_string(),
+                "*.example.com:9443".to_string(),
+            ],
+            Vec::new(),
+        )
+        .expect("dynamic config should accept host+port rules");
+
+        assert_eq!(
+            config.egress_allow_hosts,
+            vec![
+                "api.example.com:8443".to_string(),
+                "*.example.com".to_string(),
+                "*.example.com:9443".to_string(),
+            ]
+        );
     }
 
     #[test]
