@@ -206,7 +206,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - W3C `traceparent` is extracted/injected on invoke requests
 - responses include `x-dd-trace-id` for quick correlation
 
-The user-facing primitive is the memory namespace. STM gives you transactional reads/writes inside a namespace, and you can build actor-style coordination on top of that when you need it.
+The user-facing primitive is the memory namespace. STM gives you transactional reads/writes inside a namespace, and you can build higher-level coordination on top of that when you need it.
 For public host-routed traffic, workers receive the honest external request URL such as `https://chat.example.com/rooms/test?x=1`. Private `/v1/invoke/:worker/...` requests remain synthetic and use `http://worker/...`.
 
 ## Example workers

@@ -1,4 +1,6 @@
 mod config;
+mod dynamic;
+mod sessions;
 
 use crate::actor::ActorStore;
 use crate::actor_rpc::{
@@ -2402,6 +2404,7 @@ impl WorkerManager {
         }
     }
 
+    #[cfg(any())]
     fn complete_websocket_open(
         &mut self,
         worker_name: &str,
@@ -2505,6 +2508,7 @@ impl WorkerManager {
         }
     }
 
+    #[cfg(any())]
     fn register_websocket_session(
         &mut self,
         worker_name: &str,
@@ -2543,6 +2547,7 @@ impl WorkerManager {
         Ok(())
     }
 
+    #[cfg(any())]
     fn unregister_websocket_session(&mut self, session_id: &str) -> Option<WorkerWebSocketSession> {
         let session = self.websocket_sessions.remove(session_id)?;
         self.fail_websocket_frame_waiters(
@@ -2572,6 +2577,7 @@ impl WorkerManager {
         Some(session)
     }
 
+    #[cfg(any())]
     fn register_transport_session(
         &mut self,
         worker_name: &str,
@@ -2617,6 +2623,7 @@ impl WorkerManager {
         Ok(())
     }
 
+    #[cfg(any())]
     fn unregister_transport_session(&mut self, session_id: &str) -> Option<WorkerTransportSession> {
         let session = self.transport_sessions.remove(session_id)?;
         self.transport_handle_index.remove(&actor_handle_key(
@@ -2642,6 +2649,7 @@ impl WorkerManager {
         Some(session)
     }
 
+    #[cfg(any())]
     fn queue_transport_close_replay(
         &mut self,
         session: &WorkerTransportSession,
@@ -2660,6 +2668,7 @@ impl WorkerManager {
             });
     }
 
+    #[cfg(any())]
     fn queue_websocket_close_replay(
         &mut self,
         session: &WorkerWebSocketSession,
@@ -2678,6 +2687,7 @@ impl WorkerManager {
             });
     }
 
+    #[cfg(any())]
     fn complete_transport_open(
         &mut self,
         worker_name: &str,
@@ -2741,6 +2751,7 @@ impl WorkerManager {
         }));
     }
 
+    #[cfg(any())]
     fn handle_actor_socket_send(
         &mut self,
         payload: crate::ops::ActorSocketSendEvent,
@@ -2772,6 +2783,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_socket_close(
         &mut self,
         payload: crate::ops::ActorSocketCloseEvent,
@@ -2798,6 +2810,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_socket_list(
         &mut self,
         payload: crate::ops::ActorSocketListEvent,
@@ -2813,6 +2826,7 @@ impl WorkerManager {
         let _ = payload.reply.send(Ok(handles));
     }
 
+    #[cfg(any())]
     fn handle_actor_socket_consume_close(
         &mut self,
         payload: crate::ops::ActorSocketConsumeCloseEvent,
@@ -2842,6 +2856,7 @@ impl WorkerManager {
         let _ = payload.reply.send(Ok(replay));
     }
 
+    #[cfg(any())]
     fn push_transport_stream(
         &mut self,
         worker_name: &str,
@@ -2911,6 +2926,7 @@ impl WorkerManager {
         Ok(())
     }
 
+    #[cfg(any())]
     fn push_transport_datagram(
         &mut self,
         worker_name: &str,
@@ -2978,6 +2994,7 @@ impl WorkerManager {
         Ok(())
     }
 
+    #[cfg(any())]
     fn close_transport(
         &mut self,
         worker_name: &str,
@@ -3050,6 +3067,7 @@ impl WorkerManager {
         Ok(())
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_send_stream(
         &mut self,
         payload: crate::ops::ActorTransportSendStreamEvent,
@@ -3077,6 +3095,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_send_datagram(
         &mut self,
         payload: crate::ops::ActorTransportSendDatagramEvent,
@@ -3104,6 +3123,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_recv_stream(
         &mut self,
         payload: crate::ops::ActorTransportRecvStreamEvent,
@@ -3131,6 +3151,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_recv_datagram(
         &mut self,
         payload: crate::ops::ActorTransportRecvDatagramEvent,
@@ -3157,6 +3178,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_close(
         &mut self,
         payload: crate::ops::ActorTransportCloseEvent,
@@ -3186,6 +3208,7 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_list(
         &mut self,
         payload: crate::ops::ActorTransportListEvent,
@@ -3201,6 +3224,7 @@ impl WorkerManager {
         let _ = payload.reply.send(Ok(handles));
     }
 
+    #[cfg(any())]
     fn handle_actor_transport_consume_close(
         &mut self,
         payload: crate::ops::ActorTransportConsumeCloseEvent,
@@ -3230,6 +3254,7 @@ impl WorkerManager {
         let _ = payload.reply.send(Ok(replay));
     }
 
+    #[cfg(any())]
     async fn handle_dynamic_worker_create(
         &mut self,
         payload: crate::ops::DynamicWorkerCreateEvent,
@@ -3391,6 +3416,7 @@ impl WorkerManager {
         );
     }
 
+    #[cfg(any())]
     fn handle_dynamic_worker_lookup(&mut self, payload: crate::ops::DynamicWorkerLookupEvent) {
         let crate::ops::DynamicWorkerLookupEvent {
             owner_worker,
@@ -3453,6 +3479,7 @@ impl WorkerManager {
         );
     }
 
+    #[cfg(any())]
     fn handle_dynamic_worker_list(&mut self, payload: crate::ops::DynamicWorkerListEvent) {
         let crate::ops::DynamicWorkerListEvent {
             owner_worker,
@@ -3480,6 +3507,7 @@ impl WorkerManager {
         );
     }
 
+    #[cfg(any())]
     fn handle_dynamic_worker_delete(&mut self, payload: crate::ops::DynamicWorkerDeleteEvent) {
         let crate::ops::DynamicWorkerDeleteEvent {
             owner_worker,
@@ -3541,6 +3569,7 @@ impl WorkerManager {
         );
     }
 
+    #[cfg(any())]
     fn handle_dynamic_worker_invoke(
         &mut self,
         payload: crate::ops::DynamicWorkerInvokeEvent,
@@ -3679,6 +3708,7 @@ impl WorkerManager {
         });
     }
 
+    #[cfg(any())]
     fn handle_dynamic_host_rpc_invoke(
         &mut self,
         payload: crate::ops::DynamicHostRpcInvokeEvent,
@@ -3797,6 +3827,7 @@ impl WorkerManager {
         self.dynamic_profile.record_local_host_rpc_callback();
     }
 
+    #[cfg(any())]
     async fn validate_worker_cached(&mut self, source: &str) -> Result<()> {
         let source_hash = Sha256::digest(source.as_bytes()).into();
         if self.validated_worker_sources.contains(&source_hash) {
@@ -3807,6 +3838,7 @@ impl WorkerManager {
         Ok(())
     }
 
+    #[cfg(any())]
     async fn dynamic_worker_snapshot_cached(&mut self, source: &str) -> Option<&'static [u8]> {
         let source_hash: [u8; 32] = Sha256::digest(source.as_bytes()).into();
         if let Some(snapshot) = self.dynamic_worker_snapshots.get(&source_hash).copied() {
@@ -11097,7 +11129,7 @@ export default {
 
     #[tokio::test]
     #[serial]
-    async fn transport_open_preserves_connect_shape_for_actor_code() {
+    async fn transport_open_preserves_connect_shape_for_memory_namespace_code() {
         let service = test_service(RuntimeConfig {
             min_isolates: 1,
             max_isolates: 2,

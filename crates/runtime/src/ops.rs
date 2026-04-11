@@ -257,9 +257,10 @@ pub struct DynamicPendingReplies {
     next_id: Arc<AtomicU64>,
 }
 
-enum DynamicPendingReplyEntry {
-    Pending,
-    Ready(DynamicPendingReplyPayload),
+struct DynamicPendingReplyEntry {
+    notify: Arc<Notify>,
+    payload: Option<DynamicPendingReplyPayload>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub enum DynamicPendingReplyPayload {
@@ -364,7 +365,14 @@ impl DynamicPendingReplies {
             .entries
             .lock()
             .expect("dynamic pending reply lock poisoned");
-        entries.insert(reply_id.clone(), DynamicPendingReplyEntry::Pending);
+        entries.insert(
+            reply_id.clone(),
+            DynamicPendingReplyEntry {
+                notify: Arc::new(Notify::new()),
+                payload: None,
+                wake: None,
+            },
+        );
         reply_id
     }
 
@@ -382,7 +390,71 @@ impl DynamicPendingReplies {
             .lock()
             .expect("dynamic pending reply lock poisoned");
         if let Some(entry) = entries.get_mut(&reply_id) {
-            *entry = DynamicPendingReplyEntry::Ready(payload);
+            entry.payload = Some(payload);
+            if let Some(wake) = entry.wake.take() {
+                wake();
+            }
+            entry.notify.notify_waiters();
+        }
+    }
+
+    fn register_waker(&self, reply_id: &str, wake: Arc<dyn Fn() + Send + Sync>) {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("dynamic pending reply lock poisoned");
+        if let Some(entry) = entries.get_mut(reply_id) {
+            entry.wake = Some(wake);
+        }
+    }
+
+    async fn wait(&self, reply_id: &str, timeout_ms: u64) -> DynamicPendingReplyPollResult {
+        let timeout_ms = timeout_ms.max(1);
+        let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        tokio::pin!(deadline);
+
+        loop {
+            let notify = {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .expect("dynamic pending reply lock poisoned");
+                let Some(entry) = entries.get(reply_id) else {
+                    return DynamicPendingReplyPollResult {
+                        ready: true,
+                        kind: "unknown".to_string(),
+                        ok: false,
+                        error: "dynamic reply id not found".to_string(),
+                        ..DynamicPendingReplyPollResult::default()
+                    };
+                };
+                if entry.payload.is_some() {
+                    let entry = entries
+                        .remove(reply_id)
+                        .expect("dynamic pending reply should still exist");
+                    return entry
+                        .payload
+                        .expect("dynamic pending reply payload should exist")
+                        .into_poll_result();
+                }
+                entry.notify.clone()
+            };
+
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = &mut deadline => {
+                    self.cancel(reply_id);
+                    return DynamicPendingReplyPollResult {
+                        ready: true,
+                        kind: "timeout".to_string(),
+                        ok: false,
+                        error: format!("dynamic reply timed out after {timeout_ms}ms"),
+                        ..DynamicPendingReplyPollResult::default()
+                    };
+                }
+            }
         }
     }
 
@@ -400,14 +472,15 @@ impl DynamicPendingReplies {
                 ..DynamicPendingReplyPollResult::default()
             };
         };
-        if matches!(entry, DynamicPendingReplyEntry::Pending) {
+        if entry.payload.is_none() {
             return DynamicPendingReplyPollResult::default();
         }
         match entries.remove(reply_id) {
-            Some(DynamicPendingReplyEntry::Ready(payload)) => payload.into_poll_result(),
-            Some(DynamicPendingReplyEntry::Pending) | None => {
-                DynamicPendingReplyPollResult::default()
-            }
+            Some(entry) => entry
+                .payload
+                .map(DynamicPendingReplyPayload::into_poll_result)
+                .unwrap_or_default(),
+            None => DynamicPendingReplyPollResult::default(),
         }
     }
 }
@@ -2558,6 +2631,32 @@ fn op_dynamic_take_reply(
 ) -> DynamicPendingReplyPollResult {
     let pending = state.borrow::<DynamicPendingReplies>().clone();
     pending.poll(payload.reply_id.trim())
+}
+
+#[derive(Deserialize)]
+struct DynamicReplyWaitPayload {
+    reply_id: String,
+    #[serde(default = "default_dynamic_worker_timeout")]
+    timeout_ms: u64,
+}
+
+#[deno_core::op2]
+#[serde]
+async fn op_dynamic_wait_reply(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: DynamicReplyWaitPayload,
+) -> DynamicPendingReplyPollResult {
+    let (pending, waker) = {
+        let state_ref = state.borrow();
+        (
+            state_ref.borrow::<DynamicPendingReplies>().clone(),
+            state_ref.waker.clone(),
+        )
+    };
+    pending.register_waker(payload.reply_id.trim(), Arc::new(move || waker.wake()));
+    pending
+        .wait(payload.reply_id.trim(), payload.timeout_ms)
+        .await
 }
 
 #[derive(Deserialize)]
@@ -4720,6 +4819,7 @@ deno_core::extension!(
         op_dynamic_profile_reset,
         op_http_prepare,
         op_http_check_url,
+        op_dynamic_wait_reply,
         op_dynamic_take_reply,
         op_dynamic_cancel_reply,
         op_dynamic_take_local_host_rpc,
