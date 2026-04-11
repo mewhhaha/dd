@@ -1,5 +1,5 @@
 use crate::handlers::{
-    annotate_response_with_trace_id, build_worker_url, ensure_public_worker, full_body,
+    annotate_response_with_trace_id, build_public_request_url, ensure_public_worker, full_body,
     handle_public_h3_request, handle_websocket_session, open_transport_session_from_parts,
     open_websocket_session_from_parts, parse_public_worker_name_from_request,
     sanitize_websocket_handshake_headers, ResponseBody,
@@ -237,7 +237,7 @@ async fn handle_public_h3_websocket(
         &state.public_base_domain,
     )?;
     ensure_public_worker(&state, &worker_name).await?;
-    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    let url = build_public_request_url(&parts.headers, &parts.uri)?;
     let synthetic_parts = build_synthetic_websocket_parts(parts)?;
 
     let runtime::WebSocketOpen {
@@ -303,7 +303,7 @@ async fn handle_public_h3_transport(
         &state.public_base_domain,
     )?;
     ensure_public_worker(&state, &worker_name).await?;
-    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    let url = build_public_request_url(&parts.headers, &parts.uri)?;
     let synthetic_parts = build_synthetic_transport_parts(parts)?;
 
     let (outbound_stream_tx, mut outbound_stream_rx) = mpsc::unbounded_channel();

@@ -74,7 +74,7 @@ Then deploy workers to the private endpoint:
 
 ```bash
 cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.js
-cargo run -p cli -- --server http://127.0.0.1:18081 deploy echo examples/echo.js --public
+cargo run -p cli -- --server http://127.0.0.1:18081 deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 
 ## 4) Public worker traffic

@@ -23,9 +23,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_traits::impls::RealSys;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
@@ -898,9 +897,61 @@ struct DynamicHostRpcInvokePayload {
     args: Vec<u8>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DynamicPendingReplyPayloadInput {
-    reply_id: String,
+#[derive(Clone, Default)]
+pub struct DynamicProfile {
+    warm_isolate_hit: Arc<AtomicU64>,
+    fallback_dispatch: Arc<AtomicU64>,
+    async_reply_completion: Arc<AtomicU64>,
+    local_host_rpc_callback: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DynamicProfileSnapshot {
+    pub warm_isolate_hit: u64,
+    pub fallback_dispatch: u64,
+    pub async_reply_completion: u64,
+    pub local_host_rpc_callback: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DynamicProfileResult {
+    ok: bool,
+    snapshot: Option<DynamicProfileSnapshot>,
+    error: String,
+}
+
+impl DynamicProfile {
+    pub fn record_warm_isolate_hit(&self) {
+        self.warm_isolate_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_fallback_dispatch(&self) {
+        self.fallback_dispatch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_async_reply_completion(&self) {
+        self.async_reply_completion.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_local_host_rpc_callback(&self) {
+        self.local_host_rpc_callback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> DynamicProfileSnapshot {
+        DynamicProfileSnapshot {
+            warm_isolate_hit: self.warm_isolate_hit.load(Ordering::Relaxed),
+            fallback_dispatch: self.fallback_dispatch.load(Ordering::Relaxed),
+            async_reply_completion: self.async_reply_completion.load(Ordering::Relaxed),
+            local_host_rpc_callback: self.local_host_rpc_callback.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.warm_isolate_hit.store(0, Ordering::Relaxed);
+        self.fallback_dispatch.store(0, Ordering::Relaxed);
+        self.async_reply_completion.store(0, Ordering::Relaxed);
+        self.local_host_rpc_callback.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2305,6 +2356,23 @@ async fn op_http_prepare(
     }
 }
 
+#[deno_core::op2]
+#[serde]
+fn op_dynamic_profile_take(state: &mut OpState) -> DynamicProfileResult {
+    let profile = state.borrow::<DynamicProfile>().clone();
+    DynamicProfileResult {
+        ok: true,
+        snapshot: Some(profile.snapshot()),
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2(fast)]
+fn op_dynamic_profile_reset(state: &mut OpState) {
+    let profile = state.borrow::<DynamicProfile>().clone();
+    profile.reset();
+}
+
 fn dynamic_worker_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
@@ -2408,6 +2476,45 @@ fn actor_invoke_owner_for_request(
 
 #[deno_core::op2]
 #[serde]
+fn op_dynamic_take_reply(
+    state: &mut OpState,
+    #[serde] payload: DynamicReplyPollPayload,
+) -> DynamicPendingReplyPollResult {
+    let pending = state.borrow::<DynamicPendingReplies>().clone();
+    pending.poll(payload.reply_id.trim())
+}
+
+#[derive(Deserialize)]
+struct DynamicReplyPollPayload {
+    reply_id: String,
+}
+
+#[deno_core::op2(fast)]
+fn op_dynamic_cancel_reply(state: &mut OpState, #[string] reply_id: String) {
+    let pending = state.borrow::<DynamicPendingReplies>().clone();
+    pending.cancel(reply_id.trim());
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_dynamic_take_local_host_rpc(state: &mut OpState) -> DynamicLocalHostRpcTakeResult {
+    let queue = state.borrow::<DynamicLocalHostRpcQueue>().clone();
+    queue.take()
+}
+
+#[deno_core::op2]
+fn op_dynamic_finish_local_host_rpc(
+    state: &mut OpState,
+    #[serde] payload: DynamicLocalHostRpcFinishPayload,
+) {
+    let queue = state.borrow::<DynamicLocalHostRpcQueue>().clone();
+    queue.finish(payload);
+    let profile = state.borrow::<DynamicProfile>().clone();
+    profile.record_async_reply_completion();
+}
+
+#[deno_core::op2]
+#[serde]
 fn op_dynamic_worker_create(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: DynamicWorkerCreatePayload,
@@ -2462,12 +2569,11 @@ fn op_dynamic_worker_create(
                 timeout: payload.timeout,
                 host_rpc_bindings: payload.host_rpc_bindings,
                 reply_id: reply_id.clone(),
-                pending_replies: pending_replies.clone(),
+                pending_replies,
             },
         ))
         .is_err()
     {
-        pending_replies.cancel(&reply_id);
         return DynamicPendingReplyStartResult {
             ok: false,
             reply_id: String::new(),
@@ -2519,12 +2625,11 @@ fn op_dynamic_worker_lookup(
                 binding: payload.binding,
                 id: id.to_string(),
                 reply_id: reply_id.clone(),
-                pending_replies: pending_replies.clone(),
+                pending_replies,
             },
         ))
         .is_err()
     {
-        pending_replies.cancel(&reply_id);
         return DynamicPendingReplyStartResult {
             ok: false,
             reply_id: String::new(),
@@ -2567,12 +2672,11 @@ fn op_dynamic_worker_list(
                 owner_isolate_id,
                 binding: payload.binding,
                 reply_id: reply_id.clone(),
-                pending_replies: pending_replies.clone(),
+                pending_replies,
             },
         ))
         .is_err()
     {
-        pending_replies.cancel(&reply_id);
         return DynamicPendingReplyStartResult {
             ok: false,
             reply_id: String::new(),
@@ -2624,12 +2728,11 @@ fn op_dynamic_worker_delete(
                 binding: payload.binding,
                 id: id.to_string(),
                 reply_id: reply_id.clone(),
-                pending_replies: pending_replies.clone(),
+                pending_replies,
             },
         ))
         .is_err()
     {
-        pending_replies.cancel(&reply_id);
         return DynamicPendingReplyStartResult {
             ok: false,
             reply_id: String::new(),
@@ -2697,12 +2800,11 @@ fn op_dynamic_worker_invoke(
                 handle: payload.handle,
                 request,
                 reply_id: reply_id.clone(),
-                pending_replies: pending_replies.clone(),
+                pending_replies,
             },
         ))
         .is_err()
     {
-        pending_replies.cancel(&reply_id);
         return DynamicPendingReplyStartResult {
             ok: false,
             reply_id: String::new(),
@@ -2741,7 +2843,6 @@ fn op_dynamic_host_rpc_invoke(
                 };
             }
         };
-
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
     let reply_id = pending_replies.allocate();
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
@@ -2756,12 +2857,11 @@ fn op_dynamic_host_rpc_invoke(
                 method_name: method_name.to_string(),
                 args: payload.args,
                 reply_id: reply_id.clone(),
-                pending_replies: pending_replies.clone(),
+                pending_replies,
             },
         ))
         .is_err()
     {
-        pending_replies.cancel(&reply_id);
         return DynamicPendingReplyStartResult {
             ok: false,
             reply_id: String::new(),
@@ -2773,39 +2873,6 @@ fn op_dynamic_host_rpc_invoke(
         reply_id,
         error: String::new(),
     }
-}
-
-#[deno_core::op2]
-#[serde]
-fn op_dynamic_take_reply(
-    state: &mut OpState,
-    #[serde] payload: DynamicPendingReplyPayloadInput,
-) -> DynamicPendingReplyPollResult {
-    state
-        .borrow::<DynamicPendingReplies>()
-        .poll(payload.reply_id.trim())
-}
-
-#[deno_core::op2(fast)]
-fn op_dynamic_cancel_reply(state: &mut OpState, #[string] reply_id: String) {
-    state
-        .borrow::<DynamicPendingReplies>()
-        .cancel(reply_id.trim());
-}
-
-#[deno_core::op2]
-#[serde]
-fn op_dynamic_take_local_host_rpc(state: &mut OpState) -> DynamicLocalHostRpcTakeResult {
-    state.borrow::<DynamicLocalHostRpcQueue>().take()
-}
-
-#[deno_core::op2]
-#[serde]
-fn op_dynamic_finish_local_host_rpc(
-    state: &mut OpState,
-    #[serde] payload: DynamicLocalHostRpcFinishPayload,
-) {
-    state.borrow::<DynamicLocalHostRpcQueue>().finish(payload);
 }
 
 #[deno_core::op2]
@@ -4573,17 +4640,19 @@ deno_core::extension!(
         op_cache_match,
         op_cache_put,
         op_cache_delete,
+        op_dynamic_profile_take,
+        op_dynamic_profile_reset,
         op_http_prepare,
+        op_dynamic_take_reply,
+        op_dynamic_cancel_reply,
+        op_dynamic_take_local_host_rpc,
+        op_dynamic_finish_local_host_rpc,
         op_dynamic_worker_create,
         op_dynamic_worker_lookup,
         op_dynamic_worker_list,
         op_dynamic_worker_delete,
         op_dynamic_worker_invoke,
         op_dynamic_host_rpc_invoke,
-        op_dynamic_take_reply,
-        op_dynamic_cancel_reply,
-        op_dynamic_take_local_host_rpc,
-        op_dynamic_finish_local_host_rpc,
         op_request_body_read,
         op_request_body_cancel,
         op_actor_invoke_method,

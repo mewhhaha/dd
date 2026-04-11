@@ -15,11 +15,10 @@ use deno_fetch::Options as DenoFetchOptions;
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use serde::Serialize;
 use std::borrow::Cow;
-use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 
 include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 
@@ -244,9 +243,8 @@ pub fn abort_worker_request(runtime: &mut JsRuntime, request_id: &str) -> Result
     Ok(())
 }
 
-pub fn pump_event_loop_once(runtime: &mut JsRuntime) -> Result<()> {
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
+pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()> {
+    let mut cx = Context::from_waker(waker);
     match runtime.poll_event_loop(&mut cx, PollEventLoopOptions::default()) {
         Poll::Ready(Ok(())) | Poll::Pending => Ok(()),
         Poll::Ready(Err(error)) => Err(runtime_error(error)),
@@ -461,27 +459,6 @@ async fn evaluate_snapshot_module(
 fn runtime_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(error.to_string())
 }
-
-fn noop_waker() -> Waker {
-    unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)) }
-}
-
-const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    noop_waker_clone,
-    noop_waker_wake,
-    noop_waker_wake_by_ref,
-    noop_waker_drop,
-);
-
-unsafe fn noop_waker_clone(_: *const ()) -> RawWaker {
-    RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)
-}
-
-unsafe fn noop_waker_wake(_: *const ()) {}
-
-unsafe fn noop_waker_wake_by_ref(_: *const ()) {}
-
-unsafe fn noop_waker_drop(_: *const ()) {}
 
 #[cfg(test)]
 mod tests {

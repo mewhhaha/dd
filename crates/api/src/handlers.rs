@@ -237,7 +237,7 @@ where
         &state.public_base_domain,
     )?;
     ensure_public_worker(&state, &worker_name).await?;
-    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    let url = build_public_request_url(&parts.headers, &parts.uri)?;
     let request = Request::from_parts(parts, body);
     if ws_upgrade.is_some() {
         return invoke_worker_websocket_public(state, request, ws_upgrade).await;
@@ -258,7 +258,7 @@ pub async fn invoke_worker_public_h3(
         &state.public_base_domain,
     )?;
     ensure_public_worker(&state, &worker_name).await?;
-    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    let url = build_public_request_url(&parts.headers, &parts.uri)?;
     invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url).await
 }
 
@@ -464,7 +464,7 @@ where
         &state.public_base_domain,
     )?;
     ensure_public_worker(&state, &worker_name).await?;
-    let url = build_worker_url(parts.uri.path(), parts.uri.path_and_query());
+    let url = build_public_request_url(&parts.headers, &parts.uri)?;
     invoke_worker_websocket_with_target(state, parts, body, worker_name, url, ws_upgrade).await
 }
 
@@ -1033,20 +1033,56 @@ fn parse_invoke_request_uri(
     Ok((worker_name.to_string(), url))
 }
 
-pub(crate) fn build_worker_url(
-    path: &str,
-    path_and_query: Option<&http::uri::PathAndQuery>,
-) -> String {
-    let normalized_path = if path.is_empty() { "/" } else { path };
-    let query_suffix = match path_and_query {
-        Some(path_and_query) => path_and_query
-            .as_str()
-            .split_once('?')
-            .map(|(_, query)| format!("?{query}"))
-            .unwrap_or_default(),
-        None => String::new(),
+pub(crate) fn build_public_request_url(
+    headers: &HeaderMap,
+    uri: &http::Uri,
+) -> Result<String, PlatformError> {
+    let normalized_path = if uri.path().is_empty() {
+        "/"
+    } else {
+        uri.path()
     };
-    format!("http://worker{}{}", normalized_path, query_suffix)
+    let query_suffix = uri
+        .path_and_query()
+        .and_then(|path_and_query| path_and_query.as_str().split_once('?'))
+        .map(|(_, query)| format!("?{query}"))
+        .unwrap_or_default();
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| uri.authority().map(|authority| authority.as_str()))
+        .ok_or_else(|| PlatformError::bad_request("public request is missing a host"))?;
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| uri.scheme_str())
+        .map(normalize_public_request_scheme)
+        .unwrap_or("https");
+    Ok(format!("{scheme}://{host}{normalized_path}{query_suffix}"))
+}
+
+fn normalize_public_request_scheme(value: &str) -> &'static str {
+    match value
+        .trim()
+        .trim_end_matches(':')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        _ => "https",
+    }
 }
 
 fn worker_asset_path(url: &str) -> Result<String, PlatformError> {
@@ -1599,9 +1635,9 @@ pub struct PreparedWebSocketUpgrade {
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_worker, handle_private_request, handle_public_request, invoke_worker_private,
-        invoke_worker_public, parse_invoke_request_uri, parse_worker_from_host,
-        validate_deploy_bindings, validate_internal_config,
+        build_public_request_url, deploy_worker, handle_private_request, handle_public_request,
+        invoke_worker_private, invoke_worker_public, parse_invoke_request_uri,
+        parse_worker_from_host, validate_deploy_bindings, validate_internal_config,
     };
     use crate::state::AppState;
     use bytes::Bytes;
@@ -1659,6 +1695,33 @@ mod tests {
         let (worker, url) = parse_invoke_request_uri(uri.path(), uri.path_and_query()).expect("ok");
         assert_eq!(worker, "hello");
         assert_eq!(url, "http://worker/");
+    }
+
+    #[test]
+    fn build_public_request_url_prefers_forwarded_host_and_proto() {
+        let uri: http::Uri = "/rooms/test?x=1".parse().expect("uri");
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "chat.example.com")
+            .header("x-forwarded-host", "chat.wdyt.chat")
+            .header("x-forwarded-proto", "https")
+            .body(())
+            .expect("request");
+        let url = build_public_request_url(request.headers(), request.uri()).expect("url");
+        assert_eq!(url, "https://chat.wdyt.chat/rooms/test?x=1");
+    }
+
+    #[test]
+    fn build_public_request_url_normalizes_websocket_forwarded_proto() {
+        let uri: http::Uri = "/ws".parse().expect("uri");
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", "chat.example.com")
+            .header("x-forwarded-proto", "wss")
+            .body(())
+            .expect("request");
+        let url = build_public_request_url(request.headers(), request.uri()).expect("url");
+        assert_eq!(url, "https://chat.example.com/ws");
     }
 
     #[test]
@@ -1867,6 +1930,45 @@ mod tests {
             .expect("body")
             .to_bytes();
         assert_eq!(body.as_ref(), b"host-ok");
+    }
+
+    #[tokio::test]
+    #[ignore = "starts full runtime service; run manually in isolation"]
+    async fn public_host_invoke_passes_honest_request_url() {
+        let state = create_test_state("example.com").await;
+        state
+            .runtime
+            .deploy_with_config(
+                "echo".to_string(),
+                "export default { async fetch(request) { return new Response(request.url); } }"
+                    .to_string(),
+                DeployConfig {
+                    public: true,
+                    bindings: vec![],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("deploy");
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/rooms/test?x=1")
+            .header("host", "echo.example.com")
+            .header("x-forwarded-host", "echo.wdyt.chat")
+            .header("x-forwarded-proto", "https")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let response = invoke_worker_public(state, request, None)
+            .await
+            .expect("invoke");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"https://echo.wdyt.chat/rooms/test?x=1");
     }
 
     #[tokio::test]

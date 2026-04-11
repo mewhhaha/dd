@@ -25,12 +25,14 @@ use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Once};
+use std::task::{Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
@@ -212,6 +214,8 @@ pub struct HostRpcProviderDebug {
 pub struct DynamicRuntimeDebugDump {
     pub handles: Vec<DynamicHandleDebug>,
     pub providers: Vec<HostRpcProviderDebug>,
+    pub snapshot_cache_entries: usize,
+    pub snapshot_cache_failures: usize,
 }
 
 #[derive(Debug)]
@@ -393,6 +397,10 @@ struct WorkerManager {
     dynamic_worker_handles: HashMap<String, DynamicWorkerHandle>,
     dynamic_worker_ids: HashMap<DynamicWorkerIdKey, HashMap<String, String>>,
     host_rpc_providers: HashMap<String, HostRpcProvider>,
+    dynamic_profile: crate::ops::DynamicProfile,
+    validated_worker_sources: HashSet<[u8; 32]>,
+    dynamic_worker_snapshots: HashMap<[u8; 32], &'static [u8]>,
+    dynamic_worker_snapshot_failures: HashSet<[u8; 32]>,
     runtime_batch_depth: usize,
     pending_dispatches: HashSet<(String, u64)>,
     pending_cleanup_workers: HashSet<String>,
@@ -413,7 +421,9 @@ struct DynamicWorkerHandle {
     owner_generation: u64,
     binding: String,
     worker_name: String,
+    worker_generation: u64,
     timeout: u64,
+    preferred_isolate_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -433,6 +443,11 @@ struct DynamicTimeoutDiagnostic {
     binding: String,
     handle: String,
     target_worker: String,
+    target_isolate_id: Option<u64>,
+    target_generation: Option<u64>,
+    provider_id: Option<String>,
+    provider_owner_isolate_id: Option<u64>,
+    provider_target_id: Option<String>,
     timeout_ms: u64,
 }
 
@@ -563,6 +578,7 @@ struct PendingInvoke {
 #[derive(Clone)]
 enum PendingReplyKind {
     Normal,
+    DynamicInvoke { handle: String },
     WebsocketOpen { session_id: String },
     WebsocketFrame { session_id: String },
     TransportOpen { session_id: String },
@@ -578,6 +594,7 @@ impl PendingReplyKind {
     fn label(&self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::DynamicInvoke { .. } => "dynamic-invoke",
             Self::WebsocketOpen { .. } => "websocket-open",
             Self::WebsocketFrame { .. } => "websocket-frame",
             Self::TransportOpen { .. } => "transport-open",
@@ -665,7 +682,23 @@ enum IsolateCommand {
     Abort {
         runtime_request_id: String,
     },
+    DynamicHostRpcNudge,
+    PollEventLoop,
     Shutdown,
+}
+
+struct IsolateEventLoopWaker {
+    sender: std_mpsc::Sender<IsolateCommand>,
+}
+
+impl Wake for IsolateEventLoopWaker {
+    fn wake(self: Arc<Self>) {
+        let _ = self.sender.send(IsolateCommand::PollEventLoop);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.sender.send(IsolateCommand::PollEventLoop);
+    }
 }
 
 #[derive(Clone)]
@@ -1675,6 +1708,10 @@ impl WorkerManager {
             dynamic_worker_handles: HashMap::new(),
             dynamic_worker_ids: HashMap::new(),
             host_rpc_providers: HashMap::new(),
+            dynamic_profile: crate::ops::DynamicProfile::default(),
+            validated_worker_sources: HashSet::new(),
+            dynamic_worker_snapshots: HashMap::new(),
+            dynamic_worker_snapshot_failures: HashSet::new(),
             runtime_batch_depth: 0,
             pending_dispatches: HashSet::new(),
             pending_cleanup_workers: HashSet::new(),
@@ -3198,6 +3235,7 @@ impl WorkerManager {
             .cloned()
         {
             if let Some(entry) = self.dynamic_worker_handles.get(&handle) {
+                self.dynamic_profile.record_async_reply_completion();
                 pending_replies.finish(
                     reply_id,
                     crate::ops::DynamicPendingReplyPayload::Create(Ok(
@@ -3279,6 +3317,11 @@ impl WorkerManager {
         let result = result.map(|deployed| {
             let handle = format!("dynh-{}", Uuid::new_v4().simple());
             let worker_name = deployed.worker;
+            let worker_generation = self
+                .workers
+                .get(&worker_name)
+                .map(|entry| entry.current_generation)
+                .unwrap_or_default();
             self.dynamic_worker_handles.insert(
                 handle.clone(),
                 DynamicWorkerHandle {
@@ -3286,7 +3329,9 @@ impl WorkerManager {
                     owner_generation,
                     binding,
                     worker_name: worker_name.clone(),
+                    worker_generation,
                     timeout,
+                    preferred_isolate_id: None,
                 },
             );
             self.dynamic_worker_ids
@@ -3304,6 +3349,7 @@ impl WorkerManager {
                 self.host_rpc_providers.remove(&provider_id);
             }
         }
+        self.dynamic_profile.record_async_reply_completion();
         pending_replies.finish(
             reply_id,
             crate::ops::DynamicPendingReplyPayload::Create(result),
@@ -3341,6 +3387,7 @@ impl WorkerManager {
             .and_then(|by_id| by_id.get(&id))
             .cloned();
         let Some(handle) = handle else {
+            self.dynamic_profile.record_async_reply_completion();
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Lookup(Ok(None)),
@@ -3351,12 +3398,14 @@ impl WorkerManager {
             if let Some(by_id) = self.dynamic_worker_ids.get_mut(&key) {
                 by_id.remove(&id);
             }
+            self.dynamic_profile.record_async_reply_completion();
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Lookup(Ok(None)),
             );
             return;
         };
+        self.dynamic_profile.record_async_reply_completion();
         pending_replies.finish(
             reply_id,
             crate::ops::DynamicPendingReplyPayload::Lookup(Ok(Some(
@@ -3389,6 +3438,7 @@ impl WorkerManager {
             .map(|by_id| by_id.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         ids.sort();
+        self.dynamic_profile.record_async_reply_completion();
         pending_replies.finish(
             reply_id,
             crate::ops::DynamicPendingReplyPayload::List(Ok(ids)),
@@ -3433,6 +3483,7 @@ impl WorkerManager {
             self.dynamic_worker_ids.remove(&key);
         }
         let Some(handle) = handle else {
+            self.dynamic_profile.record_async_reply_completion();
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Delete(Ok(false)),
@@ -3440,6 +3491,7 @@ impl WorkerManager {
             return;
         };
         let Some(entry) = self.dynamic_worker_handles.remove(&handle) else {
+            self.dynamic_profile.record_async_reply_completion();
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Delete(Ok(false)),
@@ -3447,6 +3499,7 @@ impl WorkerManager {
             return;
         };
         self.retire_worker_completely(&entry.worker_name);
+        self.dynamic_profile.record_async_reply_completion();
         pending_replies.finish(
             reply_id,
             crate::ops::DynamicPendingReplyPayload::Delete(Ok(true)),
@@ -3468,7 +3521,7 @@ impl WorkerManager {
             reply_id,
             pending_replies,
         } = payload;
-        let Some(handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
+        let Some(mut handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::not_found(
@@ -3505,8 +3558,34 @@ impl WorkerManager {
             return;
         }
 
-        let runtime_request_id = Uuid::new_v4().to_string();
-        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
+        let target_generation = Some(handle_entry.worker_generation);
+        let mut target_isolate_id = handle_entry.preferred_isolate_id;
+        if let Some(preferred_id) = target_isolate_id {
+            let preferred_alive = self
+                .workers
+                .get(&handle_entry.worker_name)
+                .and_then(|entry| entry.pools.get(&handle_entry.worker_generation))
+                .map(|pool| {
+                    pool.isolates
+                        .iter()
+                        .any(|isolate| isolate.id == preferred_id)
+                })
+                .unwrap_or(false);
+            if preferred_alive {
+                self.dynamic_profile.record_warm_isolate_hit();
+            } else {
+                target_isolate_id = None;
+                handle_entry.preferred_isolate_id = None;
+                if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
+                    entry.preferred_isolate_id = None;
+                }
+                self.dynamic_profile.record_fallback_dispatch();
+            }
+        } else {
+            self.dynamic_profile.record_fallback_dispatch();
+        }
+
+        let runtime_request_id = next_runtime_token("dyn");
         let timeout = handle_entry.timeout;
         let timeout_diagnostic = DynamicTimeoutDiagnostic {
             stage: "invoke-reply",
@@ -3515,8 +3594,14 @@ impl WorkerManager {
             binding: binding.clone(),
             handle: handle.clone(),
             target_worker: handle_entry.worker_name.clone(),
+            target_isolate_id,
+            target_generation,
+            provider_id: None,
+            provider_owner_isolate_id: None,
+            provider_target_id: None,
             timeout_ms: timeout,
         };
+        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
         self.enqueue_invoke(
             handle_entry.worker_name,
             runtime_request_id,
@@ -3525,14 +3610,17 @@ impl WorkerManager {
             None,
             None,
             None,
-            None,
-            None,
+            target_isolate_id,
+            target_generation,
             true,
             inner_reply_tx,
-            PendingReplyKind::Normal,
+            PendingReplyKind::DynamicInvoke {
+                handle: handle.clone(),
+            },
             event_tx,
         );
         let event_tx = event_tx.clone();
+        let profile = self.dynamic_profile.clone();
         tokio::spawn(async move {
             let result =
                 match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
@@ -3548,6 +3636,7 @@ impl WorkerManager {
                         )))
                     }
                 };
+            profile.record_async_reply_completion();
             pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(result),
@@ -3639,14 +3728,18 @@ impl WorkerManager {
             );
             return;
         }
-
-        let Some(queue) = self
+        let Some((queue, sender)) = self
             .get_pool_mut(&provider.owner_worker, provider.owner_generation)
             .and_then(|pool| {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == provider.owner_isolate_id)
-                    .map(|isolate| isolate.dynamic_host_rpc_queue.clone())
+                    .map(|isolate| {
+                        (
+                            isolate.dynamic_host_rpc_queue.clone(),
+                            isolate.sender.clone(),
+                        )
+                    })
             })
         else {
             pending_replies.finish(
@@ -3664,6 +3757,47 @@ impl WorkerManager {
             reply_id,
             pending_replies,
         );
+        let _ = sender.send(IsolateCommand::DynamicHostRpcNudge);
+        self.dynamic_profile.record_local_host_rpc_callback();
+    }
+
+    async fn validate_worker_cached(&mut self, source: &str) -> Result<()> {
+        let source_hash = Sha256::digest(source.as_bytes()).into();
+        if self.validated_worker_sources.contains(&source_hash) {
+            return Ok(());
+        }
+        validate_worker(self.bootstrap_snapshot, source).await?;
+        self.validated_worker_sources.insert(source_hash);
+        Ok(())
+    }
+
+    async fn dynamic_worker_snapshot_cached(&mut self, source: &str) -> Option<&'static [u8]> {
+        let source_hash: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        if let Some(snapshot) = self.dynamic_worker_snapshots.get(&source_hash).copied() {
+            return Some(snapshot);
+        }
+        if self.dynamic_worker_snapshot_failures.contains(&source_hash) {
+            return None;
+        }
+
+        match build_worker_snapshot(self.bootstrap_snapshot, source).await {
+            Ok(snapshot) => match validate_loaded_worker_runtime(snapshot) {
+                Ok(()) => {
+                    self.dynamic_worker_snapshots.insert(source_hash, snapshot);
+                    Some(snapshot)
+                }
+                Err(error) => {
+                    self.dynamic_worker_snapshot_failures.insert(source_hash);
+                    warn!(error = %error, "dynamic worker snapshot validation failed; falling back to bootstrap snapshot");
+                    None
+                }
+            },
+            Err(error) => {
+                self.dynamic_worker_snapshot_failures.insert(source_hash);
+                warn!(error = %error, "dynamic worker snapshot build failed; falling back to bootstrap snapshot");
+                None
+            }
+        }
     }
 
     async fn deploy(
@@ -3681,7 +3815,7 @@ impl WorkerManager {
         }
         let bindings = extract_bindings(&config)?;
         let compiled_assets = compile_asset_bundle(&assets, asset_headers.as_deref())?;
-        validate_worker(self.bootstrap_snapshot, &source).await?;
+        self.validate_worker_cached(&source).await?;
         let has_dynamic_bindings = !bindings.dynamic.is_empty();
         let (snapshot, snapshot_preloaded) = if has_dynamic_bindings {
             (self.bootstrap_snapshot, false)
@@ -3766,7 +3900,7 @@ impl WorkerManager {
                 secret_replacements: Vec::new(),
                 egress_allow_hosts: Vec::new(),
                 assets: compiled_assets,
-                strict_request_isolation: has_dynamic_bindings,
+                strict_request_isolation: false,
                 queue: VecDeque::new(),
                 isolates: Vec::new(),
                 actor_owners: HashMap::new(),
@@ -3812,7 +3946,7 @@ impl WorkerManager {
         let dynamic_config =
             build_dynamic_worker_config(env, egress_allow_hosts, dynamic_rpc_bindings)?;
         if validate_source {
-            validate_worker(self.bootstrap_snapshot, &source).await?;
+            self.validate_worker_cached(&source).await?;
         }
         let generation = self.next_generation;
         self.next_generation += 1;
@@ -3822,6 +3956,11 @@ impl WorkerManager {
             .iter()
             .map(|binding| binding.binding.clone())
             .collect::<Vec<_>>();
+        let (snapshot, snapshot_preloaded) =
+            match self.dynamic_worker_snapshot_cached(&source).await {
+                Some(snapshot) => (snapshot, true),
+                None => (self.bootstrap_snapshot, false),
+            };
         let kv_read_cache_config_json = Arc::<str>::from(
             crate::json::to_string(&KvReadCacheConfigPayload {
                 max_entries: self.config.kv_read_cache_max_entries,
@@ -3842,8 +3981,8 @@ impl WorkerManager {
             deployment_id: deployment_id.clone(),
             internal_trace: None,
             is_public: false,
-            snapshot: self.bootstrap_snapshot,
-            snapshot_preloaded: false,
+            snapshot,
+            snapshot_preloaded,
             source: Arc::<str>::from(source),
             kv_bindings_json: Arc::<str>::from(
                 crate::json::to_string(&Vec::<String>::new())
@@ -3872,7 +4011,7 @@ impl WorkerManager {
             secret_replacements: dynamic_config.secret_replacements.clone(),
             egress_allow_hosts: dynamic_config.egress_allow_hosts.clone(),
             assets: AssetBundle::default(),
-            strict_request_isolation: true,
+            strict_request_isolation: false,
             queue: VecDeque::new(),
             isolates: Vec::new(),
             actor_owners: HashMap::new(),
@@ -4481,6 +4620,7 @@ impl WorkerManager {
         let kv_store = self.kv_store.clone();
         let actor_store = self.actor_store.clone();
         let cache_store = self.cache_store.clone();
+        let dynamic_profile = self.dynamic_profile.clone();
         let isolate = spawn_isolate_thread(
             snapshot,
             snapshot_preloaded,
@@ -4488,6 +4628,7 @@ impl WorkerManager {
             kv_store,
             actor_store,
             cache_store,
+            dynamic_profile,
             worker_name.to_string(),
             generation,
             isolate_id,
@@ -4631,6 +4772,22 @@ impl WorkerManager {
         if !canceled {
             match pending_kind {
                 PendingReplyKind::Normal => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                }
+                PendingReplyKind::DynamicInvoke { handle } => {
+                    if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
+                        match &result {
+                            Ok(_) => {
+                                entry.preferred_isolate_id = Some(isolate_id);
+                            }
+                            Err(_) if entry.preferred_isolate_id == Some(isolate_id) => {
+                                entry.preferred_isolate_id = None;
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     if let Some(reply) = reply {
                         let _ = reply.send(result);
                     }
@@ -5160,7 +5317,9 @@ impl WorkerManager {
                         PendingReplyKind::TransportOpen { session_id } => {
                             transport_open_session_ids.push(session_id.clone());
                         }
-                        PendingReplyKind::Normal | PendingReplyKind::WebsocketFrame { .. } => {}
+                        PendingReplyKind::Normal
+                        | PendingReplyKind::DynamicInvoke { .. }
+                        | PendingReplyKind::WebsocketFrame { .. } => {}
                     }
                     replies.push((request_id, pending.reply));
                 }
@@ -5395,7 +5554,12 @@ impl WorkerManager {
             .collect::<Vec<_>>();
         providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
 
-        DynamicRuntimeDebugDump { handles, providers }
+        DynamicRuntimeDebugDump {
+            handles,
+            providers,
+            snapshot_cache_entries: self.dynamic_worker_snapshots.len(),
+            snapshot_cache_failures: self.dynamic_worker_snapshot_failures.len(),
+        }
     }
 
     fn log_dynamic_timeout_diagnostic(&self, diagnostic: DynamicTimeoutDiagnostic) {
@@ -5439,6 +5603,11 @@ impl WorkerManager {
             binding = %diagnostic.binding,
             handle = %diagnostic.handle,
             target_worker = %diagnostic.target_worker,
+            target_isolate_id = diagnostic.target_isolate_id,
+            target_generation = diagnostic.target_generation,
+            provider_id = ?diagnostic.provider_id,
+            provider_owner_isolate_id = diagnostic.provider_owner_isolate_id,
+            provider_target_id = ?diagnostic.provider_target_id,
             timeout_ms = diagnostic.timeout_ms,
             handle_summary = ?handle_summary,
             host_rpc_providers = ?provider_summaries,
@@ -6335,6 +6504,7 @@ fn spawn_isolate_thread(
     kv_store: KvStore,
     actor_store: ActorStore,
     cache_store: CacheStore,
+    dynamic_profile: crate::ops::DynamicProfile,
     worker_name: String,
     generation: u64,
     isolate_id: u64,
@@ -6344,6 +6514,9 @@ fn spawn_isolate_thread(
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
     let dynamic_host_rpc_queue = crate::ops::DynamicLocalHostRpcQueue::default();
     let dynamic_host_rpc_queue_for_thread = dynamic_host_rpc_queue.clone();
+    let event_loop_waker = Waker::from(Arc::new(IsolateEventLoopWaker {
+        sender: command_tx.clone(),
+    }));
     let thread_name = format!("dd-isolate-{worker_name}-{generation}-{isolate_id}");
 
     thread::Builder::new()
@@ -6380,6 +6553,7 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::RequestSecretContexts::default());
                     op_state.put(crate::ops::DynamicPendingReplies::default());
                     op_state.put(dynamic_host_rpc_queue_for_thread.clone());
+                    op_state.put(dynamic_profile.clone());
                 }
                 {
                     let event_tx = event_tx.clone();
@@ -6440,7 +6614,7 @@ fn spawn_isolate_thread(
                         }
                     }
 
-                    if let Err(error) = pump_event_loop_once(&mut js_runtime) {
+                    if let Err(error) = pump_event_loop_once(&mut js_runtime, &event_loop_waker) {
                         let _ = event_tx.send(RuntimeEvent::IsolateFailed {
                             worker_name: worker_name.clone(),
                             generation,
@@ -6723,6 +6897,16 @@ fn handle_isolate_command(
             abort_worker_request(js_runtime, &runtime_request_id)?;
             Ok(true)
         }
+        IsolateCommand::DynamicHostRpcNudge => {
+            js_runtime
+                .execute_script(
+                    "<dd:dynamic-host-rpc-nudge>",
+                    "void Promise.resolve(globalThis.__dd_drain_dynamic_host_rpc_queue?.()).catch(() => undefined);",
+                )
+                .map_err(|error| PlatformError::internal(error.to_string()))?;
+            Ok(true)
+        }
+        IsolateCommand::PollEventLoop => Ok(true),
         IsolateCommand::Shutdown => Ok(false),
     }
 }
@@ -7284,6 +7468,21 @@ export default {
         .to_string()
     }
 
+    fn dynamic_plain_handle_cache_worker() -> String {
+        r#"
+export default {
+  async fetch(_request, env) {
+    const child = await env.SANDBOX.get("plain:v1", async () => ({
+      source: "let count = 0; export default { async fetch() { count += 1; return new Response(String(count)); } };",
+      timeout: 1_500,
+    }));
+    return child.fetch("http://worker/");
+  },
+};
+"#
+        .to_string()
+    }
+
     fn dynamic_namespace_ops_worker() -> String {
         r#"
 function childConfig() {
@@ -7358,6 +7557,30 @@ export default {
         .to_string()
     }
 
+    fn dynamic_snapshot_cache_worker() -> String {
+        r#"
+function childConfig() {
+  return {
+    entrypoint: "worker.js",
+    modules: {
+      "worker.js": "export default { async fetch() { return new Response('ok'); } };",
+    },
+    timeout: 1_500,
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = url.searchParams.get("id") ?? "one";
+    const child = await env.SANDBOX.get(`snap:${id}`, async () => childConfig());
+    return child.fetch("http://worker/");
+  },
+};
+"#
+        .to_string()
+    }
+
     fn dynamic_namespace_admin_worker() -> String {
         r#"
 let slow = null;
@@ -7405,6 +7628,38 @@ export default {
       } catch (error) {
         return new Response(String(error || "timeout"), { status: 504 });
       }
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_handle_cache_delete_worker() -> String {
+        r#"
+function workerSource(value) {
+  return `export default { async fetch() { return new Response(${JSON.stringify(value)}); } };`;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/delete-recreate") {
+      const first = await env.SANDBOX.get("cache:v1", async () => ({
+        source: workerSource("one"),
+        timeout: 1_500,
+      }));
+      const firstBody = await (await first.fetch("http://worker/")).text();
+      await env.SANDBOX.delete("cache:v1");
+      const second = await env.SANDBOX.get("cache:v1", async () => ({
+        source: workerSource("two"),
+        timeout: 1_500,
+      }));
+      const secondBody = await (await second.fetch("http://worker/")).text();
+      return new Response(`${firstBody}:${secondBody}`);
     }
 
     return new Response("not found", { status: 404 });
@@ -8910,6 +9165,18 @@ export default {
         }
     }
 
+    fn dynamic_bench_autoscaling_config() -> RuntimeConfig {
+        RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 8,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        }
+    }
+
     async fn invoke_with_timeout_and_dump(
         service: &RuntimeService,
         worker_name: &str,
@@ -10303,6 +10570,49 @@ https://:sub.example.com/a.js
 
     #[tokio::test]
     #[serial]
+    async fn dynamic_namespace_concurrent_hot_fetch_completes_in_single_isolate() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-plain-concurrent".to_string(),
+                dynamic_plain_handle_cache_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let mut tasks = Vec::new();
+        for idx in 0..32 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                invoke_with_timeout_and_dump(
+                    &service,
+                    "dynamic-plain-concurrent",
+                    test_invocation_with_path("/", &format!("dynamic-plain-concurrent-{idx}")),
+                    &format!("dynamic plain concurrent single-isolate {idx}"),
+                )
+                .await
+            }));
+        }
+
+        let mut bodies = Vec::new();
+        for task in tasks {
+            let output = task.await.expect("task should join");
+            assert_eq!(output.status, 200);
+            bodies.push(String::from_utf8(output.body).expect("utf8"));
+        }
+
+        assert_eq!(bodies.len(), 32);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn dynamic_namespace_plain_child_fetch_completes_in_autoscaling_config() {
         let service = test_service(dynamic_autoscaling_config()).await;
 
@@ -10541,6 +10851,83 @@ https://:sub.example.com/a.js
 
     #[tokio::test]
     #[serial]
+    async fn dynamic_handle_cache_invalidates_on_delete_before_recreate() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-cache-delete".to_string(),
+                dynamic_handle_cache_delete_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-cache-delete",
+            test_invocation_with_path("/delete-recreate", "dynamic-cache-delete-recreate"),
+            "dynamic delete should invalidate handle cache",
+        )
+        .await;
+
+        assert_eq!(output.status, 200);
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "one:two");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_snapshot_cache_reuses_snapshot_for_same_source() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-snapshot-cache".to_string(),
+                dynamic_snapshot_cache_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let first = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-snapshot-cache",
+            test_invocation_with_path("/?id=one", "dynamic-snapshot-cache-one"),
+            "dynamic snapshot cache first create",
+        )
+        .await;
+        assert_eq!(first.status, 200);
+
+        let after_first = service.dynamic_debug_dump().await;
+        assert_eq!(after_first.snapshot_cache_entries, 1);
+        assert_eq!(after_first.snapshot_cache_failures, 0);
+
+        let second = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-snapshot-cache",
+            test_invocation_with_path("/?id=two", "dynamic-snapshot-cache-two"),
+            "dynamic snapshot cache second create",
+        )
+        .await;
+        assert_eq!(second.status, 200);
+
+        let after_second = service.dynamic_debug_dump().await;
+        assert_eq!(after_second.snapshot_cache_entries, 1);
+        assert_eq!(after_second.snapshot_cache_failures, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn dynamic_namespace_child_can_return_json_response() {
         let service = test_service(dynamic_autoscaling_config()).await;
 
@@ -10624,6 +11011,59 @@ export default {
         .await;
 
         assert_eq!(String::from_utf8(output.body).expect("utf8"), "1:1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_namespace_host_rpc_completes_under_bench_like_autoscaling_load() {
+        let service = test_service(dynamic_bench_autoscaling_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-parent-autoscaling-host-rpc".to_string(),
+                dynamic_namespace_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let warm = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-parent-autoscaling-host-rpc",
+            test_invocation_with_path("/", "dynamic-host-rpc-autoscaling-warm"),
+            "dynamic host rpc autoscaling warm",
+        )
+        .await;
+        assert_eq!(warm.status, 200);
+
+        let mut tasks = Vec::new();
+        for idx in 0..32 {
+            let service = service.clone();
+            tasks.push(tokio::spawn(async move {
+                invoke_with_timeout_and_dump(
+                    &service,
+                    "dynamic-parent-autoscaling-host-rpc",
+                    test_invocation_with_path("/", &format!("dynamic-host-rpc-autoscaling-{idx}")),
+                    &format!("dynamic host rpc autoscaling request {idx}"),
+                )
+                .await
+            }));
+        }
+
+        let mut bodies = Vec::new();
+        for task in tasks {
+            let output = task.await.expect("task should join");
+            assert_eq!(output.status, 200);
+            bodies.push(String::from_utf8(output.body).expect("utf8"));
+        }
+
+        assert_eq!(bodies.len(), 32);
+        assert!(bodies.iter().all(|body| body.contains(':')));
     }
 
     #[tokio::test]

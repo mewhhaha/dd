@@ -3591,6 +3591,51 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   };
 
+  const getDynamicCacheState = () => {
+    const shared = getSharedEnv();
+    return {
+      handleCache: shared.__dd_dynamic_handle_cache,
+      sourceCache: shared.__dd_dynamic_source_cache,
+      metrics: shared.__dd_dynamic_metrics,
+    };
+  };
+
+  const recordDynamicMetric = (name, count = 1) => {
+    const metrics = getDynamicCacheState().metrics;
+    metrics[name] = Number(metrics[name] ?? 0) + Number(count ?? 0);
+  };
+
+  const dynamicHandleCacheKey = (bindingName, instanceId) => (
+    `${workerName}\u001f${bindingName}\u001f${instanceId}`
+  );
+
+  const getDynamicHandleCacheEntry = (bindingName, instanceId) => (
+    getDynamicCacheState().handleCache.get(dynamicHandleCacheKey(bindingName, instanceId)) ?? null
+  );
+
+  const setDynamicHandleCacheEntry = (bindingName, instanceId, entry) => {
+    getDynamicCacheState().handleCache.set(
+      dynamicHandleCacheKey(bindingName, instanceId),
+      Object.freeze({
+        handle: String(entry.handle ?? ""),
+        worker: String(entry.worker ?? ""),
+        timeout: normalizeDynamicTimeout(entry.timeout),
+      }),
+    );
+  };
+
+  const deleteDynamicHandleCacheEntry = (bindingName, instanceId) => {
+    getDynamicCacheState().handleCache.delete(dynamicHandleCacheKey(bindingName, instanceId));
+  };
+
+  const dynamicHandleErrorIsStale = (result) => {
+    const error = String(result?.error ?? "");
+    return error.includes("dynamic worker handle not found")
+      || error.includes("dynamic worker handle owner mismatch")
+      || error.includes("dynamic worker handle generation mismatch")
+      || error.includes("dynamic worker binding mismatch");
+  };
+
   const normalizeDynamicInstanceId = (value) => {
     const normalized = String(value ?? "").trim();
     if (!normalized) {
@@ -3768,6 +3813,21 @@ globalThis.__dd_execute_worker = (payload) => {
     return `${entrySource}\n`;
   };
 
+  const dynamicSourceCacheKey = (entrypointInput, modulesInput) => {
+    const entrypoint = normalizeModulePath(entrypointInput || "worker.js");
+    if (!isPlainObject(modulesInput)) {
+      throw new Error("dynamic worker modules must be an object");
+    }
+    const keys = Object.keys(modulesInput).sort();
+    let out = `${entrypoint}\u001f`;
+    for (const key of keys) {
+      const modulePath = normalizeModulePath(key);
+      const source = String(modulesInput[key] ?? "");
+      out += `${modulePath.length}:${modulePath}\u001e${source.length}:${source}\u001f`;
+    }
+    return out;
+  };
+
   const resolveDynamicWorkerSource = (options) => {
     if (Object.prototype.hasOwnProperty.call(options, "source")) {
       const source = String(options.source ?? "");
@@ -3785,10 +3845,20 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!isPlainObject(modules)) {
       throw new Error("dynamic worker modules must be an object");
     }
-    return buildSourceFromModules(entrypoint, modules);
+    const { sourceCache } = getDynamicCacheState();
+    const cacheKey = dynamicSourceCacheKey(entrypoint, modules);
+    const cached = sourceCache.get(cacheKey);
+    if (typeof cached === "string" && cached.length > 0) {
+      recordDynamicMetric("sourceCacheHit");
+      return cached;
+    }
+    recordDynamicMetric("sourceCacheMiss");
+    const built = buildSourceFromModules(entrypoint, modules);
+    sourceCache.set(cacheKey, built);
+    return built;
   };
 
-  const createDynamicWorkerStub = (bindingName, handle, worker, timeout) => ({
+  const createDynamicWorkerStub = (bindingName, handle, worker, timeout, cacheKey = "") => ({
     worker,
     async fetch(inputValue, initValue = undefined) {
       const request = await normalizeActorFetchInput(inputValue, initValue);
@@ -3809,6 +3879,9 @@ globalThis.__dd_execute_worker = (payload) => {
         timeout,
       );
       if (!result || typeof result !== "object" || result.ok === false) {
+        if (cacheKey && dynamicHandleErrorIsStale(result)) {
+          getDynamicCacheState().handleCache.delete(cacheKey);
+        }
         throw new Error(formatDynamicFailure("dynamic worker invoke failed", result));
       }
       return new Response(toArrayBytes(result.body), {
@@ -3909,6 +3982,19 @@ globalThis.__dd_execute_worker = (payload) => {
      */
     async get(id, factory) {
       const instanceId = normalizeDynamicInstanceId(id);
+      const cacheKey = dynamicHandleCacheKey(bindingName, instanceId);
+      const cached = getDynamicHandleCacheEntry(bindingName, instanceId);
+      if (cached) {
+        recordDynamicMetric("handleCacheHit");
+        return createDynamicWorkerStub(
+          bindingName,
+          cached.handle,
+          cached.worker,
+          cached.timeout,
+          cacheKey,
+        );
+      }
+      recordDynamicMetric("handleCacheMiss");
       const scopedRequestId = activeRequestId();
       const lookup = await awaitDynamicReply(
         `dynamic worker lookup (${bindingName}/${instanceId})`,
@@ -3922,11 +4008,13 @@ globalThis.__dd_execute_worker = (payload) => {
         throw new Error(formatDynamicFailure("dynamic worker lookup failed", lookup));
       }
       if (lookup.found === true) {
+        setDynamicHandleCacheEntry(bindingName, instanceId, lookup);
         return createDynamicWorkerStub(
           bindingName,
           String(lookup.handle ?? "").trim(),
           String(lookup.worker ?? ""),
           normalizeDynamicTimeout(lookup.timeout),
+          cacheKey,
         );
       }
 
@@ -3954,11 +4042,13 @@ globalThis.__dd_execute_worker = (payload) => {
       if (!handle) {
         throw new Error("dynamic worker create returned an invalid handle");
       }
+      setDynamicHandleCacheEntry(bindingName, instanceId, result);
       return createDynamicWorkerStub(
         bindingName,
         handle,
         String(result.worker ?? ""),
         normalizeDynamicTimeout(result.timeout ?? timeout),
+        cacheKey,
       );
     },
     /**
@@ -4002,6 +4092,9 @@ globalThis.__dd_execute_worker = (payload) => {
       if (!result || typeof result !== "object" || result.ok === false) {
         throw new Error(formatDynamicFailure("dynamic worker delete failed", result));
       }
+      if (result.deleted === true) {
+        deleteDynamicHandleCacheEntry(bindingName, instanceId);
+      }
       return Boolean(result.deleted);
     },
   });
@@ -4016,9 +4109,33 @@ globalThis.__dd_execute_worker = (payload) => {
       ? cache.get(cacheableWorker)
       : fallbackCache.get(workerName);
     if (cached) {
+      globalThis.__dd_dynamic_metrics = cached.__dd_dynamic_metrics ?? null;
       return cached;
     }
     const env = {};
+    Object.defineProperty(env, "__dd_dynamic_handle_cache", {
+      value: new Map(),
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    Object.defineProperty(env, "__dd_dynamic_source_cache", {
+      value: new Map(),
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    Object.defineProperty(env, "__dd_dynamic_metrics", {
+      value: {
+        handleCacheHit: 0,
+        handleCacheMiss: 0,
+        sourceCacheHit: 0,
+        sourceCacheMiss: 0,
+      },
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
     const defineLazyValue = (target, propertyName, factory) => {
       let initialized = false;
       let cachedValue;
@@ -4121,6 +4238,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
 
     Object.freeze(env);
+    globalThis.__dd_dynamic_metrics = env.__dd_dynamic_metrics ?? null;
     if (cacheableWorker) {
       cache.set(cacheableWorker, env);
     } else {
@@ -4451,6 +4569,7 @@ globalThis.__dd_execute_worker = (payload) => {
       });
     }
   };
+  globalThis.__dd_drain_dynamic_host_rpc_queue = drainDynamicLocalHostRpcQueue;
 
   const emitWaitUntilDone = async (timedOut) => {
     if (requestContext.waitUntilDoneSent) {

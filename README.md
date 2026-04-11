@@ -90,6 +90,7 @@ run(ServerConfig {
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             database_url: format!("file:{}/dd-kv.db", store_dir.display()),
+            // Internal field name; this controls memory-namespace sharding.
             actor_shards_per_namespace: 64,
             worker_store_enabled: true,
             blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
@@ -102,6 +103,7 @@ run(ServerConfig {
 
 ```bash
 cargo run -p cli -- --server http://127.0.0.1:3001 deploy hello examples/hello.js --public
+cargo run -p cli -- --server http://127.0.0.1:3001 deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 cargo run -p cli -- --server http://127.0.0.1:3001 invoke hello --method POST --path /echo --header "content-type: text/plain" --body-file -
 cargo run -p cli -- --server http://127.0.0.1:3001 dynamic-deploy examples/hello.js --env OPENAI_API_KEY=sk-...
 cargo run -p cli -- --server http://127.0.0.1:3001 deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
@@ -111,6 +113,8 @@ cargo run -p cli -- --server http://127.0.0.1:3001 deploy memory examples/memory
 `--memory-binding` is the canonical user-facing flag. `--actor-binding` is still accepted as a legacy alias while the repo finishes converging on memory-namespace terminology.
 
 `deploy --public` exposes a worker on the public listener. Without `--public`, a worker is private-only and can only be invoked through the private listener.
+
+`deploy --assets-dir path/to/assets` bundles exact static files at worker root paths before worker code runs. A root `_headers` file in that directory applies asset-only response headers.
 
 Worker source/config is persisted under `./store/workers` by default and restored at startup.
 
@@ -203,6 +207,7 @@ Current baseline results are in `BENCHMARKS.md`.
 - responses include `x-dd-trace-id` for quick correlation
 
 The user-facing primitive is the memory namespace. STM gives you transactional reads/writes inside a namespace, and you can build actor-style coordination on top of that when you need it. The repo still has some internal binary/file names with `actor` in them, but the model exposed to worker authors is memory-first.
+For public host-routed traffic, workers receive the honest external request URL such as `https://chat.example.com/rooms/test?x=1`. Private `/v1/invoke/:worker/...` requests remain synthetic and use `http://worker/...`.
 
 ## Example workers
 
@@ -365,4 +370,16 @@ Public invoke shape (when `PUBLIC_BASE_DOMAIN=example.com`) is host-based:
 
 ```bash
 curl -H "host: hello.example.com" http://127.0.0.1:3000/
+```
+
+Inside worker code for that direct request, `request.url` is:
+
+```js
+"http://hello.example.com/"
+```
+
+If the public listener sits behind a proxy that sends `x-forwarded-host` / `x-forwarded-proto`, workers instead see the honest external URL, for example:
+
+```js
+"https://chat.wdyt.chat/rooms/test?x=1"
 ```
