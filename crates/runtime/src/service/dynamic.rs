@@ -462,7 +462,7 @@ impl WorkerManager {
     pub(super) fn handle_dynamic_host_rpc_invoke(
         &mut self,
         payload: crate::ops::DynamicHostRpcInvokeEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let crate::ops::DynamicHostRpcInvokeEvent {
             caller_worker,
@@ -543,8 +543,7 @@ impl WorkerManager {
             );
             return;
         };
-
-        let Some((queue, sender)) = self
+        let local_queue = self
             .get_pool_mut(&provider.owner_worker, provider.owner_generation)
             .and_then(|pool| {
                 pool.isolates
@@ -556,27 +555,91 @@ impl WorkerManager {
                             isolate.sender.clone(),
                         )
                     })
-            })
-        else {
+            });
+        if let Some((queue, sender)) = local_queue {
+            queue.enqueue(
+                provider.target_id.clone(),
+                method_name,
+                args,
+                reply_id,
+                pending_replies,
+            );
+            let _ = sender.send(IsolateCommand::DynamicHostRpcNudge);
+            self.dynamic_profile.record_local_host_rpc_callback();
+            return;
+        }
+        let runtime_request_id = next_runtime_token("dynhrpc");
+        let timeout_ms = 5_000;
+        let timeout_diagnostic = DynamicTimeoutDiagnostic {
+            stage: "host-rpc-reply",
+            owner_worker: caller_worker.clone(),
+            owner_generation: caller_generation,
+            binding: binding.clone(),
+            handle: String::new(),
+            target_worker: provider.owner_worker.clone(),
+            target_isolate_id: Some(provider.owner_isolate_id),
+            target_generation: Some(owner_pool_generation),
+            provider_id: Some(provider_id.clone()),
+            provider_owner_isolate_id: Some(provider.owner_isolate_id),
+            provider_target_id: Some(provider.target_id.clone()),
+            timeout_ms,
+        };
+        let request = WorkerInvocation {
+            method: "HOST-RPC".to_string(),
+            url: format!("http://memory/__dd_rpc/{method_name}"),
+            headers: Vec::new(),
+            body: args.clone(),
+            request_id: format!("dynamic-host-rpc-{runtime_request_id}"),
+        };
+        let host_rpc_call = HostRpcExecutionCall {
+            target_id: provider.target_id.clone(),
+            method: method_name,
+            args,
+        };
+        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
+        self.enqueue_invoke(
+            provider.owner_worker.clone(),
+            runtime_request_id,
+            request,
+            None,
+            None,
+            None,
+            Some(host_rpc_call),
+            Some(provider.owner_isolate_id),
+            Some(owner_pool_generation),
+            true,
+            inner_reply_tx,
+            PendingReplyKind::Normal,
+            event_tx,
+        );
+        let event_tx = event_tx.clone();
+        let profile = self.dynamic_profile.clone();
+        tokio::spawn(async move {
+            let result =
+                match tokio::time::timeout(Duration::from_millis(timeout_ms), inner_reply_rx).await
+                {
+                    Ok(Ok(Ok(output))) => Ok(output.body),
+                    Ok(Ok(Err(error))) => Err(error),
+                    Ok(Err(_)) => Err(PlatformError::internal(
+                        "dynamic host rpc response channel closed",
+                    )),
+                    Err(_) => {
+                        let _ = event_tx
+                            .send(RuntimeEvent::DynamicTimeoutDiagnostic(timeout_diagnostic));
+                        Err(PlatformError::runtime(format!(
+                            "dynamic host rpc invoke timed out after {timeout_ms}ms"
+                        )))
+                    }
+                };
+            profile.record_async_reply_completion();
+            if result.is_ok() {
+                profile.record_local_host_rpc_callback();
+            }
             pending_replies.finish(
                 reply_id,
-                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
-                    "dynamic host rpc provider queue is unavailable",
-                ))),
+                crate::ops::DynamicPendingReplyPayload::HostRpc(result),
             );
-            return;
-        };
-        let _ = owner_pool_generation;
-        let _ = caller_isolate_id;
-        queue.enqueue(
-            provider.target_id.clone(),
-            method_name,
-            args,
-            reply_id,
-            pending_replies,
-        );
-        let _ = sender.send(IsolateCommand::DynamicHostRpcNudge);
-        self.dynamic_profile.record_local_host_rpc_callback();
+        });
         let _ = caller_isolate_id;
     }
 

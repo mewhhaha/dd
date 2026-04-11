@@ -90,7 +90,7 @@ run(ServerConfig {
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             database_url: format!("file:{}/dd-kv.db", store_dir.display()),
-            // Internal field name; this controls memory-namespace sharding.
+            // Internal field name. Controls memory-namespace sharding.
             actor_shards_per_namespace: 64,
             worker_store_enabled: true,
             blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
@@ -174,7 +174,7 @@ Run the runtime benchmark with:
 cargo run -p runtime --bin bench --release
 ```
 
-Run the keyed memory namespace benchmark with:
+Run keyed memory namespace benchmark with:
 
 ```bash
 cargo run -p runtime --bin bench_actor_storage

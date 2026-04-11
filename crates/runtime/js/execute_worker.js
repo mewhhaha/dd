@@ -4046,6 +4046,36 @@ globalThis.__dd_execute_worker = (payload) => {
     return String(result ?? fallback);
   };
 
+  const drainDynamicLocalHostRpcQueue = async () => {
+    for (;;) {
+      const task = callOp("op_dynamic_take_local_host_rpc");
+      if (!task || typeof task !== "object" || task.ready !== true) {
+        return;
+      }
+      let ok = true;
+      let value = [];
+      let error = "";
+      try {
+        const response = await invokeHostRpcCall({
+          target_id: task.target_id,
+          method: task.method_name,
+          args: task.args,
+        });
+        value = Array.from(new Uint8Array(await response.arrayBuffer()));
+      } catch (cause) {
+        ok = false;
+        error = String(cause?.message ?? cause ?? "dynamic local host rpc failed");
+      }
+      callOp("op_dynamic_finish_local_host_rpc", {
+        task_id: String(task.task_id ?? ""),
+        ok,
+        value,
+        error,
+      });
+    }
+  };
+  globalThis.__dd_drain_dynamic_host_rpc_queue = drainDynamicLocalHostRpcQueue;
+
   /**
    * @typedef {Object} DynamicWorkerConfig
    * @property {string} [source] Full worker source. If omitted, `entrypoint + modules` are used.
@@ -4630,36 +4660,6 @@ globalThis.__dd_execute_worker = (payload) => {
       headers: [["content-type", "application/octet-stream"]],
     });
   };
-
-  const drainDynamicLocalHostRpcQueue = async () => {
-    for (;;) {
-      const task = callOp("op_dynamic_take_local_host_rpc");
-      if (!task || typeof task !== "object" || task.ready !== true) {
-        return;
-      }
-      let ok = true;
-      let value = [];
-      let error = "";
-      try {
-        const response = await invokeHostRpcCall({
-          target_id: task.target_id,
-          method: task.method_name,
-          args: task.args,
-        });
-        value = Array.from(new Uint8Array(await response.arrayBuffer()));
-      } catch (cause) {
-        ok = false;
-        error = String(cause?.message ?? cause ?? "dynamic local host rpc failed");
-      }
-      callOp("op_dynamic_finish_local_host_rpc", {
-        task_id: String(task.task_id ?? ""),
-        ok,
-        value,
-        error,
-      });
-    }
-  };
-  globalThis.__dd_drain_dynamic_host_rpc_queue = drainDynamicLocalHostRpcQueue;
 
   const emitWaitUntilDone = async (timedOut) => {
     if (requestContext.waitUntilDoneSent) {
