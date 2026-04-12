@@ -387,6 +387,7 @@ struct WorkerManager {
     websocket_sessions: HashMap<String, WorkerWebSocketSession>,
     websocket_handle_index: HashMap<String, String>,
     websocket_open_handles: HashMap<String, HashSet<String>>,
+    open_handle_registry: crate::ops::ActorOpenHandleRegistry,
     websocket_pending_closes: HashMap<String, HashMap<String, Vec<SocketCloseEvent>>>,
     websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
     websocket_close_signals: HashMap<String, SocketCloseEvent>,
@@ -719,6 +720,8 @@ enum ActorExecutionCall {
         handle: String,
         is_text: bool,
         data: Vec<u8>,
+        socket_handles: Vec<String>,
+        transport_handles: Vec<String>,
     },
     Close {
         binding: String,
@@ -726,18 +729,24 @@ enum ActorExecutionCall {
         handle: String,
         code: u16,
         reason: String,
+        socket_handles: Vec<String>,
+        transport_handles: Vec<String>,
     },
     TransportDatagram {
         binding: String,
         key: String,
         handle: String,
         data: Vec<u8>,
+        socket_handles: Vec<String>,
+        transport_handles: Vec<String>,
     },
     TransportStream {
         binding: String,
         key: String,
         handle: String,
         data: Vec<u8>,
+        socket_handles: Vec<String>,
+        transport_handles: Vec<String>,
     },
     TransportClose {
         binding: String,
@@ -745,6 +754,8 @@ enum ActorExecutionCall {
         handle: String,
         code: u16,
         reason: String,
+        socket_handles: Vec<String>,
+        transport_handles: Vec<String>,
     },
 }
 
@@ -833,11 +844,6 @@ enum RuntimeEvent {
     ActorInvoke(ActorInvokeEvent),
     ActorSocketSend(crate::ops::ActorSocketSendEvent),
     ActorSocketClose(crate::ops::ActorSocketCloseEvent),
-    ActorSocketList {
-        worker_name: String,
-        generation: u64,
-        payload: crate::ops::ActorSocketListEvent,
-    },
     ActorSocketConsumeClose {
         worker_name: String,
         generation: u64,
@@ -848,11 +854,6 @@ enum RuntimeEvent {
     ActorTransportRecvStream(crate::ops::ActorTransportRecvStreamEvent),
     ActorTransportRecvDatagram(crate::ops::ActorTransportRecvDatagramEvent),
     ActorTransportClose(crate::ops::ActorTransportCloseEvent),
-    ActorTransportList {
-        worker_name: String,
-        generation: u64,
-        payload: crate::ops::ActorTransportListEvent,
-    },
     ActorTransportConsumeClose {
         worker_name: String,
         generation: u64,
@@ -1698,6 +1699,7 @@ impl WorkerManager {
             websocket_sessions: HashMap::new(),
             websocket_handle_index: HashMap::new(),
             websocket_open_handles: HashMap::new(),
+            open_handle_registry: crate::ops::ActorOpenHandleRegistry::default(),
             websocket_pending_closes: HashMap::new(),
             websocket_outbound_frames: HashMap::new(),
             websocket_close_signals: HashMap::new(),
@@ -2098,13 +2100,6 @@ impl WorkerManager {
             RuntimeEvent::ActorSocketClose(payload) => {
                 self.handle_actor_socket_close(payload, event_tx);
             }
-            RuntimeEvent::ActorSocketList {
-                worker_name: _worker_name,
-                generation: _generation,
-                payload,
-            } => {
-                self.handle_actor_socket_list(payload, event_tx);
-            }
             RuntimeEvent::ActorSocketConsumeClose {
                 worker_name: _worker_name,
                 generation: _generation,
@@ -2126,13 +2121,6 @@ impl WorkerManager {
             }
             RuntimeEvent::ActorTransportClose(payload) => {
                 self.handle_actor_transport_close(payload, event_tx);
-            }
-            RuntimeEvent::ActorTransportList {
-                worker_name: _worker_name,
-                generation: _generation,
-                payload,
-            } => {
-                self.handle_actor_transport_list(payload, event_tx);
             }
             RuntimeEvent::ActorTransportConsumeClose {
                 worker_name: _worker_name,
@@ -2200,12 +2188,18 @@ impl WorkerManager {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
+        let socket_handles =
+            self.websocket_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
+        let transport_handles =
+            self.transport_handles_snapshot(&session.binding, &session.key, None);
         let actor_call = ActorExecutionCall::Message {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
             is_text: !is_binary,
             data: frame,
+            socket_handles,
+            transport_handles,
         };
         let invoke = WorkerInvocation {
             method: "WS-MESSAGE".to_string(),
@@ -2260,12 +2254,18 @@ impl WorkerManager {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
+        let socket_handles =
+            self.websocket_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
+        let transport_handles =
+            self.transport_handles_snapshot(&session.binding, &session.key, None);
         let actor_call = ActorExecutionCall::Close {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
             code: close_code,
             reason: close_reason,
+            socket_handles,
+            transport_handles,
         };
         let invoke = WorkerInvocation {
             method: "WS-CLOSE".to_string(),
@@ -3275,6 +3275,7 @@ impl WorkerManager {
         let actor_store = self.actor_store.clone();
         let cache_store = self.cache_store.clone();
         let dynamic_profile = self.dynamic_profile.clone();
+        let open_handle_registry = self.open_handle_registry.clone();
         let isolate = spawn_isolate_thread(
             snapshot,
             snapshot_preloaded,
@@ -3282,6 +3283,7 @@ impl WorkerManager {
             kv_store,
             actor_store,
             cache_store,
+            open_handle_registry,
             dynamic_profile,
             worker_name.to_string(),
             generation,
@@ -4342,6 +4344,7 @@ impl WorkerManager {
         self.websocket_sessions.clear();
         self.websocket_handle_index.clear();
         self.websocket_open_handles.clear();
+        self.open_handle_registry.clear();
         self.websocket_pending_closes.clear();
         self.websocket_outbound_frames.clear();
         self.websocket_close_signals.clear();
@@ -4888,13 +4891,6 @@ fn handle_isolate_event_payload(
         IsolateEventPayload::ActorSocketClose(payload) => {
             let _ = event_tx.send(RuntimeEvent::ActorSocketClose(payload));
         }
-        IsolateEventPayload::ActorSocketList(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorSocketList {
-                worker_name: worker_name.to_string(),
-                generation,
-                payload,
-            });
-        }
         IsolateEventPayload::ActorSocketConsumeClose(payload) => {
             let _ = event_tx.send(RuntimeEvent::ActorSocketConsumeClose {
                 worker_name: worker_name.to_string(),
@@ -4916,13 +4912,6 @@ fn handle_isolate_event_payload(
         }
         IsolateEventPayload::ActorTransportClose(payload) => {
             let _ = event_tx.send(RuntimeEvent::ActorTransportClose(payload));
-        }
-        IsolateEventPayload::ActorTransportList(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportList {
-                worker_name: worker_name.to_string(),
-                generation,
-                payload,
-            });
         }
         IsolateEventPayload::ActorTransportConsumeClose(payload) => {
             let _ = event_tx.send(RuntimeEvent::ActorTransportConsumeClose {
@@ -4959,6 +4948,7 @@ fn spawn_isolate_thread(
     kv_store: KvStore,
     actor_store: ActorStore,
     cache_store: CacheStore,
+    open_handle_registry: crate::ops::ActorOpenHandleRegistry,
     dynamic_profile: crate::ops::DynamicProfile,
     worker_name: String,
     generation: u64,
@@ -5003,6 +4993,7 @@ fn spawn_isolate_thread(
                     op_state.put(kv_store.clone());
                     op_state.put(actor_store.clone());
                     op_state.put(cache_store.clone());
+                    op_state.put(open_handle_registry.clone());
                     op_state.put(RequestBodyStreams::default());
                     op_state.put(crate::ops::ActorRequestScopes::default());
                     op_state.put(crate::ops::RequestSecretContexts::default());
@@ -5233,12 +5224,16 @@ fn handle_isolate_command(
                     handle,
                     is_text,
                     data,
+                    socket_handles,
+                    transport_handles,
                 } => ExecuteActorCall::Message {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
                     is_text: *is_text,
                     data: data.clone(),
+                    socket_handles: socket_handles.clone(),
+                    transport_handles: transport_handles.clone(),
                 },
                 ActorExecutionCall::Close {
                     binding,
@@ -5246,34 +5241,46 @@ fn handle_isolate_command(
                     handle,
                     code,
                     reason,
+                    socket_handles,
+                    transport_handles,
                 } => ExecuteActorCall::Close {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
                     code: *code,
                     reason: reason.clone(),
+                    socket_handles: socket_handles.clone(),
+                    transport_handles: transport_handles.clone(),
                 },
                 ActorExecutionCall::TransportDatagram {
                     binding,
                     key,
                     handle,
                     data,
+                    socket_handles,
+                    transport_handles,
                 } => ExecuteActorCall::TransportDatagram {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
                     data: data.clone(),
+                    socket_handles: socket_handles.clone(),
+                    transport_handles: transport_handles.clone(),
                 },
                 ActorExecutionCall::TransportStream {
                     binding,
                     key,
                     handle,
                     data,
+                    socket_handles,
+                    transport_handles,
                 } => ExecuteActorCall::TransportStream {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
                     data: data.clone(),
+                    socket_handles: socket_handles.clone(),
+                    transport_handles: transport_handles.clone(),
                 },
                 ActorExecutionCall::TransportClose {
                     binding,
@@ -5281,12 +5288,16 @@ fn handle_isolate_command(
                     handle,
                     code,
                     reason,
+                    socket_handles,
+                    transport_handles,
                 } => ExecuteActorCall::TransportClose {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
                     code: *code,
                     reason: reason.clone(),
+                    socket_handles: socket_handles.clone(),
+                    transport_handles: transport_handles.clone(),
                 },
             });
             let dispatch_host_rpc_call = host_rpc_call.as_ref().map(|call| ExecuteHostRpcCall {
@@ -6257,6 +6268,33 @@ export default {
         .to_string()
     }
 
+    fn transport_values_worker() -> String {
+        r#"
+export default {
+  async fetch(request, env) {
+    return await env.MEDIA.get(env.MEDIA.idFromName("global")).atomic((state) => {
+      const { response } = state.accept(request);
+      return response;
+    });
+  },
+
+  async wake(event, env) {
+    const _ = env;
+    if (event.type !== "transportstream" || !event.stub || !event.handle) {
+      return;
+    }
+    const handles = await event.stub.transports.values();
+    await event.stub.apply([{
+      type: "transport.stream",
+      handle: event.handle,
+      payload: new TextEncoder().encode(`ready:${handles.length}`),
+    }]);
+  },
+};
+"#
+        .to_string()
+    }
+
     fn websocket_storage_worker() -> String {
         r#"
 export function openSocket(state, payload) {
@@ -6301,6 +6339,51 @@ export default {
       return;
     }
     await event.stub.atomic(onSocketMessage, event);
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn websocket_values_worker() -> String {
+        r#"
+function room(env) {
+  return env.CHAT.get(env.CHAT.idFromName("global"));
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/handles") {
+      const handles = await room(env).sockets.values();
+      return Response.json({ count: handles.length, handles });
+    }
+    if (url.pathname === "/txn-handles") {
+      const snapshot = await room(env).atomic((state) => {
+        const first = state.stub.sockets.values();
+        const second = state.stub.sockets.values();
+        return {
+          first_is_array: Array.isArray(first),
+          second_is_array: Array.isArray(second),
+          first_count: Array.isArray(first) ? first.length : -1,
+          second_count: Array.isArray(second) ? second.length : -1,
+        };
+      });
+      return Response.json(snapshot);
+    }
+    return await room(env).atomic((state) => {
+      const { response } = state.accept(request);
+      return response;
+    });
+  },
+
+  async wake(event) {
+    if (event.type !== "socketmessage" || !event.stub) {
+      return;
+    }
+    const handles = await event.stub.sockets.values();
+    const socket = new WebSocket(event.handle);
+    socket.send(JSON.stringify({ count: handles.length, handles }), "text");
   },
 };
 "#
@@ -9759,6 +9842,81 @@ export default {
 
     #[tokio::test]
     #[serial]
+    async fn transport_wake_can_list_transport_handles_without_deadlock() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "transport-values".to_string(),
+                transport_values_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MEDIA".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+        let opened = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.open_transport(
+                "transport-values".to_string(),
+                test_transport_invocation(),
+                stream_tx,
+                datagram_tx,
+            ),
+        )
+        .await
+        .expect("transport open should not hang")
+        .expect("transport open should succeed");
+        assert_eq!(opened.output.status, 200);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.transport_push_stream(
+                "transport-values".to_string(),
+                opened.session_id.clone(),
+                b"ping".to_vec(),
+                false,
+            ),
+        )
+        .await
+        .expect("transport push should not hang")
+        .expect("transport push should succeed");
+
+        let echoed = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+            .await
+            .expect("transport reply should arrive")
+            .expect("transport reply channel should stay open");
+        assert_eq!(echoed, b"ready:1");
+
+        service
+            .transport_close(
+                "transport-values".to_string(),
+                opened.session_id,
+                0,
+                "done".to_string(),
+            )
+            .await
+            .expect("transport close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn websocket_message_handler_can_use_actor_storage_after_handshake() {
         let service = test_service(RuntimeConfig {
             min_isolates: 1,
@@ -9828,6 +9986,103 @@ export default {
         service
             .websocket_close(
                 "ws-storage".to_string(),
+                opened.session_id,
+                1000,
+                "done".to_string(),
+            )
+            .await
+            .expect("websocket close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_wake_can_list_socket_handles_without_deadlock() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-values".to_string(),
+                websocket_values_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let opened = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.open_websocket(
+                "ws-values".to_string(),
+                test_websocket_invocation("/ws", "ws-values-open"),
+                None,
+            ),
+        )
+        .await
+        .expect("websocket open should not hang")
+        .expect("websocket open should succeed");
+        assert_eq!(opened.output.status, 101);
+
+        let echoed = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.websocket_send_frame(
+                "ws-values".to_string(),
+                opened.session_id.clone(),
+                b"ping".to_vec(),
+                false,
+            ),
+        )
+        .await
+        .expect("websocket message should not hang")
+        .expect("websocket message should succeed");
+        assert_eq!(echoed.status, 204);
+        let echoed_json: serde_json::Value =
+            serde_json::from_slice(&echoed.body).expect("wake payload should be json");
+        assert_eq!(echoed_json["count"], 1);
+
+        let handles = service
+            .invoke(
+                "ws-values".to_string(),
+                test_invocation_with_path("/handles", "ws-values-handles"),
+            )
+            .await
+            .expect("handles invoke should succeed");
+        assert_eq!(handles.status, 200);
+        let handles_json: serde_json::Value =
+            serde_json::from_slice(&handles.body).expect("handles body should be json");
+        assert_eq!(handles_json["count"], 1);
+
+        let txn_handles = service
+            .invoke(
+                "ws-values".to_string(),
+                test_invocation_with_path("/txn-handles", "ws-values-txn-handles"),
+            )
+            .await
+            .expect("txn handles invoke should succeed");
+        assert_eq!(txn_handles.status, 200);
+        let txn_handles_json: serde_json::Value =
+            serde_json::from_slice(&txn_handles.body).expect("txn handles body should be json");
+        assert_eq!(txn_handles_json["first_is_array"], true);
+        assert_eq!(txn_handles_json["second_is_array"], true);
+        assert_eq!(txn_handles_json["first_count"], 1);
+        assert_eq!(txn_handles_json["second_count"], 1);
+
+        service
+            .websocket_close(
+                "ws-values".to_string(),
                 opened.session_id,
                 1000,
                 "done".to_string(),

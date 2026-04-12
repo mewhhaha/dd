@@ -89,6 +89,8 @@ impl WorkerManager {
             .entry(actor_owner_key(binding, key))
             .or_default()
             .insert(handle.to_string());
+        self.open_handle_registry
+            .add_socket_handle(binding, key, handle);
         Ok(())
     }
 
@@ -106,6 +108,11 @@ impl WorkerManager {
             &session.key,
             &session.handle,
         ));
+        self.open_handle_registry.remove_socket_handle(
+            &session.binding,
+            &session.key,
+            &session.handle,
+        );
         self.websocket_outbound_frames.remove(session_id);
         self.websocket_close_signals.remove(session_id);
 
@@ -166,6 +173,8 @@ impl WorkerManager {
             .entry(actor_owner_key(binding, key))
             .or_default()
             .insert(handle.to_string());
+        self.open_handle_registry
+            .add_transport_handle(binding, key, handle);
         Ok(())
     }
 
@@ -179,6 +188,11 @@ impl WorkerManager {
             &session.key,
             &session.handle,
         ));
+        self.open_handle_registry.remove_transport_handle(
+            &session.binding,
+            &session.key,
+            &session.handle,
+        );
         self.transport_open_channels.remove(session_id);
         self.transport_open_waiters.remove(session_id);
 
@@ -353,19 +367,27 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_socket_list(
-        &mut self,
-        payload: crate::ops::ActorSocketListEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+    pub(super) fn websocket_handles_snapshot(
+        &self,
+        binding: &str,
+        key: &str,
+        include_handle: Option<&str>,
+    ) -> Vec<String> {
+        let owner_key = actor_owner_key(binding, key);
         let mut handles: Vec<String> = self
             .websocket_open_handles
             .get(&owner_key)
             .map(|values| values.iter().cloned().collect())
             .unwrap_or_default();
+        if let Some(handle) = include_handle {
+            let normalized = handle.trim();
+            if !normalized.is_empty() {
+                handles.push(normalized.to_string());
+            }
+        }
         handles.sort();
-        let _ = payload.reply.send(Ok(handles));
+        handles.dedup();
+        handles
     }
 
     pub(super) fn handle_actor_socket_consume_close(
@@ -422,11 +444,16 @@ impl WorkerManager {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
+        let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
+        let transport_handles =
+            self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
         let actor_call = ActorExecutionCall::TransportStream {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
             data: chunk,
+            socket_handles,
+            transport_handles,
         };
         let invoke = WorkerInvocation {
             method: "TRANSPORT-STREAM".to_string(),
@@ -489,11 +516,16 @@ impl WorkerManager {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
+        let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
+        let transport_handles =
+            self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
         let actor_call = ActorExecutionCall::TransportDatagram {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
             data: datagram,
+            socket_handles,
+            transport_handles,
         };
         let invoke = WorkerInvocation {
             method: "TRANSPORT-DATAGRAM".to_string(),
@@ -560,12 +592,17 @@ impl WorkerManager {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
+        let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
+        let transport_handles =
+            self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
         let actor_call = ActorExecutionCall::TransportClose {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
             code: close_code,
             reason: close_reason,
+            socket_handles,
+            transport_handles,
         };
         let invoke = WorkerInvocation {
             method: "TRANSPORT-CLOSE".to_string(),
@@ -741,19 +778,27 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_transport_list(
-        &mut self,
-        payload: crate::ops::ActorTransportListEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+    pub(super) fn transport_handles_snapshot(
+        &self,
+        binding: &str,
+        key: &str,
+        include_handle: Option<&str>,
+    ) -> Vec<String> {
+        let owner_key = actor_owner_key(binding, key);
         let mut handles: Vec<String> = self
             .transport_open_handles
             .get(&owner_key)
             .map(|values| values.iter().cloned().collect())
             .unwrap_or_default();
+        if let Some(handle) = include_handle {
+            let normalized = handle.trim();
+            if !normalized.is_empty() {
+                handles.push(normalized.to_string());
+            }
+        }
         handles.sort();
-        let _ = payload.reply.send(Ok(handles));
+        handles.dedup();
+        handles
     }
 
     pub(super) fn handle_actor_transport_consume_close(

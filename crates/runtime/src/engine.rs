@@ -39,6 +39,10 @@ pub enum ExecuteActorCall {
         handle: String,
         is_text: bool,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transport_handles: Vec<String>,
     },
     Close {
         binding: String,
@@ -46,6 +50,10 @@ pub enum ExecuteActorCall {
         handle: String,
         code: u16,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transport_handles: Vec<String>,
     },
     #[serde(rename = "transport_datagram")]
     TransportDatagram {
@@ -53,6 +61,10 @@ pub enum ExecuteActorCall {
         key: String,
         handle: String,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transport_handles: Vec<String>,
     },
     #[serde(rename = "transport_stream")]
     TransportStream {
@@ -60,6 +72,10 @@ pub enum ExecuteActorCall {
         key: String,
         handle: String,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transport_handles: Vec<String>,
     },
     #[serde(rename = "transport_close")]
     TransportClose {
@@ -68,6 +84,10 @@ pub enum ExecuteActorCall {
         handle: String,
         code: u16,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transport_handles: Vec<String>,
     },
 }
 

@@ -32,6 +32,109 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 #[derive(Clone)]
 pub struct IsolateEventSender(pub std::sync::mpsc::Sender<IsolateEventPayload>);
 
+#[derive(Clone, Default)]
+pub struct ActorOpenHandleRegistry {
+    socket_handles: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
+    transport_handles: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
+}
+
+impl ActorOpenHandleRegistry {
+    fn owner_key(binding: &str, key: &str) -> String {
+        format!("{binding}\u{001f}{key}")
+    }
+
+    pub fn list_socket_handles(&self, binding: &str, key: &str) -> Vec<String> {
+        let owner_key = Self::owner_key(binding, key);
+        let mut handles = self
+            .socket_handles
+            .lock()
+            .expect("socket handle registry mutex poisoned")
+            .get(&owner_key)
+            .map(|values| values.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        handles.sort();
+        handles
+    }
+
+    pub fn list_transport_handles(&self, binding: &str, key: &str) -> Vec<String> {
+        let owner_key = Self::owner_key(binding, key);
+        let mut handles = self
+            .transport_handles
+            .lock()
+            .expect("transport handle registry mutex poisoned")
+            .get(&owner_key)
+            .map(|values| values.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        handles.sort();
+        handles
+    }
+
+    pub fn add_socket_handle(&self, binding: &str, key: &str, handle: &str) {
+        let owner_key = Self::owner_key(binding, key);
+        self.socket_handles
+            .lock()
+            .expect("socket handle registry mutex poisoned")
+            .entry(owner_key)
+            .or_default()
+            .insert(handle.to_string());
+    }
+
+    pub fn remove_socket_handle(&self, binding: &str, key: &str, handle: &str) {
+        let owner_key = Self::owner_key(binding, key);
+        let mut handles = self
+            .socket_handles
+            .lock()
+            .expect("socket handle registry mutex poisoned");
+        let remove_owner = if let Some(values) = handles.get_mut(&owner_key) {
+            values.remove(handle);
+            values.is_empty()
+        } else {
+            false
+        };
+        if remove_owner {
+            handles.remove(&owner_key);
+        }
+    }
+
+    pub fn add_transport_handle(&self, binding: &str, key: &str, handle: &str) {
+        let owner_key = Self::owner_key(binding, key);
+        self.transport_handles
+            .lock()
+            .expect("transport handle registry mutex poisoned")
+            .entry(owner_key)
+            .or_default()
+            .insert(handle.to_string());
+    }
+
+    pub fn remove_transport_handle(&self, binding: &str, key: &str, handle: &str) {
+        let owner_key = Self::owner_key(binding, key);
+        let mut handles = self
+            .transport_handles
+            .lock()
+            .expect("transport handle registry mutex poisoned");
+        let remove_owner = if let Some(values) = handles.get_mut(&owner_key) {
+            values.remove(handle);
+            values.is_empty()
+        } else {
+            false
+        };
+        if remove_owner {
+            handles.remove(&owner_key);
+        }
+    }
+
+    pub fn clear(&self) {
+        self.socket_handles
+            .lock()
+            .expect("socket handle registry mutex poisoned")
+            .clear();
+        self.transport_handles
+            .lock()
+            .expect("transport handle registry mutex poisoned")
+            .clear();
+    }
+}
+
 pub enum IsolateEventPayload {
     Completion(String),
     WaitUntilDone(String),
@@ -41,14 +144,12 @@ pub enum IsolateEventPayload {
     ActorInvoke(ActorInvokeEvent),
     ActorSocketSend(ActorSocketSendEvent),
     ActorSocketClose(ActorSocketCloseEvent),
-    ActorSocketList(ActorSocketListEvent),
     ActorSocketConsumeClose(ActorSocketConsumeCloseEvent),
     ActorTransportSendStream(ActorTransportSendStreamEvent),
     ActorTransportSendDatagram(ActorTransportSendDatagramEvent),
     ActorTransportRecvStream(ActorTransportRecvStreamEvent),
     ActorTransportRecvDatagram(ActorTransportRecvDatagramEvent),
     ActorTransportClose(ActorTransportCloseEvent),
-    ActorTransportList(ActorTransportListEvent),
     ActorTransportConsumeClose(ActorTransportConsumeCloseEvent),
     DynamicWorkerCreate(DynamicWorkerCreateEvent),
     DynamicWorkerLookup(DynamicWorkerLookupEvent),
@@ -86,12 +187,6 @@ pub struct ActorSocketCloseEvent {
     pub key: String,
     pub code: u16,
     pub reason: String,
-}
-
-pub struct ActorSocketListEvent {
-    pub reply: oneshot::Sender<Result<Vec<String>>>,
-    pub binding: String,
-    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,12 +239,6 @@ pub struct ActorTransportCloseEvent {
     pub key: String,
     pub code: u16,
     pub reason: String,
-}
-
-pub struct ActorTransportListEvent {
-    pub reply: oneshot::Sender<Result<Vec<String>>>,
-    pub binding: String,
-    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3947,40 +4036,11 @@ async fn op_actor_socket_list(
         }
     };
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::ActorSocketList(ActorSocketListEvent {
-            reply: reply_tx,
-            binding,
-            key,
-        }))
-        .is_err()
-    {
-        return ActorSocketListResult {
-            ok: false,
-            handles: Vec::new(),
-            error: "memory socket list runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(handles)) => ActorSocketListResult {
-            ok: true,
-            handles,
-            error: String::new(),
-        },
-        Ok(Err(error)) => ActorSocketListResult {
-            ok: false,
-            handles: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => ActorSocketListResult {
-            ok: false,
-            handles: Vec::new(),
-            error: "memory socket list response channel closed".to_string(),
-        },
+    let registry = state.borrow().borrow::<ActorOpenHandleRegistry>().clone();
+    ActorSocketListResult {
+        ok: true,
+        handles: registry.list_socket_handles(&binding, &key),
+        error: String::new(),
     }
 }
 
@@ -4537,42 +4597,11 @@ async fn op_actor_transport_list(
         }
     };
 
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::ActorTransportList(
-            ActorTransportListEvent {
-                reply: reply_tx,
-                binding,
-                key,
-            },
-        ))
-        .is_err()
-    {
-        return ActorTransportListResult {
-            ok: false,
-            handles: Vec::new(),
-            error: "memory transport list runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(handles)) => ActorTransportListResult {
-            ok: true,
-            handles,
-            error: String::new(),
-        },
-        Ok(Err(error)) => ActorTransportListResult {
-            ok: false,
-            handles: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => ActorTransportListResult {
-            ok: false,
-            handles: Vec::new(),
-            error: "memory transport list response channel closed".to_string(),
-        },
+    let registry = state.borrow().borrow::<ActorOpenHandleRegistry>().clone();
+    ActorTransportListResult {
+        ok: true,
+        handles: registry.list_transport_handles(&binding, &key),
+        error: String::new(),
     }
 }
 

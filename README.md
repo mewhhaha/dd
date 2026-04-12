@@ -1,30 +1,21 @@
 # dd
 
-`dd` is single-node workers platform in Rust with Deno-backed isolates, host-routed public traffic, keyed memory namespaces, dynamic workers, deploy-time static assets, KV, cache, websockets, and transport.
+`dd` is single-node worker runtime in Rust with Deno-backed isolates. It is inspired by Cloudflare Workers and Durable Objects, but aimed at "run Cloudflare-like workers on one machine with disk-backed storage" rather than "managed global edge platform."
 
-## Features
+Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. State lives on disk. For coordination, `dd` does not use Durable Objects as public model. It uses keyed memory namespaces with STM-like `atomic(...)` callbacks, so you shard state by key and treat each shard like transactional memory backed by durable storage.
 
-- deploy named workers over private control plane
-- serve public traffic by host: `worker.example.com -> worker`
-- keyed memory namespaces with STM-style `atomic(...)`
-- dynamic workers from normal workers via `env.SANDBOX.get/list/delete`
-- deploy-time static assets with root `_headers`
-- shared Cache API plus Turso-backed KV
-- websocket and transport session support
-- honest public `request.url` inside workers
+Worker shape stays familiar: `fetch(request, env, ctx)` plus worker bindings. KV handles simple persistence, Cache API handles response reuse, and memory namespaces handle shardable coordination.
 
 ## Quickstart
 
-Private control plane uses bearer auth by default. CLI reads `DD_PRIVATE_TOKEN` automatically.
-
-Start server:
+Private control plane uses bearer auth. CLI reads `DD_PRIVATE_TOKEN` automatically.
 
 ```bash
 export DD_PRIVATE_TOKEN=dev-token
 cargo run -p dd_server
 ```
 
-Deploy and invoke from another shell:
+In another shell:
 
 ```bash
 export DD_PRIVATE_TOKEN=dev-token
@@ -33,80 +24,142 @@ cargo run -p cli -- --server http://127.0.0.1:8081 invoke hello --method GET --p
 curl -H 'host: hello.example.com' http://127.0.0.1:8080/
 ```
 
-Default public/private listener ports for `cargo run -p dd_server` are `8080` and `8081`.
+Default ports for `cargo run -p dd_server` are `8080` for public traffic and `8081` for private deploy/invoke traffic.
 
-## Main model
+## Memory namespaces
 
-- worker code handles HTTP-style `fetch(request, env, ctx)`
-- public requests go through host routing
-- private deploy/invoke goes through `/v1/deploy`, `/v1/dynamic/deploy`, and `/v1/invoke/...`
-- memory namespace is public coordination primitive
-- dynamic workers are separate workers created from running workers
-- assets are exact file-path matches served before worker code runs
+Memory namespace is main coordination primitive. You pick key, get shard, run synchronous `atomic(...)` callback against that shard.
 
-## Core APIs
-
-Memory namespaces:
-
-- `env.USER_MEMORY.get(id)`
-- `memory.atomic(async () => { ... })`
-- `memory.read(key)`, `memory.list(...)`, `memory.write(...)`, `memory.delete(...)`
-- `memory.tvar(name, defaultValue)`
-
-Dynamic workers:
-
-- `env.SANDBOX.get(id, factory)`
-- `env.SANDBOX.list()`
-- `env.SANDBOX.delete(id)`
-- child `fetch(...)`
-- `RpcTarget` for parent-provided host RPC bindings
-
-Static assets:
-
-- `dd deploy ... --assets-dir path/to/assets`
-- `_headers` in asset root applies asset-only headers
-- exact file serving only; worker handles non-asset routes
-
-## CLI examples
+Deploy with memory binding:
 
 ```bash
-export DD_PRIVATE_TOKEN=dev-token
-cargo run -p cli -- --server http://127.0.0.1:8081 deploy memory examples/memory.js --memory-binding USER_MEMORY
-cargo run -p cli -- --server http://127.0.0.1:8081 deploy dynamic examples/dynamic-namespace.js --dynamic-binding SANDBOX
-cargo run -p cli -- --server http://127.0.0.1:8081 dynamic-deploy examples/hello.js --env OPENAI_API_KEY='<set-via---env>'
-cargo run -p cli -- --server http://127.0.0.1:8081 deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
+cargo run -p cli -- --server http://127.0.0.1:8081 \
+  deploy counter worker.js --memory-binding COUNTERS
 ```
 
-## Examples
+Worker:
 
-- [examples/hello.js](/home/mewhhaha/src/grugd/examples/hello.js): smallest worker
-- [examples/memory.js](/home/mewhhaha/src/grugd/examples/memory.js): keyed memory namespace
-- [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js): dynamic workers plus host RPC
-- [examples/chat-worker/](/home/mewhhaha/src/grugd/examples/chat-worker): chat app with memory namespace plus deploy-time assets
-- [examples/static-assets-site/](/home/mewhhaha/src/grugd/examples/static-assets-site): asset-first website
-- [examples/bundled-router/](/home/mewhhaha/src/grugd/examples/bundled-router): bundled TypeScript worker
+```js
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const user = url.searchParams.get("user") ?? "anonymous";
+    const memory = env.COUNTERS.get(env.COUNTERS.idFromName(user));
+    const count = memory.tvar("count", 0);
 
-## Fly deploys
+    if (request.method === "POST") {
+      const next = await memory.atomic(() => {
+        const value = Number(count.read()) + 1;
+        count.write(value);
+        return value;
+      });
+      return Response.json({ user, count: next });
+    }
+
+    const current = await memory.atomic(() => Number(count.read()) || 0);
+    return Response.json({ user, count: current });
+  },
+};
+```
+
+This is closest thing to Durable Objects, but model is different. You are not instantiating long-lived object class with special lifecycle. You are reading and writing shard of transactional memory selected by key.
+
+## KV
+
+KV is for simpler key/value storage where you do not need shard-local coordination.
+
+Deploy with KV binding:
+
+```bash
+cargo run -p cli -- --server http://127.0.0.1:8081 \
+  deploy kv worker.js --kv-binding MY_KV
+```
+
+Worker:
+
+```js
+export default {
+  async fetch(_request, env) {
+    const current = Number((await env.MY_KV.get("hits")) ?? "0") || 0;
+    const next = current + 1;
+    await env.MY_KV.set("hits", String(next));
+
+    return new Response(`hits=${next}`, {
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  },
+};
+```
+
+## Cache API
+
+Cache API looks like worker-style response cache. Good for HTTP response reuse, not coordination.
+
+Worker:
+
+```js
+export default {
+  async fetch(request) {
+    const cache = caches.default;
+    const key = new Request(request.url, { method: "GET" });
+    const cached = await cache.match(key);
+    if (cached) {
+      return cached;
+    }
+
+    const response = new Response("fresh response", {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "public, max-age=60",
+      },
+    });
+
+    await cache.put(key, response.clone());
+    return response;
+  },
+};
+```
+
+## Dynamic workers and assets
+
+Workers can create other workers with `env.SANDBOX.get/list/delete`. That is useful when you want tenant-specific or generated workers without redeploying whole server. See [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js).
+
+Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](/home/mewhhaha/src/grugd/examples/static-assets-site).
+
+Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](/home/mewhhaha/src/grugd/examples/chat-worker).
+
+## How to think about it
+
+If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.
+
+If you want "Durable Objects, but expressed as disk-backed STM-like shards instead of object instances," memory namespaces are that shape.
+
+If you want one app process you can deploy to Fly or another VM and then load with named workers, `dd_server` is that shape.
+
+## Fly
 
 Fly runs one `dd_server` app process. Workers are deployed into that app; they are not separate Fly apps.
 
-Canonical Fly flow:
+Canonical flow:
 
 1. deploy app/container with `flyctl deploy`
 2. open private tunnel with `just fly-proxy <app>`
 3. deploy worker through tunnel with `just fly-worker-deploy ...`
 
-Full Fly guide: [deploy/fly/README.md](/home/mewhhaha/src/grugd/deploy/fly/README.md)
+Full guide: [deploy/fly/README.md](/home/mewhhaha/src/grugd/deploy/fly/README.md)
 
-## Benchmarks
+## Benchmarks and docs
 
-- runtime benchmark: `cargo run -p runtime --bin bench --release`
-- keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`
-- current numbers: [BENCHMARKS.md](/home/mewhhaha/src/grugd/BENCHMARKS.md)
+Runtime benchmark:
 
-## More docs
+```bash
+cargo run -p runtime --bin bench --release
+```
 
-- contributor/dev guide: [docs/development.md](/home/mewhhaha/src/grugd/docs/development.md)
-- Fly deployment guide: [deploy/fly/README.md](/home/mewhhaha/src/grugd/deploy/fly/README.md)
-- secret audit for public-readiness: [docs/security-audit-2026-04-11.md](/home/mewhhaha/src/grugd/docs/security-audit-2026-04-11.md)
-- broader security review: [docs/security-review-2026-04-11.md](/home/mewhhaha/src/grugd/docs/security-review-2026-04-11.md)
+Keyed memory benchmark:
+
+```bash
+cargo run -p runtime --bin bench_memory_storage
+```
+
+Current numbers live in [BENCHMARKS.md](/home/mewhhaha/src/grugd/BENCHMARKS.md). Contributor/dev notes live in [docs/development.md](/home/mewhhaha/src/grugd/docs/development.md).

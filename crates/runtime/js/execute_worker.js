@@ -204,6 +204,34 @@ globalThis.__dd_execute_worker = (payload) => {
     return null;
   };
 
+  const currentLocalHandleRuntime = (binding, actorKey, kind) => {
+    const current = currentRequestContext(false);
+    if (!current?.actorEntry) {
+      return null;
+    }
+    if (
+      current.actorEntry.binding !== binding
+      || current.actorEntry.actorKey !== actorKey
+    ) {
+      return null;
+    }
+    const provider = kind === "socket"
+      ? current.socketRuntimeProvider
+      : current.transportRuntimeProvider;
+    const label = kind === "socket" ? "socket" : "transport";
+    if (typeof provider !== "function") {
+      throw new Error(`memory same-lane ${label} runtime is unavailable`);
+    }
+    const runtime = provider();
+    if (!runtime || typeof runtime.listOpenHandles !== "function") {
+      throw new Error(`memory same-lane ${label} runtime is unavailable`);
+    }
+    if (typeof runtime.hasOpenHandleSnapshot === "function" && !runtime.hasOpenHandleSnapshot()) {
+      throw new Error(`memory same-lane ${label} handles are not initialized`);
+    }
+    return runtime;
+  };
+
   const sleep = (millis) => callOp("op_sleep", Number(millis) || 0);
 
   const normalizeBoundaryValue = (value) => {
@@ -2170,6 +2198,9 @@ globalThis.__dd_execute_worker = (payload) => {
   const createActorSocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
     const socketsByHandle = entry.socketBindings ??= new Map();
     const openHandles = entry.openSocketHandles ??= new Set();
+    const markOpenHandlesInitialized = () => {
+      entry.openSocketHandlesInitialized = true;
+    };
     const currentSocketRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
 
     const sendSocketFrame = async (requestIdForOp, normalizedHandle, payload, gated = true) => {
@@ -2463,6 +2494,7 @@ globalThis.__dd_execute_worker = (payload) => {
         headers.set(INTERNAL_WS_KEY_HEADER, entry.actorKey);
         upgradeAccepted.used = true;
         openHandles.add(handle);
+        markOpenHandlesInitialized();
         return {
           handle,
           response: {
@@ -2526,6 +2558,13 @@ globalThis.__dd_execute_worker = (payload) => {
         for (const value of handles) {
           openHandles.add(String(value));
         }
+        markOpenHandlesInitialized();
+      },
+      listOpenHandles() {
+        return Array.from(openHandles.values());
+      },
+      hasOpenHandleSnapshot() {
+        return entry.openSocketHandlesInitialized === true;
       },
     };
   };
@@ -2579,6 +2618,9 @@ globalThis.__dd_execute_worker = (payload) => {
   const createActorTransportRuntime = (entry, runtimeRequestId, allowTransportAccept) => {
     const transportsByHandle = entry.transportBindings ??= new Map();
     const openHandles = entry.openTransportHandles ??= new Set();
+    const markOpenHandlesInitialized = () => {
+      entry.openTransportHandlesInitialized = true;
+    };
     const currentTransportRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
 
     const consumeCloseEvents = async (target) => {
@@ -2815,6 +2857,7 @@ globalThis.__dd_execute_worker = (payload) => {
         headers.set(INTERNAL_TRANSPORT_KEY_HEADER, entry.actorKey);
         transportAccepted.used = true;
         openHandles.add(handle);
+        markOpenHandlesInitialized();
         return {
           handle,
           response: {
@@ -2859,6 +2902,13 @@ globalThis.__dd_execute_worker = (payload) => {
         for (const value of handles) {
           openHandles.add(String(value));
         }
+        markOpenHandlesInitialized();
+      },
+      listOpenHandles() {
+        return Array.from(openHandles.values());
+      },
+      hasOpenHandleSnapshot() {
+        return entry.openTransportHandlesInitialized === true;
       },
     };
   };
@@ -3289,41 +3339,53 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const createActorStubSocketApi = (bindingName, actorKey) => Object.freeze({
-    async values() {
-      const result = await callOp("op_actor_socket_list", {
-        request_id: activeRequestId(),
-        binding: bindingName,
-        key: actorKey,
-      });
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "socket values failed"));
+    values() {
+      const localRuntime = currentLocalHandleRuntime(bindingName, actorKey, "socket");
+      if (localRuntime) {
+        return localRuntime.listOpenHandles();
       }
-      return Array.isArray(result?.handles)
-        ? result.handles.map((value) => String(value))
-        : [];
+      return (async () => {
+        const result = await callOp("op_actor_socket_list", {
+          request_id: activeRequestId(),
+          binding: bindingName,
+          key: actorKey,
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "socket values failed"));
+        }
+        return Array.isArray(result?.handles)
+          ? result.handles.map((value) => String(value))
+          : [];
+      })();
     },
   });
 
   const createActorStubTransportApi = (bindingName, actorKey) => Object.freeze({
-    async values() {
-      const result = await callOpAny([
-        "op_actor_transport_list",
-        "op_actor_transport_handles",
-      ], {
-        request_id: activeRequestId(),
-        binding: bindingName,
-        key: actorKey,
-      });
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        throw new Error(String(result.error ?? "transport values failed"));
+    values() {
+      const localRuntime = currentLocalHandleRuntime(bindingName, actorKey, "transport");
+      if (localRuntime) {
+        return localRuntime.listOpenHandles();
       }
-      return Array.isArray(result?.handles)
-        ? result.handles.map((value) => String(value))
-        : Array.isArray(result?.values)
-          ? result.values.map((value) => String(value))
-          : [];
+      return (async () => {
+        const result = await callOpAny([
+          "op_actor_transport_list",
+          "op_actor_transport_handles",
+        ], {
+          request_id: activeRequestId(),
+          binding: bindingName,
+          key: actorKey,
+        });
+        await syncFrozenTime();
+        if (result && typeof result === "object" && result.ok === false) {
+          throw new Error(String(result.error ?? "transport values failed"));
+        }
+        return Array.isArray(result?.handles)
+          ? result.handles.map((value) => String(value))
+          : Array.isArray(result?.values)
+            ? result.values.map((value) => String(value))
+            : [];
+      })();
     },
     async session(handle) {
       const runtimeRequestId = activeRequestId();
@@ -4434,8 +4496,12 @@ globalThis.__dd_execute_worker = (payload) => {
           txn,
         );
         const current = currentRequestContext();
+        const previousActorEntry = current.actorEntry;
+        const previousActorRequestId = current.actorRequestId;
         const previousSocketRuntimeProvider = current.socketRuntimeProvider;
         const previousTransportRuntimeProvider = current.transportRuntimeProvider;
+        current.actorEntry = entry;
+        current.actorRequestId = runtimeRequestId;
         current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
         current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
         try {
@@ -4498,6 +4564,8 @@ globalThis.__dd_execute_worker = (payload) => {
           }
           throw error;
         } finally {
+          current.actorEntry = previousActorEntry;
+          current.actorRequestId = previousActorRequestId;
           current.socketRuntimeProvider = previousSocketRuntimeProvider;
           current.transportRuntimeProvider = previousTransportRuntimeProvider;
         }
@@ -4545,6 +4613,24 @@ globalThis.__dd_execute_worker = (payload) => {
     return event;
   };
 
+  const seedActorHandleSnapshots = (entry, actorCall) => {
+    if (!actorCall || typeof actorCall !== "object") {
+      return;
+    }
+    if (Array.isArray(actorCall.socket_handles)) {
+      entry.openSocketHandles = new Set(
+        actorCall.socket_handles.map((value) => String(value)),
+      );
+      entry.openSocketHandlesInitialized = true;
+    }
+    if (Array.isArray(actorCall.transport_handles)) {
+      entry.openTransportHandles = new Set(
+        actorCall.transport_handles.map((value) => String(value)),
+      );
+      entry.openTransportHandlesInitialized = true;
+    }
+  };
+
   const invokeActorCall = async (actorCall, request, env) => {
     if (!actorCall || typeof actorCall !== "object") {
       throw new Error("memory invoke config is missing");
@@ -4559,6 +4645,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     const runtimeRequestId = activeRequestId();
     const entry = await ensureActorEntry(binding, actorKey, runtimeRequestId, { hydrate: false });
+    seedActorHandleSnapshots(entry, actorCall);
     const kind = String(actorCall.kind ?? "");
     const scopedState = createActorRuntimeState(entry, runtimeRequestId, false, false);
     const current = currentRequestContext();
