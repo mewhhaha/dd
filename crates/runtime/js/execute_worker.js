@@ -4136,7 +4136,7 @@ globalThis.__dd_execute_worker = (payload) => {
       });
     }
   };
-  globalThis.__dd_drain_dynamic_host_rpc_queue = drainDynamicLocalHostRpcQueue;
+  globalThis.__dd_run_dynamic_host_rpc_tasks = drainDynamicLocalHostRpcQueue;
 
   /**
    * @typedef {Object} DynamicWorkerConfig
@@ -4747,7 +4747,6 @@ globalThis.__dd_execute_worker = (payload) => {
       headers: [["content-type", "application/octet-stream"]],
     });
   };
-
   const emitWaitUntilDone = async (timedOut) => {
     if (requestContext.waitUntilDoneSent) {
       return;

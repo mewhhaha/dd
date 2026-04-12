@@ -177,6 +177,8 @@ pub struct WorkerDebugIsolate {
     pub id: u64,
     pub inflight_count: usize,
     pub pending_wait_until: usize,
+    pub active_websocket_sessions: usize,
+    pub active_transport_sessions: usize,
     pub pending_requests: Vec<WorkerDebugRequest>,
 }
 
@@ -310,6 +312,13 @@ enum RuntimeCommand {
     },
     DynamicDebugDump {
         reply: oneshot::Sender<DynamicRuntimeDebugDump>,
+    },
+    #[cfg(test)]
+    ForceFailIsolate {
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+        reply: oneshot::Sender<bool>,
     },
     OpenWebsocket {
         worker_name: String,
@@ -460,6 +469,7 @@ struct DynamicTimeoutDiagnostic {
 struct WorkerWebSocketSession {
     worker_name: String,
     generation: u64,
+    owner_isolate_id: u64,
     binding: String,
     key: String,
     handle: String,
@@ -481,6 +491,7 @@ struct WebSocketOutboundFrame {
 struct WorkerTransportSession {
     worker_name: String,
     generation: u64,
+    owner_isolate_id: u64,
     binding: String,
     key: String,
     handle: String,
@@ -687,7 +698,7 @@ enum IsolateCommand {
     Abort {
         runtime_request_id: String,
     },
-    DynamicHostRpcNudge,
+    RunDynamicHostRpcTasks,
     PollEventLoop,
     Shutdown,
 }
@@ -1643,6 +1654,30 @@ impl RuntimeService {
         reply_rx.await.unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub async fn force_fail_isolate_for_test(
+        &self,
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+    ) -> bool {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RuntimeCommand::ForceFailIsolate {
+                worker_name,
+                generation,
+                isolate_id,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+
     pub async fn cache_match(&self, request: CacheRequest) -> Result<CacheLookup> {
         let span = tracing::info_span!(
             "runtime.cache.match",
@@ -2013,6 +2048,29 @@ impl WorkerManager {
             }
             RuntimeCommand::DynamicDebugDump { reply } => {
                 let _ = reply.send(self.dynamic_debug_dump());
+            }
+            #[cfg(test)]
+            RuntimeCommand::ForceFailIsolate {
+                worker_name,
+                generation,
+                isolate_id,
+                reply,
+            } => {
+                let exists = self
+                    .workers
+                    .get(&worker_name)
+                    .and_then(|entry| entry.pools.get(&generation))
+                    .map(|pool| pool.isolates.iter().any(|isolate| isolate.id == isolate_id))
+                    .unwrap_or(false);
+                if exists {
+                    self.fail_isolate(
+                        &worker_name,
+                        generation,
+                        isolate_id,
+                        PlatformError::internal("isolate removed for test"),
+                    );
+                }
+                let _ = reply.send(exists);
             }
         }
     }
@@ -3913,6 +3971,7 @@ impl WorkerManager {
 
     fn retire_worker_completely(&mut self, worker_name: &str) {
         let mut clear_request_ids = Vec::new();
+        self.reap_owned_sessions(worker_name, None, None);
         if let Some(mut entry) = self.workers.remove(worker_name) {
             for (_, pool) in entry.pools.drain() {
                 for isolate in pool.isolates {
@@ -3954,11 +4013,13 @@ impl WorkerManager {
         let mut websocket_open_session_ids = Vec::new();
         let mut transport_open_session_ids = Vec::new();
         let mut replies = Vec::new();
+        let mut removed_isolate_id = None;
         let mut removed = false;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if isolate_idx < pool.isolates.len() {
                 let isolate = pool.isolates.swap_remove(isolate_idx);
                 let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                removed_isolate_id = Some(isolate.id);
                 pool.actor_owners
                     .retain(|_, owner_id| *owner_id != isolate.id);
                 replies = Vec::with_capacity(isolate.pending_replies.len());
@@ -3981,6 +4042,9 @@ impl WorkerManager {
                 }
                 removed = true;
             }
+        }
+        if let Some(isolate_id) = removed_isolate_id {
+            self.reap_owned_sessions(worker_name, Some(generation), Some(isolate_id));
         }
         for session_id in websocket_open_session_ids {
             if let Some(waiter) = self.websocket_open_waiters.remove(&session_id) {
@@ -4053,6 +4117,8 @@ impl WorkerManager {
                     .enumerate()
                     .filter(|(_, isolate)| isolate.inflight_count == 0)
                     .filter(|(_, isolate)| isolate.pending_wait_until.is_empty())
+                    .filter(|(_, isolate)| isolate.active_websocket_sessions == 0)
+                    .filter(|(_, isolate)| isolate.active_transport_sessions == 0)
                     .filter(|(_, isolate)| now.duration_since(isolate.last_used_at) >= idle_ttl)
                     .min_by_key(|(_, isolate)| isolate.last_used_at);
                 let Some((idx, _)) = candidate else {
@@ -4105,12 +4171,12 @@ impl WorkerManager {
             .filter(|session| session.worker_name == worker_name)
             .map(|session| session.generation)
             .collect();
-        {
-            let Some(entry) = self.workers.get_mut(worker_name) else {
+        let drained = {
+            let Some(entry) = self.workers.get(worker_name) else {
                 return;
             };
             let current_generation = entry.current_generation;
-            let drained: Vec<u64> = entry
+            entry
                 .pools
                 .iter()
                 .filter(|(generation, pool)| {
@@ -4120,22 +4186,26 @@ impl WorkerManager {
                         && !live_transport_generations.contains(generation)
                 })
                 .map(|(generation, _)| *generation)
-                .collect();
+                .collect::<Vec<_>>()
+        };
 
-            for generation in drained {
-                if let Some(pool) = entry.pools.remove(&generation) {
-                    retired_generations.insert(generation);
-                    for isolate in pool.isolates {
-                        let _ = isolate.sender.send(IsolateCommand::Shutdown);
-                        for (request_id, pending) in isolate.pending_replies {
-                            clear_request_ids.push(request_id);
-                            let _ = pending
-                                .reply
-                                .send(Err(PlatformError::internal("worker generation retired")));
-                        }
+        for generation in drained {
+            if let Some(pool) = self
+                .workers
+                .get_mut(worker_name)
+                .and_then(|entry| entry.pools.remove(&generation))
+            {
+                retired_generations.insert(generation);
+                for isolate in pool.isolates {
+                    let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                    for (request_id, pending) in isolate.pending_replies {
+                        clear_request_ids.push(request_id);
+                        let _ = pending
+                            .reply
+                            .send(Err(PlatformError::internal("worker generation retired")));
                     }
-                    info!(worker = %pool.worker_name, generation, "retired worker generation");
                 }
+                info!(worker = %pool.worker_name, generation, "retired worker generation");
             }
         }
         for request_id in clear_request_ids {
@@ -4305,6 +4375,10 @@ impl WorkerManager {
     }
 
     fn shutdown_all(&mut self) {
+        let worker_names = self.workers.keys().cloned().collect::<Vec<_>>();
+        for worker_name in worker_names {
+            self.reap_owned_sessions(&worker_name, None, None);
+        }
         let mut clear_request_ids = Vec::new();
         for entry in self.workers.values_mut() {
             for pool in entry.pools.values_mut() {
@@ -4616,6 +4690,8 @@ impl WorkerPool {
                     id: isolate.id,
                     inflight_count: isolate.inflight_count,
                     pending_wait_until: isolate.pending_wait_until.len(),
+                    active_websocket_sessions: isolate.active_websocket_sessions,
+                    active_transport_sessions: isolate.active_transport_sessions,
                     pending_requests,
                 }
             })
@@ -5363,11 +5439,11 @@ fn handle_isolate_command(
             abort_worker_request(js_runtime, &runtime_request_id)?;
             Ok(true)
         }
-        IsolateCommand::DynamicHostRpcNudge => {
+        IsolateCommand::RunDynamicHostRpcTasks => {
             js_runtime
                 .execute_script(
-                    "<dd:dynamic-host-rpc-nudge>",
-                    "void Promise.resolve(globalThis.__dd_drain_dynamic_host_rpc_queue?.()).catch(() => undefined);",
+                    "<dd:dynamic-host-rpc-tasks>",
+                    "void Promise.resolve(globalThis.__dd_run_dynamic_host_rpc_tasks?.()).catch(() => undefined);",
                 )
                 .map_err(|error| PlatformError::internal(error.to_string()))?;
             Ok(true)
@@ -7737,6 +7813,23 @@ export default {
         }
     }
 
+    async fn wait_for_isolate_total(service: &RuntimeService, worker_name: &str, expected: usize) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = service
+                    .stats(worker_name.to_string())
+                    .await
+                    .expect("worker stats should exist");
+                if stats.isolates_total == expected {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("worker isolate count should converge");
+    }
+
     fn test_assets() -> Vec<DeployAsset> {
         vec![
             DeployAsset {
@@ -9606,6 +9699,70 @@ export default {
 
     #[tokio::test]
     #[serial]
+    async fn dynamic_namespace_host_rpc_reports_provider_isolate_loss_promptly() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-parent-stale-provider".to_string(),
+                dynamic_namespace_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let warm = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-parent-stale-provider",
+            test_invocation_with_path("/", "dynamic-host-rpc-stale-provider-warm"),
+            "dynamic host rpc stale provider warm",
+        )
+        .await;
+        assert_eq!(String::from_utf8(warm.body).expect("utf8"), "1:1");
+
+        let dump = service
+            .debug_dump("dynamic-parent-stale-provider".to_string())
+            .await
+            .expect("debug dump should exist");
+        let isolate_id = dump
+            .isolates
+            .first()
+            .map(|isolate| isolate.id)
+            .expect("provider isolate should exist");
+        assert!(
+            service
+                .force_fail_isolate_for_test(
+                    "dynamic-parent-stale-provider".to_string(),
+                    dump.generation,
+                    isolate_id,
+                )
+                .await
+        );
+
+        let error = timeout(
+            Duration::from_secs(5),
+            service.invoke(
+                "dynamic-parent-stale-provider".to_string(),
+                test_invocation_with_path("/", "dynamic-host-rpc-stale-provider"),
+            ),
+        )
+        .await
+        .expect("stale provider invoke should not hang")
+        .expect_err("invoke should fail once provider isolate is gone");
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("dynamic host rpc provider isolate is unavailable"),
+            "unexpected error: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn dynamic_namespace_repeated_create_and_invoke_complete_past_threshold() {
         let service = test_service(dynamic_autoscaling_config()).await;
 
@@ -9917,6 +10074,155 @@ export default {
 
     #[tokio::test]
     #[serial]
+    async fn transport_session_survives_idle_ttl_and_scales_down_after_close() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_millis(200),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "transport-idle".to_string(),
+                transport_echo_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MEDIA".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+        let opened = service
+            .open_transport(
+                "transport-idle".to_string(),
+                test_transport_invocation(),
+                stream_tx,
+                datagram_tx,
+            )
+            .await
+            .expect("transport open should succeed");
+
+        sleep(Duration::from_millis(500)).await;
+        let stats = service
+            .stats("transport-idle".to_string())
+            .await
+            .expect("worker stats should exist");
+        assert_eq!(stats.isolates_total, 1);
+
+        service
+            .transport_push_stream(
+                "transport-idle".to_string(),
+                opened.session_id.clone(),
+                b"idle-transport".to_vec(),
+                false,
+            )
+            .await
+            .expect("transport push should succeed");
+        let echoed = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await
+            .expect("transport echo should arrive")
+            .expect("transport stream should stay open");
+        assert_eq!(echoed, b"idle-transport");
+
+        service
+            .transport_close(
+                "transport-idle".to_string(),
+                opened.session_id,
+                0,
+                "done".to_string(),
+            )
+            .await
+            .expect("transport close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transport_session_reaped_when_owner_isolate_fails() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "transport-reap".to_string(),
+                transport_echo_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "MEDIA".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
+        let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+        let opened = service
+            .open_transport(
+                "transport-reap".to_string(),
+                test_transport_invocation(),
+                stream_tx,
+                datagram_tx,
+            )
+            .await
+            .expect("transport open should succeed");
+
+        let dump = service
+            .debug_dump("transport-reap".to_string())
+            .await
+            .expect("debug dump should exist");
+        let isolate_id = dump
+            .isolates
+            .first()
+            .map(|isolate| isolate.id)
+            .expect("transport isolate should exist");
+        assert!(
+            service
+                .force_fail_isolate_for_test(
+                    "transport-reap".to_string(),
+                    dump.generation,
+                    isolate_id,
+                )
+                .await
+        );
+
+        let error = service
+            .transport_push_stream(
+                "transport-reap".to_string(),
+                opened.session_id,
+                b"after-fail".to_vec(),
+                false,
+            )
+            .await
+            .expect_err("reaped transport session should fail promptly");
+        assert!(
+            error.to_string().contains("transport session not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn websocket_message_handler_can_use_actor_storage_after_handshake() {
         let service = test_service(RuntimeConfig {
             min_isolates: 1,
@@ -10083,6 +10389,224 @@ export default {
         service
             .websocket_close(
                 "ws-values".to_string(),
+                opened.session_id,
+                1000,
+                "done".to_string(),
+            )
+            .await
+            .expect("websocket close should succeed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_millis(200),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-idle".to_string(),
+                websocket_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let opened = service
+            .open_websocket(
+                "ws-idle".to_string(),
+                test_websocket_invocation("/ws", "ws-idle-open"),
+                None,
+            )
+            .await
+            .expect("websocket open should succeed");
+
+        sleep(Duration::from_millis(500)).await;
+        let stats = service
+            .stats("ws-idle".to_string())
+            .await
+            .expect("worker stats should exist");
+        assert_eq!(stats.isolates_total, 1);
+
+        let echoed = service
+            .websocket_send_frame(
+                "ws-idle".to_string(),
+                opened.session_id.clone(),
+                b"idle".to_vec(),
+                false,
+            )
+            .await
+            .expect("websocket message should succeed");
+        assert_eq!(echoed.status, 204);
+        assert_eq!(
+            String::from_utf8(echoed.body).expect("utf8"),
+            r#"{"seen":"idle","count":1}"#
+        );
+
+        service
+            .websocket_close(
+                "ws-idle".to_string(),
+                opened.session_id,
+                1000,
+                "done".to_string(),
+            )
+            .await
+            .expect("websocket close should succeed");
+
+        wait_for_isolate_total(&service, "ws-idle", 0).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_session_reaped_when_owner_isolate_fails() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy_with_config(
+                "ws-reap".to_string(),
+                websocket_storage_worker(),
+                DeployConfig {
+                    public: false,
+                    internal: DeployInternalConfig { trace: None },
+                    bindings: vec![DeployBinding::Actor {
+                        binding: "CHAT".to_string(),
+                    }],
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let opened = service
+            .open_websocket(
+                "ws-reap".to_string(),
+                test_websocket_invocation("/ws", "ws-reap-open"),
+                None,
+            )
+            .await
+            .expect("websocket open should succeed");
+
+        let dump = service
+            .debug_dump("ws-reap".to_string())
+            .await
+            .expect("debug dump should exist");
+        let isolate_id = dump
+            .isolates
+            .first()
+            .map(|isolate| isolate.id)
+            .expect("websocket isolate should exist");
+        assert!(
+            service
+                .force_fail_isolate_for_test("ws-reap".to_string(), dump.generation, isolate_id)
+                .await
+        );
+
+        let error = service
+            .websocket_send_frame(
+                "ws-reap".to_string(),
+                opened.session_id,
+                b"after-fail".to_vec(),
+                false,
+            )
+            .await
+            .expect_err("reaped websocket session should fail promptly");
+        assert!(
+            error.to_string().contains("websocket session not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn websocket_session_survives_redeploy_while_old_generation_stays_live() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_millis(200),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        let deploy_config = DeployConfig {
+            public: false,
+            internal: DeployInternalConfig { trace: None },
+            bindings: vec![DeployBinding::Actor {
+                binding: "CHAT".to_string(),
+            }],
+        };
+
+        service
+            .deploy_with_config(
+                "ws-redeploy".to_string(),
+                websocket_storage_worker(),
+                deploy_config.clone(),
+            )
+            .await
+            .expect("initial deploy should succeed");
+
+        let opened = service
+            .open_websocket(
+                "ws-redeploy".to_string(),
+                test_websocket_invocation("/ws", "ws-redeploy-open"),
+                None,
+            )
+            .await
+            .expect("websocket open should succeed");
+
+        service
+            .deploy_with_config(
+                "ws-redeploy".to_string(),
+                websocket_storage_worker(),
+                deploy_config,
+            )
+            .await
+            .expect("redeploy should succeed");
+
+        sleep(Duration::from_millis(500)).await;
+
+        let echoed = service
+            .websocket_send_frame(
+                "ws-redeploy".to_string(),
+                opened.session_id.clone(),
+                b"after-redeploy".to_vec(),
+                false,
+            )
+            .await
+            .expect("old generation websocket should stay live");
+        assert_eq!(echoed.status, 204);
+        assert_eq!(
+            String::from_utf8(echoed.body).expect("utf8"),
+            r#"{"seen":"after-redeploy","count":1}"#
+        );
+
+        service
+            .websocket_close(
+                "ws-redeploy".to_string(),
                 opened.session_id,
                 1000,
                 "done".to_string(),
@@ -13222,6 +13746,14 @@ export default {
 
         assert_eq!(state.trace_calls, 2);
         assert!(state.total_calls >= 2);
+    }
+
+    #[test]
+    fn dynamic_host_rpc_fake_wake_path_is_removed_from_runtime_sources() {
+        let worker_runtime_source = include_str!("../js/execute_worker.js");
+
+        assert!(!worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_queue"));
+        assert!(worker_runtime_source.contains("__dd_run_dynamic_host_rpc_tasks"));
     }
 
     #[test]

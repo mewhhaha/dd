@@ -332,7 +332,7 @@ pub struct DynamicHostRpcBindingSpec {
 pub struct DynamicHostRpcInvokeEvent {
     pub caller_worker: String,
     pub caller_generation: u64,
-    pub caller_isolate_id: u64,
+    pub _caller_isolate_id: u64,
     pub binding: String,
     pub method_name: String,
     pub args: Vec<u8>,
@@ -2689,6 +2689,7 @@ fn op_dynamic_finish_local_host_rpc(
     queue.finish(payload);
     let profile = state.borrow::<DynamicProfile>().clone();
     profile.record_async_reply_completion();
+    profile.record_local_host_rpc_callback();
 }
 
 #[deno_core::op2]
@@ -3030,7 +3031,7 @@ fn op_dynamic_host_rpc_invoke(
             DynamicHostRpcInvokeEvent {
                 caller_worker,
                 caller_generation,
-                caller_isolate_id,
+                _caller_isolate_id: caller_isolate_id,
                 binding: payload.binding,
                 method_name: method_name.to_string(),
                 args: payload.args,

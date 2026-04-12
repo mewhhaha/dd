@@ -1,6 +1,131 @@
 use super::*;
 
 impl WorkerManager {
+    fn increment_websocket_session_count(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) -> Result<()> {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return Err(PlatformError::not_found("worker pool missing"));
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return Err(PlatformError::internal(
+                "websocket session owner isolate is unavailable",
+            ));
+        };
+        isolate.active_websocket_sessions += 1;
+        Ok(())
+    }
+
+    fn decrement_websocket_session_count(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return;
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return;
+        };
+        isolate.active_websocket_sessions = isolate.active_websocket_sessions.saturating_sub(1);
+    }
+
+    fn increment_transport_session_count(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) -> Result<()> {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return Err(PlatformError::not_found("worker pool missing"));
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return Err(PlatformError::internal(
+                "transport session owner isolate is unavailable",
+            ));
+        };
+        isolate.active_transport_sessions += 1;
+        Ok(())
+    }
+
+    fn decrement_transport_session_count(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return;
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return;
+        };
+        isolate.active_transport_sessions = isolate.active_transport_sessions.saturating_sub(1);
+    }
+
+    pub(super) fn reap_owned_sessions(
+        &mut self,
+        worker_name: &str,
+        generation: Option<u64>,
+        isolate_id: Option<u64>,
+    ) {
+        let websocket_session_ids = self
+            .websocket_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.worker_name == worker_name
+                    && generation
+                        .map(|value| session.generation == value)
+                        .unwrap_or(true)
+                    && isolate_id
+                        .map(|value| session.owner_isolate_id == value)
+                        .unwrap_or(true)
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in websocket_session_ids {
+            let _ = self.unregister_websocket_session(&session_id);
+        }
+
+        let transport_session_ids = self
+            .transport_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.worker_name == worker_name
+                    && generation
+                        .map(|value| session.generation == value)
+                        .unwrap_or(true)
+                    && isolate_id
+                        .map(|value| session.owner_isolate_id == value)
+                        .unwrap_or(true)
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in transport_session_ids {
+            let _ = self.unregister_transport_session(&session_id);
+        }
+    }
+
     pub(super) fn complete_websocket_open(
         &mut self,
         worker_name: &str,
@@ -58,23 +183,21 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         generation: u64,
-        _isolate_id: u64,
+        isolate_id: u64,
         session_id: &str,
         binding: &str,
         key: &str,
         handle: &str,
     ) -> Result<()> {
-        if self.get_pool_mut(worker_name, generation).is_none() {
-            return Err(PlatformError::not_found("worker pool missing"));
-        }
-
         if self.websocket_sessions.contains_key(session_id) {
             let _ = self.unregister_websocket_session(session_id);
         }
+        self.increment_websocket_session_count(worker_name, generation, isolate_id)?;
 
         let session = WorkerWebSocketSession {
             worker_name: worker_name.to_string(),
             generation,
+            owner_isolate_id: isolate_id,
             binding: binding.to_string(),
             key: key.to_string(),
             handle: handle.to_string(),
@@ -99,6 +222,11 @@ impl WorkerManager {
         session_id: &str,
     ) -> Option<WorkerWebSocketSession> {
         let session = self.websocket_sessions.remove(session_id)?;
+        self.decrement_websocket_session_count(
+            &session.worker_name,
+            session.generation,
+            session.owner_isolate_id,
+        );
         self.fail_websocket_frame_waiters(
             session_id,
             PlatformError::not_found("websocket session not found"),
@@ -127,6 +255,16 @@ impl WorkerManager {
         if remove_owner_key {
             self.websocket_open_handles.remove(&owner_key);
         }
+        let remove_pending_owner_key =
+            if let Some(by_handle) = self.websocket_pending_closes.get_mut(&owner_key) {
+                by_handle.remove(&session.handle);
+                by_handle.is_empty()
+            } else {
+                false
+            };
+        if remove_pending_owner_key {
+            self.websocket_pending_closes.remove(&owner_key);
+        }
 
         Some(session)
     }
@@ -135,7 +273,7 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         generation: u64,
-        _isolate_id: u64,
+        isolate_id: u64,
         session_id: &str,
         binding: &str,
         key: &str,
@@ -143,17 +281,15 @@ impl WorkerManager {
         stream_sender: mpsc::UnboundedSender<Vec<u8>>,
         datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<()> {
-        if self.get_pool_mut(worker_name, generation).is_none() {
-            return Err(PlatformError::not_found("worker pool missing"));
-        }
-
         if self.transport_sessions.contains_key(session_id) {
             let _ = self.unregister_transport_session(session_id);
         }
+        self.increment_transport_session_count(worker_name, generation, isolate_id)?;
 
         let session = WorkerTransportSession {
             worker_name: worker_name.to_string(),
             generation,
+            owner_isolate_id: isolate_id,
             binding: binding.to_string(),
             key: key.to_string(),
             handle: handle.to_string(),
@@ -183,6 +319,11 @@ impl WorkerManager {
         session_id: &str,
     ) -> Option<WorkerTransportSession> {
         let session = self.transport_sessions.remove(session_id)?;
+        self.decrement_transport_session_count(
+            &session.worker_name,
+            session.generation,
+            session.owner_isolate_id,
+        );
         self.transport_handle_index.remove(&actor_handle_key(
             &session.binding,
             &session.key,
@@ -206,6 +347,16 @@ impl WorkerManager {
             };
         if remove_owner_key {
             self.transport_open_handles.remove(&owner_key);
+        }
+        let remove_pending_owner_key =
+            if let Some(by_handle) = self.transport_pending_closes.get_mut(&owner_key) {
+                by_handle.remove(&session.handle);
+                by_handle.is_empty()
+            } else {
+                false
+            };
+        if remove_pending_owner_key {
+            self.transport_pending_closes.remove(&owner_key);
         }
 
         Some(session)
