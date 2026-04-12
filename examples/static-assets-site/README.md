@@ -9,13 +9,14 @@ This example shows the deploy-time asset flow:
 ## Deploy
 
 ```bash
-cargo run -p cli -- deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
+export DD_PRIVATE_TOKEN=dev-token
+cargo run -p cli -- --server http://127.0.0.1:8081 deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 
 If you are deploying into the Fly app through the private proxy:
 
 ```bash
-just fly-proxy
+just fly-proxy your-dd-app
 just fly-worker-deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 

@@ -1,112 +1,102 @@
 # Fly.io: Public Traffic + Private Deploy
 
-This package runs one `dd_server` process with two listeners:
+Fly runs one `dd_server` app process with two listeners:
 
-- public listener on `BIND_PUBLIC_ADDR` (`0.0.0.0:8080`)
-- private deploy listener on `BIND_PRIVATE_ADDR` (`[::]:8081`)
+- public traffic on `BIND_PUBLIC_ADDR` (`0.0.0.0:8080`)
+- private control plane on `BIND_PRIVATE_ADDR` (`[::]:8081`)
 
-Public internet traffic reaches port `8080` through Fly service routing.
-Deploy traffic stays private and is sent to port `8081` over WireGuard (`flyctl proxy`).
+Workers are deployed into that running app. They are not separate Fly apps.
 
-If you want to try the built-in Fly domain, set `PUBLIC_BASE_DOMAIN` to your app's
-`<app-name>.fly.dev` host.
+## Canonical flow
 
-## Important model
+1. deploy platform container with `flyctl deploy`
+2. open WireGuard tunnel to private port with `just fly-proxy <app>`
+3. deploy workers through that tunnel with `just fly-worker-deploy ...`
 
-On Fly there is one app process:
+Use direct worker-store writes only as recovery/maintenance escape hatch, not normal workflow.
 
-- app/container: `dd_server`
-- workers: deployed into that running app through the private deploy endpoint
-
-Workers are **not** separate Fly apps.
-
-That means:
-
-- `fly deploy` updates the `dd_server` binary/container
-- `dd deploy` uploads worker source/config into the running `dd_server`
-
-## 1) Create the app + volume
+## 1) Create app and volume
 
 ```bash
 flyctl apps create your-dd-app
 flyctl volumes create dd_store --region ams --size 1 --app your-dd-app
 ```
 
-This profile defaults to `ams` because it is EU and widely available.
-
-## 2) Deploy the platform
-
-From the repo root:
+## 2) Deploy platform
 
 ```bash
 flyctl deploy --app your-dd-app --config deploy/fly/fly.toml --remote-only --no-cache
 ```
 
-Or use the helper:
+Helper:
 
 ```bash
 just fly-deploy your-dd-app
 ```
 
-Use the Fly app default domain while iterating (`https://<app-name>.fly.dev`) once public ingress exists.
-
-The app keeps persistent data in `/app/store`:
+Persistent data lives under `/app/store`:
 
 - deployed worker source/config
-- KV/memory/sqlite files
-- cache blobs/indexes
+- KV and memory SQLite files
+- cache blobs and indexes
 
-## 3) Private deploy tunnel (bearer auth)
+## 3) Configure private auth
 
-Set shared private token before starting server and before using CLI/helpers:
+Set shared private token for both server and CLI/helpers:
 
 ```bash
 export DD_PRIVATE_TOKEN=replace-me-with-long-random-secret
 ```
 
-Use the helper to resolve the active machine IPv6 and proxy local deploy traffic:
+This value in docs is placeholder only. Replace it with fresh random secret.
 
-```bash
-./deploy/fly/proxy-private-deploy.sh your-dd-app 18081 8081
-```
-
-Or from the repo root:
+## 4) Open private tunnel
 
 ```bash
 just fly-proxy your-dd-app
 ```
 
-Then deploy workers to the private endpoint:
+Equivalent direct helper:
 
 ```bash
-cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.js
+./deploy/fly/proxy-private-deploy.sh your-dd-app 18081 8081
+```
+
+## 5) Deploy workers through tunnel
+
+Preferred helper:
+
+```bash
+just fly-worker-deploy hello examples/hello.js --public
+just fly-worker-deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
+```
+
+Equivalent raw CLI:
+
+```bash
+cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.js --public
 cargo run -p cli -- --server http://127.0.0.1:18081 deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 
-## 4) Public worker traffic
+## 6) Public routing
 
-Once a worker is deployed with `--public`, public internet traffic can reach it via host routing:
+Once deployed with `--public`, host routing maps subdomain to worker name:
 
 - `echo.example.com/* -> worker "echo"`
 
-For the built-in Fly domain:
+For built-in Fly hostname:
 
-- if app name is `your-dd-app`
 - set `PUBLIC_BASE_DOMAIN=your-dd-app.fly.dev`
-- then `https://echo.your-dd-app.fly.dev/` maps to worker `echo`
+- `https://echo.your-dd-app.fly.dev/` maps to worker `echo`
 
-Fly’s default app hostname itself (the apex) is not mapped to a worker and returns `404`.
+Fly app apex hostname itself is not mapped to worker and returns `404`.
 
-## 5) Custom domain + wildcard subdomains
-
-If you want `worker.yourdomain.com -> worker`, add certs + DNS:
+## 7) Custom domains
 
 ```bash
 flyctl certs add example.com --app your-dd-app
 flyctl certs add "*.example.com" --app your-dd-app
 ```
-
-Add DNS records at your DNS provider as instructed by `flyctl certs show`.
 
 Then set:
 
@@ -115,18 +105,14 @@ Then set:
 PUBLIC_BASE_DOMAIN = "example.com"
 ```
 
-Now:
+## Operations
 
-- `echo.example.com` -> worker `echo`
-- `chat.example.com` -> worker `chat`
+- redeploy platform: `just fly-deploy your-dd-app`
+- open tunnel: `just fly-proxy your-dd-app`
+- deploy worker through tunnel: `just fly-worker-deploy <name> <file> [flags...]`
+- invoke private worker: `cargo run -p cli -- --server http://127.0.0.1:18081 invoke <name> --method GET --path /`
 
-## 6) Operations
+Internal escape hatch:
 
-- redeploy platform:
-  - `just fly-deploy your-dd-app`
-- open private deploy proxy:
-  - `just fly-proxy your-dd-app`
-- deploy worker:
-  - `cargo run -p cli -- --server http://127.0.0.1:18081 deploy name file.js [--public]`
-- invoke private worker:
-  - `cargo run -p cli -- --server http://127.0.0.1:18081 invoke name --method GET --path /`
+- `just fly-worker-store-deploy ...` writes directly into persisted worker store and restarts machine
+- use only when normal private control plane path is unavailable

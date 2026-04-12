@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-default_app := "dd-private-8956e096"
+default_app := "your-dd-app"
 default_fly_config := "deploy/fly/fly.toml"
 default_private_server := "http://127.0.0.1:18081"
 
@@ -33,6 +33,6 @@ fly-worker-deploy name file +flags:
 fly-worker-deploy-at server name file +flags:
   ./deploy/fly/post-worker-deploy.sh {{server}} {{name}} {{file}} {{flags}}
 
-# Deploy a worker by writing directly into the persisted Fly worker store, then restarting the machine.
+# Internal escape hatch: write directly into persisted Fly worker store, then restart machine.
 fly-worker-store-deploy name file +flags:
   ./deploy/fly/store-worker-deploy.sh {{default_app}} {{name}} {{file}} {{flags}}

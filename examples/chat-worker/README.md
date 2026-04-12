@@ -14,13 +14,14 @@ This example is a small browser chat built with:
 ## Deploy
 
 ```bash
-cargo run -p cli -- deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
+export DD_PRIVATE_TOKEN=dev-token
+cargo run -p cli -- --server http://127.0.0.1:8081 deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
 ```
 
 If you are deploying into the Fly app through the private proxy:
 
 ```bash
-just fly-proxy
+just fly-proxy your-dd-app
 just fly-worker-deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
 ```
 

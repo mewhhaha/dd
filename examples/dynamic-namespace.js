@@ -71,7 +71,7 @@ export default {
           "./lib.js": CHILD_LIB,
         },
         env: {
-          API_TOKEN: "secret-from-parent-worker",
+          API_TOKEN: "placeholder-parent-token",
           API: new DemoApi(),
         },
         timeout: 2_000,
