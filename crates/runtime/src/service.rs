@@ -411,6 +411,7 @@ struct WorkerManager {
     dynamic_worker_handles: HashMap<String, DynamicWorkerHandle>,
     dynamic_worker_ids: HashMap<DynamicWorkerIdKey, HashMap<String, String>>,
     host_rpc_providers: HashMap<String, HostRpcProvider>,
+    dynamic_host_rpc_tasks: HashMap<String, DynamicHostRpcTaskState>,
     dynamic_profile: crate::ops::DynamicProfile,
     validated_worker_sources: HashSet<[u8; 32]>,
     dynamic_worker_snapshots: HashMap<[u8; 32], &'static [u8]>,
@@ -447,6 +448,25 @@ struct HostRpcProvider {
     owner_isolate_id: u64,
     target_id: String,
     methods: HashSet<String>,
+}
+
+struct DynamicHostRpcTaskState {
+    provider_worker: String,
+    provider_generation: u64,
+    provider_isolate_id: u64,
+    reply: DynamicHostRpcTaskReply,
+}
+
+enum DynamicHostRpcTaskReply {
+    Dynamic {
+        reply_id: String,
+        pending_replies: crate::ops::DynamicPendingReplies,
+    },
+    Test {
+        reply_id: String,
+        replies: crate::ops::TestAsyncReplies,
+        success_value: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -663,7 +683,6 @@ enum DispatchSelection {
 struct IsolateHandle {
     id: u64,
     sender: std_mpsc::Sender<IsolateCommand>,
-    dynamic_host_rpc_queue: crate::ops::DynamicLocalHostRpcQueue,
     inflight_count: usize,
     active_websocket_sessions: usize,
     active_transport_sessions: usize,
@@ -698,7 +717,15 @@ enum IsolateCommand {
     Abort {
         runtime_request_id: String,
     },
-    RunDynamicHostRpcTasks,
+    DeliverDynamicReply {
+        payload_json: Arc<str>,
+    },
+    RunDynamicHostRpcTask {
+        task_id: String,
+        target_id: String,
+        method_name: String,
+        args: Vec<u8>,
+    },
     PollEventLoop,
     Shutdown,
 }
@@ -876,6 +903,20 @@ enum RuntimeEvent {
     DynamicWorkerDelete(crate::ops::DynamicWorkerDeleteEvent),
     DynamicWorkerInvoke(crate::ops::DynamicWorkerInvokeEvent),
     DynamicHostRpcInvoke(crate::ops::DynamicHostRpcInvokeEvent),
+    DynamicReplyReady(crate::ops::DynamicPendingReplyDelivery),
+    DynamicHostRpcTaskComplete {
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+        payload: crate::ops::DynamicHostRpcTaskCompletePayload,
+    },
+    TestAsyncReply(crate::ops::TestAsyncReplyEvent),
+    TestNestedTargetedInvoke(crate::ops::TestNestedTargetedInvokeEvent),
+    TestAsyncReplyComplete {
+        reply_id: String,
+        replies: crate::ops::TestAsyncReplies,
+        result: Result<String>,
+    },
     DynamicTimeoutDiagnostic(DynamicTimeoutDiagnostic),
     IsolateFailed {
         worker_name: String,
@@ -1749,6 +1790,7 @@ impl WorkerManager {
             dynamic_worker_handles: HashMap::new(),
             dynamic_worker_ids: HashMap::new(),
             host_rpc_providers: HashMap::new(),
+            dynamic_host_rpc_tasks: HashMap::new(),
             dynamic_profile: crate::ops::DynamicProfile::default(),
             validated_worker_sources: HashSet::new(),
             dynamic_worker_snapshots: HashMap::new(),
@@ -2204,6 +2246,40 @@ impl WorkerManager {
             }
             RuntimeEvent::DynamicHostRpcInvoke(payload) => {
                 self.handle_dynamic_host_rpc_invoke(payload, event_tx);
+            }
+            RuntimeEvent::DynamicReplyReady(delivery) => {
+                self.deliver_isolate_reply(
+                    &delivery.owner.worker_name,
+                    delivery.owner.generation,
+                    delivery.owner.isolate_id,
+                    &delivery.payload,
+                );
+            }
+            RuntimeEvent::DynamicHostRpcTaskComplete {
+                worker_name,
+                generation,
+                isolate_id,
+                payload,
+            } => {
+                self.handle_dynamic_host_rpc_task_complete(
+                    &worker_name,
+                    generation,
+                    isolate_id,
+                    payload,
+                );
+            }
+            RuntimeEvent::TestAsyncReply(payload) => {
+                self.handle_test_async_reply(payload, event_tx);
+            }
+            RuntimeEvent::TestNestedTargetedInvoke(payload) => {
+                self.handle_test_nested_targeted_invoke(payload, event_tx);
+            }
+            RuntimeEvent::TestAsyncReplyComplete {
+                reply_id,
+                replies,
+                result,
+            } => {
+                self.complete_test_async_reply(reply_id, replies, result);
             }
             RuntimeEvent::DynamicTimeoutDiagnostic(payload) => {
                 self.log_dynamic_timeout_diagnostic(payload);
@@ -3700,6 +3776,7 @@ impl WorkerManager {
         isolate_id: u64,
         error: PlatformError,
     ) {
+        self.fail_dynamic_host_rpc_tasks_for_provider(worker_name, generation, isolate_id);
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
         for (request_id, reply) in failed {
             self.clear_revalidation_for_request(&request_id);
@@ -4341,6 +4418,323 @@ impl WorkerManager {
             target_dump = ?target_dump,
             "dynamic invoke timeout diagnostic"
         );
+    }
+
+    fn handle_test_async_reply(
+        &mut self,
+        payload: crate::ops::TestAsyncReplyEvent,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let result = if payload.ok {
+            Ok(payload.value)
+        } else {
+            Err(PlatformError::runtime(if payload.error.trim().is_empty() {
+                "test async reply failed".to_string()
+            } else {
+                payload.error
+            }))
+        };
+        if payload.delay_ms == 0 {
+            self.complete_test_async_reply(payload.reply_id, payload.replies, result);
+            return;
+        }
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(payload.delay_ms)).await;
+            let _ = event_tx.send(RuntimeEvent::TestAsyncReplyComplete {
+                reply_id: payload.reply_id,
+                replies: payload.replies,
+                result,
+            });
+        });
+    }
+
+    fn handle_test_nested_targeted_invoke(
+        &mut self,
+        payload: crate::ops::TestNestedTargetedInvokeEvent,
+        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let Some(pool) = self.get_pool_mut(&payload.worker_name, payload.generation) else {
+            self.complete_test_async_reply(
+                payload.reply_id,
+                payload.replies,
+                Err(PlatformError::runtime(
+                    "test nested invoke worker pool is unavailable",
+                )),
+            );
+            return;
+        };
+
+        let target_isolate_id = match payload.target_mode.trim() {
+            "same" | "" => Some(payload.caller_isolate_id),
+            "other" => pool
+                .isolates
+                .iter()
+                .find(|isolate| isolate.id != payload.caller_isolate_id)
+                .map(|isolate| isolate.id),
+            mode => {
+                self.complete_test_async_reply(
+                    payload.reply_id,
+                    payload.replies,
+                    Err(PlatformError::runtime(format!(
+                        "unknown test nested target mode: {mode}"
+                    ))),
+                );
+                return;
+            }
+        };
+        let Some(target_isolate_id) = target_isolate_id else {
+            self.complete_test_async_reply(
+                payload.reply_id,
+                payload.replies,
+                Err(PlatformError::runtime(
+                    "test nested invoke target isolate is unavailable",
+                )),
+            );
+            return;
+        };
+
+        let Some(sender) = self
+            .workers
+            .get(&payload.worker_name)
+            .and_then(|entry| entry.pools.get(&payload.generation))
+            .and_then(|pool| {
+                pool.isolates
+                    .iter()
+                    .find(|isolate| isolate.id == target_isolate_id)
+                    .map(|isolate| isolate.sender.clone())
+            })
+        else {
+            self.complete_test_async_reply(
+                payload.reply_id,
+                payload.replies,
+                Err(PlatformError::runtime(
+                    "test nested invoke target isolate sender is unavailable",
+                )),
+            );
+            return;
+        };
+
+        let task_id = format!("test-dhrpc-{}", Uuid::new_v4().simple());
+        self.dynamic_host_rpc_tasks.insert(
+            task_id.clone(),
+            DynamicHostRpcTaskState {
+                provider_worker: payload.worker_name.clone(),
+                provider_generation: payload.generation,
+                provider_isolate_id: target_isolate_id,
+                reply: DynamicHostRpcTaskReply::Test {
+                    reply_id: payload.reply_id,
+                    replies: payload.replies,
+                    success_value: format!("ok:{target_isolate_id}"),
+                },
+            },
+        );
+        if sender
+            .send(IsolateCommand::RunDynamicHostRpcTask {
+                task_id: task_id.clone(),
+                target_id: payload.target_id,
+                method_name: payload.method_name,
+                args: payload.args,
+            })
+            .is_ok()
+        {
+            return;
+        }
+        if let Some(task) = self.dynamic_host_rpc_tasks.remove(&task_id) {
+            match task.reply {
+                DynamicHostRpcTaskReply::Dynamic {
+                    reply_id,
+                    pending_replies,
+                } => {
+                    self.finish_dynamic_reply(
+                        pending_replies,
+                        reply_id,
+                        crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
+                            PlatformError::runtime(
+                                "test nested invoke target isolate is unavailable",
+                            ),
+                        )),
+                    );
+                }
+                DynamicHostRpcTaskReply::Test {
+                    reply_id,
+                    replies,
+                    success_value: _,
+                } => {
+                    self.complete_test_async_reply(
+                        reply_id,
+                        replies,
+                        Err(PlatformError::runtime(
+                            "test nested invoke target isolate is unavailable",
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    fn complete_test_async_reply(
+        &mut self,
+        reply_id: String,
+        replies: crate::ops::TestAsyncReplies,
+        result: Result<String>,
+    ) {
+        let Some(delivery) = replies.finish(reply_id, result) else {
+            return;
+        };
+        self.deliver_isolate_reply(
+            &delivery.owner.worker_name,
+            delivery.owner.generation,
+            delivery.owner.isolate_id,
+            &delivery.payload,
+        );
+    }
+
+    fn finish_dynamic_reply(
+        &mut self,
+        pending_replies: crate::ops::DynamicPendingReplies,
+        reply_id: String,
+        payload: crate::ops::DynamicPendingReplyPayload,
+    ) {
+        let Some(delivery) = pending_replies.finish(reply_id, payload) else {
+            return;
+        };
+        self.deliver_isolate_reply(
+            &delivery.owner.worker_name,
+            delivery.owner.generation,
+            delivery.owner.isolate_id,
+            &delivery.payload,
+        );
+    }
+
+    fn deliver_isolate_reply<T: Serialize>(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        payload: &T,
+    ) {
+        let Some(sender) = self
+            .workers
+            .get(worker_name)
+            .and_then(|entry| entry.pools.get(&generation))
+            .and_then(|pool| {
+                pool.isolates
+                    .iter()
+                    .find(|isolate| isolate.id == isolate_id)
+                    .map(|isolate| isolate.sender.clone())
+            })
+        else {
+            return;
+        };
+        let Ok(payload_json) = serde_json::to_string(payload) else {
+            return;
+        };
+        let _ = sender.send(IsolateCommand::DeliverDynamicReply {
+            payload_json: Arc::<str>::from(payload_json),
+        });
+    }
+
+    fn fail_dynamic_host_rpc_tasks_for_provider(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) {
+        let task_ids = self
+            .dynamic_host_rpc_tasks
+            .iter()
+            .filter(|(_, task)| {
+                task.provider_worker == worker_name
+                    && task.provider_generation == generation
+                    && task.provider_isolate_id == isolate_id
+            })
+            .map(|(task_id, _)| task_id.clone())
+            .collect::<Vec<_>>();
+        for task_id in task_ids {
+            let Some(task) = self.dynamic_host_rpc_tasks.remove(&task_id) else {
+                continue;
+            };
+            match task.reply {
+                DynamicHostRpcTaskReply::Dynamic {
+                    reply_id,
+                    pending_replies,
+                } => {
+                    self.finish_dynamic_reply(
+                        pending_replies,
+                        reply_id,
+                        crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
+                            PlatformError::runtime(
+                                "dynamic host rpc provider isolate is unavailable",
+                            ),
+                        )),
+                    );
+                }
+                DynamicHostRpcTaskReply::Test {
+                    reply_id,
+                    replies,
+                    success_value: _,
+                } => {
+                    self.complete_test_async_reply(
+                        reply_id,
+                        replies,
+                        Err(PlatformError::runtime(
+                            "dynamic host rpc provider isolate is unavailable",
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_dynamic_host_rpc_task_complete(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        payload: crate::ops::DynamicHostRpcTaskCompletePayload,
+    ) {
+        let Some(task) = self.dynamic_host_rpc_tasks.remove(payload.task_id.trim()) else {
+            return;
+        };
+        if task.provider_worker != worker_name
+            || task.provider_generation != generation
+            || task.provider_isolate_id != isolate_id
+        {
+            return;
+        }
+        let result = if payload.ok {
+            Ok(payload.value)
+        } else {
+            Err(PlatformError::runtime(if payload.error.trim().is_empty() {
+                "dynamic host rpc task failed".to_string()
+            } else {
+                payload.error
+            }))
+        };
+        match task.reply {
+            DynamicHostRpcTaskReply::Dynamic {
+                reply_id,
+                pending_replies,
+            } => {
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::HostRpc(result),
+                );
+            }
+            DynamicHostRpcTaskReply::Test {
+                reply_id,
+                replies,
+                success_value,
+            } => {
+                let string_result = match result {
+                    Ok(_) => Ok(success_value),
+                    Err(error) => Err(error),
+                };
+                self.complete_test_async_reply(reply_id, replies, string_result);
+            }
+        }
     }
 
     fn resolve_asset(
@@ -5014,6 +5408,20 @@ fn handle_isolate_event_payload(
         IsolateEventPayload::DynamicHostRpcInvoke(payload) => {
             let _ = event_tx.send(RuntimeEvent::DynamicHostRpcInvoke(payload));
         }
+        IsolateEventPayload::DynamicHostRpcTaskComplete(payload) => {
+            let _ = event_tx.send(RuntimeEvent::DynamicHostRpcTaskComplete {
+                worker_name: worker_name.to_string(),
+                generation,
+                isolate_id,
+                payload,
+            });
+        }
+        IsolateEventPayload::TestAsyncReply(payload) => {
+            let _ = event_tx.send(RuntimeEvent::TestAsyncReply(payload));
+        }
+        IsolateEventPayload::TestNestedTargetedInvoke(payload) => {
+            let _ = event_tx.send(RuntimeEvent::TestNestedTargetedInvoke(payload));
+        }
     }
 }
 
@@ -5033,8 +5441,6 @@ fn spawn_isolate_thread(
 ) -> Result<IsolateHandle> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
-    let dynamic_host_rpc_queue = crate::ops::DynamicLocalHostRpcQueue::default();
-    let dynamic_host_rpc_queue_for_thread = dynamic_host_rpc_queue.clone();
     let event_loop_waker = Waker::from(Arc::new(IsolateEventLoopWaker {
         sender: command_tx.clone(),
     }));
@@ -5074,7 +5480,7 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::ActorRequestScopes::default());
                     op_state.put(crate::ops::RequestSecretContexts::default());
                     op_state.put(crate::ops::DynamicPendingReplies::default());
-                    op_state.put(dynamic_host_rpc_queue_for_thread.clone());
+                    op_state.put(crate::ops::TestAsyncReplies::default());
                     op_state.put(dynamic_profile.clone());
                 }
                 {
@@ -5183,7 +5589,6 @@ fn spawn_isolate_thread(
         Ok(Ok(())) => Ok(IsolateHandle {
             id: isolate_id,
             sender: command_tx,
-            dynamic_host_rpc_queue,
             inflight_count: 0,
             active_websocket_sessions: 0,
             active_transport_sessions: 0,
@@ -5439,13 +5844,61 @@ fn handle_isolate_command(
             abort_worker_request(js_runtime, &runtime_request_id)?;
             Ok(true)
         }
-        IsolateCommand::RunDynamicHostRpcTasks => {
+        IsolateCommand::DeliverDynamicReply { payload_json } => {
+            let script = format!(
+                "(() => {{
+                    const deliver = globalThis.__dd_deliver_dynamic_reply;
+                    if (typeof deliver !== \"function\") {{
+                      throw new Error(\"dynamic reply delivery helper missing\");
+                    }}
+                    deliver({payload_json});
+                  }})()"
+            );
             js_runtime
-                .execute_script(
-                    "<dd:dynamic-host-rpc-tasks>",
-                    "void Promise.resolve(globalThis.__dd_run_dynamic_host_rpc_tasks?.()).catch(() => undefined);",
-                )
+                .execute_script("<dd:dynamic-reply-delivery>", script)
                 .map_err(|error| PlatformError::internal(error.to_string()))?;
+            {
+                let op_state = js_runtime.op_state();
+                op_state.borrow().waker.wake();
+            }
+            Ok(true)
+        }
+        IsolateCommand::RunDynamicHostRpcTask {
+            task_id,
+            target_id,
+            method_name,
+            args,
+        } => {
+            let task_json = serde_json::to_string(&serde_json::json!({
+                "task_id": task_id,
+                "target_id": target_id,
+                "method_name": method_name,
+                "args": args,
+            }))
+            .map_err(|error| PlatformError::internal(error.to_string()))?;
+            let script = format!(
+                "(() => {{
+                    const runTask = globalThis.__dd_run_dynamic_host_rpc_task;
+                    if (typeof runTask !== \"function\") {{
+                      throw new Error(\"dynamic host rpc task helper missing\");
+                    }}
+                    void Promise.resolve(runTask({task_json})).catch((error) => {{
+                      Deno.core.ops.op_dynamic_host_rpc_task_complete({{
+                        task_id: {task_id:?},
+                        ok: false,
+                        value: [],
+                        error: String(error?.message ?? error ?? \"dynamic host rpc task failed\"),
+                      }});
+                    }});
+                  }})()"
+            );
+            js_runtime
+                .execute_script("<dd:dynamic-host-rpc-task>", script)
+                .map_err(|error| PlatformError::internal(error.to_string()))?;
+            {
+                let op_state = js_runtime.op_state();
+                op_state.borrow().waker.wake();
+            }
             Ok(true)
         }
         IsolateCommand::PollEventLoop => Ok(true),
@@ -6019,6 +6472,174 @@ export default {
       timeout: 1_500,
     }));
     return child.fetch("http://worker/");
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_wake_probe_worker() -> String {
+        r#"
+class ProbeTarget extends RpcTarget {
+  async ping() {
+    return "ok";
+  }
+}
+
+function ensureProvider() {
+  const targetId = "probe-target";
+  globalThis.__dd_probe_provider_id = targetId;
+  if (globalThis.__dd_host_rpc_targets.has(targetId)) {
+    return targetId;
+  }
+  globalThis.__dd_host_rpc_targets.set(targetId, new ProbeTarget());
+  return targetId;
+}
+
+function testReplyFailure(error) {
+  return {
+    ok: false,
+    value: "",
+    error: String(error?.message ?? error ?? "test async reply failed"),
+  };
+}
+
+async function waitTestReply(runtimeRequestId, started, timeoutMs) {
+  const waitReply = globalThis.__dd_await_dynamic_reply;
+  if (typeof waitReply !== "function") {
+    throw new Error("dynamic reply helper missing");
+  }
+  const actualReplyId = String(started?.reply_id ?? "").trim();
+  if (!actualReplyId) {
+    return testReplyFailure(started?.error ?? "test reply failed to start");
+  }
+  const timeoutStarted = Deno.core.ops.op_test_async_reply_start({
+    request_id: runtimeRequestId,
+    delay_ms: timeoutMs,
+    ok: false,
+    error: `test async reply timed out after ${timeoutMs}ms`,
+  });
+  const timeoutReplyId = String(timeoutStarted?.reply_id ?? "").trim();
+  try {
+    const raced = await Promise.race([
+      waitReply("test async reply", () => started, timeoutMs + 1_000).then((value) => ({
+        kind: "actual",
+        value,
+      })),
+      waitReply("test async timeout", () => timeoutStarted, timeoutMs + 1_000).then((value) => ({
+        kind: "timeout",
+        value,
+      })),
+    ]);
+    if (raced.kind === "actual") {
+      if (timeoutReplyId) {
+        Deno.core.ops.op_test_async_reply_cancel(timeoutReplyId);
+      }
+      return raced.value;
+    }
+    if (actualReplyId) {
+      Deno.core.ops.op_test_async_reply_cancel(actualReplyId);
+    }
+    return raced.value;
+  } catch (error) {
+    if (actualReplyId) {
+      Deno.core.ops.op_test_async_reply_cancel(actualReplyId);
+    }
+    if (timeoutReplyId) {
+      Deno.core.ops.op_test_async_reply_cancel(timeoutReplyId);
+    }
+    return testReplyFailure(error);
+  }
+}
+
+function testReplyResponse(result, fallbackStatus = 500) {
+  if (result && typeof result === "object" && result.ok === true) {
+    return new Response(String(result.value ?? ""), { status: 200 });
+  }
+  const error = String(result?.error ?? "test reply failed");
+  return new Response(error, { status: fallbackStatus });
+}
+
+export default {
+  async fetch(request, _env, ctx) {
+    const url = new URL(request.url);
+    const runtimeRequestId = String(globalThis.__dd_get_runtime_request_id?.() ?? "").trim();
+
+    if (url.pathname === "/async/immediate") {
+      const result = await waitTestReply(
+        runtimeRequestId,
+        Deno.core.ops.op_test_async_reply_start({
+          request_id: runtimeRequestId,
+          value: "immediate",
+        }),
+        250,
+      );
+      return testReplyResponse(result);
+    }
+
+    if (url.pathname === "/async/delayed") {
+      const result = await waitTestReply(
+        runtimeRequestId,
+        Deno.core.ops.op_test_async_reply_start({
+          request_id: runtimeRequestId,
+          delay_ms: 25,
+          value: "delayed",
+        }),
+        1_000,
+      );
+      return testReplyResponse(result);
+    }
+
+    if (url.pathname === "/async/timeout") {
+      const result = await waitTestReply(
+        runtimeRequestId,
+        Deno.core.ops.op_test_async_reply_start({
+          request_id: runtimeRequestId,
+          delay_ms: 200,
+          value: "late",
+        }),
+        25,
+      );
+      return testReplyResponse(result, 504);
+    }
+
+    if (url.pathname === "/warm-provider") {
+      ensureProvider();
+      const holdMs = Math.max(0, Math.trunc(Number(url.searchParams.get("hold") ?? "0") || 0));
+      if (holdMs > 0) {
+        const hold = await waitTestReply(
+          runtimeRequestId,
+          Deno.core.ops.op_test_async_reply_start({
+            request_id: runtimeRequestId,
+            delay_ms: holdMs,
+            value: "warm",
+          }),
+          holdMs + 1_000,
+        );
+        if (!hold || typeof hold !== "object" || hold.ok !== true) {
+          return testReplyResponse(hold);
+        }
+      }
+      return new Response("warm");
+    }
+
+    if (url.pathname === "/nested/same" || url.pathname === "/nested/other") {
+      const targetId = ensureProvider();
+      const result = await waitTestReply(
+        runtimeRequestId,
+        Deno.core.ops.op_test_nested_targeted_invoke_start({
+          request_id: runtimeRequestId,
+          target_mode: url.pathname.endsWith("/other") ? "other" : "same",
+          target_id: targetId,
+          method_name: "ping",
+          args: Array.from(new Uint8Array(await globalThis.__dd_encode_rpc_args([]))),
+        }),
+        1_000,
+      );
+      return testReplyResponse(result);
+    }
+
+    return new Response("not found", { status: 404 });
   },
 };
 "#
@@ -9478,6 +10099,172 @@ https://:sub.example.com/a.js
         )
         .await;
         assert_eq!(String::from_utf8(ids_after.body).expect("utf8"), "[]");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_test_async_reply_immediate_completion_resumes_request() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy(
+                "dynamic-wake-probe".to_string(),
+                dynamic_wake_probe_worker(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-wake-probe",
+            test_invocation_with_path("/async/immediate", "dyn-wake-immediate"),
+            "dynamic test async immediate",
+        )
+        .await;
+        assert_eq!(output.status, 200);
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "immediate");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_test_async_reply_delayed_completion_resumes_after_yield() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy(
+                "dynamic-wake-probe".to_string(),
+                dynamic_wake_probe_worker(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-wake-probe",
+            test_invocation_with_path("/async/delayed", "dyn-wake-delayed"),
+            "dynamic test async delayed",
+        )
+        .await;
+        assert_eq!(output.status, 200);
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "delayed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_test_async_reply_timeout_surfaces_explicit_error() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy(
+                "dynamic-wake-probe".to_string(),
+                dynamic_wake_probe_worker(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-wake-probe",
+            test_invocation_with_path("/async/timeout", "dyn-wake-timeout"),
+            "dynamic test async timeout",
+        )
+        .await;
+        assert_eq!(output.status, 504);
+        assert_eq!(
+            String::from_utf8(output.body).expect("utf8"),
+            "test async reply timed out after 25ms"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_test_nested_targeted_invoke_completes_on_same_isolate() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy(
+                "dynamic-wake-probe".to_string(),
+                dynamic_wake_probe_worker(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let warm = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-wake-probe",
+            test_invocation_with_path("/warm-provider", "dyn-nested-same-warm"),
+            "dynamic test nested same warm",
+        )
+        .await;
+        assert_eq!(warm.status, 200);
+
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-wake-probe",
+            test_invocation_with_path("/nested/same", "dyn-nested-same"),
+            "dynamic test nested same",
+        )
+        .await;
+        let body = String::from_utf8(output.body).expect("utf8");
+        assert_eq!(output.status, 200, "{body}");
+        assert!(body.starts_with("ok:"), "{body}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_test_nested_targeted_invoke_completes_across_isolates() {
+        let service = test_service(RuntimeConfig {
+            min_isolates: 2,
+            max_isolates: 2,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        })
+        .await;
+
+        service
+            .deploy(
+                "dynamic-wake-probe".to_string(),
+                dynamic_wake_probe_worker(),
+            )
+            .await
+            .expect("deploy should succeed");
+
+        let mut warm_tasks = Vec::new();
+        for idx in 0..4 {
+            let service = service.clone();
+            warm_tasks.push(tokio::spawn(async move {
+                invoke_with_timeout_and_dump(
+                    &service,
+                    "dynamic-wake-probe",
+                    test_invocation_with_path(
+                        "/warm-provider?hold=50",
+                        &format!("dyn-nested-other-warm-{idx}"),
+                    ),
+                    &format!("dynamic test nested other warm {idx}"),
+                )
+                .await
+            }));
+        }
+        for task in warm_tasks {
+            let output = task.await.expect("join");
+            assert_eq!(output.status, 200);
+        }
+        wait_for_isolate_total(&service, "dynamic-wake-probe", 2).await;
+
+        let output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-wake-probe",
+            test_invocation_with_path("/nested/other", "dyn-nested-other"),
+            "dynamic test nested other",
+        )
+        .await;
+        let body = String::from_utf8(output.body).expect("utf8");
+        assert_eq!(output.status, 200, "{body}");
+        assert!(body.starts_with("ok:"));
+        assert_ne!(body, "ok:1");
     }
 
     #[tokio::test]
@@ -13753,7 +14540,10 @@ export default {
         let worker_runtime_source = include_str!("../js/execute_worker.js");
 
         assert!(!worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_queue"));
-        assert!(worker_runtime_source.contains("__dd_run_dynamic_host_rpc_tasks"));
+        assert!(!worker_runtime_source.contains("__dd_run_dynamic_host_rpc_tasks"));
+        assert!(!worker_runtime_source.contains("op_dynamic_take_reply"));
+        assert!(worker_runtime_source.contains("__dd_deliver_dynamic_reply"));
+        assert!(worker_runtime_source.contains("__dd_run_dynamic_host_rpc_task"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -157,6 +157,9 @@ pub enum IsolateEventPayload {
     DynamicWorkerDelete(DynamicWorkerDeleteEvent),
     DynamicWorkerInvoke(DynamicWorkerInvokeEvent),
     DynamicHostRpcInvoke(DynamicHostRpcInvokeEvent),
+    DynamicHostRpcTaskComplete(DynamicHostRpcTaskCompletePayload),
+    TestAsyncReply(TestAsyncReplyEvent),
+    TestNestedTargetedInvoke(TestNestedTargetedInvokeEvent),
 }
 
 pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
@@ -340,16 +343,59 @@ pub struct DynamicHostRpcInvokeEvent {
     pub pending_replies: DynamicPendingReplies,
 }
 
+pub struct TestAsyncReplyEvent {
+    pub reply_id: String,
+    pub replies: TestAsyncReplies,
+    pub delay_ms: u64,
+    pub ok: bool,
+    pub value: String,
+    pub error: String,
+}
+
+#[derive(Clone)]
+pub struct TestAsyncReplyOwner {
+    pub worker_name: String,
+    pub generation: u64,
+    pub isolate_id: u64,
+}
+
+pub struct TestNestedTargetedInvokeEvent {
+    pub worker_name: String,
+    pub generation: u64,
+    pub caller_isolate_id: u64,
+    pub target_mode: String,
+    pub target_id: String,
+    pub method_name: String,
+    pub args: Vec<u8>,
+    pub reply_id: String,
+    pub replies: TestAsyncReplies,
+}
+
 #[derive(Clone, Default)]
 pub struct DynamicPendingReplies {
     entries: Arc<StdMutex<HashMap<String, DynamicPendingReplyEntry>>>,
     next_id: Arc<AtomicU64>,
 }
 
+#[derive(Clone, Default)]
+pub struct TestAsyncReplies {
+    entries: Arc<StdMutex<HashMap<String, TestAsyncReplyEntry>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+struct TestAsyncReplyEntry {
+    owner: TestAsyncReplyOwner,
+}
+
+#[derive(Clone)]
+pub struct DynamicPendingReplyOwner {
+    pub worker_name: String,
+    pub generation: u64,
+    pub isolate_id: u64,
+}
+
 struct DynamicPendingReplyEntry {
-    notify: Arc<Notify>,
-    payload: Option<DynamicPendingReplyPayload>,
-    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    owner: DynamicPendingReplyOwner,
 }
 
 pub enum DynamicPendingReplyPayload {
@@ -361,55 +407,14 @@ pub enum DynamicPendingReplyPayload {
     HostRpc(Result<Vec<u8>>),
 }
 
-#[derive(Clone, Default)]
-pub struct DynamicLocalHostRpcQueue {
-    pending: Arc<StdMutex<VecDeque<DynamicLocalHostRpcTask>>>,
-    inflight: Arc<StdMutex<HashMap<String, DynamicLocalHostRpcInflight>>>,
-    next_id: Arc<AtomicU64>,
-}
-
-struct DynamicLocalHostRpcTask {
-    task_id: String,
-    target_id: String,
-    method_name: String,
-    args: Vec<u8>,
-    reply_id: String,
-    pending_replies: DynamicPendingReplies,
-}
-
-struct DynamicLocalHostRpcInflight {
-    reply_id: String,
-    pending_replies: DynamicPendingReplies,
+pub struct DynamicPendingReplyDelivery {
+    pub owner: DynamicPendingReplyOwner,
+    pub payload: DynamicPendingReplyResult,
 }
 
 #[derive(Serialize)]
-struct DynamicLocalHostRpcTakeResult {
-    ready: bool,
-    task_id: String,
-    target_id: String,
-    method_name: String,
-    args: Vec<u8>,
-}
-
-#[derive(Deserialize)]
-struct DynamicLocalHostRpcFinishPayload {
-    task_id: String,
-    ok: bool,
-    #[serde(default)]
-    value: Vec<u8>,
-    #[serde(default)]
-    error: String,
-}
-
-#[derive(Serialize)]
-struct DynamicPendingReplyStartResult {
-    ok: bool,
-    reply_id: String,
-    error: String,
-}
-
-#[derive(Serialize)]
-struct DynamicPendingReplyPollResult {
+pub struct DynamicPendingReplyResult {
+    pub reply_id: String,
     ready: bool,
     kind: String,
     ok: bool,
@@ -426,9 +431,35 @@ struct DynamicPendingReplyPollResult {
     error: String,
 }
 
-impl Default for DynamicPendingReplyPollResult {
+#[derive(Deserialize)]
+pub struct DynamicHostRpcTaskCompletePayload {
+    pub task_id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub value: Vec<u8>,
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Serialize)]
+struct DynamicPendingReplyStartResult {
+    ok: bool,
+    reply_id: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+pub struct TestAsyncReplyResult {
+    pub reply_id: String,
+    pub ok: bool,
+    pub value: String,
+    pub error: String,
+}
+
+impl Default for DynamicPendingReplyResult {
     fn default() -> Self {
         Self {
+            reply_id: String::new(),
             ready: false,
             kind: String::new(),
             ok: false,
@@ -448,20 +479,13 @@ impl Default for DynamicPendingReplyPollResult {
 }
 
 impl DynamicPendingReplies {
-    pub fn allocate(&self) -> String {
+    pub fn allocate(&self, owner: DynamicPendingReplyOwner) -> String {
         let reply_id = format!("dynr-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut entries = self
             .entries
             .lock()
             .expect("dynamic pending reply lock poisoned");
-        entries.insert(
-            reply_id.clone(),
-            DynamicPendingReplyEntry {
-                notify: Arc::new(Notify::new()),
-                payload: None,
-                wake: None,
-            },
-        );
+        entries.insert(reply_id.clone(), DynamicPendingReplyEntry { owner });
         reply_id
     }
 
@@ -473,70 +497,49 @@ impl DynamicPendingReplies {
         entries.remove(reply_id);
     }
 
-    pub fn finish(&self, reply_id: String, payload: DynamicPendingReplyPayload) {
+    pub fn finish(
+        &self,
+        reply_id: String,
+        payload: DynamicPendingReplyPayload,
+    ) -> Option<DynamicPendingReplyDelivery> {
         let mut entries = self
             .entries
             .lock()
             .expect("dynamic pending reply lock poisoned");
-        if let Some(entry) = entries.get_mut(&reply_id) {
-            entry.payload = Some(payload);
-            if let Some(wake) = entry.wake.take() {
-                wake();
-            }
-            entry.notify.notify_waiters();
-        }
-    }
-
-    fn poll(&self, reply_id: &str) -> DynamicPendingReplyPollResult {
-        let mut entries = self
-            .entries
-            .lock()
-            .expect("dynamic pending reply lock poisoned");
-        let Some(entry) = entries.get(reply_id) else {
-            return DynamicPendingReplyPollResult {
-                ready: true,
-                kind: "unknown".to_string(),
-                ok: false,
-                error: "dynamic reply id not found".to_string(),
-                ..DynamicPendingReplyPollResult::default()
-            };
-        };
-        if entry.payload.is_none() {
-            return DynamicPendingReplyPollResult::default();
-        }
-        match entries.remove(reply_id) {
-            Some(entry) => entry
-                .payload
-                .map(DynamicPendingReplyPayload::into_poll_result)
-                .unwrap_or_default(),
-            None => DynamicPendingReplyPollResult::default(),
-        }
+        let entry = entries.remove(&reply_id)?;
+        Some(DynamicPendingReplyDelivery {
+            owner: entry.owner,
+            payload: payload.into_result(reply_id),
+        })
     }
 }
 
 impl DynamicPendingReplyPayload {
-    fn into_poll_result(self) -> DynamicPendingReplyPollResult {
+    fn into_result(self, reply_id: String) -> DynamicPendingReplyResult {
         match self {
             Self::Create(result) => match result {
-                Ok(created) => DynamicPendingReplyPollResult {
+                Ok(created) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "create".to_string(),
                     ok: true,
                     handle: created.handle,
                     worker: created.worker_name,
                     timeout: created.timeout,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Err(error) => DynamicPendingReplyPollResult {
+                Err(error) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "create".to_string(),
                     ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
             },
             Self::Lookup(result) => match result {
-                Ok(Some(found)) => DynamicPendingReplyPollResult {
+                Ok(Some(found)) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "lookup".to_string(),
                     ok: true,
@@ -544,174 +547,142 @@ impl DynamicPendingReplyPayload {
                     handle: found.handle,
                     worker: found.worker_name,
                     timeout: found.timeout,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Ok(None) => DynamicPendingReplyPollResult {
+                Ok(None) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "lookup".to_string(),
                     ok: true,
                     found: false,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Err(error) => DynamicPendingReplyPollResult {
+                Err(error) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "lookup".to_string(),
                     ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
             },
             Self::List(result) => match result {
-                Ok(ids) => DynamicPendingReplyPollResult {
+                Ok(ids) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "list".to_string(),
                     ok: true,
                     ids,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Err(error) => DynamicPendingReplyPollResult {
+                Err(error) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "list".to_string(),
                     ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
             },
             Self::Delete(result) => match result {
-                Ok(deleted) => DynamicPendingReplyPollResult {
+                Ok(deleted) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "delete".to_string(),
                     ok: true,
                     deleted,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Err(error) => DynamicPendingReplyPollResult {
+                Err(error) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "delete".to_string(),
                     ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
             },
             Self::Invoke(result) => match result {
-                Ok(output) => DynamicPendingReplyPollResult {
+                Ok(output) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "invoke".to_string(),
                     ok: true,
                     status: output.status,
                     headers: output.headers,
                     body: output.body,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Err(error) => DynamicPendingReplyPollResult {
+                Err(error) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "invoke".to_string(),
                     ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
             },
             Self::HostRpc(result) => match result {
-                Ok(value) => DynamicPendingReplyPollResult {
+                Ok(value) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "host-rpc".to_string(),
                     ok: true,
                     value,
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
-                Err(error) => DynamicPendingReplyPollResult {
+                Err(error) => DynamicPendingReplyResult {
+                    reply_id,
                     ready: true,
                     kind: "host-rpc".to_string(),
                     ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyPollResult::default()
+                    ..DynamicPendingReplyResult::default()
                 },
             },
         }
     }
 }
 
-impl DynamicLocalHostRpcQueue {
-    pub fn enqueue(
+impl TestAsyncReplies {
+    pub fn allocate(&self, owner: TestAsyncReplyOwner) -> String {
+        let reply_id = format!("tasr-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let mut entries = self.entries.lock().expect("test async reply lock poisoned");
+        entries.insert(reply_id.clone(), TestAsyncReplyEntry { owner });
+        reply_id
+    }
+
+    pub fn cancel(&self, reply_id: &str) {
+        let mut entries = self.entries.lock().expect("test async reply lock poisoned");
+        entries.remove(reply_id);
+    }
+
+    pub fn finish(
         &self,
-        target_id: String,
-        method_name: String,
-        args: Vec<u8>,
         reply_id: String,
-        pending_replies: DynamicPendingReplies,
-    ) {
-        let task_id = format!("dlhrpc-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let mut pending = self
-            .pending
-            .lock()
-            .expect("dynamic local host rpc pending lock poisoned");
-        pending.push_back(DynamicLocalHostRpcTask {
-            task_id,
-            target_id,
-            method_name,
-            args,
-            reply_id,
-            pending_replies,
-        });
-    }
-
-    fn take(&self) -> DynamicLocalHostRpcTakeResult {
-        let task = {
-            let mut pending = self
-                .pending
-                .lock()
-                .expect("dynamic local host rpc pending lock poisoned");
-            pending.pop_front()
+        result: Result<String>,
+    ) -> Option<TestAsyncReplyDelivery> {
+        let mut entries = self.entries.lock().expect("test async reply lock poisoned");
+        let entry = entries.remove(&reply_id)?;
+        let (ok, value, error) = match result {
+            Ok(value) => (true, value, String::new()),
+            Err(error) => (false, String::new(), error.to_string()),
         };
-        let Some(task) = task else {
-            return DynamicLocalHostRpcTakeResult {
-                ready: false,
-                task_id: String::new(),
-                target_id: String::new(),
-                method_name: String::new(),
-                args: Vec::new(),
-            };
-        };
-        let mut inflight = self
-            .inflight
-            .lock()
-            .expect("dynamic local host rpc inflight lock poisoned");
-        inflight.insert(
-            task.task_id.clone(),
-            DynamicLocalHostRpcInflight {
-                reply_id: task.reply_id,
-                pending_replies: task.pending_replies,
+        Some(TestAsyncReplyDelivery {
+            owner: entry.owner,
+            payload: TestAsyncReplyResult {
+                reply_id,
+                ok,
+                value,
+                error,
             },
-        );
-        DynamicLocalHostRpcTakeResult {
-            ready: true,
-            task_id: task.task_id,
-            target_id: task.target_id,
-            method_name: task.method_name,
-            args: task.args,
-        }
+        })
     }
+}
 
-    fn finish(&self, payload: DynamicLocalHostRpcFinishPayload) {
-        let mut inflight = self
-            .inflight
-            .lock()
-            .expect("dynamic local host rpc inflight lock poisoned");
-        let Some(task) = inflight.remove(payload.task_id.trim()) else {
-            return;
-        };
-        let result = if payload.ok {
-            Ok(payload.value)
-        } else {
-            Err(PlatformError::runtime(if payload.error.trim().is_empty() {
-                "dynamic local host rpc failed".to_string()
-            } else {
-                payload.error
-            }))
-        };
-        task.pending_replies
-            .finish(task.reply_id, DynamicPendingReplyPayload::HostRpc(result));
-    }
+pub struct TestAsyncReplyDelivery {
+    pub owner: TestAsyncReplyOwner,
+    pub payload: TestAsyncReplyResult,
 }
 
 #[derive(Default)]
@@ -2652,19 +2623,56 @@ fn actor_invoke_owner_for_request(
     Ok((worker_name, generation, isolate_id))
 }
 
-#[derive(Deserialize)]
-struct DynamicReplyPollPayload {
-    reply_id: String,
+fn request_owner_for_request(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+) -> Result<(String, u64, u64)> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(PlatformError::bad_request("request_id must not be empty"));
+    }
+    let (worker_name, generation, isolate_id) = {
+        let op_state = state.borrow();
+        let contexts = op_state.borrow::<RequestSecretContexts>();
+        let context = contexts
+            .contexts
+            .get(request_id)
+            .ok_or_else(|| PlatformError::runtime("request scope is unavailable"))?;
+        (
+            context.worker_name.clone(),
+            context.generation,
+            context.isolate_id,
+        )
+    };
+    Ok((worker_name, generation, isolate_id))
 }
 
-#[deno_core::op2]
-#[serde]
-fn op_dynamic_take_reply(
-    state: &mut OpState,
-    #[serde] payload: DynamicReplyPollPayload,
-) -> DynamicPendingReplyPollResult {
-    let pending = state.borrow::<DynamicPendingReplies>().clone();
-    pending.poll(payload.reply_id.trim())
+#[derive(Deserialize)]
+struct TestAsyncReplyStartPayload {
+    request_id: String,
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default = "test_async_reply_start_ok_default")]
+    ok: bool,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    error: String,
+}
+
+const fn test_async_reply_start_ok_default() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct TestNestedTargetedInvokeStartPayload {
+    request_id: String,
+    #[serde(default)]
+    target_mode: String,
+    target_id: String,
+    method_name: String,
+    #[serde(default)]
+    args: Vec<u8>,
 }
 
 #[deno_core::op2(fast)]
@@ -2674,22 +2682,158 @@ fn op_dynamic_cancel_reply(state: &mut OpState, #[string] reply_id: String) {
 }
 
 #[deno_core::op2]
-#[serde]
-fn op_dynamic_take_local_host_rpc(state: &mut OpState) -> DynamicLocalHostRpcTakeResult {
-    let queue = state.borrow::<DynamicLocalHostRpcQueue>().clone();
-    queue.take()
-}
-
-#[deno_core::op2]
-fn op_dynamic_finish_local_host_rpc(
+fn op_dynamic_host_rpc_task_complete(
     state: &mut OpState,
-    #[serde] payload: DynamicLocalHostRpcFinishPayload,
+    #[serde] payload: DynamicHostRpcTaskCompletePayload,
 ) {
-    let queue = state.borrow::<DynamicLocalHostRpcQueue>().clone();
-    queue.finish(payload);
+    let sender = state.borrow::<IsolateEventSender>().clone();
+    let _ = sender
+        .0
+        .send(IsolateEventPayload::DynamicHostRpcTaskComplete(payload));
     let profile = state.borrow::<DynamicProfile>().clone();
     profile.record_async_reply_completion();
     profile.record_local_host_rpc_callback();
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_test_async_reply_start(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: TestAsyncReplyStartPayload,
+) -> DynamicPendingReplyStartResult {
+    let request_id = payload.request_id.trim();
+    if request_id.is_empty() {
+        return DynamicPendingReplyStartResult {
+            ok: false,
+            reply_id: String::new(),
+            error: "test async reply requires request_id".to_string(),
+        };
+    }
+    let (worker_name, generation, isolate_id) = match request_owner_for_request(&state, request_id)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return DynamicPendingReplyStartResult {
+                ok: false,
+                reply_id: String::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+    let replies = state.borrow().borrow::<TestAsyncReplies>().clone();
+    let reply_id = replies.allocate(TestAsyncReplyOwner {
+        worker_name,
+        generation,
+        isolate_id,
+    });
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::TestAsyncReply(TestAsyncReplyEvent {
+            reply_id: reply_id.clone(),
+            replies,
+            delay_ms: payload.delay_ms,
+            ok: payload.ok,
+            value: payload.value,
+            error: payload.error,
+        }))
+        .is_err()
+    {
+        return DynamicPendingReplyStartResult {
+            ok: false,
+            reply_id: String::new(),
+            error: "test async reply runtime is unavailable".to_string(),
+        };
+    }
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2(fast)]
+fn op_test_async_reply_cancel(state: &mut OpState, #[string] reply_id: String) {
+    let replies = state.borrow::<TestAsyncReplies>().clone();
+    replies.cancel(reply_id.trim());
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_test_nested_targeted_invoke_start(
+    state: Rc<RefCell<OpState>>,
+    #[serde] payload: TestNestedTargetedInvokeStartPayload,
+) -> DynamicPendingReplyStartResult {
+    let request_id = payload.request_id.trim();
+    if request_id.is_empty() {
+        return DynamicPendingReplyStartResult {
+            ok: false,
+            reply_id: String::new(),
+            error: "test nested targeted invoke requires request_id".to_string(),
+        };
+    }
+    let target_id = payload.target_id.trim();
+    if target_id.is_empty() {
+        return DynamicPendingReplyStartResult {
+            ok: false,
+            reply_id: String::new(),
+            error: "test nested targeted invoke requires target_id".to_string(),
+        };
+    }
+    let method_name = payload.method_name.trim();
+    if method_name.is_empty() {
+        return DynamicPendingReplyStartResult {
+            ok: false,
+            reply_id: String::new(),
+            error: "test nested targeted invoke requires method_name".to_string(),
+        };
+    }
+    let (worker_name, generation, isolate_id) = match request_owner_for_request(&state, request_id)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return DynamicPendingReplyStartResult {
+                ok: false,
+                reply_id: String::new(),
+                error: error.to_string(),
+            };
+        }
+    };
+    let replies = state.borrow().borrow::<TestAsyncReplies>().clone();
+    let reply_id = replies.allocate(TestAsyncReplyOwner {
+        worker_name: worker_name.clone(),
+        generation,
+        isolate_id,
+    });
+    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
+    if sender
+        .0
+        .send(IsolateEventPayload::TestNestedTargetedInvoke(
+            TestNestedTargetedInvokeEvent {
+                worker_name,
+                generation,
+                caller_isolate_id: isolate_id,
+                target_mode: payload.target_mode,
+                target_id: target_id.to_string(),
+                method_name: method_name.to_string(),
+                args: payload.args,
+                reply_id: reply_id.clone(),
+                replies,
+            },
+        ))
+        .is_err()
+    {
+        return DynamicPendingReplyStartResult {
+            ok: false,
+            reply_id: String::new(),
+            error: "test nested targeted invoke runtime is unavailable".to_string(),
+        };
+    }
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
+    }
 }
 
 #[deno_core::op2]
@@ -2732,7 +2876,11 @@ fn op_dynamic_worker_create(
             }
         };
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
+        worker_name: owner_worker.clone(),
+        generation: owner_generation,
+        isolate_id: owner_isolate_id,
+    });
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2792,7 +2940,11 @@ fn op_dynamic_worker_lookup(
             }
         };
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
+        worker_name: owner_worker.clone(),
+        generation: owner_generation,
+        isolate_id: owner_isolate_id,
+    });
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2840,7 +2992,11 @@ fn op_dynamic_worker_list(
             }
         };
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
+        worker_name: owner_worker.clone(),
+        generation: owner_generation,
+        isolate_id: owner_isolate_id,
+    });
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2895,7 +3051,11 @@ fn op_dynamic_worker_delete(
             }
         };
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
+        worker_name: owner_worker.clone(),
+        generation: owner_generation,
+        isolate_id: owner_isolate_id,
+    });
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -2966,7 +3126,11 @@ fn op_dynamic_worker_invoke(
     };
 
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
+        worker_name: owner_worker.clone(),
+        generation: owner_generation,
+        isolate_id: owner_isolate_id,
+    });
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -3023,7 +3187,11 @@ fn op_dynamic_host_rpc_invoke(
             }
         };
     let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
+        worker_name: caller_worker.clone(),
+        generation: caller_generation,
+        isolate_id: caller_isolate_id,
+    });
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
@@ -4763,10 +4931,11 @@ deno_core::extension!(
         op_dynamic_profile_reset,
         op_http_prepare,
         op_http_check_url,
-        op_dynamic_take_reply,
         op_dynamic_cancel_reply,
-        op_dynamic_take_local_host_rpc,
-        op_dynamic_finish_local_host_rpc,
+        op_dynamic_host_rpc_task_complete,
+        op_test_async_reply_start,
+        op_test_async_reply_cancel,
+        op_test_nested_targeted_invoke_start,
         op_dynamic_worker_create,
         op_dynamic_worker_lookup,
         op_dynamic_worker_list,

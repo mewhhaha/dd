@@ -165,6 +165,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     return scoped;
   };
+  globalThis.__dd_get_runtime_request_id = activeRequestId;
 
   const actorScopedRequestId = (entry, runtimeRequestId) => {
     const current = currentRequestContext(false);
@@ -4065,6 +4066,57 @@ globalThis.__dd_execute_worker = (payload) => {
     return Promise.race([promise, timeoutError]).finally(() => clearTimeout(timeoutId));
   };
 
+  const dynamicReplyWaiters = () => (globalThis.__dd_dynamic_reply_waiters ??= new Map());
+  const dynamicReplyReady = () => (globalThis.__dd_dynamic_reply_ready ??= new Map());
+  const dynamicReplyCanceled = () => (globalThis.__dd_dynamic_reply_canceled ??= new Set());
+
+  const deliverDynamicReply = (payload) => {
+    const replyId = String(payload?.reply_id ?? "").trim();
+    if (!replyId) {
+      return;
+    }
+    const canceled = dynamicReplyCanceled();
+    const waiters = dynamicReplyWaiters();
+    const ready = dynamicReplyReady();
+    if (canceled.delete(replyId)) {
+      return;
+    }
+    const waiter = waiters.get(replyId);
+    if (waiter) {
+      waiters.delete(replyId);
+      waiter.resolve(payload);
+      return;
+    }
+    ready.set(replyId, payload);
+  };
+
+  const waitForDynamicReply = (replyId) => {
+    const ready = dynamicReplyReady();
+    if (ready.has(replyId)) {
+      const payload = ready.get(replyId);
+      ready.delete(replyId);
+      return Promise.resolve(payload);
+    }
+    return new Promise((resolve, reject) => {
+      dynamicReplyWaiters().set(replyId, { resolve, reject });
+    });
+  };
+
+  const cancelDynamicReply = (replyId, cause) => {
+    if (!replyId) {
+      return;
+    }
+    dynamicReplyCanceled().add(replyId);
+    dynamicReplyReady().delete(replyId);
+    const waiters = dynamicReplyWaiters();
+    const waiter = waiters.get(replyId);
+    if (waiter) {
+      waiters.delete(replyId);
+      waiter.reject(cause);
+    }
+    callOp("op_dynamic_cancel_reply", replyId);
+  };
+
   const awaitDynamicReply = async (label, startOp, timeoutMs = 5_000) => {
     const started = startOp();
     if (!started || typeof started !== "object" || started.ok === false) {
@@ -4074,23 +4126,23 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!replyId) {
       throw new Error(`${label} missing reply id`);
     }
+    let timeoutId = null;
     try {
-      const maxSpins = Math.max(1024, Math.trunc(timeoutMs * 256));
-      for (let spin = 0; spin < maxSpins; spin += 1) {
-        await drainDynamicLocalHostRpcQueue();
-        const result = callOp("op_dynamic_take_reply", { reply_id: replyId });
-        if (result && typeof result === "object" && result.ready === true) {
-          await syncFrozenTime();
-          return result;
-        }
-        if ((spin & 255) === 255) {
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }
-      }
-      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+      const reply = waitForDynamicReply(replyId);
+      const timeoutError = new Promise((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      });
+      const result = await Promise.race([reply, timeoutError]);
+      await syncFrozenTime();
+      return result;
     } catch (error) {
-      callOp("op_dynamic_cancel_reply", replyId);
+      cancelDynamicReply(replyId, error);
       throw error;
+    } finally {
+      clearTimeout(timeoutId);
     }
   };
 
@@ -4108,35 +4160,32 @@ globalThis.__dd_execute_worker = (payload) => {
     return String(result ?? fallback);
   };
 
-  const drainDynamicLocalHostRpcQueue = async () => {
-    for (;;) {
-      const task = callOp("op_dynamic_take_local_host_rpc");
-      if (!task || typeof task !== "object" || task.ready !== true) {
-        return;
-      }
-      let ok = true;
-      let value = [];
-      let error = "";
-      try {
-        const response = await invokeHostRpcCall({
-          target_id: task.target_id,
-          method: task.method_name,
-          args: task.args,
-        });
-        value = Array.from(new Uint8Array(await response.arrayBuffer()));
-      } catch (cause) {
-        ok = false;
-        error = String(cause?.message ?? cause ?? "dynamic local host rpc failed");
-      }
-      callOp("op_dynamic_finish_local_host_rpc", {
-        task_id: String(task.task_id ?? ""),
-        ok,
-        value,
-        error,
+  const runDynamicHostRpcTask = async (task) => {
+    let ok = true;
+    let value = [];
+    let error = "";
+    try {
+      const response = await invokeHostRpcCall({
+        target_id: task?.target_id,
+        method: task?.method_name,
+        args: task?.args,
       });
+      value = Array.from(new Uint8Array(await response.arrayBuffer()));
+    } catch (cause) {
+      ok = false;
+      error = String(cause?.message ?? cause ?? "dynamic host rpc task failed");
     }
+    callOp("op_dynamic_host_rpc_task_complete", {
+      task_id: String(task?.task_id ?? ""),
+      ok,
+      value,
+      error,
+    });
   };
-  globalThis.__dd_run_dynamic_host_rpc_tasks = drainDynamicLocalHostRpcQueue;
+  globalThis.__dd_deliver_dynamic_reply = deliverDynamicReply;
+  globalThis.__dd_await_dynamic_reply = awaitDynamicReply;
+  globalThis.__dd_encode_rpc_args = encodeRpcArgs;
+  globalThis.__dd_run_dynamic_host_rpc_task = runDynamicHostRpcTask;
 
   /**
    * @typedef {Object} DynamicWorkerConfig

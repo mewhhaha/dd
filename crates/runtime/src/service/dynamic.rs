@@ -20,7 +20,8 @@ impl WorkerManager {
         } = payload;
         let normalized_id = id.trim().to_string();
         if normalized_id.is_empty() {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Create(Err(PlatformError::bad_request(
                     "dynamic worker id must not be empty",
@@ -42,7 +43,8 @@ impl WorkerManager {
         {
             if let Some(entry) = self.dynamic_worker_handles.get(&handle) {
                 self.dynamic_profile.record_async_reply_completion();
-                pending_replies.finish(
+                self.finish_dynamic_reply(
+                    pending_replies,
                     reply_id,
                     crate::ops::DynamicPendingReplyPayload::Create(Ok(
                         crate::ops::DynamicWorkerCreateReply {
@@ -65,7 +67,8 @@ impl WorkerManager {
             let binding_name = binding_spec.binding.trim().to_string();
             let target_id = binding_spec.target_id.trim().to_string();
             if binding_name.is_empty() {
-                pending_replies.finish(
+                self.finish_dynamic_reply(
+                    pending_replies,
                     reply_id,
                     crate::ops::DynamicPendingReplyPayload::Create(Err(
                         PlatformError::bad_request("dynamic host rpc binding must not be empty"),
@@ -74,7 +77,8 @@ impl WorkerManager {
                 return;
             }
             if target_id.is_empty() {
-                pending_replies.finish(
+                self.finish_dynamic_reply(
+                    pending_replies,
                     reply_id,
                     crate::ops::DynamicPendingReplyPayload::Create(Err(
                         PlatformError::bad_request("dynamic host rpc target_id must not be empty"),
@@ -83,7 +87,8 @@ impl WorkerManager {
                 return;
             }
             if !seen_binding_names.insert(binding_name.clone()) {
-                pending_replies.finish(
+                self.finish_dynamic_reply(
+                    pending_replies,
                     reply_id,
                     crate::ops::DynamicPendingReplyPayload::Create(Err(
                         PlatformError::bad_request(format!(
@@ -156,7 +161,8 @@ impl WorkerManager {
             }
         }
         self.dynamic_profile.record_async_reply_completion();
-        pending_replies.finish(
+        self.finish_dynamic_reply(
+            pending_replies,
             reply_id,
             crate::ops::DynamicPendingReplyPayload::Create(result),
         );
@@ -182,7 +188,8 @@ impl WorkerManager {
         };
         let id = id.trim().to_string();
         if id.is_empty() {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Lookup(Err(PlatformError::bad_request(
                     "dynamic worker id must not be empty",
@@ -197,7 +204,8 @@ impl WorkerManager {
             .cloned();
         let Some(handle) = handle else {
             self.dynamic_profile.record_async_reply_completion();
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Lookup(Ok(None)),
             );
@@ -208,14 +216,16 @@ impl WorkerManager {
                 by_id.remove(&id);
             }
             self.dynamic_profile.record_async_reply_completion();
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Lookup(Ok(None)),
             );
             return;
         };
         self.dynamic_profile.record_async_reply_completion();
-        pending_replies.finish(
+        self.finish_dynamic_reply(
+            pending_replies,
             reply_id,
             crate::ops::DynamicPendingReplyPayload::Lookup(Ok(Some(
                 crate::ops::DynamicWorkerCreateReply {
@@ -251,7 +261,8 @@ impl WorkerManager {
             .unwrap_or_default();
         ids.sort();
         self.dynamic_profile.record_async_reply_completion();
-        pending_replies.finish(
+        self.finish_dynamic_reply(
+            pending_replies,
             reply_id,
             crate::ops::DynamicPendingReplyPayload::List(Ok(ids)),
         );
@@ -277,7 +288,8 @@ impl WorkerManager {
         };
         let id = id.trim().to_string();
         if id.is_empty() {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Delete(Err(PlatformError::bad_request(
                     "dynamic worker id must not be empty",
@@ -299,7 +311,8 @@ impl WorkerManager {
         }
         let Some(handle) = handle else {
             self.dynamic_profile.record_async_reply_completion();
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Delete(Ok(false)),
             );
@@ -307,7 +320,8 @@ impl WorkerManager {
         };
         let Some(entry) = self.dynamic_worker_handles.remove(&handle) else {
             self.dynamic_profile.record_async_reply_completion();
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Delete(Ok(false)),
             );
@@ -315,7 +329,8 @@ impl WorkerManager {
         };
         self.retire_worker_completely(&entry.worker_name);
         self.dynamic_profile.record_async_reply_completion();
-        pending_replies.finish(
+        self.finish_dynamic_reply(
+            pending_replies,
             reply_id,
             crate::ops::DynamicPendingReplyPayload::Delete(Ok(true)),
         );
@@ -337,7 +352,8 @@ impl WorkerManager {
             pending_replies,
         } = payload;
         let Some(mut handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::not_found(
                     "dynamic worker handle not found",
@@ -346,7 +362,8 @@ impl WorkerManager {
             return;
         };
         if handle_entry.owner_worker != owner_worker {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
                     "dynamic worker handle owner mismatch",
@@ -355,7 +372,8 @@ impl WorkerManager {
             return;
         }
         if handle_entry.owner_generation != owner_generation {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
                     "dynamic worker handle generation mismatch",
@@ -364,7 +382,8 @@ impl WorkerManager {
             return;
         }
         if handle_entry.binding != binding {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
                     "dynamic worker binding mismatch",
@@ -452,10 +471,12 @@ impl WorkerManager {
                     }
                 };
             profile.record_async_reply_completion();
-            pending_replies.finish(
+            if let Some(delivery) = pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Invoke(result),
-            );
+            ) {
+                let _ = event_tx.send(RuntimeEvent::DynamicReplyReady(delivery));
+            }
         });
     }
 
@@ -475,7 +496,8 @@ impl WorkerManager {
             pending_replies,
         } = payload;
         if host_rpc_method_blocked(&method_name) {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
                     format!("dynamic host rpc method is blocked: {method_name}"),
@@ -486,7 +508,8 @@ impl WorkerManager {
 
         let provider_id = {
             let Some(pool) = self.get_pool_mut(&caller_worker, caller_generation) else {
-                pending_replies.finish(
+                self.finish_dynamic_reply(
+                    pending_replies,
                     reply_id,
                     crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::not_found(
                         "dynamic worker pool not found",
@@ -500,7 +523,8 @@ impl WorkerManager {
                 .map(|entry| entry.provider_id.clone())
         };
         let Some(provider_id) = provider_id else {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
                     format!("dynamic host rpc binding not found: {binding}"),
@@ -509,7 +533,8 @@ impl WorkerManager {
             return;
         };
         let Some(provider) = self.host_rpc_providers.get(&provider_id).cloned() else {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::not_found(
                     "dynamic host rpc provider not found",
@@ -518,7 +543,8 @@ impl WorkerManager {
             return;
         };
         if !provider.methods.contains(&method_name) {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
                     format!("dynamic host rpc method is not allowed: {method_name}"),
@@ -535,7 +561,8 @@ impl WorkerManager {
                     .then_some(pool.generation)
             });
         let Some(owner_pool_generation) = owner_pool_generation else {
-            pending_replies.finish(
+            self.finish_dynamic_reply(
+                pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
                     "dynamic host rpc provider isolate is unavailable",
@@ -543,31 +570,74 @@ impl WorkerManager {
             );
             return;
         };
-        let local_queue = self
+        let provider_sender = self
             .get_pool_mut(&provider.owner_worker, owner_pool_generation)
             .and_then(|pool| {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == provider.owner_isolate_id)
-                    .map(|isolate| {
-                        (
-                            isolate.dynamic_host_rpc_queue.clone(),
-                            isolate.sender.clone(),
-                        )
-                    })
+                    .map(|isolate| isolate.sender.clone())
             });
-        if let Some((queue, sender)) = local_queue {
-            queue.enqueue(
-                provider.target_id.clone(),
-                method_name,
-                args,
-                reply_id,
-                pending_replies,
+        if let Some(sender) = provider_sender {
+            let task_id = format!("dhrpc-{}", Uuid::new_v4().simple());
+            self.dynamic_host_rpc_tasks.insert(
+                task_id.clone(),
+                DynamicHostRpcTaskState {
+                    provider_worker: provider.owner_worker.clone(),
+                    provider_generation: owner_pool_generation,
+                    provider_isolate_id: provider.owner_isolate_id,
+                    reply: DynamicHostRpcTaskReply::Dynamic {
+                        reply_id,
+                        pending_replies,
+                    },
+                },
             );
-            let _ = sender.send(IsolateCommand::RunDynamicHostRpcTasks);
+            if sender
+                .send(IsolateCommand::RunDynamicHostRpcTask {
+                    task_id: task_id.clone(),
+                    target_id: provider.target_id.clone(),
+                    method_name,
+                    args,
+                })
+                .is_ok()
+            {
+                return;
+            }
+            if let Some(task) = self.dynamic_host_rpc_tasks.remove(&task_id) {
+                match task.reply {
+                    DynamicHostRpcTaskReply::Dynamic {
+                        reply_id,
+                        pending_replies,
+                    } => {
+                        self.finish_dynamic_reply(
+                            pending_replies,
+                            reply_id,
+                            crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
+                                PlatformError::runtime(
+                                    "dynamic host rpc provider isolate is unavailable",
+                                ),
+                            )),
+                        );
+                    }
+                    DynamicHostRpcTaskReply::Test {
+                        reply_id,
+                        replies,
+                        success_value: _,
+                    } => {
+                        self.complete_test_async_reply(
+                            reply_id,
+                            replies,
+                            Err(PlatformError::runtime(
+                                "dynamic host rpc provider isolate is unavailable",
+                            )),
+                        );
+                    }
+                }
+            }
             return;
         }
-        pending_replies.finish(
+        self.finish_dynamic_reply(
+            pending_replies,
             reply_id,
             crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
                 "dynamic host rpc provider isolate is unavailable",
