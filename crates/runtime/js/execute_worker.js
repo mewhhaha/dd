@@ -4090,6 +4090,18 @@ globalThis.__dd_execute_worker = (payload) => {
     ready.set(replyId, payload);
   };
 
+  const drainDynamicReplyQueue = () => {
+    for (;;) {
+      const batch = callOp("op_dynamic_take_pushed_replies");
+      if (!Array.isArray(batch) || batch.length === 0) {
+        return;
+      }
+      for (const payload of batch) {
+        deliverDynamicReply(payload);
+      }
+    }
+  };
+
   const waitForDynamicReply = (replyId) => {
     const ready = dynamicReplyReady();
     if (ready.has(replyId)) {
@@ -4182,10 +4194,23 @@ globalThis.__dd_execute_worker = (payload) => {
       error,
     });
   };
-  globalThis.__dd_deliver_dynamic_reply = deliverDynamicReply;
+
+  const drainDynamicHostRpcTasks = async () => {
+    for (;;) {
+      const batch = callOp("op_dynamic_take_host_rpc_tasks");
+      if (!Array.isArray(batch) || batch.length === 0) {
+        return;
+      }
+      for (const task of batch) {
+        await runDynamicHostRpcTask(task);
+      }
+    }
+  };
+
+  globalThis.__dd_drain_dynamic_reply_queue = drainDynamicReplyQueue;
   globalThis.__dd_await_dynamic_reply = awaitDynamicReply;
   globalThis.__dd_encode_rpc_args = encodeRpcArgs;
-  globalThis.__dd_run_dynamic_host_rpc_task = runDynamicHostRpcTask;
+  globalThis.__dd_drain_dynamic_host_rpc_tasks = drainDynamicHostRpcTasks;
 
   /**
    * @typedef {Object} DynamicWorkerConfig

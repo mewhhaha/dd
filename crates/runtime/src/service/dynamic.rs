@@ -570,15 +570,20 @@ impl WorkerManager {
             );
             return;
         };
-        let provider_sender = self
+        let provider_delivery = self
             .get_pool_mut(&provider.owner_worker, owner_pool_generation)
             .and_then(|pool| {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == provider.owner_isolate_id)
-                    .map(|isolate| isolate.sender.clone())
+                    .map(|isolate| {
+                        (
+                            isolate.sender.clone(),
+                            isolate.dynamic_host_rpc_task_inbox.clone(),
+                        )
+                    })
             });
-        if let Some(sender) = provider_sender {
+        if let Some((sender, inbox)) = provider_delivery {
             let task_id = format!("dhrpc-{}", Uuid::new_v4().simple());
             self.dynamic_host_rpc_tasks.insert(
                 task_id.clone(),
@@ -592,14 +597,16 @@ impl WorkerManager {
                     },
                 },
             );
-            if sender
-                .send(IsolateCommand::RunDynamicHostRpcTask {
-                    task_id: task_id.clone(),
-                    target_id: provider.target_id.clone(),
-                    method_name,
-                    args,
-                })
-                .is_ok()
+            let schedule = inbox.push(crate::ops::DynamicHostRpcTask {
+                task_id: task_id.clone(),
+                target_id: provider.target_id.clone(),
+                method_name,
+                args,
+            });
+            if !schedule
+                || sender
+                    .send(IsolateCommand::DrainDynamicHostRpcTasks)
+                    .is_ok()
             {
                 return;
             }

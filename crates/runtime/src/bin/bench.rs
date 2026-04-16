@@ -91,8 +91,20 @@ struct DynamicBenchMetrics {
     fallback_dispatch: usize,
     #[serde(default, rename = "async_reply_completion")]
     async_reply_completion: usize,
-    #[serde(default, rename = "local_host_rpc_callback")]
-    local_host_rpc_callback: usize,
+    #[serde(
+        default,
+        rename = "provider_task_callback",
+        alias = "local_host_rpc_callback"
+    )]
+    provider_task_callback: usize,
+    #[serde(default, rename = "reply_drain_batch")]
+    reply_drain_batch: usize,
+    #[serde(default, rename = "reply_drain_item")]
+    reply_drain_item: usize,
+    #[serde(default, rename = "provider_task_drain_batch")]
+    provider_task_drain_batch: usize,
+    #[serde(default, rename = "provider_task_drain_item")]
+    provider_task_drain_item: usize,
 }
 
 struct Distribution {
@@ -1536,14 +1548,18 @@ fn format_dynamic_metrics_result(name: &str, metrics: &DynamicBenchMetrics) -> S
     let mut out = String::new();
     let _ = write!(
         out,
-        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} async_replies={} local_host_rpc={}",
+        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} async_replies={} provider_task={} reply_batches={} reply_items={} provider_batches={} provider_items={}",
         format!("{name}-metrics"),
         handle_hit_rate,
         source_hit_rate,
         metrics.warm_isolate_hit,
         metrics.fallback_dispatch,
         metrics.async_reply_completion,
-        metrics.local_host_rpc_callback,
+        metrics.provider_task_callback,
+        metrics.reply_drain_batch,
+        metrics.reply_drain_item,
+        metrics.provider_task_drain_batch,
+        metrics.provider_task_drain_item,
     );
     out
 }

@@ -683,6 +683,8 @@ enum DispatchSelection {
 struct IsolateHandle {
     id: u64,
     sender: std_mpsc::Sender<IsolateCommand>,
+    dynamic_reply_inbox: crate::ops::DynamicPushedReplyInbox,
+    dynamic_host_rpc_task_inbox: crate::ops::DynamicHostRpcTaskInbox,
     inflight_count: usize,
     active_websocket_sessions: usize,
     active_transport_sessions: usize,
@@ -717,15 +719,8 @@ enum IsolateCommand {
     Abort {
         runtime_request_id: String,
     },
-    DeliverDynamicReply {
-        payload_json: Arc<str>,
-    },
-    RunDynamicHostRpcTask {
-        task_id: String,
-        target_id: String,
-        method_name: String,
-        args: Vec<u8>,
-    },
+    DrainDynamicReplies,
+    DrainDynamicHostRpcTasks,
     PollEventLoop,
     Shutdown,
 }
@@ -2248,11 +2243,11 @@ impl WorkerManager {
                 self.handle_dynamic_host_rpc_invoke(payload, event_tx);
             }
             RuntimeEvent::DynamicReplyReady(delivery) => {
-                self.deliver_isolate_reply(
+                self.enqueue_isolate_reply(
                     &delivery.owner.worker_name,
                     delivery.owner.generation,
                     delivery.owner.isolate_id,
-                    &delivery.payload,
+                    crate::ops::DynamicPushedReplyPayload::Dynamic(delivery.payload),
                 );
             }
             RuntimeEvent::DynamicHostRpcTaskComplete {
@@ -4494,7 +4489,7 @@ impl WorkerManager {
             return;
         };
 
-        let Some(sender) = self
+        let Some((sender, inbox)) = self
             .workers
             .get(&payload.worker_name)
             .and_then(|entry| entry.pools.get(&payload.generation))
@@ -4502,7 +4497,12 @@ impl WorkerManager {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == target_isolate_id)
-                    .map(|isolate| isolate.sender.clone())
+                    .map(|isolate| {
+                        (
+                            isolate.sender.clone(),
+                            isolate.dynamic_host_rpc_task_inbox.clone(),
+                        )
+                    })
             })
         else {
             self.complete_test_async_reply(
@@ -4529,14 +4529,16 @@ impl WorkerManager {
                 },
             },
         );
-        if sender
-            .send(IsolateCommand::RunDynamicHostRpcTask {
-                task_id: task_id.clone(),
-                target_id: payload.target_id,
-                method_name: payload.method_name,
-                args: payload.args,
-            })
-            .is_ok()
+        let schedule = inbox.push(crate::ops::DynamicHostRpcTask {
+            task_id: task_id.clone(),
+            target_id: payload.target_id,
+            method_name: payload.method_name,
+            args: payload.args,
+        });
+        if !schedule
+            || sender
+                .send(IsolateCommand::DrainDynamicHostRpcTasks)
+                .is_ok()
         {
             return;
         }
@@ -4582,11 +4584,11 @@ impl WorkerManager {
         let Some(delivery) = replies.finish(reply_id, result) else {
             return;
         };
-        self.deliver_isolate_reply(
+        self.enqueue_isolate_reply(
             &delivery.owner.worker_name,
             delivery.owner.generation,
             delivery.owner.isolate_id,
-            &delivery.payload,
+            crate::ops::DynamicPushedReplyPayload::TestAsync(delivery.payload),
         );
     }
 
@@ -4599,22 +4601,22 @@ impl WorkerManager {
         let Some(delivery) = pending_replies.finish(reply_id, payload) else {
             return;
         };
-        self.deliver_isolate_reply(
+        self.enqueue_isolate_reply(
             &delivery.owner.worker_name,
             delivery.owner.generation,
             delivery.owner.isolate_id,
-            &delivery.payload,
+            crate::ops::DynamicPushedReplyPayload::Dynamic(delivery.payload),
         );
     }
 
-    fn deliver_isolate_reply<T: Serialize>(
+    fn enqueue_isolate_reply(
         &mut self,
         worker_name: &str,
         generation: u64,
         isolate_id: u64,
-        payload: &T,
+        payload: crate::ops::DynamicPushedReplyPayload,
     ) {
-        let Some(sender) = self
+        let Some((sender, inbox)) = self
             .workers
             .get(worker_name)
             .and_then(|entry| entry.pools.get(&generation))
@@ -4622,17 +4624,15 @@ impl WorkerManager {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == isolate_id)
-                    .map(|isolate| isolate.sender.clone())
+                    .map(|isolate| (isolate.sender.clone(), isolate.dynamic_reply_inbox.clone()))
             })
         else {
             return;
         };
-        let Ok(payload_json) = serde_json::to_string(payload) else {
-            return;
-        };
-        let _ = sender.send(IsolateCommand::DeliverDynamicReply {
-            payload_json: Arc::<str>::from(payload_json),
-        });
+        let schedule = inbox.push(payload);
+        if schedule {
+            let _ = sender.send(IsolateCommand::DrainDynamicReplies);
+        }
     }
 
     fn fail_dynamic_host_rpc_tasks_for_provider(
@@ -5441,6 +5441,10 @@ fn spawn_isolate_thread(
 ) -> Result<IsolateHandle> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
+    let dynamic_reply_inbox = crate::ops::DynamicPushedReplyInbox::default();
+    let dynamic_host_rpc_task_inbox = crate::ops::DynamicHostRpcTaskInbox::default();
+    let thread_dynamic_reply_inbox = dynamic_reply_inbox.clone();
+    let thread_dynamic_host_rpc_task_inbox = dynamic_host_rpc_task_inbox.clone();
     let event_loop_waker = Waker::from(Arc::new(IsolateEventLoopWaker {
         sender: command_tx.clone(),
     }));
@@ -5481,6 +5485,8 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::RequestSecretContexts::default());
                     op_state.put(crate::ops::DynamicPendingReplies::default());
                     op_state.put(crate::ops::TestAsyncReplies::default());
+                    op_state.put(thread_dynamic_reply_inbox.clone());
+                    op_state.put(thread_dynamic_host_rpc_task_inbox.clone());
                     op_state.put(dynamic_profile.clone());
                 }
                 {
@@ -5589,6 +5595,8 @@ fn spawn_isolate_thread(
         Ok(Ok(())) => Ok(IsolateHandle {
             id: isolate_id,
             sender: command_tx,
+            dynamic_reply_inbox,
+            dynamic_host_rpc_task_inbox,
             inflight_count: 0,
             active_websocket_sessions: 0,
             active_transport_sessions: 0,
@@ -5844,18 +5852,18 @@ fn handle_isolate_command(
             abort_worker_request(js_runtime, &runtime_request_id)?;
             Ok(true)
         }
-        IsolateCommand::DeliverDynamicReply { payload_json } => {
-            let script = format!(
-                "(() => {{
-                    const deliver = globalThis.__dd_deliver_dynamic_reply;
-                    if (typeof deliver !== \"function\") {{
-                      throw new Error(\"dynamic reply delivery helper missing\");
-                    }}
-                    deliver({payload_json});
-                  }})()"
-            );
+        IsolateCommand::DrainDynamicReplies => {
             js_runtime
-                .execute_script("<dd:dynamic-reply-delivery>", script)
+                .execute_script(
+                    "<dd:dynamic-reply-drain>",
+                    "(() => {
+                        const drain = globalThis.__dd_drain_dynamic_reply_queue;
+                        if (typeof drain !== \"function\") {
+                          throw new Error(\"dynamic reply drain helper missing\");
+                        }
+                        drain();
+                      })()",
+                )
                 .map_err(|error| PlatformError::internal(error.to_string()))?;
             {
                 let op_state = js_runtime.op_state();
@@ -5863,37 +5871,18 @@ fn handle_isolate_command(
             }
             Ok(true)
         }
-        IsolateCommand::RunDynamicHostRpcTask {
-            task_id,
-            target_id,
-            method_name,
-            args,
-        } => {
-            let task_json = serde_json::to_string(&serde_json::json!({
-                "task_id": task_id,
-                "target_id": target_id,
-                "method_name": method_name,
-                "args": args,
-            }))
-            .map_err(|error| PlatformError::internal(error.to_string()))?;
-            let script = format!(
-                "(() => {{
-                    const runTask = globalThis.__dd_run_dynamic_host_rpc_task;
-                    if (typeof runTask !== \"function\") {{
-                      throw new Error(\"dynamic host rpc task helper missing\");
-                    }}
-                    void Promise.resolve(runTask({task_json})).catch((error) => {{
-                      Deno.core.ops.op_dynamic_host_rpc_task_complete({{
-                        task_id: {task_id:?},
-                        ok: false,
-                        value: [],
-                        error: String(error?.message ?? error ?? \"dynamic host rpc task failed\"),
-                      }});
-                    }});
-                  }})()"
-            );
+        IsolateCommand::DrainDynamicHostRpcTasks => {
             js_runtime
-                .execute_script("<dd:dynamic-host-rpc-task>", script)
+                .execute_script(
+                    "<dd:dynamic-host-rpc-task-drain>",
+                    "(() => {
+                        const drain = globalThis.__dd_drain_dynamic_host_rpc_tasks;
+                        if (typeof drain !== \"function\") {
+                          throw new Error(\"dynamic host rpc task drain helper missing\");
+                        }
+                        void Promise.resolve(drain()).catch(() => undefined);
+                      })()",
+                )
                 .map_err(|error| PlatformError::internal(error.to_string()))?;
             {
                 let op_state = js_runtime.op_state();
@@ -14542,8 +14531,8 @@ export default {
         assert!(!worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_queue"));
         assert!(!worker_runtime_source.contains("__dd_run_dynamic_host_rpc_tasks"));
         assert!(!worker_runtime_source.contains("op_dynamic_take_reply"));
-        assert!(worker_runtime_source.contains("__dd_deliver_dynamic_reply"));
-        assert!(worker_runtime_source.contains("__dd_run_dynamic_host_rpc_task"));
+        assert!(worker_runtime_source.contains("__dd_drain_dynamic_reply_queue"));
+        assert!(worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_tasks"));
     }
 
     #[test]

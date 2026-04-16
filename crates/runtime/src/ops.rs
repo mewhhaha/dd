@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -413,6 +413,13 @@ pub struct DynamicPendingReplyDelivery {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+pub enum DynamicPushedReplyPayload {
+    Dynamic(DynamicPendingReplyResult),
+    TestAsync(TestAsyncReplyResult),
+}
+
+#[derive(Serialize)]
 pub struct DynamicPendingReplyResult {
     pub reply_id: String,
     ready: bool,
@@ -454,6 +461,54 @@ pub struct TestAsyncReplyResult {
     pub ok: bool,
     pub value: String,
     pub error: String,
+}
+
+#[derive(Serialize)]
+pub struct DynamicHostRpcTask {
+    pub task_id: String,
+    pub target_id: String,
+    pub method_name: String,
+    pub args: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct DynamicPushedReplyInbox {
+    inner: Arc<StdMutex<DrainInboxState<DynamicPushedReplyPayload>>>,
+}
+
+#[derive(Clone)]
+pub struct DynamicHostRpcTaskInbox {
+    inner: Arc<StdMutex<DrainInboxState<DynamicHostRpcTask>>>,
+}
+
+struct DrainInboxState<T> {
+    items: VecDeque<T>,
+    drain_scheduled: bool,
+}
+
+impl<T> Default for DrainInboxState<T> {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            drain_scheduled: false,
+        }
+    }
+}
+
+impl Default for DynamicPushedReplyInbox {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(DrainInboxState::default())),
+        }
+    }
+}
+
+impl Default for DynamicHostRpcTaskInbox {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(DrainInboxState::default())),
+        }
+    }
 }
 
 impl Default for DynamicPendingReplyResult {
@@ -512,6 +567,56 @@ impl DynamicPendingReplies {
             payload: payload.into_result(reply_id),
         })
     }
+}
+
+const DYNAMIC_INBOX_BATCH_SIZE: usize = 64;
+
+impl DynamicPushedReplyInbox {
+    pub fn push(&self, payload: DynamicPushedReplyPayload) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("dynamic pushed reply inbox lock poisoned");
+        inner.items.push_back(payload);
+        if inner.drain_scheduled {
+            return false;
+        }
+        inner.drain_scheduled = true;
+        true
+    }
+
+    pub fn take_batch(&self) -> Vec<DynamicPushedReplyPayload> {
+        take_drain_batch(&self.inner, "dynamic pushed reply inbox")
+    }
+}
+
+impl DynamicHostRpcTaskInbox {
+    pub fn push(&self, task: DynamicHostRpcTask) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("dynamic host rpc task inbox lock poisoned");
+        inner.items.push_back(task);
+        if inner.drain_scheduled {
+            return false;
+        }
+        inner.drain_scheduled = true;
+        true
+    }
+
+    pub fn take_batch(&self) -> Vec<DynamicHostRpcTask> {
+        take_drain_batch(&self.inner, "dynamic host rpc task inbox")
+    }
+}
+
+fn take_drain_batch<T>(inner: &Arc<StdMutex<DrainInboxState<T>>>, label: &str) -> Vec<T> {
+    let mut inner = inner.lock().expect(label);
+    if inner.items.is_empty() {
+        inner.drain_scheduled = false;
+        return Vec::new();
+    }
+    let count = inner.items.len().min(DYNAMIC_INBOX_BATCH_SIZE);
+    inner.items.drain(..count).collect()
 }
 
 impl DynamicPendingReplyPayload {
@@ -988,7 +1093,11 @@ pub struct DynamicProfile {
     warm_isolate_hit: Arc<AtomicU64>,
     fallback_dispatch: Arc<AtomicU64>,
     async_reply_completion: Arc<AtomicU64>,
-    local_host_rpc_callback: Arc<AtomicU64>,
+    provider_task_callback: Arc<AtomicU64>,
+    reply_drain_batch: Arc<AtomicU64>,
+    reply_drain_item: Arc<AtomicU64>,
+    provider_task_drain_batch: Arc<AtomicU64>,
+    provider_task_drain_item: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -996,7 +1105,11 @@ pub struct DynamicProfileSnapshot {
     pub warm_isolate_hit: u64,
     pub fallback_dispatch: u64,
     pub async_reply_completion: u64,
-    pub local_host_rpc_callback: u64,
+    pub provider_task_callback: u64,
+    pub reply_drain_batch: u64,
+    pub reply_drain_item: u64,
+    pub provider_task_drain_batch: u64,
+    pub provider_task_drain_item: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1019,8 +1132,21 @@ impl DynamicProfile {
         self.async_reply_completion.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_local_host_rpc_callback(&self) {
-        self.local_host_rpc_callback.fetch_add(1, Ordering::Relaxed);
+    pub fn record_provider_task_callback(&self) {
+        self.provider_task_callback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_reply_drain(&self, items: usize) {
+        self.reply_drain_batch.fetch_add(1, Ordering::Relaxed);
+        self.reply_drain_item
+            .fetch_add(items as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_provider_task_drain(&self, items: usize) {
+        self.provider_task_drain_batch
+            .fetch_add(1, Ordering::Relaxed);
+        self.provider_task_drain_item
+            .fetch_add(items as u64, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> DynamicProfileSnapshot {
@@ -1028,7 +1154,11 @@ impl DynamicProfile {
             warm_isolate_hit: self.warm_isolate_hit.load(Ordering::Relaxed),
             fallback_dispatch: self.fallback_dispatch.load(Ordering::Relaxed),
             async_reply_completion: self.async_reply_completion.load(Ordering::Relaxed),
-            local_host_rpc_callback: self.local_host_rpc_callback.load(Ordering::Relaxed),
+            provider_task_callback: self.provider_task_callback.load(Ordering::Relaxed),
+            reply_drain_batch: self.reply_drain_batch.load(Ordering::Relaxed),
+            reply_drain_item: self.reply_drain_item.load(Ordering::Relaxed),
+            provider_task_drain_batch: self.provider_task_drain_batch.load(Ordering::Relaxed),
+            provider_task_drain_item: self.provider_task_drain_item.load(Ordering::Relaxed),
         }
     }
 
@@ -1036,7 +1166,11 @@ impl DynamicProfile {
         self.warm_isolate_hit.store(0, Ordering::Relaxed);
         self.fallback_dispatch.store(0, Ordering::Relaxed);
         self.async_reply_completion.store(0, Ordering::Relaxed);
-        self.local_host_rpc_callback.store(0, Ordering::Relaxed);
+        self.provider_task_callback.store(0, Ordering::Relaxed);
+        self.reply_drain_batch.store(0, Ordering::Relaxed);
+        self.reply_drain_item.store(0, Ordering::Relaxed);
+        self.provider_task_drain_batch.store(0, Ordering::Relaxed);
+        self.provider_task_drain_item.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2682,6 +2816,30 @@ fn op_dynamic_cancel_reply(state: &mut OpState, #[string] reply_id: String) {
 }
 
 #[deno_core::op2]
+#[serde]
+fn op_dynamic_take_pushed_replies(state: &mut OpState) -> Vec<DynamicPushedReplyPayload> {
+    let inbox = state.borrow::<DynamicPushedReplyInbox>().clone();
+    let batch = inbox.take_batch();
+    if !batch.is_empty() {
+        let profile = state.borrow::<DynamicProfile>().clone();
+        profile.record_reply_drain(batch.len());
+    }
+    batch
+}
+
+#[deno_core::op2]
+#[serde]
+fn op_dynamic_take_host_rpc_tasks(state: &mut OpState) -> Vec<DynamicHostRpcTask> {
+    let inbox = state.borrow::<DynamicHostRpcTaskInbox>().clone();
+    let batch = inbox.take_batch();
+    if !batch.is_empty() {
+        let profile = state.borrow::<DynamicProfile>().clone();
+        profile.record_provider_task_drain(batch.len());
+    }
+    batch
+}
+
+#[deno_core::op2]
 fn op_dynamic_host_rpc_task_complete(
     state: &mut OpState,
     #[serde] payload: DynamicHostRpcTaskCompletePayload,
@@ -2692,7 +2850,7 @@ fn op_dynamic_host_rpc_task_complete(
         .send(IsolateEventPayload::DynamicHostRpcTaskComplete(payload));
     let profile = state.borrow::<DynamicProfile>().clone();
     profile.record_async_reply_completion();
-    profile.record_local_host_rpc_callback();
+    profile.record_provider_task_callback();
 }
 
 #[deno_core::op2]
@@ -4932,6 +5090,8 @@ deno_core::extension!(
         op_http_prepare,
         op_http_check_url,
         op_dynamic_cancel_reply,
+        op_dynamic_take_pushed_replies,
+        op_dynamic_take_host_rpc_tasks,
         op_dynamic_host_rpc_task_complete,
         op_test_async_reply_start,
         op_test_async_reply_cancel,
@@ -5412,7 +5572,11 @@ fn decode_cache_put_payload(payload: String) -> common::Result<(CacheRequest, Ca
 
 #[cfg(test)]
 mod tests {
-    use super::{is_egress_url_allowed, parse_egress_allow_host};
+    use super::{
+        is_egress_url_allowed, parse_egress_allow_host, DynamicHostRpcTask,
+        DynamicHostRpcTaskInbox, DynamicPendingReplyResult, DynamicPushedReplyInbox,
+        DynamicPushedReplyPayload,
+    };
 
     #[test]
     fn parse_egress_allow_host_supports_exact_and_port_rules() {
@@ -5453,5 +5617,77 @@ mod tests {
         assert!(is_egress_url_allowed(&exact, &allowed));
         assert!(is_egress_url_allowed(&wildcard_ok, &allowed));
         assert!(!is_egress_url_allowed(&wildcard_bad, &allowed));
+    }
+
+    #[test]
+    fn dynamic_reply_inbox_batches_items_under_one_schedule() {
+        let inbox = DynamicPushedReplyInbox::default();
+        assert!(inbox.push(DynamicPushedReplyPayload::Dynamic(
+            DynamicPendingReplyResult {
+                reply_id: "dynr-1".to_string(),
+                ready: true,
+                ..DynamicPendingReplyResult::default()
+            }
+        )));
+        assert!(!inbox.push(DynamicPushedReplyPayload::Dynamic(
+            DynamicPendingReplyResult {
+                reply_id: "dynr-2".to_string(),
+                ready: true,
+                ..DynamicPendingReplyResult::default()
+            }
+        )));
+
+        let first = inbox.take_batch();
+        assert_eq!(first.len(), 2);
+        assert!(matches!(
+            &first[0],
+            DynamicPushedReplyPayload::Dynamic(payload) if payload.reply_id == "dynr-1"
+        ));
+        assert!(matches!(
+            &first[1],
+            DynamicPushedReplyPayload::Dynamic(payload) if payload.reply_id == "dynr-2"
+        ));
+        assert!(inbox.take_batch().is_empty());
+        assert!(inbox.push(DynamicPushedReplyPayload::Dynamic(
+            DynamicPendingReplyResult {
+                reply_id: "dynr-3".to_string(),
+                ready: true,
+                ..DynamicPendingReplyResult::default()
+            }
+        )));
+    }
+
+    #[test]
+    fn dynamic_host_rpc_task_inbox_reschedules_after_empty_drain() {
+        let inbox = DynamicHostRpcTaskInbox::default();
+        assert!(inbox.push(DynamicHostRpcTask {
+            task_id: "task-1".to_string(),
+            target_id: "target".to_string(),
+            method_name: "ping".to_string(),
+            args: vec![1],
+        }));
+
+        let first = inbox.take_batch();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].task_id, "task-1");
+
+        assert!(
+            inbox.push(DynamicHostRpcTask {
+                task_id: "task-2".to_string(),
+                target_id: "target".to_string(),
+                method_name: "ping".to_string(),
+                args: vec![2],
+            }) == false
+        );
+        let second = inbox.take_batch();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].task_id, "task-2");
+        assert!(inbox.take_batch().is_empty());
+        assert!(inbox.push(DynamicHostRpcTask {
+            task_id: "task-3".to_string(),
+            target_id: "target".to_string(),
+            method_name: "ping".to_string(),
+            args: vec![3],
+        }));
     }
 }
