@@ -67,6 +67,7 @@ struct WebSocketBenchResult {
 
 struct DynamicBenchResult {
     cold_rounds: usize,
+    baseline_fetch: ScenarioResult,
     hot_fetch: ScenarioResult,
     hot_fetch_metrics: DynamicBenchMetrics,
     hot_fetch_host_rpc: ScenarioResult,
@@ -105,6 +106,54 @@ struct DynamicBenchMetrics {
     provider_task_drain_batch: usize,
     #[serde(default, rename = "provider_task_drain_item")]
     provider_task_drain_item: usize,
+    #[serde(default, rename = "control_drain_batch")]
+    control_drain_batch: usize,
+    #[serde(default, rename = "control_drain_item")]
+    control_drain_item: usize,
+    #[serde(default, rename = "direct_fetch_fast_path_hit")]
+    direct_fetch_fast_path_hit: usize,
+    #[serde(default, rename = "direct_fetch_fast_path_fallback")]
+    direct_fetch_fast_path_fallback: usize,
+    #[serde(default, rename = "fastFetchPathHit")]
+    fast_fetch_path_hit: usize,
+    #[serde(default, rename = "fastFetchPathFallback")]
+    fast_fetch_path_fallback: usize,
+    #[serde(default, rename = "normalizeFastPathHit")]
+    normalize_fast_path_hit: usize,
+    #[serde(default, rename = "normalizeSlowPathHit")]
+    normalize_slow_path_hit: usize,
+    #[serde(default, rename = "timeSyncApplied")]
+    time_sync_applied: usize,
+    #[serde(default, rename = "timeSyncSkipped")]
+    time_sync_skipped: usize,
+    #[serde(default, rename = "jsRequestNormalizeCount")]
+    js_request_normalize_count: usize,
+    #[serde(default, rename = "jsRequestNormalizeTotalMs")]
+    js_request_normalize_total_ms: f64,
+    #[serde(default, rename = "dynamicStartOpCount")]
+    dynamic_start_op_count: usize,
+    #[serde(default, rename = "dynamicStartOpTotalMs")]
+    dynamic_start_op_total_ms: f64,
+    #[serde(default, rename = "replyMaterializeCount")]
+    reply_materialize_count: usize,
+    #[serde(default, rename = "replyMaterializeTotalMs")]
+    reply_materialize_total_ms: f64,
+    #[serde(default, rename = "timeSyncCount")]
+    time_sync_count: usize,
+    #[serde(default, rename = "timeSyncTotalMs")]
+    time_sync_total_ms: f64,
+    #[serde(default, rename = "dynamicControlDrainCount")]
+    dynamic_control_drain_count: usize,
+    #[serde(default, rename = "dynamicControlDrainTotalMs")]
+    dynamic_control_drain_total_ms: f64,
+    #[serde(default, rename = "direct_fetch_dispatch_us")]
+    direct_fetch_dispatch_us: usize,
+    #[serde(default, rename = "direct_fetch_dispatch_count")]
+    direct_fetch_dispatch_count: usize,
+    #[serde(default, rename = "direct_fetch_child_execute_us")]
+    direct_fetch_child_execute_us: usize,
+    #[serde(default, rename = "direct_fetch_child_execute_count")]
+    direct_fetch_child_execute_count: usize,
 }
 
 struct Distribution {
@@ -129,6 +178,19 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn bench_progress(label: &str) {
+    let enabled = std::env::var("DD_BENCH_VERBOSE_PROGRESS")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+        .unwrap_or(false);
+    if enabled {
+        println!("bench-progress    {}", label);
+    }
 }
 
 fn section_enabled(name: &str) -> bool {
@@ -294,7 +356,7 @@ export default {
                 let result = run_scenario(&service, &worker_name, scenario)
                     .await
                     .map_err(|error| error.to_string())?;
-                println!("{}", format_scenario_result(scenario.name, result));
+                println!("{}", format_scenario_result(scenario.name, &result));
             }
             println!();
         }
@@ -316,10 +378,19 @@ export default {
         if section_enabled("dynamic") {
             println!("== dynamic: {} ==", config.name);
             let dynamic_tag = format!("{}-dynamic", config.name);
+            let baseline_tag = format!("{}-dynamic-baseline", config.name);
+            bench_progress("dynamic service start");
+            let baseline_service = start_service(&baseline_tag, config.runtime.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let baseline_fetch = run_dynamic_baseline_fetch(&baseline_service)
+                .await
+                .map_err(|error| error.to_string())?;
             let dynamic_service = start_service(&dynamic_tag, config.runtime.clone())
                 .await
                 .map_err(|error| error.to_string())?;
-            let dynamic = match run_dynamic_bench(&dynamic_service).await {
+            bench_progress("dynamic service ready");
+            let dynamic = match run_dynamic_bench(&dynamic_service, baseline_fetch).await {
                 Ok(dynamic) => dynamic,
                 Err(error) => {
                     println!(
@@ -331,7 +402,11 @@ export default {
             };
             println!(
                 "{}",
-                format_scenario_result("dynamic-hot-fetch", dynamic.hot_fetch)
+                format_scenario_result("dynamic-baseline", &dynamic.baseline_fetch)
+            );
+            println!(
+                "{}",
+                format_scenario_result("dynamic-hot-fetch", &dynamic.hot_fetch)
             );
             println!(
                 "{}",
@@ -339,7 +414,7 @@ export default {
             );
             println!(
                 "{}",
-                format_scenario_result("dynamic-hot-fetch-host-rpc", dynamic.hot_fetch_host_rpc)
+                format_scenario_result("dynamic-hot-fetch-host-rpc", &dynamic.hot_fetch_host_rpc)
             );
             println!(
                 "{}",
@@ -361,6 +436,14 @@ export default {
                 format_dynamic_metrics_result(
                     "dynamic-create+invoke",
                     &dynamic.cold_create_invoke_metrics,
+                )
+            );
+            println!(
+                "{}",
+                format_dynamic_gap_result(
+                    &dynamic.baseline_fetch,
+                    &dynamic.hot_fetch,
+                    &dynamic.hot_fetch_host_rpc,
                 )
             );
             println!("dynamic-final      config={} status=ok", config.name);
@@ -434,7 +517,7 @@ export default {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-                println!("{}", format_scenario_result("kv-write-sync", kv_sync));
+                println!("{}", format_scenario_result("kv-write-sync", &kv_sync));
 
                 let kv_concurrent = run_scenario(
                     &kv_service,
@@ -451,7 +534,7 @@ export default {
                 .map_err(|error| error.to_string())?;
                 println!(
                     "{}",
-                    format_scenario_result("kv-write-concurrent", kv_concurrent)
+                    format_scenario_result("kv-write-concurrent", &kv_concurrent)
                 );
                 println!();
             }
@@ -559,6 +642,14 @@ export default {
     }
 
     return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+const DYNAMIC_BENCH_BASELINE_WORKER_SOURCE: &str = r#"
+export default {
+  async fetch() {
+    return new Response("ok");
   },
 };
 "#;
@@ -986,13 +1077,44 @@ async fn run_websocket_bench(service: &RuntimeService) -> common::Result<WebSock
     })
 }
 
-async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBenchResult> {
+async fn run_dynamic_baseline_fetch(service: &RuntimeService) -> common::Result<ScenarioResult> {
+    let requests = env_usize("DD_BENCH_DYNAMIC_REQUESTS", 500);
+    let concurrency = env_usize("DD_BENCH_DYNAMIC_CONCURRENCY", 64);
+    let baseline_worker_name = format!("dynamic-baseline-{}", Uuid::new_v4());
+    service
+        .deploy(
+            baseline_worker_name.clone(),
+            DYNAMIC_BENCH_BASELINE_WORKER_SOURCE.to_string(),
+        )
+        .await?;
+    with_timeout(
+        "dynamic-baseline stage=timed",
+        run_scenario(
+            service,
+            &baseline_worker_name,
+            Scenario {
+                name: "dynamic-baseline",
+                worker_source: DYNAMIC_BENCH_BASELINE_WORKER_SOURCE,
+                requests,
+                concurrency,
+                paths: &["/"],
+            },
+        ),
+    )
+    .await
+}
+
+async fn run_dynamic_bench(
+    service: &RuntimeService,
+    baseline_fetch: ScenarioResult,
+) -> common::Result<DynamicBenchResult> {
     let requests = env_usize("DD_BENCH_DYNAMIC_REQUESTS", 500);
     let concurrency = env_usize("DD_BENCH_DYNAMIC_CONCURRENCY", 64);
     let cold_rounds = env_usize("DD_BENCH_DYNAMIC_COLD_ROUNDS", 50);
     let metric_probe_requests = requests.clamp(64, 128);
     let metric_probe_concurrency = concurrency.min(32);
 
+    bench_progress("dynamic plain deploy");
     let plain_worker_name = format!("dynamic-plain-{}", Uuid::new_v4());
     deploy_dynamic_bench_worker(
         service,
@@ -1000,6 +1122,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
         DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
     )
     .await?;
+    bench_progress("dynamic plain warm");
     with_timeout(
         "dynamic-hot-fetch stage=warm",
         service.invoke(plain_worker_name.clone(), invocation("/hot", 0)),
@@ -1007,6 +1130,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     .await
     .map(|_| ())?;
     reset_dynamic_bench_metrics(service, &plain_worker_name).await?;
+    bench_progress("dynamic plain metrics");
     with_timeout(
         "dynamic-hot-fetch stage=metrics",
         run_scenario(
@@ -1023,6 +1147,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     )
     .await?;
     let hot_fetch_metrics = fetch_dynamic_bench_metrics(service, &plain_worker_name).await?;
+    bench_progress("dynamic plain timed");
     let hot_fetch = with_timeout(
         "dynamic-hot-fetch stage=timed",
         run_scenario(
@@ -1039,6 +1164,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     )
     .await?;
 
+    bench_progress("dynamic host-rpc deploy");
     let host_rpc_worker_name = format!("dynamic-host-rpc-{}", Uuid::new_v4());
     deploy_dynamic_bench_worker(
         service,
@@ -1046,6 +1172,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
         DYNAMIC_BENCH_HOST_RPC_WORKER_SOURCE,
     )
     .await?;
+    bench_progress("dynamic host-rpc warm");
     with_dynamic_diagnostics(service, &host_rpc_worker_name, async {
         with_timeout(
             "dynamic-hot-fetch-host-rpc stage=warm",
@@ -1059,6 +1186,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     })
     .await?;
     reset_dynamic_bench_metrics(service, &host_rpc_worker_name).await?;
+    bench_progress("dynamic host-rpc metrics");
     with_dynamic_diagnostics(service, &host_rpc_worker_name, async {
         with_timeout(
             "dynamic-hot-fetch-host-rpc stage=metrics",
@@ -1080,6 +1208,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     .await?;
     let hot_fetch_host_rpc_metrics =
         fetch_dynamic_bench_metrics(service, &host_rpc_worker_name).await?;
+    bench_progress("dynamic host-rpc timed");
     let hot_fetch_host_rpc = with_dynamic_diagnostics(
         service,
         &host_rpc_worker_name,
@@ -1100,6 +1229,7 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     )
     .await?;
 
+    bench_progress("dynamic cold rounds");
     let mut cold_samples = Vec::with_capacity(cold_rounds);
     reset_dynamic_bench_metrics(service, &plain_worker_name).await?;
     for idx in 0..cold_rounds {
@@ -1120,10 +1250,12 @@ async fn run_dynamic_bench(service: &RuntimeService) -> common::Result<DynamicBe
     let cold_create_invoke_metrics =
         fetch_dynamic_bench_metrics(service, &plain_worker_name).await?;
 
+    bench_progress("dynamic admin checks");
     run_dynamic_admin_checks(service).await?;
 
     Ok(DynamicBenchResult {
         cold_rounds,
+        baseline_fetch,
         hot_fetch,
         hot_fetch_metrics,
         hot_fetch_host_rpc,
@@ -1497,7 +1629,7 @@ fn percentile_ms(latencies: &[Duration], percentile: f64) -> f64 {
     latencies[idx].as_secs_f64() * 1000.0
 }
 
-fn format_scenario_result(name: &str, result: ScenarioResult) -> String {
+fn format_scenario_result(name: &str, result: &ScenarioResult) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
@@ -1544,24 +1676,108 @@ fn format_dynamic_metrics_result(name: &str, metrics: &DynamicBenchMetrics) -> S
     } else {
         (metrics.source_cache_hit as f64 / source_total as f64) * 100.0
     };
+    let normalize_mean_ms = mean_ms(
+        metrics.js_request_normalize_total_ms,
+        metrics.js_request_normalize_count,
+    );
+    let start_mean_ms = mean_ms(
+        metrics.dynamic_start_op_total_ms,
+        metrics.dynamic_start_op_count,
+    );
+    let reply_mean_ms = mean_ms(
+        metrics.reply_materialize_total_ms,
+        metrics.reply_materialize_count,
+    );
+    let time_sync_mean_ms = mean_ms(metrics.time_sync_total_ms, metrics.time_sync_count);
+    let control_drain_mean_ms = mean_ms(
+        metrics.dynamic_control_drain_total_ms,
+        metrics.dynamic_control_drain_count,
+    );
+    let dispatch_mean_ms = mean_us_to_ms(
+        metrics.direct_fetch_dispatch_us,
+        metrics.direct_fetch_dispatch_count,
+    );
+    let child_execute_mean_ms = mean_us_to_ms(
+        metrics.direct_fetch_child_execute_us,
+        metrics.direct_fetch_child_execute_count,
+    );
 
     let mut out = String::new();
     let _ = write!(
         out,
-        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} async_replies={} provider_task={} reply_batches={} reply_items={} provider_batches={} provider_items={}",
+        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} direct_path={} direct_path_fallback={} fetch_ops={} fetch_op_fallback={} normalize_fast={} normalize_slow={} async_replies={} provider_task={} control_batches={} control_items={} reply_batches={} reply_items={} provider_batches={} provider_items={} time_sync={}/{} normalize_mean={:.3}ms start_mean={:.3}ms dispatch_mean={:.3}ms child_mean={:.3}ms reply_mean={:.3}ms sync_mean={:.3}ms control_mean={:.3}ms",
         format!("{name}-metrics"),
         handle_hit_rate,
         source_hit_rate,
         metrics.warm_isolate_hit,
         metrics.fallback_dispatch,
+        metrics.direct_fetch_fast_path_hit,
+        metrics.direct_fetch_fast_path_fallback,
+        metrics.fast_fetch_path_hit,
+        metrics.fast_fetch_path_fallback,
+        metrics.normalize_fast_path_hit,
+        metrics.normalize_slow_path_hit,
         metrics.async_reply_completion,
         metrics.provider_task_callback,
+        metrics.control_drain_batch,
+        metrics.control_drain_item,
         metrics.reply_drain_batch,
         metrics.reply_drain_item,
         metrics.provider_task_drain_batch,
         metrics.provider_task_drain_item,
+        metrics.time_sync_applied,
+        metrics.time_sync_skipped,
+        normalize_mean_ms,
+        start_mean_ms,
+        dispatch_mean_ms,
+        child_execute_mean_ms,
+        reply_mean_ms,
+        time_sync_mean_ms,
+        control_drain_mean_ms,
     );
     out
+}
+
+fn mean_ms(total_ms: f64, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total_ms / count as f64
+    }
+}
+
+fn mean_us_to_ms(total_us: usize, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        (total_us as f64 / count as f64) / 1000.0
+    }
+}
+
+fn format_dynamic_gap_result(
+    baseline: &ScenarioResult,
+    plain: &ScenarioResult,
+    host_rpc: &ScenarioResult,
+) -> String {
+    let plain_pct = if baseline.throughput_rps <= 0.0 {
+        0.0
+    } else {
+        (plain.throughput_rps / baseline.throughput_rps) * 100.0
+    };
+    let host_rpc_pct = if baseline.throughput_rps <= 0.0 {
+        0.0
+    } else {
+        (host_rpc.throughput_rps / baseline.throughput_rps) * 100.0
+    };
+    format!(
+        "{:<18} baseline={:.0}req/s plain={:.0}req/s ({:.1}%) host_rpc={:.0}req/s ({:.1}%)",
+        "dynamic-gap",
+        baseline.throughput_rps,
+        plain.throughput_rps,
+        plain_pct,
+        host_rpc.throughput_rps,
+        host_rpc_pct,
+    )
 }
 
 fn format_cold_start_result(result: ColdStartResult) -> String {
@@ -1635,7 +1851,7 @@ fn format_websocket_open_result(result: &WebSocketBenchResult) -> String {
 fn format_websocket_roundtrip_result(result: &WebSocketBenchResult) -> String {
     format_scenario_result(
         &format!("ws-send-echo x{}", result.messages_per_session),
-        ScenarioResult {
+        &ScenarioResult {
             total_requests: result.roundtrip.total_requests,
             concurrency: result.roundtrip.concurrency,
             total_duration: result.roundtrip.total_duration,

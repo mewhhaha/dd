@@ -1088,6 +1088,73 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   };
 
+  const normalizeDynamicFastBody = (value) => {
+    if (value == null) {
+      return new Uint8Array();
+    }
+    if (typeof value === "string") {
+      return toUtf8Bytes(value);
+    }
+    if (value instanceof URLSearchParams) {
+      return toUtf8Bytes(value.toString());
+    }
+    if (value instanceof Uint8Array || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+      return toArrayBytes(value);
+    }
+    return null;
+  };
+
+  const normalizeDynamicFetchInputFast = (inputValue, initValue) => {
+    if (inputValue instanceof Request) {
+      if (inputValue.body != null) {
+        return null;
+      }
+      const headers = initValue?.headers != null
+        ? toHeaderEntries(initValue.headers)
+        : Array.from(inputValue.headers.entries());
+      let body = new Uint8Array();
+      if (initValue && Object.prototype.hasOwnProperty.call(initValue, "body")) {
+        body = normalizeDynamicFastBody(initValue.body);
+        if (body == null) {
+          return null;
+        }
+      }
+      return {
+        method: String(initValue?.method ?? inputValue.method ?? "GET").toUpperCase(),
+        url: String(inputValue.url || "http://worker/"),
+        headers,
+        body,
+      };
+    }
+
+    const body = normalizeDynamicFastBody(initValue?.body);
+    if (body == null) {
+      return null;
+    }
+    const raw = String(inputValue ?? "/");
+    const method = String(initValue?.method ?? "GET").toUpperCase();
+    const url = raw.startsWith("http://") || raw.startsWith("https://")
+      ? raw
+      : new URL(raw, "http://worker").toString();
+    const headers = toHeaderEntries(initValue?.headers);
+    return {
+      method,
+      url,
+      headers,
+      body,
+    };
+  };
+
+  const normalizeDynamicFetchInput = async (inputValue, initValue) => {
+    const fast = normalizeDynamicFetchInputFast(inputValue, initValue);
+    if (fast) {
+      recordDynamicMetric("normalizeFastPathHit");
+      return fast;
+    }
+    recordDynamicMetric("normalizeSlowPathHit");
+    return normalizeActorFetchInput(inputValue, initValue);
+  };
+
   const toArrayBytes = (value) => {
     if (value instanceof Uint8Array) {
       return value;
@@ -3758,6 +3825,12 @@ globalThis.__dd_execute_worker = (payload) => {
     metrics[name] = Number(metrics[name] ?? 0) + Number(count ?? 0);
   };
 
+  const recordDynamicStageMetric = (prefix, durationMs) => {
+    const metrics = getDynamicCacheState().metrics;
+    metrics[`${prefix}Count`] = Number(metrics[`${prefix}Count`] ?? 0) + 1;
+    metrics[`${prefix}TotalMs`] = Number(metrics[`${prefix}TotalMs`] ?? 0) + Number(durationMs ?? 0);
+  };
+
   const dynamicHandleCacheKey = (bindingName, instanceId) => (
     `${workerName}\u001f${bindingName}\u001f${instanceId}`
   );
@@ -4011,38 +4084,77 @@ globalThis.__dd_execute_worker = (payload) => {
     return built;
   };
 
-  const createDynamicWorkerStub = (bindingName, handle, worker, timeout, cacheKey = "") => ({
-    worker,
-    async fetch(inputValue, initValue = undefined) {
-      const request = await normalizeActorFetchInput(inputValue, initValue);
-      const scopedRequestId = activeRequestId();
-      const invokeSeq = nextActorInvokeSeq();
-      const result = await awaitDynamicReply(
-        `dynamic worker invoke (${bindingName}/${handle})`,
-        () => callOp("op_dynamic_worker_invoke", {
-          request_id: scopedRequestId,
-          subrequest_id: `${scopedRequestId}:dynamic:${invokeSeq}`,
-          binding: bindingName,
-          handle,
-          method: request.method,
-          url: request.url,
-          headers: request.headers,
-          body: Array.from(request.body),
-        }),
-        timeout,
-      );
-      if (!result || typeof result !== "object" || result.ok === false) {
-        if (cacheKey && dynamicHandleErrorIsStale(result)) {
-          getDynamicCacheState().handleCache.delete(cacheKey);
+  const applyDynamicReplyBoundary = (result) => {
+    if (!result || typeof result !== "object" || result.boundary_changed !== true) {
+      recordDynamicMetric("timeSyncSkipped");
+      return;
+    }
+    const started = performance.now();
+    const boundary = normalizeBoundaryValue({
+      nowMs: result.boundary_now_ms,
+      perfMs: result.boundary_perf_ms,
+    });
+    if (boundary && typeof globalThis.__dd_set_time === "function") {
+      globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+      recordDynamicMetric("timeSyncApplied");
+    } else {
+      recordDynamicMetric("timeSyncSkipped");
+    }
+    recordDynamicStageMetric("timeSync", performance.now() - started);
+  };
+
+  const createDynamicWorkerStub = (bindingName, handle, worker, timeout, cacheKey = "") => {
+    const invokeLabel = `dynamic worker invoke (${bindingName}/${handle})`;
+    const invokeBase = Object.freeze({
+      binding: bindingName,
+      handle,
+    });
+    return {
+      worker,
+      async fetch(inputValue, initValue = undefined) {
+        const normalizeStarted = performance.now();
+        const request = await normalizeDynamicFetchInput(inputValue, initValue);
+        recordDynamicStageMetric("jsRequestNormalize", performance.now() - normalizeStarted);
+
+        const scopedRequestId = activeRequestId();
+        const invokeSeq = nextActorInvokeSeq();
+        const startStarted = performance.now();
+        recordDynamicMetric("fastFetchPathHit");
+        const result = await awaitDynamicReply(
+          invokeLabel,
+          () => callOp("op_dynamic_worker_fetch_start", {
+            request_id: scopedRequestId,
+            subrequest_id: `${scopedRequestId}:dynamic:${invokeSeq}`,
+            binding: invokeBase.binding,
+            handle: invokeBase.handle,
+            method: request.method,
+            url: request.url,
+            headers: request.headers,
+            body: Array.from(request.body),
+          }),
+          timeout,
+          { syncTime: false },
+        ).finally(() => {
+          recordDynamicStageMetric("dynamicStartOp", performance.now() - startStarted);
+        });
+        if (!result || typeof result !== "object" || result.ok === false) {
+          if (cacheKey && (result?.stale_handle === true || dynamicHandleErrorIsStale(result))) {
+            getDynamicCacheState().handleCache.delete(cacheKey);
+          }
+          applyDynamicReplyBoundary(result);
+          throw new Error(formatDynamicFailure("dynamic worker invoke failed", result));
         }
-        throw new Error(formatDynamicFailure("dynamic worker invoke failed", result));
-      }
-      return new Response(toArrayBytes(result.body), {
-        status: Number(result.status ?? 200),
-        headers: Array.isArray(result.headers) ? result.headers : [],
-      });
-    },
-  });
+        applyDynamicReplyBoundary(result);
+        const materializeStarted = performance.now();
+        const response = new Response(toArrayBytes(result.body), {
+          status: Number(result.status ?? 200),
+          headers: Array.isArray(result.headers) ? result.headers : [],
+        });
+        recordDynamicStageMetric("replyMaterialize", performance.now() - materializeStarted);
+        return response;
+      },
+    };
+  };
 
   const parseDynamicFactoryOptions = async (factory) => {
     if (typeof factory !== "function") {
@@ -4090,18 +4202,6 @@ globalThis.__dd_execute_worker = (payload) => {
     ready.set(replyId, payload);
   };
 
-  const drainDynamicReplyQueue = () => {
-    for (;;) {
-      const batch = callOp("op_dynamic_take_pushed_replies");
-      if (!Array.isArray(batch) || batch.length === 0) {
-        return;
-      }
-      for (const payload of batch) {
-        deliverDynamicReply(payload);
-      }
-    }
-  };
-
   const waitForDynamicReply = (replyId) => {
     const ready = dynamicReplyReady();
     if (ready.has(replyId)) {
@@ -4129,7 +4229,7 @@ globalThis.__dd_execute_worker = (payload) => {
     callOp("op_dynamic_cancel_reply", replyId);
   };
 
-  const awaitDynamicReply = async (label, startOp, timeoutMs = 5_000) => {
+  const awaitDynamicReply = async (label, startOp, timeoutMs = 5_000, options = undefined) => {
     const started = startOp();
     if (!started || typeof started !== "object" || started.ok === false) {
       throw new Error(String(started?.error ?? `${label} failed to start`));
@@ -4148,7 +4248,9 @@ globalThis.__dd_execute_worker = (payload) => {
         );
       });
       const result = await Promise.race([reply, timeoutError]);
-      await syncFrozenTime();
+      if (options?.syncTime !== false) {
+        await syncFrozenTime();
+      }
       return result;
     } catch (error) {
       cancelDynamicReply(replyId, error);
@@ -4195,22 +4297,29 @@ globalThis.__dd_execute_worker = (payload) => {
     });
   };
 
-  const drainDynamicHostRpcTasks = async () => {
+  const drainDynamicControlQueue = async () => {
     for (;;) {
-      const batch = callOp("op_dynamic_take_host_rpc_tasks");
+      const batch = callOp("op_dynamic_take_control_items");
       if (!Array.isArray(batch) || batch.length === 0) {
         return;
       }
-      for (const task of batch) {
-        await runDynamicHostRpcTask(task);
+      const started = performance.now();
+      for (const item of batch) {
+        if (item?.kind === "reply") {
+          deliverDynamicReply(item.payload);
+          continue;
+        }
+        if (item?.kind === "host-rpc-task") {
+          await runDynamicHostRpcTask(item.payload);
+        }
       }
+      recordDynamicStageMetric("dynamicControlDrain", performance.now() - started);
     }
   };
 
-  globalThis.__dd_drain_dynamic_reply_queue = drainDynamicReplyQueue;
+  globalThis.__dd_drain_dynamic_control_queue = drainDynamicControlQueue;
   globalThis.__dd_await_dynamic_reply = awaitDynamicReply;
   globalThis.__dd_encode_rpc_args = encodeRpcArgs;
-  globalThis.__dd_drain_dynamic_host_rpc_tasks = drainDynamicHostRpcTasks;
 
   /**
    * @typedef {Object} DynamicWorkerConfig

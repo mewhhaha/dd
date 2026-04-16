@@ -262,7 +262,10 @@ pub struct RuntimeService {
     storage: RuntimeStorageConfig,
 }
 
-enum RuntimeCommand {
+#[derive(Clone)]
+pub(crate) struct RuntimeFastCommandSender(pub mpsc::UnboundedSender<RuntimeCommand>);
+
+pub(crate) enum RuntimeCommand {
     Deploy {
         worker_name: String,
         source: String,
@@ -284,6 +287,15 @@ enum RuntimeCommand {
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         reply: oneshot::Sender<Result<WorkerOutput>>,
+    },
+    DynamicWorkerFetchStart {
+        owner_worker: String,
+        owner_generation: u64,
+        binding: String,
+        handle: String,
+        request: WorkerInvocation,
+        reply_id: String,
+        pending_replies: crate::ops::DynamicPendingReplies,
     },
     RegisterStream {
         worker_name: String,
@@ -385,6 +397,7 @@ struct WorkerManager {
     config: RuntimeConfig,
     storage: RuntimeStorageConfig,
     bootstrap_snapshot: &'static [u8],
+    runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     kv_store: KvStore,
     actor_store: ActorStore,
     cache_store: CacheStore,
@@ -615,6 +628,7 @@ struct PendingInvoke {
 enum PendingReplyKind {
     Normal,
     DynamicInvoke { handle: String },
+    DynamicFetch { handle: String },
     WebsocketOpen { session_id: String },
     WebsocketFrame { session_id: String },
     TransportOpen { session_id: String },
@@ -631,6 +645,7 @@ impl PendingReplyKind {
         match self {
             Self::Normal => "normal",
             Self::DynamicInvoke { .. } => "dynamic-invoke",
+            Self::DynamicFetch { .. } => "dynamic-fetch",
             Self::WebsocketOpen { .. } => "websocket-open",
             Self::WebsocketFrame { .. } => "websocket-frame",
             Self::TransportOpen { .. } => "transport-open",
@@ -654,6 +669,14 @@ struct PendingReplyMeta {
     url: String,
     traceparent: Option<String>,
     user_request_id: String,
+}
+
+enum DirectDynamicFetchDispatch {
+    Dispatched,
+    Fallback {
+        reply: oneshot::Sender<Result<WorkerOutput>>,
+        clear_preferred: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -683,8 +706,7 @@ enum DispatchSelection {
 struct IsolateHandle {
     id: u64,
     sender: std_mpsc::Sender<IsolateCommand>,
-    dynamic_reply_inbox: crate::ops::DynamicPushedReplyInbox,
-    dynamic_host_rpc_task_inbox: crate::ops::DynamicHostRpcTaskInbox,
+    dynamic_control_inbox: crate::ops::DynamicControlInbox,
     inflight_count: usize,
     active_websocket_sessions: usize,
     active_transport_sessions: usize,
@@ -719,8 +741,7 @@ enum IsolateCommand {
     Abort {
         runtime_request_id: String,
     },
-    DrainDynamicReplies,
-    DrainDynamicHostRpcTasks,
+    DrainDynamicControl,
     PollEventLoop,
     Shutdown,
 }
@@ -899,6 +920,7 @@ enum RuntimeEvent {
     DynamicWorkerInvoke(crate::ops::DynamicWorkerInvokeEvent),
     DynamicHostRpcInvoke(crate::ops::DynamicHostRpcInvokeEvent),
     DynamicReplyReady(crate::ops::DynamicPendingReplyDelivery),
+    DynamicFetchReplyReady(crate::ops::DynamicPendingReplyDelivery),
     DynamicHostRpcTaskComplete {
         worker_name: String,
         generation: u64,
@@ -1069,6 +1091,7 @@ impl RuntimeService {
         spawn_runtime_thread(
             receiver,
             cancel_receiver,
+            cancel_sender.clone(),
             bootstrap_snapshot,
             kv_store,
             actor_store,
@@ -1754,11 +1777,13 @@ impl WorkerManager {
         cache_store: CacheStore,
         config: RuntimeConfig,
         storage: RuntimeStorageConfig,
+        runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     ) -> Self {
         Self {
             config,
             storage,
             bootstrap_snapshot,
+            runtime_fast_sender,
             kv_store,
             actor_store,
             cache_store,
@@ -1879,6 +1904,26 @@ impl WorkerManager {
                     false,
                     reply,
                     PendingReplyKind::Normal,
+                    event_tx,
+                );
+            }
+            RuntimeCommand::DynamicWorkerFetchStart {
+                owner_worker,
+                owner_generation,
+                binding,
+                handle,
+                request,
+                reply_id,
+                pending_replies,
+            } => {
+                self.start_dynamic_worker_fetch(
+                    owner_worker,
+                    owner_generation,
+                    binding,
+                    handle,
+                    request,
+                    reply_id,
+                    pending_replies,
                     event_tx,
                 );
             }
@@ -2247,7 +2292,15 @@ impl WorkerManager {
                     &delivery.owner.worker_name,
                     delivery.owner.generation,
                     delivery.owner.isolate_id,
-                    crate::ops::DynamicPushedReplyPayload::Dynamic(delivery.payload),
+                    delivery.payload,
+                );
+            }
+            RuntimeEvent::DynamicFetchReplyReady(delivery) => {
+                self.enqueue_isolate_reply(
+                    &delivery.owner.worker_name,
+                    delivery.owner.generation,
+                    delivery.owner.isolate_id,
+                    delivery.payload,
                 );
             }
             RuntimeEvent::DynamicHostRpcTaskComplete {
@@ -2933,6 +2986,144 @@ impl WorkerManager {
         self.dispatch_pool(&worker_name, generation, event_tx);
     }
 
+    fn try_dispatch_direct_dynamic_fetch(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        target_isolate_id: u64,
+        runtime_request_id: String,
+        request: WorkerInvocation,
+        reply: oneshot::Sender<Result<WorkerOutput>>,
+        handle: String,
+    ) -> DirectDynamicFetchDispatch {
+        let config_max_inflight = self.config.max_inflight_per_isolate;
+        let dispatch_result = {
+            let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+                return DirectDynamicFetchDispatch::Fallback {
+                    reply,
+                    clear_preferred: true,
+                };
+            };
+            let max_inflight = if pool.strict_request_isolation {
+                1
+            } else {
+                config_max_inflight
+            };
+            let Some(isolate_idx) = pool
+                .isolates
+                .iter()
+                .position(|isolate| isolate.id == target_isolate_id)
+            else {
+                return DirectDynamicFetchDispatch::Fallback {
+                    reply,
+                    clear_preferred: true,
+                };
+            };
+            let isolate_busy = pool.isolates[isolate_idx].inflight_count >= max_inflight
+                || (pool.strict_request_isolation
+                    && !pool.isolates[isolate_idx].pending_wait_until.is_empty());
+            if isolate_busy {
+                return DirectDynamicFetchDispatch::Fallback {
+                    reply,
+                    clear_preferred: false,
+                };
+            }
+
+            let worker_name_json = Arc::clone(&pool.worker_name_json);
+            let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
+            let kv_read_cache_config_json = Arc::clone(&pool.kv_read_cache_config_json);
+            let actor_bindings_json = Arc::clone(&pool.actor_bindings_json);
+            let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
+            let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
+            let dynamic_env_json = Arc::clone(&pool.dynamic_env_json);
+            let dynamic_bindings = pool.dynamic_bindings.clone();
+            let dynamic_rpc_bindings = pool
+                .dynamic_rpc_bindings
+                .iter()
+                .map(|binding| binding.binding.clone())
+                .collect::<Vec<_>>();
+            let secret_replacements = pool.secret_replacements.clone();
+            let egress_allow_hosts = pool.egress_allow_hosts.clone();
+            let counted_reuse = pool.isolates[isolate_idx].served_requests > 0;
+            if counted_reuse {
+                pool.stats.reuse_count += 1;
+            }
+
+            let completion_token = next_runtime_token("done");
+            let completion_meta = Some(PendingReplyMeta {
+                method: request.method.clone(),
+                url: request.url.clone(),
+                traceparent: None,
+                user_request_id: request.request_id.clone(),
+            });
+            let command = IsolateCommand::Execute {
+                runtime_request_id: runtime_request_id.clone(),
+                completion_token: completion_token.clone(),
+                worker_name_json,
+                kv_bindings_json,
+                kv_read_cache_config_json,
+                actor_bindings_json,
+                dynamic_bindings_json,
+                dynamic_rpc_bindings_json,
+                dynamic_env_json,
+                dynamic_bindings,
+                dynamic_rpc_bindings,
+                secret_replacements,
+                egress_allow_hosts,
+                request,
+                request_body: None,
+                stream_response: false,
+                actor_call: None,
+                host_rpc_call: None,
+                actor_route: None,
+            };
+
+            let isolate = &mut pool.isolates[isolate_idx];
+            isolate.served_requests += 1;
+            isolate.inflight_count += 1;
+            isolate.pending_replies.insert(
+                runtime_request_id.clone(),
+                PendingReply {
+                    completion_token,
+                    canceled: false,
+                    actor_key: None,
+                    internal_origin: true,
+                    reply,
+                    completion_meta,
+                    kind: PendingReplyKind::DynamicFetch { handle },
+                    dispatched_at: Instant::now(),
+                },
+            );
+
+            if isolate.sender.send(command).is_ok() {
+                return DirectDynamicFetchDispatch::Dispatched;
+            }
+
+            let pending_reply = isolate
+                .pending_replies
+                .remove(&runtime_request_id)
+                .expect("direct dynamic fetch pending reply should exist");
+            isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
+            isolate.served_requests = isolate.served_requests.saturating_sub(1);
+            let restored_reply = pending_reply.reply;
+            if counted_reuse {
+                pool.stats.reuse_count = pool.stats.reuse_count.saturating_sub(1);
+            }
+            (isolate_idx, restored_reply)
+        };
+        let (isolate_idx, restored_reply) = dispatch_result;
+        let failed = self.remove_isolate(worker_name, generation, isolate_idx);
+        for (request_id, reply) in failed {
+            if request_id != runtime_request_id {
+                let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
+            }
+        }
+        DirectDynamicFetchDispatch::Fallback {
+            reply: restored_reply,
+            clear_preferred: true,
+        }
+    }
+
     fn enqueue_actor_invoke(
         &mut self,
         payload: ActorInvokeEvent,
@@ -3414,6 +3605,7 @@ impl WorkerManager {
             cache_store,
             open_handle_registry,
             dynamic_profile,
+            self.runtime_fast_sender.clone(),
             worker_name.to_string(),
             generation,
             isolate_id,
@@ -3561,7 +3753,8 @@ impl WorkerManager {
                         let _ = reply.send(result);
                     }
                 }
-                PendingReplyKind::DynamicInvoke { handle } => {
+                PendingReplyKind::DynamicInvoke { handle }
+                | PendingReplyKind::DynamicFetch { handle } => {
                     if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
                         match &result {
                             Ok(_) => {
@@ -4108,6 +4301,7 @@ impl WorkerManager {
                         }
                         PendingReplyKind::Normal
                         | PendingReplyKind::DynamicInvoke { .. }
+                        | PendingReplyKind::DynamicFetch { .. }
                         | PendingReplyKind::WebsocketFrame { .. } => {}
                     }
                     replies.push((request_id, pending.reply));
@@ -4500,7 +4694,7 @@ impl WorkerManager {
                     .map(|isolate| {
                         (
                             isolate.sender.clone(),
-                            isolate.dynamic_host_rpc_task_inbox.clone(),
+                            isolate.dynamic_control_inbox.clone(),
                         )
                     })
             })
@@ -4529,17 +4723,13 @@ impl WorkerManager {
                 },
             },
         );
-        let schedule = inbox.push(crate::ops::DynamicHostRpcTask {
+        let schedule = inbox.push_host_rpc_task(crate::ops::DynamicHostRpcTask {
             task_id: task_id.clone(),
             target_id: payload.target_id,
             method_name: payload.method_name,
             args: payload.args,
         });
-        if !schedule
-            || sender
-                .send(IsolateCommand::DrainDynamicHostRpcTasks)
-                .is_ok()
-        {
+        if !schedule || sender.send(IsolateCommand::DrainDynamicControl).is_ok() {
             return;
         }
         if let Some(task) = self.dynamic_host_rpc_tasks.remove(&task_id) {
@@ -4605,7 +4795,7 @@ impl WorkerManager {
             &delivery.owner.worker_name,
             delivery.owner.generation,
             delivery.owner.isolate_id,
-            crate::ops::DynamicPushedReplyPayload::Dynamic(delivery.payload),
+            delivery.payload,
         );
     }
 
@@ -4624,14 +4814,19 @@ impl WorkerManager {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == isolate_id)
-                    .map(|isolate| (isolate.sender.clone(), isolate.dynamic_reply_inbox.clone()))
+                    .map(|isolate| {
+                        (
+                            isolate.sender.clone(),
+                            isolate.dynamic_control_inbox.clone(),
+                        )
+                    })
             })
         else {
             return;
         };
-        let schedule = inbox.push(payload);
+        let schedule = inbox.push_reply(payload);
         if schedule {
-            let _ = sender.send(IsolateCommand::DrainDynamicReplies);
+            let _ = sender.send(IsolateCommand::DrainDynamicControl);
         }
     }
 
@@ -5128,6 +5323,7 @@ impl WorkerPool {
 fn spawn_runtime_thread(
     mut receiver: mpsc::Receiver<RuntimeCommand>,
     mut cancel_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
+    runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
     actor_store: ActorStore,
@@ -5152,6 +5348,7 @@ fn spawn_runtime_thread(
                     cache_store,
                     config.clone(),
                     storage,
+                    runtime_fast_sender,
                 );
                 let mut ticker = tokio::time::interval(config.scale_tick);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5434,6 +5631,7 @@ fn spawn_isolate_thread(
     cache_store: CacheStore,
     open_handle_registry: crate::ops::ActorOpenHandleRegistry,
     dynamic_profile: crate::ops::DynamicProfile,
+    runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     worker_name: String,
     generation: u64,
     isolate_id: u64,
@@ -5441,10 +5639,8 @@ fn spawn_isolate_thread(
 ) -> Result<IsolateHandle> {
     let (command_tx, command_rx) = std_mpsc::channel();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
-    let dynamic_reply_inbox = crate::ops::DynamicPushedReplyInbox::default();
-    let dynamic_host_rpc_task_inbox = crate::ops::DynamicHostRpcTaskInbox::default();
-    let thread_dynamic_reply_inbox = dynamic_reply_inbox.clone();
-    let thread_dynamic_host_rpc_task_inbox = dynamic_host_rpc_task_inbox.clone();
+    let dynamic_control_inbox = crate::ops::DynamicControlInbox::default();
+    let thread_dynamic_control_inbox = dynamic_control_inbox.clone();
     let event_loop_waker = Waker::from(Arc::new(IsolateEventLoopWaker {
         sender: command_tx.clone(),
     }));
@@ -5485,8 +5681,8 @@ fn spawn_isolate_thread(
                     op_state.put(crate::ops::RequestSecretContexts::default());
                     op_state.put(crate::ops::DynamicPendingReplies::default());
                     op_state.put(crate::ops::TestAsyncReplies::default());
-                    op_state.put(thread_dynamic_reply_inbox.clone());
-                    op_state.put(thread_dynamic_host_rpc_task_inbox.clone());
+                    op_state.put(thread_dynamic_control_inbox.clone());
+                    op_state.put(RuntimeFastCommandSender(runtime_fast_sender.clone()));
                     op_state.put(dynamic_profile.clone());
                 }
                 {
@@ -5595,8 +5791,7 @@ fn spawn_isolate_thread(
         Ok(Ok(())) => Ok(IsolateHandle {
             id: isolate_id,
             sender: command_tx,
-            dynamic_reply_inbox,
-            dynamic_host_rpc_task_inbox,
+            dynamic_control_inbox,
             inflight_count: 0,
             active_websocket_sessions: 0,
             active_transport_sessions: 0,
@@ -5852,33 +6047,14 @@ fn handle_isolate_command(
             abort_worker_request(js_runtime, &runtime_request_id)?;
             Ok(true)
         }
-        IsolateCommand::DrainDynamicReplies => {
+        IsolateCommand::DrainDynamicControl => {
             js_runtime
                 .execute_script(
-                    "<dd:dynamic-reply-drain>",
+                    "<dd:dynamic-control-drain>",
                     "(() => {
-                        const drain = globalThis.__dd_drain_dynamic_reply_queue;
+                        const drain = globalThis.__dd_drain_dynamic_control_queue;
                         if (typeof drain !== \"function\") {
-                          throw new Error(\"dynamic reply drain helper missing\");
-                        }
-                        drain();
-                      })()",
-                )
-                .map_err(|error| PlatformError::internal(error.to_string()))?;
-            {
-                let op_state = js_runtime.op_state();
-                op_state.borrow().waker.wake();
-            }
-            Ok(true)
-        }
-        IsolateCommand::DrainDynamicHostRpcTasks => {
-            js_runtime
-                .execute_script(
-                    "<dd:dynamic-host-rpc-task-drain>",
-                    "(() => {
-                        const drain = globalThis.__dd_drain_dynamic_host_rpc_tasks;
-                        if (typeof drain !== \"function\") {
-                          throw new Error(\"dynamic host rpc task drain helper missing\");
+                          throw new Error(\"dynamic control drain helper missing\");
                         }
                         void Promise.resolve(drain()).catch(() => undefined);
                       })()",
@@ -6461,6 +6637,93 @@ export default {
       timeout: 1_500,
     }));
     return child.fetch("http://worker/");
+  },
+};
+"#
+        .to_string()
+    }
+
+    fn dynamic_fast_fetch_worker() -> String {
+        r#"
+let hotChild = null;
+
+function childConfig() {
+  return {
+    entrypoint: "worker.js",
+    modules: {
+      "worker.js": `
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/echo") {
+      return new Response(await request.arrayBuffer(), {
+        status: Number(url.searchParams.get("status") ?? "207"),
+        headers: [
+          ["x-method", request.method],
+          ["x-query", url.searchParams.get("q") ?? ""],
+          ["x-test", request.headers.get("x-test") ?? ""],
+          ["content-type", request.headers.get("content-type") ?? "application/octet-stream"],
+        ],
+      });
+    }
+    return new Response("ok");
+  },
+};
+      `,
+    },
+    timeout: 1_500,
+  };
+}
+
+function metricsResponse() {
+  const jsMetrics = globalThis.__dd_dynamic_metrics ?? {};
+  const rustProfile = Deno.core.ops.op_dynamic_profile_take?.() ?? null;
+  return Response.json({
+    ...jsMetrics,
+    ...(rustProfile?.snapshot ?? {}),
+  });
+}
+
+function resetMetrics() {
+  const metrics = globalThis.__dd_dynamic_metrics ?? null;
+  if (metrics && typeof metrics === "object") {
+    for (const key of Object.keys(metrics)) {
+      metrics[key] = 0;
+    }
+  }
+  Deno.core.ops.op_dynamic_profile_reset?.();
+  return new Response("ok");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/__dynamic_metrics") {
+      return metricsResponse();
+    }
+    if (url.pathname === "/__dynamic_metrics_reset") {
+      return resetMetrics();
+    }
+
+    if (!hotChild) {
+      hotChild = await env.SANDBOX.get("fast:v1", async () => childConfig());
+    }
+
+    if (url.pathname === "/hot") {
+      return hotChild.fetch("http://worker/");
+    }
+
+    if (url.pathname === "/echo") {
+      const body = await request.arrayBuffer();
+      return hotChild.fetch(new Request(`http://worker/echo${url.search}`, {
+        method: request.method,
+        headers: request.headers,
+        body,
+      }));
+    }
+
+    return new Response("not found", { status: 404 });
   },
 };
 "#
@@ -9850,6 +10113,306 @@ https://:sub.example.com/a.js
         }
 
         assert_eq!(bodies.len(), 32);
+    }
+
+    #[derive(Deserialize)]
+    struct DynamicFastFetchMetrics {
+        #[serde(default, rename = "fastFetchPathHit")]
+        fast_fetch_path_hit: u64,
+        #[serde(default, rename = "direct_fetch_fast_path_hit")]
+        direct_fetch_fast_path_hit: u64,
+        #[serde(default, rename = "direct_fetch_fast_path_fallback")]
+        direct_fetch_fast_path_fallback: u64,
+        #[serde(default, rename = "warm_isolate_hit")]
+        warm_isolate_hit: u64,
+        #[serde(default, rename = "fallback_dispatch")]
+        fallback_dispatch: u64,
+        #[serde(default, rename = "timeSyncApplied")]
+        time_sync_applied: u64,
+        #[serde(default, rename = "direct_fetch_dispatch_count")]
+        direct_fetch_dispatch_count: u64,
+        #[serde(default, rename = "control_drain_batch")]
+        control_drain_batch: u64,
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_fast_fetch_preserves_request_response_shape_and_records_direct_metrics() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-fast-fetch".to_string(),
+                dynamic_fast_fetch_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-fetch",
+            test_invocation_with_path("/__dynamic_metrics_reset", "dynamic-fast-reset"),
+            "dynamic fast metrics reset",
+        )
+        .await;
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-fetch",
+            test_invocation_with_path("/hot", "dynamic-fast-hot-1"),
+            "dynamic fast first hot invoke",
+        )
+        .await;
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-fetch",
+            test_invocation_with_path("/hot", "dynamic-fast-hot-2"),
+            "dynamic fast second hot invoke",
+        )
+        .await;
+
+        let binary_body = vec![0, 1, 2, 3, 255];
+        let parity = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-fetch",
+            WorkerInvocation {
+                method: "POST".to_string(),
+                url: "http://worker/echo?q=hello&status=207".to_string(),
+                headers: vec![
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("x-test".to_string(), "alpha".to_string()),
+                ],
+                body: binary_body.clone(),
+                request_id: "dynamic-fast-echo".to_string(),
+            },
+            "dynamic fast parity invoke",
+        )
+        .await;
+        assert_eq!(parity.status, 207);
+        assert_eq!(parity.body, binary_body);
+        assert!(parity
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-method") && value == "POST"));
+        assert!(parity
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-query") && value == "hello"));
+        assert!(parity
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-test") && value == "alpha"));
+
+        let metrics_output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-fetch",
+            test_invocation_with_path("/__dynamic_metrics", "dynamic-fast-metrics"),
+            "dynamic fast metrics read",
+        )
+        .await;
+        let metrics: DynamicFastFetchMetrics = crate::json::from_string(
+            String::from_utf8(metrics_output.body).expect("metrics body should be utf8"),
+        )
+        .expect("metrics should parse");
+        assert!(
+            metrics.fast_fetch_path_hit >= 3,
+            "{:?}",
+            metrics.fast_fetch_path_hit
+        );
+        assert!(
+            metrics.direct_fetch_fast_path_hit >= 2,
+            "{:?}",
+            metrics.direct_fetch_fast_path_hit
+        );
+        assert!(metrics.direct_fetch_fast_path_fallback <= 1);
+        assert!(
+            metrics.warm_isolate_hit >= 1,
+            "{:?}",
+            metrics.warm_isolate_hit
+        );
+        assert!(metrics.direct_fetch_dispatch_count >= 3);
+        assert!(metrics.control_drain_batch >= 1);
+        assert!(metrics.time_sync_applied >= 3);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_fast_fetch_repeated_warm_requests_stay_on_direct_path() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-fast-repeat".to_string(),
+                dynamic_fast_fetch_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-repeat",
+            test_invocation_with_path("/hot", "dynamic-fast-repeat-warm"),
+            "dynamic fast repeat warm invoke",
+        )
+        .await;
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-repeat",
+            test_invocation_with_path("/__dynamic_metrics_reset", "dynamic-fast-repeat-reset"),
+            "dynamic fast repeat reset",
+        )
+        .await;
+
+        for index in 0..64 {
+            let request_id = format!("dynamic-fast-repeat-{index}");
+            invoke_with_timeout_and_dump(
+                &service,
+                "dynamic-fast-repeat",
+                test_invocation_with_path("/hot", &request_id),
+                "dynamic fast repeat hot invoke",
+            )
+            .await;
+        }
+
+        let metrics_output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-repeat",
+            test_invocation_with_path("/__dynamic_metrics", "dynamic-fast-repeat-metrics"),
+            "dynamic fast repeat metrics",
+        )
+        .await;
+        let metrics: DynamicFastFetchMetrics = crate::json::from_string(
+            String::from_utf8(metrics_output.body).expect("metrics body should be utf8"),
+        )
+        .expect("metrics should parse");
+        assert!(metrics.direct_fetch_fast_path_hit >= 63);
+        assert_eq!(metrics.direct_fetch_fast_path_fallback, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dynamic_fast_fetch_recovers_after_preferred_isolate_failure_and_rewarms() {
+        let service = test_service(dynamic_single_isolate_config()).await;
+
+        service
+            .deploy_with_config(
+                "dynamic-fast-rewarm".to_string(),
+                dynamic_fast_fetch_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Dynamic {
+                        binding: "SANDBOX".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("deploy should succeed");
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-rewarm",
+            test_invocation_with_path("/hot", "dynamic-fast-rewarm-warm-1"),
+            "dynamic fast rewarm first invoke",
+        )
+        .await;
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-rewarm",
+            test_invocation_with_path("/hot", "dynamic-fast-rewarm-warm-2"),
+            "dynamic fast rewarm second invoke",
+        )
+        .await;
+
+        let child_worker = service
+            .dynamic_debug_dump()
+            .await
+            .handles
+            .into_iter()
+            .find(|handle| {
+                handle.owner_worker == "dynamic-fast-rewarm" && handle.binding == "SANDBOX"
+            })
+            .map(|handle| handle.worker_name)
+            .expect("dynamic child worker should exist");
+        let child_dump = service
+            .debug_dump(child_worker.clone())
+            .await
+            .expect("child debug dump should exist");
+        let child_isolate_id = child_dump
+            .isolates
+            .first()
+            .map(|isolate| isolate.id)
+            .expect("child isolate should exist");
+        assert!(
+            service
+                .force_fail_isolate_for_test(child_worker, child_dump.generation, child_isolate_id)
+                .await
+        );
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-rewarm",
+            test_invocation_with_path("/__dynamic_metrics_reset", "dynamic-fast-rewarm-reset"),
+            "dynamic fast rewarm metrics reset",
+        )
+        .await;
+
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-rewarm",
+            test_invocation_with_path("/hot", "dynamic-fast-rewarm-after-fail-1"),
+            "dynamic fast rewarm invoke after fail",
+        )
+        .await;
+        invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-rewarm",
+            test_invocation_with_path("/hot", "dynamic-fast-rewarm-after-fail-2"),
+            "dynamic fast rewarm second invoke after fail",
+        )
+        .await;
+
+        let metrics_output = invoke_with_timeout_and_dump(
+            &service,
+            "dynamic-fast-rewarm",
+            test_invocation_with_path("/__dynamic_metrics", "dynamic-fast-rewarm-metrics"),
+            "dynamic fast rewarm metrics",
+        )
+        .await;
+        let metrics: DynamicFastFetchMetrics = crate::json::from_string(
+            String::from_utf8(metrics_output.body).expect("metrics body should be utf8"),
+        )
+        .expect("metrics should parse");
+        assert!(
+            metrics.fallback_dispatch >= 1,
+            "{:?}",
+            metrics.fallback_dispatch
+        );
+        assert!(
+            metrics.direct_fetch_fast_path_fallback >= 1,
+            "{:?}",
+            metrics.direct_fetch_fast_path_fallback
+        );
+        assert!(
+            metrics.warm_isolate_hit >= 1,
+            "{:?}",
+            metrics.warm_isolate_hit
+        );
     }
 
     #[tokio::test]
@@ -14531,8 +15094,9 @@ export default {
         assert!(!worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_queue"));
         assert!(!worker_runtime_source.contains("__dd_run_dynamic_host_rpc_tasks"));
         assert!(!worker_runtime_source.contains("op_dynamic_take_reply"));
-        assert!(worker_runtime_source.contains("__dd_drain_dynamic_reply_queue"));
-        assert!(worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_tasks"));
+        assert!(!worker_runtime_source.contains("op_dynamic_take_pushed_replies"));
+        assert!(!worker_runtime_source.contains("op_dynamic_take_host_rpc_tasks"));
+        assert!(worker_runtime_source.contains("__dd_drain_dynamic_control_queue"));
     }
 
     #[test]

@@ -480,6 +480,221 @@ impl WorkerManager {
         });
     }
 
+    pub(super) fn start_dynamic_worker_fetch(
+        &mut self,
+        owner_worker: String,
+        owner_generation: u64,
+        binding: String,
+        handle: String,
+        request: WorkerInvocation,
+        reply_id: String,
+        pending_replies: crate::ops::DynamicPendingReplies,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+    ) {
+        let Some(mut handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result: Err(PlatformError::not_found("dynamic worker handle not found")),
+                    stale_handle: true,
+                    boundary: None,
+                },
+            );
+            return;
+        };
+        if handle_entry.owner_worker != owner_worker {
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result: Err(PlatformError::bad_request(
+                        "dynamic worker handle owner mismatch",
+                    )),
+                    stale_handle: true,
+                    boundary: None,
+                },
+            );
+            return;
+        }
+        if handle_entry.owner_generation != owner_generation {
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result: Err(PlatformError::bad_request(
+                        "dynamic worker handle generation mismatch",
+                    )),
+                    stale_handle: true,
+                    boundary: None,
+                },
+            );
+            return;
+        }
+        if handle_entry.binding != binding {
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result: Err(PlatformError::bad_request(
+                        "dynamic worker binding mismatch",
+                    )),
+                    stale_handle: true,
+                    boundary: None,
+                },
+            );
+            return;
+        }
+
+        let target_generation = Some(handle_entry.worker_generation);
+        let mut target_isolate_id = handle_entry.preferred_isolate_id;
+        if let Some(preferred_id) = target_isolate_id {
+            let preferred_alive = self
+                .workers
+                .get(&handle_entry.worker_name)
+                .and_then(|entry| entry.pools.get(&handle_entry.worker_generation))
+                .map(|pool| {
+                    pool.isolates
+                        .iter()
+                        .any(|isolate| isolate.id == preferred_id)
+                })
+                .unwrap_or(false);
+            if preferred_alive {
+                self.dynamic_profile.record_warm_isolate_hit();
+            } else {
+                target_isolate_id = None;
+                handle_entry.preferred_isolate_id = None;
+                if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
+                    entry.preferred_isolate_id = None;
+                }
+                self.dynamic_profile.record_fallback_dispatch();
+            }
+        } else {
+            self.dynamic_profile.record_fallback_dispatch();
+        }
+
+        let runtime_request_id = next_runtime_token("dyn");
+        let timeout = handle_entry.timeout;
+        let timeout_diagnostic = DynamicTimeoutDiagnostic {
+            stage: "invoke-reply",
+            owner_worker: owner_worker.clone(),
+            owner_generation,
+            binding: binding.clone(),
+            handle: handle.clone(),
+            target_worker: handle_entry.worker_name.clone(),
+            target_isolate_id,
+            target_generation,
+            provider_id: None,
+            provider_owner_isolate_id: None,
+            provider_target_id: None,
+            timeout_ms: timeout,
+        };
+        let dispatch_started = Instant::now();
+        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
+        let child_worker_name = handle_entry.worker_name.clone();
+        let mut queue_target_isolate_id = None;
+        if let Some(preferred_id) = target_isolate_id {
+            match self.try_dispatch_direct_dynamic_fetch(
+                &child_worker_name,
+                handle_entry.worker_generation,
+                preferred_id,
+                runtime_request_id.clone(),
+                request.clone(),
+                inner_reply_tx,
+                handle.clone(),
+            ) {
+                DirectDynamicFetchDispatch::Dispatched => {
+                    self.dynamic_profile.record_direct_fetch_fast_path_hit();
+                }
+                DirectDynamicFetchDispatch::Fallback {
+                    reply,
+                    clear_preferred,
+                } => {
+                    self.dynamic_profile
+                        .record_direct_fetch_fast_path_fallback();
+                    self.dynamic_profile.record_fallback_dispatch();
+                    if clear_preferred {
+                        handle_entry.preferred_isolate_id = None;
+                        if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
+                            entry.preferred_isolate_id = None;
+                        }
+                    }
+                    self.enqueue_invoke(
+                        child_worker_name,
+                        runtime_request_id,
+                        request,
+                        None,
+                        None,
+                        None,
+                        None,
+                        queue_target_isolate_id.take(),
+                        target_generation,
+                        true,
+                        reply,
+                        PendingReplyKind::DynamicFetch {
+                            handle: handle.clone(),
+                        },
+                        event_tx,
+                    );
+                }
+            }
+        } else {
+            self.dynamic_profile
+                .record_direct_fetch_fast_path_fallback();
+            self.enqueue_invoke(
+                child_worker_name,
+                runtime_request_id,
+                request,
+                None,
+                None,
+                None,
+                None,
+                queue_target_isolate_id.take(),
+                target_generation,
+                true,
+                inner_reply_tx,
+                PendingReplyKind::DynamicFetch {
+                    handle: handle.clone(),
+                },
+                event_tx,
+            );
+        }
+        self.dynamic_profile
+            .record_direct_fetch_dispatch(dispatch_started.elapsed());
+
+        let event_tx = event_tx.clone();
+        let profile = self.dynamic_profile.clone();
+        tokio::spawn(async move {
+            let child_started = Instant::now();
+            let result =
+                match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(_)) => Err(PlatformError::internal(
+                        "dynamic worker invoke response channel closed",
+                    )),
+                    Err(_) => {
+                        let _ = event_tx
+                            .send(RuntimeEvent::DynamicTimeoutDiagnostic(timeout_diagnostic));
+                        Err(PlatformError::runtime(format!(
+                            "dynamic worker invoke timed out after {timeout}ms"
+                        )))
+                    }
+                };
+            profile.record_async_reply_completion();
+            profile.record_direct_fetch_child_execute(child_started.elapsed());
+            if let Some(delivery) = pending_replies.finish(
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result,
+                    stale_handle: false,
+                    boundary: Some(crate::ops::current_time_boundary()),
+                },
+            ) {
+                let _ = event_tx.send(RuntimeEvent::DynamicFetchReplyReady(delivery));
+            }
+        });
+    }
+
     pub(super) fn handle_dynamic_host_rpc_invoke(
         &mut self,
         payload: crate::ops::DynamicHostRpcInvokeEvent,
@@ -579,7 +794,7 @@ impl WorkerManager {
                     .map(|isolate| {
                         (
                             isolate.sender.clone(),
-                            isolate.dynamic_host_rpc_task_inbox.clone(),
+                            isolate.dynamic_control_inbox.clone(),
                         )
                     })
             });
@@ -597,17 +812,13 @@ impl WorkerManager {
                     },
                 },
             );
-            let schedule = inbox.push(crate::ops::DynamicHostRpcTask {
+            let schedule = inbox.push_host_rpc_task(crate::ops::DynamicHostRpcTask {
                 task_id: task_id.clone(),
                 target_id: provider.target_id.clone(),
                 method_name,
                 args,
             });
-            if !schedule
-                || sender
-                    .send(IsolateCommand::DrainDynamicHostRpcTasks)
-                    .is_ok()
-            {
+            if !schedule || sender.send(IsolateCommand::DrainDynamicControl).is_ok() {
                 return;
             }
             if let Some(task) = self.dynamic_host_rpc_tasks.remove(&task_id) {
