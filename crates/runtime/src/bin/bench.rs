@@ -114,6 +114,10 @@ struct DynamicBenchMetrics {
     direct_fetch_fast_path_hit: usize,
     #[serde(default, rename = "direct_fetch_fast_path_fallback")]
     direct_fetch_fast_path_fallback: usize,
+    #[serde(default, rename = "remoteFetchHit")]
+    remote_fetch_hit: usize,
+    #[serde(default, rename = "remoteFetchFallback")]
+    remote_fetch_fallback: usize,
     #[serde(default, rename = "fastFetchPathHit")]
     fast_fetch_path_hit: usize,
     #[serde(default, rename = "fastFetchPathFallback")]
@@ -647,9 +651,16 @@ export default {
 "#;
 
 const DYNAMIC_BENCH_BASELINE_WORKER_SOURCE: &str = r#"
+let count = 0;
+
 export default {
-  async fetch() {
-    return new Response("ok");
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/hot" || url.pathname === "/hot_get") {
+      count += 1;
+      return new Response(String(count));
+    }
+    return new Response("not found", { status: 404 });
   },
 };
 "#;
@@ -1097,7 +1108,7 @@ async fn run_dynamic_baseline_fetch(service: &RuntimeService) -> common::Result<
                 worker_source: DYNAMIC_BENCH_BASELINE_WORKER_SOURCE,
                 requests,
                 concurrency,
-                paths: &["/"],
+                paths: &["/hot"],
             },
         ),
     )
@@ -1705,7 +1716,7 @@ fn format_dynamic_metrics_result(name: &str, metrics: &DynamicBenchMetrics) -> S
     let mut out = String::new();
     let _ = write!(
         out,
-        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} direct_path={} direct_path_fallback={} fetch_ops={} fetch_op_fallback={} normalize_fast={} normalize_slow={} async_replies={} provider_task={} control_batches={} control_items={} reply_batches={} reply_items={} provider_batches={} provider_items={} time_sync={}/{} normalize_mean={:.3}ms start_mean={:.3}ms dispatch_mean={:.3}ms child_mean={:.3}ms reply_mean={:.3}ms sync_mean={:.3}ms control_mean={:.3}ms",
+        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} direct_path={} direct_path_fallback={} remote={} remote_fallback={} fetch_ops={} fetch_op_fallback={} normalize_fast={} normalize_slow={} async_replies={} provider_task={} control_batches={} control_items={} reply_batches={} reply_items={} provider_batches={} provider_items={} time_sync={}/{} normalize_mean={:.3}ms start_mean={:.3}ms dispatch_mean={:.3}ms child_mean={:.3}ms reply_mean={:.3}ms sync_mean={:.3}ms control_mean={:.3}ms",
         format!("{name}-metrics"),
         handle_hit_rate,
         source_hit_rate,
@@ -1713,6 +1724,8 @@ fn format_dynamic_metrics_result(name: &str, metrics: &DynamicBenchMetrics) -> S
         metrics.fallback_dispatch,
         metrics.direct_fetch_fast_path_hit,
         metrics.direct_fetch_fast_path_fallback,
+        metrics.remote_fetch_hit,
+        metrics.remote_fetch_fallback,
         metrics.fast_fetch_path_hit,
         metrics.fast_fetch_path_fallback,
         metrics.normalize_fast_path_hit,

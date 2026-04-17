@@ -698,7 +698,7 @@ impl WorkerManager {
     pub(super) fn handle_dynamic_host_rpc_invoke(
         &mut self,
         payload: crate::ops::DynamicHostRpcInvokeEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let crate::ops::DynamicHostRpcInvokeEvent {
             caller_worker,
@@ -791,76 +791,39 @@ impl WorkerManager {
                 pool.isolates
                     .iter()
                     .find(|isolate| isolate.id == provider.owner_isolate_id)
-                    .map(|isolate| {
-                        (
-                            isolate.sender.clone(),
-                            isolate.dynamic_control_inbox.clone(),
-                        )
-                    })
+                    .map(|isolate| isolate.id)
             });
-        if let Some((sender, inbox)) = provider_delivery {
-            let task_id = format!("dhrpc-{}", Uuid::new_v4().simple());
-            self.dynamic_host_rpc_tasks.insert(
-                task_id.clone(),
-                DynamicHostRpcTaskState {
-                    provider_worker: provider.owner_worker.clone(),
-                    provider_generation: owner_pool_generation,
-                    provider_isolate_id: provider.owner_isolate_id,
-                    reply: DynamicHostRpcTaskReply::Dynamic {
-                        reply_id,
-                        pending_replies,
-                    },
-                },
+        let Some(provider_isolate_id) = provider_delivery else {
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
+                    "dynamic host rpc provider isolate is unavailable",
+                ))),
             );
-            let schedule = inbox.push_host_rpc_task(crate::ops::DynamicHostRpcTask {
-                task_id: task_id.clone(),
-                target_id: provider.target_id.clone(),
-                method_name,
-                args,
-            });
-            if !schedule || sender.send(IsolateCommand::DrainDynamicControl).is_ok() {
-                return;
-            }
-            if let Some(task) = self.dynamic_host_rpc_tasks.remove(&task_id) {
-                match task.reply {
-                    DynamicHostRpcTaskReply::Dynamic {
-                        reply_id,
-                        pending_replies,
-                    } => {
-                        self.finish_dynamic_reply(
-                            pending_replies,
-                            reply_id,
-                            crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
-                                PlatformError::runtime(
-                                    "dynamic host rpc provider isolate is unavailable",
-                                ),
-                            )),
-                        );
-                    }
-                    DynamicHostRpcTaskReply::Test {
-                        reply_id,
-                        replies,
-                        success_value: _,
-                    } => {
-                        self.complete_test_async_reply(
-                            reply_id,
-                            replies,
-                            Err(PlatformError::runtime(
-                                "dynamic host rpc provider isolate is unavailable",
-                            )),
-                        );
-                    }
-                }
-            }
             return;
+        };
+        let reply_id_for_error = reply_id.clone();
+        let pending_replies_for_error = pending_replies.clone();
+        if let Err(error) = self.start_targeted_host_rpc_invoke(
+            provider.owner_worker,
+            owner_pool_generation,
+            provider_isolate_id,
+            provider.target_id,
+            method_name,
+            args,
+            TargetedHostRpcReply::Dynamic {
+                reply_id,
+                pending_replies,
+            },
+            event_tx,
+        ) {
+            self.finish_dynamic_reply(
+                pending_replies_for_error,
+                reply_id_for_error,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(error)),
+            );
         }
-        self.finish_dynamic_reply(
-            pending_replies,
-            reply_id,
-            crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::runtime(
-                "dynamic host rpc provider isolate is unavailable",
-            ))),
-        );
     }
 
     pub(super) async fn validate_worker_cached(&mut self, source: &str) -> Result<()> {

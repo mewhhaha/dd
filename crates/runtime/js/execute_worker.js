@@ -3840,8 +3840,9 @@ globalThis.__dd_execute_worker = (payload) => {
   );
 
   const setDynamicHandleCacheEntry = (bindingName, instanceId, entry) => {
+    const cacheKey = dynamicHandleCacheKey(bindingName, instanceId);
     getDynamicCacheState().handleCache.set(
-      dynamicHandleCacheKey(bindingName, instanceId),
+      cacheKey,
       Object.freeze({
         handle: String(entry.handle ?? ""),
         worker: String(entry.worker ?? ""),
@@ -3851,7 +3852,8 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const deleteDynamicHandleCacheEntry = (bindingName, instanceId) => {
-    getDynamicCacheState().handleCache.delete(dynamicHandleCacheKey(bindingName, instanceId));
+    const cacheKey = dynamicHandleCacheKey(bindingName, instanceId);
+    getDynamicCacheState().handleCache.delete(cacheKey);
   };
 
   const dynamicHandleErrorIsStale = (result) => {
@@ -4103,14 +4105,60 @@ globalThis.__dd_execute_worker = (payload) => {
     recordDynamicStageMetric("timeSync", performance.now() - started);
   };
 
-  const createDynamicWorkerStub = (bindingName, handle, worker, timeout, cacheKey = "") => {
-    const invokeLabel = `dynamic worker invoke (${bindingName}/${handle})`;
+  const invokeRemoteDynamicWorkerFetch = async (
+    bindingName,
+    entry,
+    request,
+    requestId,
+    invokeSeq,
+    timeout,
+    cacheKey,
+  ) => {
+    const invokeLabel = `dynamic worker invoke (${bindingName}/${entry.handle})`;
     const invokeBase = Object.freeze({
       binding: bindingName,
-      handle,
+      handle: entry.handle,
     });
+    const startStarted = performance.now();
+    recordDynamicMetric("remoteFetchHit");
+    const result = await awaitDynamicReply(
+      invokeLabel,
+      () => callOp("op_dynamic_worker_fetch_start", {
+        request_id: requestId,
+        subrequest_id: `${requestId}:dynamic:${invokeSeq}`,
+        binding: invokeBase.binding,
+        handle: invokeBase.handle,
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: Array.from(request.body),
+      }),
+      timeout,
+      { syncTime: false },
+    ).finally(() => {
+      recordDynamicStageMetric("dynamicStartOp", performance.now() - startStarted);
+    });
+    if (!result || typeof result !== "object" || result.ok === false) {
+      if (cacheKey && (result?.stale_handle === true || dynamicHandleErrorIsStale(result))) {
+        getDynamicCacheState().handleCache.delete(cacheKey);
+      }
+      applyDynamicReplyBoundary(result);
+      throw new Error(formatDynamicFailure("dynamic worker invoke failed", result));
+    }
+    applyDynamicReplyBoundary(result);
+    const materializeStarted = performance.now();
+    const response = new Response(toArrayBytes(result.body), {
+      status: Number(result.status ?? 200),
+      headers: Array.isArray(result.headers) ? result.headers : [],
+    });
+    recordDynamicStageMetric("replyMaterialize", performance.now() - materializeStarted);
+    return response;
+  };
+
+  const createDynamicWorkerStub = (bindingName, entry, cacheKey = "") => {
+    let activeEntry = entry;
     return {
-      worker,
+      worker: activeEntry.worker,
       async fetch(inputValue, initValue = undefined) {
         const normalizeStarted = performance.now();
         const request = await normalizeDynamicFetchInput(inputValue, initValue);
@@ -4118,40 +4166,16 @@ globalThis.__dd_execute_worker = (payload) => {
 
         const scopedRequestId = activeRequestId();
         const invokeSeq = nextActorInvokeSeq();
-        const startStarted = performance.now();
         recordDynamicMetric("fastFetchPathHit");
-        const result = await awaitDynamicReply(
-          invokeLabel,
-          () => callOp("op_dynamic_worker_fetch_start", {
-            request_id: scopedRequestId,
-            subrequest_id: `${scopedRequestId}:dynamic:${invokeSeq}`,
-            binding: invokeBase.binding,
-            handle: invokeBase.handle,
-            method: request.method,
-            url: request.url,
-            headers: request.headers,
-            body: Array.from(request.body),
-          }),
-          timeout,
-          { syncTime: false },
-        ).finally(() => {
-          recordDynamicStageMetric("dynamicStartOp", performance.now() - startStarted);
-        });
-        if (!result || typeof result !== "object" || result.ok === false) {
-          if (cacheKey && (result?.stale_handle === true || dynamicHandleErrorIsStale(result))) {
-            getDynamicCacheState().handleCache.delete(cacheKey);
-          }
-          applyDynamicReplyBoundary(result);
-          throw new Error(formatDynamicFailure("dynamic worker invoke failed", result));
-        }
-        applyDynamicReplyBoundary(result);
-        const materializeStarted = performance.now();
-        const response = new Response(toArrayBytes(result.body), {
-          status: Number(result.status ?? 200),
-          headers: Array.isArray(result.headers) ? result.headers : [],
-        });
-        recordDynamicStageMetric("replyMaterialize", performance.now() - materializeStarted);
-        return response;
+        return invokeRemoteDynamicWorkerFetch(
+          bindingName,
+          activeEntry,
+          request,
+          scopedRequestId,
+          invokeSeq,
+          activeEntry.timeout,
+          cacheKey,
+        );
       },
     };
   };
@@ -4274,29 +4298,6 @@ globalThis.__dd_execute_worker = (payload) => {
     return String(result ?? fallback);
   };
 
-  const runDynamicHostRpcTask = async (task) => {
-    let ok = true;
-    let value = [];
-    let error = "";
-    try {
-      const response = await invokeHostRpcCall({
-        target_id: task?.target_id,
-        method: task?.method_name,
-        args: task?.args,
-      });
-      value = Array.from(new Uint8Array(await response.arrayBuffer()));
-    } catch (cause) {
-      ok = false;
-      error = String(cause?.message ?? cause ?? "dynamic host rpc task failed");
-    }
-    callOp("op_dynamic_host_rpc_task_complete", {
-      task_id: String(task?.task_id ?? ""),
-      ok,
-      value,
-      error,
-    });
-  };
-
   const drainDynamicControlQueue = async () => {
     for (;;) {
       const batch = callOp("op_dynamic_take_control_items");
@@ -4307,10 +4308,6 @@ globalThis.__dd_execute_worker = (payload) => {
       for (const item of batch) {
         if (item?.kind === "reply") {
           deliverDynamicReply(item.payload);
-          continue;
-        }
-        if (item?.kind === "host-rpc-task") {
-          await runDynamicHostRpcTask(item.payload);
         }
       }
       recordDynamicStageMetric("dynamicControlDrain", performance.now() - started);
@@ -4351,13 +4348,7 @@ globalThis.__dd_execute_worker = (payload) => {
       const cached = getDynamicHandleCacheEntry(bindingName, instanceId);
       if (cached) {
         recordDynamicMetric("handleCacheHit");
-        return createDynamicWorkerStub(
-          bindingName,
-          cached.handle,
-          cached.worker,
-          cached.timeout,
-          cacheKey,
-        );
+        return createDynamicWorkerStub(bindingName, cached, cacheKey);
       }
       recordDynamicMetric("handleCacheMiss");
       const scopedRequestId = activeRequestId();
@@ -4374,13 +4365,12 @@ globalThis.__dd_execute_worker = (payload) => {
       }
       if (lookup.found === true) {
         setDynamicHandleCacheEntry(bindingName, instanceId, lookup);
-        return createDynamicWorkerStub(
-          bindingName,
-          String(lookup.handle ?? "").trim(),
-          String(lookup.worker ?? ""),
-          normalizeDynamicTimeout(lookup.timeout),
-          cacheKey,
-        );
+        const created = getDynamicHandleCacheEntry(bindingName, instanceId) ?? Object.freeze({
+          handle: String(lookup.handle ?? "").trim(),
+          worker: String(lookup.worker ?? ""),
+          timeout: normalizeDynamicTimeout(lookup.timeout),
+        });
+        return createDynamicWorkerStub(bindingName, created, cacheKey);
       }
 
       const options = await parseDynamicFactoryOptions(factory);
@@ -4408,13 +4398,12 @@ globalThis.__dd_execute_worker = (payload) => {
         throw new Error("dynamic worker create returned an invalid handle");
       }
       setDynamicHandleCacheEntry(bindingName, instanceId, result);
-      return createDynamicWorkerStub(
-        bindingName,
+      const created = getDynamicHandleCacheEntry(bindingName, instanceId) ?? Object.freeze({
         handle,
-        String(result.worker ?? ""),
-        normalizeDynamicTimeout(result.timeout ?? timeout),
-        cacheKey,
-      );
+        worker: String(result.worker ?? ""),
+        timeout: normalizeDynamicTimeout(result.timeout ?? timeout),
+      });
+      return createDynamicWorkerStub(bindingName, created, cacheKey);
     },
     /**
      * List active dynamic worker ids for this namespace in the current owner worker generation.
@@ -4496,6 +4485,10 @@ globalThis.__dd_execute_worker = (payload) => {
         handleCacheMiss: 0,
         sourceCacheHit: 0,
         sourceCacheMiss: 0,
+        remoteFetchHit: 0,
+        remoteFetchFallback: 0,
+        normalizeFastPathHit: 0,
+        normalizeSlowPathHit: 0,
       },
       enumerable: false,
       configurable: false,
