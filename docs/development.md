@@ -5,7 +5,7 @@ Contributor-focused notes moved here so the root README can stay product- and us
 ## Prerequisites
 
 - Rust toolchain
-- Cap'n Proto compiler (`capnp`) on `PATH`
+- `capnp` only when regenerating checked-in memory RPC bindings after schema changes
 
 ## Local run
 
@@ -27,6 +27,10 @@ CLI default server is `http://127.0.0.1:3001`, so either pass `--server http://1
 ```bash
 export DD_SERVER=http://127.0.0.1:8081
 ```
+
+Normal builds do not scrape old `target/` artifacts for RPC bindings. Checked-in generated bindings live at [crates/runtime/src/generated/memory_rpc_capnp.rs](/home/mewhhaha/src/grugd/crates/runtime/src/generated/memory_rpc_capnp.rs) and are fingerprint-checked against [crates/runtime/schema/memory_rpc.capnp](/home/mewhhaha/src/grugd/crates/runtime/schema/memory_rpc.capnp) during build.
+
+If you change the schema, regenerate the checked-in bindings on a machine with `capnp` installed, then commit both files together.
 
 Optional tracing env:
 
@@ -91,6 +95,7 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 - smoke examples: `bash scripts/smoke_examples.sh`
 - runtime benchmark: `cargo run -p runtime --bin bench --release`
 - keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`
+- public naming guard: `bash scripts/check_public_memory_naming.sh`
 
 ## Fly helpers
 

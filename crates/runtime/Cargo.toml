@@ -38,6 +38,3 @@ sys_traits = { version = "0.1.25", features = ["real", "libc"] }
 
 [dev-dependencies]
 serial_test = "3"
-
-[build-dependencies]
-capnpc = "0.20"

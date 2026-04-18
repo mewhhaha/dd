@@ -1,6 +1,8 @@
 mod config;
+mod debug;
 mod dynamic;
 mod sessions;
+mod storage;
 
 use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
@@ -46,6 +48,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use self::config::{build_dynamic_worker_config, extract_bindings, validate_runtime_config};
+use self::storage::{epoch_ms_i64, persist_worker_deployment};
 
 const INTERNAL_HEADER: &str = "x-dd-internal";
 const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";
@@ -5202,114 +5205,6 @@ impl WorkerPool {
         }
     }
 
-    fn debug_dump(&self) -> WorkerDebugDump {
-        let mut memory_owners = self
-            .memory_owners
-            .iter()
-            .map(|(key, isolate_id)| (key.clone(), *isolate_id))
-            .collect::<Vec<_>>();
-        memory_owners.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut memory_inflight = self
-            .memory_inflight
-            .iter()
-            .map(|(key, count)| (key.clone(), *count))
-            .collect::<Vec<_>>();
-        memory_inflight.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let queued_requests = self
-            .queue
-            .iter()
-            .map(|pending| WorkerDebugRequest {
-                runtime_request_id: pending.runtime_request_id.clone(),
-                user_request_id: pending.request.request_id.clone(),
-                method: pending.request.method.clone(),
-                url: pending.request.url.clone(),
-                memory_key: pending.memory_route.as_ref().map(MemoryRoute::owner_key),
-                target_isolate_id: pending.target_isolate_id,
-                internal_origin: pending.internal_origin,
-                reply_kind: pending.reply_kind.label().to_string(),
-                host_rpc_target_id: pending
-                    .host_rpc_call
-                    .as_ref()
-                    .map(|call| call.target_id.clone()),
-                host_rpc_method: pending
-                    .host_rpc_call
-                    .as_ref()
-                    .map(|call| call.method.clone()),
-            })
-            .collect::<Vec<_>>();
-
-        let isolates = self
-            .isolates
-            .iter()
-            .map(|isolate| {
-                let mut pending_requests = isolate
-                    .pending_replies
-                    .iter()
-                    .map(|(runtime_request_id, pending)| {
-                        let meta = pending.completion_meta.as_ref();
-                        WorkerDebugRequest {
-                            runtime_request_id: runtime_request_id.clone(),
-                            user_request_id: meta
-                                .map(|meta| meta.user_request_id.clone())
-                                .unwrap_or_default(),
-                            method: meta.map(|meta| meta.method.clone()).unwrap_or_default(),
-                            url: meta.map(|meta| meta.url.clone()).unwrap_or_default(),
-                            memory_key: pending.memory_key.clone(),
-                            target_isolate_id: Some(isolate.id),
-                            internal_origin: pending.internal_origin,
-                            reply_kind: pending.kind.label().to_string(),
-                            host_rpc_target_id: None,
-                            host_rpc_method: None,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                pending_requests
-                    .sort_by(|left, right| left.runtime_request_id.cmp(&right.runtime_request_id));
-                WorkerDebugIsolate {
-                    id: isolate.id,
-                    inflight_count: isolate.inflight_count,
-                    pending_wait_until: isolate.pending_wait_until.len(),
-                    active_websocket_sessions: isolate.active_websocket_sessions,
-                    active_transport_sessions: isolate.active_transport_sessions,
-                    pending_requests,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        WorkerDebugDump {
-            generation: self.generation,
-            queued: self.queue.len(),
-            memory_owners,
-            memory_inflight,
-            isolates,
-            queued_requests,
-        }
-    }
-
-    fn log_stats(&self, event: &str) {
-        if !tracing::enabled!(Level::INFO) {
-            return;
-        }
-        let snapshot = self.stats_snapshot();
-        info!(
-            worker = %self.worker_name,
-            generation = snapshot.generation,
-            public = snapshot.public,
-            deployment_id = %self.deployment_id,
-            queued = snapshot.queued,
-            busy = snapshot.busy,
-            inflight_total = snapshot.inflight_total,
-            wait_until_total = snapshot.wait_until_total,
-            isolates_total = snapshot.isolates_total,
-            spawn_count = snapshot.spawn_count,
-            reuse_count = snapshot.reuse_count,
-            scale_down_count = snapshot.scale_down_count,
-            event,
-            "worker pool stats"
-        );
-    }
 }
 
 fn spawn_runtime_thread(
@@ -6070,79 +5965,6 @@ fn handle_isolate_command(
         IsolateCommand::PollEventLoop => Ok(true),
         IsolateCommand::Shutdown => Ok(false),
     }
-}
-
-async fn persist_worker_deployment(
-    storage: &RuntimeStorageConfig,
-    worker_name: &str,
-    source: &str,
-    config: &DeployConfig,
-    assets: &[DeployAsset],
-    asset_headers: Option<&str>,
-    deployment_id: &str,
-) -> Result<()> {
-    if !storage.worker_store_enabled {
-        return Ok(());
-    }
-
-    let workers_dir = storage.store_dir.join("workers");
-    tokio::fs::create_dir_all(&workers_dir)
-        .await
-        .map_err(|error| {
-            PlatformError::internal(format!(
-                "failed to create worker store directory {}: {error}",
-                workers_dir.display()
-            ))
-        })?;
-    let final_path = workers_dir.join(format!("{}.json", encoded_worker_name(worker_name)));
-    let temp_path = workers_dir.join(format!("{}.tmp", encoded_worker_name(worker_name)));
-    let payload = StoredWorkerDeployment {
-        name: worker_name.to_string(),
-        source: source.to_string(),
-        config: config.clone(),
-        assets: assets.to_vec(),
-        asset_headers: asset_headers.map(str::to_string),
-        deployment_id: deployment_id.to_string(),
-        updated_at_ms: epoch_ms_i64()?,
-    };
-    let body = crate::json::to_vec(&payload).map_err(|error| {
-        PlatformError::internal(format!("failed to serialize worker deployment: {error}"))
-    })?;
-    tokio::fs::write(&temp_path, body).await.map_err(|error| {
-        PlatformError::internal(format!(
-            "failed to write worker store file {}: {error}",
-            temp_path.display()
-        ))
-    })?;
-    tokio::fs::rename(&temp_path, &final_path)
-        .await
-        .map_err(|error| {
-            PlatformError::internal(format!(
-                "failed to commit worker store file {}: {error}",
-                final_path.display()
-            ))
-        })?;
-    Ok(())
-}
-
-fn encoded_worker_name(worker_name: &str) -> String {
-    let mut out = String::with_capacity(worker_name.len().saturating_mul(2).max(2));
-    for byte in worker_name.as_bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    if out.is_empty() {
-        "00".to_string()
-    } else {
-        out
-    }
-}
-
-fn epoch_ms_i64() -> Result<i64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| PlatformError::internal(format!("system clock error: {error}")))?;
-    Ok(duration.as_millis() as i64)
 }
 
 fn decode_completion_payload(

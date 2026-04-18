@@ -3,70 +3,35 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MEMORY_RPC_SCHEMA_PATH: &str = "schema/memory_rpc.capnp";
+const CHECKED_IN_MEMORY_RPC_PATH: &str = "src/generated/memory_rpc_capnp.rs";
 const MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX: &str = "// dd-memory-rpc-schema-fingerprint: ";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={MEMORY_RPC_SCHEMA_PATH}");
+    println!("cargo:rerun-if-changed={CHECKED_IN_MEMORY_RPC_PATH}");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/init.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/http_client.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry.ts");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry_util.ts");
     println!("cargo:rerun-if-changed=../../patched-crates/deno_crypto/00_crypto.js");
 
-    compile_memory_rpc_schema();
+    validate_checked_in_memory_rpc();
 
     generate_execute_worker_bundle();
     generate_deno_js_extension();
 }
 
-fn compile_memory_rpc_schema() {
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"));
-    let generated = out_dir.join("memory_rpc_capnp.rs");
+fn validate_checked_in_memory_rpc() {
     let schema_fingerprint = current_memory_rpc_schema_fingerprint();
-    let compile_result = capnpc::CompilerCommand::new()
-        .src_prefix("schema")
-        .file(MEMORY_RPC_SCHEMA_PATH)
-        .run();
-
-    if generated.is_file()
-        && fs::metadata(&generated)
-            .map(|metadata| metadata.len() > 0)
-            .unwrap_or(false)
-    {
-        if compile_result.is_ok()
-            || generated_memory_rpc_file_matches_schema(&generated, &schema_fingerprint)
-        {
-            normalize_generated_memory_rpc_file(&generated, &schema_fingerprint).unwrap_or_else(
-                |error| panic!("failed to normalize {}: {error}", generated.display()),
-            );
-            return;
-        }
-    }
-
-    if try_reuse_generated_memory_rpc(&schema_fingerprint).is_some() {
-        return;
-    }
-
-    if let Err(error) = compile_result {
+    let generated = fs::read_to_string(CHECKED_IN_MEMORY_RPC_PATH).unwrap_or_else(|error| {
+        panic!("failed to read {CHECKED_IN_MEMORY_RPC_PATH}: {error}")
+    });
+    if generated_memory_rpc_fingerprint(&generated).as_deref() != Some(schema_fingerprint.as_str()) {
         panic!(
-            "failed to compile Cap'n Proto schema for memory_rpc: {error}. install `capnp` or rebuild from cache generated for current schema"
+            "checked-in memory RPC bindings at {CHECKED_IN_MEMORY_RPC_PATH} do not match {MEMORY_RPC_SCHEMA_PATH}; regenerate them with `capnp` installed"
         );
     }
-
-    if !generated.is_file()
-        || fs::metadata(&generated)
-            .map(|metadata| metadata.len() == 0)
-            .unwrap_or(true)
-    {
-        panic!(
-            "memory_rpc Cap'n Proto generation produced no usable output at {}",
-            generated.display()
-        );
-    }
-
-    normalize_generated_memory_rpc_file(&generated, &schema_fingerprint)
-        .unwrap_or_else(|error| panic!("failed to normalize {}: {error}", generated.display()));
 }
 
 fn generate_deno_js_extension() {
@@ -229,85 +194,6 @@ fn generate_execute_worker_bundle() {
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
 }
 
-fn try_reuse_generated_memory_rpc(schema_fingerprint: &str) -> Option<()> {
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR")?);
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("../../target"));
-    let build_roots = [
-        target_dir.join("debug").join("build"),
-        target_dir.join("release").join("build"),
-    ];
-    let candidate = build_roots
-        .into_iter()
-        .filter(|path| path.is_dir())
-        .filter_map(|build_dir| fs::read_dir(&build_dir).ok())
-        .flat_map(|entries| entries.filter_map(|entry| entry.ok().map(|entry| entry.path())))
-        .flat_map(|path| {
-            fs::read_dir(path.join("out"))
-                .ok()
-                .into_iter()
-                .flat_map(|entries| {
-                    entries.filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                })
-        })
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name == "memory_rpc_capnp.rs")
-                .unwrap_or(false)
-        })
-        .filter(|path| {
-            path.is_file()
-                && path.parent().and_then(|parent| parent.parent()) != Some(out_dir.as_path())
-        })
-        .filter_map(|path| {
-            let metadata = fs::metadata(&path).ok()?;
-            let len = metadata.len();
-            let modified = metadata.modified().ok()?;
-            (len > 0).then_some((modified, path))
-        })
-        .max_by_key(|(modified, _)| *modified)
-        .map(|(_, path)| path);
-    let source = candidate?;
-    let output_path = out_dir.join("memory_rpc_capnp.rs");
-    let generated = fs::read_to_string(&source).ok()?;
-    if generated_memory_rpc_fingerprint(&generated)? != schema_fingerprint {
-        return None;
-    }
-    let generated = normalize_generated_memory_rpc(&generated, schema_fingerprint);
-    fs::write(output_path, generated).ok()?;
-    Some(())
-}
-
-fn normalize_generated_memory_rpc_file(path: &Path, schema_fingerprint: &str) -> std::io::Result<()> {
-    let generated = fs::read_to_string(path)?;
-    let generated = normalize_generated_memory_rpc(&generated, schema_fingerprint);
-    fs::write(path, generated)
-}
-
-fn generated_memory_rpc_file_matches_schema(path: &Path, schema_fingerprint: &str) -> bool {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|source| generated_memory_rpc_fingerprint(&source))
-        .as_deref()
-        == Some(schema_fingerprint)
-}
-
-fn normalize_generated_memory_rpc(source: &str, schema_fingerprint: &str) -> String {
-    let source = rewrite_generated_rpc_module_refs(source);
-    if generated_memory_rpc_fingerprint(&source).as_deref() == Some(schema_fingerprint) {
-        return source;
-    }
-    let mut out =
-        String::with_capacity(source.len() + MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX.len() + 20);
-    out.push_str(MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX);
-    out.push_str(schema_fingerprint);
-    out.push('\n');
-    out.push_str(&source);
-    out
-}
-
 fn generated_memory_rpc_fingerprint(source: &str) -> Option<String> {
     source
         .lines()
@@ -331,32 +217,4 @@ fn stable_fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
-}
-
-fn rewrite_generated_rpc_module_refs(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut rest = source;
-
-    while let Some(idx) = rest.find("crate::") {
-        let (before, after) = rest.split_at(idx);
-        out.push_str(before);
-        let after = &after["crate::".len()..];
-        let ident_len = after
-            .chars()
-            .take_while(|char| char.is_ascii_lowercase() || *char == '_')
-            .count();
-        if ident_len > 0 {
-            let ident = &after[..ident_len];
-            if ident.ends_with("rpc_capnp") {
-                out.push_str("crate::memory_rpc_capnp");
-                rest = &after[ident_len..];
-                continue;
-            }
-        }
-        out.push_str("crate::");
-        rest = after;
-    }
-
-    out.push_str(rest);
-    out
 }

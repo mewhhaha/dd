@@ -744,15 +744,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "capnpc"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa3d5f01e69ed11656d2c7c47bf34327ea9bfb5c85c7de787fcd7b6c5e45b61"
-dependencies = [
- "capnp",
-]
-
-[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4982,7 +4973,6 @@ dependencies = [
  "aes-gcm",
  "base64",
  "capnp",
- "capnpc",
  "common",
  "deno_core",
  "deno_crypto",

@@ -1,1 +1,1 @@
-include!(concat!(env!("OUT_DIR"), "/memory_rpc_capnp.rs"));
+include!("generated/memory_rpc_capnp.rs");
