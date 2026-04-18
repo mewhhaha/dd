@@ -36,3 +36,8 @@ fly-worker-deploy-at server name file +flags:
 # Internal escape hatch: write directly into persisted Fly worker store, then restart machine.
 fly-worker-store-deploy name file +flags:
   ./deploy/fly/store-worker-deploy.sh {{default_app}} {{name}} {{file}} {{flags}}
+
+# Contributor check path.
+check:
+  bash scripts/check_public_memory_naming.sh
+  cargo test --workspace --no-run

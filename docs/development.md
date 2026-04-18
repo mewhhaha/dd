@@ -92,6 +92,7 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 
 ## Contributor checks
 
+- main repo check: `just check`
 - smoke examples: `bash scripts/smoke_examples.sh`
 - runtime benchmark: `cargo run -p runtime --bin bench --release`
 - keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`
