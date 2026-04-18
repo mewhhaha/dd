@@ -2,9 +2,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MEMORY_RPC_SCHEMA_PATH: &str = "schema/memory_rpc.capnp";
+const MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX: &str = "// dd-memory-rpc-schema-fingerprint: ";
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=schema/memory_rpc.capnp");
+    println!("cargo:rerun-if-changed={MEMORY_RPC_SCHEMA_PATH}");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/init.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/http_client.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry.ts");
@@ -20,9 +23,10 @@ fn main() {
 fn compile_memory_rpc_schema() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"));
     let generated = out_dir.join("memory_rpc_capnp.rs");
+    let schema_fingerprint = current_memory_rpc_schema_fingerprint();
     let compile_result = capnpc::CompilerCommand::new()
         .src_prefix("schema")
-        .file("schema/memory_rpc.capnp")
+        .file(MEMORY_RPC_SCHEMA_PATH)
         .run();
 
     if generated.is_file()
@@ -30,15 +34,24 @@ fn compile_memory_rpc_schema() {
             .map(|metadata| metadata.len() > 0)
             .unwrap_or(false)
     {
-        return;
+        if compile_result.is_ok()
+            || generated_memory_rpc_file_matches_schema(&generated, &schema_fingerprint)
+        {
+            normalize_generated_memory_rpc_file(&generated, &schema_fingerprint).unwrap_or_else(
+                |error| panic!("failed to normalize {}: {error}", generated.display()),
+            );
+            return;
+        }
     }
 
-    if try_reuse_generated_memory_rpc().is_some() {
+    if try_reuse_generated_memory_rpc(&schema_fingerprint).is_some() {
         return;
     }
 
     if let Err(error) = compile_result {
-        panic!("failed to compile Cap'n Proto schema for memory_rpc: {error}");
+        panic!(
+            "failed to compile Cap'n Proto schema for memory_rpc: {error}. install `capnp` or rebuild from cache generated for current schema"
+        );
     }
 
     if !generated.is_file()
@@ -51,6 +64,9 @@ fn compile_memory_rpc_schema() {
             generated.display()
         );
     }
+
+    normalize_generated_memory_rpc_file(&generated, &schema_fingerprint)
+        .unwrap_or_else(|error| panic!("failed to normalize {}: {error}", generated.display()));
 }
 
 fn generate_deno_js_extension() {
@@ -213,14 +229,12 @@ fn generate_execute_worker_bundle() {
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
 }
 
-fn try_reuse_generated_memory_rpc() -> Option<()> {
+fn try_reuse_generated_memory_rpc(schema_fingerprint: &str) -> Option<()> {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR")?);
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("../../target"));
-    let profile = env::var("PROFILE").ok()?;
     let build_roots = [
-        target_dir.join(&profile).join("build"),
         target_dir.join("debug").join("build"),
         target_dir.join("release").join("build"),
     ];
@@ -240,7 +254,7 @@ fn try_reuse_generated_memory_rpc() -> Option<()> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .map(|name| name.ends_with("rpc_capnp.rs"))
+                .map(|name| name == "memory_rpc_capnp.rs")
                 .unwrap_or(false)
         })
         .filter(|path| {
@@ -248,17 +262,75 @@ fn try_reuse_generated_memory_rpc() -> Option<()> {
                 && path.parent().and_then(|parent| parent.parent()) != Some(out_dir.as_path())
         })
         .filter_map(|path| {
-            let len = fs::metadata(&path).ok()?.len();
-            (len > 0).then_some((len, path))
+            let metadata = fs::metadata(&path).ok()?;
+            let len = metadata.len();
+            let modified = metadata.modified().ok()?;
+            (len > 0).then_some((modified, path))
         })
-        .max_by_key(|(len, _)| *len)
+        .max_by_key(|(modified, _)| *modified)
         .map(|(_, path)| path);
     let source = candidate?;
     let output_path = out_dir.join("memory_rpc_capnp.rs");
     let generated = fs::read_to_string(&source).ok()?;
-    let generated = rewrite_generated_rpc_module_refs(&generated);
+    if generated_memory_rpc_fingerprint(&generated)? != schema_fingerprint {
+        return None;
+    }
+    let generated = normalize_generated_memory_rpc(&generated, schema_fingerprint);
     fs::write(output_path, generated).ok()?;
     Some(())
+}
+
+fn normalize_generated_memory_rpc_file(path: &Path, schema_fingerprint: &str) -> std::io::Result<()> {
+    let generated = fs::read_to_string(path)?;
+    let generated = normalize_generated_memory_rpc(&generated, schema_fingerprint);
+    fs::write(path, generated)
+}
+
+fn generated_memory_rpc_file_matches_schema(path: &Path, schema_fingerprint: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|source| generated_memory_rpc_fingerprint(&source))
+        .as_deref()
+        == Some(schema_fingerprint)
+}
+
+fn normalize_generated_memory_rpc(source: &str, schema_fingerprint: &str) -> String {
+    let source = rewrite_generated_rpc_module_refs(source);
+    if generated_memory_rpc_fingerprint(&source).as_deref() == Some(schema_fingerprint) {
+        return source;
+    }
+    let mut out =
+        String::with_capacity(source.len() + MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX.len() + 20);
+    out.push_str(MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX);
+    out.push_str(schema_fingerprint);
+    out.push('\n');
+    out.push_str(&source);
+    out
+}
+
+fn generated_memory_rpc_fingerprint(source: &str) -> Option<String> {
+    source
+        .lines()
+        .find_map(|line| line.strip_prefix(MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX))
+        .map(|value| value.trim().to_string())
+}
+
+fn current_memory_rpc_schema_fingerprint() -> String {
+    let schema = fs::read(MEMORY_RPC_SCHEMA_PATH)
+        .unwrap_or_else(|error| panic!("failed to read {MEMORY_RPC_SCHEMA_PATH}: {error}"));
+    format!("{:016x}", stable_fnv1a64(&schema))
+}
+
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn rewrite_generated_rpc_module_refs(source: &str) -> String {

@@ -11,7 +11,7 @@
 
 - Use the `turso` crate directly for local DB access in this repo. Do not introduce `libsql` as a separate dependency.
 - KV storage semantics are `write-last` with monotonic versions.
-- KV and actor writes must remain contention-safe:
+- KV and memory writes must remain contention-safe:
   - set a connection `busy_timeout`
   - retry lock/busy conflicts with bounded backoff
   - keep a persisted/version-floor strategy so restarts do not regress version ordering
