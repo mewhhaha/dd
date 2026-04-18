@@ -9,13 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 use turso::{Builder, Connection, Database, Value};
 
-struct ActorDatabaseEntry {
+struct MemoryDatabaseEntry {
     database: Arc<Database>,
     last_used_at: Instant,
 }
 
-struct ActorSharedSnapshotEntry {
-    records: Arc<HashMap<String, ActorSnapshotEntry>>,
+struct MemorySharedSnapshotEntry {
+    records: Arc<HashMap<String, MemorySnapshotEntry>>,
     loaded_keys: Arc<HashSet<String>>,
     complete: bool,
     max_version: i64,
@@ -23,18 +23,18 @@ struct ActorSharedSnapshotEntry {
 }
 
 #[derive(Default)]
-struct ActorWriteShardState {
+struct MemoryWriteShardState {
     pending_namespaces: HashSet<String>,
     token_waiters: HashMap<u64, Vec<u64>>,
 }
 
-struct ActorWriteShard {
-    state: Mutex<ActorWriteShardState>,
+struct MemoryWriteShard {
+    state: Mutex<MemoryWriteShardState>,
     notify: Notify,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorDirectMutation {
+pub struct MemoryDirectMutation {
     pub key: String,
     pub value: Vec<u8>,
     pub encoding: String,
@@ -42,22 +42,22 @@ pub struct ActorDirectMutation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ActorQueuedMutationKey {
-    actor_key: String,
+struct MemoryQueuedMutationKey {
+    memory_key: String,
     item_key: String,
 }
 
 #[derive(Debug, Clone)]
-struct ActorPendingMutationEntry {
-    actor_key: String,
-    mutation: ActorDirectMutation,
+struct MemoryPendingMutationEntry {
+    memory_key: String,
+    mutation: MemoryDirectMutation,
     token: u64,
     queue_ids: Vec<i64>,
     completion_tokens: Vec<u64>,
 }
 
 #[derive(Debug)]
-struct ActorWriteSubmission {
+struct MemoryWriteSubmission {
     remaining_parts: usize,
     max_version: i64,
     result: Option<Result<i64>>,
@@ -65,9 +65,9 @@ struct ActorWriteSubmission {
 }
 
 #[derive(Debug, Clone)]
-struct ActorDirectQueueRow {
+struct MemoryDirectQueueRow {
     queue_id: i64,
-    actor_key: String,
+    memory_key: String,
     item_key: String,
     value: Vec<u8>,
     encoding: String,
@@ -76,13 +76,13 @@ struct ActorDirectQueueRow {
 }
 
 #[derive(Clone)]
-pub struct ActorStore {
+pub struct MemoryStore {
     root_dir: Arc<PathBuf>,
-    databases: Arc<Mutex<HashMap<String, ActorDatabaseEntry>>>,
-    actor_versions: Arc<Mutex<HashMap<String, i64>>>,
-    shared_snapshots: Arc<Mutex<HashMap<String, ActorSharedSnapshotEntry>>>,
-    write_shards: Arc<Vec<Arc<ActorWriteShard>>>,
-    write_submissions: Arc<Mutex<HashMap<u64, ActorWriteSubmission>>>,
+    databases: Arc<Mutex<HashMap<String, MemoryDatabaseEntry>>>,
+    memory_versions: Arc<Mutex<HashMap<String, i64>>>,
+    shared_snapshots: Arc<Mutex<HashMap<String, MemorySharedSnapshotEntry>>>,
+    write_shards: Arc<Vec<Arc<MemoryWriteShard>>>,
+    write_submissions: Arc<Mutex<HashMap<u64, MemoryWriteSubmission>>>,
     db_cache_max_open: usize,
     db_idle_ttl: Duration,
     namespace_shards: usize,
@@ -93,11 +93,11 @@ pub struct ActorStore {
     next_write_submission_id: Arc<AtomicU64>,
     next_write_token: Arc<AtomicU64>,
     version: Arc<AtomicU64>,
-    profile: Arc<ActorProfile>,
+    profile: Arc<MemoryProfile>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActorProfileMetricKind {
+pub enum MemoryProfileMetricKind {
     JsReadOnlyTotal,
     JsFreshnessCheck,
     JsHydrateFull,
@@ -132,7 +132,7 @@ pub enum ActorProfileMetricKind {
 }
 
 #[derive(Default)]
-struct ActorProfileMetric {
+struct MemoryProfileMetric {
     calls: AtomicU64,
     total_us: AtomicU64,
     total_items: AtomicU64,
@@ -140,7 +140,7 @@ struct ActorProfileMetric {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ActorProfileMetricSnapshot {
+pub struct MemoryProfileMetricSnapshot {
     pub calls: u64,
     pub total_us: u64,
     pub total_items: u64,
@@ -148,79 +148,79 @@ pub struct ActorProfileMetricSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ActorProfileSnapshot {
+pub struct MemoryProfileSnapshot {
     pub enabled: bool,
-    pub js_read_only_total: ActorProfileMetricSnapshot,
-    pub js_freshness_check: ActorProfileMetricSnapshot,
-    pub js_hydrate_full: ActorProfileMetricSnapshot,
-    pub js_hydrate_keys: ActorProfileMetricSnapshot,
-    pub js_txn_commit: ActorProfileMetricSnapshot,
-    pub js_txn_blind_commit: ActorProfileMetricSnapshot,
-    pub js_txn_validate: ActorProfileMetricSnapshot,
-    pub js_cache_hit: ActorProfileMetricSnapshot,
-    pub js_cache_miss: ActorProfileMetricSnapshot,
-    pub js_cache_stale: ActorProfileMetricSnapshot,
-    pub op_read: ActorProfileMetricSnapshot,
-    pub op_snapshot: ActorProfileMetricSnapshot,
-    pub op_version_if_newer: ActorProfileMetricSnapshot,
-    pub op_validate_reads: ActorProfileMetricSnapshot,
-    pub op_apply_batch: ActorProfileMetricSnapshot,
-    pub op_apply_blind_batch: ActorProfileMetricSnapshot,
-    pub store_direct_enqueue: ActorProfileMetricSnapshot,
-    pub store_direct_await: ActorProfileMetricSnapshot,
-    pub store_direct_queue_load: ActorProfileMetricSnapshot,
-    pub store_direct_queue_flush: ActorProfileMetricSnapshot,
-    pub store_direct_queue_delete: ActorProfileMetricSnapshot,
-    pub store_direct_waiter_complete: ActorProfileMetricSnapshot,
-    pub store_read: ActorProfileMetricSnapshot,
-    pub store_snapshot: ActorProfileMetricSnapshot,
-    pub store_snapshot_keys: ActorProfileMetricSnapshot,
-    pub store_version_if_newer: ActorProfileMetricSnapshot,
-    pub store_apply_batch: ActorProfileMetricSnapshot,
-    pub store_apply_batch_validate: ActorProfileMetricSnapshot,
-    pub store_apply_batch_write: ActorProfileMetricSnapshot,
-    pub store_apply_blind_batch: ActorProfileMetricSnapshot,
-    pub store_apply_blind_batch_write: ActorProfileMetricSnapshot,
+    pub js_read_only_total: MemoryProfileMetricSnapshot,
+    pub js_freshness_check: MemoryProfileMetricSnapshot,
+    pub js_hydrate_full: MemoryProfileMetricSnapshot,
+    pub js_hydrate_keys: MemoryProfileMetricSnapshot,
+    pub js_txn_commit: MemoryProfileMetricSnapshot,
+    pub js_txn_blind_commit: MemoryProfileMetricSnapshot,
+    pub js_txn_validate: MemoryProfileMetricSnapshot,
+    pub js_cache_hit: MemoryProfileMetricSnapshot,
+    pub js_cache_miss: MemoryProfileMetricSnapshot,
+    pub js_cache_stale: MemoryProfileMetricSnapshot,
+    pub op_read: MemoryProfileMetricSnapshot,
+    pub op_snapshot: MemoryProfileMetricSnapshot,
+    pub op_version_if_newer: MemoryProfileMetricSnapshot,
+    pub op_validate_reads: MemoryProfileMetricSnapshot,
+    pub op_apply_batch: MemoryProfileMetricSnapshot,
+    pub op_apply_blind_batch: MemoryProfileMetricSnapshot,
+    pub store_direct_enqueue: MemoryProfileMetricSnapshot,
+    pub store_direct_await: MemoryProfileMetricSnapshot,
+    pub store_direct_queue_load: MemoryProfileMetricSnapshot,
+    pub store_direct_queue_flush: MemoryProfileMetricSnapshot,
+    pub store_direct_queue_delete: MemoryProfileMetricSnapshot,
+    pub store_direct_waiter_complete: MemoryProfileMetricSnapshot,
+    pub store_read: MemoryProfileMetricSnapshot,
+    pub store_snapshot: MemoryProfileMetricSnapshot,
+    pub store_snapshot_keys: MemoryProfileMetricSnapshot,
+    pub store_version_if_newer: MemoryProfileMetricSnapshot,
+    pub store_apply_batch: MemoryProfileMetricSnapshot,
+    pub store_apply_batch_validate: MemoryProfileMetricSnapshot,
+    pub store_apply_batch_write: MemoryProfileMetricSnapshot,
+    pub store_apply_blind_batch: MemoryProfileMetricSnapshot,
+    pub store_apply_blind_batch_write: MemoryProfileMetricSnapshot,
 }
 
 #[derive(Default)]
-pub struct ActorProfile {
+pub struct MemoryProfile {
     enabled: AtomicBool,
-    js_read_only_total: ActorProfileMetric,
-    js_freshness_check: ActorProfileMetric,
-    js_hydrate_full: ActorProfileMetric,
-    js_hydrate_keys: ActorProfileMetric,
-    js_txn_commit: ActorProfileMetric,
-    js_txn_blind_commit: ActorProfileMetric,
-    js_txn_validate: ActorProfileMetric,
-    js_cache_hit: ActorProfileMetric,
-    js_cache_miss: ActorProfileMetric,
-    js_cache_stale: ActorProfileMetric,
-    op_read: ActorProfileMetric,
-    op_snapshot: ActorProfileMetric,
-    op_version_if_newer: ActorProfileMetric,
-    op_validate_reads: ActorProfileMetric,
-    op_apply_batch: ActorProfileMetric,
-    op_apply_blind_batch: ActorProfileMetric,
-    store_direct_enqueue: ActorProfileMetric,
-    store_direct_await: ActorProfileMetric,
-    store_direct_queue_load: ActorProfileMetric,
-    store_direct_queue_flush: ActorProfileMetric,
-    store_direct_queue_delete: ActorProfileMetric,
-    store_direct_waiter_complete: ActorProfileMetric,
-    store_read: ActorProfileMetric,
-    store_snapshot: ActorProfileMetric,
-    store_snapshot_keys: ActorProfileMetric,
-    store_version_if_newer: ActorProfileMetric,
-    store_apply_batch: ActorProfileMetric,
-    store_apply_batch_validate: ActorProfileMetric,
-    store_apply_batch_write: ActorProfileMetric,
-    store_apply_blind_batch: ActorProfileMetric,
-    store_apply_blind_batch_write: ActorProfileMetric,
+    js_read_only_total: MemoryProfileMetric,
+    js_freshness_check: MemoryProfileMetric,
+    js_hydrate_full: MemoryProfileMetric,
+    js_hydrate_keys: MemoryProfileMetric,
+    js_txn_commit: MemoryProfileMetric,
+    js_txn_blind_commit: MemoryProfileMetric,
+    js_txn_validate: MemoryProfileMetric,
+    js_cache_hit: MemoryProfileMetric,
+    js_cache_miss: MemoryProfileMetric,
+    js_cache_stale: MemoryProfileMetric,
+    op_read: MemoryProfileMetric,
+    op_snapshot: MemoryProfileMetric,
+    op_version_if_newer: MemoryProfileMetric,
+    op_validate_reads: MemoryProfileMetric,
+    op_apply_batch: MemoryProfileMetric,
+    op_apply_blind_batch: MemoryProfileMetric,
+    store_direct_enqueue: MemoryProfileMetric,
+    store_direct_await: MemoryProfileMetric,
+    store_direct_queue_load: MemoryProfileMetric,
+    store_direct_queue_flush: MemoryProfileMetric,
+    store_direct_queue_delete: MemoryProfileMetric,
+    store_direct_waiter_complete: MemoryProfileMetric,
+    store_read: MemoryProfileMetric,
+    store_snapshot: MemoryProfileMetric,
+    store_snapshot_keys: MemoryProfileMetric,
+    store_version_if_newer: MemoryProfileMetric,
+    store_apply_batch: MemoryProfileMetric,
+    store_apply_batch_validate: MemoryProfileMetric,
+    store_apply_batch_write: MemoryProfileMetric,
+    store_apply_blind_batch: MemoryProfileMetric,
+    store_apply_blind_batch_write: MemoryProfileMetric,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorSnapshotEntry {
+pub struct MemorySnapshotEntry {
     pub key: String,
     pub value: Vec<u8>,
     pub encoding: String,
@@ -229,19 +229,19 @@ pub struct ActorSnapshotEntry {
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorSnapshot {
-    pub entries: Vec<ActorSnapshotEntry>,
+pub struct MemorySnapshot {
+    pub entries: Vec<MemorySnapshotEntry>,
     pub max_version: i64,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorPointRead {
-    pub record: Option<ActorSnapshotEntry>,
+pub struct MemoryPointRead {
+    pub record: Option<MemorySnapshotEntry>,
     pub max_version: i64,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorBatchMutation {
+pub struct MemoryBatchMutation {
     pub key: String,
     pub value: Vec<u8>,
     pub encoding: String,
@@ -250,46 +250,46 @@ pub struct ActorBatchMutation {
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorReadDependency {
+pub struct MemoryReadDependency {
     pub key: String,
     pub version: i64,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActorBatchApplyResult {
+pub struct MemoryBatchApplyResult {
     pub conflict: bool,
     pub max_version: i64,
 }
 
-impl ActorStore {
+impl MemoryStore {
     pub async fn new(
         root_dir: PathBuf,
         namespace_shards: usize,
         db_cache_max_open: usize,
         db_idle_ttl: Duration,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&root_dir).map_err(actor_error)?;
+        std::fs::create_dir_all(&root_dir).map_err(memory_error)?;
         if namespace_shards == 0 {
             return Err(PlatformError::internal(
-                "actor_namespace_shards must be greater than 0",
+                "memory_namespace_shards must be greater than 0",
             ));
         }
         if db_cache_max_open == 0 {
             return Err(PlatformError::internal(
-                "actor_db_cache_max_open must be greater than 0",
+                "memory_db_cache_max_open must be greater than 0",
             ));
         }
         if db_idle_ttl.is_zero() {
             return Err(PlatformError::internal(
-                "actor_db_idle_ttl must be greater than 0",
+                "memory_db_idle_ttl must be greater than 0",
             ));
         }
-        let bootstrapped_version = detect_actor_version_floor(&root_dir).await?;
+        let bootstrapped_version = detect_memory_version_floor(&root_dir).await?;
         let write_shards = Arc::new(
             (0..namespace_shards)
                 .map(|_| {
-                    Arc::new(ActorWriteShard {
-                        state: Mutex::new(ActorWriteShardState::default()),
+                    Arc::new(MemoryWriteShard {
+                        state: Mutex::new(MemoryWriteShardState::default()),
                         notify: Notify::new(),
                     })
                 })
@@ -298,7 +298,7 @@ impl ActorStore {
         let store = Self {
             root_dir: Arc::new(root_dir),
             databases: Arc::new(Mutex::new(HashMap::new())),
-            actor_versions: Arc::new(Mutex::new(HashMap::new())),
+            memory_versions: Arc::new(Mutex::new(HashMap::new())),
             shared_snapshots: Arc::new(Mutex::new(HashMap::new())),
             write_shards,
             write_submissions: Arc::new(Mutex::new(HashMap::new())),
@@ -312,7 +312,7 @@ impl ActorStore {
             next_write_submission_id: Arc::new(AtomicU64::new(1)),
             next_write_token: Arc::new(AtomicU64::new(bootstrapped_version.max(1))),
             version: Arc::new(AtomicU64::new(bootstrapped_version.max(1))),
-            profile: Arc::new(ActorProfile::default()),
+            profile: Arc::new(MemoryProfile::default()),
         };
         for shard_index in 0..namespace_shards {
             let store_clone = store.clone();
@@ -327,11 +327,11 @@ impl ActorStore {
         self.profile.set_enabled(enabled);
     }
 
-    pub fn record_profile(&self, metric: ActorProfileMetricKind, duration_us: u64, items: u64) {
+    pub fn record_profile(&self, metric: MemoryProfileMetricKind, duration_us: u64, items: u64) {
         self.profile.record(metric, duration_us, items);
     }
 
-    pub fn take_profile_snapshot_and_reset(&self) -> ActorProfileSnapshot {
+    pub fn take_profile_snapshot_and_reset(&self) -> MemoryProfileSnapshot {
         self.profile.take_snapshot_and_reset()
     }
 
@@ -339,42 +339,43 @@ impl ActorStore {
         self.profile.reset();
     }
 
-    pub async fn snapshot(&self, namespace: &str, actor_key: &str) -> Result<ActorSnapshot> {
+    pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<MemorySnapshot> {
         let started = Instant::now();
-        if let Some(snapshot) = self.cached_full_snapshot(namespace, actor_key).await {
+        if let Some(snapshot) = self.cached_full_snapshot(namespace, memory_key).await {
             self.observe_version(snapshot.max_version);
-            self.observe_actor_version(namespace, actor_key, snapshot.max_version)
+            self.observe_memory_version(namespace, memory_key, snapshot.max_version)
                 .await;
             self.record_profile(
-                ActorProfileMetricKind::StoreSnapshot,
+                MemoryProfileMetricKind::StoreSnapshot,
                 started.elapsed().as_micros() as u64,
                 snapshot.entries.len() as u64,
             );
             return Ok(snapshot);
         }
-        let conn = self.connect(namespace, actor_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         let mut rows = conn
             .query(
                 "SELECT item_key, value_blob, encoding, value, version, deleted
-                 FROM actor_state
+                 FROM memory_state
                  WHERE entity_key = ?1
                  ORDER BY item_key ASC",
-                (actor_key,),
+                (memory_key,),
             )
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
 
         let mut entries = Vec::new();
         let mut max_version = -1i64;
-        while let Some(row) = rows.next().await.map_err(actor_error)? {
-            let key: String = row.get::<String>(0).map_err(actor_error)?;
-            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(1).map_err(actor_error)?;
-            let encoding: String = row.get::<String>(2).map_err(actor_error)?;
-            let legacy_value: String = row.get::<String>(3).map_err(actor_error)?;
-            let version: i64 = row.get::<i64>(4).map_err(actor_error)?;
-            let deleted: i64 = row.get::<i64>(5).map_err(actor_error)?;
+        while let Some(row) = rows.next().await.map_err(memory_error)? {
+            let key: String = row.get::<String>(0).map_err(memory_error)?;
+            let value_blob: Option<Vec<u8>> =
+                row.get::<Option<Vec<u8>>>(1).map_err(memory_error)?;
+            let encoding: String = row.get::<String>(2).map_err(memory_error)?;
+            let legacy_value: String = row.get::<String>(3).map_err(memory_error)?;
+            let version: i64 = row.get::<i64>(4).map_err(memory_error)?;
+            let deleted: i64 = row.get::<i64>(5).map_err(memory_error)?;
             max_version = max_version.max(version);
-            entries.push(ActorSnapshotEntry {
+            entries.push(MemorySnapshotEntry {
                 key,
                 value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
                 encoding: normalize_encoding(&encoding),
@@ -383,16 +384,16 @@ impl ActorStore {
             });
         }
         self.observe_version(max_version);
-        self.observe_actor_version(namespace, actor_key, max_version)
+        self.observe_memory_version(namespace, memory_key, max_version)
             .await;
-        let snapshot = ActorSnapshot {
+        let snapshot = MemorySnapshot {
             entries,
             max_version,
         };
-        self.put_full_snapshot(namespace, actor_key, &snapshot)
+        self.put_full_snapshot(namespace, memory_key, &snapshot)
             .await;
         self.record_profile(
-            ActorProfileMetricKind::StoreSnapshot,
+            MemoryProfileMetricKind::StoreSnapshot,
             started.elapsed().as_micros() as u64,
             snapshot.entries.len() as u64,
         );
@@ -402,38 +403,41 @@ impl ActorStore {
     pub async fn point_read(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         item_key: &str,
-    ) -> Result<ActorPointRead> {
+    ) -> Result<MemoryPointRead> {
         let started = Instant::now();
         let item_key = item_key.trim();
         if item_key.is_empty() {
-            return Err(PlatformError::runtime("actor item key must not be empty"));
+            return Err(PlatformError::runtime("memory item key must not be empty"));
         }
-        if let Some(point) = self.cached_point_read(namespace, actor_key, item_key).await {
+        if let Some(point) = self
+            .cached_point_read(namespace, memory_key, item_key)
+            .await
+        {
             self.observe_version(point.max_version);
-            self.observe_actor_version(namespace, actor_key, point.max_version)
+            self.observe_memory_version(namespace, memory_key, point.max_version)
                 .await;
             self.record_profile(
-                ActorProfileMetricKind::StoreRead,
+                MemoryProfileMetricKind::StoreRead,
                 started.elapsed().as_micros() as u64,
                 1,
             );
             return Ok(point);
         }
 
-        let conn = self.connect(namespace, actor_key).await?;
-        let record = self.record_for_key(&conn, actor_key, item_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
+        let record = self.record_for_key(&conn, memory_key, item_key).await?;
         let max_version = self
-            .max_version_for_actor(&conn, actor_key)
+            .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
         self.observe_version(max_version);
-        self.observe_actor_version(namespace, actor_key, max_version)
+        self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         self.put_partial_snapshot(
             namespace,
-            actor_key,
+            memory_key,
             max_version,
             record.clone().into_iter().collect::<Vec<_>>(),
             std::iter::once(item_key.to_string()),
@@ -441,11 +445,11 @@ impl ActorStore {
         )
         .await;
         self.record_profile(
-            ActorProfileMetricKind::StoreRead,
+            MemoryProfileMetricKind::StoreRead,
             started.elapsed().as_micros() as u64,
             1,
         );
-        Ok(ActorPointRead {
+        Ok(MemoryPointRead {
             record,
             max_version,
         })
@@ -454,11 +458,11 @@ impl ActorStore {
     pub async fn snapshot_keys(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         keys: &[String],
-    ) -> Result<ActorSnapshot> {
+    ) -> Result<MemorySnapshot> {
         if keys.is_empty() {
-            return self.snapshot(namespace, actor_key).await;
+            return self.snapshot(namespace, memory_key).await;
         }
         let started = Instant::now();
         let filtered_keys = keys
@@ -467,56 +471,57 @@ impl ActorStore {
             .filter(|key| !key.is_empty())
             .collect::<Vec<_>>();
         if filtered_keys.is_empty() {
-            let conn = self.connect(namespace, actor_key).await?;
+            let conn = self.connect(namespace, memory_key).await?;
             let max_version = self
-                .max_version_for_actor(&conn, actor_key)
+                .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
             self.observe_version(max_version);
-            return Ok(ActorSnapshot {
+            return Ok(MemorySnapshot {
                 entries: Vec::new(),
                 max_version,
             });
         }
         if let Some(snapshot) = self
-            .cached_keys_snapshot(namespace, actor_key, &filtered_keys)
+            .cached_keys_snapshot(namespace, memory_key, &filtered_keys)
             .await
         {
             self.record_profile(
-                ActorProfileMetricKind::StoreSnapshotKeys,
+                MemoryProfileMetricKind::StoreSnapshotKeys,
                 started.elapsed().as_micros() as u64,
                 filtered_keys.len() as u64,
             );
             return Ok(snapshot);
         }
-        let conn = self.connect(namespace, actor_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         let placeholders = (0..filtered_keys.len())
             .map(|index| format!("?{}", index + 2))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             "SELECT item_key, value_blob, encoding, value, version, deleted
-             FROM actor_state
+             FROM memory_state
              WHERE entity_key = ?1 AND item_key IN ({placeholders})
              ORDER BY item_key ASC"
         );
         let mut params = Vec::with_capacity(filtered_keys.len() + 1);
-        params.push(Value::Text(actor_key.to_string()));
+        params.push(Value::Text(memory_key.to_string()));
         params.extend(
             filtered_keys
                 .iter()
                 .map(|key| Value::Text((*key).to_string())),
         );
         let mut entries = Vec::new();
-        let mut rows = conn.query(&sql, params).await.map_err(actor_error)?;
-        while let Some(row) = rows.next().await.map_err(actor_error)? {
-            let key: String = row.get::<String>(0).map_err(actor_error)?;
-            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(1).map_err(actor_error)?;
-            let encoding: String = row.get::<String>(2).map_err(actor_error)?;
-            let legacy_value: String = row.get::<String>(3).map_err(actor_error)?;
-            let version: i64 = row.get::<i64>(4).map_err(actor_error)?;
-            let deleted: i64 = row.get::<i64>(5).map_err(actor_error)?;
-            entries.push(ActorSnapshotEntry {
+        let mut rows = conn.query(&sql, params).await.map_err(memory_error)?;
+        while let Some(row) = rows.next().await.map_err(memory_error)? {
+            let key: String = row.get::<String>(0).map_err(memory_error)?;
+            let value_blob: Option<Vec<u8>> =
+                row.get::<Option<Vec<u8>>>(1).map_err(memory_error)?;
+            let encoding: String = row.get::<String>(2).map_err(memory_error)?;
+            let legacy_value: String = row.get::<String>(3).map_err(memory_error)?;
+            let version: i64 = row.get::<i64>(4).map_err(memory_error)?;
+            let deleted: i64 = row.get::<i64>(5).map_err(memory_error)?;
+            entries.push(MemorySnapshotEntry {
                 key,
                 value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
                 encoding: normalize_encoding(&encoding),
@@ -525,15 +530,15 @@ impl ActorStore {
             });
         }
         let max_version = self
-            .max_version_for_actor(&conn, actor_key)
+            .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
         self.observe_version(max_version);
-        self.observe_actor_version(namespace, actor_key, max_version)
+        self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         self.put_partial_snapshot(
             namespace,
-            actor_key,
+            memory_key,
             max_version,
             entries.clone(),
             filtered_keys.iter().cloned(),
@@ -541,11 +546,11 @@ impl ActorStore {
         )
         .await;
         self.record_profile(
-            ActorProfileMetricKind::StoreSnapshotKeys,
+            MemoryProfileMetricKind::StoreSnapshotKeys,
             started.elapsed().as_micros() as u64,
             filtered_keys.len() as u64,
         );
-        Ok(ActorSnapshot {
+        Ok(MemorySnapshot {
             entries,
             max_version,
         })
@@ -554,30 +559,30 @@ impl ActorStore {
     pub async fn validate_reads(
         &self,
         namespace: &str,
-        actor_key: &str,
-        reads: &[ActorReadDependency],
+        memory_key: &str,
+        reads: &[MemoryReadDependency],
         list_gate_version: Option<i64>,
-    ) -> Result<ActorBatchApplyResult> {
+    ) -> Result<MemoryBatchApplyResult> {
         let started = Instant::now();
-        let conn = self.connect(namespace, actor_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         let current = self
-            .max_version_for_actor(&conn, actor_key)
+            .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
         if let Some(expected_list_version) = list_gate_version {
             if current != expected_list_version {
-                self.observe_actor_version(namespace, actor_key, current)
+                self.observe_memory_version(namespace, memory_key, current)
                     .await;
-                return Ok(ActorBatchApplyResult {
+                return Ok(MemoryBatchApplyResult {
                     conflict: true,
                     max_version: current,
                 });
             }
         }
         if reads.is_empty() {
-            self.observe_actor_version(namespace, actor_key, current)
+            self.observe_memory_version(namespace, memory_key, current)
                 .await;
-            return Ok(ActorBatchApplyResult {
+            return Ok(MemoryBatchApplyResult {
                 conflict: false,
                 max_version: current,
             });
@@ -588,21 +593,21 @@ impl ActorStore {
             .join(", ");
         let sql = format!(
             "SELECT item_key, version
-             FROM actor_state
+             FROM memory_state
              WHERE entity_key = ?1 AND item_key IN ({placeholders})"
         );
         let mut params = Vec::with_capacity(reads.len() + 1);
-        params.push(Value::Text(actor_key.to_string()));
+        params.push(Value::Text(memory_key.to_string()));
         params.extend(
             reads
                 .iter()
                 .map(|dependency| Value::Text(dependency.key.clone())),
         );
-        let mut rows = conn.query(&sql, params).await.map_err(actor_error)?;
+        let mut rows = conn.query(&sql, params).await.map_err(memory_error)?;
         let mut observed_versions = HashMap::with_capacity(reads.len());
-        while let Some(row) = rows.next().await.map_err(actor_error)? {
-            let key: String = row.get::<String>(0).map_err(actor_error)?;
-            let version: i64 = row.get::<i64>(1).map_err(actor_error)?;
+        while let Some(row) = rows.next().await.map_err(memory_error)? {
+            let key: String = row.get::<String>(0).map_err(memory_error)?;
+            let version: i64 = row.get::<i64>(1).map_err(memory_error)?;
             observed_versions.insert(key, version);
         }
         for dependency in reads {
@@ -611,22 +616,22 @@ impl ActorStore {
                 .copied()
                 .unwrap_or(-1);
             if observed != dependency.version {
-                self.observe_actor_version(namespace, actor_key, current.max(observed))
+                self.observe_memory_version(namespace, memory_key, current.max(observed))
                     .await;
-                return Ok(ActorBatchApplyResult {
+                return Ok(MemoryBatchApplyResult {
                     conflict: true,
                     max_version: current.max(observed),
                 });
             }
         }
-        self.observe_actor_version(namespace, actor_key, current)
+        self.observe_memory_version(namespace, memory_key, current)
             .await;
         self.record_profile(
-            ActorProfileMetricKind::OpValidateReads,
+            MemoryProfileMetricKind::OpValidateReads,
             started.elapsed().as_micros() as u64,
             reads.len() as u64,
         );
-        Ok(ActorBatchApplyResult {
+        Ok(MemoryBatchApplyResult {
             conflict: false,
             max_version: current,
         })
@@ -635,32 +640,32 @@ impl ActorStore {
     pub async fn version_if_newer(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         known_version: i64,
     ) -> Result<Option<i64>> {
         let started = Instant::now();
-        let actor_key = actor_key.trim();
-        if actor_key.is_empty() {
-            return Err(PlatformError::runtime("actor key must not be empty"));
+        let memory_key = memory_key.trim();
+        if memory_key.is_empty() {
+            return Err(PlatformError::runtime("memory key must not be empty"));
         }
-        let version_key = Self::actor_version_key(namespace, actor_key);
-        if let Some(current) = self.actor_versions.lock().await.get(&version_key).copied() {
+        let version_key = Self::memory_version_key(namespace, memory_key);
+        if let Some(current) = self.memory_versions.lock().await.get(&version_key).copied() {
             self.record_profile(
-                ActorProfileMetricKind::StoreVersionIfNewer,
+                MemoryProfileMetricKind::StoreVersionIfNewer,
                 started.elapsed().as_micros() as u64,
                 1,
             );
             return Ok((current > known_version).then_some(current));
         }
-        let conn = self.connect(namespace, actor_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         let current = self
-            .max_version_for_actor(&conn, actor_key)
+            .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
-        self.observe_actor_version(namespace, actor_key, current)
+        self.observe_memory_version(namespace, memory_key, current)
             .await;
         self.record_profile(
-            ActorProfileMetricKind::StoreVersionIfNewer,
+            MemoryProfileMetricKind::StoreVersionIfNewer,
             started.elapsed().as_micros() as u64,
             1,
         );
@@ -670,17 +675,17 @@ impl ActorStore {
     pub async fn enqueue_direct_batch(
         &self,
         namespace: &str,
-        actor_key: &str,
-        mutations: &[ActorDirectMutation],
+        memory_key: &str,
+        mutations: &[MemoryDirectMutation],
     ) -> Result<u64> {
         let started = Instant::now();
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return Err(PlatformError::runtime("memory namespace must not be empty"));
         }
-        let actor_key = actor_key.trim();
-        if actor_key.is_empty() {
-            return Err(PlatformError::runtime("actor key must not be empty"));
+        let memory_key = memory_key.trim();
+        if memory_key.is_empty() {
+            return Err(PlatformError::runtime("memory key must not be empty"));
         }
         let coalesced = coalesce_direct_mutations(mutations)?;
         let submission_id = self.next_write_submission_id.fetch_add(1, Ordering::SeqCst);
@@ -688,13 +693,13 @@ impl ActorStore {
         if coalesced.is_empty() {
             self.write_submissions.lock().await.insert(
                 submission_id,
-                ActorWriteSubmission {
+                MemoryWriteSubmission {
                     remaining_parts: 0,
                     max_version: self
-                        .actor_versions
+                        .memory_versions
                         .lock()
                         .await
-                        .get(&Self::actor_version_key(namespace, actor_key))
+                        .get(&Self::memory_version_key(namespace, memory_key))
                         .copied()
                         .unwrap_or(-1),
                     result: Some(Ok(-1)),
@@ -704,7 +709,7 @@ impl ActorStore {
             return Ok(submission_id);
         }
 
-        let shard_index = self.shard_index(actor_key);
+        let shard_index = self.shard_index(memory_key);
         let shard = self.write_shards[shard_index].clone();
         let queued = coalesced
             .into_iter()
@@ -721,26 +726,26 @@ impl ActorStore {
             attempt += 1;
             match conn.execute("BEGIN IMMEDIATE", ()).await {
                 Ok(_) => {}
-                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(actor_error(error)),
+                Err(error) => return Err(memory_error(error)),
             }
             let outcome = async {
                 let queued_rows = self.direct_queue_len(&conn).await?;
                 if queued_rows.saturating_add(queued.len()) > self.write_max_pending_keys {
                     return Err(PlatformError::runtime(
-                        "actor direct write queue overloaded",
+                        "memory direct write queue overloaded",
                     ));
                 }
                 for (token, mutation) in &queued {
                     let now_ms = epoch_ms_i64()?;
                     conn.execute(
-                        "INSERT INTO actor_direct_queue (entity_key, item_key, value_blob, encoding, deleted, token, enqueued_at_ms)
+                        "INSERT INTO memory_direct_queue (entity_key, item_key, value_blob, encoding, deleted, token, enqueued_at_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         (
-                            actor_key,
+                            memory_key,
                             mutation.key.as_str(),
                             mutation.value.as_slice(),
                             mutation.encoding.as_str(),
@@ -750,7 +755,7 @@ impl ActorStore {
                         ),
                     )
                     .await
-                    .map_err(actor_error)?;
+                    .map_err(memory_error)?;
                 }
                 Ok::<(), PlatformError>(())
             }
@@ -758,7 +763,7 @@ impl ActorStore {
             match outcome {
                 Ok(()) => match conn.execute("COMMIT", ()).await {
                     Ok(_) => break,
-                    Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                         let _ = conn.execute("ROLLBACK", ()).await;
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
@@ -766,7 +771,7 @@ impl ActorStore {
                     }
                     Err(error) => {
                         let _ = conn.execute("ROLLBACK", ()).await;
-                        return Err(actor_error(error));
+                        return Err(memory_error(error));
                     }
                 },
                 Err(error) => {
@@ -777,7 +782,7 @@ impl ActorStore {
         }
         self.write_submissions.lock().await.insert(
             submission_id,
-            ActorWriteSubmission {
+            MemoryWriteSubmission {
                 remaining_parts: queued.len(),
                 max_version: -1,
                 result: None,
@@ -797,7 +802,7 @@ impl ActorStore {
         }
         shard.notify.notify_one();
         self.record_profile(
-            ActorProfileMetricKind::StoreDirectEnqueue,
+            MemoryProfileMetricKind::StoreDirectEnqueue,
             started.elapsed().as_micros() as u64,
             queued.len() as u64,
         );
@@ -812,14 +817,14 @@ impl ActorStore {
                 let mut submissions = self.write_submissions.lock().await;
                 let Some(entry) = submissions.get(&submission_id) else {
                     return Err(PlatformError::runtime(format!(
-                        "unknown actor write submission {submission_id}"
+                        "unknown memory write submission {submission_id}"
                     )));
                 };
                 if let Some(result) = &entry.result {
                     let result = result.clone();
                     submissions.remove(&submission_id);
                     self.record_profile(
-                        ActorProfileMetricKind::StoreDirectAwait,
+                        MemoryProfileMetricKind::StoreDirectAwait,
                         started.elapsed().as_micros() as u64,
                         1,
                     );
@@ -842,12 +847,12 @@ impl ActorStore {
     }
 
     fn poll_direct_submission_locked(
-        submissions: &mut HashMap<u64, ActorWriteSubmission>,
+        submissions: &mut HashMap<u64, MemoryWriteSubmission>,
         submission_id: u64,
     ) -> Result<Option<i64>> {
         let Some(entry) = submissions.get(&submission_id) else {
             return Err(PlatformError::runtime(format!(
-                "unknown actor write submission {submission_id}"
+                "unknown memory write submission {submission_id}"
             )));
         };
         let Some(result) = &entry.result else {
@@ -861,31 +866,31 @@ impl ActorStore {
     pub async fn apply_batch(
         &self,
         namespace: &str,
-        actor_key: &str,
-        reads: &[ActorReadDependency],
-        mutations: &[ActorBatchMutation],
+        memory_key: &str,
+        reads: &[MemoryReadDependency],
+        mutations: &[MemoryBatchMutation],
         expected_base_version: Option<i64>,
         list_gate_version: Option<i64>,
         transactional: bool,
-    ) -> Result<ActorBatchApplyResult> {
+    ) -> Result<MemoryBatchApplyResult> {
         let started = Instant::now();
         let conn = if mutations.is_empty() {
-            self.connect(namespace, actor_key).await?
+            self.connect(namespace, memory_key).await?
         } else {
-            self.connect_uncached(namespace, actor_key).await?
+            self.connect_uncached(namespace, memory_key).await?
         };
         if mutations.is_empty() && reads.is_empty() && list_gate_version.is_none() {
             let max_version = self
-                .max_version_for_actor(&conn, actor_key)
+                .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
             self.observe_version(max_version);
             self.record_profile(
-                ActorProfileMetricKind::StoreApplyBatch,
+                MemoryProfileMetricKind::StoreApplyBatch,
                 started.elapsed().as_micros() as u64,
                 1,
             );
-            return Ok(ActorBatchApplyResult {
+            return Ok(MemoryBatchApplyResult {
                 conflict: false,
                 max_version,
             });
@@ -894,12 +899,12 @@ impl ActorStore {
         for mutation in mutations {
             if mutation.key.trim().is_empty() {
                 return Err(PlatformError::bad_request(
-                    "actor batch mutation key must not be empty",
+                    "memory batch mutation key must not be empty",
                 ));
             }
             if mutation.version < 0 {
                 return Err(PlatformError::bad_request(
-                    "actor batch mutation version must be non-negative",
+                    "memory batch mutation version must be non-negative",
                 ));
             }
             if !mutation.deleted
@@ -907,7 +912,7 @@ impl ActorStore {
                 && mutation.encoding != ENCODING_V8SC
             {
                 return Err(PlatformError::bad_request(format!(
-                    "unsupported actor storage encoding: {}",
+                    "unsupported memory storage encoding: {}",
                     mutation.encoding
                 )));
             }
@@ -918,7 +923,7 @@ impl ActorStore {
             for mutation in mutations {
                 if mutation.version <= previous_version {
                     return Err(PlatformError::bad_request(
-                        "actor batch mutation versions must be strictly increasing",
+                        "memory batch mutation versions must be strictly increasing",
                     ));
                 }
                 previous_version = mutation.version;
@@ -930,25 +935,25 @@ impl ActorStore {
             attempt += 1;
             match conn.execute("BEGIN CONCURRENT", ()).await {
                 Ok(_) => {}
-                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(actor_error(error)),
+                Err(error) => return Err(memory_error(error)),
             }
 
             let outcome = async {
                 let validate_started = Instant::now();
-                let current = self.max_version_for_actor(&conn, actor_key).await?.unwrap_or(-1);
+                let current = self.max_version_for_memory(&conn, memory_key).await?.unwrap_or(-1);
                 if let Some(expected_list_version) = list_gate_version {
                     if current != expected_list_version {
-                        self.observe_actor_version(namespace, actor_key, current).await;
+                        self.observe_memory_version(namespace, memory_key, current).await;
                         self.record_profile(
-                            ActorProfileMetricKind::StoreApplyBatchValidate,
+                            MemoryProfileMetricKind::StoreApplyBatchValidate,
                             validate_started.elapsed().as_micros() as u64,
                             reads.len() as u64 + 1,
                         );
-                        return Ok(ActorBatchApplyResult {
+                        return Ok(MemoryBatchApplyResult {
                             conflict: true,
                             max_version: current,
                         });
@@ -957,13 +962,13 @@ impl ActorStore {
                 if !transactional {
                     if let Some(expected) = expected_base_version {
                         if current != expected {
-                            self.observe_actor_version(namespace, actor_key, current).await;
+                            self.observe_memory_version(namespace, memory_key, current).await;
                             self.record_profile(
-                                ActorProfileMetricKind::StoreApplyBatchValidate,
+                                MemoryProfileMetricKind::StoreApplyBatchValidate,
                                 validate_started.elapsed().as_micros() as u64,
                                 reads.len() as u64 + 1,
                             );
-                            return Ok(ActorBatchApplyResult {
+                            return Ok(MemoryBatchApplyResult {
                                 conflict: true,
                                 max_version: current,
                             });
@@ -972,25 +977,25 @@ impl ActorStore {
                 }
                 for dependency in reads {
                     let observed = self
-                        .version_for_key(&conn, actor_key, dependency.key.as_str())
+                        .version_for_key(&conn, memory_key, dependency.key.as_str())
                         .await?
                         .unwrap_or(-1);
                     if observed != dependency.version {
-                        self.observe_actor_version(namespace, actor_key, current.max(observed))
+                        self.observe_memory_version(namespace, memory_key, current.max(observed))
                             .await;
                         self.record_profile(
-                            ActorProfileMetricKind::StoreApplyBatchValidate,
+                            MemoryProfileMetricKind::StoreApplyBatchValidate,
                             validate_started.elapsed().as_micros() as u64,
                             reads.len() as u64 + 1,
                         );
-                        return Ok(ActorBatchApplyResult {
+                        return Ok(MemoryBatchApplyResult {
                             conflict: true,
                             max_version: current.max(observed),
                         });
                     }
                 }
                 self.record_profile(
-                    ActorProfileMetricKind::StoreApplyBatchValidate,
+                    MemoryProfileMetricKind::StoreApplyBatchValidate,
                     validate_started.elapsed().as_micros() as u64,
                     reads.len() as u64 + 1,
                 );
@@ -1008,7 +1013,7 @@ impl ActorStore {
                     if mutation.deleted {
                         let empty_blob: &[u8] = &[];
                         conn.execute(
-                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                              VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
                              ON CONFLICT(entity_key, item_key) DO UPDATE SET
                                value = excluded.value,
@@ -1018,7 +1023,7 @@ impl ActorStore {
                                version = excluded.version,
                                updated_at_ms = excluded.updated_at_ms",
                             (
-                                actor_key,
+                                memory_key,
                                 mutation.key.as_str(),
                                 empty_blob,
                                 ENCODING_UTF8,
@@ -1027,7 +1032,7 @@ impl ActorStore {
                             ),
                         )
                         .await
-                        .map_err(actor_error)?;
+                        .map_err(memory_error)?;
                         continue;
                     }
 
@@ -1041,7 +1046,7 @@ impl ActorStore {
                         String::new()
                     };
                     conn.execute(
-                        "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                        "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                          ON CONFLICT(entity_key, item_key) DO UPDATE SET
                            value = excluded.value,
@@ -1051,7 +1056,7 @@ impl ActorStore {
                            version = excluded.version,
                            updated_at_ms = excluded.updated_at_ms",
                         (
-                            actor_key,
+                            memory_key,
                             mutation.key.as_str(),
                             value_text.as_str(),
                             mutation.value.as_slice(),
@@ -1061,7 +1066,7 @@ impl ActorStore {
                         ),
                     )
                     .await
-                    .map_err(actor_error)?;
+                    .map_err(memory_error)?;
                 }
 
                 let max_version = if let Some(version) = commit_version {
@@ -1075,24 +1080,24 @@ impl ActorStore {
                 if !mutations.is_empty() {
                     let now_ms = epoch_ms_i64()?;
                     conn.execute(
-                        "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                        "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
                          VALUES (?1, ?2, ?3)
                          ON CONFLICT(entity_key) DO UPDATE SET
                            max_version = excluded.max_version,
                            updated_at_ms = excluded.updated_at_ms",
-                        (actor_key, max_version, now_ms),
+                        (memory_key, max_version, now_ms),
                     )
                     .await
-                    .map_err(actor_error)?;
+                    .map_err(memory_error)?;
                 }
-                self.update_cached_snapshot_after_commit(namespace, actor_key, max_version, mutations)
+                self.update_cached_snapshot_after_commit(namespace, memory_key, max_version, mutations)
                     .await;
                 self.record_profile(
-                    ActorProfileMetricKind::StoreApplyBatchWrite,
+                    MemoryProfileMetricKind::StoreApplyBatchWrite,
                     write_started.elapsed().as_micros() as u64,
                     mutations.len() as u64 + 1,
                 );
-                Ok(ActorBatchApplyResult {
+                Ok(MemoryBatchApplyResult {
                     conflict: false,
                     max_version,
                 })
@@ -1107,7 +1112,7 @@ impl ActorStore {
                     }
                     match conn.execute("COMMIT", ()).await {
                         Ok(_) => {}
-                        Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                        Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                             let _ = conn.execute("ROLLBACK", ()).await;
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 5 * attempt as u64,
@@ -1117,14 +1122,14 @@ impl ActorStore {
                         }
                         Err(error) => {
                             let _ = conn.execute("ROLLBACK", ()).await;
-                            return Err(actor_error(error));
+                            return Err(memory_error(error));
                         }
                     }
                     self.observe_version(result.max_version);
-                    self.observe_actor_version(namespace, actor_key, result.max_version)
+                    self.observe_memory_version(namespace, memory_key, result.max_version)
                         .await;
                     self.record_profile(
-                        ActorProfileMetricKind::StoreApplyBatch,
+                        MemoryProfileMetricKind::StoreApplyBatch,
                         started.elapsed().as_micros() as u64,
                         mutations.len() as u64 + reads.len() as u64 + 1,
                     );
@@ -1141,27 +1146,27 @@ impl ActorStore {
     pub async fn apply_blind_batch(
         &self,
         namespace: &str,
-        actor_key: &str,
-        mutations: &[ActorBatchMutation],
-    ) -> Result<ActorBatchApplyResult> {
+        memory_key: &str,
+        mutations: &[MemoryBatchMutation],
+    ) -> Result<MemoryBatchApplyResult> {
         let started = Instant::now();
         let conn = if mutations.is_empty() {
-            self.connect(namespace, actor_key).await?
+            self.connect(namespace, memory_key).await?
         } else {
-            self.connect_uncached(namespace, actor_key).await?
+            self.connect_uncached(namespace, memory_key).await?
         };
         if mutations.is_empty() {
             let max_version = self
-                .max_version_for_actor(&conn, actor_key)
+                .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
             self.observe_version(max_version);
             self.record_profile(
-                ActorProfileMetricKind::StoreApplyBlindBatch,
+                MemoryProfileMetricKind::StoreApplyBlindBatch,
                 started.elapsed().as_micros() as u64,
                 1,
             );
-            return Ok(ActorBatchApplyResult {
+            return Ok(MemoryBatchApplyResult {
                 conflict: false,
                 max_version,
             });
@@ -1170,7 +1175,7 @@ impl ActorStore {
         for mutation in mutations {
             if mutation.key.trim().is_empty() {
                 return Err(PlatformError::bad_request(
-                    "actor batch mutation key must not be empty",
+                    "memory batch mutation key must not be empty",
                 ));
             }
             if !mutation.deleted
@@ -1178,7 +1183,7 @@ impl ActorStore {
                 && mutation.encoding != ENCODING_V8SC
             {
                 return Err(PlatformError::bad_request(format!(
-                    "unsupported actor storage encoding: {}",
+                    "unsupported memory storage encoding: {}",
                     mutation.encoding
                 )));
             }
@@ -1189,15 +1194,15 @@ impl ActorStore {
             attempt += 1;
             match conn.execute("BEGIN CONCURRENT", ()).await {
                 Ok(_) => {}
-                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(actor_error(error)),
+                Err(error) => return Err(memory_error(error)),
             }
 
             let outcome = async {
-                let current = self.max_version_for_actor(&conn, actor_key).await?.unwrap_or(-1);
+                let current = self.max_version_for_memory(&conn, memory_key).await?.unwrap_or(-1);
                 let write_started = Instant::now();
                 let commit_version = self.reserve_version_after(current);
                 for mutation in mutations {
@@ -1205,7 +1210,7 @@ impl ActorStore {
                     if mutation.deleted {
                         let empty_blob: &[u8] = &[];
                         conn.execute(
-                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                              VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
                              ON CONFLICT(entity_key, item_key) DO UPDATE SET
                                value = excluded.value,
@@ -1215,7 +1220,7 @@ impl ActorStore {
                                version = excluded.version,
                                updated_at_ms = excluded.updated_at_ms",
                             (
-                                actor_key,
+                                memory_key,
                                 mutation.key.as_str(),
                                 empty_blob,
                                 ENCODING_UTF8,
@@ -1224,7 +1229,7 @@ impl ActorStore {
                             ),
                         )
                         .await
-                        .map_err(actor_error)?;
+                        .map_err(memory_error)?;
                     } else {
                         let value_text = if mutation.encoding == ENCODING_UTF8 {
                             std::str::from_utf8(&mutation.value)
@@ -1238,7 +1243,7 @@ impl ActorStore {
                             String::new()
                         };
                         conn.execute(
-                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                              ON CONFLICT(entity_key, item_key) DO UPDATE SET
                                value = excluded.value,
@@ -1248,7 +1253,7 @@ impl ActorStore {
                                version = excluded.version,
                                updated_at_ms = excluded.updated_at_ms",
                             (
-                                actor_key,
+                                memory_key,
                                 mutation.key.as_str(),
                                 value_text.as_str(),
                                 mutation.value.as_slice(),
@@ -1258,24 +1263,24 @@ impl ActorStore {
                             ),
                         )
                         .await
-                        .map_err(actor_error)?;
+                        .map_err(memory_error)?;
                     }
                 }
                 let now_ms = epoch_ms_i64()?;
                 conn.execute(
-                    "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                    "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
                      VALUES (?1, ?2, ?3)
                      ON CONFLICT(entity_key) DO UPDATE SET
                        max_version = excluded.max_version,
                        updated_at_ms = excluded.updated_at_ms",
-                    (actor_key, commit_version, now_ms),
+                    (memory_key, commit_version, now_ms),
                 )
                 .await
-                .map_err(actor_error)?;
+                .map_err(memory_error)?;
 
                 let committed_mutations = mutations
                     .iter()
-                    .map(|mutation| ActorBatchMutation {
+                    .map(|mutation| MemoryBatchMutation {
                         key: mutation.key.clone(),
                         value: mutation.value.clone(),
                         encoding: mutation.encoding.clone(),
@@ -1285,17 +1290,17 @@ impl ActorStore {
                     .collect::<Vec<_>>();
                 self.update_cached_snapshot_after_commit(
                     namespace,
-                    actor_key,
+                    memory_key,
                     commit_version,
                     &committed_mutations,
                 )
                 .await;
                 self.record_profile(
-                    ActorProfileMetricKind::StoreApplyBlindBatchWrite,
+                    MemoryProfileMetricKind::StoreApplyBlindBatchWrite,
                     write_started.elapsed().as_micros() as u64,
                     mutations.len() as u64 + 1,
                 );
-                Ok::<ActorBatchApplyResult, PlatformError>(ActorBatchApplyResult {
+                Ok::<MemoryBatchApplyResult, PlatformError>(MemoryBatchApplyResult {
                     conflict: false,
                     max_version: commit_version,
                 })
@@ -1306,7 +1311,7 @@ impl ActorStore {
                 Ok(result) => {
                     match conn.execute("COMMIT", ()).await {
                         Ok(_) => {}
-                        Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                        Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                             let _ = conn.execute("ROLLBACK", ()).await;
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 5 * attempt as u64,
@@ -1316,14 +1321,14 @@ impl ActorStore {
                         }
                         Err(error) => {
                             let _ = conn.execute("ROLLBACK", ()).await;
-                            return Err(actor_error(error));
+                            return Err(memory_error(error));
                         }
                     }
                     self.observe_version(result.max_version);
-                    self.observe_actor_version(namespace, actor_key, result.max_version)
+                    self.observe_memory_version(namespace, memory_key, result.max_version)
                         .await;
                     self.record_profile(
-                        ActorProfileMetricKind::StoreApplyBlindBatch,
+                        MemoryProfileMetricKind::StoreApplyBlindBatch,
                         started.elapsed().as_micros() as u64,
                         mutations.len() as u64 + 1,
                     );
@@ -1404,55 +1409,55 @@ impl ActorStore {
         &self,
         namespace: &str,
         shard_index: usize,
-        entries: Vec<ActorPendingMutationEntry>,
+        entries: Vec<MemoryPendingMutationEntry>,
         allow_split: bool,
     ) -> Result<()> {
         let started = Instant::now();
         if entries.is_empty() {
             return Ok(());
         }
-        let mut actor_groups = HashMap::<String, Vec<ActorPendingMutationEntry>>::new();
+        let mut memory_groups = HashMap::<String, Vec<MemoryPendingMutationEntry>>::new();
         for entry in entries {
-            actor_groups
-                .entry(entry.actor_key.clone())
+            memory_groups
+                .entry(entry.memory_key.clone())
                 .or_default()
                 .push(entry);
         }
-        let actor_group_count = actor_groups.len() as u64;
+        let memory_group_count = memory_groups.len() as u64;
         let conn = self.connect_shard_uncached(namespace, shard_index).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
             match conn.execute("BEGIN CONCURRENT", ()).await {
                 Ok(_) => {}
-                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(actor_error(error)),
+                Err(error) => return Err(memory_error(error)),
             }
 
             let outcome = async {
-                for (actor_key, entries) in &actor_groups {
-                    let mut actor_max_version = -1i64;
+                for (memory_key, entries) in &memory_groups {
+                    let mut memory_max_version = -1i64;
                     for entry in entries {
                         let version = entry.token as i64;
-                        actor_max_version = actor_max_version.max(version);
+                        memory_max_version = memory_max_version.max(version);
                         let now_ms = epoch_ms_i64()?;
                         if entry.mutation.deleted {
                             let empty_blob: &[u8] = &[];
                             conn.execute(
-                                "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                                "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                                  VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
                                  ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                                   value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
-                                   value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
-                                   encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
-                                   deleted = CASE WHEN excluded.version > actor_state.version THEN 1 ELSE actor_state.deleted END,
-                                   version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
-                                   updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                                   value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
+                                   value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
+                                   encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
+                                   deleted = CASE WHEN excluded.version > memory_state.version THEN 1 ELSE memory_state.deleted END,
+                                   version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
+                                   updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
                                 (
-                                    actor_key.as_str(),
+                                    memory_key.as_str(),
                                     entry.mutation.key.as_str(),
                                     empty_blob,
                                     ENCODING_UTF8,
@@ -1461,7 +1466,7 @@ impl ActorStore {
                                 ),
                             )
                             .await
-                            .map_err(actor_error)?;
+                            .map_err(memory_error)?;
                         } else {
                             let value_text = if entry.mutation.encoding == ENCODING_UTF8 {
                                 std::str::from_utf8(&entry.mutation.value)
@@ -1475,17 +1480,17 @@ impl ActorStore {
                                 String::new()
                             };
                             conn.execute(
-                                "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                                "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                                  ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                                   value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
-                                   value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
-                                   encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
-                                   deleted = CASE WHEN excluded.version > actor_state.version THEN 0 ELSE actor_state.deleted END,
-                                   version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
-                                   updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                                   value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
+                                   value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
+                                   encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
+                                   deleted = CASE WHEN excluded.version > memory_state.version THEN 0 ELSE memory_state.deleted END,
+                                   version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
+                                   updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
                                 (
-                                    actor_key.as_str(),
+                                    memory_key.as_str(),
                                     entry.mutation.key.as_str(),
                                     value_text.as_str(),
                                     entry.mutation.value.as_slice(),
@@ -1495,38 +1500,38 @@ impl ActorStore {
                                 ),
                             )
                             .await
-                            .map_err(actor_error)?;
+                            .map_err(memory_error)?;
                         }
                     }
                     let now_ms = epoch_ms_i64()?;
                     conn.execute(
-                        "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                        "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
                          VALUES (?1, ?2, ?3)
                          ON CONFLICT(entity_key) DO UPDATE SET
-                           max_version = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.max_version ELSE actor_meta.max_version END,
-                           updated_at_ms = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.updated_at_ms ELSE actor_meta.updated_at_ms END",
-                        (actor_key.as_str(), actor_max_version, now_ms),
+                           max_version = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.max_version ELSE memory_meta.max_version END,
+                           updated_at_ms = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.updated_at_ms ELSE memory_meta.updated_at_ms END",
+                        (memory_key.as_str(), memory_max_version, now_ms),
                     )
                     .await
-                    .map_err(actor_error)?;
+                    .map_err(memory_error)?;
                 }
                 let delete_started = Instant::now();
                 let mut deleted = 0u64;
-                for queue_id in actor_groups
+                for queue_id in memory_groups
                     .values()
                     .flat_map(|entries| entries.iter())
                     .flat_map(|entry| entry.queue_ids.iter().copied())
                 {
                     conn.execute(
-                        "DELETE FROM actor_direct_queue WHERE queue_id = ?1",
+                        "DELETE FROM memory_direct_queue WHERE queue_id = ?1",
                         (queue_id,),
                     )
                     .await
-                    .map_err(actor_error)?;
+                    .map_err(memory_error)?;
                     deleted += 1;
                 }
                 self.record_profile(
-                    ActorProfileMetricKind::StoreDirectQueueDelete,
+                    MemoryProfileMetricKind::StoreDirectQueueDelete,
                     delete_started.elapsed().as_micros() as u64,
                     deleted,
                 );
@@ -1538,22 +1543,22 @@ impl ActorStore {
                 Ok(()) => match conn.execute("COMMIT", ()).await {
                     Ok(_) => {
                         self.record_profile(
-                            ActorProfileMetricKind::StoreDirectQueueFlush,
+                            MemoryProfileMetricKind::StoreDirectQueueFlush,
                             started.elapsed().as_micros() as u64,
-                            actor_group_count,
+                            memory_group_count,
                         );
-                        for (actor_key, entries) in actor_groups {
+                        for (memory_key, entries) in memory_groups {
                             let version = entries
                                 .iter()
                                 .map(|entry| entry.token as i64)
                                 .max()
                                 .unwrap_or(-1);
                             self.observe_version(version);
-                            self.observe_actor_version(namespace, &actor_key, version)
+                            self.observe_memory_version(namespace, &memory_key, version)
                                 .await;
                             let mutations = entries
                                 .iter()
-                                .map(|entry| ActorBatchMutation {
+                                .map(|entry| MemoryBatchMutation {
                                     key: entry.mutation.key.clone(),
                                     value: entry.mutation.value.clone(),
                                     encoding: entry.mutation.encoding.clone(),
@@ -1562,7 +1567,10 @@ impl ActorStore {
                                 })
                                 .collect::<Vec<_>>();
                             self.update_cached_snapshot_after_commit(
-                                namespace, &actor_key, version, &mutations,
+                                namespace,
+                                &memory_key,
+                                version,
+                                &mutations,
                             )
                             .await;
                             self.complete_waiters_for_tokens(
@@ -1577,14 +1585,14 @@ impl ActorStore {
                         }
                         return Ok(());
                     }
-                    Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                         let _ = conn.execute("ROLLBACK", ()).await;
-                        if allow_split && actor_groups.len() > 1 && attempt >= 3 {
-                            for (actor_key, entries) in actor_groups {
-                                self.flush_single_actor_direct_group(
+                        if allow_split && memory_groups.len() > 1 && attempt >= 3 {
+                            for (memory_key, entries) in memory_groups {
+                                self.flush_single_memory_direct_group(
                                     namespace,
                                     shard_index,
-                                    actor_key,
+                                    memory_key,
                                     entries,
                                 )
                                 .await?;
@@ -1597,7 +1605,7 @@ impl ActorStore {
                     }
                     Err(error) => {
                         let _ = conn.execute("ROLLBACK", ()).await;
-                        return Err(actor_error(error));
+                        return Err(memory_error(error));
                     }
                 },
                 Err(error) => {
@@ -1608,12 +1616,12 @@ impl ActorStore {
         }
     }
 
-    async fn flush_single_actor_direct_group(
+    async fn flush_single_memory_direct_group(
         &self,
         namespace: &str,
         shard_index: usize,
-        actor_key: String,
-        entries: Vec<ActorPendingMutationEntry>,
+        memory_key: String,
+        entries: Vec<MemoryPendingMutationEntry>,
     ) -> Result<()> {
         let started = Instant::now();
         let entry_count = entries.len() as u64;
@@ -1623,32 +1631,32 @@ impl ActorStore {
             attempt += 1;
             match conn.execute("BEGIN CONCURRENT", ()).await {
                 Ok(_) => {}
-                Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(actor_error(error)),
+                Err(error) => return Err(memory_error(error)),
             }
             let outcome = async {
-                let mut actor_max_version = -1i64;
+                let mut memory_max_version = -1i64;
                 for entry in &entries {
                     let version = entry.token as i64;
-                    actor_max_version = actor_max_version.max(version);
+                    memory_max_version = memory_max_version.max(version);
                     let now_ms = epoch_ms_i64()?;
                     if entry.mutation.deleted {
                         let empty_blob: &[u8] = &[];
                         conn.execute(
-                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                              VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
                              ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
-                               value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
-                               encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
-                               deleted = CASE WHEN excluded.version > actor_state.version THEN 1 ELSE actor_state.deleted END,
-                               version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
-                               updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                               value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
+                               value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
+                               encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
+                               deleted = CASE WHEN excluded.version > memory_state.version THEN 1 ELSE memory_state.deleted END,
+                               version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
+                               updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
                             (
-                                actor_key.as_str(),
+                                memory_key.as_str(),
                                 entry.mutation.key.as_str(),
                                 empty_blob,
                                 ENCODING_UTF8,
@@ -1657,7 +1665,7 @@ impl ActorStore {
                             ),
                         )
                         .await
-                        .map_err(actor_error)?;
+                        .map_err(memory_error)?;
                     } else {
                         let value_text = if entry.mutation.encoding == ENCODING_UTF8 {
                             std::str::from_utf8(&entry.mutation.value)
@@ -1671,17 +1679,17 @@ impl ActorStore {
                             String::new()
                         };
                         conn.execute(
-                            "INSERT INTO actor_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
                              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
                              ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = CASE WHEN excluded.version > actor_state.version THEN excluded.value ELSE actor_state.value END,
-                               value_blob = CASE WHEN excluded.version > actor_state.version THEN excluded.value_blob ELSE actor_state.value_blob END,
-                               encoding = CASE WHEN excluded.version > actor_state.version THEN excluded.encoding ELSE actor_state.encoding END,
-                               deleted = CASE WHEN excluded.version > actor_state.version THEN 0 ELSE actor_state.deleted END,
-                               version = CASE WHEN excluded.version > actor_state.version THEN excluded.version ELSE actor_state.version END,
-                               updated_at_ms = CASE WHEN excluded.version > actor_state.version THEN excluded.updated_at_ms ELSE actor_state.updated_at_ms END",
+                               value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
+                               value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
+                               encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
+                               deleted = CASE WHEN excluded.version > memory_state.version THEN 0 ELSE memory_state.deleted END,
+                               version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
+                               updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
                             (
-                                actor_key.as_str(),
+                                memory_key.as_str(),
                                 entry.mutation.key.as_str(),
                                 value_text.as_str(),
                                 entry.mutation.value.as_slice(),
@@ -1691,33 +1699,33 @@ impl ActorStore {
                             ),
                         )
                         .await
-                        .map_err(actor_error)?;
+                        .map_err(memory_error)?;
                     }
                 }
                 let now_ms = epoch_ms_i64()?;
                 conn.execute(
-                    "INSERT INTO actor_meta (entity_key, max_version, updated_at_ms)
+                    "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
                      VALUES (?1, ?2, ?3)
                      ON CONFLICT(entity_key) DO UPDATE SET
-                       max_version = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.max_version ELSE actor_meta.max_version END,
-                       updated_at_ms = CASE WHEN excluded.max_version > actor_meta.max_version THEN excluded.updated_at_ms ELSE actor_meta.updated_at_ms END",
-                    (actor_key.as_str(), actor_max_version, now_ms),
+                       max_version = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.max_version ELSE memory_meta.max_version END,
+                       updated_at_ms = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.updated_at_ms ELSE memory_meta.updated_at_ms END",
+                    (memory_key.as_str(), memory_max_version, now_ms),
                 )
                 .await
-                .map_err(actor_error)?;
+                .map_err(memory_error)?;
                 let delete_started = Instant::now();
                 let mut deleted = 0u64;
                 for queue_id in entries.iter().flat_map(|entry| entry.queue_ids.iter().copied()) {
                     conn.execute(
-                        "DELETE FROM actor_direct_queue WHERE queue_id = ?1",
+                        "DELETE FROM memory_direct_queue WHERE queue_id = ?1",
                         (queue_id,),
                     )
                     .await
-                    .map_err(actor_error)?;
+                    .map_err(memory_error)?;
                     deleted += 1;
                 }
                 self.record_profile(
-                    ActorProfileMetricKind::StoreDirectQueueDelete,
+                    MemoryProfileMetricKind::StoreDirectQueueDelete,
                     delete_started.elapsed().as_micros() as u64,
                     deleted,
                 );
@@ -1729,7 +1737,7 @@ impl ActorStore {
                 Ok(()) => match conn.execute("COMMIT", ()).await {
                     Ok(_) => {
                         self.record_profile(
-                            ActorProfileMetricKind::StoreDirectQueueFlush,
+                            MemoryProfileMetricKind::StoreDirectQueueFlush,
                             started.elapsed().as_micros() as u64,
                             entry_count,
                         );
@@ -1739,11 +1747,11 @@ impl ActorStore {
                             .max()
                             .unwrap_or(-1);
                         self.observe_version(version);
-                        self.observe_actor_version(namespace, &actor_key, version)
+                        self.observe_memory_version(namespace, &memory_key, version)
                             .await;
                         let mutations = entries
                             .iter()
-                            .map(|entry| ActorBatchMutation {
+                            .map(|entry| MemoryBatchMutation {
                                 key: entry.mutation.key.clone(),
                                 value: entry.mutation.value.clone(),
                                 encoding: entry.mutation.encoding.clone(),
@@ -1752,7 +1760,10 @@ impl ActorStore {
                             })
                             .collect::<Vec<_>>();
                         self.update_cached_snapshot_after_commit(
-                            namespace, &actor_key, version, &mutations,
+                            namespace,
+                            &memory_key,
+                            version,
+                            &mutations,
                         )
                         .await;
                         self.complete_waiters_for_tokens(
@@ -1766,7 +1777,7 @@ impl ActorStore {
                         .await;
                         return Ok(());
                     }
-                    Err(error) if is_retryable_actor_error(&error) && attempt < 8 => {
+                    Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                         let _ = conn.execute("ROLLBACK", ()).await;
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
@@ -1774,7 +1785,7 @@ impl ActorStore {
                     }
                     Err(error) => {
                         let _ = conn.execute("ROLLBACK", ()).await;
-                        return Err(actor_error(error));
+                        return Err(memory_error(error));
                     }
                 },
                 Err(error) => {
@@ -1788,7 +1799,7 @@ impl ActorStore {
     async fn fail_pending_batch(
         &self,
         shard_index: usize,
-        batch: &[ActorPendingMutationEntry],
+        batch: &[MemoryPendingMutationEntry],
         error: &str,
     ) {
         let tokens = batch
@@ -1833,7 +1844,7 @@ impl ActorStore {
             }
         }
         self.record_profile(
-            ActorProfileMetricKind::StoreDirectWaiterComplete,
+            MemoryProfileMetricKind::StoreDirectWaiterComplete,
             started.elapsed().as_micros() as u64,
             waiter_count,
         );
@@ -1891,31 +1902,31 @@ impl ActorStore {
         }
     }
 
-    async fn connect(&self, namespace: &str, actor_key: &str) -> Result<Connection> {
+    async fn connect(&self, namespace: &str, memory_key: &str) -> Result<Connection> {
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return Err(PlatformError::runtime("memory namespace must not be empty"));
         }
-        let actor_key = actor_key.trim();
-        if actor_key.is_empty() {
-            return Err(PlatformError::runtime("actor key must not be empty"));
+        let memory_key = memory_key.trim();
+        if memory_key.is_empty() {
+            return Err(PlatformError::runtime("memory key must not be empty"));
         }
 
-        self.connect_shard(namespace, self.shard_index(actor_key))
+        self.connect_shard(namespace, self.shard_index(memory_key))
             .await
     }
 
-    async fn connect_uncached(&self, namespace: &str, actor_key: &str) -> Result<Connection> {
+    async fn connect_uncached(&self, namespace: &str, memory_key: &str) -> Result<Connection> {
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return Err(PlatformError::runtime("memory namespace must not be empty"));
         }
-        let actor_key = actor_key.trim();
-        if actor_key.is_empty() {
-            return Err(PlatformError::runtime("actor key must not be empty"));
+        let memory_key = memory_key.trim();
+        if memory_key.is_empty() {
+            return Err(PlatformError::runtime("memory key must not be empty"));
         }
 
-        self.connect_shard_uncached(namespace, self.shard_index(actor_key))
+        self.connect_shard_uncached(namespace, self.shard_index(memory_key))
             .await
     }
 
@@ -1931,7 +1942,7 @@ impl ActorStore {
             })
         };
         if let Some(existing) = existing {
-            let conn = existing.connect().map_err(actor_error)?;
+            let conn = existing.connect().map_err(memory_error)?;
             configure_connection(&conn).await?;
             return Ok(conn);
         }
@@ -1942,7 +1953,7 @@ impl ActorStore {
         let database = Builder::new_local(&path_str)
             .build()
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
         let database = Arc::new(database);
         ensure_schema(&database).await?;
 
@@ -1951,7 +1962,7 @@ impl ActorStore {
             self.prune_databases_locked(&mut databases, now);
             let database = databases
                 .entry(db_key)
-                .or_insert_with(|| ActorDatabaseEntry {
+                .or_insert_with(|| MemoryDatabaseEntry {
                     database: database.clone(),
                     last_used_at: now,
                 })
@@ -1960,7 +1971,7 @@ impl ActorStore {
             self.prune_databases_locked(&mut databases, now);
             database
         };
-        let conn = database.connect().map_err(actor_error)?;
+        let conn = database.connect().map_err(memory_error)?;
         configure_connection(&conn).await?;
         Ok(conn)
     }
@@ -1976,57 +1987,57 @@ impl ActorStore {
         let database = Builder::new_local(&path_str)
             .build()
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
         ensure_schema(&database).await?;
-        let conn = database.connect().map_err(actor_error)?;
+        let conn = database.connect().map_err(memory_error)?;
         configure_connection(&conn).await?;
         Ok(conn)
     }
 
-    async fn max_version_for_actor(
+    async fn max_version_for_memory(
         &self,
         conn: &Connection,
-        actor_key: &str,
+        memory_key: &str,
     ) -> Result<Option<i64>> {
         let mut rows = conn
             .query(
-                "SELECT max_version FROM actor_meta
+                "SELECT max_version FROM memory_meta
                  WHERE entity_key = ?1
                  LIMIT 1",
-                (actor_key,),
+                (memory_key,),
             )
             .await
-            .map_err(actor_error)?;
-        let version = if let Some(row) = rows.next().await.map_err(actor_error)? {
-            row.get::<Option<i64>>(0).map_err(actor_error)?
+            .map_err(memory_error)?;
+        let version = if let Some(row) = rows.next().await.map_err(memory_error)? {
+            row.get::<Option<i64>>(0).map_err(memory_error)?
         } else {
             return Ok(None);
         };
-        let _ = rows.next().await.map_err(actor_error)?;
+        let _ = rows.next().await.map_err(memory_error)?;
         Ok(version)
     }
 
     async fn version_for_key(
         &self,
         conn: &Connection,
-        actor_key: &str,
+        memory_key: &str,
         item_key: &str,
     ) -> Result<Option<i64>> {
         let mut rows = conn
             .query(
-                "SELECT version FROM actor_state
+                "SELECT version FROM memory_state
                  WHERE entity_key = ?1 AND item_key = ?2
                  LIMIT 1",
-                (actor_key, item_key),
+                (memory_key, item_key),
             )
             .await
-            .map_err(actor_error)?;
-        let version = if let Some(row) = rows.next().await.map_err(actor_error)? {
-            row.get::<i64>(0).map_err(actor_error)?
+            .map_err(memory_error)?;
+        let version = if let Some(row) = rows.next().await.map_err(memory_error)? {
+            row.get::<i64>(0).map_err(memory_error)?
         } else {
             return Ok(None);
         };
-        let _ = rows.next().await.map_err(actor_error)?;
+        let _ = rows.next().await.map_err(memory_error)?;
         self.observe_version(version);
         Ok(Some(version))
     }
@@ -2034,29 +2045,29 @@ impl ActorStore {
     async fn record_for_key(
         &self,
         conn: &Connection,
-        actor_key: &str,
+        memory_key: &str,
         item_key: &str,
-    ) -> Result<Option<ActorSnapshotEntry>> {
+    ) -> Result<Option<MemorySnapshotEntry>> {
         let mut rows = conn
             .query(
                 "SELECT value_blob, encoding, value, version, deleted
-                 FROM actor_state
+                 FROM memory_state
                  WHERE entity_key = ?1 AND item_key = ?2
                  LIMIT 1",
-                (actor_key, item_key),
+                (memory_key, item_key),
             )
             .await
-            .map_err(actor_error)?;
-        let Some(row) = rows.next().await.map_err(actor_error)? else {
+            .map_err(memory_error)?;
+        let Some(row) = rows.next().await.map_err(memory_error)? else {
             return Ok(None);
         };
-        let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(actor_error)?;
-        let encoding: String = row.get::<String>(1).map_err(actor_error)?;
-        let legacy_value: String = row.get::<String>(2).map_err(actor_error)?;
-        let version: i64 = row.get::<i64>(3).map_err(actor_error)?;
-        let deleted: i64 = row.get::<i64>(4).map_err(actor_error)?;
-        let _ = rows.next().await.map_err(actor_error)?;
-        Ok(Some(ActorSnapshotEntry {
+        let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(memory_error)?;
+        let encoding: String = row.get::<String>(1).map_err(memory_error)?;
+        let legacy_value: String = row.get::<String>(2).map_err(memory_error)?;
+        let version: i64 = row.get::<i64>(3).map_err(memory_error)?;
+        let deleted: i64 = row.get::<i64>(4).map_err(memory_error)?;
+        let _ = rows.next().await.map_err(memory_error)?;
+        Ok(Some(MemorySnapshotEntry {
             key: item_key.to_string(),
             value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
             encoding: normalize_encoding(&encoding),
@@ -2067,14 +2078,14 @@ impl ActorStore {
 
     async fn direct_queue_len(&self, conn: &Connection) -> Result<usize> {
         let mut rows = conn
-            .query("SELECT COUNT(*) FROM actor_direct_queue", ())
+            .query("SELECT COUNT(*) FROM memory_direct_queue", ())
             .await
-            .map_err(actor_error)?;
-        let Some(row) = rows.next().await.map_err(actor_error)? else {
+            .map_err(memory_error)?;
+        let Some(row) = rows.next().await.map_err(memory_error)? else {
             return Ok(0);
         };
-        let count = row.get::<i64>(0).map_err(actor_error)?;
-        let _ = rows.next().await.map_err(actor_error)?;
+        let count = row.get::<i64>(0).map_err(memory_error)?;
+        let _ = rows.next().await.map_err(memory_error)?;
         Ok(count.max(0) as usize)
     }
 
@@ -2083,35 +2094,35 @@ impl ActorStore {
         namespace: &str,
         shard_index: usize,
         limit: usize,
-    ) -> Result<Vec<ActorPendingMutationEntry>> {
+    ) -> Result<Vec<MemoryPendingMutationEntry>> {
         let started = Instant::now();
         let conn = self.connect_shard(namespace, shard_index).await?;
         let mut rows = conn
             .query(
                 "SELECT queue_id, entity_key, item_key, value_blob, encoding, deleted, token
-                 FROM actor_direct_queue
+                 FROM memory_direct_queue
                  ORDER BY queue_id ASC
                  LIMIT ?1",
                 (limit as i64,),
             )
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
         let mut loaded = Vec::new();
-        while let Some(row) = rows.next().await.map_err(actor_error)? {
-            loaded.push(ActorDirectQueueRow {
-                queue_id: row.get::<i64>(0).map_err(actor_error)?,
-                actor_key: row.get::<String>(1).map_err(actor_error)?,
-                item_key: row.get::<String>(2).map_err(actor_error)?,
-                value: row.get::<Vec<u8>>(3).map_err(actor_error)?,
-                encoding: row.get::<String>(4).map_err(actor_error)?,
-                deleted: row.get::<i64>(5).map_err(actor_error)? != 0,
-                token: row.get::<i64>(6).map_err(actor_error)? as u64,
+        while let Some(row) = rows.next().await.map_err(memory_error)? {
+            loaded.push(MemoryDirectQueueRow {
+                queue_id: row.get::<i64>(0).map_err(memory_error)?,
+                memory_key: row.get::<String>(1).map_err(memory_error)?,
+                item_key: row.get::<String>(2).map_err(memory_error)?,
+                value: row.get::<Vec<u8>>(3).map_err(memory_error)?,
+                encoding: row.get::<String>(4).map_err(memory_error)?,
+                deleted: row.get::<i64>(5).map_err(memory_error)? != 0,
+                token: row.get::<i64>(6).map_err(memory_error)? as u64,
             });
         }
         let loaded_len = loaded.len() as u64;
         let coalesced = coalesce_direct_queue_rows(loaded);
         self.record_profile(
-            ActorProfileMetricKind::StoreDirectQueueLoad,
+            MemoryProfileMetricKind::StoreDirectQueueLoad,
             started.elapsed().as_micros() as u64,
             loaded_len,
         );
@@ -2123,10 +2134,10 @@ impl ActorStore {
         let entries = match std::fs::read_dir(self.root_dir.as_ref()) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(namespaces),
-            Err(error) => return Err(actor_error(error)),
+            Err(error) => return Err(memory_error(error)),
         };
         for entry in entries {
-            let entry = entry.map_err(actor_error)?;
+            let entry = entry.map_err(memory_error)?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -2153,12 +2164,12 @@ impl ActorStore {
         )
     }
 
-    fn actor_version_key(namespace: &str, actor_key: &str) -> String {
-        format!("{namespace}\u{1f}{actor_key}")
+    fn memory_version_key(namespace: &str, memory_key: &str) -> String {
+        format!("{namespace}\u{1f}{memory_key}")
     }
 
-    fn actor_snapshot_key(namespace: &str, actor_key: &str) -> String {
-        format!("{namespace}\u{1f}{actor_key}")
+    fn memory_snapshot_key(namespace: &str, memory_key: &str) -> String {
+        format!("{namespace}\u{1f}{memory_key}")
     }
 
     fn db_path(&self, namespace: &str, shard_index: usize) -> PathBuf {
@@ -2168,12 +2179,12 @@ impl ActorStore {
             .join(format!("shard-{shard_index:04}.db"))
     }
 
-    fn shard_index(&self, actor_key: &str) -> usize {
+    fn shard_index(&self, memory_key: &str) -> usize {
         if self.namespace_shards == 1 {
             return 0;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        actor_key.hash(&mut hasher);
+        memory_key.hash(&mut hasher);
         (hasher.finish() as usize) % self.namespace_shards
     }
 
@@ -2194,26 +2205,26 @@ impl ActorStore {
         }
     }
 
-    async fn observe_actor_version(&self, namespace: &str, actor_key: &str, version: i64) {
+    async fn observe_memory_version(&self, namespace: &str, memory_key: &str, version: i64) {
         if version < 0 {
             return;
         }
-        self.actor_versions
+        self.memory_versions
             .lock()
             .await
-            .insert(Self::actor_version_key(namespace, actor_key), version);
+            .insert(Self::memory_version_key(namespace, memory_key), version);
     }
 
     async fn cached_full_snapshot(
         &self,
         namespace: &str,
-        actor_key: &str,
-    ) -> Option<ActorSnapshot> {
-        let entry = self.cached_snapshot_entry(namespace, actor_key).await?;
+        memory_key: &str,
+    ) -> Option<MemorySnapshot> {
+        let entry = self.cached_snapshot_entry(namespace, memory_key).await?;
         if !entry.complete {
             return None;
         }
-        Some(ActorSnapshot {
+        Some(MemorySnapshot {
             entries: snapshot_entries_from_records(entry.records.as_ref()),
             max_version: entry.max_version,
         })
@@ -2222,14 +2233,14 @@ impl ActorStore {
     async fn cached_point_read(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         item_key: &str,
-    ) -> Option<ActorPointRead> {
-        let entry = self.cached_snapshot_entry(namespace, actor_key).await?;
+    ) -> Option<MemoryPointRead> {
+        let entry = self.cached_snapshot_entry(namespace, memory_key).await?;
         if !entry.complete && !entry.loaded_keys.contains(item_key) {
             return None;
         }
-        Some(ActorPointRead {
+        Some(MemoryPointRead {
             record: entry.records.get(item_key).cloned(),
             max_version: entry.max_version,
         })
@@ -2238,10 +2249,10 @@ impl ActorStore {
     async fn cached_keys_snapshot(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         keys: &[String],
-    ) -> Option<ActorSnapshot> {
-        let entry = self.cached_snapshot_entry(namespace, actor_key).await?;
+    ) -> Option<MemorySnapshot> {
+        let entry = self.cached_snapshot_entry(namespace, memory_key).await?;
         if !entry.complete
             && keys
                 .iter()
@@ -2254,7 +2265,7 @@ impl ActorStore {
             .filter_map(|key| entry.records.get(key).cloned())
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.key.cmp(&right.key));
-        Some(ActorSnapshot {
+        Some(MemorySnapshot {
             entries,
             max_version: entry.max_version,
         })
@@ -2263,14 +2274,14 @@ impl ActorStore {
     async fn cached_snapshot_entry(
         &self,
         namespace: &str,
-        actor_key: &str,
-    ) -> Option<ActorSharedSnapshotEntry> {
-        let key = Self::actor_snapshot_key(namespace, actor_key);
+        memory_key: &str,
+    ) -> Option<MemorySharedSnapshotEntry> {
+        let key = Self::memory_snapshot_key(namespace, memory_key);
         let current_version = self
-            .actor_versions
+            .memory_versions
             .lock()
             .await
-            .get(&Self::actor_version_key(namespace, actor_key))
+            .get(&Self::memory_version_key(namespace, memory_key))
             .copied();
         let now = Instant::now();
         let mut snapshots = self.shared_snapshots.lock().await;
@@ -2281,7 +2292,7 @@ impl ActorStore {
             return None;
         }
         entry.last_used_at = now;
-        Some(ActorSharedSnapshotEntry {
+        Some(MemorySharedSnapshotEntry {
             records: entry.records.clone(),
             loaded_keys: entry.loaded_keys.clone(),
             complete: entry.complete,
@@ -2290,10 +2301,15 @@ impl ActorStore {
         })
     }
 
-    async fn put_full_snapshot(&self, namespace: &str, actor_key: &str, snapshot: &ActorSnapshot) {
+    async fn put_full_snapshot(
+        &self,
+        namespace: &str,
+        memory_key: &str,
+        snapshot: &MemorySnapshot,
+    ) {
         self.put_partial_snapshot(
             namespace,
-            actor_key,
+            memory_key,
             snapshot.max_version,
             snapshot.entries.clone(),
             snapshot.entries.iter().map(|entry| entry.key.clone()),
@@ -2305,21 +2321,21 @@ impl ActorStore {
     async fn put_partial_snapshot<I>(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         max_version: i64,
-        entries: Vec<ActorSnapshotEntry>,
+        entries: Vec<MemorySnapshotEntry>,
         loaded_keys: I,
         complete: bool,
     ) where
         I: IntoIterator<Item = String>,
     {
-        let key = Self::actor_snapshot_key(namespace, actor_key);
+        let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
         let mut snapshots = self.shared_snapshots.lock().await;
         self.prune_snapshots_locked(&mut snapshots, now);
         let entry = snapshots
             .entry(key)
-            .or_insert_with(|| ActorSharedSnapshotEntry {
+            .or_insert_with(|| MemorySharedSnapshotEntry {
                 records: Arc::new(HashMap::new()),
                 loaded_keys: Arc::new(HashSet::new()),
                 complete: false,
@@ -2369,11 +2385,11 @@ impl ActorStore {
     async fn update_cached_snapshot_after_commit(
         &self,
         namespace: &str,
-        actor_key: &str,
+        memory_key: &str,
         max_version: i64,
-        mutations: &[ActorBatchMutation],
+        mutations: &[MemoryBatchMutation],
     ) {
-        let key = Self::actor_snapshot_key(namespace, actor_key);
+        let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
         let mut snapshots = self.shared_snapshots.lock().await;
         self.prune_snapshots_locked(&mut snapshots, now);
@@ -2387,7 +2403,7 @@ impl ActorStore {
             if normalized_key.is_empty() {
                 continue;
             }
-            let record = ActorSnapshotEntry {
+            let record = MemorySnapshotEntry {
                 key: normalized_key.to_string(),
                 value: mutation.value.clone(),
                 encoding: mutation.encoding.clone(),
@@ -2405,7 +2421,7 @@ impl ActorStore {
 
     fn prune_databases_locked(
         &self,
-        databases: &mut HashMap<String, ActorDatabaseEntry>,
+        databases: &mut HashMap<String, MemoryDatabaseEntry>,
         now: Instant,
     ) {
         databases.retain(|_, entry| now.duration_since(entry.last_used_at) < self.db_idle_ttl);
@@ -2425,7 +2441,7 @@ impl ActorStore {
 
     fn prune_snapshots_locked(
         &self,
-        snapshots: &mut HashMap<String, ActorSharedSnapshotEntry>,
+        snapshots: &mut HashMap<String, MemorySharedSnapshotEntry>,
         now: Instant,
     ) {
         snapshots.retain(|_, entry| now.duration_since(entry.last_used_at) < self.db_idle_ttl);
@@ -2446,7 +2462,7 @@ impl ActorStore {
     }
 }
 
-impl ActorProfileMetric {
+impl MemoryProfileMetric {
     fn record(&self, duration_us: u64, items: u64) {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.total_us.fetch_add(duration_us, Ordering::Relaxed);
@@ -2465,8 +2481,8 @@ impl ActorProfileMetric {
         }
     }
 
-    fn snapshot(&self) -> ActorProfileMetricSnapshot {
-        ActorProfileMetricSnapshot {
+    fn snapshot(&self) -> MemoryProfileMetricSnapshot {
+        MemoryProfileMetricSnapshot {
             calls: self.calls.load(Ordering::Relaxed),
             total_us: self.total_us.load(Ordering::Relaxed),
             total_items: self.total_items.load(Ordering::Relaxed),
@@ -2482,55 +2498,57 @@ impl ActorProfileMetric {
     }
 }
 
-impl ActorProfile {
+impl MemoryProfile {
     fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
 
-    fn record(&self, metric: ActorProfileMetricKind, duration_us: u64, items: u64) {
+    fn record(&self, metric: MemoryProfileMetricKind, duration_us: u64, items: u64) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
         let target = match metric {
-            ActorProfileMetricKind::JsReadOnlyTotal => &self.js_read_only_total,
-            ActorProfileMetricKind::JsFreshnessCheck => &self.js_freshness_check,
-            ActorProfileMetricKind::JsHydrateFull => &self.js_hydrate_full,
-            ActorProfileMetricKind::JsHydrateKeys => &self.js_hydrate_keys,
-            ActorProfileMetricKind::JsTxnCommit => &self.js_txn_commit,
-            ActorProfileMetricKind::JsTxnBlindCommit => &self.js_txn_blind_commit,
-            ActorProfileMetricKind::JsTxnValidate => &self.js_txn_validate,
-            ActorProfileMetricKind::JsCacheHit => &self.js_cache_hit,
-            ActorProfileMetricKind::JsCacheMiss => &self.js_cache_miss,
-            ActorProfileMetricKind::JsCacheStale => &self.js_cache_stale,
-            ActorProfileMetricKind::OpRead => &self.op_read,
-            ActorProfileMetricKind::OpSnapshot => &self.op_snapshot,
-            ActorProfileMetricKind::OpVersionIfNewer => &self.op_version_if_newer,
-            ActorProfileMetricKind::OpValidateReads => &self.op_validate_reads,
-            ActorProfileMetricKind::OpApplyBatch => &self.op_apply_batch,
-            ActorProfileMetricKind::OpApplyBlindBatch => &self.op_apply_blind_batch,
-            ActorProfileMetricKind::StoreDirectEnqueue => &self.store_direct_enqueue,
-            ActorProfileMetricKind::StoreDirectAwait => &self.store_direct_await,
-            ActorProfileMetricKind::StoreDirectQueueLoad => &self.store_direct_queue_load,
-            ActorProfileMetricKind::StoreDirectQueueFlush => &self.store_direct_queue_flush,
-            ActorProfileMetricKind::StoreDirectQueueDelete => &self.store_direct_queue_delete,
-            ActorProfileMetricKind::StoreDirectWaiterComplete => &self.store_direct_waiter_complete,
-            ActorProfileMetricKind::StoreRead => &self.store_read,
-            ActorProfileMetricKind::StoreSnapshot => &self.store_snapshot,
-            ActorProfileMetricKind::StoreSnapshotKeys => &self.store_snapshot_keys,
-            ActorProfileMetricKind::StoreVersionIfNewer => &self.store_version_if_newer,
-            ActorProfileMetricKind::StoreApplyBatch => &self.store_apply_batch,
-            ActorProfileMetricKind::StoreApplyBatchValidate => &self.store_apply_batch_validate,
-            ActorProfileMetricKind::StoreApplyBatchWrite => &self.store_apply_batch_write,
-            ActorProfileMetricKind::StoreApplyBlindBatch => &self.store_apply_blind_batch,
-            ActorProfileMetricKind::StoreApplyBlindBatchWrite => {
+            MemoryProfileMetricKind::JsReadOnlyTotal => &self.js_read_only_total,
+            MemoryProfileMetricKind::JsFreshnessCheck => &self.js_freshness_check,
+            MemoryProfileMetricKind::JsHydrateFull => &self.js_hydrate_full,
+            MemoryProfileMetricKind::JsHydrateKeys => &self.js_hydrate_keys,
+            MemoryProfileMetricKind::JsTxnCommit => &self.js_txn_commit,
+            MemoryProfileMetricKind::JsTxnBlindCommit => &self.js_txn_blind_commit,
+            MemoryProfileMetricKind::JsTxnValidate => &self.js_txn_validate,
+            MemoryProfileMetricKind::JsCacheHit => &self.js_cache_hit,
+            MemoryProfileMetricKind::JsCacheMiss => &self.js_cache_miss,
+            MemoryProfileMetricKind::JsCacheStale => &self.js_cache_stale,
+            MemoryProfileMetricKind::OpRead => &self.op_read,
+            MemoryProfileMetricKind::OpSnapshot => &self.op_snapshot,
+            MemoryProfileMetricKind::OpVersionIfNewer => &self.op_version_if_newer,
+            MemoryProfileMetricKind::OpValidateReads => &self.op_validate_reads,
+            MemoryProfileMetricKind::OpApplyBatch => &self.op_apply_batch,
+            MemoryProfileMetricKind::OpApplyBlindBatch => &self.op_apply_blind_batch,
+            MemoryProfileMetricKind::StoreDirectEnqueue => &self.store_direct_enqueue,
+            MemoryProfileMetricKind::StoreDirectAwait => &self.store_direct_await,
+            MemoryProfileMetricKind::StoreDirectQueueLoad => &self.store_direct_queue_load,
+            MemoryProfileMetricKind::StoreDirectQueueFlush => &self.store_direct_queue_flush,
+            MemoryProfileMetricKind::StoreDirectQueueDelete => &self.store_direct_queue_delete,
+            MemoryProfileMetricKind::StoreDirectWaiterComplete => {
+                &self.store_direct_waiter_complete
+            }
+            MemoryProfileMetricKind::StoreRead => &self.store_read,
+            MemoryProfileMetricKind::StoreSnapshot => &self.store_snapshot,
+            MemoryProfileMetricKind::StoreSnapshotKeys => &self.store_snapshot_keys,
+            MemoryProfileMetricKind::StoreVersionIfNewer => &self.store_version_if_newer,
+            MemoryProfileMetricKind::StoreApplyBatch => &self.store_apply_batch,
+            MemoryProfileMetricKind::StoreApplyBatchValidate => &self.store_apply_batch_validate,
+            MemoryProfileMetricKind::StoreApplyBatchWrite => &self.store_apply_batch_write,
+            MemoryProfileMetricKind::StoreApplyBlindBatch => &self.store_apply_blind_batch,
+            MemoryProfileMetricKind::StoreApplyBlindBatchWrite => {
                 &self.store_apply_blind_batch_write
             }
         };
         target.record(duration_us, items.max(1));
     }
 
-    fn take_snapshot_and_reset(&self) -> ActorProfileSnapshot {
-        let snapshot = ActorProfileSnapshot {
+    fn take_snapshot_and_reset(&self) -> MemoryProfileSnapshot {
+        let snapshot = MemoryProfileSnapshot {
             enabled: self.enabled.load(Ordering::Relaxed),
             js_read_only_total: self.js_read_only_total.snapshot(),
             js_freshness_check: self.js_freshness_check.snapshot(),
@@ -2604,11 +2622,11 @@ impl ActorProfile {
 }
 
 async fn ensure_schema(database: &Database) -> Result<()> {
-    let conn = database.connect().map_err(actor_error)?;
+    let conn = database.connect().map_err(memory_error)?;
     configure_connection(&conn).await?;
     ensure_mvcc_mode(&conn).await?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS actor_state (
+        "CREATE TABLE IF NOT EXISTS memory_state (
           entity_key TEXT NOT NULL,
           item_key TEXT NOT NULL,
           value TEXT NOT NULL,
@@ -2622,9 +2640,9 @@ async fn ensure_schema(database: &Database) -> Result<()> {
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS actor_meta (
+        "CREATE TABLE IF NOT EXISTS memory_meta (
           entity_key TEXT NOT NULL PRIMARY KEY,
           max_version INTEGER NOT NULL,
           updated_at_ms INTEGER NOT NULL
@@ -2632,24 +2650,24 @@ async fn ensure_schema(database: &Database) -> Result<()> {
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     ensure_compat_columns(&conn).await?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_actor_state_lookup
-         ON actor_state(entity_key, item_key)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_state_lookup
+         ON memory_state(entity_key, item_key)",
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_actor_state_list
-         ON actor_state(entity_key, deleted, item_key)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_state_list
+         ON memory_state(entity_key, deleted, item_key)",
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS actor_direct_queue (
+        "CREATE TABLE IF NOT EXISTS memory_direct_queue (
           queue_id INTEGER PRIMARY KEY,
           entity_key TEXT NOT NULL,
           item_key TEXT NOT NULL,
@@ -2662,40 +2680,40 @@ async fn ensure_schema(database: &Database) -> Result<()> {
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_actor_direct_queue_order
-         ON actor_direct_queue(queue_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_direct_queue_order
+         ON memory_direct_queue(queue_id)",
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_actor_direct_queue_key
-         ON actor_direct_queue(entity_key, item_key, queue_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_direct_queue_key
+         ON memory_direct_queue(entity_key, item_key, queue_id)",
         (),
     )
     .await
-    .map_err(actor_error)?;
+    .map_err(memory_error)?;
     Ok(())
 }
 
-async fn detect_actor_version_floor(root_dir: &Path) -> Result<u64> {
+async fn detect_memory_version_floor(root_dir: &Path) -> Result<u64> {
     let mut max_version = 0u64;
     let entries = match std::fs::read_dir(root_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(1),
-        Err(error) => return Err(actor_error(error)),
+        Err(error) => return Err(memory_error(error)),
     };
     for entry in entries {
-        let entry = entry.map_err(actor_error)?;
+        let entry = entry.map_err(memory_error)?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let shard_entries = std::fs::read_dir(&path).map_err(actor_error)?;
+        let shard_entries = std::fs::read_dir(&path).map_err(memory_error)?;
         for shard_entry in shard_entries {
-            let shard_entry = shard_entry.map_err(actor_error)?;
+            let shard_entry = shard_entry.map_err(memory_error)?;
             let shard_path = shard_entry.path();
             if shard_path.extension().and_then(|ext| ext.to_str()) != Some("db") {
                 continue;
@@ -2704,14 +2722,14 @@ async fn detect_actor_version_floor(root_dir: &Path) -> Result<u64> {
             let database = Builder::new_local(&path_str)
                 .build()
                 .await
-                .map_err(actor_error)?;
-            let conn = database.connect().map_err(actor_error)?;
+                .map_err(memory_error)?;
+            let conn = database.connect().map_err(memory_error)?;
             configure_connection(&conn).await?;
             max_version = max_version.max(
-                read_single_i64(&conn, "SELECT MAX(max_version) FROM actor_meta").await? as u64,
+                read_single_i64(&conn, "SELECT MAX(max_version) FROM memory_meta").await? as u64,
             );
             max_version = max_version.max(
-                read_single_i64(&conn, "SELECT MAX(token) FROM actor_direct_queue").await? as u64,
+                read_single_i64(&conn, "SELECT MAX(token) FROM memory_direct_queue").await? as u64,
             );
         }
     }
@@ -2726,45 +2744,45 @@ async fn read_single_i64(conn: &Connection, sql: &str) -> Result<i64> {
             if message.contains("no such table") {
                 return Ok(0);
             }
-            return Err(actor_error(error));
+            return Err(memory_error(error));
         }
     };
-    let Some(row) = rows.next().await.map_err(actor_error)? else {
+    let Some(row) = rows.next().await.map_err(memory_error)? else {
         return Ok(0);
     };
     let value = row
         .get::<Option<i64>>(0)
-        .map_err(actor_error)?
+        .map_err(memory_error)?
         .unwrap_or(0)
         .max(0);
-    let _ = rows.next().await.map_err(actor_error)?;
+    let _ = rows.next().await.map_err(memory_error)?;
     Ok(value)
 }
 
 async fn configure_connection(conn: &Connection) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_millis(5000))
-        .map_err(actor_error)?;
+        .map_err(memory_error)?;
     Ok(())
 }
 
 async fn ensure_mvcc_mode(conn: &Connection) -> Result<()> {
     conn.pragma_update("journal_mode", "'mvcc'")
         .await
-        .map_err(actor_error)?;
+        .map_err(memory_error)?;
     let mut rows = conn
         .query("PRAGMA journal_mode", ())
         .await
-        .map_err(actor_error)?;
-    let Some(row) = rows.next().await.map_err(actor_error)? else {
+        .map_err(memory_error)?;
+    let Some(row) = rows.next().await.map_err(memory_error)? else {
         return Err(PlatformError::runtime(
-            "actor store error: failed to read journal_mode",
+            "memory store error: failed to read journal_mode",
         ));
     };
-    let mode = row.get::<String>(0).map_err(actor_error)?;
-    let _ = rows.next().await.map_err(actor_error)?;
+    let mode = row.get::<String>(0).map_err(memory_error)?;
+    let _ = rows.next().await.map_err(memory_error)?;
     if !mode.eq_ignore_ascii_case("mvcc") {
         return Err(PlatformError::runtime(format!(
-            "actor store error: expected mvcc journal mode, got {mode}",
+            "memory store error: expected mvcc journal mode, got {mode}",
         )));
     }
     Ok(())
@@ -2772,32 +2790,32 @@ async fn ensure_mvcc_mode(conn: &Connection) -> Result<()> {
 
 async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
     let mut rows = conn
-        .query("PRAGMA table_info(actor_state)", ())
+        .query("PRAGMA table_info(memory_state)", ())
         .await
-        .map_err(actor_error)?;
+        .map_err(memory_error)?;
     let mut columns = HashSet::new();
-    while let Some(row) = rows.next().await.map_err(actor_error)? {
-        let name: String = row.get::<String>(1).map_err(actor_error)?;
+    while let Some(row) = rows.next().await.map_err(memory_error)? {
+        let name: String = row.get::<String>(1).map_err(memory_error)?;
         columns.insert(name);
     }
 
     if !columns.contains("value_blob") {
-        conn.execute("ALTER TABLE actor_state ADD COLUMN value_blob BLOB", ())
+        conn.execute("ALTER TABLE memory_state ADD COLUMN value_blob BLOB", ())
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
     }
     if !columns.contains("encoding") {
         conn.execute(
-            "ALTER TABLE actor_state ADD COLUMN encoding TEXT NOT NULL DEFAULT 'utf8'",
+            "ALTER TABLE memory_state ADD COLUMN encoding TEXT NOT NULL DEFAULT 'utf8'",
             (),
         )
         .await
-        .map_err(actor_error)?;
+        .map_err(memory_error)?;
     }
     Ok(())
 }
 
-fn is_retryable_actor_error(error: &turso::Error) -> bool {
+fn is_retryable_memory_error(error: &turso::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("database is locked")
         || message.contains("database table is locked")
@@ -2813,8 +2831,8 @@ fn epoch_ms_i64() -> Result<i64> {
     Ok(duration.as_millis() as i64)
 }
 
-fn actor_error(error: impl std::fmt::Display) -> PlatformError {
-    PlatformError::runtime(format!("actor store error: {error}"))
+fn memory_error(error: impl std::fmt::Display) -> PlatformError {
+    PlatformError::runtime(format!("memory store error: {error}"))
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -2824,7 +2842,7 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(parent).map_err(actor_error)?;
+    std::fs::create_dir_all(parent).map_err(memory_error)?;
     Ok(())
 }
 
@@ -2850,34 +2868,34 @@ fn normalize_encoding(raw: &str) -> String {
 }
 
 fn snapshot_entries_from_records(
-    records: &HashMap<String, ActorSnapshotEntry>,
-) -> Vec<ActorSnapshotEntry> {
+    records: &HashMap<String, MemorySnapshotEntry>,
+) -> Vec<MemorySnapshotEntry> {
     let mut entries = records.values().cloned().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     entries
 }
 
 fn coalesce_direct_mutations(
-    mutations: &[ActorDirectMutation],
-) -> Result<Vec<ActorDirectMutation>> {
-    let mut coalesced = HashMap::<String, ActorDirectMutation>::new();
+    mutations: &[MemoryDirectMutation],
+) -> Result<Vec<MemoryDirectMutation>> {
+    let mut coalesced = HashMap::<String, MemoryDirectMutation>::new();
     for mutation in mutations {
         let key = mutation.key.trim();
         if key.is_empty() {
             return Err(PlatformError::bad_request(
-                "actor direct mutation key must not be empty",
+                "memory direct mutation key must not be empty",
             ));
         }
         let encoding = normalize_encoding(&mutation.encoding);
         if !mutation.deleted && encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
             return Err(PlatformError::bad_request(format!(
-                "unsupported actor storage encoding: {}",
+                "unsupported memory storage encoding: {}",
                 mutation.encoding
             )));
         }
         coalesced.insert(
             key.to_string(),
-            ActorDirectMutation {
+            MemoryDirectMutation {
                 key: key.to_string(),
                 value: mutation.value.clone(),
                 encoding,
@@ -2888,14 +2906,14 @@ fn coalesce_direct_mutations(
     Ok(coalesced.into_values().collect())
 }
 
-fn coalesce_direct_queue_rows(rows: Vec<ActorDirectQueueRow>) -> Vec<ActorPendingMutationEntry> {
-    let mut coalesced = HashMap::<ActorQueuedMutationKey, ActorPendingMutationEntry>::new();
+fn coalesce_direct_queue_rows(rows: Vec<MemoryDirectQueueRow>) -> Vec<MemoryPendingMutationEntry> {
+    let mut coalesced = HashMap::<MemoryQueuedMutationKey, MemoryPendingMutationEntry>::new();
     for row in rows {
-        let key = ActorQueuedMutationKey {
-            actor_key: row.actor_key.clone(),
+        let key = MemoryQueuedMutationKey {
+            memory_key: row.memory_key.clone(),
             item_key: row.item_key.clone(),
         };
-        let mutation = ActorDirectMutation {
+        let mutation = MemoryDirectMutation {
             key: row.item_key.clone(),
             value: row.value.clone(),
             encoding: normalize_encoding(&row.encoding),
@@ -2911,8 +2929,8 @@ fn coalesce_direct_queue_rows(rows: Vec<ActorDirectQueueRow>) -> Vec<ActorPendin
         } else {
             coalesced.insert(
                 key,
-                ActorPendingMutationEntry {
-                    actor_key: row.actor_key,
+                MemoryPendingMutationEntry {
+                    memory_key: row.memory_key,
                     mutation,
                     token: row.token,
                     queue_ids: vec![row.queue_id],
@@ -2949,11 +2967,11 @@ mod tests {
     use uuid::Uuid;
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("dd-actor-store-{name}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("dd-memory-store-{name}-{}", Uuid::new_v4()))
     }
 
-    fn utf8_mutation(key: &str, value: &str, version: i64) -> ActorBatchMutation {
-        ActorBatchMutation {
+    fn utf8_mutation(key: &str, value: &str, version: i64) -> MemoryBatchMutation {
+        MemoryBatchMutation {
             key: key.to_string(),
             value: value.as_bytes().to_vec(),
             encoding: ENCODING_UTF8.to_string(),
@@ -2966,7 +2984,7 @@ mod tests {
         root: &Path,
         namespace: &str,
         shard_index: usize,
-        actor_key: &str,
+        memory_key: &str,
         item_key: &str,
         value: &str,
         token: i64,
@@ -2979,19 +2997,19 @@ mod tests {
         let database = Builder::new_local(&path_str)
             .build()
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
         ensure_schema(&database).await?;
-        let conn = database.connect().map_err(actor_error)?;
+        let conn = database.connect().map_err(memory_error)?;
         configure_connection(&conn).await?;
         conn.execute("BEGIN IMMEDIATE", ())
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
         let outcome = async {
             conn.execute(
-                "INSERT INTO actor_direct_queue (entity_key, item_key, value_blob, encoding, deleted, token, enqueued_at_ms)
+                "INSERT INTO memory_direct_queue (entity_key, item_key, value_blob, encoding, deleted, token, enqueued_at_ms)
                  VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
                 (
-                    actor_key,
+                    memory_key,
                     item_key,
                     value.as_bytes(),
                     ENCODING_UTF8,
@@ -3000,13 +3018,13 @@ mod tests {
                 ),
             )
             .await
-            .map_err(actor_error)?;
+            .map_err(memory_error)?;
             Ok::<(), PlatformError>(())
         }
         .await;
         match outcome {
             Ok(()) => {
-                conn.execute("COMMIT", ()).await.map_err(actor_error)?;
+                conn.execute("COMMIT", ()).await.map_err(memory_error)?;
             }
             Err(error) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
@@ -3017,9 +3035,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_db_paths_are_stable_per_namespace() -> Result<()> {
-        let store = ActorStore::new(temp_root("paths"), 16, 4, Duration::from_secs(60)).await?;
-        let shard = store.shard_index("actor-a");
+    async fn memory_db_paths_are_stable_per_namespace() -> Result<()> {
+        let store = MemoryStore::new(temp_root("paths"), 16, 4, Duration::from_secs(60)).await?;
+        let shard = store.shard_index("memory-a");
         let ns_a = store.db_path("ns", shard);
         let ns_a_again = store.db_path("ns", shard);
         let ns_b = store.db_path("other", shard);
@@ -3030,12 +3048,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_db_cache_eviction_keeps_persisted_state() -> Result<()> {
-        let store = ActorStore::new(temp_root("eviction"), 1, 1, Duration::from_secs(60)).await?;
+    async fn memory_db_cache_eviction_keeps_persisted_state() -> Result<()> {
+        let store = MemoryStore::new(temp_root("eviction"), 1, 1, Duration::from_secs(60)).await?;
         store
             .apply_batch(
                 "ns",
-                "actor-a",
+                "memory-a",
                 &[],
                 &[utf8_mutation("count", "1", 1)],
                 Some(-1),
@@ -3046,7 +3064,7 @@ mod tests {
         store
             .apply_batch(
                 "ns",
-                "actor-b",
+                "memory-b",
                 &[],
                 &[utf8_mutation("count", "2", 2)],
                 Some(-1),
@@ -3057,7 +3075,7 @@ mod tests {
 
         assert_eq!(store.databases.lock().await.len(), 1);
 
-        let snapshot = store.snapshot("ns", "actor-a").await?;
+        let snapshot = store.snapshot("ns", "memory-a").await?;
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(
             String::from_utf8(snapshot.entries[0].value.clone()).expect("utf8"),
@@ -3067,19 +3085,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_version_if_newer_observes_commits() -> Result<()> {
-        let store = ActorStore::new(
+    async fn memory_version_if_newer_observes_commits() -> Result<()> {
+        let store = MemoryStore::new(
             temp_root("version-if-newer"),
             16,
             4,
             Duration::from_secs(60),
         )
         .await?;
-        assert_eq!(store.version_if_newer("ns", "actor-a", -1).await?, None);
+        assert_eq!(store.version_if_newer("ns", "memory-a", -1).await?, None);
         store
             .apply_batch(
                 "ns",
-                "actor-a",
+                "memory-a",
                 &[],
                 &[utf8_mutation("count", "1", 1)],
                 Some(-1),
@@ -3087,23 +3105,23 @@ mod tests {
                 false,
             )
             .await?;
-        assert_eq!(store.version_if_newer("ns", "actor-a", -1).await?, Some(1));
-        assert_eq!(store.version_if_newer("ns", "actor-a", 1).await?, None);
+        assert_eq!(store.version_if_newer("ns", "memory-a", -1).await?, Some(1));
+        assert_eq!(store.version_if_newer("ns", "memory-a", 1).await?, None);
         Ok(())
     }
 
     #[tokio::test]
-    async fn actor_snapshot_cache_updates_after_transactional_commit() -> Result<()> {
+    async fn memory_snapshot_cache_updates_after_transactional_commit() -> Result<()> {
         let store =
-            ActorStore::new(temp_root("snapshot-cache"), 16, 4, Duration::from_secs(60)).await?;
+            MemoryStore::new(temp_root("snapshot-cache"), 16, 4, Duration::from_secs(60)).await?;
 
-        let initial = store.snapshot("ns", "actor-a").await?;
+        let initial = store.snapshot("ns", "memory-a").await?;
         assert_eq!(initial.max_version, -1);
 
         store
             .apply_batch(
                 "ns",
-                "actor-a",
+                "memory-a",
                 &[],
                 &[utf8_mutation("count", "1", 1)],
                 Some(-1),
@@ -3112,7 +3130,7 @@ mod tests {
             )
             .await?;
 
-        let snapshot = store.snapshot("ns", "actor-a").await?;
+        let snapshot = store.snapshot("ns", "memory-a").await?;
         assert_eq!(snapshot.max_version, 1);
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].key, "count");
@@ -3124,8 +3142,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_point_read_populates_partial_shared_cache_and_tracks_misses() -> Result<()> {
-        let store = ActorStore::new(
+    async fn memory_point_read_populates_partial_shared_cache_and_tracks_misses() -> Result<()> {
+        let store = MemoryStore::new(
             temp_root("point-read-cache"),
             16,
             4,
@@ -3136,7 +3154,7 @@ mod tests {
         store
             .apply_batch(
                 "ns",
-                "actor-a",
+                "memory-a",
                 &[],
                 &[utf8_mutation("count", "1", 1)],
                 Some(-1),
@@ -3145,7 +3163,7 @@ mod tests {
             )
             .await?;
 
-        let hit = store.point_read("ns", "actor-a", "count").await?;
+        let hit = store.point_read("ns", "memory-a", "count").await?;
         assert_eq!(hit.max_version, 1);
         assert_eq!(
             String::from_utf8(
@@ -3159,7 +3177,7 @@ mod tests {
             "1"
         );
 
-        let key = ActorStore::actor_snapshot_key("ns", "actor-a");
+        let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
         {
             let snapshots = store.shared_snapshots.lock().await;
             let entry = snapshots
@@ -3170,7 +3188,7 @@ mod tests {
             assert!(entry.records.contains_key("count"));
         }
 
-        let miss = store.point_read("ns", "actor-a", "missing").await?;
+        let miss = store.point_read("ns", "memory-a", "missing").await?;
         assert_eq!(miss.max_version, 1);
         assert!(miss.record.is_none());
 
@@ -3184,8 +3202,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_point_read_cache_updates_after_commit() -> Result<()> {
-        let store = ActorStore::new(
+    async fn memory_point_read_cache_updates_after_commit() -> Result<()> {
+        let store = MemoryStore::new(
             temp_root("point-read-commit"),
             16,
             4,
@@ -3196,7 +3214,7 @@ mod tests {
         store
             .apply_batch(
                 "ns",
-                "actor-a",
+                "memory-a",
                 &[],
                 &[utf8_mutation("count", "1", 1)],
                 Some(-1),
@@ -3204,14 +3222,14 @@ mod tests {
                 true,
             )
             .await?;
-        let first = store.point_read("ns", "actor-a", "count").await?;
+        let first = store.point_read("ns", "memory-a", "count").await?;
         assert_eq!(first.max_version, 1);
 
         store
             .apply_batch(
                 "ns",
-                "actor-a",
-                &[ActorReadDependency {
+                "memory-a",
+                &[MemoryReadDependency {
                     key: "count".to_string(),
                     version: 1,
                 }],
@@ -3222,7 +3240,7 @@ mod tests {
             )
             .await?;
 
-        let updated = store.point_read("ns", "actor-a", "count").await?;
+        let updated = store.point_read("ns", "memory-a", "count").await?;
         assert_eq!(updated.max_version, 2);
         assert_eq!(
             String::from_utf8(
@@ -3240,9 +3258,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_transactional_writes_complete_past_repeated_commit_threshold() -> Result<()> {
+    async fn memory_transactional_writes_complete_past_repeated_commit_threshold() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let store = ActorStore::new(
+            let store = MemoryStore::new(
                 temp_root("transactional-write-threshold"),
                 16,
                 4,
@@ -3256,7 +3274,7 @@ mod tests {
                 let reads = if observed_version < 0 {
                     Vec::new()
                 } else {
-                    vec![ActorReadDependency {
+                    vec![MemoryReadDependency {
                         key: "count".to_string(),
                         version: observed_version,
                     }]
@@ -3264,7 +3282,7 @@ mod tests {
                 let result = store
                     .apply_batch(
                         "ns",
-                        "actor-a",
+                        "memory-a",
                         &reads,
                         &[utf8_mutation("count", &next_value, idx as i64 + 1)],
                         Some(-1),
@@ -3276,7 +3294,7 @@ mod tests {
                 observed_version = result.max_version;
             }
 
-            let final_value = store.point_read("ns", "actor-a", "count").await?;
+            let final_value = store.point_read("ns", "memory-a", "count").await?;
             assert_eq!(
                 String::from_utf8(
                     final_value
@@ -3299,9 +3317,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_blind_writes_complete_past_repeated_commit_threshold() -> Result<()> {
+    async fn memory_blind_writes_complete_past_repeated_commit_threshold() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let store = ActorStore::new(
+            let store = MemoryStore::new(
                 temp_root("blind-write-threshold"),
                 16,
                 4,
@@ -3314,7 +3332,7 @@ mod tests {
                 let result = store
                     .apply_blind_batch(
                         "ns",
-                        "actor-a",
+                        "memory-a",
                         &[utf8_mutation("count", &next_value, idx as i64 + 1)],
                     )
                     .await?;
@@ -3324,7 +3342,7 @@ mod tests {
                 );
             }
 
-            let final_value = store.point_read("ns", "actor-a", "count").await?;
+            let final_value = store.point_read("ns", "memory-a", "count").await?;
             assert_eq!(
                 String::from_utf8(
                     final_value
@@ -3347,9 +3365,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_direct_queue_submissions_complete_past_repeated_threshold() -> Result<()> {
+    async fn memory_direct_queue_submissions_complete_past_repeated_threshold() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), async {
-            let store = ActorStore::new(
+            let store = MemoryStore::new(
                 temp_root("direct-queue-threshold"),
                 16,
                 4,
@@ -3360,7 +3378,7 @@ mod tests {
             let mut observed_version = -1;
             for idx in 0..64 {
                 let next_value = (idx + 1).to_string();
-                let mutation = ActorDirectMutation {
+                let mutation = MemoryDirectMutation {
                     key: "count".to_string(),
                     value: next_value.as_bytes().to_vec(),
                     encoding: ENCODING_UTF8.to_string(),
@@ -3369,7 +3387,7 @@ mod tests {
                 let submission_id =
                     tokio::time::timeout(Duration::from_secs(2), store.enqueue_direct_batch(
                         "ns",
-                        "actor-a",
+                        "memory-a",
                         &[mutation],
                     ))
                     .await
@@ -3395,7 +3413,7 @@ mod tests {
                 observed_version = version;
             }
 
-            let final_value = store.point_read("ns", "actor-a", "count").await?;
+            let final_value = store.point_read("ns", "memory-a", "count").await?;
             assert_eq!(
                 String::from_utf8(
                     final_value
@@ -3418,25 +3436,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_version_floor_bootstraps_from_direct_queue_tokens() -> Result<()> {
+    async fn memory_version_floor_bootstraps_from_direct_queue_tokens() -> Result<()> {
         let root = temp_root("version-floor");
-        seed_direct_queue_row(&root, "ns", 0, "actor-a", "count", "9", 41).await?;
+        seed_direct_queue_row(&root, "ns", 0, "memory-a", "count", "9", 41).await?;
 
-        let store = ActorStore::new(root, 1, 4, Duration::from_secs(60)).await?;
+        let store = MemoryStore::new(root, 1, 4, Duration::from_secs(60)).await?;
         assert_eq!(store.next_write_token.load(Ordering::SeqCst), 42);
         assert_eq!(store.version.load(Ordering::SeqCst), 42);
         Ok(())
     }
 
     #[tokio::test]
-    async fn actor_direct_queue_replays_on_store_startup() -> Result<()> {
+    async fn memory_direct_queue_replays_on_store_startup() -> Result<()> {
         let root = temp_root("queue-replay");
-        seed_direct_queue_row(&root, "ns", 0, "actor-a", "count", "9", 7).await?;
+        seed_direct_queue_row(&root, "ns", 0, "memory-a", "count", "9", 7).await?;
 
-        let store = ActorStore::new(root, 1, 4, Duration::from_secs(60)).await?;
+        let store = MemoryStore::new(root, 1, 4, Duration::from_secs(60)).await?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let snapshot = store.snapshot("ns", "actor-a").await?;
+            let snapshot = store.snapshot("ns", "memory-a").await?;
             let current = snapshot
                 .entries
                 .iter()

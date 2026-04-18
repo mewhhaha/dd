@@ -22,7 +22,7 @@ struct Scenario {
     worker_source: &'static str,
     path: &'static str,
     use_kv_binding: bool,
-    use_actor_binding: bool,
+    use_memory_binding: bool,
     seed_path: Option<&'static str>,
 }
 
@@ -168,7 +168,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -182,7 +182,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -198,7 +198,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -212,7 +212,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: false,
-            use_actor_binding: true,
+            use_memory_binding: true,
             seed_path: None,
         },
         Scenario {
@@ -226,7 +226,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -245,7 +245,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: Some("/seed"),
         },
         Scenario {
@@ -261,7 +261,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
@@ -277,7 +277,7 @@ export default {
 "#,
             path: "/",
             use_kv_binding: true,
-            use_actor_binding: false,
+            use_memory_binding: false,
             seed_path: None,
         },
     ];
@@ -397,9 +397,9 @@ async fn run_config_scenario(
                     vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),
                     }]
-                } else if scenario.use_actor_binding {
+                } else if scenario.use_memory_binding {
                     vec![DeployBinding::Memory {
-                        binding: "BENCH_ACTOR".to_string(),
+                        binding: "BENCH_MEMORY".to_string(),
                     }]
                 } else {
                     Vec::new()
@@ -432,9 +432,9 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
         storage: RuntimeStorageConfig {
             store_dir: paths.store_dir.clone(),
             database_url: format!("file:{}", paths.db_path.display()),
-            actor_namespace_shards: 16,
-            actor_db_cache_max_open: 4096,
-            actor_db_idle_ttl: Duration::from_secs(60),
+            memory_namespace_shards: 16,
+            memory_db_cache_max_open: 4096,
+            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
             blob_store: runtime::BlobStoreConfig::local(paths.store_dir.join("blobs")),
         },

@@ -26,7 +26,7 @@ static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ExecuteActorCall {
+pub enum ExecuteMemoryCall {
     Method {
         binding: String,
         key: String,
@@ -211,19 +211,19 @@ pub fn dispatch_worker_request(
     worker_name_json: &str,
     kv_bindings_json: &str,
     kv_read_cache_config_json: &str,
-    actor_bindings_json: &str,
+    memory_bindings_json: &str,
     dynamic_bindings_json: &str,
     dynamic_rpc_bindings_json: &str,
     dynamic_env_json: &str,
     has_request_body_stream: bool,
     stream_response: bool,
-    actor_call: Option<&ExecuteActorCall>,
+    memory_call: Option<&ExecuteMemoryCall>,
     host_rpc_call: Option<&ExecuteHostRpcCall>,
     request: WorkerInvocation,
 ) -> Result<()> {
     let request_json = crate::json::to_string(&request)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let actor_call_json = crate::json::to_string(&actor_call)
+    let memory_call_json = crate::json::to_string(&memory_call)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let host_rpc_call_json = crate::json::to_string(&host_rpc_call)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
@@ -235,11 +235,11 @@ pub fn dispatch_worker_request(
         worker_name_json,
         kv_bindings_json,
         kv_read_cache_config_json,
-        actor_bindings_json,
+        memory_bindings_json,
         dynamic_bindings_json,
         dynamic_rpc_bindings_json,
         dynamic_env_json,
-        &actor_call_json,
+        &memory_call_json,
         &host_rpc_call_json,
         &request_id_json,
         &completion_token_json,

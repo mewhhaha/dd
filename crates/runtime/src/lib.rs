@@ -1,12 +1,12 @@
-mod actor;
-mod actor_rpc;
-mod actor_rpc_capnp;
 mod assets;
 mod blob;
 mod cache;
 mod engine;
 mod json;
 mod kv;
+mod memory;
+mod memory_rpc;
+mod memory_rpc_capnp;
 mod ops;
 mod service;
 mod static_assets;

@@ -1,17 +1,17 @@
-  const createActorSocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
+  const createMemorySocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
     const socketsByHandle = entry.socketBindings ??= new Map();
     const openHandles = entry.openSocketHandles ??= new Set();
     const markOpenHandlesInitialized = () => {
       entry.openSocketHandlesInitialized = true;
     };
-    const currentSocketRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
+    const currentSocketRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
 
     const sendSocketFrame = async (requestIdForOp, normalizedHandle, payload, gated = true) => {
       const perform = async () => {
-        const result = await callOp("op_actor_socket_send", {
+        const result = await callOp("op_memory_socket_send", {
           request_id: requestIdForOp,
           binding: entry.binding,
-          key: entry.actorKey,
+          key: entry.memoryKey,
           handle: normalizedHandle,
           message_kind: payload.kind,
           message: payload.value,
@@ -22,7 +22,7 @@
         }
       };
       if (gated) {
-        await gateActorOutput(entry, requestIdForOp, perform);
+        await gateMemoryOutput(entry, requestIdForOp, perform);
         return;
       }
       await perform();
@@ -30,10 +30,10 @@
 
     const closeSocketFrame = async (requestIdForOp, normalizedHandle, code, reason, gated = true) => {
       const perform = async () => {
-        const result = await callOp("op_actor_socket_close", {
+        const result = await callOp("op_memory_socket_close", {
           request_id: requestIdForOp,
           binding: entry.binding,
-          key: entry.actorKey,
+          key: entry.memoryKey,
           handle: normalizedHandle,
           code,
           reason,
@@ -44,17 +44,17 @@
         }
       };
       if (gated) {
-        await gateActorOutput(entry, requestIdForOp, perform);
+        await gateMemoryOutput(entry, requestIdForOp, perform);
         return;
       }
       await perform();
     };
 
     const consumeCloseEvents = async (target) => {
-      const result = await callOp("op_actor_socket_consume_close", {
+      const result = await callOp("op_memory_socket_consume_close", {
         request_id: currentSocketRequestId(),
         binding: entry.binding,
-        key: entry.actorKey,
+        key: entry.memoryKey,
         handle: target.__dd_handle,
       });
       await syncFrozenTime();
@@ -137,7 +137,7 @@
         },
         async send(value, kind) {
           const payload = encodeSocketSendPayload(value, kind);
-          const scope = actorTxnScopeFor(entry.binding, entry.actorKey);
+          const scope = memoryTxnScopeFor(entry.binding, entry.memoryKey);
           const perform = async () => {
             if (this.readyState !== 1) {
               return;
@@ -174,7 +174,7 @@
               // Best-effort close; ignore races with already-closed handles.
             }
           };
-          const scope = actorTxnScopeFor(entry.binding, entry.actorKey);
+          const scope = memoryTxnScopeFor(entry.binding, entry.memoryKey);
           if (scope) {
             scope.state.defer(perform);
             return;
@@ -258,7 +258,7 @@
       return target;
     };
 
-    const WebSocketForActor = function WebSocket(handle) {
+    const WebSocketForMemory = function WebSocket(handle) {
       return ensureSocket(handle);
     };
 
@@ -294,7 +294,7 @@
         headers.set(INTERNAL_WS_SESSION_HEADER, sessionId);
         headers.set(INTERNAL_WS_HANDLE_HEADER, handle);
         headers.set(INTERNAL_WS_BINDING_HEADER, entry.binding);
-        headers.set(INTERNAL_WS_KEY_HEADER, entry.actorKey);
+        headers.set(INTERNAL_WS_KEY_HEADER, entry.memoryKey);
         upgradeAccepted.used = true;
         openHandles.add(handle);
         markOpenHandlesInitialized();
@@ -321,7 +321,7 @@
 
     return {
       sockets,
-      WebSocket: WebSocketForActor,
+      WebSocket: WebSocketForMemory,
       ensureSocket,
       async sendEffect(handle, value, kind) {
         const socket = ensureSocket(handle);
@@ -347,10 +347,10 @@
         );
       },
       async refreshOpenHandles() {
-        const result = await callOp("op_actor_socket_list", {
+        const result = await callOp("op_memory_socket_list", {
           request_id: currentSocketRequestId(),
           binding: entry.binding,
-          key: entry.actorKey,
+          key: entry.memoryKey,
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -418,19 +418,19 @@
     };
   };
 
-  const createActorTransportRuntime = (entry, runtimeRequestId, allowTransportAccept) => {
+  const createMemoryTransportRuntime = (entry, runtimeRequestId, allowTransportAccept) => {
     const transportsByHandle = entry.transportBindings ??= new Map();
     const openHandles = entry.openTransportHandles ??= new Set();
     const markOpenHandlesInitialized = () => {
       entry.openTransportHandlesInitialized = true;
     };
-    const currentTransportRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
+    const currentTransportRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
 
     const consumeCloseEvents = async (target) => {
-      const result = await callOp("op_actor_transport_consume_close", {
+      const result = await callOp("op_memory_transport_consume_close", {
         request_id: currentTransportRequestId(),
         binding: entry.binding,
-        key: entry.actorKey,
+        key: entry.memoryKey,
         handle: target.__dd_handle,
       });
       await syncFrozenTime();
@@ -490,23 +490,23 @@
             request_id: boundRequestId,
             handle: normalizedHandle,
             binding: entry.binding,
-            key: entry.actorKey,
+            key: entry.memoryKey,
             datagram: payload,
           }
           : {
             request_id: boundRequestId,
             handle: normalizedHandle,
             binding: entry.binding,
-            key: entry.actorKey,
+            key: entry.memoryKey,
             chunk: payload,
           };
-        await gateActorOutput(entry, currentTransportRequestId(), async () => {
+        await gateMemoryOutput(entry, currentTransportRequestId(), async () => {
           const result = await callOpAny(
             [
               kind === "datagram"
-                ? "op_actor_transport_send_datagram"
-                : "op_actor_transport_send_stream",
-              "op_actor_transport_send",
+                ? "op_memory_transport_send_datagram"
+                : "op_memory_transport_send_stream",
+              "op_memory_transport_send",
             ],
             body,
           );
@@ -562,17 +562,17 @@
           const normalizedCode = Number.isFinite(Number(code))
             ? Math.trunc(Number(code))
             : 0;
-          await gateActorOutput(entry, currentTransportRequestId(), async () => {
+          await gateMemoryOutput(entry, currentTransportRequestId(), async () => {
             const result = await callOpAny(
               [
-                "op_actor_transport_close",
-                "op_actor_transport_terminate",
+                "op_memory_transport_close",
+                "op_memory_transport_terminate",
               ],
               {
                 request_id: currentTransportRequestId(),
                 handle: normalizedHandle,
                 binding: entry.binding,
-                key: entry.actorKey,
+                key: entry.memoryKey,
                 code: normalizedCode,
                 reason: reason == null ? "" : String(reason),
               },
@@ -610,7 +610,7 @@
       return target;
     };
 
-    const WebTransportSessionForActor = function WebTransportSession(handle) {
+    const WebTransportSessionForMemory = function WebTransportSession(handle) {
       return ensureTransport(handle);
     };
 
@@ -657,7 +657,7 @@
         headers.set(INTERNAL_TRANSPORT_SESSION_HEADER, sessionId);
         headers.set(INTERNAL_TRANSPORT_HANDLE_HEADER, handle);
         headers.set(INTERNAL_TRANSPORT_BINDING_HEADER, entry.binding);
-        headers.set(INTERNAL_TRANSPORT_KEY_HEADER, entry.actorKey);
+        headers.set(INTERNAL_TRANSPORT_KEY_HEADER, entry.memoryKey);
         transportAccepted.used = true;
         openHandles.add(handle);
         markOpenHandlesInitialized();
@@ -681,16 +681,16 @@
 
     return {
       transports,
-      WebTransportSession: WebTransportSessionForActor,
+      WebTransportSession: WebTransportSessionForMemory,
       ensureTransport,
       async refreshOpenHandles() {
         const result = await callOpAny([
-          "op_actor_transport_list",
-          "op_actor_transport_handles",
+          "op_memory_transport_list",
+          "op_memory_transport_handles",
         ], {
           request_id: currentTransportRequestId(),
           binding: entry.binding,
-          key: entry.actorKey,
+          key: entry.memoryKey,
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -716,19 +716,19 @@
     };
   };
 
-  const createActorRuntimeState = (
+  const createMemoryRuntimeState = (
     entry,
     runtimeRequestId,
     allowSocketAccept,
     allowTransportAccept,
     txn = null,
   ) => {
-    const storage = createActorStorageBinding(entry, runtimeRequestId, txn);
+    const storage = createMemoryStorageBinding(entry, runtimeRequestId, txn);
     let socketRuntime = null;
     let transportRuntime = null;
     const ensureSocketRuntime = () => {
       if (!socketRuntime) {
-        socketRuntime = createActorSocketRuntime(
+        socketRuntime = createMemorySocketRuntime(
           entry,
           runtimeRequestId,
           allowSocketAccept,
@@ -739,7 +739,7 @@
     };
     const ensureTransportRuntime = () => {
       if (!transportRuntime) {
-        transportRuntime = createActorTransportRuntime(
+        transportRuntime = createMemoryTransportRuntime(
           entry,
           runtimeRequestId,
           allowTransportAccept,
@@ -751,7 +751,7 @@
     return {
       id: {
         toString() {
-          return entry.actorKey;
+          return entry.memoryKey;
         },
       },
       get(key, options) {
@@ -782,14 +782,14 @@
     };
   };
 
-  const createActorAtomicState = (
+  const createMemoryAtomicState = (
     entry,
     runtimeRequestId,
     allowSocketAccept,
     allowTransportAccept,
     txn,
   ) => {
-    const runtimeState = createActorRuntimeState(
+    const runtimeState = createMemoryRuntimeState(
       entry,
       runtimeRequestId,
       allowSocketAccept,
@@ -799,7 +799,7 @@
     let stub = null;
     const ensureStub = () => {
       if (!stub) {
-        stub = createActorStub(entry.binding, entry.actorKey);
+        stub = createMemoryStub(entry.binding, entry.memoryKey);
       }
       return stub;
     };
@@ -917,7 +917,7 @@
     };
   };
 
-  const createActorStateFacade = (stateRef) => {
+  const createMemoryStateFacade = (stateRef) => {
     const facade = {
       id: {
         toString() {
@@ -980,21 +980,21 @@
     return facade;
   };
 
-  const actorStateEntries = globalThis.__dd_actor_state_entries ??= new Map();
-  const liveActorExecutables = globalThis.__dd_live_actor_executables ??= new Map();
-  let liveActorExecutableSeq = globalThis.__dd_live_actor_executable_seq ?? 0;
+  const memoryStateEntries = globalThis.__dd_memory_state_entries ??= new Map();
+  const liveMemoryExecutables = globalThis.__dd_live_memory_executables ??= new Map();
+  let liveMemoryExecutableSeq = globalThis.__dd_live_memory_executable_seq ?? 0;
 
-  const ACTOR_ATOMIC_METHOD = "__dd_atomic";
+  const MEMORY_ATOMIC_METHOD = "__dd_atomic";
 
-  const actorMethodNameIsBlocked = (name) => (
+  const memoryMethodNameIsBlocked = (name) => (
     !name
     || name === "constructor"
     || name === "fetch"
     || name === "then"
   );
 
-  const actorMethodNameIsBlockedForProxy = (name) => (
-    actorMethodNameIsBlocked(name)
+  const memoryMethodNameIsBlockedForProxy = (name) => (
+    memoryMethodNameIsBlocked(name)
   );
 
   const hostRpcMethodNameIsBlocked = (name) => (
@@ -1074,28 +1074,28 @@
     },
   });
 
-  const actorEntryKey = (binding, actorKey) => `${binding}\u001f${actorKey}`;
+  const memoryEntryKey = (binding, memoryKey) => `${binding}\u001f${memoryKey}`;
 
-  const createActorId = (bindingName, actorKey) => ({
-    __dd_actor_key: actorKey,
-    __dd_actor_binding: bindingName,
+  const createMemoryId = (bindingName, memoryKey) => ({
+    __dd_memory_key: memoryKey,
+    __dd_memory_binding: bindingName,
     toString() {
-      return actorKey;
+      return memoryKey;
     },
   });
 
-  const ensureActorEntry = async (
+  const ensureMemoryEntry = async (
     binding,
-    actorKey,
+    memoryKey,
     hydrationRequestId,
     options = {},
   ) => {
-    const cacheKey = actorEntryKey(binding, actorKey);
-    let entry = actorStateEntries.get(cacheKey);
+    const cacheKey = memoryEntryKey(binding, memoryKey);
+    let entry = memoryStateEntries.get(cacheKey);
     if (!entry) {
       entry = {
         binding,
-        actorKey,
+        memoryKey,
         cacheKey,
         socketBindings: new Map(),
         openSocketHandles: new Set(),
@@ -1104,22 +1104,22 @@
         openTransportHandles: new Set(),
         transportRuntime: null,
       };
-      actorStateEntries.set(cacheKey, entry);
+      memoryStateEntries.set(cacheKey, entry);
     }
     entry.binding = binding;
-    entry.actorKey = actorKey;
+    entry.memoryKey = memoryKey;
     entry.cacheKey = cacheKey;
     if (options?.hydrate !== false) {
-      await ensureActorStorageHydrated(entry, hydrationRequestId);
+      await ensureMemoryStorageHydrated(entry, hydrationRequestId);
     }
     return entry;
   };
 
-  const registerLiveActorExecutable = (executable) => {
-    liveActorExecutableSeq += 1;
-    globalThis.__dd_live_actor_executable_seq = liveActorExecutableSeq;
-    const token = `${activeRequestId()}:live-actor:${liveActorExecutableSeq}`;
-    liveActorExecutables.set(token, executable);
+  const registerLiveMemoryExecutable = (executable) => {
+    liveMemoryExecutableSeq += 1;
+    globalThis.__dd_live_memory_executable_seq = liveMemoryExecutableSeq;
+    const token = `${activeRequestId()}:live-memory:${liveMemoryExecutableSeq}`;
+    liveMemoryExecutables.set(token, executable);
     return token;
   };
 
@@ -1134,24 +1134,24 @@
     if (!exportName && !source.trim()) {
       throw new Error("stub.atomic(fn, ...args) requires a non-empty function body");
     }
-    const liveToken = registerLiveActorExecutable(executable);
+    const liveToken = registerLiveMemoryExecutable(executable);
     if (exportName && exported === executable) {
       return { live_token: liveToken, export_name: exportName, source };
     }
     return { live_token: liveToken, source };
   };
 
-  const createActorStubSocketApi = (bindingName, actorKey) => Object.freeze({
+  const createMemoryStubSocketApi = (bindingName, memoryKey) => Object.freeze({
     values() {
-      const localRuntime = currentLocalHandleRuntime(bindingName, actorKey, "socket");
+      const localRuntime = currentLocalHandleRuntime(bindingName, memoryKey, "socket");
       if (localRuntime) {
         return localRuntime.listOpenHandles();
       }
       return (async () => {
-        const result = await callOp("op_actor_socket_list", {
+        const result = await callOp("op_memory_socket_list", {
           request_id: activeRequestId(),
           binding: bindingName,
-          key: actorKey,
+          key: memoryKey,
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -1164,20 +1164,20 @@
     },
   });
 
-  const createActorStubTransportApi = (bindingName, actorKey) => Object.freeze({
+  const createMemoryStubTransportApi = (bindingName, memoryKey) => Object.freeze({
     values() {
-      const localRuntime = currentLocalHandleRuntime(bindingName, actorKey, "transport");
+      const localRuntime = currentLocalHandleRuntime(bindingName, memoryKey, "transport");
       if (localRuntime) {
         return localRuntime.listOpenHandles();
       }
       return (async () => {
         const result = await callOpAny([
-          "op_actor_transport_list",
-          "op_actor_transport_handles",
+          "op_memory_transport_list",
+          "op_memory_transport_handles",
         ], {
           request_id: activeRequestId(),
           binding: bindingName,
-          key: actorKey,
+          key: memoryKey,
         });
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -1192,16 +1192,16 @@
     },
     async session(handle) {
       const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId, { hydrate: false });
-      const state = createActorRuntimeState(entry, runtimeRequestId, false, false);
+      const entry = await ensureMemoryEntry(bindingName, memoryKey, runtimeRequestId, { hydrate: false });
+      const state = createMemoryRuntimeState(entry, runtimeRequestId, false, false);
       return state.transports.session(handle);
     },
   });
 
-  const createActorStubVarApi = (bindingName, actorKey, key, defaultValue = null) => {
+  const createMemoryStubVarApi = (bindingName, memoryKey, key, defaultValue = null) => {
     const normalizedKey = String(key);
     const requireScope = (operation) => {
-      const scope = actorTxnScopeFor(bindingName, actorKey);
+      const scope = memoryTxnScopeFor(bindingName, memoryKey);
       if (!scope) {
         throw new Error(`stub.var(${JSON.stringify(normalizedKey)}).${operation}() requires stub.atomic(...)`);
       }
@@ -1210,20 +1210,20 @@
     return {
       key: normalizedKey,
       read(options) {
-        const scope = actorTxnScopeFor(bindingName, actorKey);
+        const scope = memoryTxnScopeFor(bindingName, memoryKey);
         if (scope) {
           const record = scope.state.storage.get(normalizedKey, options);
           return record ? record.value : defaultValue;
         }
         return (async () => {
           const runtimeRequestId = activeRequestId();
-          const entry = await ensureActorEntry(bindingName, actorKey, runtimeRequestId, { hydrate: false });
-          const storageState = await ensureActorDirectReadReady(entry, runtimeRequestId, normalizedKey);
+          const entry = await ensureMemoryEntry(bindingName, memoryKey, runtimeRequestId, { hydrate: false });
+          const storageState = await ensureMemoryDirectReadReady(entry, runtimeRequestId, normalizedKey);
           const record = storageState.mirror.get(normalizedKey) ?? null;
           if (!record || record.deleted) {
             return defaultValue;
           }
-          const value = decodeActorStorageValue(record);
+          const value = decodeMemoryStorageValue(record);
           if (options && typeof options === "object" && options.withVersion === true) {
             return {
               value,
@@ -1246,7 +1246,7 @@
     };
   };
 
-  const normalizeActorWriteManyEntries = (entries) => {
+  const normalizeMemoryWriteManyEntries = (entries) => {
     if (!Array.isArray(entries)) {
       throw new Error("stub.writeMany(entries) requires an array");
     }

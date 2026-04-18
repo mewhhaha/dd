@@ -205,11 +205,11 @@ impl WorkerManager {
         self.websocket_sessions
             .insert(session_id.to_string(), session.clone());
         self.websocket_handle_index.insert(
-            actor_handle_key(&session.binding, &session.key, &session.handle),
+            memory_handle_key(&session.binding, &session.key, &session.handle),
             session_id.to_string(),
         );
         self.websocket_open_handles
-            .entry(actor_owner_key(binding, key))
+            .entry(memory_owner_key(binding, key))
             .or_default()
             .insert(handle.to_string());
         self.open_handle_registry
@@ -231,7 +231,7 @@ impl WorkerManager {
             session_id,
             PlatformError::not_found("websocket session not found"),
         );
-        self.websocket_handle_index.remove(&actor_handle_key(
+        self.websocket_handle_index.remove(&memory_handle_key(
             &session.binding,
             &session.key,
             &session.handle,
@@ -244,7 +244,7 @@ impl WorkerManager {
         self.websocket_outbound_frames.remove(session_id);
         self.websocket_close_signals.remove(session_id);
 
-        let owner_key = actor_owner_key(&session.binding, &session.key);
+        let owner_key = memory_owner_key(&session.binding, &session.key);
         let remove_owner_key =
             if let Some(handles) = self.websocket_open_handles.get_mut(&owner_key) {
                 handles.remove(&session.handle);
@@ -302,11 +302,11 @@ impl WorkerManager {
         self.transport_sessions
             .insert(session_id.to_string(), session.clone());
         self.transport_handle_index.insert(
-            actor_handle_key(&session.binding, &session.key, &session.handle),
+            memory_handle_key(&session.binding, &session.key, &session.handle),
             session_id.to_string(),
         );
         self.transport_open_handles
-            .entry(actor_owner_key(binding, key))
+            .entry(memory_owner_key(binding, key))
             .or_default()
             .insert(handle.to_string());
         self.open_handle_registry
@@ -324,7 +324,7 @@ impl WorkerManager {
             session.generation,
             session.owner_isolate_id,
         );
-        self.transport_handle_index.remove(&actor_handle_key(
+        self.transport_handle_index.remove(&memory_handle_key(
             &session.binding,
             &session.key,
             &session.handle,
@@ -337,7 +337,7 @@ impl WorkerManager {
         self.transport_open_channels.remove(session_id);
         self.transport_open_waiters.remove(session_id);
 
-        let owner_key = actor_owner_key(&session.binding, &session.key);
+        let owner_key = memory_owner_key(&session.binding, &session.key);
         let remove_owner_key =
             if let Some(handles) = self.transport_open_handles.get_mut(&owner_key) {
                 handles.remove(&session.handle);
@@ -368,7 +368,7 @@ impl WorkerManager {
         close_code: u16,
         close_reason: String,
     ) {
-        let owner_key = actor_owner_key(&session.binding, &session.key);
+        let owner_key = memory_owner_key(&session.binding, &session.key);
         self.transport_pending_closes
             .entry(owner_key)
             .or_default()
@@ -386,7 +386,7 @@ impl WorkerManager {
         close_code: u16,
         close_reason: String,
     ) {
-        let owner_key = actor_owner_key(&session.binding, &session.key);
+        let owner_key = memory_owner_key(&session.binding, &session.key);
         self.websocket_pending_closes
             .entry(owner_key)
             .or_default()
@@ -461,12 +461,12 @@ impl WorkerManager {
         }));
     }
 
-    pub(super) fn handle_actor_socket_send(
+    pub(super) fn handle_memory_socket_send(
         &mut self,
-        payload: crate::ops::ActorSocketSendEvent,
+        payload: crate::ops::MemorySocketSendEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorSocketSendEvent {
+        let crate::ops::MemorySocketSendEvent {
             reply,
             handle,
             binding,
@@ -474,7 +474,7 @@ impl WorkerManager {
             is_text,
             message,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let result = match self.websocket_handle_index.get(&index_key).cloned() {
             Some(session_id) => {
                 self.websocket_outbound_frames
@@ -492,12 +492,12 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_socket_close(
+    pub(super) fn handle_memory_socket_close(
         &mut self,
-        payload: crate::ops::ActorSocketCloseEvent,
+        payload: crate::ops::MemorySocketCloseEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorSocketCloseEvent {
+        let crate::ops::MemorySocketCloseEvent {
             reply,
             handle,
             binding,
@@ -505,7 +505,7 @@ impl WorkerManager {
             code,
             reason,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let result = match self.websocket_handle_index.get(&index_key).cloned() {
             Some(session_id) => {
                 self.websocket_close_signals
@@ -524,7 +524,7 @@ impl WorkerManager {
         key: &str,
         include_handle: Option<&str>,
     ) -> Vec<String> {
-        let owner_key = actor_owner_key(binding, key);
+        let owner_key = memory_owner_key(binding, key);
         let mut handles: Vec<String> = self
             .websocket_open_handles
             .get(&owner_key)
@@ -541,12 +541,12 @@ impl WorkerManager {
         handles
     }
 
-    pub(super) fn handle_actor_socket_consume_close(
+    pub(super) fn handle_memory_socket_consume_close(
         &mut self,
-        payload: crate::ops::ActorSocketConsumeCloseEvent,
+        payload: crate::ops::MemorySocketConsumeCloseEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+        let owner_key = memory_owner_key(&payload.binding, &payload.key);
         let events = self
             .websocket_pending_closes
             .get_mut(&owner_key)
@@ -560,9 +560,9 @@ impl WorkerManager {
         if remove_owner_key {
             self.websocket_pending_closes.remove(&owner_key);
         }
-        let replay: Vec<crate::ops::ActorSocketCloseReplayEvent> = events
+        let replay: Vec<crate::ops::MemorySocketCloseReplayEvent> = events
             .into_iter()
-            .map(|event| crate::ops::ActorSocketCloseReplayEvent {
+            .map(|event| crate::ops::MemorySocketCloseReplayEvent {
                 code: event.code,
                 reason: event.reason,
             })
@@ -591,14 +591,14 @@ impl WorkerManager {
             return Ok(());
         }
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = ActorRoute {
+        let route = MemoryRoute {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
         let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
         let transport_handles =
             self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
-        let actor_call = ActorExecutionCall::TransportStream {
+        let memory_call = MemoryExecutionCall::TransportStream {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
@@ -608,7 +608,7 @@ impl WorkerManager {
         };
         let invoke = WorkerInvocation {
             method: "TRANSPORT-STREAM".to_string(),
-            url: format!("http://actor/__dd_transport_stream/{session_id}"),
+            url: format!("http://memory/__dd_transport_stream/{session_id}"),
             headers: Vec::new(),
             body: Vec::new(),
             request_id: format!("transport-stream-{runtime_request_id}"),
@@ -620,7 +620,7 @@ impl WorkerManager {
             invoke,
             None,
             Some(route),
-            Some(actor_call),
+            Some(memory_call),
             None,
             None,
             Some(session.generation),
@@ -663,14 +663,14 @@ impl WorkerManager {
             return Ok(());
         }
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = ActorRoute {
+        let route = MemoryRoute {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
         let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
         let transport_handles =
             self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
-        let actor_call = ActorExecutionCall::TransportDatagram {
+        let memory_call = MemoryExecutionCall::TransportDatagram {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
@@ -680,7 +680,7 @@ impl WorkerManager {
         };
         let invoke = WorkerInvocation {
             method: "TRANSPORT-DATAGRAM".to_string(),
-            url: format!("http://actor/__dd_transport_datagram/{session_id}"),
+            url: format!("http://memory/__dd_transport_datagram/{session_id}"),
             headers: Vec::new(),
             body: Vec::new(),
             request_id: format!("transport-datagram-{runtime_request_id}"),
@@ -692,7 +692,7 @@ impl WorkerManager {
             invoke,
             None,
             Some(route),
-            Some(actor_call),
+            Some(memory_call),
             None,
             None,
             Some(session.generation),
@@ -739,14 +739,14 @@ impl WorkerManager {
         self.queue_transport_close_replay(&session, close_code, close_reason.clone());
 
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = ActorRoute {
+        let route = MemoryRoute {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
         let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
         let transport_handles =
             self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
-        let actor_call = ActorExecutionCall::TransportClose {
+        let memory_call = MemoryExecutionCall::TransportClose {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
@@ -757,7 +757,7 @@ impl WorkerManager {
         };
         let invoke = WorkerInvocation {
             method: "TRANSPORT-CLOSE".to_string(),
-            url: format!("http://actor/__dd_transport_close/{session_id}"),
+            url: format!("http://memory/__dd_transport_close/{session_id}"),
             headers: Vec::new(),
             body: Vec::new(),
             request_id: format!("transport-close-{runtime_request_id}"),
@@ -769,7 +769,7 @@ impl WorkerManager {
             invoke,
             None,
             Some(route),
-            Some(actor_call),
+            Some(memory_call),
             None,
             None,
             Some(session.generation),
@@ -793,19 +793,19 @@ impl WorkerManager {
         Ok(())
     }
 
-    pub(super) fn handle_actor_transport_send_stream(
+    pub(super) fn handle_memory_transport_send_stream(
         &mut self,
-        payload: crate::ops::ActorTransportSendStreamEvent,
+        payload: crate::ops::MemoryTransportSendStreamEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorTransportSendStreamEvent {
+        let crate::ops::MemoryTransportSendStreamEvent {
             reply,
             handle,
             binding,
             key,
             chunk,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let session_id = self.transport_handle_index.get(&index_key).cloned();
         let result = match session_id.as_deref() {
             Some(session_id) => match self.transport_sessions.get(session_id) {
@@ -820,19 +820,19 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_transport_send_datagram(
+    pub(super) fn handle_memory_transport_send_datagram(
         &mut self,
-        payload: crate::ops::ActorTransportSendDatagramEvent,
+        payload: crate::ops::MemoryTransportSendDatagramEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorTransportSendDatagramEvent {
+        let crate::ops::MemoryTransportSendDatagramEvent {
             reply,
             handle,
             binding,
             key,
             datagram,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let session_id = self.transport_handle_index.get(&index_key).cloned();
         let result = match session_id.as_deref() {
             Some(session_id) => match self.transport_sessions.get(session_id) {
@@ -847,18 +847,18 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_transport_recv_stream(
+    pub(super) fn handle_memory_transport_recv_stream(
         &mut self,
-        payload: crate::ops::ActorTransportRecvStreamEvent,
+        payload: crate::ops::MemoryTransportRecvStreamEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorTransportRecvStreamEvent {
+        let crate::ops::MemoryTransportRecvStreamEvent {
             reply,
             handle,
             binding,
             key,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let session_id = self.transport_handle_index.get(&index_key).cloned();
         let result = match session_id.as_deref() {
             Some(session_id) => match self.transport_sessions.get_mut(session_id) {
@@ -874,18 +874,18 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_transport_recv_datagram(
+    pub(super) fn handle_memory_transport_recv_datagram(
         &mut self,
-        payload: crate::ops::ActorTransportRecvDatagramEvent,
+        payload: crate::ops::MemoryTransportRecvDatagramEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorTransportRecvDatagramEvent {
+        let crate::ops::MemoryTransportRecvDatagramEvent {
             reply,
             handle,
             binding,
             key,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let session_id = self.transport_handle_index.get(&index_key).cloned();
         let result = match session_id.as_deref() {
             Some(session_id) => match self.transport_sessions.get_mut(session_id) {
@@ -900,12 +900,12 @@ impl WorkerManager {
         let _ = reply.send(result);
     }
 
-    pub(super) fn handle_actor_transport_close(
+    pub(super) fn handle_memory_transport_close(
         &mut self,
-        payload: crate::ops::ActorTransportCloseEvent,
+        payload: crate::ops::MemoryTransportCloseEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let crate::ops::ActorTransportCloseEvent {
+        let crate::ops::MemoryTransportCloseEvent {
             reply,
             handle,
             binding,
@@ -913,7 +913,7 @@ impl WorkerManager {
             code,
             reason,
         } = payload;
-        let index_key = actor_handle_key(&binding, &key, &handle);
+        let index_key = memory_handle_key(&binding, &key, &handle);
         let session_id = self.transport_handle_index.get(&index_key).cloned();
         let result = match session_id.as_deref() {
             Some(session_id) => {
@@ -935,7 +935,7 @@ impl WorkerManager {
         key: &str,
         include_handle: Option<&str>,
     ) -> Vec<String> {
-        let owner_key = actor_owner_key(binding, key);
+        let owner_key = memory_owner_key(binding, key);
         let mut handles: Vec<String> = self
             .transport_open_handles
             .get(&owner_key)
@@ -952,12 +952,12 @@ impl WorkerManager {
         handles
     }
 
-    pub(super) fn handle_actor_transport_consume_close(
+    pub(super) fn handle_memory_transport_consume_close(
         &mut self,
-        payload: crate::ops::ActorTransportConsumeCloseEvent,
+        payload: crate::ops::MemoryTransportConsumeCloseEvent,
         _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let owner_key = actor_owner_key(&payload.binding, &payload.key);
+        let owner_key = memory_owner_key(&payload.binding, &payload.key);
         let events = self
             .transport_pending_closes
             .get_mut(&owner_key)
@@ -971,9 +971,9 @@ impl WorkerManager {
         if remove_owner_key {
             self.transport_pending_closes.remove(&owner_key);
         }
-        let replay: Vec<crate::ops::ActorTransportCloseReplayEvent> = events
+        let replay: Vec<crate::ops::MemoryTransportCloseReplayEvent> = events
             .into_iter()
-            .map(|event| crate::ops::ActorTransportCloseReplayEvent {
+            .map(|event| crate::ops::MemoryTransportCloseReplayEvent {
                 code: event.code,
                 reason: event.reason,
             })

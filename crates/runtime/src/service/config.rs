@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 pub(super) struct DeployBindings {
     pub(super) kv: Vec<String>,
-    pub(super) actor: Vec<String>,
+    pub(super) memory: Vec<String>,
     pub(super) dynamic: Vec<String>,
 }
 
@@ -19,7 +19,7 @@ pub(super) struct DynamicWorkerConfig {
 
 pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
     let mut kv = Vec::new();
-    let mut actor = Vec::new();
+    let mut memory = Vec::new();
     let mut dynamic = Vec::new();
     let mut seen = HashSet::new();
     for binding in &config.bindings {
@@ -46,7 +46,7 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
                         "duplicate binding name: {name}"
                     )));
                 }
-                actor.push(name.to_string());
+                memory.push(name.to_string());
             }
             DeployBinding::Dynamic { binding } => {
                 let name = binding.trim();
@@ -62,7 +62,11 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
             }
         }
     }
-    Ok(DeployBindings { kv, actor, dynamic })
+    Ok(DeployBindings {
+        kv,
+        memory,
+        dynamic,
+    })
 }
 
 pub(super) fn build_dynamic_worker_config(

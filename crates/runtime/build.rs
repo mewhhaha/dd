@@ -4,25 +4,25 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=schema/actor_rpc.capnp");
+    println!("cargo:rerun-if-changed=schema/memory_rpc.capnp");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/init.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/http_client.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry.ts");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry_util.ts");
     println!("cargo:rerun-if-changed=../../patched-crates/deno_crypto/00_crypto.js");
 
-    compile_actor_rpc_schema();
+    compile_memory_rpc_schema();
 
     generate_execute_worker_bundle();
     generate_deno_js_extension();
 }
 
-fn compile_actor_rpc_schema() {
+fn compile_memory_rpc_schema() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"));
-    let generated = out_dir.join("actor_rpc_capnp.rs");
+    let generated = out_dir.join("memory_rpc_capnp.rs");
     let compile_result = capnpc::CompilerCommand::new()
         .src_prefix("schema")
-        .file("schema/actor_rpc.capnp")
+        .file("schema/memory_rpc.capnp")
         .run();
 
     if generated.is_file()
@@ -33,12 +33,12 @@ fn compile_actor_rpc_schema() {
         return;
     }
 
-    if try_reuse_generated_actor_rpc().is_some() {
+    if try_reuse_generated_memory_rpc().is_some() {
         return;
     }
 
     if let Err(error) = compile_result {
-        panic!("failed to compile Cap'n Proto schema for actor_rpc: {error}");
+        panic!("failed to compile Cap'n Proto schema for memory_rpc: {error}");
     }
 
     if !generated.is_file()
@@ -47,7 +47,7 @@ fn compile_actor_rpc_schema() {
             .unwrap_or(true)
     {
         panic!(
-            "actor_rpc Cap'n Proto generation produced no usable output at {}",
+            "memory_rpc Cap'n Proto generation produced no usable output at {}",
             generated.display()
         );
     }
@@ -213,7 +213,7 @@ fn generate_execute_worker_bundle() {
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
 }
 
-fn try_reuse_generated_actor_rpc() -> Option<()> {
+fn try_reuse_generated_memory_rpc() -> Option<()> {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR")?);
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -229,7 +229,20 @@ fn try_reuse_generated_actor_rpc() -> Option<()> {
         .filter(|path| path.is_dir())
         .filter_map(|build_dir| fs::read_dir(&build_dir).ok())
         .flat_map(|entries| entries.filter_map(|entry| entry.ok().map(|entry| entry.path())))
-        .map(|path| path.join("out/actor_rpc_capnp.rs"))
+        .flat_map(|path| {
+            fs::read_dir(path.join("out"))
+                .ok()
+                .into_iter()
+                .flat_map(|entries| {
+                    entries.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                })
+        })
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with("rpc_capnp.rs"))
+                .unwrap_or(false)
+        })
         .filter(|path| {
             path.is_file()
                 && path.parent().and_then(|parent| parent.parent()) != Some(out_dir.as_path())
@@ -241,6 +254,37 @@ fn try_reuse_generated_actor_rpc() -> Option<()> {
         .max_by_key(|(len, _)| *len)
         .map(|(_, path)| path);
     let source = candidate?;
-    fs::copy(source, out_dir.join("actor_rpc_capnp.rs")).ok()?;
+    let output_path = out_dir.join("memory_rpc_capnp.rs");
+    let generated = fs::read_to_string(&source).ok()?;
+    let generated = rewrite_generated_rpc_module_refs(&generated);
+    fs::write(output_path, generated).ok()?;
     Some(())
+}
+
+fn rewrite_generated_rpc_module_refs(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+
+    while let Some(idx) = rest.find("crate::") {
+        let (before, after) = rest.split_at(idx);
+        out.push_str(before);
+        let after = &after["crate::".len()..];
+        let ident_len = after
+            .chars()
+            .take_while(|char| char.is_ascii_lowercase() || *char == '_')
+            .count();
+        if ident_len > 0 {
+            let ident = &after[..ident_len];
+            if ident.ends_with("rpc_capnp") {
+                out.push_str("crate::memory_rpc_capnp");
+                rest = &after[ident_len..];
+                continue;
+            }
+        }
+        out.push_str("crate::");
+        rest = after;
+    }
+
+    out.push_str(rest);
+    out
 }

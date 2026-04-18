@@ -1,14 +1,14 @@
-use crate::actor::{
-    ActorBatchMutation, ActorDirectMutation, ActorProfileMetricKind, ActorReadDependency,
-    ActorStore,
-};
-use crate::actor_rpc::{
-    decode_actor_invoke_response, encode_actor_invoke_request, ActorInvokeCall, ActorInvokeRequest,
-    ActorInvokeResponse,
-};
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{
     KvBatchMutation, KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup,
+};
+use crate::memory::{
+    MemoryBatchMutation, MemoryDirectMutation, MemoryProfileMetricKind, MemoryReadDependency,
+    MemoryStore,
+};
+use crate::memory_rpc::{
+    decode_memory_invoke_response, encode_memory_invoke_request, MemoryInvokeCall,
+    MemoryInvokeRequest, MemoryInvokeResponse,
 };
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
@@ -33,12 +33,12 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 pub struct IsolateEventSender(pub std::sync::mpsc::Sender<IsolateEventPayload>);
 
 #[derive(Clone, Default)]
-pub struct ActorOpenHandleRegistry {
+pub struct MemoryOpenHandleRegistry {
     socket_handles: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
     transport_handles: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
 }
 
-impl ActorOpenHandleRegistry {
+impl MemoryOpenHandleRegistry {
     fn owner_key(binding: &str, key: &str) -> String {
         format!("{binding}\u{001f}{key}")
     }
@@ -141,16 +141,16 @@ pub enum IsolateEventPayload {
     ResponseStart(String),
     ResponseChunk(String),
     CacheRevalidate(String),
-    ActorInvoke(ActorInvokeEvent),
-    ActorSocketSend(ActorSocketSendEvent),
-    ActorSocketClose(ActorSocketCloseEvent),
-    ActorSocketConsumeClose(ActorSocketConsumeCloseEvent),
-    ActorTransportSendStream(ActorTransportSendStreamEvent),
-    ActorTransportSendDatagram(ActorTransportSendDatagramEvent),
-    ActorTransportRecvStream(ActorTransportRecvStreamEvent),
-    ActorTransportRecvDatagram(ActorTransportRecvDatagramEvent),
-    ActorTransportClose(ActorTransportCloseEvent),
-    ActorTransportConsumeClose(ActorTransportConsumeCloseEvent),
+    MemoryInvoke(MemoryInvokeEvent),
+    MemorySocketSend(MemorySocketSendEvent),
+    MemorySocketClose(MemorySocketCloseEvent),
+    MemorySocketConsumeClose(MemorySocketConsumeCloseEvent),
+    MemoryTransportSendStream(MemoryTransportSendStreamEvent),
+    MemoryTransportSendDatagram(MemoryTransportSendDatagramEvent),
+    MemoryTransportRecvStream(MemoryTransportRecvStreamEvent),
+    MemoryTransportRecvDatagram(MemoryTransportRecvDatagramEvent),
+    MemoryTransportClose(MemoryTransportCloseEvent),
+    MemoryTransportConsumeClose(MemoryTransportConsumeCloseEvent),
     DynamicWorkerCreate(DynamicWorkerCreateEvent),
     DynamicWorkerLookup(DynamicWorkerLookupEvent),
     DynamicWorkerList(DynamicWorkerListEvent),
@@ -164,7 +164,7 @@ pub enum IsolateEventPayload {
 pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
 pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
 
-pub struct ActorInvokeEvent {
+pub struct MemoryInvokeEvent {
     pub request_frame: Vec<u8>,
     pub caller_worker_name: String,
     pub caller_generation: u64,
@@ -173,7 +173,7 @@ pub struct ActorInvokeEvent {
     pub reply: oneshot::Sender<Result<Vec<u8>>>,
 }
 
-pub struct ActorSocketSendEvent {
+pub struct MemorySocketSendEvent {
     pub reply: oneshot::Sender<Result<()>>,
     pub handle: String,
     pub binding: String,
@@ -182,7 +182,7 @@ pub struct ActorSocketSendEvent {
     pub message: Vec<u8>,
 }
 
-pub struct ActorSocketCloseEvent {
+pub struct MemorySocketCloseEvent {
     pub reply: oneshot::Sender<Result<()>>,
     pub handle: String,
     pub binding: String,
@@ -192,19 +192,19 @@ pub struct ActorSocketCloseEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ActorSocketCloseReplayEvent {
+pub struct MemorySocketCloseReplayEvent {
     pub code: u16,
     pub reason: String,
 }
 
-pub struct ActorSocketConsumeCloseEvent {
-    pub reply: oneshot::Sender<Result<Vec<ActorSocketCloseReplayEvent>>>,
+pub struct MemorySocketConsumeCloseEvent {
+    pub reply: oneshot::Sender<Result<Vec<MemorySocketCloseReplayEvent>>>,
     pub binding: String,
     pub key: String,
     pub handle: String,
 }
 
-pub struct ActorTransportSendStreamEvent {
+pub struct MemoryTransportSendStreamEvent {
     pub reply: oneshot::Sender<Result<()>>,
     pub handle: String,
     pub binding: String,
@@ -212,7 +212,7 @@ pub struct ActorTransportSendStreamEvent {
     pub chunk: Vec<u8>,
 }
 
-pub struct ActorTransportSendDatagramEvent {
+pub struct MemoryTransportSendDatagramEvent {
     pub reply: oneshot::Sender<Result<()>>,
     pub handle: String,
     pub binding: String,
@@ -220,21 +220,21 @@ pub struct ActorTransportSendDatagramEvent {
     pub datagram: Vec<u8>,
 }
 
-pub struct ActorTransportRecvStreamEvent {
+pub struct MemoryTransportRecvStreamEvent {
     pub reply: oneshot::Sender<Result<TransportRecvEvent>>,
     pub handle: String,
     pub binding: String,
     pub key: String,
 }
 
-pub struct ActorTransportRecvDatagramEvent {
+pub struct MemoryTransportRecvDatagramEvent {
     pub reply: oneshot::Sender<Result<TransportRecvEvent>>,
     pub handle: String,
     pub binding: String,
     pub key: String,
 }
 
-pub struct ActorTransportCloseEvent {
+pub struct MemoryTransportCloseEvent {
     pub reply: oneshot::Sender<Result<()>>,
     pub handle: String,
     pub binding: String,
@@ -244,13 +244,13 @@ pub struct ActorTransportCloseEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ActorTransportCloseReplayEvent {
+pub struct MemoryTransportCloseReplayEvent {
     pub code: u16,
     pub reason: String,
 }
 
-pub struct ActorTransportConsumeCloseEvent {
-    pub reply: oneshot::Sender<Result<Vec<ActorTransportCloseReplayEvent>>>,
+pub struct MemoryTransportConsumeCloseEvent {
+    pub reply: oneshot::Sender<Result<Vec<MemoryTransportCloseReplayEvent>>>,
     pub binding: String,
     pub key: String,
     pub handle: String,
@@ -799,14 +799,14 @@ pub struct TestAsyncReplyDelivery {
 }
 
 #[derive(Default)]
-pub struct ActorRequestScopes {
-    scopes: HashMap<String, ActorRequestScope>,
+pub struct MemoryRequestScopes {
+    scopes: HashMap<String, MemoryRequestScope>,
 }
 
 #[derive(Clone)]
-struct ActorRequestScope {
+struct MemoryRequestScope {
     namespace: String,
-    actor_key: String,
+    memory_key: String,
 }
 
 #[derive(Default)]
@@ -1271,7 +1271,7 @@ struct WaitUntilRequestId {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorInvokeMethodPayload {
+struct MemoryInvokeMethodPayload {
     caller_request_id: String,
     worker_name: String,
     binding: String,
@@ -1285,14 +1285,14 @@ struct ActorInvokeMethodPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorInvokeMethodResult {
+struct MemoryInvokeMethodResult {
     ok: bool,
     value: Vec<u8>,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorSocketSendPayload {
+struct MemorySocketSendPayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1304,13 +1304,13 @@ struct ActorSocketSendPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorSocketSendResult {
+struct MemorySocketSendResult {
     ok: bool,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorSocketClosePayload {
+struct MemorySocketClosePayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1322,7 +1322,7 @@ struct ActorSocketClosePayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorSocketListPayload {
+struct MemorySocketListPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
@@ -1331,14 +1331,14 @@ struct ActorSocketListPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorSocketListResult {
+struct MemorySocketListResult {
     ok: bool,
     handles: Vec<String>,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorSocketConsumeClosePayload {
+struct MemorySocketConsumeClosePayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1348,26 +1348,26 @@ struct ActorSocketConsumeClosePayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorSocketReplayClose {
+struct MemorySocketReplayClose {
     code: u16,
     reason: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorSocketConsumeCloseResult {
+struct MemorySocketConsumeCloseResult {
     ok: bool,
-    events: Vec<ActorSocketReplayClose>,
+    events: Vec<MemorySocketReplayClose>,
     error: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorSocketCloseResult {
+struct MemorySocketCloseResult {
     ok: bool,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorTransportSendStreamPayload {
+struct MemoryTransportSendStreamPayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1378,7 +1378,7 @@ struct ActorTransportSendStreamPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorTransportSendDatagramPayload {
+struct MemoryTransportSendDatagramPayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1389,7 +1389,7 @@ struct ActorTransportSendDatagramPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorTransportRecvPayload {
+struct MemoryTransportRecvPayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1399,13 +1399,13 @@ struct ActorTransportRecvPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorTransportSendResult {
+struct MemoryTransportSendResult {
     ok: bool,
     error: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorTransportRecvResult {
+struct MemoryTransportRecvResult {
     ok: bool,
     done: bool,
     chunk: Vec<u8>,
@@ -1413,7 +1413,7 @@ struct ActorTransportRecvResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorTransportClosePayload {
+struct MemoryTransportClosePayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1425,7 +1425,7 @@ struct ActorTransportClosePayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorTransportListPayload {
+struct MemoryTransportListPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
@@ -1434,14 +1434,14 @@ struct ActorTransportListPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorTransportListResult {
+struct MemoryTransportListResult {
     ok: bool,
     handles: Vec<String>,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorTransportConsumeClosePayload {
+struct MemoryTransportConsumeClosePayload {
     request_id: String,
     handle: String,
     #[serde(default)]
@@ -1451,26 +1451,26 @@ struct ActorTransportConsumeClosePayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorTransportReplayClose {
+struct MemoryTransportReplayClose {
     code: u16,
     reason: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorTransportConsumeCloseResult {
+struct MemoryTransportConsumeCloseResult {
     ok: bool,
-    events: Vec<ActorTransportReplayClose>,
+    events: Vec<MemoryTransportReplayClose>,
     error: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorTransportCloseResult {
+struct MemoryTransportCloseResult {
     ok: bool,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateSnapshotPayload {
+struct MemoryStateSnapshotPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
@@ -1481,7 +1481,7 @@ struct ActorStateSnapshotPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateGetPayload {
+struct MemoryStateGetPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
@@ -1491,7 +1491,7 @@ struct ActorStateGetPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateGetEntry {
+struct MemoryStateGetEntry {
     key: String,
     value: Vec<u8>,
     encoding: String,
@@ -1500,15 +1500,15 @@ struct ActorStateGetEntry {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateGetResult {
+struct MemoryStateGetResult {
     ok: bool,
-    record: Option<ActorStateGetEntry>,
+    record: Option<MemoryStateGetEntry>,
     max_version: i64,
     error: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateSnapshotEntry {
+struct MemoryStateSnapshotEntry {
     key: String,
     value: Vec<u8>,
     encoding: String,
@@ -1517,22 +1517,22 @@ struct ActorStateSnapshotEntry {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateSnapshotResult {
+struct MemoryStateSnapshotResult {
     ok: bool,
-    entries: Vec<ActorStateSnapshotEntry>,
+    entries: Vec<MemoryStateSnapshotEntry>,
     max_version: i64,
     error: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorProfileResult {
+struct MemoryProfileResult {
     ok: bool,
-    snapshot: Option<crate::actor::ActorProfileSnapshot>,
+    snapshot: Option<crate::memory::MemoryProfileSnapshot>,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateVersionIfNewerPayload {
+struct MemoryStateVersionIfNewerPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
@@ -1542,7 +1542,7 @@ struct ActorStateVersionIfNewerPayload {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateVersionIfNewerResult {
+struct MemoryStateVersionIfNewerResult {
     ok: bool,
     stale: bool,
     max_version: i64,
@@ -1550,7 +1550,7 @@ struct ActorStateVersionIfNewerResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateBatchMutationPayload {
+struct MemoryStateBatchMutationPayload {
     key: String,
     value: Vec<u8>,
     encoding: String,
@@ -1559,13 +1559,13 @@ struct ActorStateBatchMutationPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateReadDependencyPayload {
+struct MemoryStateReadDependencyPayload {
     key: String,
     version: i64,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateApplyBatchPayload {
+struct MemoryStateApplyBatchPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
@@ -1575,24 +1575,24 @@ struct ActorStateApplyBatchPayload {
     #[serde(default)]
     transactional: bool,
     #[serde(default)]
-    reads: Vec<ActorStateReadDependencyPayload>,
+    reads: Vec<MemoryStateReadDependencyPayload>,
     #[serde(default)]
     list_gate_version: i64,
-    mutations: Vec<ActorStateBatchMutationPayload>,
+    mutations: Vec<MemoryStateBatchMutationPayload>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateApplyBlindBatchPayload {
+struct MemoryStateApplyBlindBatchPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
     #[serde(default)]
     key: String,
-    mutations: Vec<ActorStateBatchMutationPayload>,
+    mutations: Vec<MemoryStateBatchMutationPayload>,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateApplyBatchResult {
+struct MemoryStateApplyBatchResult {
     ok: bool,
     conflict: bool,
     max_version: i64,
@@ -1600,7 +1600,7 @@ struct ActorStateApplyBatchResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateEnqueueBatchMutationPayload {
+struct MemoryStateEnqueueBatchMutationPayload {
     key: String,
     value: Vec<u8>,
     encoding: String,
@@ -1608,29 +1608,29 @@ struct ActorStateEnqueueBatchMutationPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateEnqueueBatchPayload {
+struct MemoryStateEnqueueBatchPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
     #[serde(default)]
     key: String,
-    mutations: Vec<ActorStateEnqueueBatchMutationPayload>,
+    mutations: Vec<MemoryStateEnqueueBatchMutationPayload>,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateEnqueueBatchResult {
+struct MemoryStateEnqueueBatchResult {
     ok: bool,
     submission_id: u64,
     error: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateAwaitSubmissionPayload {
+struct MemoryStateAwaitSubmissionPayload {
     submission_id: u64,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorStateAwaitSubmissionResult {
+struct MemoryStateAwaitSubmissionResult {
     ok: bool,
     pending: bool,
     max_version: i64,
@@ -1638,32 +1638,32 @@ struct ActorStateAwaitSubmissionResult {
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorStateValidateReadsPayload {
+struct MemoryStateValidateReadsPayload {
     request_id: String,
     #[serde(default)]
     binding: String,
     #[serde(default)]
     key: String,
     #[serde(default)]
-    reads: Vec<ActorStateReadDependencyPayload>,
+    reads: Vec<MemoryStateReadDependencyPayload>,
     #[serde(default)]
     list_gate_version: i64,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorScopePayload {
+struct MemoryScopePayload {
     request_id: String,
     binding: String,
     key: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ActorScopeClearPayload {
+struct MemoryScopeClearPayload {
     request_id: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ActorScopeResult {
+struct MemoryScopeResult {
     ok: bool,
     error: String,
 }
@@ -2811,7 +2811,7 @@ fn dynamic_host_rpc_owner_for_request(
     Ok((worker_name, generation, isolate_id))
 }
 
-fn actor_invoke_owner_for_request(
+fn memory_invoke_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
 ) -> Result<(String, u64, u64)> {
@@ -3594,10 +3594,10 @@ fn op_request_body_cancel(state: &mut OpState, #[string] request_id: String) {
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_invoke_method(
+async fn op_memory_invoke_method(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorInvokeMethodPayload,
-) -> ActorInvokeMethodResult {
+    #[serde] payload: MemoryInvokeMethodPayload,
+) -> MemoryInvokeMethodResult {
     if payload.caller_request_id.trim().is_empty()
         || payload.worker_name.trim().is_empty()
         || payload.binding.trim().is_empty()
@@ -3605,7 +3605,7 @@ async fn op_actor_invoke_method(
         || payload.method_name.trim().is_empty()
         || payload.request_id.trim().is_empty()
     {
-        return ActorInvokeMethodResult {
+        return MemoryInvokeMethodResult {
             ok: false,
             value: Vec::new(),
             error: "memory method invoke requires caller_request_id, worker_name, binding, key, method_name, request_id"
@@ -3613,21 +3613,21 @@ async fn op_actor_invoke_method(
         };
     }
     let (caller_worker_name, caller_generation, caller_isolate_id) =
-        match actor_invoke_owner_for_request(&state, &payload.caller_request_id) {
+        match memory_invoke_owner_for_request(&state, &payload.caller_request_id) {
             Ok(value) => value,
             Err(error) => {
-                return ActorInvokeMethodResult {
+                return MemoryInvokeMethodResult {
                     ok: false,
                     value: Vec::new(),
                     error: error.to_string(),
                 };
             }
         };
-    let request_frame = match encode_actor_invoke_request(&ActorInvokeRequest {
+    let request_frame = match encode_memory_invoke_request(&MemoryInvokeRequest {
         worker_name: payload.worker_name,
         binding: payload.binding,
         key: payload.key,
-        call: ActorInvokeCall::Method {
+        call: MemoryInvokeCall::Method {
             name: payload.method_name,
             args: payload.args,
             request_id: payload.request_id,
@@ -3635,7 +3635,7 @@ async fn op_actor_invoke_method(
     }) {
         Ok(frame) => frame,
         Err(error) => {
-            return ActorInvokeMethodResult {
+            return MemoryInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
                 error: format!("memory method invoke encode failed: {error}"),
@@ -3647,7 +3647,7 @@ async fn op_actor_invoke_method(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorInvoke(ActorInvokeEvent {
+        .send(IsolateEventPayload::MemoryInvoke(MemoryInvokeEvent {
             request_frame,
             caller_worker_name,
             caller_generation,
@@ -3657,7 +3657,7 @@ async fn op_actor_invoke_method(
         }))
         .is_err()
     {
-        return ActorInvokeMethodResult {
+        return MemoryInvokeMethodResult {
             ok: false,
             value: Vec::new(),
             error: "memory method runtime is unavailable".to_string(),
@@ -3665,34 +3665,34 @@ async fn op_actor_invoke_method(
     }
 
     match reply_rx.await {
-        Ok(Ok(frame)) => match decode_actor_invoke_response(&frame) {
-            Ok(ActorInvokeResponse::Method { value }) => ActorInvokeMethodResult {
+        Ok(Ok(frame)) => match decode_memory_invoke_response(&frame) {
+            Ok(MemoryInvokeResponse::Method { value }) => MemoryInvokeMethodResult {
                 ok: true,
                 value,
                 error: String::new(),
             },
-            Ok(ActorInvokeResponse::Error(error)) => ActorInvokeMethodResult {
+            Ok(MemoryInvokeResponse::Error(error)) => MemoryInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
                 error,
             },
-            Ok(ActorInvokeResponse::Fetch(_)) => ActorInvokeMethodResult {
+            Ok(MemoryInvokeResponse::Fetch(_)) => MemoryInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
                 error: "memory method invoke received fetch response".to_string(),
             },
-            Err(error) => ActorInvokeMethodResult {
+            Err(error) => MemoryInvokeMethodResult {
                 ok: false,
                 value: Vec::new(),
                 error: format!("memory method invoke decode failed: {error}"),
             },
         },
-        Ok(Err(error)) => ActorInvokeMethodResult {
+        Ok(Err(error)) => MemoryInvokeMethodResult {
             ok: false,
             value: Vec::new(),
             error: error.to_string(),
         },
-        Err(_) => ActorInvokeMethodResult {
+        Err(_) => MemoryInvokeMethodResult {
             ok: false,
             value: Vec::new(),
             error: "memory method invoke response channel closed".to_string(),
@@ -3700,21 +3700,21 @@ async fn op_actor_invoke_method(
     }
 }
 
-fn actor_scope_for_request(
+fn memory_scope_for_request(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
 ) -> Result<(String, String)> {
     state
         .borrow()
-        .borrow::<ActorRequestScopes>()
+        .borrow::<MemoryRequestScopes>()
         .scopes
         .get(request_id)
         .cloned()
-        .map(|scope| (scope.namespace, scope.actor_key))
+        .map(|scope| (scope.namespace, scope.memory_key))
         .ok_or_else(|| PlatformError::runtime("memory storage scope is unavailable"))
 }
 
-fn actor_socket_scope_for_payload(
+fn memory_socket_scope_for_payload(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
     binding: &str,
@@ -3725,10 +3725,10 @@ fn actor_socket_scope_for_payload(
     if !binding.is_empty() && !key.is_empty() {
         return Ok((binding.to_string(), key.to_string()));
     }
-    actor_scope_for_request(state, request_id)
+    memory_scope_for_request(state, request_id)
 }
 
-fn actor_storage_scope_for_payload(
+fn memory_storage_scope_for_payload(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
     binding: &str,
@@ -3739,17 +3739,17 @@ fn actor_storage_scope_for_payload(
     if !binding.is_empty() && !key.is_empty() {
         return Ok((binding.to_string(), key.to_string()));
     }
-    actor_scope_for_request(state, request_id)
+    memory_scope_for_request(state, request_id)
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_get(
+async fn op_memory_state_get(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateGetPayload,
-) -> ActorStateGetResult {
+    #[serde] payload: MemoryStateGetPayload,
+) -> MemoryStateGetResult {
     let started = Instant::now();
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -3757,7 +3757,7 @@ async fn op_actor_state_get(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateGetResult {
+            return MemoryStateGetResult {
                 ok: false,
                 record: None,
                 max_version: -1,
@@ -3765,7 +3765,7 @@ async fn op_actor_state_get(
             };
         }
     };
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     let store_for_read = store.clone();
     let item_key = payload.item_key;
     let read_result = std::thread::spawn(move || {
@@ -3773,20 +3773,20 @@ async fn op_actor_state_get(
             .enable_all()
             .build()
             .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_read.point_read(&namespace, &actor_key, &item_key))
+        runtime.block_on(store_for_read.point_read(&namespace, &memory_key, &item_key))
     })
     .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("actor point read worker panicked")));
+    .unwrap_or_else(|_| Err(PlatformError::internal("memory point read worker panicked")));
     match read_result {
         Ok(point) => {
             store.record_profile(
-                ActorProfileMetricKind::OpRead,
+                MemoryProfileMetricKind::OpRead,
                 started.elapsed().as_micros() as u64,
                 1,
             );
-            ActorStateGetResult {
+            MemoryStateGetResult {
                 ok: true,
-                record: point.record.map(|entry| ActorStateGetEntry {
+                record: point.record.map(|entry| MemoryStateGetEntry {
                     key: entry.key,
                     value: entry.value,
                     encoding: entry.encoding,
@@ -3797,7 +3797,7 @@ async fn op_actor_state_get(
                 error: String::new(),
             }
         }
-        Err(error) => ActorStateGetResult {
+        Err(error) => MemoryStateGetResult {
             ok: false,
             record: None,
             max_version: -1,
@@ -3808,12 +3808,12 @@ async fn op_actor_state_get(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_snapshot(
+async fn op_memory_state_snapshot(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateSnapshotPayload,
-) -> ActorStateSnapshotResult {
+    #[serde] payload: MemoryStateSnapshotPayload,
+) -> MemoryStateSnapshotResult {
     let started = Instant::now();
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -3821,7 +3821,7 @@ async fn op_actor_state_snapshot(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateSnapshotResult {
+            return MemoryStateSnapshotResult {
                 ok: false,
                 entries: Vec::new(),
                 max_version: -1,
@@ -3829,7 +3829,7 @@ async fn op_actor_state_snapshot(
             };
         }
     };
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     let keys = payload
         .keys
         .into_iter()
@@ -3845,29 +3845,29 @@ async fn op_actor_state_snapshot(
             .map_err(|error| PlatformError::internal(error.to_string()))?;
         runtime.block_on(async move {
             if keys.is_empty() {
-                store_for_snapshot.snapshot(&namespace, &actor_key).await
+                store_for_snapshot.snapshot(&namespace, &memory_key).await
             } else {
                 store_for_snapshot
-                    .snapshot_keys(&namespace, &actor_key, &keys)
+                    .snapshot_keys(&namespace, &memory_key, &keys)
                     .await
             }
         })
     })
     .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("actor snapshot worker panicked")));
+    .unwrap_or_else(|_| Err(PlatformError::internal("memory snapshot worker panicked")));
     match snapshot_result {
         Ok(snapshot) => {
             store.record_profile(
-                ActorProfileMetricKind::OpSnapshot,
+                MemoryProfileMetricKind::OpSnapshot,
                 started.elapsed().as_micros() as u64,
                 profile_items,
             );
-            ActorStateSnapshotResult {
+            MemoryStateSnapshotResult {
                 ok: true,
                 entries: snapshot
                     .entries
                     .into_iter()
-                    .map(|entry| ActorStateSnapshotEntry {
+                    .map(|entry| MemoryStateSnapshotEntry {
                         key: entry.key,
                         value: entry.value,
                         encoding: entry.encoding,
@@ -3879,7 +3879,7 @@ async fn op_actor_state_snapshot(
                 error: String::new(),
             }
         }
-        Err(error) => ActorStateSnapshotResult {
+        Err(error) => MemoryStateSnapshotResult {
             ok: false,
             entries: Vec::new(),
             max_version: -1,
@@ -3890,12 +3890,12 @@ async fn op_actor_state_snapshot(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_version_if_newer(
+async fn op_memory_state_version_if_newer(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateVersionIfNewerPayload,
-) -> ActorStateVersionIfNewerResult {
+    #[serde] payload: MemoryStateVersionIfNewerPayload,
+) -> MemoryStateVersionIfNewerResult {
     let started = Instant::now();
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -3903,7 +3903,7 @@ async fn op_actor_state_version_if_newer(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateVersionIfNewerResult {
+            return MemoryStateVersionIfNewerResult {
                 ok: false,
                 stale: false,
                 max_version: -1,
@@ -3911,18 +3911,18 @@ async fn op_actor_state_version_if_newer(
             };
         }
     };
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     match store
-        .version_if_newer(&namespace, &actor_key, payload.known_version)
+        .version_if_newer(&namespace, &memory_key, payload.known_version)
         .await
     {
         Ok(Some(max_version)) => {
             store.record_profile(
-                ActorProfileMetricKind::OpVersionIfNewer,
+                MemoryProfileMetricKind::OpVersionIfNewer,
                 started.elapsed().as_micros() as u64,
                 1,
             );
-            ActorStateVersionIfNewerResult {
+            MemoryStateVersionIfNewerResult {
                 ok: true,
                 stale: true,
                 max_version,
@@ -3931,18 +3931,18 @@ async fn op_actor_state_version_if_newer(
         }
         Ok(None) => {
             store.record_profile(
-                ActorProfileMetricKind::OpVersionIfNewer,
+                MemoryProfileMetricKind::OpVersionIfNewer,
                 started.elapsed().as_micros() as u64,
                 1,
             );
-            ActorStateVersionIfNewerResult {
+            MemoryStateVersionIfNewerResult {
                 ok: true,
                 stale: false,
                 max_version: payload.known_version,
                 error: String::new(),
             }
         }
-        Err(error) => ActorStateVersionIfNewerResult {
+        Err(error) => MemoryStateVersionIfNewerResult {
             ok: false,
             stale: false,
             max_version: -1,
@@ -3953,12 +3953,12 @@ async fn op_actor_state_version_if_newer(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_validate_reads(
+async fn op_memory_state_validate_reads(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateValidateReadsPayload,
-) -> ActorStateApplyBatchResult {
+    #[serde] payload: MemoryStateValidateReadsPayload,
+) -> MemoryStateApplyBatchResult {
     let started = Instant::now();
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -3966,7 +3966,7 @@ async fn op_actor_state_validate_reads(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateApplyBatchResult {
+            return MemoryStateApplyBatchResult {
                 ok: false,
                 conflict: false,
                 max_version: -1,
@@ -3977,7 +3977,7 @@ async fn op_actor_state_validate_reads(
     let reads = payload
         .reads
         .into_iter()
-        .map(|dependency| ActorReadDependency {
+        .map(|dependency| MemoryReadDependency {
             key: dependency.key,
             version: dependency.version,
         })
@@ -3987,25 +3987,25 @@ async fn op_actor_state_validate_reads(
     } else {
         Some(payload.list_gate_version)
     };
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     match store
-        .validate_reads(&namespace, &actor_key, &reads, list_gate_version)
+        .validate_reads(&namespace, &memory_key, &reads, list_gate_version)
         .await
     {
         Ok(result) => {
             store.record_profile(
-                ActorProfileMetricKind::OpValidateReads,
+                MemoryProfileMetricKind::OpValidateReads,
                 started.elapsed().as_micros() as u64,
                 reads.len().max(1) as u64,
             );
-            ActorStateApplyBatchResult {
+            MemoryStateApplyBatchResult {
                 ok: true,
                 conflict: result.conflict,
                 max_version: result.max_version,
                 error: String::new(),
             }
         }
-        Err(error) => ActorStateApplyBatchResult {
+        Err(error) => MemoryStateApplyBatchResult {
             ok: false,
             conflict: false,
             max_version: -1,
@@ -4015,34 +4015,34 @@ async fn op_actor_state_validate_reads(
 }
 
 #[deno_core::op2(fast)]
-fn op_actor_profile_record_js(
+fn op_memory_profile_record_js(
     state: &mut OpState,
     #[string] metric: String,
     duration_us: u32,
     items: u32,
 ) {
     let kind = match metric.as_str() {
-        "js_read_only_total" => ActorProfileMetricKind::JsReadOnlyTotal,
-        "js_freshness_check" => ActorProfileMetricKind::JsFreshnessCheck,
-        "js_hydrate_full" => ActorProfileMetricKind::JsHydrateFull,
-        "js_hydrate_keys" => ActorProfileMetricKind::JsHydrateKeys,
-        "js_txn_commit" => ActorProfileMetricKind::JsTxnCommit,
-        "js_txn_blind_commit" => ActorProfileMetricKind::JsTxnBlindCommit,
-        "js_txn_validate" => ActorProfileMetricKind::JsTxnValidate,
-        "actor_cache_hit" => ActorProfileMetricKind::JsCacheHit,
-        "actor_cache_miss" => ActorProfileMetricKind::JsCacheMiss,
-        "actor_cache_stale" => ActorProfileMetricKind::JsCacheStale,
+        "js_read_only_total" => MemoryProfileMetricKind::JsReadOnlyTotal,
+        "js_freshness_check" => MemoryProfileMetricKind::JsFreshnessCheck,
+        "js_hydrate_full" => MemoryProfileMetricKind::JsHydrateFull,
+        "js_hydrate_keys" => MemoryProfileMetricKind::JsHydrateKeys,
+        "js_txn_commit" => MemoryProfileMetricKind::JsTxnCommit,
+        "js_txn_blind_commit" => MemoryProfileMetricKind::JsTxnBlindCommit,
+        "js_txn_validate" => MemoryProfileMetricKind::JsTxnValidate,
+        "memory_cache_hit" => MemoryProfileMetricKind::JsCacheHit,
+        "memory_cache_miss" => MemoryProfileMetricKind::JsCacheMiss,
+        "memory_cache_stale" => MemoryProfileMetricKind::JsCacheStale,
         _ => return,
     };
-    let store = state.borrow::<ActorStore>().clone();
+    let store = state.borrow::<MemoryStore>().clone();
     store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
 }
 
 #[deno_core::op2]
 #[serde]
-fn op_actor_profile_take(state: &mut OpState) -> ActorProfileResult {
-    let store = state.borrow::<ActorStore>().clone();
-    ActorProfileResult {
+fn op_memory_profile_take(state: &mut OpState) -> MemoryProfileResult {
+    let store = state.borrow::<MemoryStore>().clone();
+    MemoryProfileResult {
         ok: true,
         snapshot: Some(store.take_profile_snapshot_and_reset()),
         error: String::new(),
@@ -4050,21 +4050,21 @@ fn op_actor_profile_take(state: &mut OpState) -> ActorProfileResult {
 }
 
 #[deno_core::op2(fast)]
-fn op_actor_profile_reset(state: &mut OpState) {
-    let store = state.borrow::<ActorStore>().clone();
+fn op_memory_profile_reset(state: &mut OpState) {
+    let store = state.borrow::<MemoryStore>().clone();
     store.reset_profile();
 }
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_apply_batch(
+async fn op_memory_state_apply_batch(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateApplyBatchPayload,
-) -> ActorStateApplyBatchResult {
+    #[serde] payload: MemoryStateApplyBatchPayload,
+) -> MemoryStateApplyBatchResult {
     let started = std::time::Instant::now();
     let mutation_count = payload.mutations.len() as u64;
     let read_count = payload.reads.len() as u64;
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4072,7 +4072,7 @@ async fn op_actor_state_apply_batch(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateApplyBatchResult {
+            return MemoryStateApplyBatchResult {
                 ok: false,
                 conflict: false,
                 max_version: -1,
@@ -4083,7 +4083,7 @@ async fn op_actor_state_apply_batch(
     let mutations = payload
         .mutations
         .into_iter()
-        .map(|mutation| ActorBatchMutation {
+        .map(|mutation| MemoryBatchMutation {
             key: mutation.key,
             value: mutation.value,
             encoding: mutation.encoding,
@@ -4094,7 +4094,7 @@ async fn op_actor_state_apply_batch(
     let reads = payload
         .reads
         .into_iter()
-        .map(|dependency| ActorReadDependency {
+        .map(|dependency| MemoryReadDependency {
             key: dependency.key,
             version: dependency.version,
         })
@@ -4109,7 +4109,7 @@ async fn op_actor_state_apply_batch(
     } else {
         Some(payload.list_gate_version)
     };
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     let store_for_apply = store.clone();
     let apply_result = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4118,7 +4118,7 @@ async fn op_actor_state_apply_batch(
             .map_err(|error| PlatformError::internal(error.to_string()))?;
         runtime.block_on(store_for_apply.apply_batch(
             &namespace,
-            &actor_key,
+            &memory_key,
             &reads,
             &mutations,
             expected_base_version,
@@ -4127,22 +4127,22 @@ async fn op_actor_state_apply_batch(
         ))
     })
     .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("actor apply worker panicked")));
+    .unwrap_or_else(|_| Err(PlatformError::internal("memory apply worker panicked")));
     match apply_result {
         Ok(result) => {
             store.record_profile(
-                ActorProfileMetricKind::OpApplyBatch,
+                MemoryProfileMetricKind::OpApplyBatch,
                 started.elapsed().as_micros() as u64,
                 mutation_count + read_count + 1,
             );
-            ActorStateApplyBatchResult {
+            MemoryStateApplyBatchResult {
                 ok: true,
                 conflict: result.conflict,
                 max_version: result.max_version,
                 error: String::new(),
             }
         }
-        Err(error) => ActorStateApplyBatchResult {
+        Err(error) => MemoryStateApplyBatchResult {
             ok: false,
             conflict: false,
             max_version: -1,
@@ -4153,13 +4153,13 @@ async fn op_actor_state_apply_batch(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_apply_blind_batch(
+async fn op_memory_state_apply_blind_batch(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateApplyBlindBatchPayload,
-) -> ActorStateApplyBatchResult {
+    #[serde] payload: MemoryStateApplyBlindBatchPayload,
+) -> MemoryStateApplyBatchResult {
     let started = std::time::Instant::now();
     let mutation_count = payload.mutations.len() as u64;
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4167,7 +4167,7 @@ async fn op_actor_state_apply_blind_batch(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateApplyBatchResult {
+            return MemoryStateApplyBatchResult {
                 ok: false,
                 conflict: false,
                 max_version: -1,
@@ -4178,7 +4178,7 @@ async fn op_actor_state_apply_blind_batch(
     let mutations = payload
         .mutations
         .into_iter()
-        .map(|mutation| ActorBatchMutation {
+        .map(|mutation| MemoryBatchMutation {
             key: mutation.key,
             value: mutation.value,
             encoding: mutation.encoding,
@@ -4186,32 +4186,36 @@ async fn op_actor_state_apply_blind_batch(
             deleted: mutation.deleted,
         })
         .collect::<Vec<_>>();
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     let store_for_apply = store.clone();
     let apply_result = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_apply.apply_blind_batch(&namespace, &actor_key, &mutations))
+        runtime.block_on(store_for_apply.apply_blind_batch(&namespace, &memory_key, &mutations))
     })
     .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("actor blind apply worker panicked")));
+    .unwrap_or_else(|_| {
+        Err(PlatformError::internal(
+            "memory blind apply worker panicked",
+        ))
+    });
     match apply_result {
         Ok(result) => {
             store.record_profile(
-                ActorProfileMetricKind::OpApplyBlindBatch,
+                MemoryProfileMetricKind::OpApplyBlindBatch,
                 started.elapsed().as_micros() as u64,
                 mutation_count + 1,
             );
-            ActorStateApplyBatchResult {
+            MemoryStateApplyBatchResult {
                 ok: true,
                 conflict: result.conflict,
                 max_version: result.max_version,
                 error: String::new(),
             }
         }
-        Err(error) => ActorStateApplyBatchResult {
+        Err(error) => MemoryStateApplyBatchResult {
             ok: false,
             conflict: false,
             max_version: -1,
@@ -4222,11 +4226,11 @@ async fn op_actor_state_apply_blind_batch(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_enqueue_batch(
+async fn op_memory_state_enqueue_batch(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateEnqueueBatchPayload,
-) -> ActorStateEnqueueBatchResult {
-    let (namespace, actor_key) = match actor_storage_scope_for_payload(
+    #[serde] payload: MemoryStateEnqueueBatchPayload,
+) -> MemoryStateEnqueueBatchResult {
+    let (namespace, memory_key) = match memory_storage_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4234,7 +4238,7 @@ async fn op_actor_state_enqueue_batch(
     ) {
         Ok(scope) => scope,
         Err(error) => {
-            return ActorStateEnqueueBatchResult {
+            return MemoryStateEnqueueBatchResult {
                 ok: false,
                 submission_id: 0,
                 error: error.to_string(),
@@ -4244,35 +4248,39 @@ async fn op_actor_state_enqueue_batch(
     let mutations = payload
         .mutations
         .into_iter()
-        .map(|mutation| ActorDirectMutation {
+        .map(|mutation| MemoryDirectMutation {
             key: mutation.key,
             value: mutation.value,
             encoding: mutation.encoding,
             deleted: mutation.deleted,
         })
         .collect::<Vec<_>>();
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     let store_for_enqueue = store.clone();
     let enqueue_result = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_enqueue.enqueue_direct_batch(&namespace, &actor_key, &mutations))
+        runtime.block_on(store_for_enqueue.enqueue_direct_batch(
+            &namespace,
+            &memory_key,
+            &mutations,
+        ))
     })
     .join()
     .unwrap_or_else(|_| {
         Err(PlatformError::internal(
-            "actor direct enqueue worker panicked",
+            "memory direct enqueue worker panicked",
         ))
     });
     match enqueue_result {
-        Ok(submission_id) => ActorStateEnqueueBatchResult {
+        Ok(submission_id) => MemoryStateEnqueueBatchResult {
             ok: true,
             submission_id,
             error: String::new(),
         },
-        Err(error) => ActorStateEnqueueBatchResult {
+        Err(error) => MemoryStateEnqueueBatchResult {
             ok: false,
             submission_id: 0,
             error: error.to_string(),
@@ -4282,21 +4290,21 @@ async fn op_actor_state_enqueue_batch(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_state_await_submission(
+async fn op_memory_state_await_submission(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorStateAwaitSubmissionPayload,
-) -> ActorStateAwaitSubmissionResult {
-    let store = state.borrow().borrow::<ActorStore>().clone();
+    #[serde] payload: MemoryStateAwaitSubmissionPayload,
+) -> MemoryStateAwaitSubmissionResult {
+    let store = state.borrow().borrow::<MemoryStore>().clone();
     let started = Instant::now();
     loop {
         match store.try_poll_direct_submission(payload.submission_id) {
             Ok(Some(max_version)) => {
                 store.record_profile(
-                    ActorProfileMetricKind::StoreDirectAwait,
+                    MemoryProfileMetricKind::StoreDirectAwait,
                     started.elapsed().as_micros() as u64,
                     1,
                 );
-                return ActorStateAwaitSubmissionResult {
+                return MemoryStateAwaitSubmissionResult {
                     ok: true,
                     pending: false,
                     max_version,
@@ -4307,7 +4315,7 @@ async fn op_actor_state_await_submission(
                 std::thread::sleep(Duration::from_millis(1));
             }
             Ok(None) => {
-                return ActorStateAwaitSubmissionResult {
+                return MemoryStateAwaitSubmissionResult {
                     ok: false,
                     pending: false,
                     max_version: -1,
@@ -4318,7 +4326,7 @@ async fn op_actor_state_await_submission(
                 };
             }
             Err(error) => {
-                return ActorStateAwaitSubmissionResult {
+                return MemoryStateAwaitSubmissionResult {
                     ok: false,
                     pending: false,
                     max_version: -1,
@@ -4331,18 +4339,18 @@ async fn op_actor_state_await_submission(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_socket_send(
+async fn op_memory_socket_send(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorSocketSendPayload,
-) -> ActorSocketSendResult {
+    #[serde] payload: MemorySocketSendPayload,
+) -> MemorySocketSendResult {
     if payload.request_id.trim().is_empty() {
-        return ActorSocketSendResult {
+        return MemorySocketSendResult {
             ok: false,
             error: "memory socket send requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorSocketSendResult {
+        return MemorySocketSendResult {
             ok: false,
             error: "memory socket send requires handle".to_string(),
         };
@@ -4352,14 +4360,14 @@ async fn op_actor_socket_send(
         "text" => true,
         "binary" => false,
         _ => {
-            return ActorSocketSendResult {
+            return MemorySocketSendResult {
                 ok: false,
                 error: format!("unsupported message kind: {normalized_kind}"),
             };
         }
     };
 
-    let (binding, key) = match actor_socket_scope_for_payload(
+    let (binding, key) = match memory_socket_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4367,7 +4375,7 @@ async fn op_actor_socket_send(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorSocketSendResult {
+            return MemorySocketSendResult {
                 ok: false,
                 error: error.to_string(),
             }
@@ -4378,24 +4386,26 @@ async fn op_actor_socket_send(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorSocketSend(ActorSocketSendEvent {
-            reply: reply_tx,
-            handle: payload.handle,
-            binding,
-            key,
-            is_text,
-            message: payload.message,
-        }))
+        .send(IsolateEventPayload::MemorySocketSend(
+            MemorySocketSendEvent {
+                reply: reply_tx,
+                handle: payload.handle,
+                binding,
+                key,
+                is_text,
+                message: payload.message,
+            },
+        ))
         .is_err()
     {
-        return ActorSocketSendResult {
+        return MemorySocketSendResult {
             ok: false,
             error: "memory socket send runtime is unavailable".to_string(),
         };
     }
 
     drop(reply_rx);
-    ActorSocketSendResult {
+    MemorySocketSendResult {
         ok: true,
         error: String::new(),
     }
@@ -4403,24 +4413,24 @@ async fn op_actor_socket_send(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_socket_close(
+async fn op_memory_socket_close(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorSocketClosePayload,
-) -> ActorSocketCloseResult {
+    #[serde] payload: MemorySocketClosePayload,
+) -> MemorySocketCloseResult {
     if payload.request_id.trim().is_empty() {
-        return ActorSocketCloseResult {
+        return MemorySocketCloseResult {
             ok: false,
             error: "memory socket close requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorSocketCloseResult {
+        return MemorySocketCloseResult {
             ok: false,
             error: "memory socket close requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_socket_scope_for_payload(
+    let (binding, key) = match memory_socket_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4428,7 +4438,7 @@ async fn op_actor_socket_close(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorSocketCloseResult {
+            return MemorySocketCloseResult {
                 ok: false,
                 error: error.to_string(),
             };
@@ -4439,8 +4449,8 @@ async fn op_actor_socket_close(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorSocketClose(
-            ActorSocketCloseEvent {
+        .send(IsolateEventPayload::MemorySocketClose(
+            MemorySocketCloseEvent {
                 reply: reply_tx,
                 handle: payload.handle,
                 binding,
@@ -4451,14 +4461,14 @@ async fn op_actor_socket_close(
         ))
         .is_err()
     {
-        return ActorSocketCloseResult {
+        return MemorySocketCloseResult {
             ok: false,
             error: "memory socket close runtime is unavailable".to_string(),
         };
     }
 
     drop(reply_rx);
-    ActorSocketCloseResult {
+    MemorySocketCloseResult {
         ok: true,
         error: String::new(),
     }
@@ -4466,19 +4476,19 @@ async fn op_actor_socket_close(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_socket_list(
+async fn op_memory_socket_list(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorSocketListPayload,
-) -> ActorSocketListResult {
+    #[serde] payload: MemorySocketListPayload,
+) -> MemorySocketListResult {
     if payload.request_id.trim().is_empty() {
-        return ActorSocketListResult {
+        return MemorySocketListResult {
             ok: false,
             handles: Vec::new(),
             error: "memory socket list requires request_id".to_string(),
         };
     }
 
-    let (binding, key) = match actor_socket_scope_for_payload(
+    let (binding, key) = match memory_socket_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4486,7 +4496,7 @@ async fn op_actor_socket_list(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorSocketListResult {
+            return MemorySocketListResult {
                 ok: false,
                 handles: Vec::new(),
                 error: error.to_string(),
@@ -4494,8 +4504,8 @@ async fn op_actor_socket_list(
         }
     };
 
-    let registry = state.borrow().borrow::<ActorOpenHandleRegistry>().clone();
-    ActorSocketListResult {
+    let registry = state.borrow().borrow::<MemoryOpenHandleRegistry>().clone();
+    MemorySocketListResult {
         ok: true,
         handles: registry.list_socket_handles(&binding, &key),
         error: String::new(),
@@ -4504,26 +4514,26 @@ async fn op_actor_socket_list(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_socket_consume_close(
+async fn op_memory_socket_consume_close(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorSocketConsumeClosePayload,
-) -> ActorSocketConsumeCloseResult {
+    #[serde] payload: MemorySocketConsumeClosePayload,
+) -> MemorySocketConsumeCloseResult {
     if payload.request_id.trim().is_empty() {
-        return ActorSocketConsumeCloseResult {
+        return MemorySocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory socket consumeClose requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorSocketConsumeCloseResult {
+        return MemorySocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory socket consumeClose requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_socket_scope_for_payload(
+    let (binding, key) = match memory_socket_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4531,7 +4541,7 @@ async fn op_actor_socket_consume_close(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorSocketConsumeCloseResult {
+            return MemorySocketConsumeCloseResult {
                 ok: false,
                 events: Vec::new(),
                 error: error.to_string(),
@@ -4543,8 +4553,8 @@ async fn op_actor_socket_consume_close(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorSocketConsumeClose(
-            ActorSocketConsumeCloseEvent {
+        .send(IsolateEventPayload::MemorySocketConsumeClose(
+            MemorySocketConsumeCloseEvent {
                 reply: reply_tx,
                 binding,
                 key,
@@ -4553,7 +4563,7 @@ async fn op_actor_socket_consume_close(
         ))
         .is_err()
     {
-        return ActorSocketConsumeCloseResult {
+        return MemorySocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory socket consumeClose runtime is unavailable".to_string(),
@@ -4561,23 +4571,23 @@ async fn op_actor_socket_consume_close(
     }
 
     match reply_rx.await {
-        Ok(Ok(events)) => ActorSocketConsumeCloseResult {
+        Ok(Ok(events)) => MemorySocketConsumeCloseResult {
             ok: true,
             events: events
                 .into_iter()
-                .map(|event| ActorSocketReplayClose {
+                .map(|event| MemorySocketReplayClose {
                     code: event.code,
                     reason: event.reason,
                 })
                 .collect(),
             error: String::new(),
         },
-        Ok(Err(error)) => ActorSocketConsumeCloseResult {
+        Ok(Err(error)) => MemorySocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: error.to_string(),
         },
-        Err(_) => ActorSocketConsumeCloseResult {
+        Err(_) => MemorySocketConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory socket consumeClose response channel closed".to_string(),
@@ -4585,7 +4595,7 @@ async fn op_actor_socket_consume_close(
     }
 }
 
-fn actor_transport_scope_for_payload(
+fn memory_transport_scope_for_payload(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
     binding: &str,
@@ -4596,29 +4606,29 @@ fn actor_transport_scope_for_payload(
     if !binding.is_empty() && !key.is_empty() {
         return Ok((binding.to_string(), key.to_string()));
     }
-    actor_scope_for_request(state, request_id)
+    memory_scope_for_request(state, request_id)
 }
 
 #[deno_core::op2]
 #[serde]
-fn op_actor_scope_enter(
+fn op_memory_scope_enter(
     state: &mut OpState,
-    #[serde] payload: ActorScopePayload,
-) -> ActorScopeResult {
+    #[serde] payload: MemoryScopePayload,
+) -> MemoryScopeResult {
     if payload.request_id.trim().is_empty() {
-        return ActorScopeResult {
+        return MemoryScopeResult {
             ok: false,
             error: "memory scope enter requires request_id".to_string(),
         };
     }
     if payload.binding.trim().is_empty() || payload.key.trim().is_empty() {
-        return ActorScopeResult {
+        return MemoryScopeResult {
             ok: false,
             error: "memory scope enter requires binding and key".to_string(),
         };
     }
-    register_actor_request_scope(state, payload.request_id, payload.binding, payload.key);
-    ActorScopeResult {
+    register_memory_request_scope(state, payload.request_id, payload.binding, payload.key);
+    MemoryScopeResult {
         ok: true,
         error: String::new(),
     }
@@ -4626,18 +4636,18 @@ fn op_actor_scope_enter(
 
 #[deno_core::op2]
 #[serde]
-fn op_actor_scope_exit(
+fn op_memory_scope_exit(
     state: &mut OpState,
-    #[serde] payload: ActorScopeClearPayload,
-) -> ActorScopeResult {
+    #[serde] payload: MemoryScopeClearPayload,
+) -> MemoryScopeResult {
     if payload.request_id.trim().is_empty() {
-        return ActorScopeResult {
+        return MemoryScopeResult {
             ok: false,
             error: "memory scope exit requires request_id".to_string(),
         };
     }
-    clear_actor_request_scope(state, &payload.request_id);
-    ActorScopeResult {
+    clear_memory_request_scope(state, &payload.request_id);
+    MemoryScopeResult {
         ok: true,
         error: String::new(),
     }
@@ -4645,24 +4655,24 @@ fn op_actor_scope_exit(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_send_stream(
+async fn op_memory_transport_send_stream(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportSendStreamPayload,
-) -> ActorTransportSendResult {
+    #[serde] payload: MemoryTransportSendStreamPayload,
+) -> MemoryTransportSendResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportSendResult {
+        return MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendStream requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorTransportSendResult {
+        return MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendStream requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4670,7 +4680,7 @@ async fn op_actor_transport_send_stream(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportSendResult {
+            return MemoryTransportSendResult {
                 ok: false,
                 error: error.to_string(),
             };
@@ -4681,8 +4691,8 @@ async fn op_actor_transport_send_stream(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorTransportSendStream(
-            ActorTransportSendStreamEvent {
+        .send(IsolateEventPayload::MemoryTransportSendStream(
+            MemoryTransportSendStreamEvent {
                 reply: reply_tx,
                 handle: payload.handle,
                 binding,
@@ -4692,22 +4702,22 @@ async fn op_actor_transport_send_stream(
         ))
         .is_err()
     {
-        return ActorTransportSendResult {
+        return MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendStream runtime is unavailable".to_string(),
         };
     }
 
     match reply_rx.await {
-        Ok(Ok(())) => ActorTransportSendResult {
+        Ok(Ok(())) => MemoryTransportSendResult {
             ok: true,
             error: String::new(),
         },
-        Ok(Err(error)) => ActorTransportSendResult {
+        Ok(Err(error)) => MemoryTransportSendResult {
             ok: false,
             error: error.to_string(),
         },
-        Err(_) => ActorTransportSendResult {
+        Err(_) => MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendStream response channel closed".to_string(),
         },
@@ -4716,24 +4726,24 @@ async fn op_actor_transport_send_stream(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_send_datagram(
+async fn op_memory_transport_send_datagram(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportSendDatagramPayload,
-) -> ActorTransportSendResult {
+    #[serde] payload: MemoryTransportSendDatagramPayload,
+) -> MemoryTransportSendResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportSendResult {
+        return MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendDatagram requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorTransportSendResult {
+        return MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendDatagram requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4741,7 +4751,7 @@ async fn op_actor_transport_send_datagram(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportSendResult {
+            return MemoryTransportSendResult {
                 ok: false,
                 error: error.to_string(),
             };
@@ -4752,8 +4762,8 @@ async fn op_actor_transport_send_datagram(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorTransportSendDatagram(
-            ActorTransportSendDatagramEvent {
+        .send(IsolateEventPayload::MemoryTransportSendDatagram(
+            MemoryTransportSendDatagramEvent {
                 reply: reply_tx,
                 handle: payload.handle,
                 binding,
@@ -4763,22 +4773,22 @@ async fn op_actor_transport_send_datagram(
         ))
         .is_err()
     {
-        return ActorTransportSendResult {
+        return MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendDatagram runtime is unavailable".to_string(),
         };
     }
 
     match reply_rx.await {
-        Ok(Ok(())) => ActorTransportSendResult {
+        Ok(Ok(())) => MemoryTransportSendResult {
             ok: true,
             error: String::new(),
         },
-        Ok(Err(error)) => ActorTransportSendResult {
+        Ok(Err(error)) => MemoryTransportSendResult {
             ok: false,
             error: error.to_string(),
         },
-        Err(_) => ActorTransportSendResult {
+        Err(_) => MemoryTransportSendResult {
             ok: false,
             error: "memory transport sendDatagram response channel closed".to_string(),
         },
@@ -4787,12 +4797,12 @@ async fn op_actor_transport_send_datagram(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_recv_stream(
+async fn op_memory_transport_recv_stream(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportRecvPayload,
-) -> ActorTransportRecvResult {
+    #[serde] payload: MemoryTransportRecvPayload,
+) -> MemoryTransportRecvResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportRecvResult {
+        return MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4800,7 +4810,7 @@ async fn op_actor_transport_recv_stream(
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorTransportRecvResult {
+        return MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4808,7 +4818,7 @@ async fn op_actor_transport_recv_stream(
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4816,7 +4826,7 @@ async fn op_actor_transport_recv_stream(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportRecvResult {
+            return MemoryTransportRecvResult {
                 ok: false,
                 done: true,
                 chunk: Vec::new(),
@@ -4829,8 +4839,8 @@ async fn op_actor_transport_recv_stream(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorTransportRecvStream(
-            ActorTransportRecvStreamEvent {
+        .send(IsolateEventPayload::MemoryTransportRecvStream(
+            MemoryTransportRecvStreamEvent {
                 reply: reply_tx,
                 handle: payload.handle,
                 binding,
@@ -4839,7 +4849,7 @@ async fn op_actor_transport_recv_stream(
         ))
         .is_err()
     {
-        return ActorTransportRecvResult {
+        return MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4848,19 +4858,19 @@ async fn op_actor_transport_recv_stream(
     }
 
     match reply_rx.await {
-        Ok(Ok(event)) => ActorTransportRecvResult {
+        Ok(Ok(event)) => MemoryTransportRecvResult {
             ok: true,
             done: event.done,
             chunk: event.chunk,
             error: String::new(),
         },
-        Ok(Err(error)) => ActorTransportRecvResult {
+        Ok(Err(error)) => MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
             error: error.to_string(),
         },
-        Err(_) => ActorTransportRecvResult {
+        Err(_) => MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4871,12 +4881,12 @@ async fn op_actor_transport_recv_stream(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_recv_datagram(
+async fn op_memory_transport_recv_datagram(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportRecvPayload,
-) -> ActorTransportRecvResult {
+    #[serde] payload: MemoryTransportRecvPayload,
+) -> MemoryTransportRecvResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportRecvResult {
+        return MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4884,7 +4894,7 @@ async fn op_actor_transport_recv_datagram(
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorTransportRecvResult {
+        return MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4892,7 +4902,7 @@ async fn op_actor_transport_recv_datagram(
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4900,7 +4910,7 @@ async fn op_actor_transport_recv_datagram(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportRecvResult {
+            return MemoryTransportRecvResult {
                 ok: false,
                 done: true,
                 chunk: Vec::new(),
@@ -4913,8 +4923,8 @@ async fn op_actor_transport_recv_datagram(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorTransportRecvDatagram(
-            ActorTransportRecvDatagramEvent {
+        .send(IsolateEventPayload::MemoryTransportRecvDatagram(
+            MemoryTransportRecvDatagramEvent {
                 reply: reply_tx,
                 handle: payload.handle,
                 binding,
@@ -4923,7 +4933,7 @@ async fn op_actor_transport_recv_datagram(
         ))
         .is_err()
     {
-        return ActorTransportRecvResult {
+        return MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4932,19 +4942,19 @@ async fn op_actor_transport_recv_datagram(
     }
 
     match reply_rx.await {
-        Ok(Ok(event)) => ActorTransportRecvResult {
+        Ok(Ok(event)) => MemoryTransportRecvResult {
             ok: true,
             done: event.done,
             chunk: event.chunk,
             error: String::new(),
         },
-        Ok(Err(error)) => ActorTransportRecvResult {
+        Ok(Err(error)) => MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
             error: error.to_string(),
         },
-        Err(_) => ActorTransportRecvResult {
+        Err(_) => MemoryTransportRecvResult {
             ok: false,
             done: true,
             chunk: Vec::new(),
@@ -4955,24 +4965,24 @@ async fn op_actor_transport_recv_datagram(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_close(
+async fn op_memory_transport_close(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportClosePayload,
-) -> ActorTransportCloseResult {
+    #[serde] payload: MemoryTransportClosePayload,
+) -> MemoryTransportCloseResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportCloseResult {
+        return MemoryTransportCloseResult {
             ok: false,
             error: "memory transport close requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorTransportCloseResult {
+        return MemoryTransportCloseResult {
             ok: false,
             error: "memory transport close requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -4980,7 +4990,7 @@ async fn op_actor_transport_close(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportCloseResult {
+            return MemoryTransportCloseResult {
                 ok: false,
                 error: error.to_string(),
             };
@@ -4991,8 +5001,8 @@ async fn op_actor_transport_close(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorTransportClose(
-            ActorTransportCloseEvent {
+        .send(IsolateEventPayload::MemoryTransportClose(
+            MemoryTransportCloseEvent {
                 reply: reply_tx,
                 handle: payload.handle,
                 binding,
@@ -5003,22 +5013,22 @@ async fn op_actor_transport_close(
         ))
         .is_err()
     {
-        return ActorTransportCloseResult {
+        return MemoryTransportCloseResult {
             ok: false,
             error: "memory transport close runtime is unavailable".to_string(),
         };
     }
 
     match reply_rx.await {
-        Ok(Ok(())) => ActorTransportCloseResult {
+        Ok(Ok(())) => MemoryTransportCloseResult {
             ok: true,
             error: String::new(),
         },
-        Ok(Err(error)) => ActorTransportCloseResult {
+        Ok(Err(error)) => MemoryTransportCloseResult {
             ok: false,
             error: error.to_string(),
         },
-        Err(_) => ActorTransportCloseResult {
+        Err(_) => MemoryTransportCloseResult {
             ok: false,
             error: "memory transport close response channel closed".to_string(),
         },
@@ -5027,19 +5037,19 @@ async fn op_actor_transport_close(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_list(
+async fn op_memory_transport_list(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportListPayload,
-) -> ActorTransportListResult {
+    #[serde] payload: MemoryTransportListPayload,
+) -> MemoryTransportListResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportListResult {
+        return MemoryTransportListResult {
             ok: false,
             handles: Vec::new(),
             error: "memory transport list requires request_id".to_string(),
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -5047,7 +5057,7 @@ async fn op_actor_transport_list(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportListResult {
+            return MemoryTransportListResult {
                 ok: false,
                 handles: Vec::new(),
                 error: error.to_string(),
@@ -5055,8 +5065,8 @@ async fn op_actor_transport_list(
         }
     };
 
-    let registry = state.borrow().borrow::<ActorOpenHandleRegistry>().clone();
-    ActorTransportListResult {
+    let registry = state.borrow().borrow::<MemoryOpenHandleRegistry>().clone();
+    MemoryTransportListResult {
         ok: true,
         handles: registry.list_transport_handles(&binding, &key),
         error: String::new(),
@@ -5065,26 +5075,26 @@ async fn op_actor_transport_list(
 
 #[deno_core::op2]
 #[serde]
-async fn op_actor_transport_consume_close(
+async fn op_memory_transport_consume_close(
     state: Rc<RefCell<OpState>>,
-    #[serde] payload: ActorTransportConsumeClosePayload,
-) -> ActorTransportConsumeCloseResult {
+    #[serde] payload: MemoryTransportConsumeClosePayload,
+) -> MemoryTransportConsumeCloseResult {
     if payload.request_id.trim().is_empty() {
-        return ActorTransportConsumeCloseResult {
+        return MemoryTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory transport consumeClose requires request_id".to_string(),
         };
     }
     if payload.handle.trim().is_empty() {
-        return ActorTransportConsumeCloseResult {
+        return MemoryTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory transport consumeClose requires handle".to_string(),
         };
     }
 
-    let (binding, key) = match actor_transport_scope_for_payload(
+    let (binding, key) = match memory_transport_scope_for_payload(
         &state,
         &payload.request_id,
         &payload.binding,
@@ -5092,7 +5102,7 @@ async fn op_actor_transport_consume_close(
     ) {
         Ok(value) => value,
         Err(error) => {
-            return ActorTransportConsumeCloseResult {
+            return MemoryTransportConsumeCloseResult {
                 ok: false,
                 events: Vec::new(),
                 error: error.to_string(),
@@ -5104,8 +5114,8 @@ async fn op_actor_transport_consume_close(
     let sender = state.borrow().borrow::<IsolateEventSender>().clone();
     if sender
         .0
-        .send(IsolateEventPayload::ActorTransportConsumeClose(
-            ActorTransportConsumeCloseEvent {
+        .send(IsolateEventPayload::MemoryTransportConsumeClose(
+            MemoryTransportConsumeCloseEvent {
                 reply: reply_tx,
                 binding,
                 key,
@@ -5114,7 +5124,7 @@ async fn op_actor_transport_consume_close(
         ))
         .is_err()
     {
-        return ActorTransportConsumeCloseResult {
+        return MemoryTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory transport consumeClose runtime is unavailable".to_string(),
@@ -5122,23 +5132,23 @@ async fn op_actor_transport_consume_close(
     }
 
     match reply_rx.await {
-        Ok(Ok(events)) => ActorTransportConsumeCloseResult {
+        Ok(Ok(events)) => MemoryTransportConsumeCloseResult {
             ok: true,
             events: events
                 .into_iter()
-                .map(|event| ActorTransportReplayClose {
+                .map(|event| MemoryTransportReplayClose {
                     code: event.code,
                     reason: event.reason,
                 })
                 .collect(),
             error: String::new(),
         },
-        Ok(Err(error)) => ActorTransportConsumeCloseResult {
+        Ok(Err(error)) => MemoryTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: error.to_string(),
         },
-        Err(_) => ActorTransportConsumeCloseResult {
+        Err(_) => MemoryTransportConsumeCloseResult {
             ok: false,
             events: Vec::new(),
             error: "memory transport consumeClose response channel closed".to_string(),
@@ -5152,7 +5162,7 @@ fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
         let request_id = meta.request_id;
         clear_request_body_stream(state, &request_id);
         if meta.wait_until_count == 0 {
-            clear_actor_request_scope(state, &request_id);
+            clear_memory_request_scope(state, &request_id);
             clear_request_secret_context(state, &request_id);
         }
     }
@@ -5163,7 +5173,7 @@ fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
 #[deno_core::op2(fast)]
 fn op_emit_wait_until_done(state: &mut OpState, #[string] payload: String) {
     if let Some(request_id) = wait_until_request_id(&payload) {
-        clear_actor_request_scope(state, &request_id);
+        clear_memory_request_scope(state, &request_id);
         clear_request_secret_context(state, &request_id);
     }
     let sender = state.borrow::<IsolateEventSender>().clone();
@@ -5234,31 +5244,31 @@ deno_core::extension!(
         op_dynamic_host_rpc_invoke,
         op_request_body_read,
         op_request_body_cancel,
-        op_actor_invoke_method,
-        op_actor_profile_record_js,
-        op_actor_profile_take,
-        op_actor_profile_reset,
-        op_actor_state_get,
-        op_actor_state_snapshot,
-        op_actor_state_validate_reads,
-        op_actor_state_version_if_newer,
-        op_actor_state_apply_batch,
-        op_actor_state_apply_blind_batch,
-        op_actor_state_enqueue_batch,
-        op_actor_state_await_submission,
-        op_actor_socket_send,
-        op_actor_socket_close,
-        op_actor_socket_list,
-        op_actor_socket_consume_close,
-        op_actor_scope_enter,
-        op_actor_scope_exit,
-        op_actor_transport_send_stream,
-        op_actor_transport_send_datagram,
-        op_actor_transport_recv_stream,
-        op_actor_transport_recv_datagram,
-        op_actor_transport_close,
-        op_actor_transport_list,
-        op_actor_transport_consume_close,
+        op_memory_invoke_method,
+        op_memory_profile_record_js,
+        op_memory_profile_take,
+        op_memory_profile_reset,
+        op_memory_state_get,
+        op_memory_state_snapshot,
+        op_memory_state_validate_reads,
+        op_memory_state_version_if_newer,
+        op_memory_state_apply_batch,
+        op_memory_state_apply_blind_batch,
+        op_memory_state_enqueue_batch,
+        op_memory_state_await_submission,
+        op_memory_socket_send,
+        op_memory_socket_close,
+        op_memory_socket_list,
+        op_memory_socket_consume_close,
+        op_memory_scope_enter,
+        op_memory_scope_exit,
+        op_memory_transport_send_stream,
+        op_memory_transport_send_datagram,
+        op_memory_transport_recv_stream,
+        op_memory_transport_recv_datagram,
+        op_memory_transport_close,
+        op_memory_transport_list,
+        op_memory_transport_consume_close,
         op_emit_completion,
         op_emit_wait_until_done,
         op_emit_response_start,
@@ -5530,17 +5540,17 @@ pub fn register_request_body_stream(
         .insert(request_id, Arc::new(RequestBodyStream::new(receiver)));
 }
 
-pub fn register_actor_request_scope(
+pub fn register_memory_request_scope(
     state: &mut OpState,
     request_id: String,
     namespace: String,
-    actor_key: String,
+    memory_key: String,
 ) {
-    state.borrow_mut::<ActorRequestScopes>().scopes.insert(
+    state.borrow_mut::<MemoryRequestScopes>().scopes.insert(
         request_id,
-        ActorRequestScope {
+        MemoryRequestScope {
             namespace,
-            actor_key,
+            memory_key,
         },
     );
 }
@@ -5611,9 +5621,9 @@ pub fn clear_request_body_stream(state: &mut OpState, request_id: &str) {
     }
 }
 
-pub fn clear_actor_request_scope(state: &mut OpState, request_id: &str) {
+pub fn clear_memory_request_scope(state: &mut OpState, request_id: &str) {
     state
-        .borrow_mut::<ActorRequestScopes>()
+        .borrow_mut::<MemoryRequestScopes>()
         .scopes
         .remove(request_id);
 }

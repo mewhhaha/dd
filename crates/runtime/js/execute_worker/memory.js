@@ -1,88 +1,88 @@
-  const createActorStub = (namespace, actorKey) => Object.freeze({
-    id: createActorId(namespace, actorKey),
+  const createMemoryStub = (namespace, memoryKey) => Object.freeze({
+    id: createMemoryId(namespace, memoryKey),
     binding: namespace,
-    sockets: createActorStubSocketApi(namespace, actorKey),
-    transports: createActorStubTransportApi(namespace, actorKey),
+    sockets: createMemoryStubSocketApi(namespace, memoryKey),
+    transports: createMemoryStubTransportApi(namespace, memoryKey),
     read(key, options) {
-      return createActorStubVarApi(namespace, actorKey, key).read(options);
+      return createMemoryStubVarApi(namespace, memoryKey, key).read(options);
     },
     async write(key, value) {
       const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
-      const state = createActorStorageBinding(entry, runtimeRequestId);
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      const state = createMemoryStorageBinding(entry, runtimeRequestId);
       state.put(String(key ?? ""), value);
-      await ensureActorStorageQueued(entry, runtimeRequestId);
+      await ensureMemoryStorageQueued(entry, runtimeRequestId);
       return value;
     },
     async delete(key) {
       const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
-      const state = createActorStorageBinding(entry, runtimeRequestId);
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      const state = createMemoryStorageBinding(entry, runtimeRequestId);
       state.delete(String(key ?? ""));
-      await ensureActorStorageQueued(entry, runtimeRequestId);
+      await ensureMemoryStorageQueued(entry, runtimeRequestId);
       return true;
     },
     async writeMany(entries) {
       const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
-      const state = createActorStorageBinding(entry, runtimeRequestId);
-      const normalizedEntries = normalizeActorWriteManyEntries(entries);
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      const state = createMemoryStorageBinding(entry, runtimeRequestId);
+      const normalizedEntries = normalizeMemoryWriteManyEntries(entries);
       for (const item of normalizedEntries) {
         state.put(item.key, item.value);
       }
-      await ensureActorStorageQueued(entry, runtimeRequestId);
+      await ensureMemoryStorageQueued(entry, runtimeRequestId);
       return normalizedEntries.length;
     },
     async list(options = {}) {
-      const scope = actorTxnScopeFor(namespace, actorKey);
+      const scope = memoryTxnScopeFor(namespace, memoryKey);
       if (scope) {
         return scope.state.list(options);
       }
       const runtimeRequestId = activeRequestId();
-      const entry = await ensureActorEntry(namespace, actorKey, runtimeRequestId, { hydrate: false });
-      const storageState = ensureActorStorageState(entry);
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      const storageState = ensureMemoryStorageState(entry);
       if (
         !storageState.fullSnapshotLoaded
         || storageState.stale === true
-        || actorSnapshotTtlExpired(storageState)
+        || memorySnapshotTtlExpired(storageState)
       ) {
-        await ensureActorStorageHydrated(entry, runtimeRequestId, {
+        await ensureMemoryStorageHydrated(entry, runtimeRequestId, {
           force: storageState.fullSnapshotLoaded,
         });
       } else {
-        recordActorProfile("actor_cache_hit", 0, 1);
+        recordMemoryProfile("memory_cache_hit", 0, 1);
       }
-      return createActorStorageBinding(entry, runtimeRequestId).list(options).map((entryValue) => ({
+      return createMemoryStorageBinding(entry, runtimeRequestId).list(options).map((entryValue) => ({
         key: entryValue.key,
         value: entryValue.value,
         version: entryValue.version,
       }));
     },
     var(key) {
-      return createActorStubVarApi(namespace, actorKey, key);
+      return createMemoryStubVarApi(namespace, memoryKey, key);
     },
     tvar(key, defaultValue = null) {
-      return createActorStubVarApi(namespace, actorKey, key, defaultValue);
+      return createMemoryStubVarApi(namespace, memoryKey, key, defaultValue);
     },
     defer(callback) {
-      const scope = actorTxnScopeFor(namespace, actorKey);
+      const scope = memoryTxnScopeFor(namespace, memoryKey);
       if (!scope) {
         throw new Error("stub.defer(callback) requires stub.atomic(...)");
       }
       return scope.state.defer(callback);
     },
     accept(request, options) {
-      const scope = actorTxnScopeFor(namespace, actorKey);
+      const scope = memoryTxnScopeFor(namespace, memoryKey);
       if (!scope) {
         throw new Error("stub.accept(request) requires stub.atomic(...)");
       }
       return scope.state.accept(request, options);
     },
     async atomic(executable, ...args) {
-      return await invokeActorExecutable(
+      return await invokeMemoryExecutable(
         namespace,
-        actorKey,
-        ACTOR_ATOMIC_METHOD,
+        memoryKey,
+        MEMORY_ATOMIC_METHOD,
         executable,
         args,
       );
@@ -139,18 +139,18 @@
     },
   });
 
-  const invokeActorExecutable = async (
+  const invokeMemoryExecutable = async (
     namespace,
-    actorKey,
+    memoryKey,
     methodName,
     executable,
     args,
   ) => {
       const scopedRequestId = activeRequestId();
-      const localRuntimeRequestId = `${scopedRequestId}:actor-run:${nextActorInvokeSeq()}`;
-      if (methodName === ACTOR_ATOMIC_METHOD && typeof executable === "function") {
-        const entry = await ensureActorEntry(namespace, actorKey, localRuntimeRequestId, { hydrate: false });
-        return await executeActorTransaction(
+      const localRuntimeRequestId = `${scopedRequestId}:memory-run:${nextMemoryInvokeSeq()}`;
+      if (methodName === MEMORY_ATOMIC_METHOD && typeof executable === "function") {
+        const entry = await ensureMemoryEntry(namespace, memoryKey, localRuntimeRequestId, { hydrate: false });
+        return await executeMemoryTransaction(
           entry,
           localRuntimeRequestId,
           executable,
@@ -168,11 +168,11 @@
       try {
         const preferCallerIsolate = !descriptor.export_name;
         const result = await callOp(
-          "op_actor_invoke_method",
+          "op_memory_invoke_method",
           {
             worker_name: workerName,
             binding: namespace,
-            key: actorKey,
+            key: memoryKey,
             method_name: methodName,
             prefer_caller_isolate: preferCallerIsolate,
             args: Array.from(argsBytes),
@@ -187,50 +187,50 @@
         return decodeRpcResult(toArrayBytes(result.value));
       } finally {
         if (descriptor.live_token) {
-          liveActorExecutables.delete(String(descriptor.live_token));
+          liveMemoryExecutables.delete(String(descriptor.live_token));
         }
       }
     };
 
-  const actorIdKey = (id) => {
+  const memoryIdKey = (id) => {
     if (typeof id === "string") {
       return id;
     }
     if (
       id
       && typeof id === "object"
-      && typeof id.__dd_actor_key === "string"
-      && typeof id.__dd_actor_binding === "string"
+      && typeof id.__dd_memory_key === "string"
+      && typeof id.__dd_memory_binding === "string"
     ) {
-      return id.__dd_actor_key;
+      return id.__dd_memory_key;
     }
     return "";
   };
 
-  const createActorNamespace = (bindingName) => Object.freeze({
+  const createMemoryNamespace = (bindingName) => Object.freeze({
     idFromName(name) {
       const key = String(name ?? "").trim();
       if (!key) {
         throw new Error("memory idFromName requires a non-empty name");
       }
-      return createActorId(bindingName, key);
+      return createMemoryId(bindingName, key);
     },
     get(id) {
       if (
         id
         && typeof id === "object"
-        && "__dd_actor_binding" in id
-        && String(id.__dd_actor_binding) !== bindingName
+        && "__dd_memory_binding" in id
+        && String(id.__dd_memory_binding) !== bindingName
       ) {
         throw new Error(
-          `memory id belongs to namespace ${String(id.__dd_actor_binding)}, not ${bindingName}`,
+          `memory id belongs to namespace ${String(id.__dd_memory_binding)}, not ${bindingName}`,
         );
       }
-      const actorKey = actorIdKey(id).trim();
-      if (!actorKey) {
+      const memoryKey = memoryIdKey(id).trim();
+      if (!memoryKey) {
         throw new Error("memory namespace get() requires a valid memory id");
       }
-      return createActorStub(bindingName, actorKey);
+      return createMemoryStub(bindingName, memoryKey);
     },
   });
 

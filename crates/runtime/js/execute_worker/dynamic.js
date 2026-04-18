@@ -352,7 +352,7 @@
         recordDynamicStageMetric("jsRequestNormalize", performance.now() - normalizeStarted);
 
         const scopedRequestId = activeRequestId();
-        const invokeSeq = nextActorInvokeSeq();
+        const invokeSeq = nextMemoryInvokeSeq();
         recordDynamicMetric("fastFetchPathHit");
         return invokeRemoteDynamicWorkerFetch(
           bindingName,
@@ -768,8 +768,8 @@
       });
     }
 
-    const actorBindings = Array.isArray(actorBindingsConfig) ? actorBindingsConfig : [];
-    for (const entry of actorBindings) {
+    const memoryBindings = Array.isArray(memoryBindingsConfig) ? memoryBindingsConfig : [];
+    for (const entry of memoryBindings) {
       const bindingName = Array.isArray(entry)
         ? String(entry[0] ?? "").trim()
         : entry && typeof entry === "object"
@@ -779,7 +779,7 @@
         continue;
       }
       const envName = bindingName;
-      defineLazyValue(env, envName, () => createActorNamespace(bindingName));
+      defineLazyValue(env, envName, () => createMemoryNamespace(bindingName));
     }
 
     Object.freeze(env);
@@ -812,9 +812,9 @@
 
   const instantiateExecutable = (descriptor) => {
     const liveToken = String(descriptor?.liveToken ?? "").trim();
-    if (liveToken && liveActorExecutables.has(liveToken)) {
-      const executable = liveActorExecutables.get(liveToken);
-      liveActorExecutables.delete(liveToken);
+    if (liveToken && liveMemoryExecutables.has(liveToken)) {
+      const executable = liveMemoryExecutables.get(liveToken);
+      liveMemoryExecutables.delete(liveToken);
       if (typeof executable === "function") {
         return executable;
       }
@@ -839,7 +839,7 @@
     }
   };
 
-  const executeActorTransaction = async (
+  const executeMemoryTransaction = async (
     entry,
     runtimeRequestId,
     executable,
@@ -849,9 +849,9 @@
     let lastConflict = null;
     for (let attempt = 0; attempt < maxRetries; attempt += 1) {
       for (;;) {
-        const txn = createActorTxn(entry);
+        const txn = createMemoryTxn(entry);
         const txnStarted = performance.now();
-        const scopedState = createActorAtomicState(
+        const scopedState = createMemoryAtomicState(
           entry,
           runtimeRequestId,
           true,
@@ -859,19 +859,19 @@
           txn,
         );
         const current = currentRequestContext();
-        const previousActorEntry = current.actorEntry;
-        const previousActorRequestId = current.actorRequestId;
+        const previousMemoryEntry = current.memoryEntry;
+        const previousMemoryRequestId = current.memoryRequestId;
         const previousSocketRuntimeProvider = current.socketRuntimeProvider;
         const previousTransportRuntimeProvider = current.transportRuntimeProvider;
-        current.actorEntry = entry;
-        current.actorRequestId = runtimeRequestId;
+        current.memoryEntry = entry;
+        current.memoryRequestId = runtimeRequestId;
         current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
         current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
         try {
-          const value = withActorTxnScope(
+          const value = withMemoryTxnScope(
             {
               binding: entry.binding,
-              actorKey: entry.actorKey,
+              memoryKey: entry.memoryKey,
               state: scopedState,
               stub: scopedState.stub,
             },
@@ -880,19 +880,19 @@
           if (value instanceof Promise) {
             throw new Error("stub.atomic callback must be synchronous");
           }
-          if (actorTxnIsSnapshotOnly(txn)) {
-            recordActorProfile("js_read_only_total", performance.now() - txnStarted, 1);
+          if (memoryTxnIsSnapshotOnly(txn)) {
+            recordMemoryProfile("js_read_only_total", performance.now() - txnStarted, 1);
             return value;
           }
-          if (actorTxnIsReadOnly(txn)) {
-            recordActorProfile("js_read_only_total", performance.now() - txnStarted, 1);
+          if (memoryTxnIsReadOnly(txn)) {
+            recordMemoryProfile("js_read_only_total", performance.now() - txnStarted, 1);
             return value;
           }
-          const committed = actorTxnIsBlindWrite(txn)
-            ? await commitActorBlindTxn(txn, runtimeRequestId)
+          const committed = memoryTxnIsBlindWrite(txn)
+            ? await commitMemoryBlindTxn(txn, runtimeRequestId)
             : txn.writes.size === 0 && txn.accepted !== true
-            ? await validateActorTxnReads(txn, runtimeRequestId)
-            : await commitActorTxn(txn, runtimeRequestId);
+            ? await validateMemoryTxnReads(txn, runtimeRequestId)
+            : await commitMemoryTxn(txn, runtimeRequestId);
           if (!committed) {
             lastConflict = new Error("memory transaction conflicted");
             await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
@@ -908,9 +908,9 @@
         } catch (error) {
           if (error instanceof MemoryHydrationNeeded && error.__dd_memory_hydration_needed === true) {
             if (error.mode === "full") {
-              await ensureActorStorageHydrated(entry, runtimeRequestId);
+              await ensureMemoryStorageHydrated(entry, runtimeRequestId);
             } else {
-              await ensureActorStorageKeysHydrated(entry, runtimeRequestId, error.keys);
+              await ensureMemoryStorageKeysHydrated(entry, runtimeRequestId, error.keys);
             }
             continue;
           }
@@ -927,8 +927,8 @@
           }
           throw error;
         } finally {
-          current.actorEntry = previousActorEntry;
-          current.actorRequestId = previousActorRequestId;
+          current.memoryEntry = previousMemoryEntry;
+          current.memoryRequestId = previousMemoryRequestId;
           current.socketRuntimeProvider = previousSocketRuntimeProvider;
           current.transportRuntimeProvider = previousTransportRuntimeProvider;
         }
@@ -937,12 +937,12 @@
     throw lastConflict ?? new Error("memory transaction exceeded retry limit");
   };
 
-  const buildWakeEvent = (actorCall, stub) => {
-    const kind = String(actorCall.kind ?? "").trim();
+  const buildWakeEvent = (memoryCall, stub) => {
+    const kind = String(memoryCall.kind ?? "").trim();
     const event = {
       type: kind,
-      binding: String(actorCall.binding ?? ""),
-      key: String(actorCall.key ?? ""),
+      binding: String(memoryCall.binding ?? ""),
+      key: String(memoryCall.key ?? ""),
     };
     Object.defineProperty(event, "stub", {
       value: stub,
@@ -950,96 +950,96 @@
       configurable: true,
       writable: false,
     });
-    if ("handle" in actorCall) {
-      event.handle = String(actorCall.handle ?? "");
+    if ("handle" in memoryCall) {
+      event.handle = String(memoryCall.handle ?? "");
     }
     if (kind === "message") {
-      const raw = toArrayBytes(actorCall.data);
-      event.data = actorCall.is_text === true ? Deno.core.decode(raw) : raw;
-      event.isText = actorCall.is_text === true;
+      const raw = toArrayBytes(memoryCall.data);
+      event.data = memoryCall.is_text === true ? Deno.core.decode(raw) : raw;
+      event.isText = memoryCall.is_text === true;
       event.type = "socketmessage";
     } else if (kind === "close") {
-      event.code = Number(actorCall.code ?? 1000);
-      event.reason = String(actorCall.reason ?? "");
+      event.code = Number(memoryCall.code ?? 1000);
+      event.reason = String(memoryCall.reason ?? "");
       event.type = "socketclose";
     } else if (kind === "transport_datagram" || kind === "datagram") {
-      event.data = toArrayBytes(actorCall.data);
+      event.data = toArrayBytes(memoryCall.data);
       event.type = "transportdatagram";
     } else if (kind === "transport_stream" || kind === "stream") {
-      event.data = toArrayBytes(actorCall.data);
+      event.data = toArrayBytes(memoryCall.data);
       event.type = "transportstream";
     } else if (kind === "transport_close" || kind === "transport") {
-      event.code = Number(actorCall.code ?? 0);
-      event.reason = String(actorCall.reason ?? "");
+      event.code = Number(memoryCall.code ?? 0);
+      event.reason = String(memoryCall.reason ?? "");
       event.type = "transportclose";
     }
     return event;
   };
 
-  const seedActorHandleSnapshots = (entry, actorCall) => {
-    if (!actorCall || typeof actorCall !== "object") {
+  const seedMemoryHandleSnapshots = (entry, memoryCall) => {
+    if (!memoryCall || typeof memoryCall !== "object") {
       return;
     }
-    if (Array.isArray(actorCall.socket_handles)) {
+    if (Array.isArray(memoryCall.socket_handles)) {
       entry.openSocketHandles = new Set(
-        actorCall.socket_handles.map((value) => String(value)),
+        memoryCall.socket_handles.map((value) => String(value)),
       );
       entry.openSocketHandlesInitialized = true;
     }
-    if (Array.isArray(actorCall.transport_handles)) {
+    if (Array.isArray(memoryCall.transport_handles)) {
       entry.openTransportHandles = new Set(
-        actorCall.transport_handles.map((value) => String(value)),
+        memoryCall.transport_handles.map((value) => String(value)),
       );
       entry.openTransportHandlesInitialized = true;
     }
   };
 
-  const invokeActorCall = async (actorCall, request, env) => {
-    if (!actorCall || typeof actorCall !== "object") {
+  const invokeMemoryCall = async (memoryCall, request, env) => {
+    if (!memoryCall || typeof memoryCall !== "object") {
       throw new Error("memory invoke config is missing");
     }
-    const binding = String(actorCall.binding ?? "").trim();
-    const actorKey = String(actorCall.key ?? "").trim();
-    if (!binding || !actorKey) {
+    const binding = String(memoryCall.binding ?? "").trim();
+    const memoryKey = String(memoryCall.key ?? "").trim();
+    if (!binding || !memoryKey) {
       throw new Error("memory invoke requires binding and key");
     }
     if (!Object.prototype.hasOwnProperty.call(env, binding)) {
       throw new Error(`memory binding not declared for worker: ${binding}`);
     }
     const runtimeRequestId = activeRequestId();
-    const entry = await ensureActorEntry(binding, actorKey, runtimeRequestId, { hydrate: false });
-    seedActorHandleSnapshots(entry, actorCall);
-    const kind = String(actorCall.kind ?? "");
-    const scopedState = createActorRuntimeState(entry, runtimeRequestId, false, false);
+    const entry = await ensureMemoryEntry(binding, memoryKey, runtimeRequestId, { hydrate: false });
+    seedMemoryHandleSnapshots(entry, memoryCall);
+    const kind = String(memoryCall.kind ?? "");
+    const scopedState = createMemoryRuntimeState(entry, runtimeRequestId, false, false);
     const current = currentRequestContext();
-    const previousActorEntry = current.actorEntry;
-    const previousActorRequestId = current.actorRequestId;
+    const previousMemoryEntry = current.memoryEntry;
+    const previousMemoryRequestId = current.memoryRequestId;
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
     const previousTransportRuntimeProvider = current.transportRuntimeProvider;
     current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
     current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
-    current.actorEntry = entry;
-    current.actorRequestId = runtimeRequestId;
+    current.memoryEntry = entry;
+    current.memoryRequestId = runtimeRequestId;
     try {
       if (kind === "method") {
         await scopedState.__dd_socket_runtime.refreshOpenHandles();
         await scopedState.__dd_transport_runtime.refreshOpenHandles();
-        const methodName = String(actorCall.name ?? "").trim();
+        const methodName = String(memoryCall.name ?? "").trim();
         if (!methodName) {
           throw new Error("memory method invoke requires a method name");
         }
         if (
-          actorMethodNameIsBlocked(methodName)
-          && methodName !== ACTOR_ATOMIC_METHOD
+          memoryMethodNameIsBlocked(methodName)
+          && methodName !== MEMORY_ATOMIC_METHOD
         ) {
           throw new Error(`memory method is blocked: ${methodName}`);
         }
-        if (methodName !== ACTOR_ATOMIC_METHOD) {
+        if (methodName !== MEMORY_ATOMIC_METHOD) {
           throw new Error(`unsupported memory method: ${methodName}`);
         }
-        const { descriptor, args } = decodeExecPayload(actorCall.args);
+        const { descriptor, args } = decodeExecPayload(memoryCall.args);
         const executable = instantiateExecutable(descriptor);
-        const value = await executeActorTransaction(
+        const value = await executeMemoryTransaction(
           entry,
           runtimeRequestId,
           executable,
@@ -1065,15 +1065,15 @@
         if (typeof wakeMethod !== "function") {
           throw new Error("worker does not define wake(event, env)");
         }
-        const event = buildWakeEvent(actorCall, createActorStub(binding, actorKey));
+        const event = buildWakeEvent(memoryCall, createMemoryStub(binding, memoryKey));
         await wakeMethod.call(worker, event, env);
-        await gateActorOutput(entry, runtimeRequestId, async () => undefined);
+        await gateMemoryOutput(entry, runtimeRequestId, async () => undefined);
         return new Response(null, { status: 204 });
       }
       throw new Error(`unsupported memory invoke kind: ${kind}`);
     } finally {
-      current.actorEntry = previousActorEntry;
-      current.actorRequestId = previousActorRequestId;
+      current.memoryEntry = previousMemoryEntry;
+      current.memoryRequestId = previousMemoryRequestId;
       current.socketRuntimeProvider = previousSocketRuntimeProvider;
       current.transportRuntimeProvider = previousTransportRuntimeProvider;
     }
@@ -1250,8 +1250,8 @@
 
       const response = hostRpcCallConfig
         ? await invokeHostRpcCall(hostRpcCallConfig)
-        : actorCallConfig
-          ? await invokeActorCall(actorCallConfig, workerRequest, env)
+        : memoryCallConfig
+          ? await invokeMemoryCall(memoryCallConfig, workerRequest, env)
           : await worker.fetch(workerRequest, env, ctx);
       await syncFrozenTime();
 

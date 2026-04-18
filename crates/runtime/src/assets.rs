@@ -18,11 +18,11 @@ pub fn execute_worker_js(
     worker_name: &str,
     kv_bindings_json: &str,
     kv_read_cache_config_json: &str,
-    actor_bindings_json: &str,
+    memory_bindings_json: &str,
     dynamic_bindings_json: &str,
     dynamic_rpc_bindings_json: &str,
     dynamic_env_json: &str,
-    actor_call_json: &str,
+    memory_call_json: &str,
     host_rpc_call_json: &str,
     request_id: &str,
     completion_token: &str,
@@ -37,11 +37,11 @@ completion_token:{completion_token},\
 worker_name:{worker_name},\
 kv_bindings:{kv_bindings_json},\
 kv_read_cache_config:{kv_read_cache_config_json},\
-actor_bindings:{actor_bindings_json},\
+memory_bindings:{memory_bindings_json},\
 dynamic_bindings:{dynamic_bindings_json},\
 dynamic_rpc_bindings:{dynamic_rpc_bindings_json},\
 dynamic_env:{dynamic_env_json},\
-actor_call:{actor_call_json},\
+memory_call:{memory_call_json},\
 host_rpc_call:{host_rpc_call_json},\
 has_request_body_stream:{has_request_body_stream},\
 stream_response:{stream_response},\

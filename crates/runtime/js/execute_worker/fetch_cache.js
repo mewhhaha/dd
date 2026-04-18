@@ -46,7 +46,7 @@
       return fast;
     }
     recordDynamicMetric("normalizeSlowPathHit");
-    return normalizeActorFetchInput(inputValue, initValue);
+    return normalizeMemoryFetchInput(inputValue, initValue);
   };
 
   const toArrayBytes = (value) => {
@@ -235,7 +235,7 @@
     };
   };
 
-  const encodeActorStorageValue = (value) => {
+  const encodeMemoryStorageValue = (value) => {
     if (typeof value === "string") {
       return {
         encoding: "utf8",
@@ -248,7 +248,7 @@
     };
   };
 
-  const decodeActorStorageValue = (record) => {
+  const decodeMemoryStorageValue = (record) => {
     if (!record) {
       return null;
     }
@@ -263,7 +263,7 @@
     throw new Error(`memory storage get unsupported encoding: ${encoding}`);
   };
 
-  const ensureActorStorageState = (entry) => {
+  const ensureMemoryStorageState = (entry) => {
     if (!entry.storageState) {
       entry.storageState = {
         hydrated: false,
@@ -290,11 +290,11 @@
     return entry.storageState;
   };
 
-  const actorRecordVersion = (record) => (
+  const memoryRecordVersion = (record) => (
     record && !record.deleted ? Number(record.version ?? -1) : -1
   );
 
-  const cloneActorRecord = (record) => {
+  const cloneMemoryRecord = (record) => {
     if (!record) {
       return null;
     }
@@ -307,7 +307,7 @@
     };
   };
 
-  const createActorTxn = (entry) => ({
+  const createMemoryTxn = (entry) => ({
     entry,
     reads: new Map(),
     writes: new Map(),
@@ -320,7 +320,7 @@
     committedVersion: null,
   });
 
-  const actorTxnIsSnapshotOnly = (txn) => !!txn
+  const memoryTxnIsSnapshotOnly = (txn) => !!txn
     && txn.reads.size === 0
     && txn.writes.size === 0
     && txn.deferred.length === 0
@@ -328,13 +328,13 @@
     && txn.accepted !== true
     && txn.sideEffects !== true;
 
-  const actorTxnIsReadOnly = (txn) => !!txn
+  const memoryTxnIsReadOnly = (txn) => !!txn
     && txn.writes.size === 0
     && txn.deferred.length === 0
     && txn.accepted !== true
     && txn.sideEffects !== true;
 
-  const actorTxnIsBlindWrite = (txn) => !!txn
+  const memoryTxnIsBlindWrite = (txn) => !!txn
     && txn.writes.size > 0
     && txn.reads.size === 0
     && txn.deferred.length === 0
@@ -354,7 +354,7 @@
     }
   }
 
-  const mergeActorSnapshotEntries = (storageState, entries, maxVersion, mode, requestedKeys = []) => {
+  const mergeMemorySnapshotEntries = (storageState, entries, maxVersion, mode, requestedKeys = []) => {
     if (mode === "full") {
       storageState.mirror.clear();
       storageState.loadedKeys.clear();
@@ -413,8 +413,8 @@
     }
   };
 
-  const invalidateActorSnapshot = (entry, knownVersion = null) => {
-    const storageState = ensureActorStorageState(entry);
+  const invalidateMemorySnapshot = (entry, knownVersion = null) => {
+    const storageState = ensureMemoryStorageState(entry);
     storageState.mirror.clear();
     storageState.loadedKeys.clear();
     storageState.hydrated = false;
@@ -439,16 +439,16 @@
     return storageState;
   };
 
-  const actorTxnReadRecord = (txn, key) => {
+  const memoryTxnReadRecord = (txn, key) => {
     const normalizedKey = String(key);
     if (txn?.writes?.has(normalizedKey)) {
       return txn.writes.get(normalizedKey);
     }
-    const storageState = ensureActorStorageState(txn.entry);
+    const storageState = ensureMemoryStorageState(txn.entry);
     return storageState.mirror.get(normalizedKey) ?? null;
   };
 
-  const actorTxnTrackRead = (txn, key, record, allowConcurrency) => {
+  const memoryTxnTrackRead = (txn, key, record, allowConcurrency) => {
     if (!txn || allowConcurrency === true) {
       return;
     }
@@ -456,15 +456,15 @@
     if (txn.reads.has(normalizedKey)) {
       return;
     }
-    txn.reads.set(normalizedKey, actorRecordVersion(record));
+    txn.reads.set(normalizedKey, memoryRecordVersion(record));
   };
 
-  const actorTxnNextVersion = (txn) => {
+  const memoryTxnNextVersion = (txn) => {
     if (!txn) {
       throw new Error("transaction is required");
     }
     if (!Number.isFinite(Number(txn.stagedVersionSeed))) {
-      const storageState = ensureActorStorageState(txn.entry);
+      const storageState = ensureMemoryStorageState(txn.entry);
       txn.stagedVersionSeed = Number(storageState.committedVersion ?? -1) + 1;
     }
     const version = Number(txn.stagedVersionSeed);
@@ -472,11 +472,11 @@
     return version;
   };
 
-  const closeActorResourcesOnFailure = async (entry, runtimeRequestId) => {
+  const closeMemoryResourcesOnFailure = async (entry, runtimeRequestId) => {
     const socketHandles = Array.from(entry.openSocketHandles ?? []);
     for (const handle of socketHandles) {
       try {
-        const result = await callOp("op_actor_socket_close", {
+        const result = await callOp("op_memory_socket_close", {
           request_id: runtimeRequestId,
           handle,
           code: 1011,
@@ -487,7 +487,7 @@
           console.warn(String(result.error ?? "memory socket close failed"));
         }
       } catch {
-        // Ignore follow-up close failures after the actor has already failed.
+        // Ignore follow-up close failures after the memory has already failed.
       }
     }
 
@@ -496,8 +496,8 @@
       try {
         const result = await callOpAny(
           [
-            "op_actor_transport_close",
-            "op_actor_transport_terminate",
+            "op_memory_transport_close",
+            "op_memory_transport_terminate",
           ],
           {
             request_id: runtimeRequestId,
@@ -511,38 +511,38 @@
           console.warn(String(result.error ?? "memory transport close failed"));
         }
       } catch {
-        // Ignore follow-up close failures after the actor has already failed.
+        // Ignore follow-up close failures after the memory has already failed.
       }
     }
   };
 
-  const failActorEntry = async (entry, runtimeRequestId, error) => {
-    const storageState = ensureActorStorageState(entry);
+  const failMemoryEntry = async (entry, runtimeRequestId, error) => {
+    const storageState = ensureMemoryStorageState(entry);
     if (storageState.failedError) {
       throw storageState.failedError;
     }
     const failure = error instanceof Error ? error : new Error(String(error ?? "memory namespace failed"));
     storageState.failedError = failure;
     if (entry.cacheKey) {
-      actorStateEntries.delete(entry.cacheKey);
+      memoryStateEntries.delete(entry.cacheKey);
     }
-    await closeActorResourcesOnFailure(entry, runtimeRequestId);
+    await closeMemoryResourcesOnFailure(entry, runtimeRequestId);
     throw failure;
   };
 
-  const handleActorDirectWriteFailure = (entry, error) => {
-    const storageState = ensureActorStorageState(entry);
+  const handleMemoryDirectWriteFailure = (entry, error) => {
+    const storageState = ensureMemoryStorageState(entry);
     console.warn(String(error?.message ?? error ?? "memory direct write failed"));
-    invalidateActorSnapshot(entry);
+    invalidateMemorySnapshot(entry);
     storageState.freshnessCheckedRequestId = "";
   };
 
-  const waitForActorDirectSubmission = async (entry, submissionId) => {
-    const storageState = ensureActorStorageState(entry);
+  const waitForMemoryDirectSubmission = async (entry, submissionId) => {
+    const storageState = ensureMemoryStorageState(entry);
     try {
       let result = null;
       for (;;) {
-        result = await callOp("op_actor_state_await_submission", {
+        result = await callOp("op_memory_state_await_submission", {
           submission_id: Number(submissionId),
         });
         await syncFrozenTime();
@@ -569,7 +569,7 @@
       }
       return Number(result.max_version ?? -1);
     } catch (error) {
-      handleActorDirectWriteFailure(entry, error);
+      handleMemoryDirectWriteFailure(entry, error);
       throw error;
     } finally {
       storageState.pendingSubmissionCount = Math.max(
@@ -579,8 +579,8 @@
     }
   };
 
-  const flushActorStorage = (entry, runtimeRequestId) => {
-    const storageState = ensureActorStorageState(entry);
+  const flushMemoryStorage = (entry, runtimeRequestId) => {
+    const storageState = ensureMemoryStorageState(entry);
     if (storageState.flushRunning) {
       return storageState.flushTail;
     }
@@ -589,11 +589,11 @@
       while (storageState.pendingMutations.length > 0) {
         const mutations = storageState.pendingMutations.splice(0, storageState.pendingMutations.length);
         const result = await callOp(
-          "op_actor_state_enqueue_batch",
+          "op_memory_state_enqueue_batch",
           {
             request_id: runtimeRequestId,
             binding: entry.binding,
-            key: entry.actorKey,
+            key: entry.memoryKey,
             mutations: mutations.map((mutation) => ({
               key: mutation.key,
               value: Array.from(mutation.value),
@@ -607,7 +607,7 @@
           throw new Error(String(result?.error ?? "memory storage batch flush failed"));
         }
         storageState.pendingSubmissionCount += 1;
-        const submission = waitForActorDirectSubmission(entry, Number(result.submission_id ?? 0));
+        const submission = waitForMemoryDirectSubmission(entry, Number(result.submission_id ?? 0));
         storageState.pendingSubmissionPromises.push(submission);
         submission.finally(() => {
           const index = storageState.pendingSubmissionPromises.indexOf(submission);
@@ -618,7 +618,7 @@
       }
     })()
       .catch((error) => {
-        handleActorDirectWriteFailure(entry, error);
+        handleMemoryDirectWriteFailure(entry, error);
         throw error;
       })
       .finally(() => {
@@ -627,21 +627,21 @@
     return storageState.flushTail;
   };
 
-  const queueActorMutation = (entry, runtimeRequestId, mutation) => {
-    const storageState = ensureActorStorageState(entry);
+  const queueMemoryMutation = (entry, runtimeRequestId, mutation) => {
+    const storageState = ensureMemoryStorageState(entry);
     if (storageState.failedError) {
       throw storageState.failedError;
     }
     storageState.pendingMutations.push(mutation);
   };
 
-  const ensureActorStorageQueued = async (entry, runtimeRequestId) => {
-    const storageState = ensureActorStorageState(entry);
+  const ensureMemoryStorageQueued = async (entry, runtimeRequestId) => {
+    const storageState = ensureMemoryStorageState(entry);
     if (storageState.failedError) {
       throw storageState.failedError;
     }
     if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
-      await flushActorStorage(entry, runtimeRequestId);
+      await flushMemoryStorage(entry, runtimeRequestId);
     }
     if (storageState.pendingSubmissionPromises.length > 0) {
       await Promise.all(Array.from(storageState.pendingSubmissionPromises));
@@ -651,13 +651,13 @@
     }
   };
 
-  const waitForActorFlush = async (entry, runtimeRequestId) => {
-    const storageState = ensureActorStorageState(entry);
+  const waitForMemoryFlush = async (entry, runtimeRequestId) => {
+    const storageState = ensureMemoryStorageState(entry);
     if (storageState.failedError) {
       throw storageState.failedError;
     }
     if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
-      await flushActorStorage(entry, runtimeRequestId);
+      await flushMemoryStorage(entry, runtimeRequestId);
     }
     if (storageState.pendingSubmissionPromises.length > 0) {
       await Promise.all(Array.from(storageState.pendingSubmissionPromises));
@@ -667,10 +667,10 @@
     }
   };
 
-  const gateActorOutput = (entry, runtimeRequestId, callback) => {
-    const storageState = ensureActorStorageState(entry);
+  const gateMemoryOutput = (entry, runtimeRequestId, callback) => {
+    const storageState = ensureMemoryStorageState(entry);
     const run = async () => {
-      await waitForActorFlush(entry, runtimeRequestId);
+      await waitForMemoryFlush(entry, runtimeRequestId);
       return await callback();
     };
     const gated = storageState.outputGate.then(run, run);
@@ -681,8 +681,8 @@
     return gated;
   };
 
-  const ensureActorStoragePointHydrated = async (entry, runtimeRequestId, key, options = {}) => {
-    const storageState = ensureActorStorageState(entry);
+  const ensureMemoryStoragePointHydrated = async (entry, runtimeRequestId, key, options = {}) => {
+    const storageState = ensureMemoryStorageState(entry);
     const normalizedKey = String(key ?? "");
     if (!normalizedKey) {
       return storageState;
@@ -692,17 +692,17 @@
       return storageState;
     }
     const started = performance.now();
-    const result = await callOp("op_actor_state_get", {
+    const result = await callOp("op_memory_state_get", {
       request_id: runtimeRequestId,
       binding: entry.binding,
-      key: entry.actorKey,
+      key: entry.memoryKey,
       item_key: normalizedKey,
     });
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory storage point read failed"));
     }
-    mergeActorSnapshotEntries(
+    mergeMemorySnapshotEntries(
       storageState,
       result.record ? [result.record] : [],
       result.max_version,
@@ -712,28 +712,28 @@
     storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
     storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
     storageState.freshnessCheckedAtMs = performance.now();
-    recordActorProfile("js_hydrate_keys", performance.now() - started, 1);
+    recordMemoryProfile("js_hydrate_keys", performance.now() - started, 1);
     return storageState;
   };
 
-  const ensureActorStorageHydrated = async (entry, runtimeRequestId, options = {}) => {
-    const storageState = ensureActorStorageState(entry);
+  const ensureMemoryStorageHydrated = async (entry, runtimeRequestId, options = {}) => {
+    const storageState = ensureMemoryStorageState(entry);
     if (storageState.fullSnapshotLoaded && options?.force !== true) {
       return storageState;
     }
     if (!storageState.hydrating) {
       storageState.hydrating = (async () => {
         const started = performance.now();
-        const result = await callOp("op_actor_state_snapshot", {
+        const result = await callOp("op_memory_state_snapshot", {
           request_id: runtimeRequestId,
           binding: entry.binding,
-          key: entry.actorKey,
+          key: entry.memoryKey,
         });
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
           throw new Error(String(result?.error ?? "memory storage snapshot failed"));
         }
-        mergeActorSnapshotEntries(
+        mergeMemorySnapshotEntries(
           storageState,
           result.entries,
           result.max_version,
@@ -742,19 +742,19 @@
         storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
         storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
         storageState.freshnessCheckedAtMs = performance.now();
-        recordActorProfile("js_hydrate_full", performance.now() - started, result.entries?.length ?? 1);
+        recordMemoryProfile("js_hydrate_full", performance.now() - started, result.entries?.length ?? 1);
         storageState.hydrating = null;
         return storageState;
       })().catch(async (error) => {
         storageState.hydrating = null;
-        return await failActorEntry(entry, runtimeRequestId, error);
+        return await failMemoryEntry(entry, runtimeRequestId, error);
       });
     }
     return await storageState.hydrating;
   };
 
-  const ensureActorStorageKeysHydrated = async (entry, runtimeRequestId, keys, options = {}) => {
-    const storageState = ensureActorStorageState(entry);
+  const ensureMemoryStorageKeysHydrated = async (entry, runtimeRequestId, keys, options = {}) => {
+    const storageState = ensureMemoryStorageState(entry);
     const force = options?.force === true;
     if (storageState.fullSnapshotLoaded && !force) {
       return storageState;
@@ -769,20 +769,20 @@
       return storageState;
     }
     if (pendingKeys.length === 1) {
-      return ensureActorStoragePointHydrated(entry, runtimeRequestId, pendingKeys[0], { force });
+      return ensureMemoryStoragePointHydrated(entry, runtimeRequestId, pendingKeys[0], { force });
     }
     const started = performance.now();
-    const result = await callOp("op_actor_state_snapshot", {
+    const result = await callOp("op_memory_state_snapshot", {
       request_id: runtimeRequestId,
       binding: entry.binding,
-      key: entry.actorKey,
+      key: entry.memoryKey,
       keys: pendingKeys,
     });
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory storage point snapshot failed"));
     }
-    mergeActorSnapshotEntries(
+    mergeMemorySnapshotEntries(
       storageState,
       result.entries,
       result.max_version,
@@ -792,26 +792,26 @@
     storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
     storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
     storageState.freshnessCheckedAtMs = performance.now();
-    recordActorProfile("js_hydrate_keys", performance.now() - started, pendingKeys.length);
+    recordMemoryProfile("js_hydrate_keys", performance.now() - started, pendingKeys.length);
     return storageState;
   };
 
-  const stageActorTxnWrite = (txn, record) => {
-    txn.writes.set(String(record.key ?? ""), cloneActorRecord(record));
+  const stageMemoryTxnWrite = (txn, record) => {
+    txn.writes.set(String(record.key ?? ""), cloneMemoryRecord(record));
   };
 
-  const refreshActorEntrySnapshot = async (entry, runtimeRequestId) => {
-    invalidateActorSnapshot(entry);
-    await ensureActorStorageHydrated(entry, runtimeRequestId, { force: true });
+  const refreshMemoryEntrySnapshot = async (entry, runtimeRequestId) => {
+    invalidateMemorySnapshot(entry);
+    await ensureMemoryStorageHydrated(entry, runtimeRequestId, { force: true });
   };
 
-  const actorSnapshotTtlExpired = (storageState) => (
-    performance.now() - Number(storageState.freshnessCheckedAtMs ?? 0) > actorReadSnapshotFreshTtlMs
+  const memorySnapshotTtlExpired = (storageState) => (
+    performance.now() - Number(storageState.freshnessCheckedAtMs ?? 0) > memoryReadSnapshotFreshTtlMs
   );
 
-  const ensureActorDirectReadReady = async (entry, runtimeRequestId, key) => {
+  const ensureMemoryDirectReadReady = async (entry, runtimeRequestId, key) => {
     const normalizedKey = String(key ?? "");
-    const storageState = ensureActorStorageState(entry);
+    const storageState = ensureMemoryStorageState(entry);
     if (
       (
         storageState.pendingMutations.length > 0
@@ -829,37 +829,37 @@
     if (
       (storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey))
       && storageState.stale !== true
-      && !actorSnapshotTtlExpired(storageState)
+      && !memorySnapshotTtlExpired(storageState)
     ) {
-      recordActorProfile("actor_cache_hit", 0, 1);
+      recordMemoryProfile("memory_cache_hit", 0, 1);
       return storageState;
     }
     if (storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey)) {
-      recordActorProfile("actor_cache_stale", 0, 1);
+      recordMemoryProfile("memory_cache_stale", 0, 1);
     } else {
-      recordActorProfile("actor_cache_miss", 0, 1);
+      recordMemoryProfile("memory_cache_miss", 0, 1);
     }
-    await ensureActorStoragePointHydrated(entry, runtimeRequestId, normalizedKey, {
+    await ensureMemoryStoragePointHydrated(entry, runtimeRequestId, normalizedKey, {
       force: storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey),
     });
     return storageState;
   };
 
-  const commitActorTxn = async (txn, runtimeRequestId) => {
+  const commitMemoryTxn = async (txn, runtimeRequestId) => {
     if (!txn) {
       return;
     }
     const started = performance.now();
-    const storageState = ensureActorStorageState(txn.entry);
+    const storageState = ensureMemoryStorageState(txn.entry);
     const writes = Array.from(txn.writes.values());
     const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
       key,
       version: Number(version ?? -1),
     }));
-    const result = await callOp("op_actor_state_apply_batch", {
+    const result = await callOp("op_memory_state_apply_batch", {
       request_id: runtimeRequestId,
       binding: txn.entry.binding,
-      key: txn.entry.actorKey,
+      key: txn.entry.memoryKey,
       transactional: true,
       expected_base_version: -1,
       reads,
@@ -877,14 +877,14 @@
       throw new Error(String(result?.error ?? "memory transaction commit failed"));
     }
     if (result.conflict === true) {
-      await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
+      await refreshMemoryEntrySnapshot(txn.entry, runtimeRequestId);
       return false;
     }
     const committedVersion = Number(result.max_version ?? storageState.committedVersion);
     for (const mutation of writes) {
       storageState.loadedKeys.add(mutation.key);
       storageState.mirror.set(mutation.key, {
-        ...cloneActorRecord(mutation),
+        ...cloneMemoryRecord(mutation),
         version: committedVersion,
       });
     }
@@ -901,23 +901,23 @@
     txn.committed = true;
     txn.committedVersion = committedVersion;
     if (txn.deferred.length > 0 || txn.accepted === true || txn.sideEffects === true) {
-      await gateActorOutput(txn.entry, runtimeRequestId, async () => undefined);
+      await gateMemoryOutput(txn.entry, runtimeRequestId, async () => undefined);
     }
-    recordActorProfile("js_txn_commit", performance.now() - started, writes.length + reads.length + 1);
+    recordMemoryProfile("js_txn_commit", performance.now() - started, writes.length + reads.length + 1);
     return true;
   };
 
-  const commitActorBlindTxn = async (txn, runtimeRequestId) => {
+  const commitMemoryBlindTxn = async (txn, runtimeRequestId) => {
     if (!txn) {
       return;
     }
     const started = performance.now();
-    const storageState = ensureActorStorageState(txn.entry);
+    const storageState = ensureMemoryStorageState(txn.entry);
     const writes = Array.from(txn.writes.values());
-    const result = await callOp("op_actor_state_apply_blind_batch", {
+    const result = await callOp("op_memory_state_apply_blind_batch", {
       request_id: runtimeRequestId,
       binding: txn.entry.binding,
-      key: txn.entry.actorKey,
+      key: txn.entry.memoryKey,
       mutations: writes.map((mutation) => ({
         key: mutation.key,
         value: Array.from(mutation.value),
@@ -931,14 +931,14 @@
       throw new Error(String(result?.error ?? "memory blind transaction commit failed"));
     }
     if (result.conflict === true) {
-      await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
+      await refreshMemoryEntrySnapshot(txn.entry, runtimeRequestId);
       return false;
     }
     const committedVersion = Number(result.max_version ?? storageState.committedVersion);
     for (const mutation of writes) {
       storageState.loadedKeys.add(mutation.key);
       storageState.mirror.set(mutation.key, {
-        ...cloneActorRecord(mutation),
+        ...cloneMemoryRecord(mutation),
         version: committedVersion,
       });
     }
@@ -954,24 +954,24 @@
     storageState.stale = false;
     txn.committed = true;
     txn.committedVersion = committedVersion;
-    recordActorProfile("js_txn_blind_commit", performance.now() - started, writes.length + 1);
+    recordMemoryProfile("js_txn_blind_commit", performance.now() - started, writes.length + 1);
     return true;
   };
 
-  const validateActorTxnReads = async (txn, runtimeRequestId) => {
+  const validateMemoryTxnReads = async (txn, runtimeRequestId) => {
     if (!txn) {
       return true;
     }
     const started = performance.now();
-    const storageState = ensureActorStorageState(txn.entry);
+    const storageState = ensureMemoryStorageState(txn.entry);
     const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
       key,
       version: Number(version ?? -1),
     }));
-    const result = await callOp("op_actor_state_validate_reads", {
+    const result = await callOp("op_memory_state_validate_reads", {
       request_id: runtimeRequestId,
       binding: txn.entry.binding,
-      key: txn.entry.actorKey,
+      key: txn.entry.memoryKey,
       reads,
       list_gate_version: txn.listGateVersion == null ? -1 : Number(txn.listGateVersion),
     });
@@ -980,14 +980,14 @@
       throw new Error(String(result?.error ?? "memory transaction validation failed"));
     }
     if (result.conflict === true) {
-      await ensureActorStorageKeysHydrated(
+      await ensureMemoryStorageKeysHydrated(
         txn.entry,
         runtimeRequestId,
         reads.map((entry) => entry.key),
         { force: true },
       );
       if (txn.listGateVersion != null) {
-        await refreshActorEntrySnapshot(txn.entry, runtimeRequestId);
+        await refreshMemoryEntrySnapshot(txn.entry, runtimeRequestId);
       }
       return false;
     }
@@ -1001,38 +1001,38 @@
     );
     txn.committed = true;
     txn.committedVersion = Number(result.max_version ?? storageState.committedVersion);
-    recordActorProfile("js_txn_validate", performance.now() - started, reads.length + 1);
+    recordMemoryProfile("js_txn_validate", performance.now() - started, reads.length + 1);
     return true;
   };
 
-  const createActorStorageBinding = (entry, runtimeRequestId, txn = null) => {
-    const currentStorageRequestId = () => actorScopedRequestId(entry, runtimeRequestId);
+  const createMemoryStorageBinding = (entry, runtimeRequestId, txn = null) => {
+    const currentStorageRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
     return {
       get(key, options = {}) {
-        const storageState = ensureActorStorageState(entry);
+        const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
         const normalizedKey = String(key);
         if (txn && !storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(normalizedKey)) {
-          recordActorProfile("actor_cache_miss", 0, 1);
+          recordMemoryProfile("memory_cache_miss", 0, 1);
           throw new MemoryHydrationNeeded("keys", [normalizedKey]);
         }
         const record = txn
-          ? actorTxnReadRecord(txn, normalizedKey)
+          ? memoryTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
-        actorTxnTrackRead(txn, normalizedKey, record, options?.allowConcurrency === true);
+        memoryTxnTrackRead(txn, normalizedKey, record, options?.allowConcurrency === true);
         if (!record || record.deleted) {
           return null;
         }
         return {
-          value: decodeActorStorageValue(record),
+          value: decodeMemoryStorageValue(record),
           version: Number(record.version ?? -1),
           encoding: String(record.encoding ?? "utf8"),
         };
       },
       put(key, value, options = {}) {
-        const storageState = ensureActorStorageState(entry);
+        const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
@@ -1042,7 +1042,7 @@
           ? Math.trunc(Number(expectedInput))
           : -1;
         const current = txn
-          ? actorTxnReadRecord(txn, normalizedKey)
+          ? memoryTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
         const currentVersion = current ? Number(current.version ?? -1) : -1;
         if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
@@ -1052,9 +1052,9 @@
             version: currentVersion,
           };
         }
-        const encoded = encodeActorStorageValue(value);
+        const encoded = encodeMemoryStorageValue(value);
         const version = txn
-          ? actorTxnNextVersion(txn)
+          ? memoryTxnNextVersion(txn)
           : Number(storageState.committedVersion ?? -1);
         const record = {
           key: normalizedKey,
@@ -1064,11 +1064,11 @@
           deleted: false,
         };
         if (txn) {
-          stageActorTxnWrite(txn, record);
+          stageMemoryTxnWrite(txn, record);
         } else {
           storageState.loadedKeys.add(normalizedKey);
           storageState.mirror.set(normalizedKey, record);
-          queueActorMutation(entry, currentStorageRequestId(), record);
+          queueMemoryMutation(entry, currentStorageRequestId(), record);
         }
         return {
           ok: true,
@@ -1077,7 +1077,7 @@
         };
       },
       delete(key, options = {}) {
-        const storageState = ensureActorStorageState(entry);
+        const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
@@ -1087,7 +1087,7 @@
           ? Math.trunc(Number(expectedInput))
           : -1;
         const current = txn
-          ? actorTxnReadRecord(txn, normalizedKey)
+          ? memoryTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
         const currentVersion = current ? Number(current.version ?? -1) : -1;
         if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
@@ -1098,7 +1098,7 @@
           };
         }
         const version = txn
-          ? actorTxnNextVersion(txn)
+          ? memoryTxnNextVersion(txn)
           : Number(storageState.committedVersion ?? -1);
         const record = {
           key: normalizedKey,
@@ -1108,11 +1108,11 @@
           deleted: true,
         };
         if (txn) {
-          stageActorTxnWrite(txn, record);
+          stageMemoryTxnWrite(txn, record);
         } else {
           storageState.loadedKeys.add(normalizedKey);
           storageState.mirror.set(normalizedKey, record);
-          queueActorMutation(entry, currentStorageRequestId(), record);
+          queueMemoryMutation(entry, currentStorageRequestId(), record);
         }
         return {
           ok: true,
@@ -1121,7 +1121,7 @@
         };
       },
       list(options = {}) {
-        const storageState = ensureActorStorageState(entry);
+        const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
@@ -1136,7 +1136,7 @@
         const merged = new Map(storageState.mirror);
         if (txn) {
           for (const [key, record] of txn.writes.entries()) {
-            merged.set(key, cloneActorRecord(record));
+            merged.set(key, cloneMemoryRecord(record));
           }
           if (options?.allowConcurrency !== true) {
             txn.listGateVersion = Number(storageState.committedVersion ?? -1);

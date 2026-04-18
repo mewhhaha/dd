@@ -1,4 +1,3 @@
-
 use super::{
     BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
 };
@@ -1612,9 +1611,9 @@ export default {
     .to_string()
 }
 
-fn actor_worker() -> String {
+fn memory_worker() -> String {
     r#"
-globalThis.__dd_actor_runtime = globalThis.__dd_actor_runtime ?? {
+globalThis.__dd_memory_runtime = globalThis.__dd_memory_runtime ?? {
   active: new Map(),
   max: new Map(),
 };
@@ -1671,24 +1670,24 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const key = queryParam(url.search, "key") ?? "default";
-    const id = env.MY_ACTOR.idFromName(key);
-    const actor = env.MY_ACTOR.get(id);
+    const id = env.MY_MEMORY.idFromName(key);
+    const memory = env.MY_MEMORY.get(id);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_actor_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
 
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_actor_profile_reset?.();
+      Deno.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
 
     if (url.pathname === "/run") {
-      await actor.atomic((state) => {
+      await memory.atomic((state) => {
         const slot = String(state.id);
-        const runtime = globalThis.__dd_actor_runtime;
+        const runtime = globalThis.__dd_memory_runtime;
         const active = (runtime.active.get(slot) ?? 0) + 1;
         runtime.active.set(slot, active);
         const max = Math.max(runtime.max.get(slot) ?? 0, active);
@@ -1701,19 +1700,19 @@ export default {
     }
 
     if (url.pathname === "/max") {
-      return new Response(String(await actor.atomic((state) => {
-        const runtime = globalThis.__dd_actor_runtime;
+      return new Response(String(await memory.atomic((state) => {
+        const runtime = globalThis.__dd_memory_runtime;
         return runtime.max.get(String(state.id)) ?? 0;
       })));
     }
 
     if (url.pathname === "/seed") {
-      await actor.atomic(seedCount);
+      await memory.atomic(seedCount);
       return new Response("ok");
     }
 
     if (url.pathname === "/value-roundtrip") {
-      const ok = await actor.atomic((state) => {
+      const ok = await memory.atomic((state) => {
         state.set("profile", {
           name: "alice",
           createdAt: new Date("2026-01-02T03:04:05.000Z"),
@@ -1740,7 +1739,7 @@ export default {
     }
 
     if (url.pathname === "/value-string-get-guard") {
-      const ok = await actor.atomic((state) => {
+      const ok = await memory.atomic((state) => {
         state.set("profile", { nested: { ok: true } });
         const loaded = state.get("profile");
         return Boolean(
@@ -1753,7 +1752,7 @@ export default {
     }
 
     if (url.pathname === "/local-visibility") {
-      const ok = await actor.atomic((state) => {
+      const ok = await memory.atomic((state) => {
         state.set("count", "41");
         const loaded = state.get("count");
         const listed = state.list({ prefix: "co" });
@@ -1769,13 +1768,13 @@ export default {
     }
 
     if (url.pathname === "/inc-cas") {
-      await actor.atomic(incrementStrict);
+      await memory.atomic(incrementStrict);
       return new Response("ok");
     }
 
     if (url.pathname === "/stm-blind-write") {
       const value = String(url.searchParams.get("value") ?? "1");
-      const committed = await actor.atomic((state) => {
+      const committed = await memory.atomic((state) => {
         state.set("count", value);
         return value;
       });
@@ -1784,7 +1783,7 @@ export default {
 
     if (url.pathname === "/stm-read-write") {
       const value = String(url.searchParams.get("value") ?? "1");
-      const committed = await actor.atomic((state) => {
+      const committed = await memory.atomic((state) => {
         const previous = String(state.get("count") ?? "0");
         state.set("count", value);
         return previous + "->" + String(state.get("count") ?? "missing");
@@ -1793,21 +1792,21 @@ export default {
     }
 
     if (url.pathname === "/direct-set") {
-      await actor.write("count", "5");
+      await memory.write("count", "5");
       return new Response("ok");
     }
 
     if (url.pathname === "/direct-delete") {
-      await actor.delete("count");
+      await memory.delete("count");
       return new Response("ok");
     }
 
     if (url.pathname === "/direct-get") {
-      return new Response(String(await actor.read("count") ?? "0"));
+      return new Response(String(await memory.read("count") ?? "0"));
     }
 
     if (url.pathname === "/get") {
-      return new Response(String(await actor.atomic(readCount)));
+      return new Response(String(await memory.atomic(readCount)));
     }
 
     return new Response("not found", { status: 404 });
@@ -1817,15 +1816,15 @@ export default {
     .to_string()
 }
 
-fn actor_constructor_storage_worker() -> String {
+fn memory_constructor_storage_worker() -> String {
     r#"
 export default {
   async fetch(request, env) {
-    const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName("user-ctor"));
+    const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName("user-ctor"));
     const url = new URL(request.url);
 
     if (url.pathname === "/seed") {
-      await actor.atomic((state) => {
+      await memory.atomic((state) => {
         state.set("count", "7");
         return true;
       });
@@ -1833,15 +1832,15 @@ export default {
     }
 
     if (url.pathname === "/constructor-value") {
-      return new Response(String(await actor.atomic((state) => state.get("count") ?? "missing")));
+      return new Response(String(await memory.atomic((state) => state.get("count") ?? "missing")));
     }
 
     if (url.pathname === "/direct-value") {
-      return new Response(String(await actor.read("count") ?? "missing"));
+      return new Response(String(await memory.read("count") ?? "missing"));
     }
 
     if (url.pathname === "/current-value") {
-      return new Response(String(await actor.atomic((state) => state.get("count") ?? "missing")));
+      return new Response(String(await memory.atomic((state) => state.get("count") ?? "missing")));
     }
 
     return new Response("not found", { status: 404 });
@@ -1851,7 +1850,7 @@ export default {
     .to_string()
 }
 
-fn actor_multi_atomic_read_worker() -> String {
+fn memory_multi_atomic_read_worker() -> String {
     r#"
 export function seedOne(state) {
   state.set("count", "1");
@@ -1866,16 +1865,16 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/seed") {
-      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName("bench-1"));
-      await actor.atomic(seedOne);
+      const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName("bench-1"));
+      await memory.atomic(seedOne);
       return new Response("ok");
     }
     if (url.pathname === "/sum") {
       const keys = Math.max(1, Number(url.searchParams.get("keys") ?? "1") || 1);
       let total = 0;
       for (let i = 0; i < keys; i++) {
-        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(keys === 1 ? "hot" : `bench-${i}`));
-        total += Number(await actor.atomic(readCount));
+        const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(keys === 1 ? "hot" : `bench-${i}`));
+        total += Number(await memory.atomic(readCount));
       }
       return new Response(String(total));
     }
@@ -1886,7 +1885,7 @@ export default {
     .to_string()
 }
 
-fn actor_multi_key_storage_worker() -> String {
+fn memory_multi_key_storage_worker() -> String {
     r#"
 export function seedCount(state) {
   state.set("count", "1");
@@ -1911,8 +1910,8 @@ export default {
 
     if (url.pathname === "/seed-all") {
       for (let i = 0; i < keys; i++) {
-        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(`bench-${i}`));
-        await actor.atomic(seedCount);
+        const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(`bench-${i}`));
+        await memory.atomic(seedCount);
       }
       return new Response("ok");
     }
@@ -1920,8 +1919,8 @@ export default {
     if (url.pathname === "/direct-sum") {
       let total = 0;
       for (let i = 0; i < keys; i++) {
-        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(`bench-${i}`));
-        total += Number(await actor.read("count") ?? "0");
+        const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(`bench-${i}`));
+        total += Number(await memory.read("count") ?? "0");
       }
       return new Response(String(total));
     }
@@ -1929,27 +1928,27 @@ export default {
     if (url.pathname === "/stm-sum") {
       let total = 0;
       for (let i = 0; i < keys; i++) {
-        const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(`bench-${i}`));
-        total += Number(await actor.atomic(readCount));
+        const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(`bench-${i}`));
+        total += Number(await memory.atomic(readCount));
       }
       return new Response(String(total));
     }
 
     if (url.pathname === "/inc") {
-      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
-      return new Response(String(await actor.atomic(incrementCount)));
+      const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(key));
+      return new Response(String(await memory.atomic(incrementCount)));
     }
 
     if (url.pathname === "/direct-write") {
       const value = String(url.searchParams.get("value") ?? "1");
-      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
-      await actor.write("count", value);
+      const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(key));
+      await memory.write("count", value);
       return new Response(value);
     }
 
     if (url.pathname === "/get") {
-      const actor = env.MY_ACTOR.get(env.MY_ACTOR.idFromName(key));
-      return new Response(String(await actor.atomic(readCount)));
+      const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(key));
+      return new Response(String(await memory.atomic(readCount)));
     }
 
     return new Response("not found", { status: 404 });
@@ -1959,7 +1958,7 @@ export default {
     .to_string()
 }
 
-fn hosted_actor_worker() -> String {
+fn hosted_memory_worker() -> String {
     r#"
 globalThis.__hosted_shared_global = globalThis.__hosted_shared_global ?? 0;
 
@@ -2006,22 +2005,22 @@ export function readPairSnapshot(state) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const id = env.MY_ACTOR.idFromName(url.searchParams.get("key") ?? "default");
-    const actor = env.MY_ACTOR.get(id);
+    const id = env.MY_MEMORY.idFromName(url.searchParams.get("key") ?? "default");
+    const memory = env.MY_MEMORY.get(id);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_actor_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
 
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_actor_profile_reset?.();
+      Deno.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
 
     if (url.pathname === "/alpha/inc") {
-      return new Response(String(await actor.atomic((state) => {
+      return new Response(String(await memory.atomic((state) => {
         const current = Number(state.get("count") ?? 0);
         const next = current + 1;
         state.set("count", String(next));
@@ -2030,7 +2029,7 @@ export default {
     }
 
     if (url.pathname === "/beta/read") {
-      return new Response(String(await actor.atomic((state) => {
+      return new Response(String(await memory.atomic((state) => {
         return String(state.get("count") ?? "0");
       })));
     }
@@ -2040,12 +2039,12 @@ export default {
       return new Response(String(globalThis.__hosted_shared_global));
     }
 
-    if (url.pathname === "/actor/global/read") {
-      return new Response(String(await actor.atomic((_state) => globalThis.__hosted_shared_global)));
+    if (url.pathname === "/memory/global/read") {
+      return new Response(String(await memory.atomic((_state) => globalThis.__hosted_shared_global)));
     }
 
-    if (url.pathname === "/actor/global/inc") {
-      return new Response(String(await actor.atomic((_state) => {
+    if (url.pathname === "/memory/global/inc") {
+      return new Response(String(await memory.atomic((_state) => {
         globalThis.__hosted_shared_global += 1;
         return globalThis.__hosted_shared_global;
       })));
@@ -2053,48 +2052,48 @@ export default {
 
     if (url.pathname === "/inline") {
       const suffix = "inline";
-      return new Response(String(await actor.atomic(() => `ok-${suffix}`)));
+      return new Response(String(await memory.atomic(() => `ok-${suffix}`)));
     }
 
     if (url.pathname === "/stm/seed") {
-      await actor.atomic(seedStm);
+      await memory.atomic(seedStm);
       return new Response("ok");
     }
 
     if (url.pathname === "/stm/write-a") {
       const value = String(url.searchParams.get("value") ?? "1");
-      await actor.atomic(writeA, value);
+      await memory.atomic(writeA, value);
       return new Response("ok");
     }
 
     if (url.pathname === "/stm/read-once") {
-      return new Response(String(await actor.atomic(readOnce)));
+      return new Response(String(await memory.atomic(readOnce)));
     }
 
     if (url.pathname === "/read-direct") {
-      return new Response(String(await actor.read("a") ?? "missing"));
+      return new Response(String(await memory.read("a") ?? "missing"));
     }
 
     if (url.pathname === "/stm/read-pair") {
-      return new Response(String(await actor.atomic(readPairStrict)));
+      return new Response(String(await memory.atomic(readPairStrict)));
     }
 
     if (url.pathname === "/stm/read-pair-snapshot") {
-      return new Response(String(await actor.atomic(readPairSnapshot)));
+      return new Response(String(await memory.atomic(readPairSnapshot)));
     }
 
     if (url.pathname === "/stm/tvar-default/read") {
-      const count = actor.tvar("count", 7);
-      return new Response(String(await actor.atomic(() => count.read())));
+      const count = memory.tvar("count", 7);
+      return new Response(String(await memory.atomic(() => count.read())));
     }
 
     if (url.pathname === "/stm/tvar-default/raw") {
-      return new Response(String(await actor.atomic((state) => state.get("count") ?? "missing")));
+      return new Response(String(await memory.atomic((state) => state.get("count") ?? "missing")));
     }
 
     if (url.pathname === "/stm/tvar-default/write") {
-      const count = actor.tvar("count", 7);
-      return new Response(String(await actor.atomic(() => {
+      const count = memory.tvar("count", 7);
+      return new Response(String(await memory.atomic(() => {
         const next = Number(count.read()) + 1;
         count.write(String(next));
         return next;
@@ -2247,9 +2246,9 @@ async fn test_service(config: RuntimeConfig) -> RuntimeService {
         storage: RuntimeStorageConfig {
             store_dir: PathBuf::from(&store_dir),
             database_url: format!("file:{db_path}"),
-            actor_namespace_shards: 16,
-            actor_db_cache_max_open: 4096,
-            actor_db_idle_ttl: Duration::from_secs(60),
+            memory_namespace_shards: 16,
+            memory_db_cache_max_open: 4096,
+            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: false,
             blob_store: BlobStoreConfig::local(PathBuf::from(&store_dir).join("blobs")),
         },
@@ -2269,9 +2268,9 @@ async fn test_service_with_paths(
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             database_url,
-            actor_namespace_shards: 16,
-            actor_db_cache_max_open: 4096,
-            actor_db_idle_ttl: Duration::from_secs(60),
+            memory_namespace_shards: 16,
+            memory_db_cache_max_open: 4096,
+            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled,
             blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
         },
@@ -5265,7 +5264,7 @@ async fn transport_session_reaped_when_owner_isolate_fails() {
 
 #[tokio::test]
 #[serial]
-async fn websocket_message_handler_can_use_actor_storage_after_handshake() {
+async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -5765,7 +5764,7 @@ async fn websocket_message_handler_can_close_handle_backed_socket() {
 
 #[tokio::test]
 #[serial]
-async fn websocket_storage_uses_current_request_scope_on_warm_actor_instance() {
+async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -6814,7 +6813,7 @@ async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
 
 #[tokio::test]
 #[serial]
-async fn actor_same_key_allows_overlap_by_default() {
+async fn memory_same_key_allows_overlap_by_default() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 3,
@@ -6828,13 +6827,13 @@ async fn actor_same_key_allows_overlap_by_default() {
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -6847,8 +6846,8 @@ async fn actor_same_key_allows_overlap_by_default() {
         let svc = service.clone();
         tasks.push(tokio::spawn(async move {
             svc.invoke(
-                "actor".to_string(),
-                test_invocation_with_path("/run?key=user-1", &format!("actor-run-{idx}")),
+                "memory".to_string(),
+                test_invocation_with_path("/run?key=user-1", &format!("memory-run-{idx}")),
             )
             .await
         }));
@@ -6860,14 +6859,14 @@ async fn actor_same_key_allows_overlap_by_default() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_millis(650),
-        "expected overlap for same actor key by default, elapsed={elapsed:?}"
+        "expected overlap for same memory key by default, elapsed={elapsed:?}"
     );
 }
 
 #[tokio::test]
 #[serial]
-#[ignore = "hot same-actor STM write contention still needs a dedicated follow-up pass"]
-async fn actor_storage_increment_preserves_all_updates_under_concurrency() {
+#[ignore = "hot same-memory STM write contention still needs a dedicated follow-up pass"]
+async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -6881,13 +6880,13 @@ async fn actor_storage_increment_preserves_all_updates_under_concurrency() {
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -6896,7 +6895,7 @@ async fn actor_storage_increment_preserves_all_updates_under_concurrency() {
 
     service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/seed?key=user-3", "seed"),
         )
         .await
@@ -6908,7 +6907,7 @@ async fn actor_storage_increment_preserves_all_updates_under_concurrency() {
         let svc = service.clone();
         tasks.push(tokio::spawn(async move {
             svc.invoke(
-                "actor".to_string(),
+                "memory".to_string(),
                 test_invocation_with_path("/inc-cas?key=user-3", &format!("cas-{idx}")),
             )
             .await
@@ -6922,7 +6921,7 @@ async fn actor_storage_increment_preserves_all_updates_under_concurrency() {
 
     let current = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/get?key=user-3", "get-after-inc"),
         )
         .await
@@ -6935,7 +6934,7 @@ async fn actor_storage_increment_preserves_all_updates_under_concurrency() {
 
 #[tokio::test]
 #[serial]
-async fn actor_storage_different_keys_preserve_all_updates_under_concurrency() {
+async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 8,
@@ -6949,13 +6948,13 @@ async fn actor_storage_different_keys_preserve_all_updates_under_concurrency() {
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -6968,7 +6967,7 @@ async fn actor_storage_different_keys_preserve_all_updates_under_concurrency() {
     for key in &keys {
         service
             .invoke(
-                "actor".to_string(),
+                "memory".to_string(),
                 test_invocation_with_path(&format!("/seed?key={key}"), &format!("seed-{key}")),
             )
             .await
@@ -6981,7 +6980,7 @@ async fn actor_storage_different_keys_preserve_all_updates_under_concurrency() {
         let key = key.clone();
         tasks.push(tokio::spawn(async move {
             svc.invoke(
-                "actor".to_string(),
+                "memory".to_string(),
                 test_invocation_with_path(&format!("/inc-cas?key={key}"), &format!("inc-{key}")),
             )
             .await
@@ -6996,7 +6995,7 @@ async fn actor_storage_different_keys_preserve_all_updates_under_concurrency() {
     for key in &keys {
         let current = service
             .invoke(
-                "actor".to_string(),
+                "memory".to_string(),
                 test_invocation_with_path(&format!("/get?key={key}"), &format!("get-{key}")),
             )
             .await
@@ -7013,7 +7012,7 @@ async fn actor_storage_different_keys_preserve_all_updates_under_concurrency() {
 
 #[tokio::test]
 #[serial]
-async fn actor_storage_structured_value_roundtrip_works() {
+async fn memory_storage_structured_value_roundtrip_works() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -7027,13 +7026,13 @@ async fn actor_storage_structured_value_roundtrip_works() {
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7042,7 +7041,7 @@ async fn actor_storage_structured_value_roundtrip_works() {
 
     let roundtrip = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/value-roundtrip?key=user-4", "value-roundtrip"),
         )
         .await
@@ -7052,7 +7051,7 @@ async fn actor_storage_structured_value_roundtrip_works() {
 
     let guard = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/value-string-get-guard?key=user-5", "value-guard"),
         )
         .await
@@ -7062,7 +7061,7 @@ async fn actor_storage_structured_value_roundtrip_works() {
 
     let visibility = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/local-visibility?key=user-6", "value-visibility"),
         )
         .await
@@ -7073,7 +7072,7 @@ async fn actor_storage_structured_value_roundtrip_works() {
 
 #[tokio::test]
 #[serial]
-async fn actor_direct_write_visibility_roundtrip_works() {
+async fn memory_direct_write_visibility_roundtrip_works() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7087,13 +7086,13 @@ async fn actor_direct_write_visibility_roundtrip_works() {
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7102,7 +7101,7 @@ async fn actor_direct_write_visibility_roundtrip_works() {
 
     let set = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/direct-set?key=user-direct-1", "direct-set"),
         )
         .await
@@ -7111,7 +7110,7 @@ async fn actor_direct_write_visibility_roundtrip_works() {
 
     let after_set = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/direct-get?key=user-direct-1", "direct-get-set"),
         )
         .await
@@ -7121,7 +7120,7 @@ async fn actor_direct_write_visibility_roundtrip_works() {
 
     let delete = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/direct-delete?key=user-direct-1", "direct-delete"),
         )
         .await
@@ -7130,7 +7129,7 @@ async fn actor_direct_write_visibility_roundtrip_works() {
 
     let after_delete = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path("/direct-get?key=user-direct-1", "direct-get-delete"),
         )
         .await
@@ -7141,7 +7140,7 @@ async fn actor_direct_write_visibility_roundtrip_works() {
 
 #[tokio::test]
 #[serial]
-async fn actor_direct_writes_preserve_distinct_actor_updates() {
+async fn memory_direct_writes_preserve_distinct_memory_updates() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7155,13 +7154,13 @@ async fn actor_direct_writes_preserve_distinct_actor_updates() {
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7174,7 +7173,7 @@ async fn actor_direct_writes_preserve_distinct_actor_updates() {
     for key in &keys {
         let set = service
             .invoke(
-                "actor".to_string(),
+                "memory".to_string(),
                 test_invocation_with_path(
                     &format!("/direct-set?key={key}"),
                     &format!("direct-set-{key}"),
@@ -7192,7 +7191,7 @@ async fn actor_direct_writes_preserve_distinct_actor_updates() {
         for key in &keys {
             let output = service
                 .invoke(
-                    "actor".to_string(),
+                    "memory".to_string(),
                     test_invocation_with_path(
                         &format!("/direct-get?key={key}"),
                         &format!("direct-get-{key}"),
@@ -7220,7 +7219,7 @@ async fn actor_direct_writes_preserve_distinct_actor_updates() {
 
 #[tokio::test]
 #[serial]
-async fn actor_blind_stm_write_uses_blind_apply_path() {
+async fn memory_blind_stm_write_uses_blind_apply_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7228,20 +7227,20 @@ async fn actor_blind_stm_write_uses_blind_apply_path() {
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
         queue_warn_thresholds: vec![10],
-        actor_profile_enabled: true,
+        memory_profile_enabled: true,
         ..RuntimeConfig::default()
     })
     .await;
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7250,18 +7249,18 @@ async fn actor_blind_stm_write_uses_blind_apply_path() {
 
     service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile_reset", "actor-blind-profile-reset"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile_reset", "memory-blind-profile-reset"),
         )
         .await
         .expect("profile reset should succeed");
 
     let write = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path(
                 "/stm-blind-write?key=user-blind-stm&value=7",
-                "actor-blind-write",
+                "memory-blind-write",
             ),
         )
         .await
@@ -7271,8 +7270,8 @@ async fn actor_blind_stm_write_uses_blind_apply_path() {
 
     let output = service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile", "actor-blind-profile"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile", "memory-blind-profile"),
         )
         .await
         .expect("profile should succeed");
@@ -7302,7 +7301,7 @@ async fn actor_blind_stm_write_uses_blind_apply_path() {
 
 #[tokio::test]
 #[serial]
-async fn actor_mixed_stm_write_stays_on_full_apply_path() {
+async fn memory_mixed_stm_write_stays_on_full_apply_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7310,20 +7309,20 @@ async fn actor_mixed_stm_write_stays_on_full_apply_path() {
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
         queue_warn_thresholds: vec![10],
-        actor_profile_enabled: true,
+        memory_profile_enabled: true,
         ..RuntimeConfig::default()
     })
     .await;
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7332,26 +7331,26 @@ async fn actor_mixed_stm_write_stays_on_full_apply_path() {
 
     service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/seed?key=user-mixed-stm", "actor-mixed-seed"),
+            "memory".to_string(),
+            test_invocation_with_path("/seed?key=user-mixed-stm", "memory-mixed-seed"),
         )
         .await
         .expect("seed should succeed");
 
     service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile_reset", "actor-mixed-profile-reset"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile_reset", "memory-mixed-profile-reset"),
         )
         .await
         .expect("profile reset should succeed");
 
     let write = service
         .invoke(
-            "actor".to_string(),
+            "memory".to_string(),
             test_invocation_with_path(
                 "/stm-read-write?key=user-mixed-stm&value=9",
-                "actor-mixed-write",
+                "memory-mixed-write",
             ),
         )
         .await
@@ -7361,8 +7360,8 @@ async fn actor_mixed_stm_write_stays_on_full_apply_path() {
 
     let output = service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile", "actor-mixed-profile"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile", "memory-mixed-profile"),
         )
         .await
         .expect("profile should succeed");
@@ -7392,7 +7391,7 @@ async fn actor_mixed_stm_write_stays_on_full_apply_path() {
 
 #[tokio::test]
 #[serial]
-async fn actor_direct_read_uses_point_read_lane() {
+async fn memory_direct_read_uses_point_read_lane() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7400,20 +7399,20 @@ async fn actor_direct_read_uses_point_read_lane() {
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
         queue_warn_thresholds: vec![10],
-        actor_profile_enabled: true,
+        memory_profile_enabled: true,
         ..RuntimeConfig::default()
     })
     .await;
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7422,16 +7421,19 @@ async fn actor_direct_read_uses_point_read_lane() {
 
     service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile_reset", "actor-direct-profile-reset"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile_reset", "memory-direct-profile-reset"),
         )
         .await
         .expect("profile reset should succeed");
 
     let read = service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/direct-get?key=user-direct-fast-read", "actor-direct-read"),
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/direct-get?key=user-direct-fast-read",
+                "memory-direct-read",
+            ),
         )
         .await
         .expect("direct read should succeed");
@@ -7440,8 +7442,8 @@ async fn actor_direct_read_uses_point_read_lane() {
 
     let output = service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile", "actor-direct-profile"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile", "memory-direct-profile"),
         )
         .await
         .expect("profile should succeed");
@@ -7471,7 +7473,7 @@ async fn actor_direct_read_uses_point_read_lane() {
 
 #[tokio::test]
 #[serial]
-async fn actor_read_only_atomic_avoids_stm_commit_path() {
+async fn memory_read_only_atomic_avoids_stm_commit_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7479,20 +7481,20 @@ async fn actor_read_only_atomic_avoids_stm_commit_path() {
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
         queue_warn_thresholds: vec![10],
-        actor_profile_enabled: true,
+        memory_profile_enabled: true,
         ..RuntimeConfig::default()
     })
     .await;
 
     service
         .deploy_with_config(
-            "actor".to_string(),
-            actor_worker(),
+            "memory".to_string(),
+            memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7501,16 +7503,16 @@ async fn actor_read_only_atomic_avoids_stm_commit_path() {
 
     service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile_reset", "actor-read-only-profile-reset"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile_reset", "memory-read-only-profile-reset"),
         )
         .await
         .expect("profile reset should succeed");
 
     let read = service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/get?key=user-read-only-fast", "actor-read-only"),
+            "memory".to_string(),
+            test_invocation_with_path("/get?key=user-read-only-fast", "memory-read-only"),
         )
         .await
         .expect("atomic read should succeed");
@@ -7519,8 +7521,8 @@ async fn actor_read_only_atomic_avoids_stm_commit_path() {
 
     let output = service
         .invoke(
-            "actor".to_string(),
-            test_invocation_with_path("/__profile", "actor-read-only-profile"),
+            "memory".to_string(),
+            test_invocation_with_path("/__profile", "memory-read-only-profile"),
         )
         .await
         .expect("profile should succeed");
@@ -7562,7 +7564,7 @@ async fn actor_read_only_atomic_avoids_stm_commit_path() {
 
 #[tokio::test]
 #[serial]
-async fn actor_multiple_atomic_reads_in_one_request_complete() {
+async fn memory_multiple_atomic_reads_in_one_request_complete() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7576,13 +7578,13 @@ async fn actor_multiple_atomic_reads_in_one_request_complete() {
 
     service
         .deploy_with_config(
-            "actor-multi-read".to_string(),
-            actor_multi_atomic_read_worker(),
+            "memory-multi-read".to_string(),
+            memory_multi_atomic_read_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7591,7 +7593,7 @@ async fn actor_multiple_atomic_reads_in_one_request_complete() {
 
     let seed = service
         .invoke(
-            "actor-multi-read".to_string(),
+            "memory-multi-read".to_string(),
             test_invocation_with_path("/seed", "multi-read-seed"),
         )
         .await
@@ -7601,7 +7603,7 @@ async fn actor_multiple_atomic_reads_in_one_request_complete() {
     let output = tokio::time::timeout(
         Duration::from_secs(2),
         service.invoke(
-            "actor-multi-read".to_string(),
+            "memory-multi-read".to_string(),
             test_invocation_with_path("/sum?keys=2", "multi-read-sum"),
         ),
     )
@@ -7614,7 +7616,7 @@ async fn actor_multiple_atomic_reads_in_one_request_complete() {
 
 #[tokio::test]
 #[serial]
-async fn actor_multikey_direct_reads_complete_after_warmup() {
+async fn memory_multikey_direct_reads_complete_after_warmup() {
     let service = test_service(RuntimeConfig {
         min_isolates: 4,
         max_isolates: 4,
@@ -7628,13 +7630,13 @@ async fn actor_multikey_direct_reads_complete_after_warmup() {
 
     service
         .deploy_with_config(
-            "actor-multi-key".to_string(),
-            actor_multi_key_storage_worker(),
+            "memory-multi-key".to_string(),
+            memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7643,7 +7645,7 @@ async fn actor_multikey_direct_reads_complete_after_warmup() {
 
     service
         .invoke(
-            "actor-multi-key".to_string(),
+            "memory-multi-key".to_string(),
             test_invocation_with_path("/seed-all?keys=8", "multi-key-direct-seed"),
         )
         .await
@@ -7651,7 +7653,7 @@ async fn actor_multikey_direct_reads_complete_after_warmup() {
 
     let warmed = service
         .invoke(
-            "actor-multi-key".to_string(),
+            "memory-multi-key".to_string(),
             test_invocation_with_path("/direct-sum?keys=8", "multi-key-direct-warm"),
         )
         .await
@@ -7665,7 +7667,7 @@ async fn actor_multikey_direct_reads_complete_after_warmup() {
             timeout(
                 Duration::from_secs(2),
                 service.invoke(
-                    "actor-multi-key".to_string(),
+                    "memory-multi-key".to_string(),
                     test_invocation_with_path(
                         "/direct-sum?keys=8",
                         &format!("multi-key-direct-{idx}"),
@@ -7688,7 +7690,7 @@ async fn actor_multikey_direct_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn actor_multikey_stm_reads_complete_after_warmup() {
+async fn memory_multikey_stm_reads_complete_after_warmup() {
     let service = test_service(RuntimeConfig {
         min_isolates: 4,
         max_isolates: 4,
@@ -7702,13 +7704,13 @@ async fn actor_multikey_stm_reads_complete_after_warmup() {
 
     service
         .deploy_with_config(
-            "actor-multi-key".to_string(),
-            actor_multi_key_storage_worker(),
+            "memory-multi-key".to_string(),
+            memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7717,7 +7719,7 @@ async fn actor_multikey_stm_reads_complete_after_warmup() {
 
     service
         .invoke(
-            "actor-multi-key".to_string(),
+            "memory-multi-key".to_string(),
             test_invocation_with_path("/seed-all?keys=8", "multi-key-stm-seed"),
         )
         .await
@@ -7725,7 +7727,7 @@ async fn actor_multikey_stm_reads_complete_after_warmup() {
 
     let warmed = service
         .invoke(
-            "actor-multi-key".to_string(),
+            "memory-multi-key".to_string(),
             test_invocation_with_path("/stm-sum?keys=8", "multi-key-stm-warm"),
         )
         .await
@@ -7739,7 +7741,7 @@ async fn actor_multikey_stm_reads_complete_after_warmup() {
             timeout(
                 Duration::from_secs(2),
                 service.invoke(
-                    "actor-multi-key".to_string(),
+                    "memory-multi-key".to_string(),
                     test_invocation_with_path("/stm-sum?keys=8", &format!("multi-key-stm-{idx}")),
                 ),
             )
@@ -7759,7 +7761,7 @@ async fn actor_multikey_stm_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn actor_stm_benchmark_worker_returns_correct_total() {
+async fn memory_stm_benchmark_worker_returns_correct_total() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 2,
@@ -7773,13 +7775,13 @@ async fn actor_stm_benchmark_worker_returns_correct_total() {
 
     service
         .deploy_with_config(
-            "actor-multi-key".to_string(),
-            actor_multi_key_storage_worker(),
+            "memory-multi-key".to_string(),
+            memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7788,7 +7790,7 @@ async fn actor_stm_benchmark_worker_returns_correct_total() {
 
     service
         .invoke(
-            "actor-multi-key".to_string(),
+            "memory-multi-key".to_string(),
             test_invocation_with_path("/seed-all?keys=1", "multi-key-write-seed"),
         )
         .await
@@ -7798,7 +7800,7 @@ async fn actor_stm_benchmark_worker_returns_correct_total() {
         let output = timeout(
             Duration::from_secs(2),
             service.invoke(
-                "actor-multi-key".to_string(),
+                "memory-multi-key".to_string(),
                 test_invocation_with_path("/inc?key=bench-0", &format!("multi-key-inc-{idx}")),
             ),
         )
@@ -7810,7 +7812,7 @@ async fn actor_stm_benchmark_worker_returns_correct_total() {
 
     let total = service
         .invoke(
-            "actor-multi-key".to_string(),
+            "memory-multi-key".to_string(),
             test_invocation_with_path("/get?key=bench-0", "multi-key-write-total"),
         )
         .await
@@ -7821,7 +7823,7 @@ async fn actor_stm_benchmark_worker_returns_correct_total() {
 
 #[tokio::test]
 #[serial]
-async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
+async fn memory_direct_writes_complete_past_repeated_worker_threshold() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7835,13 +7837,13 @@ async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
 
     service
         .deploy_with_config(
-            "actor-direct-write-threshold".to_string(),
-            actor_multi_key_storage_worker(),
+            "memory-direct-write-threshold".to_string(),
+            memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7853,7 +7855,7 @@ async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
         let result = timeout(
             Duration::from_secs(10),
             service.invoke(
-                "actor-direct-write-threshold".to_string(),
+                "memory-direct-write-threshold".to_string(),
                 test_invocation_with_path(&path, &format!("direct-write-threshold-{idx}")),
             ),
         )
@@ -7863,7 +7865,7 @@ async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
             Ok(Err(error)) => panic!("direct write {idx} failed: {error}"),
             Err(_) => {
                 let dump = service
-                    .debug_dump("actor-direct-write-threshold".to_string())
+                    .debug_dump("memory-direct-write-threshold".to_string())
                     .await;
                 panic!("direct write {idx} should not hang; debug dump: {dump:?}");
             }
@@ -7874,7 +7876,7 @@ async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
     let total = timeout(
         Duration::from_secs(10),
         service.invoke(
-            "actor-direct-write-threshold".to_string(),
+            "memory-direct-write-threshold".to_string(),
             test_invocation_with_path("/get?key=bench-direct", "direct-write-threshold-total"),
         ),
     )
@@ -7887,7 +7889,7 @@ async fn actor_direct_writes_complete_past_repeated_worker_threshold() {
 
 #[tokio::test]
 #[serial]
-async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
+async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -7901,13 +7903,13 @@ async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
 
     service
         .deploy_with_config(
-            "actor-atomic-write-threshold".to_string(),
-            actor_multi_key_storage_worker(),
+            "memory-atomic-write-threshold".to_string(),
+            memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7916,7 +7918,7 @@ async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
 
     service
         .invoke(
-            "actor-atomic-write-threshold".to_string(),
+            "memory-atomic-write-threshold".to_string(),
             test_invocation_with_path("/seed-all?keys=1", "atomic-write-threshold-seed"),
         )
         .await
@@ -7926,7 +7928,7 @@ async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
         let result = timeout(
             Duration::from_secs(10),
             service.invoke(
-                "actor-atomic-write-threshold".to_string(),
+                "memory-atomic-write-threshold".to_string(),
                 test_invocation_with_path(
                     "/inc?key=bench-0",
                     &format!("atomic-write-threshold-{idx}"),
@@ -7939,7 +7941,7 @@ async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
             Ok(Err(error)) => panic!("atomic write {idx} failed: {error}"),
             Err(_) => {
                 let dump = service
-                    .debug_dump("actor-atomic-write-threshold".to_string())
+                    .debug_dump("memory-atomic-write-threshold".to_string())
                     .await;
                 panic!("atomic write {idx} should not hang; debug dump: {dump:?}");
             }
@@ -7950,7 +7952,7 @@ async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
     let total = timeout(
         Duration::from_secs(10),
         service.invoke(
-            "actor-atomic-write-threshold".to_string(),
+            "memory-atomic-write-threshold".to_string(),
             test_invocation_with_path("/get?key=bench-0", "atomic-write-threshold-total"),
         ),
     )
@@ -7963,7 +7965,7 @@ async fn actor_atomic_writes_complete_past_repeated_worker_threshold() {
 
 #[tokio::test]
 #[serial]
-async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
+async fn memory_constructor_reads_hydrated_storage_snapshot_synchronously() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates: 1,
@@ -7977,13 +7979,13 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     service
         .deploy_with_config(
-            "actor-ctor".to_string(),
-            actor_constructor_storage_worker(),
+            "memory-ctor".to_string(),
+            memory_constructor_storage_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -7992,7 +7994,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     let seeded = service
         .invoke(
-            "actor-ctor".to_string(),
+            "memory-ctor".to_string(),
             test_invocation_with_path("/seed", "ctor-seed"),
         )
         .await
@@ -8001,7 +8003,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     let warm_ctor = service
         .invoke(
-            "actor-ctor".to_string(),
+            "memory-ctor".to_string(),
             test_invocation_with_path("/constructor-value", "ctor-warm"),
         )
         .await
@@ -8010,7 +8012,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     let warm_direct = service
         .invoke(
-            "actor-ctor".to_string(),
+            "memory-ctor".to_string(),
             test_invocation_with_path("/direct-value", "ctor-direct-warm"),
         )
         .await
@@ -8020,7 +8022,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
     timeout(Duration::from_secs(3), async {
         loop {
             let stats = service
-                .stats("actor-ctor".to_string())
+                .stats("memory-ctor".to_string())
                 .await
                 .expect("stats");
             if stats.isolates_total == 0 {
@@ -8030,11 +8032,11 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
         }
     })
     .await
-    .expect("actor pool should scale down to zero");
+    .expect("memory pool should scale down to zero");
 
     let cold_ctor = service
         .invoke(
-            "actor-ctor".to_string(),
+            "memory-ctor".to_string(),
             test_invocation_with_path("/constructor-value", "ctor-cold"),
         )
         .await
@@ -8043,7 +8045,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     let cold_direct = service
         .invoke(
-            "actor-ctor".to_string(),
+            "memory-ctor".to_string(),
             test_invocation_with_path("/direct-value", "ctor-direct-cold"),
         )
         .await
@@ -8052,7 +8054,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     let current = service
         .invoke(
-            "actor-ctor".to_string(),
+            "memory-ctor".to_string(),
             test_invocation_with_path("/current-value", "ctor-current"),
         )
         .await
@@ -8062,7 +8064,7 @@ async fn actor_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_actor_factories_share_state_and_module_globals() {
+async fn hosted_memory_factories_share_state_and_module_globals() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -8076,13 +8078,13 @@ async fn hosted_actor_factories_share_state_and_module_globals() {
 
     service
         .deploy_with_config(
-            "hosted-actor".to_string(),
-            hosted_actor_worker(),
+            "hosted-memory".to_string(),
+            hosted_memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -8091,7 +8093,7 @@ async fn hosted_actor_factories_share_state_and_module_globals() {
 
     let alpha = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/alpha/inc?key=user-1", "alpha-inc"),
         )
         .await
@@ -8100,7 +8102,7 @@ async fn hosted_actor_factories_share_state_and_module_globals() {
 
     let beta = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/beta/read?key=user-1", "beta-read"),
         )
         .await
@@ -8109,35 +8111,38 @@ async fn hosted_actor_factories_share_state_and_module_globals() {
 
     let worker_global = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/worker/global/inc?key=user-1", "worker-global-inc"),
         )
         .await
         .expect("worker global increment should succeed");
     assert_eq!(String::from_utf8(worker_global.body).expect("utf8"), "1");
 
-    let actor_global = service
+    let memory_global = service
         .invoke(
-            "hosted-actor".to_string(),
-            test_invocation_with_path("/actor/global/read?key=user-1", "actor-global-read"),
+            "hosted-memory".to_string(),
+            test_invocation_with_path("/memory/global/read?key=user-1", "memory-global-read"),
         )
         .await
-        .expect("actor global read should succeed");
-    assert_eq!(String::from_utf8(actor_global.body).expect("utf8"), "1");
+        .expect("memory global read should succeed");
+    assert_eq!(String::from_utf8(memory_global.body).expect("utf8"), "1");
 
-    let actor_global_inc = service
+    let memory_global_inc = service
         .invoke(
-            "hosted-actor".to_string(),
-            test_invocation_with_path("/actor/global/inc?key=user-1", "actor-global-inc"),
+            "hosted-memory".to_string(),
+            test_invocation_with_path("/memory/global/inc?key=user-1", "memory-global-inc"),
         )
         .await
-        .expect("actor global increment should succeed");
-    assert_eq!(String::from_utf8(actor_global_inc.body).expect("utf8"), "2");
+        .expect("memory global increment should succeed");
+    assert_eq!(
+        String::from_utf8(memory_global_inc.body).expect("utf8"),
+        "2"
+    );
 }
 
 #[tokio::test]
 #[serial]
-async fn hosted_actor_allows_inline_closures() {
+async fn hosted_memory_allows_inline_closures() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -8151,13 +8156,13 @@ async fn hosted_actor_allows_inline_closures() {
 
     service
         .deploy_with_config(
-            "hosted-actor".to_string(),
-            hosted_actor_worker(),
+            "hosted-memory".to_string(),
+            hosted_memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -8166,7 +8171,7 @@ async fn hosted_actor_allows_inline_closures() {
 
     let output = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/inline?key=user-2", "inline-closure"),
         )
         .await
@@ -8176,7 +8181,7 @@ async fn hosted_actor_allows_inline_closures() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_actor_stm_single_read_is_point_in_time_only() {
+async fn hosted_memory_stm_single_read_is_point_in_time_only() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -8190,13 +8195,13 @@ async fn hosted_actor_stm_single_read_is_point_in_time_only() {
 
     service
         .deploy_with_config(
-            "hosted-actor".to_string(),
-            hosted_actor_worker(),
+            "hosted-memory".to_string(),
+            hosted_memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -8205,7 +8210,7 @@ async fn hosted_actor_stm_single_read_is_point_in_time_only() {
 
     service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/stm/seed?key=user-stm-once", "stm-seed-once"),
         )
         .await
@@ -8216,7 +8221,7 @@ async fn hosted_actor_stm_single_read_is_point_in_time_only() {
         tokio::spawn(async move {
             service
                 .invoke(
-                    "hosted-actor".to_string(),
+                    "hosted-memory".to_string(),
                     test_invocation_with_path("/stm/read-once?key=user-stm-once", "stm-read-once"),
                 )
                 .await
@@ -8227,7 +8232,7 @@ async fn hosted_actor_stm_single_read_is_point_in_time_only() {
 
     service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/stm/write-a?key=user-stm-once&value=1", "stm-write-once"),
         )
         .await
@@ -8242,8 +8247,8 @@ async fn hosted_actor_stm_single_read_is_point_in_time_only() {
 
 #[tokio::test]
 #[serial]
-#[ignore = "same-actor STM retry path still needs a dedicated follow-up pass"]
-async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
+#[ignore = "same-memory STM retry path still needs a dedicated follow-up pass"]
+async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -8257,13 +8262,13 @@ async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
 
     service
         .deploy_with_config(
-            "hosted-actor".to_string(),
-            hosted_actor_worker(),
+            "hosted-memory".to_string(),
+            hosted_memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -8272,7 +8277,7 @@ async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
 
     service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/stm/seed?key=user-stm-pair", "stm-seed-pair"),
         )
         .await
@@ -8283,7 +8288,7 @@ async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
         tokio::spawn(async move {
             service
                 .invoke(
-                    "hosted-actor".to_string(),
+                    "hosted-memory".to_string(),
                     test_invocation_with_path("/stm/read-pair?key=user-stm-pair", "stm-read-pair"),
                 )
                 .await
@@ -8300,7 +8305,7 @@ async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
             runtime.block_on(async move {
                 service
                     .invoke(
-                        "hosted-actor".to_string(),
+                        "hosted-memory".to_string(),
                         test_invocation_with_path(
                             "/stm/write-a?key=user-stm-pair&value=1",
                             "stm-write-pair",
@@ -8322,7 +8327,7 @@ async fn hosted_actor_stm_retries_when_prior_read_goes_stale() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_actor_stm_snapshot_read_skips_retry_for_that_read() {
+async fn hosted_memory_stm_snapshot_read_skips_retry_for_that_read() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 3,
@@ -8336,13 +8341,13 @@ async fn hosted_actor_stm_snapshot_read_skips_retry_for_that_read() {
 
     service
         .deploy_with_config(
-            "hosted-actor".to_string(),
-            hosted_actor_worker(),
+            "hosted-memory".to_string(),
+            hosted_memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -8351,7 +8356,7 @@ async fn hosted_actor_stm_snapshot_read_skips_retry_for_that_read() {
 
     service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/stm/seed?key=user-stm-allow", "stm-seed-allow"),
         )
         .await
@@ -8362,7 +8367,7 @@ async fn hosted_actor_stm_snapshot_read_skips_retry_for_that_read() {
         tokio::spawn(async move {
             service
                 .invoke(
-                    "hosted-actor".to_string(),
+                    "hosted-memory".to_string(),
                     test_invocation_with_path(
                         "/stm/read-pair-snapshot?key=user-stm-allow",
                         "stm-read-allow",
@@ -8376,7 +8381,7 @@ async fn hosted_actor_stm_snapshot_read_skips_retry_for_that_read() {
 
     service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path("/stm/write-a?key=user-stm-allow&value=1", "stm-write-allow"),
         )
         .await
@@ -8391,7 +8396,7 @@ async fn hosted_actor_stm_snapshot_read_skips_retry_for_that_read() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_actor_tvar_default_is_lazy_until_written() {
+async fn hosted_memory_tvar_default_is_lazy_until_written() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -8405,13 +8410,13 @@ async fn hosted_actor_tvar_default_is_lazy_until_written() {
 
     service
         .deploy_with_config(
-            "hosted-actor".to_string(),
-            hosted_actor_worker(),
+            "hosted-memory".to_string(),
+            hosted_memory_worker(),
             DeployConfig {
                 public: false,
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
-                    binding: "MY_ACTOR".to_string(),
+                    binding: "MY_MEMORY".to_string(),
                 }],
             },
         )
@@ -8420,10 +8425,10 @@ async fn hosted_actor_tvar_default_is_lazy_until_written() {
 
     let default_read = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path(
                 "/stm/tvar-default/read?key=user-1",
-                "hosted-actor-tvar-default-read",
+                "hosted-memory-tvar-default-read",
             ),
         )
         .await
@@ -8432,10 +8437,10 @@ async fn hosted_actor_tvar_default_is_lazy_until_written() {
 
     let raw_before_write = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path(
                 "/stm/tvar-default/raw?key=user-1",
-                "hosted-actor-tvar-default-raw-before-write",
+                "hosted-memory-tvar-default-raw-before-write",
             ),
         )
         .await
@@ -8447,10 +8452,10 @@ async fn hosted_actor_tvar_default_is_lazy_until_written() {
 
     let write = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path(
                 "/stm/tvar-default/write?key=user-1",
-                "hosted-actor-tvar-default-write",
+                "hosted-memory-tvar-default-write",
             ),
         )
         .await
@@ -8459,10 +8464,10 @@ async fn hosted_actor_tvar_default_is_lazy_until_written() {
 
     let raw_after_write = service
         .invoke(
-            "hosted-actor".to_string(),
+            "hosted-memory".to_string(),
             test_invocation_with_path(
                 "/stm/tvar-default/raw?key=user-1",
-                "hosted-actor-tvar-default-raw-after-write",
+                "hosted-memory-tvar-default-raw-after-write",
             ),
         )
         .await

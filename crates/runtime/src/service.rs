@@ -2,22 +2,23 @@ mod config;
 mod dynamic;
 mod sessions;
 
-use crate::actor::ActorStore;
-use crate::actor_rpc::{
-    decode_actor_invoke_request, encode_actor_invoke_response, ActorInvokeCall, ActorInvokeResponse,
-};
 use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
     ensure_v8_flags, load_worker, new_runtime_from_snapshot, pump_event_loop_once,
-    validate_loaded_worker_runtime, validate_worker, ExecuteActorCall, ExecuteHostRpcCall,
+    validate_loaded_worker_runtime, validate_worker, ExecuteHostRpcCall, ExecuteMemoryCall,
 };
 use crate::kv::KvStore;
+use crate::memory::MemoryStore;
+use crate::memory_rpc::{
+    decode_memory_invoke_request, encode_memory_invoke_response, MemoryInvokeCall,
+    MemoryInvokeResponse,
+};
 use crate::ops::{
     cancel_request_body_stream, clear_request_body_stream, clear_request_secret_context,
-    register_actor_request_scope, register_request_body_stream, register_request_secret_context,
-    ActorInvokeEvent, IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
+    register_memory_request_scope, register_request_body_stream, register_request_secret_context,
+    IsolateEventPayload, IsolateEventSender, MemoryInvokeEvent, RequestBodyStreams,
 };
 use crate::static_assets::{
     compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,
@@ -67,7 +68,7 @@ const INTERNAL_TRANSPORT_CLOSE_CODE_HEADER: &str = "x-dd-transport-close-code";
 const INTERNAL_TRANSPORT_CLOSE_REASON_HEADER: &str = "x-dd-transport-close-reason";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const JSON_CONTENT_TYPE: &str = "application/json";
-const ACTOR_ATOMIC_METHOD: &str = "__dd_atomic";
+const MEMORY_ATOMIC_METHOD: &str = "__dd_atomic";
 
 static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -88,7 +89,7 @@ pub struct RuntimeConfig {
     pub kv_read_cache_miss_ttl: Duration,
     pub v8_flags: Vec<String>,
     pub kv_profile_enabled: bool,
-    pub actor_profile_enabled: bool,
+    pub memory_profile_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -109,7 +110,7 @@ impl Default for RuntimeConfig {
             kv_read_cache_miss_ttl: Duration::from_secs(30),
             v8_flags: Vec::new(),
             kv_profile_enabled: false,
-            actor_profile_enabled: false,
+            memory_profile_enabled: false,
         }
     }
 }
@@ -118,9 +119,9 @@ impl Default for RuntimeConfig {
 pub struct RuntimeStorageConfig {
     pub store_dir: PathBuf,
     pub database_url: String,
-    pub actor_namespace_shards: usize,
-    pub actor_db_cache_max_open: usize,
-    pub actor_db_idle_ttl: Duration,
+    pub memory_namespace_shards: usize,
+    pub memory_db_cache_max_open: usize,
+    pub memory_db_idle_ttl: Duration,
     pub worker_store_enabled: bool,
     pub blob_store: BlobStoreConfig,
 }
@@ -133,9 +134,9 @@ impl Default for RuntimeStorageConfig {
         Self {
             store_dir,
             database_url,
-            actor_namespace_shards: 16,
-            actor_db_cache_max_open: 4096,
-            actor_db_idle_ttl: Duration::from_secs(60),
+            memory_namespace_shards: 16,
+            memory_db_cache_max_open: 4096,
+            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: !cfg!(test),
             blob_store: BlobStoreConfig::local(blob_root),
         }
@@ -166,8 +167,8 @@ pub struct WorkerStats {
 pub struct WorkerDebugDump {
     pub generation: u64,
     pub queued: usize,
-    pub actor_owners: Vec<(String, u64)>,
-    pub actor_inflight: Vec<(String, usize)>,
+    pub memory_owners: Vec<(String, u64)>,
+    pub memory_inflight: Vec<(String, usize)>,
     pub isolates: Vec<WorkerDebugIsolate>,
     pub queued_requests: Vec<WorkerDebugRequest>,
 }
@@ -188,7 +189,7 @@ pub struct WorkerDebugRequest {
     pub user_request_id: String,
     pub method: String,
     pub url: String,
-    pub actor_key: Option<String>,
+    pub memory_key: Option<String>,
     pub target_isolate_id: Option<u64>,
     pub internal_origin: bool,
     pub reply_kind: String,
@@ -402,7 +403,7 @@ struct WorkerManager {
     bootstrap_snapshot: &'static [u8],
     runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     kv_store: KvStore,
-    actor_store: ActorStore,
+    memory_store: MemoryStore,
     cache_store: CacheStore,
     workers: HashMap<String, WorkerEntry>,
     pre_canceled: HashMap<String, HashSet<String>>,
@@ -412,7 +413,7 @@ struct WorkerManager {
     websocket_sessions: HashMap<String, WorkerWebSocketSession>,
     websocket_handle_index: HashMap<String, String>,
     websocket_open_handles: HashMap<String, HashSet<String>>,
-    open_handle_registry: crate::ops::ActorOpenHandleRegistry,
+    open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
     websocket_pending_closes: HashMap<String, HashMap<String, Vec<SocketCloseEvent>>>,
     websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
     websocket_close_signals: HashMap<String, SocketCloseEvent>,
@@ -573,8 +574,8 @@ struct WorkerPool {
     source: Arc<str>,
     kv_bindings_json: Arc<str>,
     kv_read_cache_config_json: Arc<str>,
-    actor_bindings: Vec<String>,
-    actor_bindings_json: Arc<str>,
+    memory_bindings: Vec<String>,
+    memory_bindings_json: Arc<str>,
     dynamic_bindings: Vec<String>,
     dynamic_bindings_json: Arc<str>,
     dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
@@ -586,8 +587,8 @@ struct WorkerPool {
     strict_request_isolation: bool,
     queue: VecDeque<PendingInvoke>,
     isolates: Vec<IsolateHandle>,
-    actor_owners: HashMap<String, u64>,
-    actor_inflight: HashMap<String, usize>,
+    memory_owners: HashMap<String, u64>,
+    memory_inflight: HashMap<String, usize>,
     stats: PoolStats,
     queue_warn_level: usize,
 }
@@ -609,8 +610,8 @@ struct PendingInvoke {
     runtime_request_id: String,
     request: WorkerInvocation,
     request_body: Option<InvokeRequestBodyReceiver>,
-    actor_route: Option<ActorRoute>,
-    actor_call: Option<ActorExecutionCall>,
+    memory_route: Option<MemoryRoute>,
+    memory_call: Option<MemoryExecutionCall>,
     host_rpc_call: Option<HostRpcExecutionCall>,
     target_isolate_id: Option<u64>,
     reply_kind: PendingReplyKind,
@@ -651,7 +652,7 @@ impl PendingReplyKind {
 struct PendingReply {
     completion_token: String,
     canceled: bool,
-    actor_key: Option<String>,
+    memory_key: Option<String>,
     internal_origin: bool,
     reply: oneshot::Sender<Result<WorkerOutput>>,
     completion_meta: Option<PendingReplyMeta>,
@@ -675,12 +676,12 @@ enum DirectDynamicFetchDispatch {
 }
 
 #[derive(Debug, Clone)]
-struct ActorRoute {
+struct MemoryRoute {
     binding: String,
     key: String,
 }
 
-impl ActorRoute {
+impl MemoryRoute {
     fn owner_key(&self) -> String {
         format!("{}\u{001f}{}", self.binding, self.key)
     }
@@ -689,7 +690,7 @@ impl ActorRoute {
 struct DispatchCandidate {
     queue_idx: usize,
     isolate_idx: usize,
-    actor_key: Option<String>,
+    memory_key: Option<String>,
     assign_owner: bool,
 }
 
@@ -718,7 +719,7 @@ enum IsolateCommand {
         worker_name_json: Arc<str>,
         kv_bindings_json: Arc<str>,
         kv_read_cache_config_json: Arc<str>,
-        actor_bindings_json: Arc<str>,
+        memory_bindings_json: Arc<str>,
         dynamic_bindings_json: Arc<str>,
         dynamic_rpc_bindings_json: Arc<str>,
         dynamic_env_json: Arc<str>,
@@ -729,9 +730,9 @@ enum IsolateCommand {
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         stream_response: bool,
-        actor_call: Option<ActorExecutionCall>,
+        memory_call: Option<MemoryExecutionCall>,
         host_rpc_call: Option<HostRpcExecutionCall>,
-        actor_route: Option<ActorRoute>,
+        memory_route: Option<MemoryRoute>,
     },
     Abort {
         runtime_request_id: String,
@@ -756,7 +757,7 @@ impl Wake for IsolateEventLoopWaker {
 }
 
 #[derive(Clone)]
-enum ActorExecutionCall {
+enum MemoryExecutionCall {
     Method {
         binding: String,
         key: String,
@@ -890,23 +891,23 @@ enum RuntimeEvent {
         generation: u64,
         payload: String,
     },
-    ActorInvoke(ActorInvokeEvent),
-    ActorSocketSend(crate::ops::ActorSocketSendEvent),
-    ActorSocketClose(crate::ops::ActorSocketCloseEvent),
-    ActorSocketConsumeClose {
+    MemoryInvoke(MemoryInvokeEvent),
+    MemorySocketSend(crate::ops::MemorySocketSendEvent),
+    MemorySocketClose(crate::ops::MemorySocketCloseEvent),
+    MemorySocketConsumeClose {
         worker_name: String,
         generation: u64,
-        payload: crate::ops::ActorSocketConsumeCloseEvent,
+        payload: crate::ops::MemorySocketConsumeCloseEvent,
     },
-    ActorTransportSendStream(crate::ops::ActorTransportSendStreamEvent),
-    ActorTransportSendDatagram(crate::ops::ActorTransportSendDatagramEvent),
-    ActorTransportRecvStream(crate::ops::ActorTransportRecvStreamEvent),
-    ActorTransportRecvDatagram(crate::ops::ActorTransportRecvDatagramEvent),
-    ActorTransportClose(crate::ops::ActorTransportCloseEvent),
-    ActorTransportConsumeClose {
+    MemoryTransportSendStream(crate::ops::MemoryTransportSendStreamEvent),
+    MemoryTransportSendDatagram(crate::ops::MemoryTransportSendDatagramEvent),
+    MemoryTransportRecvStream(crate::ops::MemoryTransportRecvStreamEvent),
+    MemoryTransportRecvDatagram(crate::ops::MemoryTransportRecvDatagramEvent),
+    MemoryTransportClose(crate::ops::MemoryTransportCloseEvent),
+    MemoryTransportConsumeClose {
         worker_name: String,
         generation: u64,
-        payload: crate::ops::ActorTransportConsumeCloseEvent,
+        payload: crate::ops::MemoryTransportConsumeCloseEvent,
     },
     DynamicWorkerCreate(crate::ops::DynamicWorkerCreateEvent),
     DynamicWorkerLookup(crate::ops::DynamicWorkerLookupEvent),
@@ -1028,19 +1029,19 @@ impl RuntimeService {
         let RuntimeServiceConfig { runtime, storage } = config;
         validate_runtime_config(&runtime)?;
         ensure_v8_flags(&runtime.v8_flags)?;
-        if storage.actor_db_cache_max_open == 0 {
+        if storage.memory_db_cache_max_open == 0 {
             return Err(PlatformError::internal(
-                "actor_db_cache_max_open must be greater than 0",
+                "memory_db_cache_max_open must be greater than 0",
             ));
         }
-        if storage.actor_namespace_shards == 0 {
+        if storage.memory_namespace_shards == 0 {
             return Err(PlatformError::internal(
-                "actor_namespace_shards must be greater than 0",
+                "memory_namespace_shards must be greater than 0",
             ));
         }
-        if storage.actor_db_idle_ttl.is_zero() {
+        if storage.memory_db_idle_ttl.is_zero() {
             return Err(PlatformError::internal(
-                "actor_db_idle_ttl must be greater than 0",
+                "memory_db_idle_ttl must be greater than 0",
             ));
         }
         tokio::fs::create_dir_all(&storage.store_dir)
@@ -1055,14 +1056,14 @@ impl RuntimeService {
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
         let kv_store = KvStore::from_database_url(&storage.database_url).await?;
         kv_store.set_profile_enabled(runtime.kv_profile_enabled);
-        let actor_store = ActorStore::new(
-            storage.store_dir.join("actors"),
-            storage.actor_namespace_shards,
-            storage.actor_db_cache_max_open,
-            storage.actor_db_idle_ttl,
+        let memory_store = MemoryStore::new(
+            storage.store_dir.join("memory"),
+            storage.memory_namespace_shards,
+            storage.memory_db_cache_max_open,
+            storage.memory_db_idle_ttl,
         )
         .await?;
-        actor_store.set_profile_enabled(runtime.actor_profile_enabled);
+        memory_store.set_profile_enabled(runtime.memory_profile_enabled);
         let blob_store = BlobStore::from_config(storage.blob_store.clone()).await?;
         let cache_store = CacheStore::from_config(
             CacheConfig {
@@ -1083,7 +1084,7 @@ impl RuntimeService {
             cancel_sender.clone(),
             bootstrap_snapshot,
             kv_store,
-            actor_store,
+            memory_store,
             cache_store.clone(),
             runtime,
             storage.clone(),
@@ -1778,7 +1779,7 @@ impl WorkerManager {
     fn new(
         bootstrap_snapshot: &'static [u8],
         kv_store: KvStore,
-        actor_store: ActorStore,
+        memory_store: MemoryStore,
         cache_store: CacheStore,
         config: RuntimeConfig,
         storage: RuntimeStorageConfig,
@@ -1790,7 +1791,7 @@ impl WorkerManager {
             bootstrap_snapshot,
             runtime_fast_sender,
             kv_store,
-            actor_store,
+            memory_store,
             cache_store,
             workers: HashMap::new(),
             pre_canceled: HashMap::new(),
@@ -1800,7 +1801,7 @@ impl WorkerManager {
             websocket_sessions: HashMap::new(),
             websocket_handle_index: HashMap::new(),
             websocket_open_handles: HashMap::new(),
-            open_handle_registry: crate::ops::ActorOpenHandleRegistry::default(),
+            open_handle_registry: crate::ops::MemoryOpenHandleRegistry::default(),
             websocket_pending_closes: HashMap::new(),
             websocket_outbound_frames: HashMap::new(),
             websocket_close_signals: HashMap::new(),
@@ -2260,43 +2261,43 @@ impl WorkerManager {
             } => {
                 self.schedule_cache_revalidate(&worker_name, generation, payload, event_tx);
             }
-            RuntimeEvent::ActorInvoke(payload) => {
-                self.enqueue_actor_invoke(payload, event_tx);
+            RuntimeEvent::MemoryInvoke(payload) => {
+                self.enqueue_memory_invoke(payload, event_tx);
             }
-            RuntimeEvent::ActorSocketSend(payload) => {
-                self.handle_actor_socket_send(payload, event_tx);
+            RuntimeEvent::MemorySocketSend(payload) => {
+                self.handle_memory_socket_send(payload, event_tx);
             }
-            RuntimeEvent::ActorSocketClose(payload) => {
-                self.handle_actor_socket_close(payload, event_tx);
+            RuntimeEvent::MemorySocketClose(payload) => {
+                self.handle_memory_socket_close(payload, event_tx);
             }
-            RuntimeEvent::ActorSocketConsumeClose {
+            RuntimeEvent::MemorySocketConsumeClose {
                 worker_name: _worker_name,
                 generation: _generation,
                 payload,
             } => {
-                self.handle_actor_socket_consume_close(payload, event_tx);
+                self.handle_memory_socket_consume_close(payload, event_tx);
             }
-            RuntimeEvent::ActorTransportSendStream(payload) => {
-                self.handle_actor_transport_send_stream(payload, event_tx);
+            RuntimeEvent::MemoryTransportSendStream(payload) => {
+                self.handle_memory_transport_send_stream(payload, event_tx);
             }
-            RuntimeEvent::ActorTransportSendDatagram(payload) => {
-                self.handle_actor_transport_send_datagram(payload, event_tx);
+            RuntimeEvent::MemoryTransportSendDatagram(payload) => {
+                self.handle_memory_transport_send_datagram(payload, event_tx);
             }
-            RuntimeEvent::ActorTransportRecvStream(payload) => {
-                self.handle_actor_transport_recv_stream(payload, event_tx);
+            RuntimeEvent::MemoryTransportRecvStream(payload) => {
+                self.handle_memory_transport_recv_stream(payload, event_tx);
             }
-            RuntimeEvent::ActorTransportRecvDatagram(payload) => {
-                self.handle_actor_transport_recv_datagram(payload, event_tx);
+            RuntimeEvent::MemoryTransportRecvDatagram(payload) => {
+                self.handle_memory_transport_recv_datagram(payload, event_tx);
             }
-            RuntimeEvent::ActorTransportClose(payload) => {
-                self.handle_actor_transport_close(payload, event_tx);
+            RuntimeEvent::MemoryTransportClose(payload) => {
+                self.handle_memory_transport_close(payload, event_tx);
             }
-            RuntimeEvent::ActorTransportConsumeClose {
+            RuntimeEvent::MemoryTransportConsumeClose {
                 worker_name: _worker_name,
                 generation: _generation,
                 payload,
             } => {
-                self.handle_actor_transport_consume_close(payload, event_tx);
+                self.handle_memory_transport_consume_close(payload, event_tx);
             }
             RuntimeEvent::DynamicWorkerCreate(payload) => {
                 self.handle_dynamic_worker_create(payload).await;
@@ -2382,7 +2383,7 @@ impl WorkerManager {
         }
 
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = ActorRoute {
+        let route = MemoryRoute {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
@@ -2390,7 +2391,7 @@ impl WorkerManager {
             self.websocket_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
         let transport_handles =
             self.transport_handles_snapshot(&session.binding, &session.key, None);
-        let actor_call = ActorExecutionCall::Message {
+        let memory_call = MemoryExecutionCall::Message {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
@@ -2401,7 +2402,7 @@ impl WorkerManager {
         };
         let invoke = WorkerInvocation {
             method: "WS-MESSAGE".to_string(),
-            url: format!("http://actor/__dd_socket/{session_id}"),
+            url: format!("http://memory/__dd_socket/{session_id}"),
             headers: Vec::new(),
             body: Vec::new(),
             request_id: format!("ws-message-{runtime_request_id}"),
@@ -2412,7 +2413,7 @@ impl WorkerManager {
             invoke,
             None,
             Some(route),
-            Some(actor_call),
+            Some(memory_call),
             None,
             None,
             Some(session.generation),
@@ -2448,7 +2449,7 @@ impl WorkerManager {
         self.queue_websocket_close_replay(&session, close_code, close_reason.clone());
 
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = ActorRoute {
+        let route = MemoryRoute {
             binding: session.binding.clone(),
             key: session.key.clone(),
         };
@@ -2456,7 +2457,7 @@ impl WorkerManager {
             self.websocket_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
         let transport_handles =
             self.transport_handles_snapshot(&session.binding, &session.key, None);
-        let actor_call = ActorExecutionCall::Close {
+        let memory_call = MemoryExecutionCall::Close {
             binding: session.binding.clone(),
             key: session.key.clone(),
             handle: session.handle.clone(),
@@ -2467,7 +2468,7 @@ impl WorkerManager {
         };
         let invoke = WorkerInvocation {
             method: "WS-CLOSE".to_string(),
-            url: format!("http://actor/__dd_socket_close/{session_id}"),
+            url: format!("http://memory/__dd_socket_close/{session_id}"),
             headers: Vec::new(),
             body: Vec::new(),
             request_id: format!("ws-close-{runtime_request_id}"),
@@ -2479,7 +2480,7 @@ impl WorkerManager {
             invoke,
             None,
             Some(route),
-            Some(actor_call),
+            Some(memory_call),
             None,
             None,
             Some(session.generation),
@@ -2687,8 +2688,8 @@ impl WorkerManager {
             crate::json::to_string(&bindings.kv)
                 .map_err(|error| PlatformError::internal(error.to_string()))?,
         );
-        let actor_bindings_json = Arc::<str>::from(
-            crate::json::to_string(&bindings.actor)
+        let memory_bindings_json = Arc::<str>::from(
+            crate::json::to_string(&bindings.memory)
                 .map_err(|error| PlatformError::internal(error.to_string()))?,
         );
         let dynamic_bindings_json = Arc::<str>::from(
@@ -2742,8 +2743,8 @@ impl WorkerManager {
                 source: Arc::<str>::from(source.clone()),
                 kv_bindings_json,
                 kv_read_cache_config_json,
-                actor_bindings: bindings.actor,
-                actor_bindings_json,
+                memory_bindings: bindings.memory,
+                memory_bindings_json,
                 dynamic_bindings: bindings.dynamic,
                 dynamic_bindings_json,
                 dynamic_rpc_bindings: Vec::new(),
@@ -2755,8 +2756,8 @@ impl WorkerManager {
                 strict_request_isolation: false,
                 queue: VecDeque::new(),
                 isolates: Vec::new(),
-                actor_owners: HashMap::new(),
-                actor_inflight: HashMap::new(),
+                memory_owners: HashMap::new(),
+                memory_inflight: HashMap::new(),
                 stats: PoolStats::default(),
                 queue_warn_level: 0,
             };
@@ -2841,8 +2842,8 @@ impl WorkerManager {
                     .map_err(|error| PlatformError::internal(error.to_string()))?,
             ),
             kv_read_cache_config_json,
-            actor_bindings: Vec::new(),
-            actor_bindings_json: Arc::<str>::from(
+            memory_bindings: Vec::new(),
+            memory_bindings_json: Arc::<str>::from(
                 crate::json::to_string(&Vec::<String>::new())
                     .map_err(|error| PlatformError::internal(error.to_string()))?,
             ),
@@ -2866,8 +2867,8 @@ impl WorkerManager {
             strict_request_isolation: false,
             queue: VecDeque::new(),
             isolates: Vec::new(),
-            actor_owners: HashMap::new(),
-            actor_inflight: HashMap::new(),
+            memory_owners: HashMap::new(),
+            memory_inflight: HashMap::new(),
             stats: PoolStats::default(),
             queue_warn_level: 0,
         };
@@ -2922,8 +2923,8 @@ impl WorkerManager {
         runtime_request_id: String,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
-        actor_route: Option<ActorRoute>,
-        actor_call: Option<ActorExecutionCall>,
+        memory_route: Option<MemoryRoute>,
+        memory_call: Option<MemoryExecutionCall>,
         host_rpc_call: Option<HostRpcExecutionCall>,
         target_isolate_id: Option<u64>,
         target_generation: Option<u64>,
@@ -2963,9 +2964,9 @@ impl WorkerManager {
         }
 
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
-            if let Some(route) = &actor_route {
+            if let Some(route) = &memory_route {
                 if !pool
-                    .actor_bindings
+                    .memory_bindings
                     .iter()
                     .any(|binding| binding == &route.binding)
                 {
@@ -2982,8 +2983,8 @@ impl WorkerManager {
                 runtime_request_id,
                 request,
                 request_body,
-                actor_route,
-                actor_call,
+                memory_route,
+                memory_call,
                 host_rpc_call,
                 target_isolate_id,
                 internal_origin,
@@ -3048,7 +3049,7 @@ impl WorkerManager {
             let worker_name_json = Arc::clone(&pool.worker_name_json);
             let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
             let kv_read_cache_config_json = Arc::clone(&pool.kv_read_cache_config_json);
-            let actor_bindings_json = Arc::clone(&pool.actor_bindings_json);
+            let memory_bindings_json = Arc::clone(&pool.memory_bindings_json);
             let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
             let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
             let dynamic_env_json = Arc::clone(&pool.dynamic_env_json);
@@ -3078,7 +3079,7 @@ impl WorkerManager {
                 worker_name_json,
                 kv_bindings_json,
                 kv_read_cache_config_json,
-                actor_bindings_json,
+                memory_bindings_json,
                 dynamic_bindings_json,
                 dynamic_rpc_bindings_json,
                 dynamic_env_json,
@@ -3089,9 +3090,9 @@ impl WorkerManager {
                 request,
                 request_body: None,
                 stream_response: false,
-                actor_call: None,
+                memory_call: None,
                 host_rpc_call: None,
-                actor_route: None,
+                memory_route: None,
             };
 
             let isolate = &mut pool.isolates[isolate_idx];
@@ -3102,7 +3103,7 @@ impl WorkerManager {
                 PendingReply {
                     completion_token,
                     canceled: false,
-                    actor_key: None,
+                    memory_key: None,
                     internal_origin: true,
                     reply,
                     completion_meta,
@@ -3140,40 +3141,40 @@ impl WorkerManager {
         }
     }
 
-    fn enqueue_actor_invoke(
+    fn enqueue_memory_invoke(
         &mut self,
-        payload: ActorInvokeEvent,
+        payload: MemoryInvokeEvent,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let decoded = match decode_actor_invoke_request(&payload.request_frame) {
+        let decoded = match decode_memory_invoke_request(&payload.request_frame) {
             Ok(decoded) => decoded,
             Err(error) => {
                 let _ = payload.reply.send(Err(error));
                 return;
             }
         };
-        let (request, actor_call, prefer_caller_isolate) = match decoded.call {
-            ActorInvokeCall::Method {
+        let (request, memory_call, prefer_caller_isolate) = match decoded.call {
+            MemoryInvokeCall::Method {
                 name,
                 args,
                 request_id,
             } => (
                 WorkerInvocation {
-                    method: "ACTOR-RPC".to_string(),
-                    url: format!("http://actor/__dd_rpc/{}", name),
+                    method: "MEMORY-RPC".to_string(),
+                    url: format!("http://memory/__dd_rpc/{}", name),
                     headers: Vec::new(),
                     body: args.clone(),
                     request_id,
                 },
-                ActorExecutionCall::Method {
+                MemoryExecutionCall::Method {
                     binding: decoded.binding.clone(),
                     key: decoded.key.clone(),
                     name: name.clone(),
                     args,
                 },
-                name == ACTOR_ATOMIC_METHOD && payload.prefer_caller_isolate,
+                name == MEMORY_ATOMIC_METHOD && payload.prefer_caller_isolate,
             ),
-            ActorInvokeCall::Fetch(_) => {
+            MemoryInvokeCall::Fetch(_) => {
                 let _ = payload.reply.send(Err(PlatformError::bad_request(
                     "memory fetch invoke is no longer supported; use fetch + wake + stub.atomic",
                 )));
@@ -3181,7 +3182,7 @@ impl WorkerManager {
             }
         };
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = ActorRoute {
+        let route = MemoryRoute {
             binding: decoded.binding.trim().to_string(),
             key: decoded.key.trim().to_string(),
         };
@@ -3207,7 +3208,7 @@ impl WorkerManager {
                         .any(|isolate| isolate.id == payload.caller_isolate_id)
                 {
                     let owner_key = route.owner_key();
-                    match pool.actor_owners.get(&owner_key).copied() {
+                    match pool.memory_owners.get(&owner_key).copied() {
                         Some(owner_id) if owner_id == payload.caller_isolate_id => {
                             target_isolate_id = Some(payload.caller_isolate_id);
                         }
@@ -3226,7 +3227,7 @@ impl WorkerManager {
             request,
             None,
             Some(route),
-            Some(actor_call),
+            Some(memory_call),
             None,
             target_isolate_id,
             target_generation,
@@ -3237,13 +3238,13 @@ impl WorkerManager {
         );
         tokio::spawn(async move {
             let result = match reply_rx.await {
-                Ok(Ok(output)) => encode_actor_invoke_response(&ActorInvokeResponse::Method {
+                Ok(Ok(output)) => encode_memory_invoke_response(&MemoryInvokeResponse::Method {
                     value: output.body,
                 }),
                 Ok(Err(error)) => {
-                    encode_actor_invoke_response(&ActorInvokeResponse::Error(error.to_string()))
+                    encode_memory_invoke_response(&MemoryInvokeResponse::Error(error.to_string()))
                 }
-                Err(_) => encode_actor_invoke_response(&ActorInvokeResponse::Error(
+                Err(_) => encode_memory_invoke_response(&MemoryInvokeResponse::Error(
                     "memory invoke response channel closed".to_string(),
                 )),
             };
@@ -3487,7 +3488,7 @@ impl WorkerManager {
                 let worker_name_json = Arc::clone(&pool.worker_name_json);
                 let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
                 let kv_read_cache_config_json = Arc::clone(&pool.kv_read_cache_config_json);
-                let actor_bindings_json = Arc::clone(&pool.actor_bindings_json);
+                let memory_bindings_json = Arc::clone(&pool.memory_bindings_json);
                 let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
                 let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
                 let dynamic_env_json = Arc::clone(&pool.dynamic_env_json);
@@ -3504,12 +3505,12 @@ impl WorkerManager {
                     pool.stats.reuse_count += 1;
                 }
                 let pending_kind = pending_invoke.reply_kind.clone();
-                if let Some(actor_key) = &candidate.actor_key {
+                if let Some(memory_key) = &candidate.memory_key {
                     if candidate.assign_owner {
                         let owner_id = pool.isolates[isolate_idx].id;
-                        pool.actor_owners.insert(actor_key.clone(), owner_id);
+                        pool.memory_owners.insert(memory_key.clone(), owner_id);
                     }
-                    let entry = pool.actor_inflight.entry(actor_key.clone()).or_insert(0);
+                    let entry = pool.memory_inflight.entry(memory_key.clone()).or_insert(0);
                     *entry += 1;
                 }
                 let isolate = &mut pool.isolates[isolate_idx];
@@ -3526,7 +3527,7 @@ impl WorkerManager {
                     worker_name_json,
                     kv_bindings_json,
                     kv_read_cache_config_json,
-                    actor_bindings_json,
+                    memory_bindings_json,
                     dynamic_bindings_json,
                     dynamic_rpc_bindings_json,
                     dynamic_env_json,
@@ -3537,9 +3538,9 @@ impl WorkerManager {
                     request: pending_invoke.request,
                     request_body: pending_invoke.request_body,
                     stream_response,
-                    actor_call: pending_invoke.actor_call,
+                    memory_call: pending_invoke.memory_call,
                     host_rpc_call: pending_invoke.host_rpc_call,
-                    actor_route: pending_invoke.actor_route,
+                    memory_route: pending_invoke.memory_route,
                 };
                 isolate.inflight_count += 1;
                 isolate.pending_replies.insert(
@@ -3547,7 +3548,7 @@ impl WorkerManager {
                     PendingReply {
                         completion_token,
                         canceled: false,
-                        actor_key: candidate.actor_key.clone(),
+                        memory_key: candidate.memory_key.clone(),
                         internal_origin,
                         reply: pending_reply
                             .take()
@@ -3559,10 +3560,10 @@ impl WorkerManager {
                 );
                 if isolate.sender.send(command).is_err() {
                     isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
-                    if let Some(actor_key) = candidate.actor_key.as_ref() {
-                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    if let Some(memory_key) = candidate.memory_key.as_ref() {
+                        decrement_memory_inflight(&mut pool.memory_inflight, memory_key);
                         if candidate.assign_owner {
-                            pool.actor_owners.remove(actor_key);
+                            pool.memory_owners.remove(memory_key);
                         }
                     }
                     pending_reply = isolate
@@ -3608,7 +3609,7 @@ impl WorkerManager {
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
-        let actor_store = self.actor_store.clone();
+        let memory_store = self.memory_store.clone();
         let cache_store = self.cache_store.clone();
         let dynamic_profile = self.dynamic_profile.clone();
         let open_handle_registry = self.open_handle_registry.clone();
@@ -3617,7 +3618,7 @@ impl WorkerManager {
             snapshot_preloaded,
             source,
             kv_store,
-            actor_store,
+            memory_store,
             cache_store,
             open_handle_registry,
             dynamic_profile,
@@ -3695,8 +3696,8 @@ impl WorkerManager {
                     isolate.last_used_at = Instant::now();
                 }
                 if let Some(pending) = isolate.pending_replies.remove(request_id) {
-                    if let Some(actor_key) = &pending.actor_key {
-                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    if let Some(memory_key) = &pending.memory_key {
+                        decrement_memory_inflight(&mut pool.memory_inflight, memory_key);
                     }
                     canceled = pending.canceled;
                     internal_origin = pending.internal_origin;
@@ -4140,8 +4141,8 @@ impl WorkerManager {
                 runtime_request_id: runtime_request_id.clone(),
                 request: invocation,
                 request_body: None,
-                actor_route: None,
-                actor_call: None,
+                memory_route: None,
+                memory_call: None,
                 host_rpc_call: None,
                 target_isolate_id: None,
                 internal_origin: false,
@@ -4300,12 +4301,12 @@ impl WorkerManager {
                 let isolate = pool.isolates.swap_remove(isolate_idx);
                 let _ = isolate.sender.send(IsolateCommand::Shutdown);
                 removed_isolate_id = Some(isolate.id);
-                pool.actor_owners
+                pool.memory_owners
                     .retain(|_, owner_id| *owner_id != isolate.id);
                 replies = Vec::with_capacity(isolate.pending_replies.len());
                 for (request_id, pending) in isolate.pending_replies {
-                    if let Some(actor_key) = pending.actor_key.as_deref() {
-                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    if let Some(memory_key) = pending.memory_key.as_deref() {
+                        decrement_memory_inflight(&mut pool.memory_inflight, memory_key);
                     }
                     match &pending.kind {
                         PendingReplyKind::WebsocketOpen { session_id } => {
@@ -4407,11 +4408,11 @@ impl WorkerManager {
                 };
                 let isolate = pool.isolates.swap_remove(idx);
                 pool.stats.scale_down_count += 1;
-                pool.actor_owners
+                pool.memory_owners
                     .retain(|_, owner_id| *owner_id != isolate.id);
                 for pending in isolate.pending_replies.values() {
-                    if let Some(actor_key) = pending.actor_key.as_deref() {
-                        decrement_actor_inflight(&mut pool.actor_inflight, actor_key);
+                    if let Some(memory_key) = pending.memory_key.as_deref() {
+                        decrement_memory_inflight(&mut pool.memory_inflight, memory_key);
                     }
                 }
                 removed.push(isolate);
@@ -4993,7 +4994,8 @@ fn select_dispatch_candidate(
         let Some(target_isolate_id) = pending.target_isolate_id else {
             continue;
         };
-        let targeted_nested_call = pending.host_rpc_call.is_some() || pending.actor_route.is_some();
+        let targeted_nested_call =
+            pending.host_rpc_call.is_some() || pending.memory_route.is_some();
         if !targeted_nested_call {
             continue;
         }
@@ -5003,12 +5005,12 @@ fn select_dispatch_candidate(
             .enumerate()
             .find(|(_, isolate)| isolate.id == target_isolate_id)
         {
-            let actor_key = pending.actor_route.as_ref().map(ActorRoute::owner_key);
+            let memory_key = pending.memory_route.as_ref().map(MemoryRoute::owner_key);
             if isolate.inflight_count < max_inflight || targeted_nested_call {
                 return Some(DispatchSelection::Dispatch(DispatchCandidate {
                     queue_idx,
                     isolate_idx,
-                    actor_key,
+                    memory_key,
                     assign_owner: false,
                 }));
             }
@@ -5026,8 +5028,8 @@ fn select_dispatch_candidate(
                 .find(|(_, isolate)| isolate.id == target_isolate_id)
             {
                 let targeted_nested_call =
-                    pending.host_rpc_call.is_some() || pending.actor_route.is_some();
-                let actor_key = pending.actor_route.as_ref().map(ActorRoute::owner_key);
+                    pending.host_rpc_call.is_some() || pending.memory_route.is_some();
+                let memory_key = pending.memory_route.as_ref().map(MemoryRoute::owner_key);
                 if (targeted_nested_call || isolate.inflight_count < max_inflight)
                     && (targeted_nested_call
                         || !require_wait_until_idle
@@ -5036,7 +5038,7 @@ fn select_dispatch_candidate(
                     return Some(DispatchSelection::Dispatch(DispatchCandidate {
                         queue_idx,
                         isolate_idx,
-                        actor_key,
+                        memory_key,
                         assign_owner: false,
                     }));
                 }
@@ -5046,19 +5048,19 @@ fn select_dispatch_candidate(
             continue;
         }
 
-        let Some(route) = &pending.actor_route else {
+        let Some(route) = &pending.memory_route else {
             return least_loaded_isolate_idx(&pool.isolates, max_inflight, require_wait_until_idle)
                 .map(|isolate_idx| {
                     DispatchSelection::Dispatch(DispatchCandidate {
                         queue_idx,
                         isolate_idx,
-                        actor_key: None,
+                        memory_key: None,
                         assign_owner: false,
                     })
                 });
         };
 
-        let actor_key = route.owner_key();
+        let memory_key = route.owner_key();
 
         if let Some(isolate_idx) =
             least_loaded_isolate_any_idx(&pool.isolates, require_wait_until_idle)
@@ -5066,7 +5068,7 @@ fn select_dispatch_candidate(
             return Some(DispatchSelection::Dispatch(DispatchCandidate {
                 queue_idx,
                 isolate_idx,
-                actor_key: Some(actor_key),
+                memory_key: Some(memory_key),
                 assign_owner: false,
             }));
         }
@@ -5109,13 +5111,13 @@ fn least_loaded_isolate_any_idx(
         .map(|(idx, _)| idx)
 }
 
-fn decrement_actor_inflight(actor_inflight: &mut HashMap<String, usize>, actor_key: &str) {
-    let Some(current) = actor_inflight.get_mut(actor_key) else {
+fn decrement_memory_inflight(memory_inflight: &mut HashMap<String, usize>, memory_key: &str) {
+    let Some(current) = memory_inflight.get_mut(memory_key) else {
         return;
     };
     *current = current.saturating_sub(1);
     if *current == 0 {
-        actor_inflight.remove(actor_key);
+        memory_inflight.remove(memory_key);
     }
 }
 
@@ -5201,19 +5203,19 @@ impl WorkerPool {
     }
 
     fn debug_dump(&self) -> WorkerDebugDump {
-        let mut actor_owners = self
-            .actor_owners
+        let mut memory_owners = self
+            .memory_owners
             .iter()
             .map(|(key, isolate_id)| (key.clone(), *isolate_id))
             .collect::<Vec<_>>();
-        actor_owners.sort_by(|left, right| left.0.cmp(&right.0));
+        memory_owners.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let mut actor_inflight = self
-            .actor_inflight
+        let mut memory_inflight = self
+            .memory_inflight
             .iter()
             .map(|(key, count)| (key.clone(), *count))
             .collect::<Vec<_>>();
-        actor_inflight.sort_by(|left, right| left.0.cmp(&right.0));
+        memory_inflight.sort_by(|left, right| left.0.cmp(&right.0));
 
         let queued_requests = self
             .queue
@@ -5223,7 +5225,7 @@ impl WorkerPool {
                 user_request_id: pending.request.request_id.clone(),
                 method: pending.request.method.clone(),
                 url: pending.request.url.clone(),
-                actor_key: pending.actor_route.as_ref().map(ActorRoute::owner_key),
+                memory_key: pending.memory_route.as_ref().map(MemoryRoute::owner_key),
                 target_isolate_id: pending.target_isolate_id,
                 internal_origin: pending.internal_origin,
                 reply_kind: pending.reply_kind.label().to_string(),
@@ -5254,7 +5256,7 @@ impl WorkerPool {
                                 .unwrap_or_default(),
                             method: meta.map(|meta| meta.method.clone()).unwrap_or_default(),
                             url: meta.map(|meta| meta.url.clone()).unwrap_or_default(),
-                            actor_key: pending.actor_key.clone(),
+                            memory_key: pending.memory_key.clone(),
                             target_isolate_id: Some(isolate.id),
                             internal_origin: pending.internal_origin,
                             reply_kind: pending.kind.label().to_string(),
@@ -5279,8 +5281,8 @@ impl WorkerPool {
         WorkerDebugDump {
             generation: self.generation,
             queued: self.queue.len(),
-            actor_owners,
-            actor_inflight,
+            memory_owners,
+            memory_inflight,
             isolates,
             queued_requests,
         }
@@ -5316,7 +5318,7 @@ fn spawn_runtime_thread(
     runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     bootstrap_snapshot: &'static [u8],
     kv_store: KvStore,
-    actor_store: ActorStore,
+    memory_store: MemoryStore,
     cache_store: CacheStore,
     config: RuntimeConfig,
     storage: RuntimeStorageConfig,
@@ -5334,7 +5336,7 @@ fn spawn_runtime_thread(
                 let mut manager = WorkerManager::new(
                     bootstrap_snapshot,
                     kv_store,
-                    actor_store,
+                    memory_store,
                     cache_store,
                     config.clone(),
                     storage,
@@ -5556,39 +5558,39 @@ fn handle_isolate_event_payload(
                 payload,
             });
         }
-        IsolateEventPayload::ActorInvoke(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorInvoke(payload));
+        IsolateEventPayload::MemoryInvoke(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryInvoke(payload));
         }
-        IsolateEventPayload::ActorSocketSend(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorSocketSend(payload));
+        IsolateEventPayload::MemorySocketSend(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemorySocketSend(payload));
         }
-        IsolateEventPayload::ActorSocketClose(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorSocketClose(payload));
+        IsolateEventPayload::MemorySocketClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemorySocketClose(payload));
         }
-        IsolateEventPayload::ActorSocketConsumeClose(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorSocketConsumeClose {
+        IsolateEventPayload::MemorySocketConsumeClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemorySocketConsumeClose {
                 worker_name: worker_name.to_string(),
                 generation,
                 payload,
             });
         }
-        IsolateEventPayload::ActorTransportSendStream(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportSendStream(payload));
+        IsolateEventPayload::MemoryTransportSendStream(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryTransportSendStream(payload));
         }
-        IsolateEventPayload::ActorTransportSendDatagram(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportSendDatagram(payload));
+        IsolateEventPayload::MemoryTransportSendDatagram(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryTransportSendDatagram(payload));
         }
-        IsolateEventPayload::ActorTransportRecvStream(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportRecvStream(payload));
+        IsolateEventPayload::MemoryTransportRecvStream(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryTransportRecvStream(payload));
         }
-        IsolateEventPayload::ActorTransportRecvDatagram(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportRecvDatagram(payload));
+        IsolateEventPayload::MemoryTransportRecvDatagram(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryTransportRecvDatagram(payload));
         }
-        IsolateEventPayload::ActorTransportClose(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportClose(payload));
+        IsolateEventPayload::MemoryTransportClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryTransportClose(payload));
         }
-        IsolateEventPayload::ActorTransportConsumeClose(payload) => {
-            let _ = event_tx.send(RuntimeEvent::ActorTransportConsumeClose {
+        IsolateEventPayload::MemoryTransportConsumeClose(payload) => {
+            let _ = event_tx.send(RuntimeEvent::MemoryTransportConsumeClose {
                 worker_name: worker_name.to_string(),
                 generation,
                 payload,
@@ -5626,9 +5628,9 @@ fn spawn_isolate_thread(
     snapshot_preloaded: bool,
     source: Arc<str>,
     kv_store: KvStore,
-    actor_store: ActorStore,
+    memory_store: MemoryStore,
     cache_store: CacheStore,
-    open_handle_registry: crate::ops::ActorOpenHandleRegistry,
+    open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
     dynamic_profile: crate::ops::DynamicProfile,
     runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
     worker_name: String,
@@ -5672,11 +5674,11 @@ fn spawn_isolate_thread(
                     let mut op_state = op_state.borrow_mut();
                     op_state.put(IsolateEventSender(event_payload_tx));
                     op_state.put(kv_store.clone());
-                    op_state.put(actor_store.clone());
+                    op_state.put(memory_store.clone());
                     op_state.put(cache_store.clone());
                     op_state.put(open_handle_registry.clone());
                     op_state.put(RequestBodyStreams::default());
-                    op_state.put(crate::ops::ActorRequestScopes::default());
+                    op_state.put(crate::ops::MemoryRequestScopes::default());
                     op_state.put(crate::ops::RequestSecretContexts::default());
                     op_state.put(crate::ops::DynamicPendingReplies::default());
                     op_state.put(crate::ops::TestAsyncReplies::default());
@@ -5819,7 +5821,7 @@ fn handle_isolate_command(
             worker_name_json,
             kv_bindings_json,
             kv_read_cache_config_json,
-            actor_bindings_json,
+            memory_bindings_json,
             dynamic_bindings_json,
             dynamic_rpc_bindings_json,
             dynamic_env_json,
@@ -5830,9 +5832,9 @@ fn handle_isolate_command(
             request,
             request_body,
             stream_response,
-            actor_call,
+            memory_call,
             host_rpc_call,
-            actor_route,
+            memory_route,
         } => {
             let request_id = request.request_id.clone();
             let has_request_body_stream = request_body.is_some();
@@ -5845,10 +5847,10 @@ fn handle_isolate_command(
                     request_body,
                 );
             }
-            if let Some(route) = actor_route.as_ref() {
+            if let Some(route) = memory_route.as_ref() {
                 let op_state = js_runtime.op_state();
                 let mut op_state = op_state.borrow_mut();
-                register_actor_request_scope(
+                register_memory_request_scope(
                     &mut op_state,
                     runtime_request_id.clone(),
                     route.binding.clone(),
@@ -5889,19 +5891,19 @@ fn handle_isolate_command(
             };
             let _execute_guard = execute_span.as_ref().map(|span| span.enter());
             let started_at = Instant::now();
-            let dispatch_actor_call = actor_call.as_ref().map(|call| match call {
-                ActorExecutionCall::Method {
+            let dispatch_memory_call = memory_call.as_ref().map(|call| match call {
+                MemoryExecutionCall::Method {
                     binding,
                     key,
                     name,
                     args,
-                } => ExecuteActorCall::Method {
+                } => ExecuteMemoryCall::Method {
                     binding: binding.clone(),
                     key: key.clone(),
                     name: name.clone(),
                     args: args.clone(),
                 },
-                ActorExecutionCall::Message {
+                MemoryExecutionCall::Message {
                     binding,
                     key,
                     handle,
@@ -5909,7 +5911,7 @@ fn handle_isolate_command(
                     data,
                     socket_handles,
                     transport_handles,
-                } => ExecuteActorCall::Message {
+                } => ExecuteMemoryCall::Message {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
@@ -5918,7 +5920,7 @@ fn handle_isolate_command(
                     socket_handles: socket_handles.clone(),
                     transport_handles: transport_handles.clone(),
                 },
-                ActorExecutionCall::Close {
+                MemoryExecutionCall::Close {
                     binding,
                     key,
                     handle,
@@ -5926,7 +5928,7 @@ fn handle_isolate_command(
                     reason,
                     socket_handles,
                     transport_handles,
-                } => ExecuteActorCall::Close {
+                } => ExecuteMemoryCall::Close {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
@@ -5935,14 +5937,14 @@ fn handle_isolate_command(
                     socket_handles: socket_handles.clone(),
                     transport_handles: transport_handles.clone(),
                 },
-                ActorExecutionCall::TransportDatagram {
+                MemoryExecutionCall::TransportDatagram {
                     binding,
                     key,
                     handle,
                     data,
                     socket_handles,
                     transport_handles,
-                } => ExecuteActorCall::TransportDatagram {
+                } => ExecuteMemoryCall::TransportDatagram {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
@@ -5950,14 +5952,14 @@ fn handle_isolate_command(
                     socket_handles: socket_handles.clone(),
                     transport_handles: transport_handles.clone(),
                 },
-                ActorExecutionCall::TransportStream {
+                MemoryExecutionCall::TransportStream {
                     binding,
                     key,
                     handle,
                     data,
                     socket_handles,
                     transport_handles,
-                } => ExecuteActorCall::TransportStream {
+                } => ExecuteMemoryCall::TransportStream {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
@@ -5965,7 +5967,7 @@ fn handle_isolate_command(
                     socket_handles: socket_handles.clone(),
                     transport_handles: transport_handles.clone(),
                 },
-                ActorExecutionCall::TransportClose {
+                MemoryExecutionCall::TransportClose {
                     binding,
                     key,
                     handle,
@@ -5973,7 +5975,7 @@ fn handle_isolate_command(
                     reason,
                     socket_handles,
                     transport_handles,
-                } => ExecuteActorCall::TransportClose {
+                } => ExecuteMemoryCall::TransportClose {
                     binding: binding.clone(),
                     key: key.clone(),
                     handle: handle.clone(),
@@ -5995,13 +5997,13 @@ fn handle_isolate_command(
                 &worker_name_json,
                 &kv_bindings_json,
                 &kv_read_cache_config_json,
-                &actor_bindings_json,
+                &memory_bindings_json,
                 &dynamic_bindings_json,
                 &dynamic_rpc_bindings_json,
                 &dynamic_env_json,
                 has_request_body_stream,
                 stream_response,
-                dispatch_actor_call.as_ref(),
+                dispatch_memory_call.as_ref(),
                 dispatch_host_rpc_call.as_ref(),
                 request,
             ) {
@@ -6009,7 +6011,7 @@ fn handle_isolate_command(
                     let op_state = js_runtime.op_state();
                     let mut op_state = op_state.borrow_mut();
                     clear_request_body_stream(&mut op_state, &runtime_request_id);
-                    crate::ops::clear_actor_request_scope(&mut op_state, &runtime_request_id);
+                    crate::ops::clear_memory_request_scope(&mut op_state, &runtime_request_id);
                     clear_request_secret_context(&mut op_state, &runtime_request_id);
                 }
                 tracing::warn!(
@@ -6040,7 +6042,7 @@ fn handle_isolate_command(
                 let mut op_state = op_state.borrow_mut();
                 cancel_request_body_stream(&mut op_state, &runtime_request_id);
                 clear_request_body_stream(&mut op_state, &runtime_request_id);
-                crate::ops::clear_actor_request_scope(&mut op_state, &runtime_request_id);
+                crate::ops::clear_memory_request_scope(&mut op_state, &runtime_request_id);
                 clear_request_secret_context(&mut op_state, &runtime_request_id);
             }
             abort_worker_request(js_runtime, &runtime_request_id)?;
@@ -6260,11 +6262,11 @@ fn append_or_update_header(headers: &mut Vec<(String, String)>, key: &str, value
     headers.push((key.to_string(), value.to_string()));
 }
 
-fn actor_owner_key(binding: &str, key: &str) -> String {
+fn memory_owner_key(binding: &str, key: &str) -> String {
     format!("{binding}\u{001f}{key}")
 }
 
-fn actor_handle_key(binding: &str, key: &str, handle: &str) -> String {
+fn memory_handle_key(binding: &str, key: &str, handle: &str) -> String {
     format!("{binding}\u{001f}{key}\u{001f}{handle}")
 }
 

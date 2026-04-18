@@ -4,11 +4,11 @@ globalThis.__dd_execute_worker = (payload) => {
   const workerName = String(payload?.worker_name ?? "");
   const kvBindingsConfig = payload?.kv_bindings ?? [];
   const kvReadCacheConfigInput = payload?.kv_read_cache_config ?? null;
-  const actorBindingsConfig = payload?.actor_bindings ?? [];
+  const memoryBindingsConfig = payload?.memory_bindings ?? [];
   const dynamicBindingsConfig = payload?.dynamic_bindings ?? [];
   const dynamicRpcBindingsConfig = payload?.dynamic_rpc_bindings ?? [];
   const dynamicEnvConfig = payload?.dynamic_env ?? [];
-  const actorCallConfig = payload?.actor_call ?? null;
+  const memoryCallConfig = payload?.memory_call ?? null;
   const hostRpcCallConfig = payload?.host_rpc_call ?? null;
   const hasRequestBodyStream = payload?.has_request_body_stream === true;
   const streamResponse = payload?.stream_response === true;
@@ -51,15 +51,15 @@ globalThis.__dd_execute_worker = (payload) => {
       missTtlMs,
     });
   })();
-  const actorReadSnapshotFreshTtlMs = 1_000;
+  const memoryReadSnapshotFreshTtlMs = 1_000;
   const requestContext = {
     requestId,
     controller,
     waitUntilPromises: [],
     waitUntilDoneSent: false,
-    actorInvokeSeq: 0,
-    actorEntry: null,
-    actorRequestId: null,
+    memoryInvokeSeq: 0,
+    memoryEntry: null,
+    memoryRequestId: null,
     memoryTxnScope: null,
     socketRuntimeProvider: null,
     transportRuntimeProvider: null,
@@ -76,10 +76,10 @@ globalThis.__dd_execute_worker = (payload) => {
     return current;
   };
 
-  const nextActorInvokeSeq = () => {
+  const nextMemoryInvokeSeq = () => {
     const current = currentRequestContext();
-    current.actorInvokeSeq = Number(current.actorInvokeSeq ?? 0) + 1;
-    return current.actorInvokeSeq;
+    current.memoryInvokeSeq = Number(current.memoryInvokeSeq ?? 0) + 1;
+    return current.memoryInvokeSeq;
   };
 
   if (!globalThis.__dd_handle_websocket_wrapped) {
@@ -146,8 +146,8 @@ globalThis.__dd_execute_worker = (payload) => {
     );
   };
 
-  const recordActorProfile = (metric, durationMs, items = 1) => {
-    const op = Deno?.core?.ops?.op_actor_profile_record_js;
+  const recordMemoryProfile = (metric, durationMs, items = 1) => {
+    const op = Deno?.core?.ops?.op_memory_profile_record_js;
     if (typeof op !== "function") {
       return;
     }
@@ -167,10 +167,10 @@ globalThis.__dd_execute_worker = (payload) => {
   };
   globalThis.__dd_get_runtime_request_id = activeRequestId;
 
-  const actorScopedRequestId = (entry, runtimeRequestId) => {
+  const memoryScopedRequestId = (entry, runtimeRequestId) => {
     const current = currentRequestContext(false);
-    if (current?.actorEntry === entry && current.actorRequestId) {
-      return current.actorRequestId;
+    if (current?.memoryEntry === entry && current.memoryRequestId) {
+      return current.memoryRequestId;
     }
     if (current?.requestId) {
       return String(current.requestId);
@@ -182,7 +182,7 @@ globalThis.__dd_execute_worker = (payload) => {
     return activeRequestId();
   };
 
-  const withActorTxnScope = (scope, callback) => {
+  const withMemoryTxnScope = (scope, callback) => {
     const current = currentRequestContext();
     const previousScope = current.memoryTxnScope;
     current.memoryTxnScope = scope;
@@ -193,26 +193,26 @@ globalThis.__dd_execute_worker = (payload) => {
     }
   };
 
-  const actorTxnScopeFor = (binding, actorKey) => {
-    const currentActorTxnScope = currentRequestContext(false)?.memoryTxnScope ?? null;
+  const memoryTxnScopeFor = (binding, memoryKey) => {
+    const currentMemoryTxnScope = currentRequestContext(false)?.memoryTxnScope ?? null;
     if (
-      currentActorTxnScope
-      && currentActorTxnScope.binding === binding
-      && currentActorTxnScope.actorKey === actorKey
+      currentMemoryTxnScope
+      && currentMemoryTxnScope.binding === binding
+      && currentMemoryTxnScope.memoryKey === memoryKey
     ) {
-      return currentActorTxnScope;
+      return currentMemoryTxnScope;
     }
     return null;
   };
 
-  const currentLocalHandleRuntime = (binding, actorKey, kind) => {
+  const currentLocalHandleRuntime = (binding, memoryKey, kind) => {
     const current = currentRequestContext(false);
-    if (!current?.actorEntry) {
+    if (!current?.memoryEntry) {
       return null;
     }
     if (
-      current.actorEntry.binding !== binding
-      || current.actorEntry.actorKey !== actorKey
+      current.memoryEntry.binding !== binding
+      || current.memoryEntry.memoryKey !== memoryKey
     ) {
       return null;
     }
@@ -1069,8 +1069,8 @@ globalThis.__dd_execute_worker = (payload) => {
         }
       };
       const current = currentRequestContext(false);
-      if (current?.actorEntry) {
-        return gateActorOutput(current.actorEntry, current.actorRequestId || current.requestId, run);
+      if (current?.memoryEntry) {
+        return gateMemoryOutput(current.memoryEntry, current.memoryRequestId || current.requestId, run);
       }
       return run();
     };
@@ -1095,7 +1095,7 @@ globalThis.__dd_execute_worker = (payload) => {
     return value;
   };
 
-  const normalizeActorFetchInput = async (inputValue, initValue) => {
+  const normalizeMemoryFetchInput = async (inputValue, initValue) => {
     let method = "GET";
     let url = "http://worker/";
     let headers = [];

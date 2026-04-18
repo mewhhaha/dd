@@ -575,8 +575,8 @@ export async function onSocketMessage(stub, event) {
 
 export default {
   async fetch(request, env) {
-    const actor = env.BENCH_ACTOR.get(env.BENCH_ACTOR.idFromName("global"));
-    return await actor.atomic(openSocket, { request });
+    const memory = env.BENCH_MEMORY.get(env.BENCH_MEMORY.idFromName("global"));
+    return await memory.atomic(openSocket, { request });
   },
 
   async wake(event, _env) {
@@ -814,9 +814,9 @@ fn runtime_service_config(
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
             database_url: format!("file:{}", db_path.display()),
-            actor_namespace_shards: 16,
-            actor_db_cache_max_open: 4096,
-            actor_db_idle_ttl: Duration::from_secs(60),
+            memory_namespace_shards: 16,
+            memory_db_cache_max_open: 4096,
+            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled,
             blob_store: runtime::BlobStoreConfig::local(store_dir.join("blobs")),
         },
@@ -1067,7 +1067,7 @@ async fn run_websocket_bench(service: &RuntimeService) -> common::Result<WebSock
             DeployConfig {
                 public: false,
                 bindings: vec![DeployBinding::Memory {
-                    binding: "BENCH_ACTOR".to_string(),
+                    binding: "BENCH_MEMORY".to_string(),
                 }],
                 ..DeployConfig::default()
             },
