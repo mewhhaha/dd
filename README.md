@@ -122,7 +122,7 @@ export default {
 
 ## Dynamic workers and assets
 
-Workers can create other workers with `env.SANDBOX.get/list/delete`. That is useful when you want tenant-specific or generated workers without redeploying whole server. See [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js).
+Workers can create other workers with `env.SANDBOX.get/list/delete`. Dynamic workers run in separate Deno isolates, so they fit tenant-specific or agent-generated code that should stay runtime-isolated from parent worker state. That is isolate-level separation, not OS process, VM, or container sandboxing. See [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js).
 
 Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](/home/mewhhaha/src/grugd/examples/static-assets-site).
 

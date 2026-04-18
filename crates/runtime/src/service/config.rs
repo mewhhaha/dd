@@ -36,7 +36,7 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
                 }
                 kv.push(name.to_string());
             }
-            DeployBinding::Actor { binding } => {
+            DeployBinding::Memory { binding } => {
                 let name = binding.trim();
                 if name.is_empty() {
                     return Err(PlatformError::bad_request("binding name must not be empty"));

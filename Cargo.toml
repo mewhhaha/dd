@@ -18,7 +18,7 @@ deno_core = "0.394"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = { version = "0.14", features = ["serde_impl"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

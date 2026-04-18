@@ -1066,7 +1066,7 @@ async fn run_websocket_bench(service: &RuntimeService) -> common::Result<WebSock
             WEBSOCKET_ECHO_WORKER_SOURCE.to_string(),
             DeployConfig {
                 public: false,
-                bindings: vec![DeployBinding::Actor {
+                bindings: vec![DeployBinding::Memory {
                     binding: "BENCH_ACTOR".to_string(),
                 }],
                 ..DeployConfig::default()

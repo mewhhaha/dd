@@ -1,3 +1,5 @@
+// Dynamic child runs in separate Deno isolate.
+// Good for generated or tenant code that should not share parent runtime state.
 /// <reference path="./types/dynamic-worker-config.d.ts" />
 
 const CHILD_ENTRY = `

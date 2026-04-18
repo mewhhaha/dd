@@ -238,7 +238,7 @@ fn parse_memory_binding(value: String) -> Result<DeployBinding, String> {
             "invalid memory binding {trimmed:?}, expected BINDING"
         ));
     }
-    Ok(DeployBinding::Actor {
+    Ok(DeployBinding::Memory {
         binding: binding.to_string(),
     })
 }

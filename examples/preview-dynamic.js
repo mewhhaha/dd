@@ -1,3 +1,5 @@
+// Each preview child runs in separate Deno isolate.
+// Isolation is runtime-level, not OS/container sandboxing.
 /// <reference path="./types/dynamic-worker-config.d.ts" />
 
 function html(body) {

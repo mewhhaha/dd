@@ -1112,7 +1112,7 @@ async fn run_and_print(
             source.to_string(),
             DeployConfig {
                 public: false,
-                bindings: vec![DeployBinding::Actor {
+                bindings: vec![DeployBinding::Memory {
                     binding: "BENCH_ACTOR".to_string(),
                 }],
                 ..DeployConfig::default()

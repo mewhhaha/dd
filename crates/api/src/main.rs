@@ -1,3 +1,4 @@
+use clap::Parser;
 use common::{PlatformError, Result};
 use dd_server::ServerConfig;
 use opentelemetry::trace::TracerProvider as _;
@@ -13,38 +14,70 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+#[derive(Parser, Debug)]
+#[command(name = "dd_server")]
+#[command(about = "Single-node dd worker runtime server")]
+#[command(
+    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT"
+)]
+struct Cli {
+    #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = "0.0.0.0:8080")]
+    bind_public_addr: String,
+
+    #[arg(long, env = "BIND_PRIVATE_ADDR", default_value = "[::]:8081")]
+    bind_private_addr: String,
+
+    #[arg(long, env = "PUBLIC_BASE_DOMAIN", default_value = "example.com")]
+    public_base_domain: String,
+
+    #[arg(long, env = "DD_PRIVATE_TOKEN")]
+    private_token: Option<String>,
+
+    #[arg(long, env = "PRIVATE_BEARER_TOKEN")]
+    private_bearer_token: Option<String>,
+
+    #[arg(
+        long,
+        env = "DD_ALLOW_INSECURE_PRIVATE_LOOPBACK",
+        default_value_t = false
+    )]
+    dd_allow_insecure_private_loopback: bool,
+
+    #[arg(long, env = "ALLOW_INSECURE_PRIVATE_LOOPBACK", default_value_t = false)]
+    allow_insecure_private_loopback: bool,
+
+    #[arg(long, env = "PUBLIC_TLS_CERT_PATH")]
+    public_tls_cert_path: Option<PathBuf>,
+
+    #[arg(long, env = "PUBLIC_TLS_KEY_PATH")]
+    public_tls_key_path: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     let otel_provider = init_tracing()?;
 
-    let bind_public_addr =
-        env::var("BIND_PUBLIC_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let public_addr: SocketAddr = bind_public_addr
+    let public_addr: SocketAddr = cli
+        .bind_public_addr
         .parse()
         .map_err(|error| PlatformError::internal(format!("invalid BIND_PUBLIC_ADDR: {error}")))?;
-    let bind_private_addr =
-        env::var("BIND_PRIVATE_ADDR").unwrap_or_else(|_| "[::]:8081".to_string());
-    let private_addr: SocketAddr = bind_private_addr
+    let private_addr: SocketAddr = cli
+        .bind_private_addr
         .parse()
         .map_err(|error| PlatformError::internal(format!("invalid BIND_PRIVATE_ADDR: {error}")))?;
-    let private_bearer_token = env::var("DD_PRIVATE_TOKEN")
-        .ok()
-        .or_else(|| env::var("PRIVATE_BEARER_TOKEN").ok());
-    let allow_insecure_private_loopback = env_flag("ALLOW_INSECURE_PRIVATE_LOOPBACK")
-        || env_flag("DD_ALLOW_INSECURE_PRIVATE_LOOPBACK");
-    let public_base_domain =
-        env::var("PUBLIC_BASE_DOMAIN").unwrap_or_else(|_| "example.com".to_string());
-    let public_tls_cert_path = env::var("PUBLIC_TLS_CERT_PATH").ok().map(PathBuf::from);
-    let public_tls_key_path = env::var("PUBLIC_TLS_KEY_PATH").ok().map(PathBuf::from);
+    let private_bearer_token = cli.private_token.or(cli.private_bearer_token);
+    let allow_insecure_private_loopback =
+        cli.dd_allow_insecure_private_loopback || cli.allow_insecure_private_loopback;
 
     let result = dd_server::run(ServerConfig {
         bind_public_addr: public_addr,
         bind_private_addr: private_addr,
-        public_base_domain,
+        public_base_domain: cli.public_base_domain,
         private_bearer_token,
         allow_insecure_private_loopback,
-        public_tls_cert_path,
-        public_tls_key_path,
+        public_tls_cert_path: cli.public_tls_cert_path,
+        public_tls_key_path: cli.public_tls_key_path,
         ..ServerConfig::default()
     })
     .await;
@@ -53,18 +86,6 @@ async fn main() -> Result<()> {
         let _ = provider.shutdown();
     }
     result
-}
-
-fn env_flag(name: &str) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn init_tracing() -> Result<Option<OTelTracerProvider>> {

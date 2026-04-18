@@ -202,7 +202,7 @@ export default {
             seed_path: None,
         },
         Scenario {
-            name: "instant-text-actor-bound",
+            name: "instant-text-memory-bound",
             worker_source: r#"
 export default {
   fetch() {
@@ -398,7 +398,7 @@ async fn run_config_scenario(
                         binding: "MY_KV".to_string(),
                     }]
                 } else if scenario.use_actor_binding {
-                    vec![DeployBinding::Actor {
+                    vec![DeployBinding::Memory {
                         binding: "BENCH_ACTOR".to_string(),
                     }]
                 } else {

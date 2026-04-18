@@ -1276,14 +1276,14 @@ fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(), PlatformEr
     for binding in bindings {
         match binding {
             DeployBinding::Kv { binding }
-            | DeployBinding::Actor { binding }
+            | DeployBinding::Memory { binding }
             | DeployBinding::Dynamic { binding }
                 if binding.trim().is_empty() =>
             {
                 return Err(PlatformError::bad_request("binding name must not be empty"));
             }
             DeployBinding::Kv { binding }
-            | DeployBinding::Actor { binding }
+            | DeployBinding::Memory { binding }
             | DeployBinding::Dynamic { binding } => {
                 let normalized = binding.trim().to_string();
                 if !seen.insert(normalized.clone()) {
@@ -1677,52 +1677,11 @@ pub struct PreparedWebSocketUpgrade {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_public_request_url, deploy_worker, handle_private_request, handle_public_request,
-        invoke_worker_private, invoke_worker_public, parse_invoke_request_uri,
-        parse_worker_from_host, validate_deploy_bindings, validate_internal_config,
+        build_public_request_url, parse_invoke_request_uri, parse_worker_from_host,
+        validate_deploy_bindings, validate_internal_config,
     };
-    use crate::state::AppState;
-    use bytes::Bytes;
-    use common::{
-        DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest,
-        DeployTraceDestination, ErrorKind,
-    };
-    use http::{HeaderMap, Request, StatusCode};
-    use http_body_util::{BodyExt, Empty};
-    use runtime::{RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
-    use std::path::PathBuf;
-    use uuid::Uuid;
-
-    async fn create_test_state(public_base_domain: &str) -> AppState {
-        let store_dir = PathBuf::from(format!("./target/test-store-api-{}", Uuid::new_v4()));
-        let storage = RuntimeStorageConfig {
-            store_dir: store_dir.clone(),
-            database_url: format!("file:{}/dd-test.db", store_dir.display()),
-            worker_store_enabled: false,
-            ..RuntimeStorageConfig::default()
-        };
-        let runtime = RuntimeService::start_with_service_config(RuntimeServiceConfig {
-            runtime: Default::default(),
-            storage,
-        })
-        .await
-        .expect("runtime");
-        AppState::new(
-            runtime,
-            1024 * 1024,
-            public_base_domain.to_string(),
-            Some("test-private-token".to_string()),
-            None,
-            None,
-        )
-    }
-
-    fn test_assets() -> Vec<DeployAsset> {
-        vec![DeployAsset {
-            path: "/a.js".to_string(),
-            content_base64: "YXNzZXQtYm9keQ==".to_string(),
-        }]
-    }
+    use common::{DeployBinding, DeployInternalConfig, DeployTraceDestination, ErrorKind};
+    use http::{HeaderMap, Request};
 
     #[test]
     fn parse_invoke_path_and_query() {
@@ -1781,12 +1740,12 @@ mod tests {
     }
 
     #[test]
-    fn kv_and_actor_binding_name_collision_is_rejected() {
+    fn kv_and_memory_binding_name_collision_is_rejected() {
         let bindings = vec![
             DeployBinding::Kv {
                 binding: "SHARED".to_string(),
             },
-            DeployBinding::Actor {
+            DeployBinding::Memory {
                 binding: "SHARED".to_string(),
             },
         ];
@@ -1794,8 +1753,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_actor_binding_name_is_rejected() {
-        let bindings = vec![DeployBinding::Actor {
+    fn empty_memory_binding_name_is_rejected() {
+        let bindings = vec![DeployBinding::Memory {
             binding: String::new(),
         }];
         assert!(validate_deploy_bindings(&bindings).is_err());
@@ -1888,266 +1847,6 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 
-    #[tokio::test]
-    #[ignore = "starts full runtime service; run manually in isolation"]
-    async fn public_listener_blocks_deploy_path() {
-        let state = create_test_state("example.com").await;
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/deploy")
-            .header("host", "echo.example.com")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = invoke_worker_public(state, request, None)
-            .await
-            .expect_err("blocked");
-        assert_eq!(response.0.kind(), ErrorKind::NotFound);
-    }
-
-    #[tokio::test]
-    #[ignore = "starts full runtime service; run manually in isolation"]
-    async fn private_deploy_and_invoke_succeeds() {
-        let state = create_test_state("example.com").await;
-        let deploy = DeployRequest {
-            name: "echo".to_string(),
-            source: "export default { async fetch() { return new Response('ok'); } }".to_string(),
-            config: DeployConfig {
-                public: false,
-                bindings: vec![],
-                ..Default::default()
-            },
-            assets: Vec::new(),
-            asset_headers: None,
-        };
-        let response = deploy_worker(state.clone(), deploy).await.expect("deploy");
-        assert!(response.ok);
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/v1/invoke/echo")
-            .header("authorization", "Bearer test-private-token")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = invoke_worker_private(state, request, None)
-            .await
-            .expect("invoke");
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        assert_eq!(body.as_ref(), b"ok");
-    }
-
-    #[tokio::test]
-    #[ignore = "starts full runtime service; run manually in isolation"]
-    async fn public_host_invoke_routes_by_subdomain() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_config(
-                "echo".to_string(),
-                "export default { async fetch() { return new Response('host-ok'); } }".to_string(),
-                DeployConfig {
-                    public: true,
-                    bindings: vec![],
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/")
-            .header("host", "echo.example.com")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = invoke_worker_public(state, request, None)
-            .await
-            .expect("invoke");
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        assert_eq!(body.as_ref(), b"host-ok");
-    }
-
-    #[tokio::test]
-    #[ignore = "starts full runtime service; run manually in isolation"]
-    async fn public_host_invoke_ignores_spoofed_forwarded_request_url() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_config(
-                "echo".to_string(),
-                "export default { async fetch(request) { return new Response(request.url); } }"
-                    .to_string(),
-                DeployConfig {
-                    public: true,
-                    bindings: vec![],
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/rooms/test?x=1")
-            .header("host", "echo.example.com")
-            .header("x-forwarded-host", "echo.wdyt.chat")
-            .header("x-forwarded-proto", "https")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = invoke_worker_public(state, request, None)
-            .await
-            .expect("invoke");
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        assert_eq!(body.as_ref(), b"https://echo.example.com/rooms/test?x=1");
-    }
-
-    #[tokio::test]
-    #[ignore = "starts full runtime service; run manually in isolation"]
-    async fn public_host_invoke_rejects_private_worker() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_config(
-                "private-worker".to_string(),
-                "export default { async fetch() { return new Response('private-ok'); } }"
-                    .to_string(),
-                DeployConfig {
-                    public: false,
-                    bindings: vec![],
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/")
-            .header("host", "private-worker.example.com")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let error = invoke_worker_public(state, request, None)
-            .await
-            .expect_err("private worker should not be public");
-        assert_eq!(error.0.kind(), ErrorKind::NotFound);
-    }
-
-    #[tokio::test]
-    async fn private_invoke_serves_asset_before_worker_code() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_bundle_config(
-                "assets".to_string(),
-                "export default { async fetch() { return new Response('worker-fallback'); } }"
-                    .to_string(),
-                DeployConfig::default(),
-                test_assets(),
-                Some("/a.js\n  Cache-Control: public, max-age=60\n".to_string()),
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/v1/invoke/assets/a.js")
-            .header("authorization", "Bearer test-private-token")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = invoke_worker_private(state.clone(), request, None)
-            .await
-            .expect("invoke");
-        let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        assert_eq!(body.as_ref(), b"asset-body");
-        assert_eq!(
-            headers
-                .get("cache-control")
-                .and_then(|value| value.to_str().ok()),
-            Some("public, max-age=60")
-        );
-
-        let fallback_request = Request::builder()
-            .method("GET")
-            .uri("/v1/invoke/assets/missing")
-            .header("authorization", "Bearer test-private-token")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let fallback = invoke_worker_private(state, fallback_request, None)
-            .await
-            .expect("invoke fallback");
-        let fallback_body = fallback
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        assert_eq!(fallback_body.as_ref(), b"worker-fallback");
-    }
-
-    #[tokio::test]
-    async fn public_host_invoke_serves_assets_for_public_workers() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_bundle_config(
-                "assets".to_string(),
-                "export default { async fetch() { return new Response('worker-fallback'); } }"
-                    .to_string(),
-                DeployConfig {
-                    public: true,
-                    ..DeployConfig::default()
-                },
-                test_assets(),
-                None,
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("HEAD")
-            .uri("/a.js")
-            .header("host", "assets.example.com")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = invoke_worker_public(state, request, None)
-            .await
-            .expect("invoke");
-        let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        assert!(body.is_empty());
-        assert_eq!(
-            headers
-                .get("content-length")
-                .and_then(|value| value.to_str().ok()),
-            Some("10")
-        );
-    }
-
     #[test]
     fn websocket_upgrade_checks_required_headers() {
         let mut headers = HeaderMap::new();
@@ -2159,90 +1858,5 @@ mod tests {
         non_ws.insert("connection", "keep-alive".parse().expect("header"));
         non_ws.insert("upgrade", "websocket".parse().expect("header"));
         assert!(!super::is_websocket_upgrade(&non_ws));
-    }
-
-    #[tokio::test]
-    #[ignore = "starts full runtime service and http stack; run manually in isolation"]
-    async fn private_websocket_route_rejects_non_actor_upgrade() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_config(
-                "echo".to_string(),
-                "export default { async fetch() { return new Response('ok'); } }".to_string(),
-                DeployConfig {
-                    public: false,
-                    bindings: vec![],
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/v1/invoke/echo")
-            .header("authorization", "Bearer test-private-token")
-            .header("upgrade", "websocket")
-            .header("connection", "Upgrade")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .header("sec-websocket-version", "13")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-
-        let response = handle_private_request(state, request).await.status();
-        assert_eq!(response, StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn private_routes_reject_missing_bearer_token() {
-        let state = create_test_state("example.com").await;
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/deploy")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-        let response = handle_private_request(state, request).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            response
-                .headers()
-                .get("www-authenticate")
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer")
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "starts full runtime service and http stack; run manually in isolation"]
-    async fn public_websocket_route_rejects_non_actor_upgrade() {
-        let state = create_test_state("example.com").await;
-        state
-            .runtime
-            .deploy_with_config(
-                "echo".to_string(),
-                "export default { async fetch() { return new Response('ok'); } }".to_string(),
-                DeployConfig {
-                    public: true,
-                    bindings: vec![],
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("deploy");
-
-        let request = Request::builder()
-            .method("GET")
-            .uri("/")
-            .header("host", "echo.example.com")
-            .header("upgrade", "websocket")
-            .header("connection", "Upgrade")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .header("sec-websocket-version", "13")
-            .body(Empty::<Bytes>::new())
-            .expect("request");
-
-        let response = handle_public_request(state, request).await.status();
-        assert_eq!(response, StatusCode::BAD_REQUEST);
     }
 }

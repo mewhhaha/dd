@@ -121,7 +121,7 @@ pub enum DeployBinding {
         binding: String,
     },
     #[serde(rename = "memory")]
-    Actor {
+    Memory {
         binding: String,
     },
     Dynamic {

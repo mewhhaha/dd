@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+clap.workspace = true
 bytes = "1"
 common = { path = "../common" }
 futures = "0.3"
@@ -35,3 +36,6 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+serial_test = "3"

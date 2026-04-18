@@ -1,3 +1,5 @@
+// Generated child workers run in separate Deno isolates.
+// This keeps mutable JS state isolated from parent worker, but is not OS/container sandboxing.
 /// <reference path="./types/dynamic-worker-config.d.ts" />
 
 function json(data, init = {}) {

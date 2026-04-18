@@ -58,7 +58,7 @@ fn blackbox_public_h3_websocket_echoes_text_and_binary() {
             "#,
                         DeployConfig {
                             public: true,
-                            bindings: vec![DeployBinding::Actor {
+                            bindings: vec![DeployBinding::Memory {
                                 binding: "CHAT".to_string(),
                             }],
                             ..Default::default()
@@ -194,7 +194,7 @@ fn blackbox_public_h3_websocket_storage_on_message_does_not_close() {
             "#,
                         DeployConfig {
                             public: true,
-                            bindings: vec![DeployBinding::Actor {
+                            bindings: vec![DeployBinding::Memory {
                                 binding: "CHAT".to_string(),
                             }],
                             ..Default::default()
@@ -333,7 +333,7 @@ fn blackbox_public_h3_transport_echoes_stream() {
             "#,
                             DeployConfig {
                                 public: true,
-                                bindings: vec![DeployBinding::Actor {
+                                bindings: vec![DeployBinding::Memory {
                                     binding: "MEDIA".to_string(),
                                 }],
                                 ..Default::default()

@@ -1370,6 +1370,7 @@ name = "dd_server"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
  "common",
  "futures",
  "futures-util",
@@ -1391,6 +1392,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "serial_test",
  "tokio",
  "tokio-quiche",
  "tokio-stream",

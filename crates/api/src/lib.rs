@@ -1,5 +1,7 @@
 mod app;
 mod handlers;
+#[cfg(test)]
+mod handlers_runtime_tests;
 mod public_quic;
 mod state;
 
