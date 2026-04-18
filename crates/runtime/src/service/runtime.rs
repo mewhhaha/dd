@@ -126,7 +126,10 @@ pub(super) fn least_loaded_isolate_any_idx(
         .map(|(idx, _)| idx)
 }
 
-pub(super) fn decrement_memory_inflight(memory_inflight: &mut HashMap<String, usize>, memory_key: &str) {
+pub(super) fn decrement_memory_inflight(
+    memory_inflight: &mut HashMap<String, usize>,
+    memory_key: &str,
+) {
     let Some(current) = memory_inflight.get_mut(memory_key) else {
         return;
     };
@@ -216,7 +219,6 @@ impl WorkerPool {
             scale_down_count: self.stats.scale_down_count,
         }
     }
-
 }
 
 pub(super) fn spawn_runtime_thread(

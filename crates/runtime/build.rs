@@ -24,10 +24,10 @@ fn main() {
 
 fn validate_checked_in_memory_rpc() {
     let schema_fingerprint = current_memory_rpc_schema_fingerprint();
-    let generated = fs::read_to_string(CHECKED_IN_MEMORY_RPC_PATH).unwrap_or_else(|error| {
-        panic!("failed to read {CHECKED_IN_MEMORY_RPC_PATH}: {error}")
-    });
-    if generated_memory_rpc_fingerprint(&generated).as_deref() != Some(schema_fingerprint.as_str()) {
+    let generated = fs::read_to_string(CHECKED_IN_MEMORY_RPC_PATH)
+        .unwrap_or_else(|error| panic!("failed to read {CHECKED_IN_MEMORY_RPC_PATH}: {error}"));
+    if generated_memory_rpc_fingerprint(&generated).as_deref() != Some(schema_fingerprint.as_str())
+    {
         panic!(
             "checked-in memory RPC bindings at {CHECKED_IN_MEMORY_RPC_PATH} do not match {MEMORY_RPC_SCHEMA_PATH}; regenerate them with `capnp` installed"
         );

@@ -1563,4 +1563,3 @@ pub(super) async fn op_memory_transport_consume_close(
         },
     }
 }
-

@@ -1,6 +1,10 @@
 use super::*;
 
-pub(super) async fn print_profile_on_failure(service: &RuntimeService, worker_name: &str, label: &str) {
+pub(super) async fn print_profile_on_failure(
+    service: &RuntimeService,
+    worker_name: &str,
+    label: &str,
+) {
     match timeout(Duration::from_secs(2), take_profile(service, worker_name)).await {
         Err(_) => {
             println!(
@@ -21,7 +25,11 @@ pub(super) async fn print_profile_on_failure(service: &RuntimeService, worker_na
     }
 }
 
-pub(super) async fn print_debug_dump_on_failure(service: &RuntimeService, worker_name: &str, label: &str) {
+pub(super) async fn print_debug_dump_on_failure(
+    service: &RuntimeService,
+    worker_name: &str,
+    label: &str,
+) {
     match timeout(
         Duration::from_secs(2),
         service.debug_dump(worker_name.to_string()),

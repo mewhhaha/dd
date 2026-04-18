@@ -165,7 +165,9 @@ pub(super) fn parse_websocket_open_metadata(
     Ok((handle, binding, key))
 }
 
-pub(super) fn strip_websocket_open_internal_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+pub(super) fn strip_websocket_open_internal_headers(
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_ACCEPT_HEADER))
@@ -177,7 +179,9 @@ pub(super) fn strip_websocket_open_internal_headers(headers: &[(String, String)]
         .collect()
 }
 
-pub(super) fn strip_websocket_frame_internal_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+pub(super) fn strip_websocket_frame_internal_headers(
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_ACCEPT_HEADER))
@@ -224,7 +228,9 @@ pub(super) fn parse_transport_open_metadata(
     Ok((handle, binding, key))
 }
 
-pub(super) fn strip_transport_open_internal_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+pub(super) fn strip_transport_open_internal_headers(
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_ACCEPT_HEADER))

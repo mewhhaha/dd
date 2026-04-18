@@ -17,14 +17,14 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-#[path = "tests/fixtures.rs"]
-mod fixtures;
 #[path = "tests/dynamic.rs"]
 mod dynamic;
-#[path = "tests/sessions.rs"]
-mod sessions;
+#[path = "tests/fixtures.rs"]
+mod fixtures;
 #[path = "tests/memory.rs"]
 mod memory;
+#[path = "tests/sessions.rs"]
+mod sessions;
 
 use self::fixtures::*;
 

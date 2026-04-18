@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<RuntimeService> {
+pub(super) async fn start_service(
+    tag: &str,
+    runtime: RuntimeConfig,
+) -> common::Result<RuntimeService> {
     let paths = bench_paths(tag);
     tokio::fs::create_dir_all(&paths.store_dir)
         .await

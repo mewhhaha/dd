@@ -3,7 +3,6 @@ use super::*;
 pub type RequestBodyChunk = std::result::Result<Vec<u8>, String>;
 pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
 
-
 #[derive(Default)]
 pub struct MemoryRequestScopes {
     pub(crate) scopes: HashMap<String, MemoryRequestScope>,
