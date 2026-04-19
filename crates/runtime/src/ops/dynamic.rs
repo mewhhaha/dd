@@ -388,6 +388,7 @@ pub(super) fn op_dynamic_worker_create(
                 source: payload.source,
                 env: payload.env,
                 timeout: payload.timeout,
+                policy: payload.policy,
                 host_rpc_bindings: payload.host_rpc_bindings,
                 reply_id: reply_id.clone(),
                 pending_replies,

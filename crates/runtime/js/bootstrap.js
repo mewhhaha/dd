@@ -336,6 +336,12 @@ async function syncFrozenTimeBoundary() {
   }
 }
 
+function activeRuntimeRequestId() {
+  return typeof globalThis.__dd_get_runtime_request_id === "function"
+    ? String(globalThis.__dd_get_runtime_request_id() ?? "")
+    : "";
+}
+
 class Cache {
   constructor(name = "default") {
     this.name = String(name || "default");
@@ -348,6 +354,7 @@ class Cache {
     const result = await runtimeOp(
       "op_cache_match",
       JSON.stringify({
+        request_id: activeRuntimeRequestId(),
         cache_name: this.name,
         method: normalizedRequest.method,
         url: normalizedRequest.url,
@@ -392,6 +399,7 @@ class Cache {
     const result = await runtimeOp(
       "op_cache_put",
       JSON.stringify({
+        request_id: activeRuntimeRequestId(),
         cache_name: this.name,
         method: normalizedRequest.method,
         url: normalizedRequest.url,
@@ -413,6 +421,7 @@ class Cache {
     const result = await runtimeOp(
       "op_cache_delete",
       JSON.stringify({
+        request_id: activeRuntimeRequestId(),
         cache_name: this.name,
         method: normalizedRequest.method,
         url: normalizedRequest.url,

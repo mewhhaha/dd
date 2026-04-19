@@ -40,6 +40,137 @@ async fn dynamic_namespace_can_create_and_invoke_dynamic_workers() {
 
 #[tokio::test]
 #[serial]
+async fn dynamic_namespace_default_host_rpc_requires_explicit_policy() {
+    let service = test_service(dynamic_single_isolate_config()).await;
+
+    service
+        .deploy_with_config(
+            "dynamic-rpc-policy".to_string(),
+            dynamic_policy_default_host_rpc_denied_worker(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-rpc-policy",
+        test_invocation(),
+        "dynamic host rpc default policy denial",
+    )
+    .await;
+    let body = String::from_utf8(output.body).expect("utf8");
+    assert!(body.contains("allow_host_rpc"));
+}
+
+#[tokio::test]
+#[serial]
+async fn dynamic_namespace_default_egress_is_denied() {
+    let service = test_service(dynamic_single_isolate_config()).await;
+
+    service
+        .deploy_with_config(
+            "dynamic-egress-policy".to_string(),
+            dynamic_policy_default_egress_denied_worker(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-egress-policy",
+        test_invocation(),
+        "dynamic default egress denial",
+    )
+    .await;
+    let body = String::from_utf8(output.body).expect("utf8");
+    assert!(body.contains("egress origin is not allowed"));
+}
+
+#[tokio::test]
+#[serial]
+async fn dynamic_namespace_default_cache_access_is_denied() {
+    let service = test_service(dynamic_single_isolate_config()).await;
+
+    service
+        .deploy_with_config(
+            "dynamic-cache-policy".to_string(),
+            dynamic_policy_default_cache_denied_worker(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-cache-policy",
+        test_invocation(),
+        "dynamic default cache denial",
+    )
+    .await;
+    let body = String::from_utf8(output.body).expect("utf8");
+    assert!(body.contains("blocks cache access"));
+}
+
+#[tokio::test]
+#[serial]
+async fn dynamic_namespace_quota_kill_recreates_child_cleanly() {
+    let service = test_service(dynamic_single_isolate_config()).await;
+
+    service
+        .deploy_with_config(
+            "dynamic-quota-recovery".to_string(),
+            dynamic_policy_quota_kill_recovery_worker(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-quota-recovery",
+        test_invocation_with_path("/boom", "dynamic-quota-boom"),
+        "dynamic quota kill first invoke",
+    )
+    .await;
+    assert_eq!(first.status, 502);
+    let first_body = String::from_utf8(first.body).expect("utf8");
+    assert!(first_body.contains("max_response_bytes"));
+
+    let second = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-quota-recovery",
+        test_invocation_with_path("/recover", "dynamic-quota-recover"),
+        "dynamic quota recovery second invoke",
+    )
+    .await;
+    assert_eq!(second.status, 200);
+    assert_eq!(String::from_utf8(second.body).expect("utf8"), "ok");
+}
+
+#[tokio::test]
+#[serial]
 async fn dynamic_namespace_plain_child_fetch_completes_in_single_isolate() {
     let service = test_service(dynamic_single_isolate_config()).await;
 

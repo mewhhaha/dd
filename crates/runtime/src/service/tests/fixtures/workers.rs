@@ -46,6 +46,7 @@ export default {
           "worker.js": "import { nextCounter } from './lib.js'; export default { async fetch(_request, childEnv) { const hostCount = await childEnv.API.bump(); return new Response(String(nextCounter()) + ':' + String(hostCount)); } };",
           "./lib.js": "let counter = 0; export function nextCounter() { counter += 1; return counter; }",
         },
+        allow_host_rpc: true,
         env: { SECRET: "ok", API: new Api() },
         timeout: 1_500,
       }));
@@ -215,6 +216,7 @@ export default {
 };
       `,
     },
+    allow_host_rpc: true,
     env: {
       API: new Api(),
     },
@@ -643,6 +645,128 @@ export default {
         .to_string()
 }
 
+pub(crate) fn dynamic_policy_default_host_rpc_denied_worker() -> String {
+    r#"
+class Api extends RpcTarget {
+  async ping() {
+    return "pong";
+  }
+}
+
+export default {
+  async fetch(_request, env) {
+    try {
+      await env.SANDBOX.get("rpc-denied:v1", async () => ({
+        source: "export default { async fetch() { return new Response('ok'); } };",
+        env: {
+          API: new Api(),
+        },
+        timeout: 1_500,
+      }));
+      return new Response("unexpected-success", { status: 500 });
+    } catch (error) {
+      return new Response(String(error?.message ?? error));
+    }
+  },
+};
+"#
+    .to_string()
+}
+
+pub(crate) fn dynamic_policy_default_egress_denied_worker() -> String {
+    r#"
+export default {
+  async fetch(_request, env) {
+    const child = await env.SANDBOX.get("egress-denied:v1", async () => ({
+      source: `
+export default {
+  async fetch() {
+    try {
+      await fetch("https://example.com/");
+      return new Response("unexpected-success", { status: 500 });
+    } catch (error) {
+      return new Response(String(error?.message ?? error));
+    }
+  },
+};
+      `,
+      timeout: 1_500,
+    }));
+    return child.fetch("http://worker/");
+  },
+};
+"#
+    .to_string()
+}
+
+pub(crate) fn dynamic_policy_default_cache_denied_worker() -> String {
+    r#"
+export default {
+  async fetch(_request, env) {
+    const child = await env.SANDBOX.get("cache-denied:v1", async () => ({
+      source: `
+export default {
+  async fetch() {
+    try {
+      await caches.default.match("http://worker/cache");
+      return new Response("unexpected-success", { status: 500 });
+    } catch (error) {
+      return new Response(String(error?.message ?? error));
+    }
+  },
+};
+      `,
+      timeout: 1_500,
+    }));
+    return child.fetch("http://worker/");
+  },
+};
+"#
+    .to_string()
+}
+
+pub(crate) fn dynamic_policy_quota_kill_recovery_worker() -> String {
+    r#"
+let phase = "boom";
+
+function childConfig() {
+  if (phase === "boom") {
+    return {
+      source: "export default { async fetch() { return new Response('0123456789ABCDEF'); } };",
+      max_response_bytes: 8,
+      timeout: 1_500,
+    };
+  }
+  return {
+    source: "export default { async fetch() { return new Response('ok'); } };",
+    max_response_bytes: 8,
+    timeout: 1_500,
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/boom") {
+      const child = await env.SANDBOX.get("quota-kill:v1", async () => childConfig());
+      try {
+        return await child.fetch("http://worker/");
+      } catch (error) {
+        phase = "recover";
+        return new Response(String(error?.message ?? error), { status: 502 });
+      }
+    }
+    if (url.pathname === "/recover") {
+      const child = await env.SANDBOX.get("quota-kill:v1", async () => childConfig());
+      return child.fetch("http://worker/");
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+    .to_string()
+}
+
 pub(crate) fn dynamic_runtime_surface_worker() -> String {
     r#"
 function runtimeSurface() {
@@ -1003,6 +1127,7 @@ async function ensurePreview(env, previewId) {
   return env.SANDBOX.get(`preview:${previewId}`, async () => ({
     entrypoint: "worker.js",
     modules: previewModules(),
+    allow_host_rpc: true,
     env: {
       PREVIEW: new PreviewControl(previewId),
     },

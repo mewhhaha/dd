@@ -70,6 +70,7 @@ async function ensurePreview(env, previewId) {
     const config = {
       entrypoint: "worker.js",
       modules: previewModules(),
+      allow_host_rpc: true,
       env: {
         PREVIEW: new PreviewControl(key),
       },

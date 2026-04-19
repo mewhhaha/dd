@@ -1,5 +1,5 @@
-// Dynamic child runs in separate Deno isolate.
-// Good for generated or tenant code that should not share parent runtime state.
+// Dynamic child runs in separate Deno isolate inside same process.
+// Good for containment and separation, not OS/container sandboxing.
 /// <reference path="./types/dynamic-worker-config.d.ts" />
 
 const CHILD_ENTRY = `
@@ -72,6 +72,7 @@ export default {
           "worker.js": CHILD_ENTRY,
           "./lib.js": CHILD_LIB,
         },
+        allow_host_rpc: true,
         env: {
           API_TOKEN: "placeholder-parent-token",
           API: new DemoApi(),

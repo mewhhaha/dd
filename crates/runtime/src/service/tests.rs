@@ -2272,9 +2272,15 @@ fn dynamic_host_rpc_fake_wake_path_is_removed_from_runtime_sources() {
 fn dynamic_worker_config_builds_placeholders() {
     let mut env = HashMap::new();
     env.insert("OPENAI_API_KEY".to_string(), "sk-test-123".to_string());
-    let config =
-        super::build_dynamic_worker_config(env, vec!["api.openai.com".to_string()], Vec::new())
-            .expect("dynamic config should build");
+    let config = super::build_dynamic_worker_config(
+        env,
+        crate::ops::DynamicWorkerPolicy {
+            egress_allow_hosts: vec!["api.openai.com".to_string()],
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .expect("dynamic config should build");
 
     assert_eq!(config.dynamic_env.len(), 1);
     assert_eq!(config.secret_replacements.len(), 1);
@@ -2294,7 +2300,10 @@ fn dynamic_worker_config_builds_placeholders() {
 fn dynamic_worker_config_rejects_invalid_host() {
     let config = super::build_dynamic_worker_config(
         HashMap::new(),
-        vec!["http://bad-host".to_string()],
+        crate::ops::DynamicWorkerPolicy {
+            egress_allow_hosts: vec!["http://bad-host".to_string()],
+            ..Default::default()
+        },
         Vec::new(),
     );
     assert!(config.is_err());
@@ -2304,11 +2313,14 @@ fn dynamic_worker_config_rejects_invalid_host() {
 fn dynamic_worker_config_accepts_host_port_and_wildcard_rules() {
     let config = super::build_dynamic_worker_config(
         HashMap::new(),
-        vec![
-            "api.example.com:8443".to_string(),
-            "*.example.com".to_string(),
-            "*.example.com:9443".to_string(),
-        ],
+        crate::ops::DynamicWorkerPolicy {
+            egress_allow_hosts: vec![
+                "api.example.com:8443".to_string(),
+                "*.example.com".to_string(),
+                "*.example.com:9443".to_string(),
+            ],
+            ..Default::default()
+        },
         Vec::new(),
     )
     .expect("dynamic config should accept host+port rules");

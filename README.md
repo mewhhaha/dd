@@ -122,7 +122,44 @@ export default {
 
 ## Dynamic workers and assets
 
-Workers can create other workers with `env.SANDBOX.get/list/delete`. Dynamic workers run in separate Deno isolates, so they fit tenant-specific or agent-generated code that should stay runtime-isolated from parent worker state. That is isolate-level separation, not OS process, VM, or container sandboxing. See [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js).
+Workers can create other workers with `env.SANDBOX.get/list/delete`. Dynamic workers run in separate Deno isolates inside same process, so they fit buggy or semi-hostile agent code that should not share parent runtime state. That is runtime isolation and containment, not OS process, VM, or container sandboxing.
+
+Default child policy is deny-first. No outbound fetch, no host RPC, no websocket/transport upgrade, no cache access unless child opts in:
+
+```js
+const child = await env.SANDBOX.get("agent:v1", async () => ({
+  entrypoint: "worker.js",
+  modules: {
+    "worker.js": `
+      export default {
+        async fetch(request) {
+          return new Response("ok");
+        },
+      };
+    `,
+  },
+  egress_allow_hosts: ["api.openai.com"],
+  max_request_bytes: 1_048_576,
+  max_response_bytes: 2_097_152,
+  max_outbound_requests: 8,
+  max_concurrency: 8,
+  timeout: 2_500,
+}));
+```
+
+If child needs parent callback, opt in explicitly:
+
+```js
+const child = await env.SANDBOX.get("preview:v1", async () => ({
+  entrypoint: "worker.js",
+  modules: previewModules(),
+  allow_host_rpc: true,
+  env: { PREVIEW: new PreviewControl("preview:v1") },
+  timeout: 3_000,
+}));
+```
+
+See [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js), [examples/preview-dynamic.js](/home/mewhhaha/src/grugd/examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](/home/mewhhaha/src/grugd/examples/llm-dynamic-exec.js).
 
 Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](/home/mewhhaha/src/grugd/examples/static-assets-site).
 

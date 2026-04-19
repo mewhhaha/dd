@@ -74,6 +74,51 @@
     return normalized;
   };
 
+  const normalizeDynamicPolicy = (options) => {
+    const parseBool = (value, fallback = false) => value == null ? fallback : Boolean(value);
+    const parsePositiveInt = (label, value, fallback, max) => {
+      if (value == null) {
+        return fallback;
+      }
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error(`dynamic worker ${label} must be a positive number`);
+      }
+      const normalized = Math.trunc(parsed);
+      return Math.min(normalized, max);
+    };
+    const normalizeHosts = (value) => {
+      if (value == null) {
+        return [];
+      }
+      if (!Array.isArray(value)) {
+        throw new Error("dynamic worker egress_allow_hosts must be an array");
+      }
+      const seen = new Set();
+      const out = [];
+      for (const entry of value) {
+        const host = String(entry ?? "").trim().toLowerCase();
+        if (!host || seen.has(host)) {
+          continue;
+        }
+        seen.add(host);
+        out.push(host);
+      }
+      return out;
+    };
+    return Object.freeze({
+      egress_allow_hosts: normalizeHosts(options.egress_allow_hosts),
+      allow_host_rpc: parseBool(options.allow_host_rpc, false),
+      allow_websocket: parseBool(options.allow_websocket, false),
+      allow_transport: parseBool(options.allow_transport, false),
+      allow_state_bindings: parseBool(options.allow_state_bindings, false),
+      max_request_bytes: parsePositiveInt("max_request_bytes", options.max_request_bytes, 1_048_576, 64 * 1024 * 1024),
+      max_response_bytes: parsePositiveInt("max_response_bytes", options.max_response_bytes, 2_097_152, 64 * 1024 * 1024),
+      max_outbound_requests: parsePositiveInt("max_outbound_requests", options.max_outbound_requests, 16, 10_000),
+      max_concurrency: parsePositiveInt("max_concurrency", options.max_concurrency, 32, 1_024),
+    });
+  };
+
   const normalizeModulePath = (value) => {
     const raw = String(value ?? "").replaceAll("\\", "/").trim();
     if (!raw) {
@@ -513,6 +558,15 @@
    * @property {Record<string, any>} [env] Env bindings for the dynamic worker.
    * String values stay opaque and are only resolved at host I/O boundaries; `RpcTarget` values become host RPC bindings.
    * @property {number} [timeout] Per-invoke timeout in ms. Default `5000`, max `60000`.
+   * @property {string[]} [egress_allow_hosts] Exact host / host:port / wildcard origins allowed for outbound fetch. Default deny.
+   * @property {boolean} [allow_host_rpc] Allow `RpcTarget` env bindings. Default `false`.
+   * @property {boolean} [allow_websocket] Allow websocket upgrade responses. Default `false`.
+   * @property {boolean} [allow_transport] Allow transport upgrade responses. Default `false`.
+   * @property {boolean} [allow_state_bindings] Allow stateful runtime bindings like cache. Default `false`.
+   * @property {number} [max_request_bytes] Maximum inbound request bytes per child invoke.
+   * @property {number} [max_response_bytes] Maximum outbound response bytes per child invoke.
+   * @property {number} [max_outbound_requests] Maximum outbound host fetch count across child lifetime.
+   * @property {number} [max_concurrency] Maximum concurrent inflight invokes for child.
    */
 
   /**
@@ -562,8 +616,9 @@
 
       const options = await parseDynamicFactoryOptions(factory);
       const source = resolveDynamicWorkerSource(options);
+      const policy = normalizeDynamicPolicy(options);
       const envInput = options.env;
-      const envConfig = splitDynamicEnvInput(envInput);
+      const envConfig = splitDynamicEnvInput(envInput, policy);
       const timeout = normalizeDynamicTimeout(options.timeout);
       const result = await awaitDynamicReply(
         `dynamic worker create (${bindingName}/${instanceId})`,
@@ -573,6 +628,7 @@
           id: instanceId,
           source,
           env: envConfig.stringEnv,
+          policy,
           host_rpc_bindings: envConfig.hostRpcBindings,
           timeout,
         }),

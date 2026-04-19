@@ -90,6 +90,7 @@ async function ensureSandbox(env, plan) {
     const config = {
       entrypoint: "worker.js",
       modules: plan.modules,
+      allow_host_rpc: true,
       env: {
         RUNTIME_AUDIT: new RuntimeAudit(),
       },

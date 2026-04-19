@@ -101,6 +101,8 @@ pub(crate) struct KvListResult {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CacheRequestPayload {
+    #[serde(default)]
+    request_id: String,
     cache_name: String,
     method: String,
     url: String,
@@ -111,6 +113,8 @@ pub(crate) struct CacheRequestPayload {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CachePutPayload {
+    #[serde(default)]
+    request_id: String,
     cache_name: String,
     method: String,
     url: String,
@@ -644,7 +648,7 @@ pub(crate) async fn op_cache_match(
     state: Rc<RefCell<OpState>>,
     #[string] payload: String,
 ) -> CacheMatchResult {
-    let request = match decode_cache_request_payload(payload) {
+    let (request, request_id) = match decode_cache_request_payload(payload) {
         Ok(request) => request,
         Err(error) => {
             return CacheMatchResult {
@@ -659,7 +663,18 @@ pub(crate) async fn op_cache_match(
             };
         }
     };
-
+    if let Err(error) = ensure_cache_allowed(&state, &request_id) {
+        return CacheMatchResult {
+            ok: false,
+            found: false,
+            stale: false,
+            should_revalidate: false,
+            status: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+            error,
+        };
+    }
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.get(&request).await {
         Ok(CacheLookup::Fresh(response)) => CacheMatchResult {
@@ -721,7 +736,7 @@ pub(crate) async fn op_cache_put(
     state: Rc<RefCell<OpState>>,
     #[string] payload: String,
 ) -> KvOpResult {
-    let (request, response) = match decode_cache_put_payload(payload) {
+    let ((request, response), request_id) = match decode_cache_put_payload(payload) {
         Ok(values) => values,
         Err(error) => {
             return KvOpResult {
@@ -731,6 +746,13 @@ pub(crate) async fn op_cache_put(
             };
         }
     };
+    if let Err(error) = ensure_cache_allowed(&state, &request_id) {
+        return KvOpResult {
+            ok: false,
+            error,
+            version: None,
+        };
+    }
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.put(&request, response).await {
         Ok(_) => KvOpResult {
@@ -752,7 +774,7 @@ pub(crate) async fn op_cache_delete(
     state: Rc<RefCell<OpState>>,
     #[string] payload: String,
 ) -> CacheDeleteResult {
-    let request = match decode_cache_request_payload(payload) {
+    let (request, request_id) = match decode_cache_request_payload(payload) {
         Ok(request) => request,
         Err(error) => {
             return CacheDeleteResult {
@@ -762,6 +784,13 @@ pub(crate) async fn op_cache_delete(
             };
         }
     };
+    if let Err(error) = ensure_cache_allowed(&state, &request_id) {
+        return CacheDeleteResult {
+            ok: false,
+            deleted: false,
+            error,
+        };
+    }
 
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.delete(&request).await {
@@ -778,6 +807,29 @@ pub(crate) async fn op_cache_delete(
     }
 }
 
+fn ensure_cache_allowed(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+) -> std::result::Result<(), String> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Ok(());
+    }
+    let allowed = {
+        let state_ref = state.borrow();
+        state_ref
+            .borrow::<RequestSecretContexts>()
+            .contexts
+            .get(request_id)
+            .map(|context| context.allow_cache)
+            .unwrap_or(true)
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err("dynamic child policy blocks cache access".to_string())
+}
+
 pub(crate) fn prepare_http_fetch_request(
     state: &Rc<RefCell<OpState>>,
     payload: HttpFetchPayload,
@@ -792,7 +844,15 @@ pub(crate) fn prepare_http_fetch_request(
     ),
     String,
 > {
-    let (replacements, egress_allow_hosts, canceled, canceled_notify) =
+    let (
+        worker_name,
+        replacements,
+        egress_allow_hosts,
+        max_outbound_requests,
+        dynamic_quota_state,
+        canceled,
+        canceled_notify,
+    ) =
         http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
@@ -807,10 +867,33 @@ pub(crate) fn prepare_http_fetch_request(
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
+        if let Some(quota_state) = &dynamic_quota_state {
+            quota_state.egress_deny_count.fetch_add(1, Ordering::Relaxed);
+        }
+        state.borrow().borrow::<DynamicProfile>().record_egress_deny();
         return Err(format!(
             "egress origin is not allowed: {}",
             parsed_url.origin().ascii_serialization()
         ));
+    }
+    if let Some(quota_state) = &dynamic_quota_state {
+        let next = quota_state.outbound_requests.fetch_add(1, Ordering::Relaxed) + 1;
+        if max_outbound_requests
+            .map(|limit| next > limit)
+            .unwrap_or(false)
+        {
+            quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
+            state.borrow().borrow::<DynamicProfile>().record_quota_kill();
+            let command_sender = state
+                .borrow()
+                .borrow::<crate::service::RuntimeFastCommandSender>()
+                .clone();
+            let _ = command_sender.0.send(crate::service::RuntimeCommand::RetireDynamicWorker {
+                worker_name,
+                reason: "dynamic child exceeded max_outbound_requests".to_string(),
+            });
+            return Err("dynamic child exceeded max_outbound_requests".to_string());
+        }
     }
 
     let headers = payload
@@ -837,7 +920,15 @@ pub(crate) fn check_http_fetch_url(
     state: &Rc<RefCell<OpState>>,
     payload: HttpUrlCheckPayload,
 ) -> std::result::Result<String, String> {
-    let (replacements, egress_allow_hosts, canceled, canceled_notify) =
+    let (
+        _worker_name,
+        replacements,
+        egress_allow_hosts,
+        _max_outbound_requests,
+        dynamic_quota_state,
+        canceled,
+        canceled_notify,
+    ) =
         http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
@@ -847,6 +938,10 @@ pub(crate) fn check_http_fetch_url(
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
+        if let Some(quota_state) = &dynamic_quota_state {
+            quota_state.egress_deny_count.fetch_add(1, Ordering::Relaxed);
+        }
+        state.borrow().borrow::<DynamicProfile>().record_egress_deny();
         return Err(format!(
             "egress origin is not allowed: {}",
             parsed_url.origin().ascii_serialization()
@@ -860,8 +955,11 @@ pub(crate) fn http_fetch_context(
     request_id: &str,
 ) -> std::result::Result<
     (
+        String,
         HashMap<String, String>,
         Vec<String>,
+        Option<u64>,
+        Option<Arc<crate::service::DynamicQuotaState>>,
         Arc<AtomicBool>,
         Arc<Notify>,
     ),
@@ -879,8 +977,11 @@ pub(crate) fn http_fetch_context(
             .get(request_id)
             .map(|context| {
                 (
+                    context.worker_name.clone(),
                     context.replacements.clone(),
                     context.egress_allow_hosts.clone(),
+                    context.max_outbound_requests,
+                    context.dynamic_quota_state.clone(),
                     context.canceled.clone(),
                     context.canceled_notify.clone(),
                 )
@@ -1102,37 +1203,45 @@ pub(crate) fn to_list_item(entry: KvEntry) -> KvListItem {
     }
 }
 
-pub(crate) fn decode_cache_request_payload(payload: String) -> common::Result<CacheRequest> {
+pub(crate) fn decode_cache_request_payload(
+    payload: String,
+) -> common::Result<(CacheRequest, String)> {
     let payload: CacheRequestPayload = crate::json::from_string(payload).map_err(|error| {
         common::PlatformError::runtime(format!("invalid cache payload: {error}"))
-    })?;
-    Ok(CacheRequest {
-        cache_name: payload.cache_name,
-        method: payload.method,
-        url: payload.url,
-        headers: payload.headers,
-        bypass_stale: payload.bypass_stale,
-    })
-}
-
-pub(crate) fn decode_cache_put_payload(
-    payload: String,
-) -> common::Result<(CacheRequest, CacheResponse)> {
-    let payload: CachePutPayload = crate::json::from_string(payload).map_err(|error| {
-        common::PlatformError::runtime(format!("invalid cache put payload: {error}"))
     })?;
     Ok((
         CacheRequest {
             cache_name: payload.cache_name,
             method: payload.method,
             url: payload.url,
-            headers: payload.request_headers,
-            bypass_stale: false,
+            headers: payload.headers,
+            bypass_stale: payload.bypass_stale,
         },
-        CacheResponse {
-            status: payload.response_status,
-            headers: payload.response_headers,
-            body: payload.response_body,
-        },
+        payload.request_id,
+    ))
+}
+
+pub(crate) fn decode_cache_put_payload(
+    payload: String,
+) -> common::Result<((CacheRequest, CacheResponse), String)> {
+    let payload: CachePutPayload = crate::json::from_string(payload).map_err(|error| {
+        common::PlatformError::runtime(format!("invalid cache put payload: {error}"))
+    })?;
+    Ok((
+        (
+            CacheRequest {
+                cache_name: payload.cache_name,
+                method: payload.method,
+                url: payload.url,
+                headers: payload.request_headers,
+                bypass_stale: false,
+            },
+            CacheResponse {
+                status: payload.response_status,
+                headers: payload.response_headers,
+                body: payload.response_body,
+            },
+        ),
+        payload.request_id,
     ))
 }

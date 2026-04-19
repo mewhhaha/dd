@@ -1,4 +1,5 @@
 use super::{DynamicRpcBinding, RuntimeConfig};
+use crate::ops::DynamicWorkerPolicy;
 use common::{DeployBinding, DeployConfig, PlatformError, Result};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -15,6 +16,59 @@ pub(super) struct DynamicWorkerConfig {
     pub(super) secret_replacements: Vec<(String, String)>,
     pub(super) egress_allow_hosts: Vec<String>,
     pub(super) env_placeholders: HashMap<String, String>,
+    pub(super) policy: ValidatedDynamicWorkerPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum DynamicWorkerTier {
+    IsolatedAgent,
+    RpcChild,
+    FullDynamic,
+}
+
+impl DynamicWorkerTier {
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Self::IsolatedAgent => "isolated-agent",
+            Self::RpcChild => "rpc-child",
+            Self::FullDynamic => "full-dynamic",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ValidatedDynamicWorkerPolicy {
+    pub(super) egress_allow_hosts: Vec<String>,
+    pub(super) allow_host_rpc: bool,
+    pub(super) allow_websocket: bool,
+    pub(super) allow_transport: bool,
+    pub(super) allow_state_bindings: bool,
+    pub(super) max_request_bytes: usize,
+    pub(super) max_response_bytes: usize,
+    pub(super) max_outbound_requests: u64,
+    pub(super) max_concurrency: usize,
+    pub(super) tier: DynamicWorkerTier,
+}
+
+pub(super) const MAX_DYNAMIC_HOST_RPC_METHODS: usize = 64;
+pub(super) const MAX_DYNAMIC_HOST_RPC_ARG_BYTES: usize = 128 * 1024;
+pub(super) const MAX_DYNAMIC_HOST_RPC_REPLY_BYTES: usize = 128 * 1024;
+
+pub(super) fn full_dynamic_internal_policy(
+    egress_allow_hosts: Vec<String>,
+) -> ValidatedDynamicWorkerPolicy {
+    ValidatedDynamicWorkerPolicy {
+        egress_allow_hosts,
+        allow_host_rpc: true,
+        allow_websocket: true,
+        allow_transport: true,
+        allow_state_bindings: true,
+        max_request_bytes: usize::MAX,
+        max_response_bytes: usize::MAX,
+        max_outbound_requests: u64::MAX,
+        max_concurrency: usize::MAX,
+        tier: DynamicWorkerTier::FullDynamic,
+    }
 }
 
 pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> {
@@ -71,7 +125,7 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
 
 pub(super) fn build_dynamic_worker_config(
     env: HashMap<String, String>,
-    egress_allow_hosts: Vec<String>,
+    policy_input: DynamicWorkerPolicy,
     dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
 ) -> Result<DynamicWorkerConfig> {
     let mut dynamic_env = Vec::new();
@@ -104,7 +158,7 @@ pub(super) fn build_dynamic_worker_config(
 
     let mut normalized_hosts = Vec::new();
     let mut seen_hosts = HashSet::new();
-    for host in egress_allow_hosts {
+    for host in &policy_input.egress_allow_hosts {
         let normalized = host.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             continue;
@@ -119,12 +173,64 @@ pub(super) fn build_dynamic_worker_config(
         }
     }
 
+    let max_request_bytes = usize::try_from(policy_input.max_request_bytes)
+        .map_err(|_| PlatformError::bad_request("dynamic max_request_bytes is too large"))?;
+    let max_response_bytes = usize::try_from(policy_input.max_response_bytes)
+        .map_err(|_| PlatformError::bad_request("dynamic max_response_bytes is too large"))?;
+    let max_concurrency = usize::try_from(policy_input.max_concurrency)
+        .map_err(|_| PlatformError::bad_request("dynamic max_concurrency is too large"))?;
+    if max_request_bytes == 0 {
+        return Err(PlatformError::bad_request(
+            "dynamic max_request_bytes must be greater than 0",
+        ));
+    }
+    if max_response_bytes == 0 {
+        return Err(PlatformError::bad_request(
+            "dynamic max_response_bytes must be greater than 0",
+        ));
+    }
+    if policy_input.max_outbound_requests == 0 {
+        return Err(PlatformError::bad_request(
+            "dynamic max_outbound_requests must be greater than 0",
+        ));
+    }
+    if max_concurrency == 0 {
+        return Err(PlatformError::bad_request(
+            "dynamic max_concurrency must be greater than 0",
+        ));
+    }
+
+    let tier = if policy_input.allow_websocket
+        || policy_input.allow_transport
+        || policy_input.allow_state_bindings
+    {
+        DynamicWorkerTier::FullDynamic
+    } else if policy_input.allow_host_rpc || !dynamic_rpc_bindings.is_empty() {
+        DynamicWorkerTier::RpcChild
+    } else {
+        DynamicWorkerTier::IsolatedAgent
+    };
+
+    let policy = ValidatedDynamicWorkerPolicy {
+        egress_allow_hosts: normalized_hosts.clone(),
+        allow_host_rpc: policy_input.allow_host_rpc,
+        allow_websocket: policy_input.allow_websocket,
+        allow_transport: policy_input.allow_transport,
+        allow_state_bindings: policy_input.allow_state_bindings,
+        max_request_bytes,
+        max_response_bytes,
+        max_outbound_requests: policy_input.max_outbound_requests,
+        max_concurrency,
+        tier,
+    };
+
     Ok(DynamicWorkerConfig {
         dynamic_env,
         dynamic_rpc_bindings,
         secret_replacements,
         egress_allow_hosts: normalized_hosts,
         env_placeholders,
+        policy,
     })
 }
 

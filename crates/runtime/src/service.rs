@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Once};
 use std::task::{Wake, Waker};
@@ -51,7 +51,11 @@ use tracing::{info, warn, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
-use self::config::{build_dynamic_worker_config, extract_bindings, validate_runtime_config};
+use self::config::{
+    build_dynamic_worker_config, extract_bindings, full_dynamic_internal_policy,
+    validate_runtime_config, ValidatedDynamicWorkerPolicy, MAX_DYNAMIC_HOST_RPC_ARG_BYTES,
+    MAX_DYNAMIC_HOST_RPC_METHODS, MAX_DYNAMIC_HOST_RPC_REPLY_BYTES,
+};
 use self::protocol::*;
 use self::runtime::*;
 use self::storage::{epoch_ms_i64, persist_worker_deployment};
@@ -209,11 +213,20 @@ pub struct WorkerDebugRequest {
 #[derive(Debug, Clone, Default)]
 pub struct DynamicHandleDebug {
     pub handle: String,
+    pub id: String,
     pub owner_worker: String,
     pub owner_generation: u64,
     pub binding: String,
     pub worker_name: String,
     pub timeout_ms: u64,
+    pub policy_tier: String,
+    pub egress_deny_count: u64,
+    pub rpc_deny_count: u64,
+    pub quota_kill_count: u64,
+    pub upgrade_deny_count: u64,
+    pub outbound_requests: u64,
+    pub inflight: usize,
+    pub max_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -306,6 +319,14 @@ pub(crate) enum RuntimeCommand {
         request: WorkerInvocation,
         reply_id: String,
         pending_replies: crate::ops::DynamicPendingReplies,
+    },
+    RetireDynamicWorkerHandle {
+        handle: String,
+        reason: String,
+    },
+    RetireDynamicWorker {
+        worker_name: String,
+        reason: String,
     },
     RegisterStream {
         worker_name: String,
@@ -457,13 +478,29 @@ struct DynamicWorkerIdKey {
 
 #[derive(Clone)]
 struct DynamicWorkerHandle {
+    id: String,
     owner_worker: String,
     owner_generation: u64,
     binding: String,
     worker_name: String,
     worker_generation: u64,
     timeout: u64,
+    policy: ValidatedDynamicWorkerPolicy,
+    host_rpc_provider_ids: Vec<String>,
     preferred_isolate_id: Option<u64>,
+    quota_state: Arc<DynamicQuotaState>,
+}
+
+#[derive(Default)]
+pub(crate) struct DynamicQuotaState {
+    pub(crate) inflight: AtomicUsize,
+    pub(crate) outbound_requests: AtomicU64,
+    pub(crate) total_request_bytes: AtomicU64,
+    pub(crate) total_response_bytes: AtomicU64,
+    pub(crate) egress_deny_count: AtomicU64,
+    pub(crate) rpc_deny_count: AtomicU64,
+    pub(crate) quota_kill_count: AtomicU64,
+    pub(crate) upgrade_deny_count: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -592,6 +629,8 @@ struct WorkerPool {
     dynamic_env_json: Arc<str>,
     secret_replacements: Vec<(String, String)>,
     egress_allow_hosts: Vec<String>,
+    dynamic_child_policy: Option<ValidatedDynamicWorkerPolicy>,
+    dynamic_quota_state: Option<Arc<DynamicQuotaState>>,
     assets: AssetBundle,
     strict_request_isolation: bool,
     queue: VecDeque<PendingInvoke>,
@@ -736,6 +775,9 @@ enum IsolateCommand {
         dynamic_rpc_bindings: Vec<String>,
         secret_replacements: Vec<(String, String)>,
         egress_allow_hosts: Vec<String>,
+        allow_cache: bool,
+        max_outbound_requests: Option<u64>,
+        dynamic_quota_state: Option<Arc<DynamicQuotaState>>,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         stream_response: bool,
@@ -1933,6 +1975,7 @@ impl WorkerManager {
                 reply_id,
                 pending_replies,
             } => {
+                let runtime_fast_sender = self.runtime_fast_sender.clone();
                 self.start_dynamic_worker_fetch(
                     owner_worker,
                     owner_generation,
@@ -1941,8 +1984,20 @@ impl WorkerManager {
                     request,
                     reply_id,
                     pending_replies,
+                    &runtime_fast_sender,
                     event_tx,
                 );
+                true
+            }
+            RuntimeCommand::RetireDynamicWorkerHandle { handle, reason } => {
+                self.retire_dynamic_worker_handle(&handle, &reason, true);
+                true
+            }
+            RuntimeCommand::RetireDynamicWorker {
+                worker_name,
+                reason,
+            } => {
+                self.retire_dynamic_worker_by_worker_name(&worker_name, &reason, true);
                 true
             }
             RuntimeCommand::OpenWebsocket {
@@ -2321,7 +2376,8 @@ impl WorkerManager {
                 self.handle_dynamic_worker_delete(payload);
             }
             RuntimeEvent::DynamicWorkerInvoke(payload) => {
-                self.handle_dynamic_worker_invoke(payload, event_tx);
+                let runtime_fast_sender = self.runtime_fast_sender.clone();
+                self.handle_dynamic_worker_invoke(payload, &runtime_fast_sender, event_tx);
             }
             RuntimeEvent::DynamicHostRpcInvoke(payload) => {
                 self.handle_dynamic_host_rpc_invoke(payload, event_tx);
@@ -2896,6 +2952,12 @@ impl WorkerManager {
         let profile = self.dynamic_profile.clone();
         tokio::spawn(async move {
             let result = match inner_reply_rx.await {
+                Ok(Ok(output)) if output.body.len() > MAX_DYNAMIC_HOST_RPC_REPLY_BYTES => {
+                    profile.record_rpc_deny();
+                    Err(PlatformError::runtime(format!(
+                        "dynamic host rpc reply exceeds limit ({MAX_DYNAMIC_HOST_RPC_REPLY_BYTES} bytes)"
+                    )))
+                }
                 Ok(Ok(output)) => Ok(output.body),
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(PlatformError::internal(

@@ -234,7 +234,7 @@
     },
   });
 
-  const splitDynamicEnvInput = (value) => {
+  const splitDynamicEnvInput = (value, policy = null) => {
     if (value == null) {
       return {
         stringEnv: {},
@@ -252,6 +252,11 @@
         throw new Error("dynamic worker env key must not be empty");
       }
       if (isRpcTargetInstance(entry)) {
+        if (!(policy && policy.allow_host_rpc === true)) {
+          throw new Error(
+            `dynamic worker env value for ${name} is RpcTarget, but allow_host_rpc is false`,
+          );
+        }
         const targetIdRaw = callOp("op_crypto_random_uuid");
         const targetId = String(targetIdRaw ?? "").trim();
         if (!targetId) {
@@ -276,4 +281,3 @@
       hostRpcBindings,
     };
   };
-

@@ -9,6 +9,7 @@ pub struct DynamicWorkerCreateEvent {
     pub source: String,
     pub env: HashMap<String, String>,
     pub timeout: u64,
+    pub policy: DynamicWorkerPolicy,
     pub host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
     pub reply_id: String,
     pub pending_replies: DynamicPendingReplies,
@@ -67,6 +68,60 @@ pub struct DynamicHostRpcBindingSpec {
     pub target_id: String,
     #[serde(default)]
     pub methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicWorkerPolicy {
+    #[serde(default)]
+    pub egress_allow_hosts: Vec<String>,
+    #[serde(default)]
+    pub allow_host_rpc: bool,
+    #[serde(default)]
+    pub allow_websocket: bool,
+    #[serde(default)]
+    pub allow_transport: bool,
+    #[serde(default)]
+    pub allow_state_bindings: bool,
+    #[serde(default = "default_dynamic_max_request_bytes")]
+    pub max_request_bytes: u64,
+    #[serde(default = "default_dynamic_max_response_bytes")]
+    pub max_response_bytes: u64,
+    #[serde(default = "default_dynamic_max_outbound_requests")]
+    pub max_outbound_requests: u64,
+    #[serde(default = "default_dynamic_max_concurrency")]
+    pub max_concurrency: u64,
+}
+
+impl Default for DynamicWorkerPolicy {
+    fn default() -> Self {
+        Self {
+            egress_allow_hosts: Vec::new(),
+            allow_host_rpc: false,
+            allow_websocket: false,
+            allow_transport: false,
+            allow_state_bindings: false,
+            max_request_bytes: default_dynamic_max_request_bytes(),
+            max_response_bytes: default_dynamic_max_response_bytes(),
+            max_outbound_requests: default_dynamic_max_outbound_requests(),
+            max_concurrency: default_dynamic_max_concurrency(),
+        }
+    }
+}
+
+const fn default_dynamic_max_request_bytes() -> u64 {
+    1_048_576
+}
+
+const fn default_dynamic_max_response_bytes() -> u64 {
+    2_097_152
+}
+
+const fn default_dynamic_max_outbound_requests() -> u64 {
+    16
+}
+
+const fn default_dynamic_max_concurrency() -> u64 {
+    32
 }
 
 pub struct DynamicHostRpcInvokeEvent {
@@ -547,6 +602,8 @@ pub(crate) struct DynamicWorkerCreatePayload {
     #[serde(default = "default_dynamic_worker_timeout")]
     pub(crate) timeout: u64,
     #[serde(default)]
+    pub(crate) policy: DynamicWorkerPolicy,
+    #[serde(default)]
     pub(crate) host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
 }
 
@@ -603,6 +660,10 @@ pub struct DynamicProfile {
     pub(crate) fallback_dispatch: Arc<AtomicU64>,
     pub(crate) async_reply_completion: Arc<AtomicU64>,
     pub(crate) provider_task_callback: Arc<AtomicU64>,
+    pub(crate) egress_deny_count: Arc<AtomicU64>,
+    pub(crate) rpc_deny_count: Arc<AtomicU64>,
+    pub(crate) quota_kill_count: Arc<AtomicU64>,
+    pub(crate) upgrade_deny_count: Arc<AtomicU64>,
     pub(crate) direct_fetch_fast_path_hit: Arc<AtomicU64>,
     pub(crate) direct_fetch_fast_path_fallback: Arc<AtomicU64>,
     pub(crate) direct_fetch_dispatch_us: Arc<AtomicU64>,
@@ -623,6 +684,10 @@ pub struct DynamicProfileSnapshot {
     pub fallback_dispatch: u64,
     pub async_reply_completion: u64,
     pub provider_task_callback: u64,
+    pub egress_deny_count: u64,
+    pub rpc_deny_count: u64,
+    pub quota_kill_count: u64,
+    pub upgrade_deny_count: u64,
     pub direct_fetch_fast_path_hit: u64,
     pub direct_fetch_fast_path_fallback: u64,
     pub direct_fetch_dispatch_us: u64,
@@ -659,6 +724,22 @@ impl DynamicProfile {
 
     pub fn record_provider_task_callback(&self) {
         self.provider_task_callback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_egress_deny(&self) {
+        self.egress_deny_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_rpc_deny(&self) {
+        self.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_quota_kill(&self) {
+        self.quota_kill_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_upgrade_deny(&self) {
+        self.upgrade_deny_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_direct_fetch_fast_path_hit(&self) {
@@ -707,6 +788,10 @@ impl DynamicProfile {
             fallback_dispatch: self.fallback_dispatch.load(Ordering::Relaxed),
             async_reply_completion: self.async_reply_completion.load(Ordering::Relaxed),
             provider_task_callback: self.provider_task_callback.load(Ordering::Relaxed),
+            egress_deny_count: self.egress_deny_count.load(Ordering::Relaxed),
+            rpc_deny_count: self.rpc_deny_count.load(Ordering::Relaxed),
+            quota_kill_count: self.quota_kill_count.load(Ordering::Relaxed),
+            upgrade_deny_count: self.upgrade_deny_count.load(Ordering::Relaxed),
             direct_fetch_fast_path_hit: self.direct_fetch_fast_path_hit.load(Ordering::Relaxed),
             direct_fetch_fast_path_fallback: self
                 .direct_fetch_fast_path_fallback
@@ -733,6 +818,10 @@ impl DynamicProfile {
         self.fallback_dispatch.store(0, Ordering::Relaxed);
         self.async_reply_completion.store(0, Ordering::Relaxed);
         self.provider_task_callback.store(0, Ordering::Relaxed);
+        self.egress_deny_count.store(0, Ordering::Relaxed);
+        self.rpc_deny_count.store(0, Ordering::Relaxed);
+        self.quota_kill_count.store(0, Ordering::Relaxed);
+        self.upgrade_deny_count.store(0, Ordering::Relaxed);
         self.direct_fetch_fast_path_hit.store(0, Ordering::Relaxed);
         self.direct_fetch_fast_path_fallback
             .store(0, Ordering::Relaxed);

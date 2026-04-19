@@ -27,6 +27,9 @@ pub(crate) struct RequestSecretContext {
     pub(crate) dynamic_rpc_bindings: HashSet<String>,
     pub(crate) replacements: HashMap<String, String>,
     pub(crate) egress_allow_hosts: Vec<String>,
+    pub(crate) allow_cache: bool,
+    pub(crate) max_outbound_requests: Option<u64>,
+    pub(crate) dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
     pub(crate) canceled: Arc<AtomicBool>,
     pub(crate) canceled_notify: Arc<Notify>,
 }

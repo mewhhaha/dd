@@ -100,6 +100,8 @@ impl WorkerManager {
                 dynamic_env_json,
                 secret_replacements: Vec::new(),
                 egress_allow_hosts: Vec::new(),
+                dynamic_child_policy: None,
+                dynamic_quota_state: None,
                 assets: compiled_assets,
                 strict_request_isolation: false,
                 queue: VecDeque::new(),
@@ -131,21 +133,40 @@ impl WorkerManager {
         egress_allow_hosts: Vec<String>,
         dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     ) -> Result<DynamicDeployResult> {
-        self.deploy_dynamic_internal(source, env, egress_allow_hosts, dynamic_rpc_bindings, true)
-            .await
+        self.deploy_dynamic_internal(
+            source,
+            env,
+            full_dynamic_internal_policy(egress_allow_hosts),
+            dynamic_rpc_bindings,
+            true,
+        )
+        .await
     }
 
     pub(crate) async fn deploy_dynamic_internal(
         &mut self,
         source: String,
         env: HashMap<String, String>,
-        egress_allow_hosts: Vec<String>,
+        policy: ValidatedDynamicWorkerPolicy,
         dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
         validate_source: bool,
     ) -> Result<DynamicDeployResult> {
         let worker_name = format!("dyn-{}", Uuid::new_v4().simple());
-        let dynamic_config =
-            build_dynamic_worker_config(env, egress_allow_hosts, dynamic_rpc_bindings)?;
+        let dynamic_config = build_dynamic_worker_config(
+            env,
+            crate::ops::DynamicWorkerPolicy {
+                egress_allow_hosts: policy.egress_allow_hosts.clone(),
+                allow_host_rpc: policy.allow_host_rpc,
+                allow_websocket: policy.allow_websocket,
+                allow_transport: policy.allow_transport,
+                allow_state_bindings: policy.allow_state_bindings,
+                max_request_bytes: policy.max_request_bytes as u64,
+                max_response_bytes: policy.max_response_bytes as u64,
+                max_outbound_requests: policy.max_outbound_requests,
+                max_concurrency: policy.max_concurrency as u64,
+            },
+            dynamic_rpc_bindings,
+        )?;
         if validate_source {
             self.validate_worker_cached(&source).await?;
         }
@@ -211,6 +232,8 @@ impl WorkerManager {
             ),
             secret_replacements: dynamic_config.secret_replacements.clone(),
             egress_allow_hosts: dynamic_config.egress_allow_hosts.clone(),
+            dynamic_child_policy: Some(dynamic_config.policy.clone()),
+            dynamic_quota_state: Some(Arc::new(DynamicQuotaState::default())),
             assets: AssetBundle::default(),
             strict_request_isolation: false,
             queue: VecDeque::new(),
@@ -806,11 +829,29 @@ impl WorkerManager {
             .iter()
             .map(|(handle, entry)| DynamicHandleDebug {
                 handle: handle.clone(),
+                id: entry.id.clone(),
                 owner_worker: entry.owner_worker.clone(),
                 owner_generation: entry.owner_generation,
                 binding: entry.binding.clone(),
                 worker_name: entry.worker_name.clone(),
                 timeout_ms: entry.timeout,
+                policy_tier: entry.policy.tier.as_str().to_string(),
+                egress_deny_count: entry
+                    .quota_state
+                    .egress_deny_count
+                    .load(Ordering::Relaxed),
+                rpc_deny_count: entry.quota_state.rpc_deny_count.load(Ordering::Relaxed),
+                quota_kill_count: entry.quota_state.quota_kill_count.load(Ordering::Relaxed),
+                upgrade_deny_count: entry
+                    .quota_state
+                    .upgrade_deny_count
+                    .load(Ordering::Relaxed),
+                outbound_requests: entry
+                    .quota_state
+                    .outbound_requests
+                    .load(Ordering::Relaxed),
+                inflight: entry.quota_state.inflight.load(Ordering::Relaxed),
+                max_concurrency: entry.policy.max_concurrency,
             })
             .collect::<Vec<_>>();
         handles.sort_by(|left, right| left.handle.cmp(&right.handle));

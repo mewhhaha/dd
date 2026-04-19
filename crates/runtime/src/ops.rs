@@ -331,6 +331,9 @@ pub fn register_request_secret_context(
     dynamic_rpc_bindings: Vec<String>,
     replacements: Vec<(String, String)>,
     egress_allow_hosts: Vec<String>,
+    allow_cache: bool,
+    max_outbound_requests: Option<u64>,
+    dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
 ) {
     let dynamic_bindings: HashSet<String> = dynamic_bindings
         .into_iter()
@@ -362,6 +365,9 @@ pub fn register_request_secret_context(
             dynamic_rpc_bindings,
             replacements,
             egress_allow_hosts,
+            allow_cache,
+            max_outbound_requests,
+            dynamic_quota_state,
             canceled: Arc::new(AtomicBool::new(false)),
             canceled_notify: Arc::new(Notify::new()),
         },

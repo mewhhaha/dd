@@ -738,6 +738,9 @@ pub(super) fn handle_isolate_command(
             dynamic_rpc_bindings,
             secret_replacements,
             egress_allow_hosts,
+            allow_cache,
+            max_outbound_requests,
+            dynamic_quota_state,
             request,
             request_body,
             stream_response,
@@ -779,6 +782,9 @@ pub(super) fn handle_isolate_command(
                     dynamic_rpc_bindings.clone(),
                     secret_replacements,
                     egress_allow_hosts,
+                    allow_cache,
+                    max_outbound_requests,
+                    dynamic_quota_state,
                 );
             }
             let execute_span = if tracing::enabled!(Level::INFO) {

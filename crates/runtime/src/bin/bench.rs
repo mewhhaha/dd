@@ -687,6 +687,7 @@ function childConfig(label) {
       "worker.js": "import { nextCounter } from './lib.js'; export default { async fetch(_request, childEnv) { const hostCount = await childEnv.API.bump(); return new Response(String(nextCounter()) + ':' + String(hostCount)); } };",
       "./lib.js": "let counter = 0; export function nextCounter() { counter += 1; return counter; }",
     },
+    allow_host_rpc: true,
     env: {
       LABEL: label,
       API: new BenchApi(),

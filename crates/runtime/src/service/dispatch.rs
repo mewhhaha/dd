@@ -165,6 +165,16 @@ impl WorkerManager {
                 .collect::<Vec<_>>();
             let secret_replacements = pool.secret_replacements.clone();
             let egress_allow_hosts = pool.egress_allow_hosts.clone();
+            let allow_cache = pool
+                .dynamic_child_policy
+                .as_ref()
+                .map(|policy| policy.allow_state_bindings)
+                .unwrap_or(true);
+            let max_outbound_requests = pool
+                .dynamic_child_policy
+                .as_ref()
+                .map(|policy| policy.max_outbound_requests);
+            let dynamic_quota_state = pool.dynamic_quota_state.clone();
             let counted_reuse = pool.isolates[isolate_idx].served_requests > 0;
             if counted_reuse {
                 pool.stats.reuse_count += 1;
@@ -191,6 +201,9 @@ impl WorkerManager {
                 dynamic_rpc_bindings,
                 secret_replacements,
                 egress_allow_hosts,
+                allow_cache,
+                max_outbound_requests,
+                dynamic_quota_state,
                 request,
                 request_body: None,
                 stream_response: false,
@@ -604,6 +617,16 @@ impl WorkerManager {
                     .collect::<Vec<_>>();
                 let secret_replacements = pool.secret_replacements.clone();
                 let egress_allow_hosts = pool.egress_allow_hosts.clone();
+                let allow_cache = pool
+                    .dynamic_child_policy
+                    .as_ref()
+                    .map(|policy| policy.allow_state_bindings)
+                    .unwrap_or(true);
+                let max_outbound_requests = pool
+                    .dynamic_child_policy
+                    .as_ref()
+                    .map(|policy| policy.max_outbound_requests);
+                let dynamic_quota_state = pool.dynamic_quota_state.clone();
                 let should_count_reuse = pool.isolates[isolate_idx].served_requests > 0;
                 if should_count_reuse {
                     pool.stats.reuse_count += 1;
@@ -639,6 +662,9 @@ impl WorkerManager {
                     dynamic_rpc_bindings,
                     secret_replacements,
                     egress_allow_hosts,
+                    allow_cache,
+                    max_outbound_requests,
+                    dynamic_quota_state,
                     request: pending_invoke.request,
                     request_body: pending_invoke.request_body,
                     stream_response,

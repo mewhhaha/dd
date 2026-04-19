@@ -14,6 +14,7 @@ impl WorkerManager {
             source,
             env,
             timeout,
+            policy,
             host_rpc_bindings,
             reply_id,
             pending_replies,
@@ -30,6 +31,17 @@ impl WorkerManager {
             return;
         }
         let timeout = timeout.clamp(1, 60_000);
+        if !policy.allow_host_rpc && !host_rpc_bindings.is_empty() {
+            self.dynamic_profile.record_rpc_deny();
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Create(Err(PlatformError::bad_request(
+                    "dynamic child policy blocks host RPC bindings; set allow_host_rpc: true",
+                ))),
+            );
+            return;
+        }
         let id_key = DynamicWorkerIdKey {
             owner_worker: owner_worker.clone(),
             owner_generation,
@@ -105,6 +117,45 @@ impl WorkerManager {
                 .map(|method| method.trim().to_string())
                 .filter(|method| !method.is_empty())
                 .collect::<HashSet<_>>();
+            if methods.is_empty() {
+                self.dynamic_profile.record_rpc_deny();
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(
+                        PlatformError::bad_request(format!(
+                            "dynamic host rpc binding must expose at least one method: {binding_name}"
+                        )),
+                    )),
+                );
+                return;
+            }
+            if methods.len() > MAX_DYNAMIC_HOST_RPC_METHODS {
+                self.dynamic_profile.record_rpc_deny();
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(
+                        PlatformError::bad_request(format!(
+                            "dynamic host rpc binding exceeds method limit ({MAX_DYNAMIC_HOST_RPC_METHODS}): {binding_name}"
+                        )),
+                    )),
+                );
+                return;
+            }
+            if let Some(blocked) = methods.iter().find(|method| host_rpc_method_blocked(method)) {
+                self.dynamic_profile.record_rpc_deny();
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(
+                        PlatformError::bad_request(format!(
+                            "dynamic host rpc method is blocked: {blocked}"
+                        )),
+                    )),
+                );
+                return;
+            }
             self.host_rpc_providers.insert(
                 provider_id.clone(),
                 HostRpcProvider {
@@ -121,8 +172,29 @@ impl WorkerManager {
                 provider_id,
             });
         }
+        let validated_policy = match build_dynamic_worker_config(
+            env.clone(),
+            policy.clone(),
+            dynamic_rpc_bindings.clone(),
+        ) {
+            Ok(config) => config.policy,
+            Err(error) => {
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Create(Err(error)),
+                );
+                return;
+            }
+        };
         let result = self
-            .deploy_dynamic_internal(source, env, Vec::new(), dynamic_rpc_bindings, false)
+            .deploy_dynamic_internal(
+                source,
+                env,
+                validated_policy.clone(),
+                dynamic_rpc_bindings,
+                false,
+            )
             .await;
         let owner_worker_for_handle = owner_worker.clone();
         let result = result.map(|deployed| {
@@ -133,16 +205,26 @@ impl WorkerManager {
                 .get(&worker_name)
                 .map(|entry| entry.current_generation)
                 .unwrap_or_default();
+            let quota_state = self
+                .workers
+                .get(&worker_name)
+                .and_then(|entry| entry.pools.get(&worker_generation))
+                .and_then(|pool| pool.dynamic_quota_state.clone())
+                .unwrap_or_else(|| Arc::new(DynamicQuotaState::default()));
             self.dynamic_worker_handles.insert(
                 handle.clone(),
                 DynamicWorkerHandle {
+                    id: normalized_id.clone(),
                     owner_worker: owner_worker_for_handle.clone(),
                     owner_generation,
                     binding,
                     worker_name: worker_name.clone(),
                     worker_generation,
                     timeout,
+                    policy: validated_policy.clone(),
+                    host_rpc_provider_ids: created_provider_ids.clone(),
                     preferred_isolate_id: None,
+                    quota_state,
                 },
             );
             self.dynamic_worker_ids
@@ -318,7 +400,7 @@ impl WorkerManager {
             );
             return;
         };
-        let Some(entry) = self.dynamic_worker_handles.remove(&handle) else {
+        let Some(_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
             self.dynamic_profile.record_async_reply_completion();
             self.finish_dynamic_reply(
                 pending_replies,
@@ -327,7 +409,7 @@ impl WorkerManager {
             );
             return;
         };
-        self.retire_worker_completely(&entry.worker_name);
+        self.retire_dynamic_worker_handle(&handle, "dynamic worker deleted", false);
         self.dynamic_profile.record_async_reply_completion();
         self.finish_dynamic_reply(
             pending_replies,
@@ -339,6 +421,7 @@ impl WorkerManager {
     pub(super) fn handle_dynamic_worker_invoke(
         &mut self,
         payload: crate::ops::DynamicWorkerInvokeEvent,
+        command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let crate::ops::DynamicWorkerInvokeEvent {
@@ -391,6 +474,56 @@ impl WorkerManager {
             );
             return;
         }
+        if request.body.len() > handle_entry.policy.max_request_bytes {
+            handle_entry
+                .quota_state
+                .total_request_bytes
+                .fetch_add(request.body.len() as u64, Ordering::Relaxed);
+            handle_entry
+                .quota_state
+                .quota_kill_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.dynamic_profile.record_quota_kill();
+            self.retire_dynamic_worker_handle(
+                &handle,
+                "dynamic child exceeded max_request_bytes",
+                true,
+            );
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::runtime(
+                    format!(
+                        "dynamic child request exceeds max_request_bytes ({})",
+                        handle_entry.policy.max_request_bytes
+                    ),
+                ))),
+            );
+            return;
+        }
+        if !self.try_acquire_dynamic_inflight(&handle_entry) {
+            self.dynamic_profile.record_quota_kill();
+            self.retire_dynamic_worker_handle(
+                &handle,
+                "dynamic child exceeded max_concurrency",
+                true,
+            );
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::runtime(
+                    format!(
+                        "dynamic child exceeded max_concurrency ({})",
+                        handle_entry.policy.max_concurrency
+                    ),
+                ))),
+            );
+            return;
+        }
+        handle_entry
+            .quota_state
+            .total_request_bytes
+            .fetch_add(request.body.len() as u64, Ordering::Relaxed);
 
         let target_generation = Some(handle_entry.worker_generation);
         let mut target_isolate_id = handle_entry.preferred_isolate_id;
@@ -454,7 +587,11 @@ impl WorkerManager {
             event_tx,
         );
         let event_tx = event_tx.clone();
+        let command_tx = command_tx.clone();
         let profile = self.dynamic_profile.clone();
+        let handle_for_task = handle.clone();
+        let policy = handle_entry.policy.clone();
+        let quota_state = handle_entry.quota_state.clone();
         tokio::spawn(async move {
             let result =
                 match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
@@ -470,6 +607,31 @@ impl WorkerManager {
                         )))
                     }
                 };
+            quota_state.inflight.fetch_sub(1, Ordering::Relaxed);
+            let result = match result {
+                Ok(output) if output.body.len() > policy.max_response_bytes => {
+                    quota_state
+                        .total_response_bytes
+                        .fetch_add(output.body.len() as u64, Ordering::Relaxed);
+                    quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
+                    profile.record_quota_kill();
+                    let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                        handle: handle_for_task.clone(),
+                        reason: "dynamic child exceeded max_response_bytes".to_string(),
+                    });
+                    Err(PlatformError::runtime(format!(
+                        "dynamic child response exceeds max_response_bytes ({})",
+                        policy.max_response_bytes
+                    )))
+                }
+                Ok(output) => {
+                    quota_state
+                        .total_response_bytes
+                        .fetch_add(output.body.len() as u64, Ordering::Relaxed);
+                    Ok(output)
+                }
+                Err(error) => Err(error),
+            };
             profile.record_async_reply_completion();
             if let Some(delivery) = pending_replies.finish(
                 reply_id,
@@ -489,6 +651,7 @@ impl WorkerManager {
         request: WorkerInvocation,
         reply_id: String,
         pending_replies: crate::ops::DynamicPendingReplies,
+        command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let Some(mut handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
@@ -545,6 +708,60 @@ impl WorkerManager {
             );
             return;
         }
+        if request.body.len() > handle_entry.policy.max_request_bytes {
+            handle_entry
+                .quota_state
+                .total_request_bytes
+                .fetch_add(request.body.len() as u64, Ordering::Relaxed);
+            handle_entry
+                .quota_state
+                .quota_kill_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.dynamic_profile.record_quota_kill();
+            self.retire_dynamic_worker_handle(
+                &handle,
+                "dynamic child exceeded max_request_bytes",
+                true,
+            );
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result: Err(PlatformError::runtime(format!(
+                        "dynamic child request exceeds max_request_bytes ({})",
+                        handle_entry.policy.max_request_bytes
+                    ))),
+                    stale_handle: true,
+                    boundary: None,
+                },
+            );
+            return;
+        }
+        if !self.try_acquire_dynamic_inflight(&handle_entry) {
+            self.dynamic_profile.record_quota_kill();
+            self.retire_dynamic_worker_handle(
+                &handle,
+                "dynamic child exceeded max_concurrency",
+                true,
+            );
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::Fetch {
+                    result: Err(PlatformError::runtime(format!(
+                        "dynamic child exceeded max_concurrency ({})",
+                        handle_entry.policy.max_concurrency
+                    ))),
+                    stale_handle: true,
+                    boundary: None,
+                },
+            );
+            return;
+        }
+        handle_entry
+            .quota_state
+            .total_request_bytes
+            .fetch_add(request.body.len() as u64, Ordering::Relaxed);
 
         let target_generation = Some(handle_entry.worker_generation);
         let mut target_isolate_id = handle_entry.preferred_isolate_id;
@@ -663,7 +880,11 @@ impl WorkerManager {
             .record_direct_fetch_dispatch(dispatch_started.elapsed());
 
         let event_tx = event_tx.clone();
+        let command_tx = command_tx.clone();
         let profile = self.dynamic_profile.clone();
+        let handle_for_task = handle.clone();
+        let policy = handle_entry.policy.clone();
+        let quota_state = handle_entry.quota_state.clone();
         tokio::spawn(async move {
             let child_started = Instant::now();
             let result =
@@ -680,13 +901,67 @@ impl WorkerManager {
                         )))
                     }
                 };
+            quota_state.inflight.fetch_sub(1, Ordering::Relaxed);
+            let result = match result {
+                Ok(output) => {
+                    quota_state
+                        .total_response_bytes
+                        .fetch_add(output.body.len() as u64, Ordering::Relaxed);
+                    if output.body.len() > policy.max_response_bytes {
+                        quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
+                        profile.record_quota_kill();
+                        let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                            handle: handle_for_task.clone(),
+                            reason: "dynamic child exceeded max_response_bytes".to_string(),
+                        });
+                        Err(PlatformError::runtime(format!(
+                            "dynamic child response exceeds max_response_bytes ({})",
+                            policy.max_response_bytes
+                        )))
+                    } else if !policy.allow_websocket
+                        && internal_header_value(&output.headers, INTERNAL_WS_ACCEPT_HEADER)
+                            .as_deref()
+                            == Some("1")
+                    {
+                        quota_state.upgrade_deny_count.fetch_add(1, Ordering::Relaxed);
+                        profile.record_upgrade_deny();
+                        let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                            handle: handle_for_task.clone(),
+                            reason: "dynamic child attempted websocket upgrade without permission"
+                                .to_string(),
+                        });
+                        Err(PlatformError::runtime(
+                            "dynamic child policy blocks websocket upgrade",
+                        ))
+                    } else if !policy.allow_transport
+                        && internal_header_value(&output.headers, INTERNAL_TRANSPORT_ACCEPT_HEADER)
+                            .as_deref()
+                            == Some("1")
+                    {
+                        quota_state.upgrade_deny_count.fetch_add(1, Ordering::Relaxed);
+                        profile.record_upgrade_deny();
+                        let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                            handle: handle_for_task.clone(),
+                            reason: "dynamic child attempted transport upgrade without permission"
+                                .to_string(),
+                        });
+                        Err(PlatformError::runtime(
+                            "dynamic child policy blocks transport upgrade",
+                        ))
+                    } else {
+                        Ok(output)
+                    }
+                }
+                Err(error) => Err(error),
+            };
             profile.record_async_reply_completion();
             profile.record_direct_fetch_child_execute(child_started.elapsed());
+            let stale_handle = result.is_err();
             if let Some(delivery) = pending_replies.finish(
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::Fetch {
                     result,
-                    stale_handle: false,
+                    stale_handle,
                     boundary: Some(crate::ops::current_time_boundary()),
                 },
             ) {
@@ -711,11 +986,27 @@ impl WorkerManager {
             pending_replies,
         } = payload;
         if host_rpc_method_blocked(&method_name) {
+            self.record_dynamic_rpc_deny_for_pool(&caller_worker, caller_generation);
+            self.dynamic_profile.record_rpc_deny();
             self.finish_dynamic_reply(
                 pending_replies,
                 reply_id,
                 crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
                     format!("dynamic host rpc method is blocked: {method_name}"),
+                ))),
+            );
+            return;
+        }
+        if args.len() > MAX_DYNAMIC_HOST_RPC_ARG_BYTES {
+            self.record_dynamic_rpc_deny_for_pool(&caller_worker, caller_generation);
+            self.dynamic_profile.record_rpc_deny();
+            self.finish_dynamic_reply(
+                pending_replies,
+                reply_id,
+                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
+                    format!(
+                        "dynamic host rpc args exceed limit ({MAX_DYNAMIC_HOST_RPC_ARG_BYTES} bytes)"
+                    ),
                 ))),
             );
             return;
@@ -732,6 +1023,24 @@ impl WorkerManager {
                 );
                 return;
             };
+            if let Some(policy) = &pool.dynamic_child_policy {
+                if !policy.allow_host_rpc {
+                    if let Some(quota_state) = &pool.dynamic_quota_state {
+                        quota_state.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.dynamic_profile.record_rpc_deny();
+                    self.finish_dynamic_reply(
+                        pending_replies,
+                        reply_id,
+                        crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
+                            PlatformError::bad_request(
+                                "dynamic child policy blocks host RPC; set allow_host_rpc: true",
+                            ),
+                        )),
+                    );
+                    return;
+                }
+            }
             pool.dynamic_rpc_bindings
                 .iter()
                 .find(|entry| entry.binding == binding)
@@ -758,6 +1067,8 @@ impl WorkerManager {
             return;
         };
         if !provider.methods.contains(&method_name) {
+            self.record_dynamic_rpc_deny_for_pool(&caller_worker, caller_generation);
+            self.dynamic_profile.record_rpc_deny();
             self.finish_dynamic_reply(
                 pending_replies,
                 reply_id,
@@ -834,6 +1145,93 @@ impl WorkerManager {
         validate_worker(self.bootstrap_snapshot, source).await?;
         self.validated_worker_sources.insert(source_hash);
         Ok(())
+    }
+
+    pub(super) fn try_acquire_dynamic_inflight(&self, handle: &DynamicWorkerHandle) -> bool {
+        let inflight = handle.quota_state.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        if inflight <= handle.policy.max_concurrency {
+            return true;
+        }
+        handle.quota_state.inflight.fetch_sub(1, Ordering::Relaxed);
+        handle
+            .quota_state
+            .quota_kill_count
+            .fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    fn record_dynamic_rpc_deny_for_pool(&mut self, worker_name: &str, generation: u64) {
+        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
+            if let Some(quota_state) = &pool.dynamic_quota_state {
+                quota_state.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn retire_dynamic_worker_handle(
+        &mut self,
+        handle: &str,
+        reason: &str,
+        policy_violation: bool,
+    ) {
+        let Some(entry) = self.dynamic_worker_handles.remove(handle) else {
+            return;
+        };
+        for provider_id in &entry.host_rpc_provider_ids {
+            self.host_rpc_providers.remove(provider_id);
+        }
+        let id_key = DynamicWorkerIdKey {
+            owner_worker: entry.owner_worker.clone(),
+            owner_generation: entry.owner_generation,
+            binding: entry.binding.clone(),
+        };
+        if let Some(by_id) = self.dynamic_worker_ids.get_mut(&id_key) {
+            by_id.remove(&entry.id);
+            if by_id.is_empty() {
+                self.dynamic_worker_ids.remove(&id_key);
+            }
+        }
+        if policy_violation {
+            warn!(
+                handle = handle,
+                worker = %entry.worker_name,
+                owner_worker = %entry.owner_worker,
+                binding = %entry.binding,
+                reason,
+                "retiring dynamic child worker after policy violation"
+            );
+        } else {
+            info!(
+                handle = handle,
+                worker = %entry.worker_name,
+                owner_worker = %entry.owner_worker,
+                binding = %entry.binding,
+                reason,
+                "retiring dynamic child worker"
+            );
+        }
+        self.retire_worker_completely(&entry.worker_name);
+    }
+
+    pub(super) fn retire_dynamic_worker_by_worker_name(
+        &mut self,
+        worker_name: &str,
+        reason: &str,
+        policy_violation: bool,
+    ) {
+        let handle = self
+            .dynamic_worker_handles
+            .iter()
+            .find(|(_, entry)| entry.worker_name == worker_name)
+            .map(|(handle, _)| handle.clone());
+        if let Some(handle) = handle {
+            self.retire_dynamic_worker_handle(&handle, reason, policy_violation);
+            return;
+        }
+        if policy_violation {
+            warn!(worker = worker_name, reason, "retiring dynamic worker without handle mapping");
+        }
+        self.retire_worker_completely(worker_name);
     }
 
     pub(super) async fn dynamic_worker_snapshot_cached(
