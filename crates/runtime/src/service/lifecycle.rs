@@ -836,20 +836,11 @@ impl WorkerManager {
                 worker_name: entry.worker_name.clone(),
                 timeout_ms: entry.timeout,
                 policy_tier: entry.policy.tier.as_str().to_string(),
-                egress_deny_count: entry
-                    .quota_state
-                    .egress_deny_count
-                    .load(Ordering::Relaxed),
+                egress_deny_count: entry.quota_state.egress_deny_count.load(Ordering::Relaxed),
                 rpc_deny_count: entry.quota_state.rpc_deny_count.load(Ordering::Relaxed),
                 quota_kill_count: entry.quota_state.quota_kill_count.load(Ordering::Relaxed),
-                upgrade_deny_count: entry
-                    .quota_state
-                    .upgrade_deny_count
-                    .load(Ordering::Relaxed),
-                outbound_requests: entry
-                    .quota_state
-                    .outbound_requests
-                    .load(Ordering::Relaxed),
+                upgrade_deny_count: entry.quota_state.upgrade_deny_count.load(Ordering::Relaxed),
+                outbound_requests: entry.quota_state.outbound_requests.load(Ordering::Relaxed),
                 inflight: entry.quota_state.inflight.load(Ordering::Relaxed),
                 max_concurrency: entry.policy.max_concurrency,
             })

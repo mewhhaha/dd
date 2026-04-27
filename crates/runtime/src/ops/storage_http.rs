@@ -852,8 +852,7 @@ pub(crate) fn prepare_http_fetch_request(
         dynamic_quota_state,
         canceled,
         canceled_notify,
-    ) =
-        http_fetch_context(state, &payload.request_id)?;
+    ) = http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
@@ -868,30 +867,43 @@ pub(crate) fn prepare_http_fetch_request(
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
         if let Some(quota_state) = &dynamic_quota_state {
-            quota_state.egress_deny_count.fetch_add(1, Ordering::Relaxed);
+            quota_state
+                .egress_deny_count
+                .fetch_add(1, Ordering::Relaxed);
         }
-        state.borrow().borrow::<DynamicProfile>().record_egress_deny();
+        state
+            .borrow()
+            .borrow::<DynamicProfile>()
+            .record_egress_deny();
         return Err(format!(
             "egress origin is not allowed: {}",
             parsed_url.origin().ascii_serialization()
         ));
     }
     if let Some(quota_state) = &dynamic_quota_state {
-        let next = quota_state.outbound_requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let next = quota_state
+            .outbound_requests
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         if max_outbound_requests
             .map(|limit| next > limit)
             .unwrap_or(false)
         {
             quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
-            state.borrow().borrow::<DynamicProfile>().record_quota_kill();
+            state
+                .borrow()
+                .borrow::<DynamicProfile>()
+                .record_quota_kill();
             let command_sender = state
                 .borrow()
                 .borrow::<crate::service::RuntimeFastCommandSender>()
                 .clone();
-            let _ = command_sender.0.send(crate::service::RuntimeCommand::RetireDynamicWorker {
-                worker_name,
-                reason: "dynamic child exceeded max_outbound_requests".to_string(),
-            });
+            let _ = command_sender
+                .0
+                .send(crate::service::RuntimeCommand::RetireDynamicWorker {
+                    worker_name,
+                    reason: "dynamic child exceeded max_outbound_requests".to_string(),
+                });
             return Err("dynamic child exceeded max_outbound_requests".to_string());
         }
     }
@@ -928,8 +940,7 @@ pub(crate) fn check_http_fetch_url(
         dynamic_quota_state,
         canceled,
         canceled_notify,
-    ) =
-        http_fetch_context(state, &payload.request_id)?;
+    ) = http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
@@ -939,9 +950,14 @@ pub(crate) fn check_http_fetch_url(
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
         if let Some(quota_state) = &dynamic_quota_state {
-            quota_state.egress_deny_count.fetch_add(1, Ordering::Relaxed);
+            quota_state
+                .egress_deny_count
+                .fetch_add(1, Ordering::Relaxed);
         }
-        state.borrow().borrow::<DynamicProfile>().record_egress_deny();
+        state
+            .borrow()
+            .borrow::<DynamicProfile>()
+            .record_egress_deny();
         return Err(format!(
             "egress origin is not allowed: {}",
             parsed_url.origin().ascii_serialization()

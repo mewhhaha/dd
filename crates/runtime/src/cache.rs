@@ -80,6 +80,14 @@ struct CacheDeleteCandidate {
     body_ref: String,
 }
 
+struct CacheCleanupCandidate {
+    id: String,
+    headers_json: String,
+    body_storage: String,
+    body_ref: String,
+    expires_at_ms: i64,
+}
+
 #[derive(Default)]
 struct CacheControl {
     no_store: bool,
@@ -219,12 +227,14 @@ impl CacheStore {
             let response_headers = to_header_map(&response.headers);
             let response_control =
                 parse_cache_control(header_value(&response_headers, "cache-control"));
-            let swr_until_ms = record.expires_at_ms.saturating_add(
-                (response_control.stale_while_revalidate.unwrap_or(0) as i64) * 1000,
+            let swr_until_ms = stale_deadline_ms(
+                record.expires_at_ms,
+                response_control.stale_while_revalidate.unwrap_or(0),
             );
-            let sie_until_ms = record
-                .expires_at_ms
-                .saturating_add((response_control.stale_if_error.unwrap_or(0) as i64) * 1000);
+            let sie_until_ms = stale_deadline_ms(
+                record.expires_at_ms,
+                response_control.stale_if_error.unwrap_or(0),
+            );
             let max_stale_until_ms = swr_until_ms.max(sie_until_ms);
 
             if now_ms <= record.expires_at_ms {
@@ -266,14 +276,19 @@ impl CacheStore {
         }
 
         if !selected_id.is_empty() {
-            conn.execute(
-                "UPDATE worker_cache_entries
+            let changed = conn
+                .execute(
+                    "UPDATE worker_cache_entries
                  SET last_access_seq = ?1
-                 WHERE id = ?3",
-                (self.next_access_seq(), selected_id),
-            )
-            .await
-            .map_err(cache_error)?;
+                 WHERE id = ?2",
+                    (self.next_access_seq(), selected_id.as_str()),
+                )
+                .await
+                .map_err(cache_error)?;
+            debug_assert_eq!(
+                changed, 1,
+                "selected cache hit should update one recency row"
+            );
         }
 
         Ok(lookup)
@@ -619,28 +634,59 @@ impl CacheStore {
     }
 
     async fn cleanup_expired(&self, conn: &Connection, now_ms: i64) -> Result<()> {
+        let mut cursor_expires_at = i64::MIN;
+        let mut cursor_id = String::new();
         loop {
             let mut rows = conn
                 .query(
-                    "SELECT id, body_storage, body_ref
+                    "SELECT id, headers_json, body_storage, body_ref, expires_at_ms
                      FROM worker_cache_entries
                      WHERE expires_at_ms <= ?1
+                       AND (expires_at_ms > ?2 OR (expires_at_ms = ?2 AND id > ?3))
+                     ORDER BY expires_at_ms ASC, id ASC
                      LIMIT 64",
-                    (now_ms,),
+                    (now_ms, cursor_expires_at, cursor_id.as_str()),
                 )
                 .await
                 .map_err(cache_error)?;
             let mut expired = Vec::new();
+            let mut scanned_any = false;
             while let Some(row) = rows.next().await.map_err(cache_error)? {
-                expired.push(CacheDeleteCandidate {
+                scanned_any = true;
+                let candidate = CacheCleanupCandidate {
                     id: row.get::<String>(0).map_err(cache_error)?,
-                    body_storage: row.get::<String>(1).map_err(cache_error)?,
-                    body_ref: row.get::<String>(2).map_err(cache_error)?,
-                });
+                    headers_json: row.get::<String>(1).map_err(cache_error)?,
+                    body_storage: row.get::<String>(2).map_err(cache_error)?,
+                    body_ref: row.get::<String>(3).map_err(cache_error)?,
+                    expires_at_ms: row.get::<i64>(4).map_err(cache_error)?,
+                };
+                cursor_expires_at = candidate.expires_at_ms;
+                cursor_id = candidate.id.clone();
+                let should_delete = match crate::json::from_string::<Vec<(String, String)>>(
+                    candidate.headers_json.clone(),
+                ) {
+                    Ok(headers) => {
+                        let response_headers = to_header_map(&headers);
+                        let response_control =
+                            parse_cache_control(header_value(&response_headers, "cache-control"));
+                        now_ms > max_stale_deadline_ms(candidate.expires_at_ms, &response_control)
+                    }
+                    Err(_) => true,
+                };
+                if should_delete {
+                    expired.push(CacheDeleteCandidate {
+                        id: candidate.id,
+                        body_storage: candidate.body_storage,
+                        body_ref: candidate.body_ref,
+                    });
+                }
             }
             drop(rows);
-            if expired.is_empty() {
+            if !scanned_any {
                 break;
+            }
+            if expired.is_empty() {
+                continue;
             }
             self.remove_records(conn, &expired).await?;
         }
@@ -827,6 +873,21 @@ fn parse_cache_control(value: &str) -> CacheControl {
 
 fn parse_u64_token(value: &str) -> Option<u64> {
     value.trim().trim_matches('"').parse::<u64>().ok()
+}
+
+fn stale_deadline_ms(expires_at_ms: i64, stale_seconds: u64) -> i64 {
+    let capped_seconds = stale_seconds.min((i64::MAX / 1000) as u64);
+    expires_at_ms.saturating_add((capped_seconds as i64).saturating_mul(1000))
+}
+
+fn max_stale_deadline_ms(expires_at_ms: i64, control: &CacheControl) -> i64 {
+    stale_deadline_ms(
+        expires_at_ms,
+        control
+            .stale_while_revalidate
+            .unwrap_or(0)
+            .max(control.stale_if_error.unwrap_or(0)),
+    )
 }
 
 fn parse_vary_headers(response_headers: &[(String, String)]) -> Option<Vec<String>> {
@@ -1076,6 +1137,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_hit_refreshes_lru_recency() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 2,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req_a = request("/lru-a");
+        let req_b = request("/lru-b");
+        let req_c = request("/lru-c");
+
+        assert!(store.put(&req_a, response("a")).await?);
+        assert!(store.put(&req_b, response("b")).await?);
+        match store.get(&req_a).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"a"),
+            other => panic!("expected fresh a hit, got {:?}", other),
+        }
+        assert!(store.put(&req_c, response("c")).await?);
+
+        assert!(matches!(store.get(&req_b).await?, CacheLookup::Miss));
+        match store.get(&req_a).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"a"),
+            other => panic!("expected fresh a hit after eviction, got {:?}", other),
+        }
+        match store.get(&req_c).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"c"),
+            other => panic!("expected fresh c hit, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn large_body_uses_blob_storage() -> Result<()> {
         let store = test_store(CacheConfig {
             max_entries: 8,
@@ -1086,13 +1180,13 @@ mod tests {
         .await;
         let req = request("/blob");
         let body = "x".repeat(1024);
-        let response = CacheResponse {
+        let cached_response = CacheResponse {
             status: 200,
             headers: vec![("cache-control".to_string(), "max-age=60".to_string())],
             body: body.as_bytes().to_vec(),
         };
 
-        assert!(store.put(&req, response).await?);
+        assert!(store.put(&req, cached_response).await?);
         match store.get(&req).await? {
             CacheLookup::Fresh(value) => assert_eq!(value.body.len(), 1024),
             other => panic!("expected blob fresh hit, got {:?}", other),
@@ -1149,7 +1243,7 @@ mod tests {
         })
         .await;
         let req = request("/swr");
-        let response = CacheResponse {
+        let cached_response = CacheResponse {
             status: 200,
             headers: vec![(
                 "cache-control".to_string(),
@@ -1158,8 +1252,41 @@ mod tests {
             body: b"stale".to_vec(),
         };
 
-        assert!(store.put(&req, response).await?);
+        assert!(store.put(&req, cached_response).await?);
         tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(matches!(
+            store.get(&req).await?,
+            CacheLookup::StaleWhileRevalidate(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn swr_entry_survives_unrelated_put_after_expiry() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/swr-cleanup");
+        let cached_response = CacheResponse {
+            status: 200,
+            headers: vec![(
+                "cache-control".to_string(),
+                "max-age=1, stale-while-revalidate=30".to_string(),
+            )],
+            body: b"stale".to_vec(),
+        };
+
+        assert!(store.put(&req, cached_response).await?);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            store
+                .put(&request("/unrelated-swr"), response("fresh"))
+                .await?
+        );
         assert!(matches!(
             store.get(&req).await?,
             CacheLookup::StaleWhileRevalidate(_)
@@ -1177,7 +1304,7 @@ mod tests {
         })
         .await;
         let req = request("/sie");
-        let response = CacheResponse {
+        let cached_response = CacheResponse {
             status: 200,
             headers: vec![(
                 "cache-control".to_string(),
@@ -1186,8 +1313,41 @@ mod tests {
             body: b"stale".to_vec(),
         };
 
-        assert!(store.put(&req, response).await?);
+        assert!(store.put(&req, cached_response).await?);
         tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(matches!(
+            store.get(&req).await?,
+            CacheLookup::StaleIfError(_)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sie_entry_survives_unrelated_put_after_expiry() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/sie-cleanup");
+        let cached_response = CacheResponse {
+            status: 200,
+            headers: vec![(
+                "cache-control".to_string(),
+                "max-age=1, stale-if-error=30".to_string(),
+            )],
+            body: b"stale".to_vec(),
+        };
+
+        assert!(store.put(&req, cached_response).await?);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            store
+                .put(&request("/unrelated-sie"), response("fresh"))
+                .await?
+        );
         assert!(matches!(
             store.get(&req).await?,
             CacheLookup::StaleIfError(_)

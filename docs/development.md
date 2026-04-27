@@ -40,7 +40,9 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
 
 ## Patch workflow
 
-Patched crate overrides live under `./patched-crates`. Checked-in source of truth stays under `./patches`.
+Patched crate overrides live under `./patched-crates` and are checked-in build input. A fresh clone should build with normal Cargo commands without a bootstrap step.
+
+Patch files under `./patches` are audit and refresh artifacts. Keep them in sync when the vendored crate changes.
 
 ```bash
 just patch deno_crypto

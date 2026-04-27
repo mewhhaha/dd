@@ -54,7 +54,6 @@ async fn memory_same_key_allows_overlap_by_default() {
 
 #[tokio::test]
 #[serial]
-#[ignore = "hot same-memory STM write contention still needs a dedicated follow-up pass"]
 async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
@@ -1436,7 +1435,6 @@ async fn hosted_memory_stm_single_read_is_point_in_time_only() {
 
 #[tokio::test]
 #[serial]
-#[ignore = "same-memory STM retry path still needs a dedicated follow-up pass"]
 async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
@@ -1483,6 +1481,8 @@ async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
                 .await
         })
     };
+
+    sleep(Duration::from_millis(10)).await;
 
     let writer_thread = {
         let service = service.clone();

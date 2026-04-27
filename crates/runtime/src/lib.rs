@@ -10,6 +10,7 @@ mod memory_rpc_capnp;
 mod ops;
 mod service;
 mod static_assets;
+mod turso_util;
 
 pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};

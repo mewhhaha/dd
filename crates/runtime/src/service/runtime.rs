@@ -668,30 +668,7 @@ pub(super) fn spawn_isolate_thread(
                         continue;
                     }
 
-                    match command_rx.recv_timeout(Duration::from_millis(1)) {
-                        Ok(command) => match handle_isolate_command(
-                            &mut js_runtime,
-                            &event_tx,
-                            &worker_name,
-                            generation,
-                            isolate_id,
-                            command,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => return,
-                            Err(error) => {
-                                let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                                    worker_name: worker_name.clone(),
-                                    generation,
-                                    isolate_id,
-                                    error,
-                                });
-                                return;
-                            }
-                        },
-                        Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             });
         })

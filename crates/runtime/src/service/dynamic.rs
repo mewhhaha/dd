@@ -143,7 +143,10 @@ impl WorkerManager {
                 );
                 return;
             }
-            if let Some(blocked) = methods.iter().find(|method| host_rpc_method_blocked(method)) {
+            if let Some(blocked) = methods
+                .iter()
+                .find(|method| host_rpc_method_blocked(method))
+            {
                 self.dynamic_profile.record_rpc_deny();
                 self.finish_dynamic_reply(
                     pending_replies,
@@ -923,7 +926,9 @@ impl WorkerManager {
                             .as_deref()
                             == Some("1")
                     {
-                        quota_state.upgrade_deny_count.fetch_add(1, Ordering::Relaxed);
+                        quota_state
+                            .upgrade_deny_count
+                            .fetch_add(1, Ordering::Relaxed);
                         profile.record_upgrade_deny();
                         let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
                             handle: handle_for_task.clone(),
@@ -938,7 +943,9 @@ impl WorkerManager {
                             .as_deref()
                             == Some("1")
                     {
-                        quota_state.upgrade_deny_count.fetch_add(1, Ordering::Relaxed);
+                        quota_state
+                            .upgrade_deny_count
+                            .fetch_add(1, Ordering::Relaxed);
                         profile.record_upgrade_deny();
                         let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
                             handle: handle_for_task.clone(),
@@ -1229,7 +1236,10 @@ impl WorkerManager {
             return;
         }
         if policy_violation {
-            warn!(worker = worker_name, reason, "retiring dynamic worker without handle mapping");
+            warn!(
+                worker = worker_name,
+                reason, "retiring dynamic worker without handle mapping"
+            );
         }
         self.retire_worker_completely(worker_name);
     }

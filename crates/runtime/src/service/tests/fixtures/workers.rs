@@ -2002,7 +2002,7 @@ export function readOnce(state) {
 
 export function readPairStrict(state) {
   const a = String(state.get("a") ?? "missing");
-  busyWait(5);
+  busyWait(50);
   const b = String(state.get("b") ?? "missing");
   return `${a}:${b}`;
 }

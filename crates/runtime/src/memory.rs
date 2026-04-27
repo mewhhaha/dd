@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify};
 use turso::{Builder, Connection, Database, Value};
 
+use crate::turso_util::{configure_turso_connection, is_retryable_turso_error, VersionFloor};
+
 struct MemoryDatabaseEntry {
     database: Arc<Database>,
     last_used_at: Instant,
@@ -259,6 +261,11 @@ pub struct MemoryReadDependency {
 pub struct MemoryBatchApplyResult {
     pub conflict: bool,
     pub max_version: i64,
+}
+
+struct MemoryBatchCommitOutcome {
+    result: MemoryBatchApplyResult,
+    cache_mutations: Vec<MemoryBatchMutation>,
 }
 
 impl MemoryStore {
@@ -933,7 +940,12 @@ impl MemoryStore {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            match conn.execute("BEGIN CONCURRENT", ()).await {
+            let begin = if transactional {
+                "BEGIN IMMEDIATE"
+            } else {
+                "BEGIN CONCURRENT"
+            };
+            match conn.execute(begin, ()).await {
                 Ok(_) => {}
                 Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
@@ -953,9 +965,12 @@ impl MemoryStore {
                             validate_started.elapsed().as_micros() as u64,
                             reads.len() as u64 + 1,
                         );
-                        return Ok(MemoryBatchApplyResult {
-                            conflict: true,
-                            max_version: current,
+                        return Ok(MemoryBatchCommitOutcome {
+                            result: MemoryBatchApplyResult {
+                                conflict: true,
+                                max_version: current,
+                            },
+                            cache_mutations: Vec::new(),
                         });
                     }
                 }
@@ -968,9 +983,12 @@ impl MemoryStore {
                                 validate_started.elapsed().as_micros() as u64,
                                 reads.len() as u64 + 1,
                             );
-                            return Ok(MemoryBatchApplyResult {
-                                conflict: true,
-                                max_version: current,
+                            return Ok(MemoryBatchCommitOutcome {
+                                result: MemoryBatchApplyResult {
+                                    conflict: true,
+                                    max_version: current,
+                                },
+                                cache_mutations: Vec::new(),
                             });
                         }
                     }
@@ -988,9 +1006,12 @@ impl MemoryStore {
                             validate_started.elapsed().as_micros() as u64,
                             reads.len() as u64 + 1,
                         );
-                        return Ok(MemoryBatchApplyResult {
-                            conflict: true,
-                            max_version: current.max(observed),
+                        return Ok(MemoryBatchCommitOutcome {
+                            result: MemoryBatchApplyResult {
+                                conflict: true,
+                                max_version: current.max(observed),
+                            },
+                            cache_mutations: Vec::new(),
                         });
                     }
                 }
@@ -1090,22 +1111,32 @@ impl MemoryStore {
                     .await
                     .map_err(memory_error)?;
                 }
-                self.update_cached_snapshot_after_commit(namespace, memory_key, max_version, mutations)
-                    .await;
+                let cache_mutations = mutations
+                    .iter()
+                    .map(|mutation| {
+                        let mut mutation = mutation.clone();
+                        mutation.version = commit_version.unwrap_or(mutation.version);
+                        mutation
+                    })
+                    .collect::<Vec<_>>();
                 self.record_profile(
                     MemoryProfileMetricKind::StoreApplyBatchWrite,
                     write_started.elapsed().as_micros() as u64,
                     mutations.len() as u64 + 1,
                 );
-                Ok(MemoryBatchApplyResult {
-                    conflict: false,
-                    max_version,
+                Ok(MemoryBatchCommitOutcome {
+                    result: MemoryBatchApplyResult {
+                        conflict: false,
+                        max_version,
+                    },
+                    cache_mutations,
                 })
             }
             .await;
 
             match outcome {
-                Ok(result) => {
+                Ok(outcome) => {
+                    let result = outcome.result;
                     if result.conflict {
                         let _ = conn.execute("ROLLBACK", ()).await;
                         return Ok(result);
@@ -1128,6 +1159,15 @@ impl MemoryStore {
                     self.observe_version(result.max_version);
                     self.observe_memory_version(namespace, memory_key, result.max_version)
                         .await;
+                    if !outcome.cache_mutations.is_empty() {
+                        self.update_cached_snapshot_after_commit(
+                            namespace,
+                            memory_key,
+                            result.max_version,
+                            &outcome.cache_mutations,
+                        )
+                        .await;
+                    }
                     self.record_profile(
                         MemoryProfileMetricKind::StoreApplyBatch,
                         started.elapsed().as_micros() as u64,
@@ -1278,7 +1318,7 @@ impl MemoryStore {
                 .await
                 .map_err(memory_error)?;
 
-                let committed_mutations = mutations
+                let cache_mutations = mutations
                     .iter()
                     .map(|mutation| MemoryBatchMutation {
                         key: mutation.key.clone(),
@@ -1288,27 +1328,24 @@ impl MemoryStore {
                         deleted: mutation.deleted,
                     })
                     .collect::<Vec<_>>();
-                self.update_cached_snapshot_after_commit(
-                    namespace,
-                    memory_key,
-                    commit_version,
-                    &committed_mutations,
-                )
-                .await;
                 self.record_profile(
                     MemoryProfileMetricKind::StoreApplyBlindBatchWrite,
                     write_started.elapsed().as_micros() as u64,
                     mutations.len() as u64 + 1,
                 );
-                Ok::<MemoryBatchApplyResult, PlatformError>(MemoryBatchApplyResult {
-                    conflict: false,
-                    max_version: commit_version,
+                Ok::<MemoryBatchCommitOutcome, PlatformError>(MemoryBatchCommitOutcome {
+                    result: MemoryBatchApplyResult {
+                        conflict: false,
+                        max_version: commit_version,
+                    },
+                    cache_mutations,
                 })
             }
             .await;
 
             match outcome {
-                Ok(result) => {
+                Ok(outcome) => {
+                    let result = outcome.result;
                     match conn.execute("COMMIT", ()).await {
                         Ok(_) => {}
                         Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
@@ -1327,6 +1364,15 @@ impl MemoryStore {
                     self.observe_version(result.max_version);
                     self.observe_memory_version(namespace, memory_key, result.max_version)
                         .await;
+                    if !outcome.cache_mutations.is_empty() {
+                        self.update_cached_snapshot_after_commit(
+                            namespace,
+                            memory_key,
+                            result.max_version,
+                            &outcome.cache_mutations,
+                        )
+                        .await;
+                    }
                     self.record_profile(
                         MemoryProfileMetricKind::StoreApplyBlindBatch,
                         started.elapsed().as_micros() as u64,
@@ -2189,20 +2235,7 @@ impl MemoryStore {
     }
 
     fn observe_version(&self, version: i64) {
-        if version < 0 {
-            return;
-        }
-        let wanted = version as u64 + 1;
-        let mut current = self.version.load(Ordering::SeqCst);
-        while current < wanted {
-            match self
-                .version
-                .compare_exchange(current, wanted, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
+        VersionFloor::observe_i64(&self.version, version);
     }
 
     async fn observe_memory_version(&self, namespace: &str, memory_key: &str, version: i64) {
@@ -2760,9 +2793,7 @@ async fn read_single_i64(conn: &Connection, sql: &str) -> Result<i64> {
 }
 
 async fn configure_connection(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(std::time::Duration::from_millis(5000))
-        .map_err(memory_error)?;
-    Ok(())
+    configure_turso_connection(conn, memory_error)
 }
 
 async fn ensure_mvcc_mode(conn: &Connection) -> Result<()> {
@@ -2816,12 +2847,7 @@ async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
 }
 
 fn is_retryable_memory_error(error: &turso::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("database is locked")
-        || message.contains("database table is locked")
-        || message.contains("database is busy")
-        || message.contains("busy")
-        || message.contains("conflict")
+    is_retryable_turso_error(error)
 }
 
 fn epoch_ms_i64() -> Result<i64> {
@@ -3073,6 +3099,8 @@ mod tests {
             )
             .await?;
 
+        let warm_snapshot = store.snapshot("ns", "memory-b").await?;
+        assert_eq!(warm_snapshot.entries.len(), 1);
         assert_eq!(store.databases.lock().await.len(), 1);
 
         let snapshot = store.snapshot("ns", "memory-a").await?;
@@ -3137,6 +3165,84 @@ mod tests {
         assert_eq!(
             String::from_utf8(snapshot.entries[0].value.clone()).expect("utf8"),
             "1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_transactional_snapshot_cache_uses_committed_version() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("transactional-cache-version"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let initial = store.snapshot("ns", "memory-a").await?;
+        assert_eq!(initial.max_version, -1);
+
+        let result = store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[],
+                &[utf8_mutation("count", "1", 99)],
+                Some(-1),
+                None,
+                true,
+            )
+            .await?;
+        assert_eq!(result.max_version, 1);
+
+        let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
+        let snapshots = store.shared_snapshots.lock().await;
+        let entry = snapshots
+            .get(&key)
+            .expect("shared cache entry should be updated after commit");
+        assert_eq!(entry.max_version, result.max_version);
+        assert_eq!(
+            entry
+                .records
+                .get("count")
+                .expect("count should be cached")
+                .version,
+            result.max_version
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_blind_snapshot_cache_uses_committed_version() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("blind-cache-version"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let initial = store.snapshot("ns", "memory-a").await?;
+        assert_eq!(initial.max_version, -1);
+
+        let result = store
+            .apply_blind_batch("ns", "memory-a", &[utf8_mutation("count", "1", 99)])
+            .await?;
+        assert_eq!(result.max_version, 1);
+
+        let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
+        let snapshots = store.shared_snapshots.lock().await;
+        let entry = snapshots
+            .get(&key)
+            .expect("shared cache entry should be updated after commit");
+        assert_eq!(entry.max_version, result.max_version);
+        assert_eq!(
+            entry
+                .records
+                .get("count")
+                .expect("count should be cached")
+                .version,
+            result.max_version
         );
         Ok(())
     }
@@ -3468,8 +3574,7 @@ mod tests {
             if Instant::now() >= deadline {
                 return Err(PlatformError::runtime(format!(
                     "expected queued write to replay before timeout, got snapshot version {} and value {:?}",
-                    snapshot.max_version,
-                    current
+                    snapshot.max_version, current
                 )));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

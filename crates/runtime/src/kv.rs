@@ -10,6 +10,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use turso::{transaction::TransactionBehavior, Builder, Connection, Database, Value};
 
+use crate::turso_util::{
+    configure_turso_connection, is_retryable_turso_error, retry_turso_busy, VersionFloor,
+};
+
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
 
@@ -705,7 +709,7 @@ impl KvWriteSchedulerInner {
                         if let Some(tx) = tx.take() {
                             let _ = tx.rollback().await;
                         }
-                        if is_retryable_kv_error(&error) && attempt + 1 < MAX_ATTEMPTS {
+                        if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
                             profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
                             tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64))
                                 .await;
@@ -725,7 +729,7 @@ impl KvWriteSchedulerInner {
                 .commit()
                 .await
             {
-                if is_retryable_kv_error(&error) && attempt + 1 < MAX_ATTEMPTS {
+                if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
                     profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
                     tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
                     continue;
@@ -1234,20 +1238,11 @@ impl KvStore {
     }
 
     fn next_version(&self) -> i64 {
-        self.version.fetch_add(1, Ordering::SeqCst) as i64
+        VersionFloor::next_i64(&self.version)
     }
 
     fn set_version_floor(&self, floor: u64) {
-        let mut current = self.version.load(Ordering::SeqCst);
-        while current < floor {
-            match self
-                .version
-                .compare_exchange(current, floor, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+        VersionFloor::set_floor(&self.version, floor);
     }
 }
 
@@ -1271,9 +1266,7 @@ fn kv_error(error: impl std::fmt::Display) -> PlatformError {
 }
 
 async fn configure_connection(conn: &Connection) -> Result<()> {
-    conn.busy_timeout(std::time::Duration::from_millis(5000))
-        .map_err(kv_error)?;
-    Ok(())
+    configure_turso_connection(conn, kv_error)
 }
 
 async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
@@ -1308,31 +1301,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = turso::Result<u64>>,
 {
-    const MAX_ATTEMPTS: usize = 8;
-    let mut attempt = 0usize;
-    loop {
-        match execute().await {
-            Ok(affected) => return Ok(affected),
-            Err(error) => {
-                attempt += 1;
-                let is_locked = is_retryable_kv_error(&error);
-                if is_locked && attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
-                    continue;
-                }
-                return Err(kv_error(error));
-            }
-        }
-    }
-}
-
-fn is_retryable_kv_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("database is locked")
-        || message.contains("database table is locked")
-        || message.contains("database is busy")
-        || message.contains("busy")
-        || message.contains("conflict")
+    retry_turso_busy(|| execute(), kv_error).await
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {

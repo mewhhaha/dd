@@ -941,6 +941,12 @@
             return value;
           }
           if (memoryTxnIsReadOnly(txn)) {
+            const fresh = await ensureMemoryReadTxnFresh(txn, runtimeRequestId);
+            if (!fresh) {
+              lastConflict = new Error("memory transaction conflicted");
+              await Promise.resolve();
+              break;
+            }
             recordMemoryProfile("js_read_only_total", performance.now() - txnStarted, 1);
             return value;
           }
@@ -951,7 +957,7 @@
             : await commitMemoryTxn(txn, runtimeRequestId);
           if (!committed) {
             lastConflict = new Error("memory transaction conflicted");
-            await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
+            await Promise.resolve();
             break;
           }
           for (const deferred of txn.deferred) {
@@ -978,7 +984,7 @@
             && String(error.message ?? "").includes("conflicted")
           ) {
             lastConflict = error;
-            await new Promise((resolve) => setTimeout(resolve, Math.min(attempt + 1, 8)));
+            await Promise.resolve();
             break;
           }
           throw error;

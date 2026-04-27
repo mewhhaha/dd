@@ -456,6 +456,9 @@
     if (txn.reads.has(normalizedKey)) {
       return;
     }
+    if (txn.writes.has(normalizedKey)) {
+      return;
+    }
     txn.reads.set(normalizedKey, memoryRecordVersion(record));
   };
 
@@ -1005,6 +1008,35 @@
     return true;
   };
 
+  const ensureMemoryReadTxnFresh = async (txn, runtimeRequestId) => {
+    if (!txn || (txn.reads.size === 0 && txn.listGateVersion == null)) {
+      return true;
+    }
+    const started = performance.now();
+    const storageState = ensureMemoryStorageState(txn.entry);
+    const knownVersion = Number(storageState.committedVersion ?? -1);
+    const result = await callOp("op_memory_state_version_if_newer", {
+      request_id: runtimeRequestId,
+      binding: txn.entry.binding,
+      key: txn.entry.memoryKey,
+      known_version: knownVersion,
+    });
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory transaction freshness check failed"));
+    }
+    recordMemoryProfile("js_freshness_check", performance.now() - started, txn.reads.size + 1);
+    if (result.stale !== true) {
+      storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+      storageState.freshnessCheckedVersion = knownVersion;
+      storageState.freshnessCheckedAtMs = performance.now();
+      storageState.stale = false;
+      return true;
+    }
+    storageState.stale = true;
+    return await validateMemoryTxnReads(txn, runtimeRequestId);
+  };
+
   const createMemoryStorageBinding = (entry, runtimeRequestId, txn = null) => {
     const currentStorageRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
     return {
@@ -1156,4 +1188,3 @@
       },
     };
   };
-
