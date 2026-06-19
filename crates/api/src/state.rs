@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
+use crate::deploy_tokens::DeployTokenStore;
 use runtime::RuntimeService;
 
 #[derive(Clone, Debug)]
@@ -16,6 +17,7 @@ pub struct WebSocketSession {
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: RuntimeService,
+    pub deploy_tokens: DeployTokenStore,
     pub edge_revalidations: Arc<Mutex<HashSet<String>>>,
     pub invoke_max_body_bytes: usize,
     pub public_base_domain: String,
@@ -28,6 +30,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         runtime: RuntimeService,
+        deploy_tokens: DeployTokenStore,
         invoke_max_body_bytes: usize,
         public_base_domain: String,
         private_bearer_token: Option<String>,
@@ -36,6 +39,7 @@ impl AppState {
     ) -> Self {
         Self {
             runtime,
+            deploy_tokens,
             edge_revalidations: Arc::new(Mutex::new(HashSet::new())),
             invoke_max_body_bytes,
             public_base_domain: public_base_domain.trim().to_ascii_lowercase(),

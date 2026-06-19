@@ -31,12 +31,11 @@ test("responds through the real dd runtime", async () => {
 
 ```js
 import { defineConfig } from "vite";
-import { ddVitePlugin } from "@dd/vite";
+import dd from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    ddVitePlugin({
-      entry: new URL("./src/worker.js", import.meta.url),
+    dd({
       mount: "/__dd",
     }),
   ],
@@ -48,6 +47,12 @@ runtime. Vite and framework HMR continue to flow normally; on hot updates the
 plugin discards the deployed worker and lazily rebuilds it on the next worker
 request.
 
+The default export is the Vite plugin factory, so you can name it whatever fits
+your config. The named `ddVitePlugin` export remains available. If the package
+root contains `dd.json`, the plugin reads it by default for the worker name,
+entrypoint, and deploy config. Inline plugin options override values from
+`dd.json`.
+
 The plugin also registers a Vite Environment API environment named `dd`, backed
 by `createFetchableDevEnvironment`, for framework code that wants to dispatch
 `Request` objects directly.
@@ -58,12 +63,11 @@ name, similar to Cloudflare's Vite plugin shape:
 ```js
 import { reactRouter } from "@react-router/dev/vite";
 import { defineConfig } from "vite";
-import { ddVitePlugin } from "@dd/vite";
+import ddWorker from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    ddVitePlugin({
-      entry: new URL("./src/worker.js", import.meta.url),
+    ddWorker({
       viteEnvironment: { name: "ssr" },
       mount: "/__dd",
     }),
@@ -95,12 +99,7 @@ asset packaging, and carries over the runtime deploy config.
 ```js
 export default defineConfig({
   plugins: [
-    ddVitePlugin({
-      entry: new URL("./src/worker.ts", import.meta.url),
-      deploymentConfig: {
-        input: new URL("./dd.json", import.meta.url),
-      },
-    }),
+    dd(),
   ],
 });
 ```
@@ -108,13 +107,34 @@ export default defineConfig({
 If `dd.json` points at a TypeScript entrypoint or source asset directory, the
 generated output config replaces those with the bundled worker path and Vite
 output asset path while preserving fields such as `name`, `config`, and custom
-metadata.
+metadata. Non-secret deploy settings such as `base_url` are preserved too, so
+`dd deploy-config dist/dd.deploy.json` can pick the target server from the
+generated config.
+
+Pass options inline when you want to override the file:
+
+```js
+dd({
+  entry: new URL("./src/dev-worker.ts", import.meta.url),
+  config: { public: true },
+  deploymentConfig: {
+    input: { name: "local-dev", entrypoint: "src/worker.ts", config: { public: true } },
+  },
+});
+```
 
 The generated config can be packaged or deployed by the CLI:
 
 ```bash
 cargo run -p cli -- package-deploy-config dist/dd.deploy.json
 cargo run -p cli -- deploy-config dist/dd.deploy.json
+```
+
+Store the deploy token once with the OS credential store instead of putting it
+in `dd.json`:
+
+```bash
+cargo run -p cli -- auth login
 ```
 
 Runtime binary resolution order:

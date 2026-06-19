@@ -8,7 +8,9 @@ version.workspace = true
 base64.workspace = true
 clap.workspace = true
 common = { path = "../common" }
+keyring = "3"
 reqwest.workspace = true
+rpassword = "7"
 serde.workspace = true
 simd-json.workspace = true
 tokio.workspace = true

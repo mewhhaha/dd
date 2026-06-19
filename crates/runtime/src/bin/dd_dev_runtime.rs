@@ -264,6 +264,9 @@ async fn invoke(
 
 fn error_kind(kind: ErrorKind) -> &'static str {
     match kind {
+        ErrorKind::Unauthorized => "unauthorized",
+        ErrorKind::Forbidden => "forbidden",
+        ErrorKind::Conflict => "conflict",
         ErrorKind::BadRequest => "bad_request",
         ErrorKind::NotFound => "not_found",
         ErrorKind::Overloaded => "overloaded",

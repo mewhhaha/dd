@@ -26,6 +26,27 @@ curl -H 'host: hello.example.com' http://127.0.0.1:8080/
 
 Default ports for `cargo run -p dd_server` are `8080` for public traffic and `8081` for private deploy/invoke traffic.
 
+Project deploy settings can live in `dd.json`:
+
+```json
+{
+  "name": "hello",
+  "entrypoint": "examples/hello.js",
+  "base_url": "https://your-dd-app.fly.dev",
+  "config": { "public": true }
+}
+```
+
+`base_url` is non-secret. Store deploy tokens in the OS credential store:
+
+```bash
+cargo run -p cli -- auth login
+cargo run -p cli -- deploy-config dist/dd.deploy.json
+```
+
+CLI server precedence is `--server`, `DD_SERVER`, config `base_url`, then the
+local private default.
+
 ## Memory namespaces
 
 Memory namespace is main coordination primitive. You pick key, get shard, run synchronous `atomic(...)` callback against that shard.
@@ -187,6 +208,11 @@ During `vite build`, the plugin emits `dist/dd.deploy.json` and a bundled
 `dist/worker.js`. The generated config preserves deploy settings while pointing
 at the bundled worker and Vite output assets.
 
+`@dd/vite` has a default plugin export, so configs can use any local name:
+`import dd from "@dd/vite"`. By default it reads `dd.json` from the nearest
+package root for the worker name, source entrypoint, and deploy config; inline
+plugin options override that file.
+
 See [docs/development.md](docs/development.md#vite-and-vitest-worker-development).
 
 ## How to think about it
@@ -205,7 +231,18 @@ Canonical flow:
 
 1. deploy app/container with `flyctl deploy`
 2. open private tunnel with `just fly-proxy <app>`
-3. deploy worker through tunnel with `just fly-worker-deploy ...`
+3. mint a scoped token with `just fly-worker-mint-token ...`
+4. deploy through the public endpoint with `DD_TOKEN`
+
+The private admin resource `/v1/admin/tokens` creates, lists, reads, and deletes
+bearer tokens with explicit capabilities: worker names, public/private deploy
+permission, allowed bindings, internal trace permission, source and asset size
+limits, optional expiry, and optional max uses. Token names are unique
+lowercase, dash-delimited ids, so `my-token-at-home` is the value used later for
+listing, reading, and deletion. Public `POST /v1/deploy` accepts those scoped
+tokens, so GitHub Actions can deploy one worker without carrying the private
+control-plane secret. Locally, `dd auth login` stores that deploy token in the
+OS credential store, scoped by the resolved `base_url`.
 
 Full guide: [deploy/fly/README.md](deploy/fly/README.md)
 

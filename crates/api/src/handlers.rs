@@ -6,8 +6,10 @@ mod websocket;
 use crate::state::AppState;
 use bytes::Bytes;
 use common::{
-    DeployBinding, DeployInternalConfig, DeployRequest, DeployResponse, DynamicDeployRequest,
-    DynamicDeployResponse, ErrorBody, ErrorKind, PlatformError, WorkerInvocation, WorkerOutput,
+    DeployBinding, DeployInternalConfig, DeployRequest, DeployResponse, DeployTokenDeleteResponse,
+    DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
+    DeployTokenMintResponse, DynamicDeployRequest, DynamicDeployResponse, ErrorBody, ErrorKind,
+    PlatformError, WorkerInvocation, WorkerOutput,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use http::header::{
@@ -63,12 +65,12 @@ pub use self::invocation::{invoke_worker_private, invoke_worker_public, invoke_w
 pub(crate) use self::routing::deploy_worker;
 pub use self::routing::{handle_private_request, handle_public_h3_request, handle_public_request};
 pub(crate) use self::util::{annotate_response_with_trace_id, full_body};
-use self::util::{empty_body, inject_current_trace_context};
 use self::util::{
-    json_response, private_auth_response, private_request_is_authorized,
+    bearer_token_from_headers, json_response, private_auth_response, private_request_is_authorized,
     private_route_requires_auth, read_json_body, respond, set_span_parent_from_http_headers,
     validate_deploy_bindings, validate_internal_config,
 };
+use self::util::{empty_body, inject_current_trace_context};
 pub(crate) use self::websocket::{
     handle_websocket_session, open_transport_session_from_parts, open_websocket_session_from_parts,
     sanitize_websocket_handshake_headers,

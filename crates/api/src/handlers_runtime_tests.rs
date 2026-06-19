@@ -1,10 +1,15 @@
+use crate::deploy_tokens::DeployTokenStore;
 use crate::handlers::{
     deploy_worker, handle_private_request, handle_public_request, invoke_worker_private,
     invoke_worker_public,
 };
 use crate::state::AppState;
 use bytes::Bytes;
-use common::{DeployAsset, DeployConfig, DeployRequest, ErrorKind};
+use common::{
+    DeployAsset, DeployBinding, DeployConfig, DeployRequest, DeployTokenCapabilities,
+    DeployTokenDeleteResponse, DeployTokenGetResponse, DeployTokenListResponse,
+    DeployTokenMintRequest, DeployTokenMintResponse, ErrorKind,
+};
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use runtime::{RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
@@ -32,8 +37,12 @@ impl TestState {
         })
         .await
         .expect("runtime");
+        let deploy_tokens = DeployTokenStore::load(store_dir.join("tokens.json"))
+            .await
+            .expect("token store");
         let state = AppState::new(
             runtime,
+            deploy_tokens,
             1024 * 1024,
             public_base_domain.to_string(),
             Some("test-private-token".to_string()),
@@ -66,7 +75,7 @@ fn test_assets() -> Vec<DeployAsset> {
 
 #[tokio::test]
 #[serial]
-async fn public_listener_blocks_deploy_path() {
+async fn public_listener_requires_deploy_token() {
     let state = TestState::new("example.com").await;
     let request = Request::builder()
         .method("POST")
@@ -74,10 +83,243 @@ async fn public_listener_blocks_deploy_path() {
         .header("host", "echo.example.com")
         .body(Empty::<Bytes>::new())
         .expect("request");
+    let response = handle_public_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn private_admin_mints_scoped_deploy_token_for_public_deploy() {
+    let state = TestState::new("example.com").await;
+    let mint = DeployTokenMintRequest {
+        name: Some("ci".to_string()),
+        max_uses: Some(1),
+        capabilities: DeployTokenCapabilities {
+            workers: vec!["echo".to_string()],
+            allow_public: true,
+            bindings: vec![DeployBinding::Memory {
+                binding: "ROOM".to_string(),
+            }],
+            max_source_bytes: Some(1024),
+            max_assets: Some(0),
+            ..DeployTokenCapabilities::default()
+        },
+        ..DeployTokenMintRequest::default()
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/tokens")
+        .header("authorization", "Bearer test-private-token")
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(Bytes::from(
+            serde_json::to_vec(&mint).expect("mint json"),
+        )))
+        .expect("request");
+    let response = handle_private_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let minted: DeployTokenMintResponse = serde_json::from_slice(&body).expect("minted token");
+    assert!(minted.ok);
+    assert_eq!(minted.id, "ci");
+    assert_eq!(minted.name.as_deref(), Some("ci"));
+
+    let deploy = DeployRequest {
+        name: "echo".to_string(),
+        source: "export default { async fetch() { return new Response('public-ok'); } }"
+            .to_string(),
+        config: DeployConfig {
+            public: true,
+            bindings: vec![DeployBinding::Memory {
+                binding: "ROOM".to_string(),
+            }],
+            ..DeployConfig::default()
+        },
+        assets: Vec::new(),
+        asset_headers: None,
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/deploy")
+        .header("host", "example.com")
+        .header("authorization", format!("Bearer {}", minted.token))
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(Bytes::from(
+            serde_json::to_vec(&deploy).expect("deploy json"),
+        )))
+        .expect("request");
+    let response = handle_public_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("host", "echo.example.com")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
     let response = invoke_worker_public(state.app(), request, None)
         .await
-        .expect_err("blocked");
-    assert_eq!(response.0.kind(), ErrorKind::NotFound);
+        .expect("invoke");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(body.as_ref(), b"public-ok");
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn public_deploy_token_rejects_unscoped_binding() {
+    let state = TestState::new("example.com").await;
+    let minted = state
+        .app()
+        .deploy_tokens
+        .mint(DeployTokenMintRequest {
+            capabilities: DeployTokenCapabilities {
+                workers: vec!["echo".to_string()],
+                allow_public: true,
+                bindings: vec![DeployBinding::Memory {
+                    binding: "ROOM".to_string(),
+                }],
+                ..DeployTokenCapabilities::default()
+            },
+            ..DeployTokenMintRequest::default()
+        })
+        .await
+        .expect("mint");
+    let deploy = DeployRequest {
+        name: "echo".to_string(),
+        source: "export default { async fetch() { return new Response('bad'); } }".to_string(),
+        config: DeployConfig {
+            public: true,
+            bindings: vec![DeployBinding::Kv {
+                binding: "ROOM".to_string(),
+            }],
+            ..DeployConfig::default()
+        },
+        assets: Vec::new(),
+        asset_headers: None,
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/deploy")
+        .header("host", "example.com")
+        .header("authorization", format!("Bearer {}", minted.token))
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(Bytes::from(
+            serde_json::to_vec(&deploy).expect("deploy json"),
+        )))
+        .expect("request");
+    let response = handle_public_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn private_admin_lists_reads_and_deletes_tokens() {
+    let state = TestState::new("example.com").await;
+    let minted = state
+        .app()
+        .deploy_tokens
+        .mint(DeployTokenMintRequest {
+            name: Some("github".to_string()),
+            capabilities: DeployTokenCapabilities {
+                workers: vec!["echo".to_string()],
+                allow_public: true,
+                allow_any_bindings: true,
+                ..DeployTokenCapabilities::default()
+            },
+            ..DeployTokenMintRequest::default()
+        })
+        .await
+        .expect("mint");
+    assert_eq!(minted.id, "github");
+    assert_eq!(minted.name.as_deref(), Some("github"));
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/tokens")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = handle_private_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let list: DeployTokenListResponse = serde_json::from_slice(&body).expect("list");
+    assert_eq!(list.tokens.len(), 1);
+    assert_eq!(list.tokens[0].id, minted.id);
+    assert_eq!(list.tokens[0].uses, 0);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/admin/tokens/{}", minted.id))
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = handle_private_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let get: DeployTokenGetResponse = serde_json::from_slice(&body).expect("get");
+    assert_eq!(get.token.name.as_deref(), Some("github"));
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/admin/tokens/{}", minted.id))
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = handle_private_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let deleted: DeployTokenDeleteResponse = serde_json::from_slice(&body).expect("delete");
+    assert_eq!(deleted.id, minted.id);
+
+    let deploy = DeployRequest {
+        name: "echo".to_string(),
+        source: "export default { async fetch() { return new Response('bad'); } }".to_string(),
+        config: DeployConfig {
+            public: true,
+            ..DeployConfig::default()
+        },
+        assets: Vec::new(),
+        asset_headers: None,
+    };
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/deploy")
+        .header("host", "example.com")
+        .header("authorization", format!("Bearer {}", minted.token))
+        .header("content-type", "application/json")
+        .body(http_body_util::Full::new(Bytes::from(
+            serde_json::to_vec(&deploy).expect("deploy json"),
+        )))
+        .expect("request");
+    let response = handle_public_request(state.app(), request).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     state.shutdown().await;
 }
 

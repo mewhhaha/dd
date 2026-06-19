@@ -33,6 +33,22 @@ fly-worker-deploy name file +flags:
 fly-worker-deploy-config config:
   cargo run -p cli -- --server {{default_private_server}} deploy-config {{config}}
 
+# Mint a scoped token through the private proxy.
+fly-worker-mint-token +flags:
+  cargo run -p cli -- --server {{default_private_server}} mint-token {{flags}}
+
+# List token metadata through the private proxy.
+fly-worker-list-tokens:
+  cargo run -p cli -- --server {{default_private_server}} list-tokens
+
+# Delete a token through the private proxy.
+fly-worker-delete-token id:
+  cargo run -p cli -- --server {{default_private_server}} delete-token {{id}}
+
+# Deploy a generated worker config through the public Fly endpoint with DD_TOKEN.
+fly-worker-public-deploy-config app=default_app config='dist/dd.deploy.json':
+  cargo run -p cli -- --server https://{{app}}.fly.dev deploy-config {{config}}
+
 # Deploy a worker into the running Fly app through an explicitly chosen private proxy endpoint.
 fly-worker-deploy-at server name file +flags:
   ./deploy/fly/post-worker-deploy.sh {{server}} {{name}} {{file}} {{flags}}
@@ -53,6 +69,7 @@ check:
 
 # Syntax-check source-only JS integration package.
 check-js:
+  node --check packages/dd-vite/src/index.js
   node --check packages/dd-runtime/index.cjs
   node --check packages/dd-vite/src/runtime.js
   node --check packages/dd-vite/src/vite.js

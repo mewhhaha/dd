@@ -22,10 +22,30 @@ export DD_PRIVATE_TOKEN=dev-token
 cargo run -p dd_server
 ```
 
-CLI default server is `http://127.0.0.1:8081`. To override it, pass `--server` explicitly or set:
+CLI default server is `http://127.0.0.1:8081`. To override it, pass `--server`,
+set `DD_SERVER`, or put `base_url` in the nearest `dd.json`:
 
 ```bash
 export DD_SERVER=http://127.0.0.1:8081
+```
+
+```json
+{
+  "name": "my-worker",
+  "entrypoint": "src/worker.ts",
+  "base_url": "https://your-dd-app.fly.dev",
+  "config": { "public": true }
+}
+```
+
+Server precedence is `--server`, `DD_SERVER`, config `base_url`, then the local
+default. `base_url` is not secret; deploy tokens should live in env vars or the
+OS credential store:
+
+```bash
+cargo run -p cli -- auth login
+cargo run -p cli -- auth status
+cargo run -p cli -- auth logout
 ```
 
 Normal builds do not scrape old `target/` artifacts for RPC bindings. Checked-in generated bindings live at [crates/runtime/src/generated/memory_rpc_capnp.rs](../crates/runtime/src/generated/memory_rpc_capnp.rs) and are fingerprint-checked against [crates/runtime/schema/memory_rpc.capnp](../crates/runtime/schema/memory_rpc.capnp) during build.
@@ -80,17 +100,22 @@ Vite example:
 
 ```js
 import { defineConfig } from "vite";
-import { ddVitePlugin } from "@dd/vite";
+import dd from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    ddVitePlugin({
-      entry: new URL("./src/worker.js", import.meta.url),
+    dd({
       mount: "/__dd",
     }),
   ],
 });
 ```
+
+The package default export is the plugin factory, so local configs can name it
+however they prefer. The named `ddVitePlugin` export still exists. By default,
+the plugin looks for `dd.json` in the nearest package root and uses that file
+for the worker name, source `entrypoint`, and deploy `config`. Inline plugin
+options override `dd.json`.
 
 The plugin also registers a Vite Environment API environment named `dd`, backed
 by Vite's fetchable dev environment API. Framework code can dispatch a `Request`
@@ -105,12 +130,11 @@ name:
 ```js
 import { reactRouter } from "@react-router/dev/vite";
 import { defineConfig } from "vite";
-import { ddVitePlugin } from "@dd/vite";
+import ddWorker from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    ddVitePlugin({
-      entry: new URL("./src/worker.js", import.meta.url),
+    ddWorker({
       viteEnvironment: { name: "ssr" },
       mount: "/__dd",
     }),
@@ -133,18 +157,19 @@ dist/dd.deploy.json
 dist/worker.js
 ```
 
-`deploymentConfig.input` can point at a normal source config whose `entrypoint`
-is still `src/worker.ts` and whose `assets_dir` points at source assets. The
-generated output config preserves `name`, `config`, and custom metadata, then
-replaces `entrypoint` with the bundled worker path and `assets_dir` with the
-Vite output directory. It also excludes the generated worker and config file
-from static asset packaging.
+By default, the plugin uses root `dd.json` as the source config. That file can
+point at `src/worker.ts` and source assets. The generated output config
+preserves `name`, `config`, and custom metadata, then replaces `entrypoint` with
+the bundled worker path and `assets_dir` with the Vite output directory. It also
+excludes the generated worker and config file from static asset packaging.
+Fields such as `base_url` are carried into `dist/dd.deploy.json`, so the CLI can
+deploy the generated config without a separate `--server`.
 
 ```js
-ddVitePlugin({
-  entry: new URL("./src/worker.ts", import.meta.url),
+dd({
+  // Optional: override the root dd.json or provide the config inline.
   deploymentConfig: {
-    input: new URL("./dd.json", import.meta.url),
+    input: { name: "local-dev", entrypoint: "src/worker.ts", config: { public: true } },
   },
 });
 ```
@@ -155,6 +180,40 @@ Package or deploy the generated config with:
 cargo run -p cli -- package-deploy-config dist/dd.deploy.json
 cargo run -p cli -- deploy-config dist/dd.deploy.json
 just fly-worker-deploy-config dist/dd.deploy.json
+```
+
+For CI, mint a scoped token once through the private control plane, then
+deploy through the public endpoint:
+
+```bash
+cargo run -p cli -- --server http://127.0.0.1:18081 mint-token \
+  --name my-worker-ci \
+  --worker my-worker \
+  --public \
+  --memory-binding ROOM \
+  --max-source-bytes 1048576 \
+  --max-assets 256 \
+  --max-asset-bytes 16777216
+
+export DD_TOKEN=dddt_...
+cargo run -p cli -- --server https://your-dd-app.fly.dev deploy-config dist/dd.deploy.json
+```
+
+The token capability set controls worker names, public/private deploys,
+bindings, internal trace configuration, source and asset size limits, expiry,
+and max uses. The token `--name` is a unique lowercase, dash-delimited id used
+for listing, reading, and deleting the token. Omit expiry for a long-lived
+repository token. For local use, store the returned token with:
+
+```bash
+cargo run -p cli -- --server https://your-dd-app.fly.dev auth login
+cargo run -p cli -- deploy-config dist/dd.deploy.json
+```
+
+Revoke with:
+
+```bash
+cargo run -p cli -- --server http://127.0.0.1:18081 delete-token my-worker-ci
 ```
 
 `dd_dev_runtime` is explicitly a debug/dev surface. The JS client starts it with

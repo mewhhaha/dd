@@ -6,9 +6,11 @@ import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
 import { createWorkerTestRuntime } from "./vitest.js";
 
 const DEFAULT_MOUNT = "/__dd";
+const DEFAULT_SOURCE_CONFIG_FILE = "dd.json";
 const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
 const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
 const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
+const DEFAULT_WORKER_NAME = "dev-worker";
 
 export function ddEnvironment(options = {}) {
   const environmentOptions = options.viteEnvironment?.options ?? options.environmentOptions ?? {};
@@ -39,7 +41,6 @@ export function ddEnvironment(options = {}) {
 }
 
 export function ddVitePlugin(options = {}) {
-  const workerName = options.name ?? "dev-worker";
   const environmentName = options.viteEnvironment?.name ?? options.environmentName ?? "dd";
   const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
   let runtime;
@@ -49,6 +50,42 @@ export function ddVitePlugin(options = {}) {
   const deploymentConfig = normalizeDeploymentConfigOptions(options.deploymentConfig);
   let deploymentConfigWritten = false;
   let resolvedConfig;
+  let rootHint;
+  let sourceConfigRoot;
+  let sourceConfigPromise;
+
+  async function sourceConfig() {
+    const root = resolve(resolvedConfig?.root ?? rootHint ?? process.cwd());
+    if (!sourceConfigPromise || sourceConfigRoot !== root) {
+      sourceConfigRoot = root;
+      sourceConfigPromise = loadSourceDeploymentConfig(deploymentConfig, root);
+    }
+    return sourceConfigPromise;
+  }
+
+  async function effectiveWorkerName() {
+    const source = await sourceConfig();
+    return options.name ?? nonEmptyString(source.config.name) ?? DEFAULT_WORKER_NAME;
+  }
+
+  async function effectiveWorkerEntry() {
+    if (options.entry) {
+      return options.entry;
+    }
+    const source = await sourceConfig();
+    const entrypoint = nonEmptyString(source.config.entrypoint);
+    return entrypoint ? resolve(source.dir, entrypoint) : undefined;
+  }
+
+  async function effectiveRuntimeConfig() {
+    const source = await sourceConfig();
+    return (
+      options.config ??
+      source.config.config ??
+      topLevelRuntimeConfig(source.config) ??
+      { public: true }
+    );
+  }
 
   async function workerSource() {
     if (typeof options.source === "function") {
@@ -57,10 +94,11 @@ export function ddVitePlugin(options = {}) {
     if (typeof options.source === "string") {
       return options.source;
     }
-    if (!options.entry) {
+    const entry = await effectiveWorkerEntry();
+    if (!entry) {
       throw new Error("ddVitePlugin requires either source or entry");
     }
-    return bundleWorkerEntry(options.entry, {
+    return bundleWorkerEntry(entry, {
       viteConfig: options.viteConfig,
       target: options.target,
       sourcemap: options.sourcemap,
@@ -74,15 +112,17 @@ export function ddVitePlugin(options = {}) {
     if (deployment) {
       return deployment;
     }
+    const workerName = await effectiveWorkerName();
+    const deployConfig = await effectiveRuntimeConfig();
     deploying ??= runtime
-      .deploy(workerName, await workerSource(), options.config ?? { public: true })
+      .deploy(workerName, await workerSource(), deployConfig)
       .catch(async (error) => {
         if (!isRecoverableRuntimeClientError(error)) {
           throw error;
         }
         await runtime?.close().catch(() => {});
         runtime = createDdRuntime(options.runtimeOptions);
-        return runtime.deploy(workerName, await workerSource(), options.config ?? { public: true });
+        return runtime.deploy(workerName, await workerSource(), deployConfig);
       })
       .finally(() => {
         deploying = undefined;
@@ -101,10 +141,12 @@ export function ddVitePlugin(options = {}) {
   return {
     name: "dd-vite",
     enforce: "post",
-    config() {
+    async config(config) {
       if (options.environment === false) {
         return;
       }
+      rootHint = resolve(config.root ?? process.cwd());
+      const workerName = await effectiveWorkerName();
       return {
         environments: {
           [environmentName]: ddEnvironment({
@@ -131,6 +173,7 @@ export function ddVitePlugin(options = {}) {
             next();
             return;
           }
+          const workerName = await effectiveWorkerName();
           await ensureDeployed();
           const request = await nodeRequestToWorkerRequest(req, originalUrl, mount, workerName);
           const response = await runtime.fetch(workerName, request);
@@ -141,7 +184,12 @@ export function ddVitePlugin(options = {}) {
       });
     },
     async handleHotUpdate(context) {
-      if (shouldInvalidateOnHotUpdate(context, options, hotReloadMode)) {
+      const source = await sourceConfig();
+      if (source.path === context.file) {
+        sourceConfigPromise = undefined;
+        deployment = undefined;
+      }
+      if (await shouldInvalidateOnHotUpdate(context, hotReloadMode, effectiveWorkerEntry, options)) {
         await invalidateDeployment();
       }
     },
@@ -149,7 +197,7 @@ export function ddVitePlugin(options = {}) {
       if (
         deploymentConfigWritten ||
         !deploymentConfig.enabled ||
-        !hasReloadableWorkerSource(options)
+        !(await hasReloadableWorkerSource(options, effectiveWorkerEntry))
       ) {
         return;
       }
@@ -164,8 +212,10 @@ export function ddVitePlugin(options = {}) {
         "deploymentConfig.output",
       );
       await writeOutputFile(outDir, workerFile, await workerSource());
+      const workerName = await effectiveWorkerName();
+      const source = await sourceConfig();
       const config = await buildGeneratedDeploymentConfig({
-        input: deploymentConfig.input,
+        base: source.config,
         options,
         workerName,
         workerFile,
@@ -259,21 +309,22 @@ function normalizeHotReloadMode(value) {
   throw new Error("ddVitePlugin reloadOnHotUpdate must be false, true, 'all', or 'entry'");
 }
 
-function shouldInvalidateOnHotUpdate(context, options, mode) {
+async function shouldInvalidateOnHotUpdate(context, mode, effectiveWorkerEntry, options) {
   if (mode === false) {
     return false;
   }
   if (mode === "all") {
-    return hasReloadableWorkerSource(options);
+    return hasReloadableWorkerSource(options, effectiveWorkerEntry);
   }
-  if (!options.entry) {
+  const entry = await effectiveWorkerEntry();
+  if (!entry) {
     return typeof options.source === "function";
   }
-  return context.file === normalizeFile(options.entry);
+  return context.file === normalizeFile(entry);
 }
 
-function hasReloadableWorkerSource(options) {
-  return Boolean(options.entry || typeof options.source === "function");
+async function hasReloadableWorkerSource(options, effectiveWorkerEntry) {
+  return Boolean((await effectiveWorkerEntry()) || typeof options.source === "function");
 }
 
 function isRecoverableRuntimeClientError(error) {
@@ -306,7 +357,7 @@ async function writeOutputFile(outDir, file, contents) {
 }
 
 async function buildGeneratedDeploymentConfig({
-  input,
+  base,
   options,
   workerName,
   workerFile,
@@ -314,7 +365,6 @@ async function buildGeneratedDeploymentConfig({
   assetsDir,
   assetExcludes,
 }) {
-  const base = await loadDeploymentConfigInput(input);
   const deployment = { ...base };
   const runtimeConfig =
     options.config ?? deployment.config ?? topLevelRuntimeConfig(deployment) ?? { public: true };
@@ -323,7 +373,7 @@ async function buildGeneratedDeploymentConfig({
   delete deployment.bindings;
   delete deployment.internal;
 
-  deployment.name = deployment.name ?? workerName;
+  deployment.name = options.name ?? deployment.name ?? workerName;
   deployment.entrypoint = workerFile;
   if (assetsDir === false) {
     delete deployment.assets_dir;
@@ -343,17 +393,70 @@ async function buildGeneratedDeploymentConfig({
   return deployment;
 }
 
-async function loadDeploymentConfigInput(input) {
-  if (!input) {
-    return {};
+async function loadSourceDeploymentConfig(deploymentConfig, root) {
+  const explicitInput = deploymentConfig.enabled ? deploymentConfig.input : undefined;
+  if (explicitInput !== undefined) {
+    return loadDeploymentConfigInput(explicitInput, root);
+  }
+  const packageRoot = await findPackageRoot(root);
+  const path = join(packageRoot, DEFAULT_SOURCE_CONFIG_FILE);
+  try {
+    return {
+      config: JSON.parse(await readFile(path, "utf8")),
+      dir: packageRoot,
+      path,
+    };
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+    return {
+      config: {},
+      dir: packageRoot,
+      path: undefined,
+    };
+  }
+}
+
+async function loadDeploymentConfigInput(input, root) {
+  if (input == null) {
+    return { config: {}, dir: root, path: undefined };
   }
   if (typeof input === "function") {
-    return cloneJson(await input());
+    return { config: cloneJson(await input()), dir: root, path: undefined };
   }
   if (typeof input === "string" || input instanceof URL) {
-    return JSON.parse(await readFile(normalizeFile(input), "utf8"));
+    const path = normalizeFile(input);
+    return {
+      config: JSON.parse(await readFile(path, "utf8")),
+      dir: dirname(path),
+      path,
+    };
   }
-  return cloneJson(input);
+  return { config: cloneJson(input), dir: root, path: undefined };
+}
+
+async function findPackageRoot(start) {
+  let current = resolve(start);
+  for (;;) {
+    try {
+      await readFile(join(current, "package.json"), "utf8");
+      return current;
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return resolve(start);
+    }
+    current = parent;
+  }
+}
+
+function isMissingFileError(error) {
+  return error?.code === "ENOENT" || error?.code === "ENOTDIR";
 }
 
 function topLevelRuntimeConfig(config) {
@@ -402,4 +505,12 @@ function normalizeConfigRelativePath(value, label) {
 
 function cloneJson(value) {
   return value == null ? {} : JSON.parse(JSON.stringify(value));
+}
+
+function nonEmptyString(value) {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
 }

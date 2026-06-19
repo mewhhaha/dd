@@ -95,3 +95,4 @@ export function ddEnvironment(
   },
 ): EnvironmentOptions;
 export function ddVitePlugin(options?: DdVitePluginOptions): Plugin;
+export default ddVitePlugin;

@@ -20,6 +20,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    Unauthorized,
+    Forbidden,
+    Conflict,
     BadRequest,
     NotFound,
     Overloaded,
@@ -43,6 +46,18 @@ impl PlatformError {
 
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::BadRequest, message)
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unauthorized, message)
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Forbidden, message)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Conflict, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
@@ -134,7 +149,7 @@ fn default_trace_path() -> String {
     "/ingest".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DeployBinding {
     Kv {
@@ -154,6 +169,87 @@ pub struct DeployResponse {
     pub ok: bool,
     pub worker: String,
     pub deployment_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployTokenCapabilities {
+    #[serde(default)]
+    pub workers: Vec<String>,
+    #[serde(default)]
+    pub allow_any_worker: bool,
+    #[serde(default)]
+    pub allow_public: bool,
+    #[serde(default)]
+    pub allow_private: bool,
+    #[serde(default)]
+    pub bindings: Vec<DeployBinding>,
+    #[serde(default)]
+    pub allow_any_bindings: bool,
+    #[serde(default)]
+    pub allow_internal_trace: bool,
+    #[serde(default)]
+    pub max_source_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_assets: Option<u64>,
+    #[serde(default)]
+    pub max_asset_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployTokenMintRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub expires_in_seconds: Option<u64>,
+    #[serde(default)]
+    pub expires_at_unix: Option<u64>,
+    #[serde(default)]
+    pub max_uses: Option<u64>,
+    #[serde(default)]
+    pub capabilities: DeployTokenCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTokenMintResponse {
+    pub ok: bool,
+    pub id: String,
+    pub name: Option<String>,
+    pub token: String,
+    pub expires_at_unix: Option<u64>,
+    pub max_uses: Option<u64>,
+    pub capabilities: DeployTokenCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTokenMetadata {
+    pub id: String,
+    pub name: Option<String>,
+    pub created_at_unix: u64,
+    pub expires_at_unix: Option<u64>,
+    pub max_uses: Option<u64>,
+    pub uses: u64,
+    pub last_used_at_unix: Option<u64>,
+    pub capabilities: DeployTokenCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTokenListResponse {
+    pub ok: bool,
+    pub tokens: Vec<DeployTokenMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTokenGetResponse {
+    pub ok: bool,
+    pub token: DeployTokenMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployTokenDeleteResponse {
+    pub ok: bool,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

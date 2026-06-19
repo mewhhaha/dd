@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "dd_server")]
 #[command(about = "Single-node dd worker runtime server")]
 #[command(
-    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT"
+    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT"
 )]
 struct Cli {
     #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = DEFAULT_PUBLIC_BIND_ADDR)]
@@ -54,6 +54,9 @@ struct Cli {
 
     #[arg(long, env = "PUBLIC_TLS_KEY_PATH")]
     public_tls_key_path: Option<PathBuf>,
+
+    #[arg(long, env = "DD_TOKEN_STORE_PATH")]
+    token_store_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -84,6 +87,9 @@ async fn main() -> Result<()> {
         allow_insecure_private_loopback,
         public_tls_cert_path: cli.public_tls_cert_path,
         public_tls_key_path: cli.public_tls_key_path,
+        token_store_path: cli
+            .token_store_path
+            .or_else(|| env::var_os("DD_DEPLOY_TOKEN_STORE_PATH").map(PathBuf::from)),
         ..ServerConfig::default()
     })
     .await;

@@ -1,6 +1,8 @@
 use super::*;
 pub(super) fn private_route_requires_auth(path: &str) -> bool {
     path == "/v1/deploy"
+        || path == "/v1/admin/tokens"
+        || path.starts_with("/v1/admin/tokens/")
         || path == "/v1/dynamic/deploy"
         || path == "/v1/invoke"
         || path.starts_with("/v1/invoke/")
@@ -10,16 +12,13 @@ pub(super) fn private_request_is_authorized(state: &AppState, headers: &HeaderMa
     let Some(expected_token) = state.private_bearer_token.as_deref() else {
         return true;
     };
-    let Some(value) = headers.get(AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    private_token_matches(expected_token, token)
+    bearer_token_from_headers(headers)
+        .is_some_and(|token| private_token_matches(expected_token, token))
+}
+
+pub(super) fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    value.strip_prefix("Bearer ").map(str::trim)
 }
 
 pub(super) fn private_token_matches(expected_token: &str, provided_token: &str) -> bool {
@@ -176,6 +175,9 @@ impl From<PlatformError> for ApiError {
 impl ApiError {
     fn into_http_response(self) -> Response<ResponseBody> {
         let status = match self.0.kind() {
+            ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+            ErrorKind::Forbidden => StatusCode::FORBIDDEN,
+            ErrorKind::Conflict => StatusCode::CONFLICT,
             ErrorKind::BadRequest | ErrorKind::Runtime => StatusCode::BAD_REQUEST,
             ErrorKind::NotFound => StatusCode::NOT_FOUND,
             ErrorKind::Overloaded => StatusCode::SERVICE_UNAVAILABLE,

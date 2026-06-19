@@ -2,8 +2,10 @@ use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use common::{
     first_non_empty_trimmed, DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig,
-    DeployRequest, DeployResponse, DeployTraceDestination, DynamicDeployRequest,
-    DynamicDeployResponse, ErrorBody, DEFAULT_PRIVATE_SERVER_URL,
+    DeployRequest, DeployResponse, DeployTokenCapabilities, DeployTokenDeleteResponse,
+    DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
+    DeployTokenMintResponse, DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse,
+    ErrorBody, DEFAULT_PRIVATE_SERVER_URL,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -12,12 +14,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
+const DEFAULT_CONFIG_FILE: &str = "dd.json";
+const KEYRING_SERVICE: &str = "dd";
+const KEYRING_DEPLOY_TOKEN_PREFIX: &str = "deploy-token:";
+
 #[derive(Parser)]
 #[command(name = "dd")]
 #[command(about = "CLI for the dd worker platform")]
 struct Cli {
-    #[arg(long, global = true, default_value_t = default_server())]
-    server: String,
+    #[arg(long, global = true, value_name = "URL")]
+    server: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -32,8 +38,37 @@ enum Command {
     DeployConfigFile(DeployConfigFileCmd),
     #[command(name = "package-deploy-config", hide = true)]
     PackageDeployConfigFile(DeployConfigFileCmd),
+    #[command(name = "auth")]
+    Auth(AuthCmd),
+    #[command(name = "mint-token", alias = "mint-deploy-token")]
+    MintDeployToken(MintDeployTokenCmd),
+    #[command(name = "list-tokens")]
+    ListTokens,
+    #[command(name = "get-token")]
+    GetToken(TokenIdCmd),
+    #[command(name = "delete-token")]
+    DeleteToken(TokenIdCmd),
     DynamicDeploy(DynamicDeployCmd),
     Invoke(InvokeCmd),
+}
+
+#[derive(Args)]
+struct AuthCmd {
+    #[command(subcommand)]
+    command: AuthCommand,
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    Login(AuthLoginCmd),
+    Logout,
+    Status,
+}
+
+#[derive(Args)]
+struct AuthLoginCmd {
+    #[arg(long)]
+    token: Option<String>,
 }
 
 #[derive(Args)]
@@ -69,6 +104,65 @@ struct DeployConfigFileCmd {
     config_file: String,
 }
 
+#[derive(Args)]
+struct TokenIdCmd {
+    id: String,
+}
+
+#[derive(Args)]
+struct MintDeployTokenCmd {
+    #[arg(long)]
+    id: Option<String>,
+
+    #[arg(long)]
+    name: Option<String>,
+
+    #[arg(long = "worker")]
+    workers: Vec<String>,
+
+    #[arg(long = "any-worker")]
+    allow_any_worker: bool,
+
+    #[arg(long = "public")]
+    allow_public: bool,
+
+    #[arg(long = "private")]
+    allow_private: bool,
+
+    #[arg(long = "kv-binding")]
+    kv_bindings: Vec<String>,
+
+    #[arg(long = "memory-binding")]
+    memory_bindings: Vec<String>,
+
+    #[arg(long = "dynamic-binding")]
+    dynamic_bindings: Vec<String>,
+
+    #[arg(long = "any-binding")]
+    allow_any_bindings: bool,
+
+    #[arg(long = "allow-internal-trace")]
+    allow_internal_trace: bool,
+
+    #[arg(long = "max-source-bytes")]
+    max_source_bytes: Option<u64>,
+
+    #[arg(long = "max-assets")]
+    max_assets: Option<u64>,
+
+    #[arg(long = "max-asset-bytes")]
+    max_asset_bytes: Option<u64>,
+
+    #[arg(long = "expires-in-seconds")]
+    expires_in_seconds: Option<u64>,
+
+    #[arg(long = "expires-at-unix")]
+    expires_at_unix: Option<u64>,
+
+    #[arg(long = "max-uses")]
+    max_uses: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct DeployFileConfig {
     name: String,
@@ -79,6 +173,12 @@ struct DeployFileConfig {
     asset_excludes: Vec<String>,
     #[serde(default)]
     config: DeployConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CliConfig {
+    #[serde(default, alias = "baseUrl")]
+    base_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -112,53 +212,45 @@ struct DynamicDeployCmd {
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
+    let cli_config = load_cli_config(&cli.command)?;
+    let server = resolve_server(cli.server.as_deref(), &cli_config)?;
     let client = reqwest::Client::new();
     let private_bearer_token = private_bearer_token();
+    let deploy_bearer_token = deploy_bearer_token(&server).or_else(|| private_bearer_token.clone());
 
     match cli.command {
         Command::Deploy(command) => {
-            deploy(
-                &client,
-                &cli.server,
-                private_bearer_token.as_deref(),
-                command,
-            )
-            .await?
+            deploy(&client, &server, deploy_bearer_token.as_deref(), command).await?
         }
         Command::PackageDeploy(command) => {
             let request = build_deploy_request(command).await?;
             println!("{}", to_json_string(&request)?);
         }
         Command::DeployConfigFile(command) => {
-            deploy_config_file(
-                &client,
-                &cli.server,
-                private_bearer_token.as_deref(),
-                command,
-            )
-            .await?
+            deploy_config_file(&client, &server, deploy_bearer_token.as_deref(), command).await?
         }
         Command::PackageDeployConfigFile(command) => {
             let request = build_deploy_request_from_config_file(command).await?;
             println!("{}", to_json_string(&request)?);
         }
+        Command::Auth(command) => auth(command, &server)?,
+        Command::MintDeployToken(command) => {
+            mint_deploy_token(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
+        Command::ListTokens => {
+            list_tokens(&client, &server, private_bearer_token.as_deref()).await?
+        }
+        Command::GetToken(command) => {
+            get_token(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
+        Command::DeleteToken(command) => {
+            delete_token(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
         Command::DynamicDeploy(command) => {
-            dynamic_deploy(
-                &client,
-                &cli.server,
-                private_bearer_token.as_deref(),
-                command,
-            )
-            .await?
+            dynamic_deploy(&client, &server, private_bearer_token.as_deref(), command).await?
         }
         Command::Invoke(command) => {
-            invoke(
-                &client,
-                &cli.server,
-                private_bearer_token.as_deref(),
-                command,
-            )
-            .await?
+            invoke(&client, &server, private_bearer_token.as_deref(), command).await?
         }
     }
 
@@ -172,8 +264,8 @@ async fn deploy(
     command: DeployCmd,
 ) -> Result<(), String> {
     let request = build_deploy_request(command).await?;
-    let response = with_private_auth(
-        client.post(format!("{server}/v1/deploy")),
+    let response = with_bearer_auth(
+        client.post(api_url(server, "/v1/deploy")),
         private_bearer_token,
     )
     .json(&request)
@@ -193,8 +285,8 @@ async fn deploy_config_file(
     command: DeployConfigFileCmd,
 ) -> Result<(), String> {
     let request = build_deploy_request_from_config_file(command).await?;
-    let response = with_private_auth(
-        client.post(format!("{server}/v1/deploy")),
+    let response = with_bearer_auth(
+        client.post(api_url(server, "/v1/deploy")),
         private_bearer_token,
     )
     .json(&request)
@@ -205,6 +297,179 @@ async fn deploy_config_file(
     let deployment: DeployResponse = decode_json(response).await?;
     println!("{}", to_json_string(&deployment)?);
     Ok(())
+}
+
+fn auth(command: AuthCmd, server: &str) -> Result<(), String> {
+    match command.command {
+        AuthCommand::Login(command) => auth_login(server, command),
+        AuthCommand::Logout => auth_logout(server),
+        AuthCommand::Status => auth_status(server),
+    }
+}
+
+fn auth_login(server: &str, command: AuthLoginCmd) -> Result<(), String> {
+    let token = match command.token {
+        Some(token) => token,
+        None => rpassword::prompt_password("Deploy token: ").map_err(|error| error.to_string())?,
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("deploy token must not be empty".to_string());
+    }
+
+    keyring_entry(server)?
+        .set_password(token)
+        .map_err(|error| {
+            format!("failed to store deploy token for {server} in the OS credential store: {error}")
+        })?;
+    println!("Stored deploy token for {server}");
+    Ok(())
+}
+
+fn auth_logout(server: &str) -> Result<(), String> {
+    match keyring_entry(server)?.delete_credential() {
+        Ok(()) => println!("Removed deploy token for {server}"),
+        Err(keyring::Error::NoEntry) => println!("No deploy token stored for {server}"),
+        Err(error) => {
+            return Err(format!(
+                "failed to remove deploy token for {server} from the OS credential store: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn auth_status(server: &str) -> Result<(), String> {
+    match stored_deploy_token(server) {
+        Ok(Some(_)) => println!("Deploy token is stored for {server}"),
+        Ok(None) => println!("No deploy token stored for {server}"),
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+async fn mint_deploy_token(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: MintDeployTokenCmd,
+) -> Result<(), String> {
+    let request = build_deploy_token_mint_request(command)?;
+    let response = with_bearer_auth(
+        client.post(api_url(server, "/v1/admin/tokens")),
+        private_bearer_token,
+    )
+    .json(&request)
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let minted: DeployTokenMintResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&minted)?);
+    Ok(())
+}
+
+async fn list_tokens(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+) -> Result<(), String> {
+    let response = with_bearer_auth(
+        client.get(api_url(server, "/v1/admin/tokens")),
+        private_bearer_token,
+    )
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let tokens: DeployTokenListResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&tokens)?);
+    Ok(())
+}
+
+async fn get_token(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: TokenIdCmd,
+) -> Result<(), String> {
+    let response = with_bearer_auth(
+        client.get(api_url(server, &format!("/v1/admin/tokens/{}", command.id))),
+        private_bearer_token,
+    )
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let token: DeployTokenGetResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&token)?);
+    Ok(())
+}
+
+async fn delete_token(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: TokenIdCmd,
+) -> Result<(), String> {
+    let response = with_bearer_auth(
+        client.delete(api_url(server, &format!("/v1/admin/tokens/{}", command.id))),
+        private_bearer_token,
+    )
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let deleted: DeployTokenDeleteResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&deleted)?);
+    Ok(())
+}
+
+fn build_deploy_token_mint_request(
+    command: MintDeployTokenCmd,
+) -> Result<DeployTokenMintRequest, String> {
+    let mut bindings: Vec<DeployBinding> = command
+        .kv_bindings
+        .into_iter()
+        .map(|binding| DeployBinding::Kv {
+            binding: binding.trim().to_string(),
+        })
+        .collect();
+    bindings.extend(
+        command
+            .memory_bindings
+            .into_iter()
+            .map(parse_memory_binding)
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    bindings.extend(
+        command
+            .dynamic_bindings
+            .into_iter()
+            .map(|binding| DeployBinding::Dynamic {
+                binding: binding.trim().to_string(),
+            }),
+    );
+
+    Ok(DeployTokenMintRequest {
+        id: command.id,
+        name: command.name,
+        expires_in_seconds: command.expires_in_seconds,
+        expires_at_unix: command.expires_at_unix,
+        max_uses: command.max_uses,
+        capabilities: DeployTokenCapabilities {
+            workers: command.workers,
+            allow_any_worker: command.allow_any_worker,
+            allow_public: command.allow_public,
+            allow_private: command.allow_private,
+            bindings,
+            allow_any_bindings: command.allow_any_bindings,
+            allow_internal_trace: command.allow_internal_trace,
+            max_source_bytes: command.max_source_bytes,
+            max_assets: command.max_assets,
+            max_asset_bytes: command.max_asset_bytes,
+        },
+    })
 }
 
 async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, String> {
@@ -301,8 +566,8 @@ async fn dynamic_deploy(
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
     let env = parse_env_vars(&command.env_vars)?;
-    let response = with_private_auth(
-        client.post(format!("{server}/v1/dynamic/deploy")),
+    let response = with_bearer_auth(
+        client.post(api_url(server, "/v1/dynamic/deploy")),
         private_bearer_token,
     )
     .json(&DynamicDeployRequest {
@@ -367,14 +632,9 @@ async fn invoke(
     let headers = parse_headers(&command.headers)?;
     let body = read_request_body(command.body_file.as_deref()).await?;
     let path = normalize_path(&command.path);
-    let url = format!(
-        "{}/v1/invoke/{}{}",
-        server.trim_end_matches('/'),
-        command.name,
-        path
-    );
+    let url = api_url(server, &format!("/v1/invoke/{}{}", command.name, path));
 
-    let response = with_private_auth(client.request(method, url), private_bearer_token)
+    let response = with_bearer_auth(client.request(method, url), private_bearer_token)
         .headers(headers)
         .body(body)
         .send()
@@ -482,10 +742,6 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-fn default_server() -> String {
-    env::var("DD_SERVER").unwrap_or_else(|_| DEFAULT_PRIVATE_SERVER_URL.to_string())
-}
-
 fn private_bearer_token() -> Option<String> {
     first_non_empty_trimmed([
         env::var("DD_PRIVATE_TOKEN").unwrap_or_default(),
@@ -493,14 +749,143 @@ fn private_bearer_token() -> Option<String> {
     ])
 }
 
-fn with_private_auth(
+fn deploy_bearer_token(server: &str) -> Option<String> {
+    first_non_empty_trimmed([
+        env::var("DD_TOKEN").unwrap_or_default(),
+        env::var("DD_DEPLOY_TOKEN").unwrap_or_default(),
+    ])
+    .or_else(|| stored_deploy_token(server).ok().flatten())
+}
+
+fn with_bearer_auth(
     request: reqwest::RequestBuilder,
-    private_bearer_token: Option<&str>,
+    bearer_token: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    match private_bearer_token {
+    match bearer_token {
         Some(token) => request.bearer_auth(token),
         None => request,
     }
+}
+
+fn load_cli_config(command: &Command) -> Result<CliConfig, String> {
+    let mut config = load_workspace_cli_config()?;
+    if let Some(path) = command_config_path(command) {
+        let command_config = load_cli_config_file(Path::new(path))?;
+        if command_config.base_url.is_some() {
+            config.base_url = command_config.base_url;
+        }
+    }
+    Ok(config)
+}
+
+fn load_workspace_cli_config() -> Result<CliConfig, String> {
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    load_workspace_cli_config_from(&cwd)
+}
+
+fn load_workspace_cli_config_from(start: &Path) -> Result<CliConfig, String> {
+    let Some(path) = find_config_file(start) else {
+        return Ok(CliConfig::default());
+    };
+    load_cli_config_file(&path)
+}
+
+fn command_config_path(command: &Command) -> Option<&str> {
+    match command {
+        Command::DeployConfigFile(command) | Command::PackageDeployConfigFile(command) => {
+            Some(command.config_file.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn load_cli_config_file(path: &Path) -> Result<CliConfig, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    parse_json_bytes(&bytes).map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn find_config_file(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_dir() {
+        start.to_path_buf()
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    loop {
+        let candidate = current.join(DEFAULT_CONFIG_FILE);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn resolve_server(cli_server: Option<&str>, config: &CliConfig) -> Result<String, String> {
+    let env_server = env::var("DD_SERVER").unwrap_or_default();
+    resolve_server_from(cli_server, env_server.as_str(), config)
+}
+
+fn resolve_server_from(
+    cli_server: Option<&str>,
+    env_server: &str,
+    config: &CliConfig,
+) -> Result<String, String> {
+    let config_server = config.base_url.clone().unwrap_or_default();
+    let server = first_non_empty_trimmed([
+        cli_server.unwrap_or("").to_string(),
+        env_server.to_string(),
+        config_server,
+        DEFAULT_PRIVATE_SERVER_URL.to_string(),
+    ])
+    .expect("default server is non-empty");
+    normalize_server_url(&server)
+}
+
+fn normalize_server_url(server: &str) -> Result<String, String> {
+    let trimmed = server.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("server URL must not be empty".to_string());
+    }
+    let url =
+        reqwest::Url::parse(trimmed).map_err(|error| format!("invalid server URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("server URL must use http or https".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("server URL must include a host".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("server URL must not include query or fragment".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn api_url(server: &str, path: &str) -> String {
+    format!("{}{}", server.trim_end_matches('/'), path)
+}
+
+fn stored_deploy_token(server: &str) -> Result<Option<String>, String> {
+    match keyring_entry(server)?.get_password() {
+        Ok(token) => Ok(first_non_empty_trimmed([token])),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "failed to read deploy token for {server} from the OS credential store: {error}"
+        )),
+    }
+}
+
+fn keyring_entry(server: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, &keyring_account(server))
+        .map_err(|error| format!("failed to open OS credential store: {error}"))
+}
+
+fn keyring_account(server: &str) -> String {
+    format!(
+        "{KEYRING_DEPLOY_TOKEN_PREFIX}{}",
+        server.trim_end_matches('/')
+    )
 }
 
 fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<String>), String> {
@@ -694,8 +1079,10 @@ fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        build_deploy_request_from_config_file, normalize_asset_relative_path, package_assets_dir,
-        Cli, DeployConfigFileCmd,
+        build_deploy_request_from_config_file, build_deploy_token_mint_request, keyring_account,
+        load_workspace_cli_config_from, normalize_asset_relative_path, package_assets_dir,
+        resolve_server_from, Cli, CliConfig, DeployConfigFileCmd, MintDeployTokenCmd,
+        DEFAULT_PRIVATE_SERVER_URL,
     };
     use clap::Parser;
     use std::fs;
@@ -806,5 +1193,98 @@ mod tests {
             "ROOMS",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mint_deploy_token_command_builds_capabilities() {
+        let request = build_deploy_token_mint_request(MintDeployTokenCmd {
+            id: None,
+            name: Some("ci".to_string()),
+            workers: vec!["chat".to_string()],
+            allow_any_worker: false,
+            allow_public: true,
+            allow_private: false,
+            kv_bindings: vec!["CACHE".to_string()],
+            memory_bindings: vec!["ROOM".to_string()],
+            dynamic_bindings: Vec::new(),
+            allow_any_bindings: false,
+            allow_internal_trace: false,
+            max_source_bytes: Some(1024),
+            max_assets: Some(4),
+            max_asset_bytes: Some(4096),
+            expires_in_seconds: Some(3600),
+            expires_at_unix: None,
+            max_uses: Some(1),
+        })
+        .expect("mint request");
+
+        assert_eq!(request.name.as_deref(), Some("ci"));
+        assert_eq!(request.id.as_deref(), None);
+        assert_eq!(request.capabilities.workers, vec!["chat"]);
+        assert!(request.capabilities.allow_public);
+        assert_eq!(request.capabilities.bindings.len(), 2);
+        assert_eq!(request.expires_in_seconds, Some(3600));
+        assert_eq!(request.max_uses, Some(1));
+    }
+
+    #[test]
+    fn cli_config_loads_base_url_from_nearest_dd_json() {
+        let root = temp_dir("dd-json");
+        let nested = root.join("packages").join("worker");
+        fs::create_dir_all(&nested).expect("create nested");
+        fs::write(
+            root.join("dd.json"),
+            r#"{
+              "name": "chat",
+              "entrypoint": "src/worker.ts",
+              "base_url": "https://dd.example.com"
+            }"#,
+        )
+        .expect("write dd.json");
+
+        let config = load_workspace_cli_config_from(&nested).expect("load config");
+        assert_eq!(config.base_url.as_deref(), Some("https://dd.example.com"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn server_resolution_prefers_cli_env_config_then_default() {
+        let config = CliConfig {
+            base_url: Some("https://config.example.com/".to_string()),
+        };
+        assert_eq!(
+            resolve_server_from(
+                Some("https://cli.example.com/"),
+                "https://env.example.com",
+                &config
+            )
+            .expect("cli server"),
+            "https://cli.example.com"
+        );
+        assert_eq!(
+            resolve_server_from(None, "https://env.example.com", &config).expect("env server"),
+            "https://env.example.com"
+        );
+        assert_eq!(
+            resolve_server_from(None, "", &config).expect("config server"),
+            "https://config.example.com"
+        );
+        assert_eq!(
+            resolve_server_from(None, "", &CliConfig::default()).expect("default server"),
+            DEFAULT_PRIVATE_SERVER_URL
+        );
+    }
+
+    #[test]
+    fn stored_deploy_token_key_is_scoped_to_base_url() {
+        assert_eq!(
+            keyring_account("https://dd.example.com/"),
+            "deploy-token:https://dd.example.com"
+        );
+        assert_ne!(
+            keyring_account("https://dd.example.com"),
+            keyring_account("https://other.example.com")
+        );
     }
 }

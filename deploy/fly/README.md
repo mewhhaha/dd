@@ -11,7 +11,8 @@ Workers are deployed into that running app. They are not separate Fly apps.
 
 1. deploy platform container with `flyctl deploy`
 2. open WireGuard tunnel to private port with `just fly-proxy <app>`
-3. deploy workers through that tunnel with `just fly-worker-deploy ...`
+3. mint a scoped token through the private control plane
+4. deploy workers through the public endpoint with that token
 
 Use direct worker-store writes only as recovery/maintenance escape hatch, not normal workflow.
 
@@ -64,7 +65,8 @@ Equivalent direct helper:
 
 ## 5) Deploy workers through tunnel
 
-Preferred helper:
+The private control plane can always deploy directly, and remains useful for
+local admin work:
 
 ```bash
 just fly-worker-deploy hello examples/hello.js --public
@@ -78,7 +80,67 @@ cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.
 cargo run -p cli -- --server http://127.0.0.1:18081 deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 
-## 6) Public routing
+## 6) Mint a public token
+
+For CI and GitHub Actions, mint a narrow token once, then store only that
+token in the repository secret store. Tokens are hashed at rest by `dd_server`.
+
+Example token for one public worker that needs one memory binding:
+
+```bash
+just fly-worker-mint-token \
+  --name github-actions-chat \
+  --worker chat \
+  --public \
+  --memory-binding CHAT_ROOM \
+  --max-source-bytes 1048576 \
+  --max-assets 256 \
+  --max-asset-bytes 16777216
+```
+
+`--name` is the token id used by `list-tokens`, `get-token`, and
+`delete-token`. It must be a unique lowercase, dash-delimited slug such as
+`github-actions-chat`; uppercase input is normalized to lowercase. The response
+includes `token`. Put that value in `DD_TOKEN` in CI. Omit expiry for a
+long-lived token, or add `--expires-in-seconds` and/or `--max-uses` for
+short-lived release tokens.
+
+Token admin stays on the private control plane:
+
+```bash
+cargo run -p cli -- --server http://127.0.0.1:18081 list-tokens
+cargo run -p cli -- --server http://127.0.0.1:18081 get-token github-actions-chat
+cargo run -p cli -- --server http://127.0.0.1:18081 delete-token github-actions-chat
+```
+
+Deploy a generated Vite config through the public endpoint:
+
+```bash
+export DD_TOKEN=dddt_...
+cargo run -p cli -- --server https://your-dd-app.fly.dev deploy-config dist/dd.deploy.json
+```
+
+For local machines, put the public app URL in `dd.json` or the generated
+`dist/dd.deploy.json`, then store the token in the OS credential store:
+
+```json
+{
+  "base_url": "https://your-dd-app.fly.dev"
+}
+```
+
+```bash
+cargo run -p cli -- auth login
+cargo run -p cli -- deploy-config dist/dd.deploy.json
+```
+
+Helper:
+
+```bash
+DD_TOKEN=dddt_... just fly-worker-public-deploy-config your-dd-app dist/dd.deploy.json
+```
+
+## 7) Public routing
 
 Once deployed with `--public`, host routing maps subdomain to worker name:
 
@@ -91,7 +153,7 @@ For built-in Fly hostname:
 
 Fly app apex hostname itself is not mapped to worker and returns `404`.
 
-## 7) Custom domains
+## 8) Custom domains
 
 ```bash
 flyctl certs add example.com --app your-dd-app
@@ -110,6 +172,10 @@ PUBLIC_BASE_DOMAIN = "example.com"
 - redeploy platform: `just fly-deploy your-dd-app`
 - open tunnel: `just fly-proxy your-dd-app`
 - deploy worker through tunnel: `just fly-worker-deploy <name> <file> [flags...]`
+- mint token through tunnel: `just fly-worker-mint-token --name <token-name> --worker <worker> --public ...`
+- list tokens through tunnel: `just fly-worker-list-tokens`
+- delete token through tunnel: `just fly-worker-delete-token <token-name>`
+- deploy through public endpoint: `DD_TOKEN=... just fly-worker-public-deploy-config <app> <config>`
 - invoke private worker: `cargo run -p cli -- --server http://127.0.0.1:18081 invoke <name> --method GET --path /`
 
 Internal escape hatch:
