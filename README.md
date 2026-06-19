@@ -277,12 +277,21 @@ Project shape:
 | total tracked lines | 106,694 |
 | Rust test attributes | 224 |
 
-Release artifacts from `cargo build --release -p dd_server -p cli`:
+Distribution artifacts use the `dist` Cargo profile:
+
+```bash
+cargo build --locked --profile dist -p dd_server -p cli
+just size-report
+```
+
+Historical release artifacts from `cargo build --release -p dd_server -p cli`:
 
 | artifact | unstripped | stripped temporary copy |
 | --- | ---: | ---: |
 | `target/release/dd_server` | 116,086,200 bytes / 110.71 MiB | 88,256,352 bytes / 84.17 MiB |
 | `target/release/cli` | 7,458,232 bytes / 7.11 MiB | 5,430,640 bytes / 5.18 MiB |
+
+Current `dd_server` size work and the selected `dist` profile report are summarized in [docs/binary-size-report.md](docs/binary-size-report.md).
 
 Current focused benchmark results:
 

@@ -6,7 +6,7 @@ use common::{
 use dd_server::ServerConfig;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::TracerProvider as OTelTracerProvider;
 use opentelemetry_sdk::Resource;
@@ -105,10 +105,7 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
-    let endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .ok()
-        .or_else(|| env::var("DD_OTEL_ENDPOINT").ok())
-        .filter(|value| !value.trim().is_empty());
+    let endpoint = configured_otlp_http_traces_endpoint();
     let resource = Resource::new(vec![
         KeyValue::new("service.name", "dd-server"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
@@ -117,8 +114,9 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
 
     if let Some(endpoint) = endpoint {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
+            .with_http()
             .with_endpoint(endpoint)
+            .with_protocol(Protocol::HttpBinary)
             .build()
             .map_err(|error| {
                 PlatformError::internal(format!("otlp exporter init failed: {error}"))
@@ -138,8 +136,37 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
     Ok(Some(provider))
 }
 
+fn configured_otlp_http_traces_endpoint() -> Option<String> {
+    env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .or_else(|| {
+            env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| otlp_http_traces_endpoint(&value))
+        })
+        .or_else(|| {
+            env::var("DD_OTEL_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| otlp_http_traces_endpoint(&value))
+        })
+}
+
+fn otlp_http_traces_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1/traces") {
+        return trimmed.to_string();
+    }
+
+    format!("{trimmed}/v1/traces")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::otlp_http_traces_endpoint;
     use common::first_non_empty_trimmed;
 
     #[test]
@@ -158,5 +185,29 @@ mod tests {
     fn token_selection_returns_none_when_all_tokens_are_empty() {
         let token = first_non_empty_trimmed(["", " "]);
         assert!(token.is_none());
+    }
+
+    #[test]
+    fn otlp_http_endpoint_appends_trace_path_to_base_endpoint() {
+        assert_eq!(
+            otlp_http_traces_endpoint("http://collector:4318"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            otlp_http_traces_endpoint("http://collector:4318/"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            otlp_http_traces_endpoint("http://collector:4318/otlp"),
+            "http://collector:4318/otlp/v1/traces"
+        );
+    }
+
+    #[test]
+    fn otlp_http_endpoint_keeps_explicit_trace_path() {
+        assert_eq!(
+            otlp_http_traces_endpoint("http://collector:4318/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
     }
 }

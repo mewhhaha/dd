@@ -19,15 +19,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = { version = "0.14", features = ["serde_impl"] }
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.28"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [patch.crates-io]
@@ -40,4 +40,13 @@ debug = false
 lto = "fat"
 opt-level = "z"
 panic = "abort"
+strip = "symbols"
+
+[profile.dist]
+inherits = "release"
+debug = false
+incremental = false
+codegen-units = 1
+lto = "thin"
+opt-level = 3
 strip = "symbols"

@@ -10,19 +10,12 @@ clap.workspace = true
 bytes = "1"
 common = { path = "../common" }
 futures = "0.3"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
-quiche = "0.26.1"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rcgen = "0.14"
 runtime = { path = "../runtime" }
-rustls = "0.23"
-rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
@@ -40,4 +33,5 @@ opentelemetry-otlp.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rcgen = "0.14"
 serial_test = "3"

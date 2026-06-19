@@ -633,6 +633,25 @@ async fn crypto_globals_work_with_deno_crypto_ops() {
         "random bytes should not be all zero"
     );
     assert_eq!(payload.digest_length, 32);
+    assert_eq!(
+        payload.digest_hex,
+        "fdc8751e9cb507759ed6fb3f14b311bb5427acb288ebc5c70e4e06f5c8471d04"
+    );
+    assert_eq!(payload.hmac_signature_length, 32);
+    assert!(payload.hmac_verified, "HMAC signature should verify");
+    assert!(
+        payload.aes_ciphertext_length > "secret-data".len(),
+        "AES-GCM ciphertext should include authentication tag"
+    );
+    assert_eq!(payload.aes_roundtrip, "secret-data");
+    assert!(
+        payload.asymmetric_signature_length > 0,
+        "asymmetric signature should be non-empty"
+    );
+    assert!(
+        payload.asymmetric_verified,
+        "asymmetric signature should verify"
+    );
     assert_eq!(payload.uuid.len(), 36, "uuid should be canonical v4 length");
 }
 

@@ -55,8 +55,27 @@ If you change the schema, regenerate the checked-in bindings on a machine with `
 Optional tracing env:
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
+
+## Distribution Builds
+
+Shipped server artifacts use the `dist` Cargo profile rather than the ordinary
+developer release profile:
+
+```bash
+cargo build --locked --profile dist -p dd_server -p cli
+```
+
+Generate a reproducible size report for `dd_server` with:
+
+```bash
+just size-report
+```
+
+Reports are written to `target/size-report/<git-sha>/<profile>/` and include
+exact unstripped/stripped bytes, section sizes, dependency trees, and optional
+`cargo bloat`/`bloaty` output when those tools are installed.
 
 ## Vite and Vitest worker development
 

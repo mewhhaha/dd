@@ -10,15 +10,10 @@ use crate::memory_rpc::{
     decode_memory_invoke_response, encode_memory_invoke_request, MemoryInvokeCall,
     MemoryInvokeRequest, MemoryInvokeResponse,
 };
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
 use deno_core::OpState;
 use deno_permissions::{PermissionsContainer, RuntimePermissionDescriptorParser};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -29,8 +24,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_traits::impls::RealSys;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
-#[path = "ops/crypto.rs"]
-mod crypto_ops;
 #[path = "ops/dynamic.rs"]
 mod dynamic_ops;
 #[path = "ops/dynamic_types.rs"]
@@ -46,7 +39,6 @@ mod request_types;
 #[path = "ops/storage_http.rs"]
 mod storage_http_ops;
 
-use self::crypto_ops::*;
 use self::dynamic_ops::*;
 pub(crate) use self::dynamic_types::*;
 use self::memory_ops::*;
@@ -54,6 +46,8 @@ pub(crate) use self::memory_types::*;
 use self::request_ops::*;
 pub(crate) use self::request_types::*;
 use self::storage_http_ops::*;
+
+static PROCESS_MONO_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct IsolateEventSender(pub std::sync::mpsc::Sender<IsolateEventPayload>);
@@ -205,7 +199,7 @@ fn emit_isolate_event_from_rc(
 
 pub(crate) fn current_time_boundary() -> TimeBoundary {
     let now_ms = wall_ms();
-    let perf_ms = crypto_ops::PROCESS_MONO_START
+    let perf_ms = PROCESS_MONO_START
         .get_or_init(Instant::now)
         .elapsed()
         .as_secs_f64()
@@ -229,11 +223,6 @@ deno_core::extension!(
     ops = [
         op_sleep,
         op_time_boundary_now,
-        op_crypto_digest,
-        op_crypto_hmac_sign,
-        op_crypto_hmac_verify,
-        op_crypto_aes_gcm_encrypt,
-        op_crypto_aes_gcm_decrypt,
         op_kv_get,
         op_kv_get_many_utf8,
         op_kv_get_value,

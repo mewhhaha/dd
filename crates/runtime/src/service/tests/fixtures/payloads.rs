@@ -66,4 +66,11 @@ pub(crate) struct CryptoState {
     pub(crate) random_non_zero: bool,
     pub(crate) uuid: String,
     pub(crate) digest_length: usize,
+    pub(crate) digest_hex: String,
+    pub(crate) hmac_signature_length: usize,
+    pub(crate) hmac_verified: bool,
+    pub(crate) aes_ciphertext_length: usize,
+    pub(crate) aes_roundtrip: String,
+    pub(crate) asymmetric_signature_length: usize,
+    pub(crate) asymmetric_verified: bool,
 }

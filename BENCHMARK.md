@@ -2,6 +2,47 @@
 
 Canonical continuous benchmark history for hardening work. New focused runs should be appended here with command, environment, and result.
 
+## 2026-06-19 - Binary Size Reduction Dist Profile
+
+Change:
+
+- Added the `dist` Cargo profile and Fly packaging now builds `dd_server` with it.
+- Disabled unintended Reqwest defaults, removing native TLS/OpenSSL from the server graph.
+- Removed unused direct H3/Quinn candidate dependencies while keeping `tokio-quiche`.
+- Switched default OTLP export from Tonic transport to OTLP/HTTP protobuf.
+- Removed unused local crypto ops after expanding worker WebCrypto coverage.
+- Replaced the workspace's direct Tokio `full` request with the explicit features used by this repo. The final artifact is unchanged because transitive dependencies still enable Tokio `full`.
+- Rejected the Turso `mimalloc` default-feature experiment; the final lockfile keeps Turso's default allocator.
+
+Same-host baseline was measured from detached worktree commit `96bbb2eca0cd7b1808179efe819901bfe5dc9502`; candidate was the working tree on the same commit.
+
+Distribution profile variants:
+
+| variant | opt-level | LTO | stripped bytes | result |
+| --- | ---: | --- | ---: | --- |
+| A | 3 | thin | 82,488,216 | selected |
+| B | 3 | fat | 79,702,936 | not selected |
+| C | s | thin | 76,409,752 | not selected |
+| D | s | fat | 72,264,600 | not selected |
+| E | z | thin | 75,226,008 | not selected |
+| F | z | fat | 70,359,960 | rejected by latency gate |
+
+Variant F passed direct-read throughput but was rejected because direct-write median tail latency regressed beyond the gate: p95 was 11.74ms versus 10.65ms baseline (+10.2%), and p99 was 21.75ms versus 18.20ms baseline (+19.5%).
+
+Focused benchmark medians:
+
+| scenario | baseline | candidate | delta |
+| --- | ---: | ---: | ---: |
+| direct memory read throughput | 12,292 req/s | 12,955 req/s | +5.4% |
+| direct memory write throughput | 2,024 req/s | 2,052 req/s | +1.4% |
+| dynamic baseline throughput | 4,479 req/s | 4,387 req/s | -2.1% |
+| dynamic hot fetch throughput | 3,464 req/s | 3,513 req/s | +1.4% |
+| dynamic hot fetch + host RPC throughput | 2,058 req/s | 2,116 req/s | +2.8% |
+| startup-to-ready | 77ms | 76ms | -1.3% |
+| idle RSS | 124,064 KiB | 79,948 KiB | -35.6% |
+
+The full default `cargo run -p runtime --bin bench --release` benchmark is still not used as a gate because of the documented signal-139 instability.
+
 ## Environment
 
 - Date: `2026-06-18T20:32:16+02:00`

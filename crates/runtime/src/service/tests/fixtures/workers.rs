@@ -1219,18 +1219,86 @@ pub(crate) fn crypto_worker() -> String {
     r#"
 export default {
   async fetch() {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const bytes = (buffer) => Array.from(new Uint8Array(buffer));
+    const hex = (buffer) => bytes(buffer).map((value) => value.toString(16).padStart(2, "0")).join("");
+
     const random = new Uint8Array(16);
     crypto.getRandomValues(random);
     const digestBuffer = await crypto.subtle.digest(
       "SHA-256",
-      new TextEncoder().encode("dd-runtime"),
+      encoder.encode("dd-runtime"),
     );
-    const digest = Array.from(new Uint8Array(digestBuffer));
+    const hmacKey = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode("secret-key"),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign", "verify"],
+    );
+    const hmacSignature = await crypto.subtle.sign(
+      "HMAC",
+      hmacKey,
+      encoder.encode("signed-payload"),
+    );
+    const hmacVerified = await crypto.subtle.verify(
+      "HMAC",
+      hmacKey,
+      hmacSignature,
+      encoder.encode("signed-payload"),
+    );
+
+    const aesKey = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array([1, 35, 69, 103, 137, 171, 205, 239, 16, 50, 84, 118, 152, 186, 220, 254]),
+      "AES-GCM",
+      false,
+      ["encrypt", "decrypt"],
+    );
+    const iv = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    const additionalData = encoder.encode("dd-aad");
+    const aesCiphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData, tagLength: 128 },
+      aesKey,
+      encoder.encode("secret-data"),
+    );
+    const aesPlaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv, additionalData, tagLength: 128 },
+      aesKey,
+      aesCiphertext,
+    );
+
+    const asymmetricKey = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign", "verify"],
+    );
+    const asymmetricPayload = encoder.encode("asymmetric-payload");
+    const asymmetricSignature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      asymmetricKey.privateKey,
+      asymmetricPayload,
+    );
+    const asymmetricVerified = await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      asymmetricKey.publicKey,
+      asymmetricSignature,
+      asymmetricPayload,
+    );
+
     return Response.json({
       random_length: random.length,
       random_non_zero: random.some((value) => value !== 0),
       uuid: crypto.randomUUID(),
-      digest_length: digest.length,
+      digest_length: bytes(digestBuffer).length,
+      digest_hex: hex(digestBuffer),
+      hmac_signature_length: bytes(hmacSignature).length,
+      hmac_verified: hmacVerified,
+      aes_ciphertext_length: bytes(aesCiphertext).length,
+      aes_roundtrip: decoder.decode(aesPlaintext),
+      asymmetric_signature_length: bytes(asymmetricSignature).length,
+      asymmetric_verified: asymmetricVerified,
     });
   },
 };

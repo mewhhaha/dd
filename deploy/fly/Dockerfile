@@ -23,7 +23,7 @@ COPY patches ./patches
 RUN ./scripts/patch-crate.sh deno_crypto
 COPY crates ./crates
 
-RUN cargo build --locked --release -p dd_server
+RUN cargo build --locked --profile dist -p dd_server
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
 
@@ -35,7 +35,7 @@ ENV RUST_LOG=info
 
 VOLUME ["/app/store"]
 
-COPY --from=builder /workspace/target/release/dd_server /app/dd_server
+COPY --from=builder /workspace/target/dist/dd_server /app/dd_server
 
 EXPOSE 8080
 CMD ["/app/dd_server"]

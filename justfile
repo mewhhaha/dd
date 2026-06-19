@@ -65,7 +65,13 @@ fly-worker-store-deploy name file +flags:
 check:
   bash scripts/check_public_memory_naming.sh
   just check-js
+  cargo fmt --all -- --check
+  cargo check --workspace --all-targets --all-features
   cargo test --workspace
+
+# Build dd_server with the selected distribution profile and write a size report.
+size-report profile="dist":
+  ./scripts/measure-binary-size.sh {{profile}}
 
 # Syntax-check source-only JS integration package.
 check-js:

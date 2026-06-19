@@ -1,11 +1,12 @@
 use common::{DeployBinding, DeployConfig, DeployRequest};
-use quiche::h3::{Header, NameValue};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio_quiche::quiche;
+use tokio_quiche::quiche::h3::{Header, NameValue};
 use uuid::Uuid;
 
 const MAX_QUIC_DATAGRAM_SIZE: usize = 1350;
