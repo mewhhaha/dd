@@ -38,6 +38,148 @@ Optional tracing env:
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
 ```
 
+## Vite and Vitest worker development
+
+The repo includes a dev-only stdio runtime bridge and a source-only Vite package:
+
+- [crates/runtime/src/bin/dd_dev_runtime.rs](../crates/runtime/src/bin/dd_dev_runtime.rs)
+- [packages/dd-vite](../packages/dd-vite)
+- [packages/dd-runtime](../packages/dd-runtime)
+
+This path does not start `dd_server` or a separate private control-plane server.
+The JS helper launches `dd_dev_runtime`, then sends JSON commands over stdio to
+deploy and invoke workers through `RuntimeService` directly.
+
+`@dd/vite` can use the optional `@dd/runtime` wrapper package. That wrapper has
+platform-specific optional dependencies such as `@dd/runtime-linux-x64`,
+`@dd/runtime-linux-arm64`, `@dd/runtime-darwin-arm64`, and
+`@dd/runtime-win32-x64`, so package managers install only the runtime binary for
+the current `os` and `cpu`. In this source checkout, the JS client still falls
+back to `cargo run -p runtime --bin dd_dev_runtime` when no packaged binary is
+installed.
+
+Vitest example:
+
+```js
+import { afterAll, expect, test } from "vitest";
+import { createWorkerTestRuntime } from "@dd/vite/vitest";
+
+const worker = await createWorkerTestRuntime({
+  entry: new URL("./src/worker.js", import.meta.url),
+});
+
+afterAll(() => worker.close());
+
+test("worker fetch runs in dd", async () => {
+  const response = await worker.fetch("https://worker.test/");
+  expect(response.status).toBe(200);
+});
+```
+
+Vite example:
+
+```js
+import { defineConfig } from "vite";
+import { ddVitePlugin } from "@dd/vite";
+
+export default defineConfig({
+  plugins: [
+    ddVitePlugin({
+      entry: new URL("./src/worker.js", import.meta.url),
+      mount: "/__dd",
+    }),
+  ],
+});
+```
+
+The plugin also registers a Vite Environment API environment named `dd`, backed
+by Vite's fetchable dev environment API. Framework code can dispatch a `Request`
+to that environment while the worker still runs in the native `dd` runtime.
+During Vite hot updates, the plugin leaves Vite's normal browser and framework
+HMR path alone, discards the deployed worker, and lazily rebuilds it on the next
+worker request.
+
+For frameworks that own the SSR environment, bind `dd` to the same environment
+name:
+
+```js
+import { reactRouter } from "@react-router/dev/vite";
+import { defineConfig } from "vite";
+import { ddVitePlugin } from "@dd/vite";
+
+export default defineConfig({
+  plugins: [
+    ddVitePlugin({
+      entry: new URL("./src/worker.js", import.meta.url),
+      viteEnvironment: { name: "ssr" },
+      mount: "/__dd",
+    }),
+    reactRouter(),
+  ],
+});
+```
+
+This follows the same broad direction as Cloudflare's Vite plugin integration:
+use Vite's Environment API and let full-stack frameworks merge with their SSR
+environment. The current implementation still rebuilds and redeploys worker
+source through the native runtime on demand; full React Router RSC-style module
+evaluation inside the isolate needs a dedicated Vite ModuleRunner transport.
+
+During `vite build`, the plugin also writes a deployment config into Vite's
+output directory:
+
+```text
+dist/dd.deploy.json
+dist/worker.js
+```
+
+`deploymentConfig.input` can point at a normal source config whose `entrypoint`
+is still `src/worker.ts` and whose `assets_dir` points at source assets. The
+generated output config preserves `name`, `config`, and custom metadata, then
+replaces `entrypoint` with the bundled worker path and `assets_dir` with the
+Vite output directory. It also excludes the generated worker and config file
+from static asset packaging.
+
+```js
+ddVitePlugin({
+  entry: new URL("./src/worker.ts", import.meta.url),
+  deploymentConfig: {
+    input: new URL("./dd.json", import.meta.url),
+  },
+});
+```
+
+Package or deploy the generated config with:
+
+```bash
+cargo run -p cli -- package-deploy-config dist/dd.deploy.json
+cargo run -p cli -- deploy-config dist/dd.deploy.json
+just fly-worker-deploy-config dist/dd.deploy.json
+```
+
+`dd_dev_runtime` is explicitly a debug/dev surface. The JS client starts it with
+`--allow-code-generation` by default so worker code using `eval` or
+`new Function` can run during local test/dev. Do not expose this binary as a
+production control plane.
+
+For faster startup outside this source checkout, build the bridge once and point
+the JS client at it:
+
+```bash
+cargo build -p runtime --bin dd_dev_runtime
+export DD_DEV_RUNTIME_BIN="$PWD/target/debug/dd_dev_runtime"
+```
+
+To produce the package runtime binary for the current host, use the size-oriented
+runtime profile:
+
+```bash
+just build-dd-runtime-package
+```
+
+That writes the binary into the matching `packages/dd-runtime-*/bin` directory.
+The `dev-runtime` profile favors package size over peak execution performance.
+
 ## Patch workflow
 
 Patched crate overrides live under `./patched-crates` and are checked-in build input. A fresh clone should build with normal Cargo commands without a bootstrap step.
@@ -95,6 +237,7 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 ## Contributor checks
 
 - main repo check: `just check`
+- JS package syntax check: `just check-js`
 - smoke examples: `bash scripts/smoke_examples.sh`
 - runtime benchmark: `cargo run -p runtime --bin bench --release`
 - keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`

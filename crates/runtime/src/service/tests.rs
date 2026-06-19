@@ -45,6 +45,89 @@ async fn service_starts_with_deno_runtime_bootstrap() {
 
 #[tokio::test]
 #[serial]
+async fn production_runtime_rejects_string_code_generation() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "production-codegen".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return new Response(String(eval("20 + 1")));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let error = service
+        .invoke(
+            "production-codegen".to_string(),
+            test_invocation_with_path("/", "production-codegen"),
+        )
+        .await
+        .expect_err("production invoke should reject eval");
+    assert_eq!(error.kind(), ErrorKind::Runtime);
+    assert!(
+        error.to_string().contains("Code generation from strings"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn debug_runtime_allows_string_code_generation() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        debug_code_generation: true,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "debug-codegen".to_string(),
+            r#"
+export default {
+  async fetch() {
+    const evalValue = eval("20 + 1");
+    const functionValue = new Function("value", "return value + 1")(evalValue);
+    return new Response(String(functionValue));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "debug-codegen",
+        test_invocation_with_path("/", "debug-codegen"),
+        "debug code generation",
+    )
+    .await;
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "22");
+}
+
+#[tokio::test]
+#[serial]
 async fn worker_queue_rejects_when_per_worker_limit_is_full() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,

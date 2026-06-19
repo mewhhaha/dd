@@ -5,10 +5,11 @@ use common::{
     DeployRequest, DeployResponse, DeployTraceDestination, DynamicDeployRequest,
     DynamicDeployResponse, ErrorBody, DEFAULT_PRIVATE_SERVER_URL,
 };
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
@@ -27,6 +28,10 @@ enum Command {
     Deploy(DeployCmd),
     #[command(hide = true)]
     PackageDeploy(DeployCmd),
+    #[command(name = "deploy-config")]
+    DeployConfigFile(DeployConfigFileCmd),
+    #[command(name = "package-deploy-config", hide = true)]
+    PackageDeployConfigFile(DeployConfigFileCmd),
     DynamicDeploy(DynamicDeployCmd),
     Invoke(InvokeCmd),
 }
@@ -57,6 +62,23 @@ struct DeployCmd {
 
     #[arg(long = "trace-path", default_value = "/ingest")]
     trace_path: String,
+}
+
+#[derive(Args)]
+struct DeployConfigFileCmd {
+    config_file: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployFileConfig {
+    name: String,
+    entrypoint: String,
+    #[serde(default)]
+    assets_dir: Option<String>,
+    #[serde(default)]
+    asset_excludes: Vec<String>,
+    #[serde(default)]
+    config: DeployConfig,
 }
 
 #[derive(Args)]
@@ -107,6 +129,19 @@ async fn main() -> Result<(), String> {
             let request = build_deploy_request(command).await?;
             println!("{}", to_json_string(&request)?);
         }
+        Command::DeployConfigFile(command) => {
+            deploy_config_file(
+                &client,
+                &cli.server,
+                private_bearer_token.as_deref(),
+                command,
+            )
+            .await?
+        }
+        Command::PackageDeployConfigFile(command) => {
+            let request = build_deploy_request_from_config_file(command).await?;
+            println!("{}", to_json_string(&request)?);
+        }
         Command::DynamicDeploy(command) => {
             dynamic_deploy(
                 &client,
@@ -137,6 +172,27 @@ async fn deploy(
     command: DeployCmd,
 ) -> Result<(), String> {
     let request = build_deploy_request(command).await?;
+    let response = with_private_auth(
+        client.post(format!("{server}/v1/deploy")),
+        private_bearer_token,
+    )
+    .json(&request)
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let deployment: DeployResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&deployment)?);
+    Ok(())
+}
+
+async fn deploy_config_file(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: DeployConfigFileCmd,
+) -> Result<(), String> {
+    let request = build_deploy_request_from_config_file(command).await?;
     let response = with_private_auth(
         client.post(format!("{server}/v1/deploy")),
         private_bearer_token,
@@ -190,6 +246,46 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
         name: command.name,
         source,
         config,
+        assets,
+        asset_headers,
+    })
+}
+
+async fn build_deploy_request_from_config_file(
+    command: DeployConfigFileCmd,
+) -> Result<DeployRequest, String> {
+    let config_path = PathBuf::from(&command.config_file);
+    let config_bytes = tokio::fs::read(&config_path)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
+    let deploy_file = parse_json_bytes::<DeployFileConfig>(&config_bytes)?;
+    if deploy_file.name.trim().is_empty() {
+        return Err("deploy config name must not be empty".to_string());
+    }
+    if deploy_file.entrypoint.trim().is_empty() {
+        return Err("deploy config entrypoint must not be empty".to_string());
+    }
+
+    let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let entry_path = config_relative_path(base_dir, &deploy_file.entrypoint);
+    let source = tokio::fs::read_to_string(&entry_path)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", entry_path.display()))?;
+
+    let mut asset_excludes = deploy_file.asset_excludes;
+    let (assets, asset_headers) = if let Some(assets_dir) = deploy_file.assets_dir.as_deref() {
+        let assets_path = config_relative_path(base_dir, assets_dir);
+        push_asset_exclude_if_within(&mut asset_excludes, &assets_path, &entry_path)?;
+        push_asset_exclude_if_within(&mut asset_excludes, &assets_path, &config_path)?;
+        package_assets_dir_with_excludes(Some(&path_to_string(&assets_path)?), &asset_excludes)?
+    } else {
+        (Vec::new(), None)
+    };
+
+    Ok(DeployRequest {
+        name: deploy_file.name,
+        source,
+        config: deploy_file.config,
         assets,
         asset_headers,
     })
@@ -408,9 +504,17 @@ fn with_private_auth(
 }
 
 fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<String>), String> {
+    package_assets_dir_with_excludes(dir, &[])
+}
+
+fn package_assets_dir_with_excludes(
+    dir: Option<&str>,
+    excludes: &[String],
+) -> Result<(Vec<DeployAsset>, Option<String>), String> {
     let Some(dir) = dir else {
         return Ok((Vec::new(), None));
     };
+    let excluded_paths = normalized_asset_excludes(excludes)?;
 
     let root = Path::new(dir);
     if !root.exists() {
@@ -422,7 +526,7 @@ fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<Str
 
     let mut assets = Vec::new();
     let mut asset_headers = None;
-    collect_assets_from_dir(root, root, &mut assets, &mut asset_headers)?;
+    collect_assets_from_dir(root, root, &excluded_paths, &mut assets, &mut asset_headers)?;
     assets.sort_by(|left, right| left.path.cmp(&right.path));
     Ok((assets, asset_headers))
 }
@@ -430,6 +534,7 @@ fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<Str
 fn collect_assets_from_dir(
     root: &Path,
     current: &Path,
+    excluded_paths: &HashSet<String>,
     assets: &mut Vec<DeployAsset>,
     asset_headers: &mut Option<String>,
 ) -> Result<(), String> {
@@ -450,7 +555,7 @@ fn collect_assets_from_dir(
             ));
         }
         if metadata.is_dir() {
-            collect_assets_from_dir(root, &path, assets, asset_headers)?;
+            collect_assets_from_dir(root, &path, excluded_paths, assets, asset_headers)?;
             continue;
         }
         if !metadata.is_file() {
@@ -461,6 +566,9 @@ fn collect_assets_from_dir(
             format!("failed to normalize asset path {}: {error}", path.display())
         })?;
         let relative_path = normalize_asset_relative_path(relative)?;
+        if excluded_paths.contains(&relative_path) {
+            continue;
+        }
         if relative_path == "_headers" {
             *asset_headers = Some(
                 fs::read_to_string(&path)
@@ -514,6 +622,66 @@ fn normalize_asset_relative_path(path: &Path) -> Result<String, String> {
     Ok(segments.join("/"))
 }
 
+fn normalized_asset_excludes(excludes: &[String]) -> Result<HashSet<String>, String> {
+    excludes
+        .iter()
+        .map(|path| normalize_asset_exclude(path))
+        .collect()
+}
+
+fn normalize_asset_exclude(path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("asset exclude path must not be empty".to_string());
+    }
+    normalize_asset_relative_path(Path::new(trimmed))
+}
+
+fn config_relative_path(base_dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn push_asset_exclude_if_within(
+    excludes: &mut Vec<String>,
+    assets_root: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let assets_root = canonical_or_absolute_path(assets_root)?;
+    let path = canonical_or_absolute_path(path)?;
+    if let Ok(relative) = path.strip_prefix(&assets_root) {
+        excludes.push(normalize_asset_relative_path(relative)?);
+    }
+    Ok(())
+}
+
+fn canonical_or_absolute_path(path: &Path) -> Result<PathBuf, String> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(_) => absolute_path(path),
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn path_to_string(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
+}
+
 fn parse_json_bytes<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     let mut input = bytes.to_vec();
     simd_json::serde::from_slice(&mut input).map_err(|error| error.to_string())
@@ -525,7 +693,10 @@ fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_asset_relative_path, package_assets_dir, Cli};
+    use super::{
+        build_deploy_request_from_config_file, normalize_asset_relative_path, package_assets_dir,
+        Cli, DeployConfigFileCmd,
+    };
     use clap::Parser;
     use std::fs;
     use std::path::PathBuf;
@@ -554,6 +725,49 @@ mod tests {
         assert!(asset_headers
             .expect("headers should be present")
             .contains("Cache-Control"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn package_deploy_config_uses_bundled_entrypoint_and_excludes_artifacts() {
+        let root = temp_dir("deploy-config");
+        fs::create_dir_all(root.join("assets")).expect("create assets");
+        fs::write(root.join("worker.js"), "export default { fetch() {} };").expect("write worker");
+        fs::write(root.join("index.html"), "<div id=\"root\"></div>").expect("write html");
+        fs::write(root.join("assets").join("app.js"), "console.log('asset');")
+            .expect("write asset");
+        fs::write(
+            root.join("dd.deploy.json"),
+            r#"{
+              "name": "built-worker",
+              "entrypoint": "worker.js",
+              "assets_dir": ".",
+              "asset_excludes": ["worker.js", "dd.deploy.json"],
+              "config": {
+                "public": true,
+                "bindings": [{ "type": "memory", "binding": "ROOM" }]
+              }
+            }"#,
+        )
+        .expect("write deploy config");
+
+        let request = build_deploy_request_from_config_file(DeployConfigFileCmd {
+            config_file: root.join("dd.deploy.json").display().to_string(),
+        })
+        .await
+        .expect("package generated deploy config");
+
+        assert_eq!(request.name, "built-worker");
+        assert!(request.source.contains("export default"));
+        assert!(request.config.public);
+        assert_eq!(request.config.bindings.len(), 1);
+        let asset_paths = request
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(asset_paths, vec!["/assets/app.js", "/index.html"]);
 
         let _ = fs::remove_dir_all(root);
     }

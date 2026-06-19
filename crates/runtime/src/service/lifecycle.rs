@@ -22,8 +22,13 @@ impl WorkerManager {
         let (snapshot, snapshot_preloaded) = if has_dynamic_bindings {
             (self.bootstrap_snapshot, false)
         } else {
-            let worker_snapshot = build_worker_snapshot(self.bootstrap_snapshot, &source).await?;
-            validate_loaded_worker_runtime(worker_snapshot)?;
+            let worker_snapshot = build_worker_snapshot(
+                self.bootstrap_snapshot,
+                &source,
+                self.config.debug_code_generation,
+            )
+            .await?;
+            validate_loaded_worker_runtime(worker_snapshot, self.config.debug_code_generation)?;
             (worker_snapshot, true)
         };
         let generation = self.next_generation;

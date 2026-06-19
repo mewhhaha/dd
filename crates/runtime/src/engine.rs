@@ -5,8 +5,8 @@ use crate::assets::{
 use crate::ops::runtime_extension;
 use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
-    resolve_import, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot, ModuleLoadResponse,
-    ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
+    resolve_import, v8, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot,
+    ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
     PollEventLoopOptions, RequestedModuleType, ResolutionKind, RuntimeOptions,
 };
 use deno_crypto::deno_crypto as deno_crypto_ext;
@@ -69,8 +69,12 @@ pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub async fn validate_worker(bootstrap_snapshot: &'static [u8], source: &str) -> Result<()> {
-    let mut runtime = new_runtime(bootstrap_snapshot)?;
+pub async fn validate_worker(
+    bootstrap_snapshot: &'static [u8],
+    source: &str,
+    allow_code_generation: bool,
+) -> Result<()> {
+    let mut runtime = new_runtime(bootstrap_snapshot, allow_code_generation)?;
     load_worker(&mut runtime, source).await
 }
 
@@ -78,6 +82,7 @@ pub async fn validate_worker(bootstrap_snapshot: &'static [u8], source: &str) ->
 pub async fn build_worker_snapshot(
     _bootstrap_snapshot: &'static [u8],
     source: &str,
+    allow_code_generation: bool,
 ) -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: runtime_extensions(),
@@ -87,6 +92,7 @@ pub async fn build_worker_snapshot(
     runtime
         .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
         .map_err(runtime_error)?;
+    set_snapshot_code_generation_from_strings(&mut runtime, allow_code_generation);
     evaluate_snapshot_module(&mut runtime, WORKER_SPECIFIER, source, false).await?;
     let install_code = install_worker_js();
     evaluate_snapshot_module(&mut runtime, INSTALL_SPECIFIER, &install_code, true).await?;
@@ -94,8 +100,11 @@ pub async fn build_worker_snapshot(
     Ok(Box::leak(snapshot))
 }
 
-pub fn validate_loaded_worker_runtime(startup_snapshot: &'static [u8]) -> Result<()> {
-    let mut runtime = new_runtime(startup_snapshot)?;
+pub fn validate_loaded_worker_runtime(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+) -> Result<()> {
+    let mut runtime = new_runtime(startup_snapshot, allow_code_generation)?;
     runtime
         .execute_script(
             "<dd:worker-snapshot-validate>",
@@ -119,8 +128,11 @@ pub fn validate_loaded_worker_runtime(startup_snapshot: &'static [u8]) -> Result
     Ok(())
 }
 
-pub fn new_runtime_from_snapshot(startup_snapshot: &'static [u8]) -> Result<JsRuntime> {
-    new_runtime(startup_snapshot)
+pub fn new_runtime_from_snapshot(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+) -> Result<JsRuntime> {
+    new_runtime(startup_snapshot, allow_code_generation)
 }
 
 pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
@@ -200,14 +212,30 @@ pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()
     }
 }
 
-fn new_runtime(startup_snapshot: &'static [u8]) -> Result<JsRuntime> {
-    JsRuntime::try_new(RuntimeOptions {
+fn new_runtime(startup_snapshot: &'static [u8], allow_code_generation: bool) -> Result<JsRuntime> {
+    let mut runtime = JsRuntime::try_new(RuntimeOptions {
         extensions: runtime_extensions(),
         module_loader: Some(Rc::new(DataUrlModuleLoader)),
         startup_snapshot: Some(startup_snapshot),
         ..Default::default()
     })
-    .map_err(runtime_error)
+    .map_err(runtime_error)?;
+    set_code_generation_from_strings(&mut runtime, allow_code_generation);
+    Ok(runtime)
+}
+
+fn set_code_generation_from_strings(runtime: &mut JsRuntime, allow: bool) {
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    context.set_allow_generation_from_strings(allow);
+}
+
+fn set_snapshot_code_generation_from_strings(runtime: &mut JsRuntimeForSnapshot, allow: bool) {
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    context.set_allow_generation_from_strings(allow);
 }
 
 fn runtime_extensions() -> Vec<Extension> {
@@ -452,7 +480,8 @@ mod tests {
         let snapshot = build_bootstrap_snapshot()
             .await
             .expect("bootstrap snapshot should build");
-        let _ = new_runtime_from_snapshot(snapshot).expect("runtime should start from snapshot");
+        let _ =
+            new_runtime_from_snapshot(snapshot, false).expect("runtime should start from snapshot");
     }
 
     #[tokio::test]
@@ -461,13 +490,14 @@ mod tests {
         let snapshot = build_bootstrap_snapshot()
             .await
             .expect("bootstrap snapshot should build");
-        validate_worker(snapshot, simple_worker_source())
+        validate_worker(snapshot, simple_worker_source(), false)
             .await
             .expect("worker should validate");
-        let worker_snapshot = build_worker_snapshot(snapshot, simple_worker_source())
+        let worker_snapshot = build_worker_snapshot(snapshot, simple_worker_source(), false)
             .await
             .expect("worker snapshot should build");
-        validate_loaded_worker_runtime(worker_snapshot).expect("worker snapshot should validate");
+        validate_loaded_worker_runtime(worker_snapshot, false)
+            .expect("worker snapshot should validate");
     }
 
     #[test]
@@ -481,7 +511,7 @@ mod tests {
             .block_on(build_bootstrap_snapshot())
             .expect("bootstrap snapshot should build");
         let mut js_runtime =
-            new_runtime_from_snapshot(snapshot).expect("runtime should start from snapshot");
+            new_runtime_from_snapshot(snapshot, false).expect("runtime should start from snapshot");
 
         js_runtime
             .execute_script(
@@ -614,12 +644,12 @@ mod tests {
             let bootstrap = build_bootstrap_snapshot()
                 .await
                 .expect("bootstrap snapshot should build");
-            validate_worker(bootstrap, simple_worker_source())
+            validate_worker(bootstrap, simple_worker_source(), false)
                 .await
                 .expect("worker should validate");
             bootstrap
         });
-        let mut js_runtime = new_runtime_from_snapshot(snapshot)
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false)
             .expect("runtime should start from bootstrap snapshot");
         runtime
             .block_on(load_worker(&mut js_runtime, simple_worker_source()))
@@ -668,12 +698,12 @@ mod tests {
             let bootstrap = build_bootstrap_snapshot()
                 .await
                 .expect("bootstrap snapshot should build");
-            validate_worker(bootstrap, simple_worker_source())
+            validate_worker(bootstrap, simple_worker_source(), false)
                 .await
                 .expect("worker should validate");
             bootstrap
         });
-        let mut js_runtime = new_runtime_from_snapshot(snapshot)
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false)
             .expect("runtime should start from bootstrap snapshot");
         runtime
             .block_on(load_worker(&mut js_runtime, simple_worker_source()))

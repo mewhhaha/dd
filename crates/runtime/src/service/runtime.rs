@@ -537,6 +537,7 @@ pub(super) fn spawn_isolate_thread(
     snapshot: &'static [u8],
     snapshot_preloaded: bool,
     source: Arc<str>,
+    allow_code_generation: bool,
     kv_store: KvStore,
     memory_store: MemoryStore,
     cache_store: CacheStore,
@@ -569,13 +570,14 @@ pub(super) fn spawn_isolate_thread(
             };
 
             runtime.block_on(async move {
-                let mut js_runtime = match new_runtime_from_snapshot(snapshot) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = init_tx.send(Err(error));
-                        return;
-                    }
-                };
+                let mut js_runtime =
+                    match new_runtime_from_snapshot(snapshot, allow_code_generation) {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = init_tx.send(Err(error));
+                            return;
+                        }
+                    };
 
                 let (event_payload_tx, event_payload_rx) =
                     std_mpsc::channel::<IsolateEventPayload>();

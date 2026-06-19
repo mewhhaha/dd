@@ -869,6 +869,7 @@ impl WorkerManager {
             .and_then(|entry| entry.pools.get(&generation))
             .map(|pool| (pool.snapshot, pool.snapshot_preloaded, pool.source.clone()))
             .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
+        let allow_code_generation = self.config.debug_code_generation;
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
@@ -880,6 +881,7 @@ impl WorkerManager {
             snapshot,
             snapshot_preloaded,
             source,
+            allow_code_generation,
             kv_store,
             memory_store,
             cache_store,

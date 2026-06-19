@@ -1,0 +1,15 @@
+{
+  "name": "@dd/runtime-win32-x64",
+  "version": "0.1.0",
+  "description": "Windows x64 dd dev runtime binary",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": [
+    "bin/dd_dev_runtime.exe",
+    "README.md",
+    "package.json"
+  ],
+  "bin": {
+    "dd-dev-runtime": "bin/dd_dev_runtime.exe"
+  }
+}

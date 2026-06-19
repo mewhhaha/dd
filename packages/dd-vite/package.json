@@ -1,0 +1,38 @@
+{
+  "name": "@dd/vite",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./runtime": {
+      "types": "./src/index.d.ts",
+      "default": "./src/runtime.js"
+    },
+    "./vitest": {
+      "types": "./src/index.d.ts",
+      "default": "./src/vitest.js"
+    },
+    "./vitest-environment": {
+      "types": "./src/index.d.ts",
+      "default": "./src/vitest-environment.js"
+    }
+  },
+  "peerDependencies": {
+    "vite": "^8.0.0",
+    "vitest": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    },
+    "vitest": {
+      "optional": true
+    }
+  },
+  "optionalDependencies": {
+    "@dd/runtime": "0.1.0"
+  }
+}

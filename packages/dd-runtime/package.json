@@ -1,0 +1,21 @@
+{
+  "name": "@dd/runtime",
+  "version": "0.1.0",
+  "description": "Platform selector for the dd dev runtime binary",
+  "main": "./index.cjs",
+  "exports": {
+    ".": "./index.cjs"
+  },
+  "files": [
+    "index.cjs",
+    "README.md",
+    "package.json"
+  ],
+  "optionalDependencies": {
+    "@dd/runtime-darwin-arm64": "0.1.0",
+    "@dd/runtime-darwin-x64": "0.1.0",
+    "@dd/runtime-linux-arm64": "0.1.0",
+    "@dd/runtime-linux-x64": "0.1.0",
+    "@dd/runtime-win32-x64": "0.1.0"
+  }
+}

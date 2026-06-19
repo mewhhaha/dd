@@ -21,6 +21,7 @@ pub struct RuntimeConfig {
     pub kv_read_cache_hit_ttl: Duration,
     pub kv_read_cache_miss_ttl: Duration,
     pub v8_flags: Vec<String>,
+    pub debug_code_generation: bool,
     pub kv_profile_enabled: bool,
     pub memory_profile_enabled: bool,
 }
@@ -47,6 +48,7 @@ impl Default for RuntimeConfig {
             kv_read_cache_hit_ttl: Duration::from_secs(300),
             kv_read_cache_miss_ttl: Duration::from_secs(30),
             v8_flags: Vec::new(),
+            debug_code_generation: false,
             kv_profile_enabled: false,
             memory_profile_enabled: false,
         }

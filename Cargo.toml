@@ -32,3 +32,12 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [patch.crates-io]
 deno_crypto = { path = "patched-crates/deno_crypto" }
+
+[profile.dev-runtime]
+inherits = "release"
+codegen-units = 1
+debug = false
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"

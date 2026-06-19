@@ -29,9 +29,17 @@ fly-proxy app=default_app local_port='18081' remote_port='8081':
 fly-worker-deploy name file +flags:
   ./deploy/fly/post-worker-deploy.sh {{default_private_server}} {{name}} {{file}} {{flags}}
 
+# Deploy a generated worker config into the running Fly app through the private proxy.
+fly-worker-deploy-config config:
+  cargo run -p cli -- --server {{default_private_server}} deploy-config {{config}}
+
 # Deploy a worker into the running Fly app through an explicitly chosen private proxy endpoint.
 fly-worker-deploy-at server name file +flags:
   ./deploy/fly/post-worker-deploy.sh {{server}} {{name}} {{file}} {{flags}}
+
+# Deploy a generated worker config through an explicitly chosen private proxy endpoint.
+fly-worker-deploy-config-at server config:
+  cargo run -p cli -- --server {{server}} deploy-config {{config}}
 
 # Internal escape hatch: write directly into persisted Fly worker store, then restart machine.
 fly-worker-store-deploy name file +flags:
@@ -40,4 +48,17 @@ fly-worker-store-deploy name file +flags:
 # Contributor check path.
 check:
   bash scripts/check_public_memory_naming.sh
+  just check-js
   cargo test --workspace
+
+# Syntax-check source-only JS integration package.
+check-js:
+  node --check packages/dd-runtime/index.cjs
+  node --check packages/dd-vite/src/runtime.js
+  node --check packages/dd-vite/src/vite.js
+  node --check packages/dd-vite/src/vitest.js
+  node --check packages/dd-vite/src/vitest-environment.js
+
+# Build the size-optimized dd dev runtime binary into the current host package.
+build-dd-runtime-package package='':
+  ./scripts/build-dd-runtime-package.sh {{package}}

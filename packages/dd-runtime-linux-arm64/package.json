@@ -1,0 +1,15 @@
+{
+  "name": "@dd/runtime-linux-arm64",
+  "version": "0.1.0",
+  "description": "Linux arm64 dd dev runtime binary",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": [
+    "bin/dd_dev_runtime",
+    "README.md",
+    "package.json"
+  ],
+  "bin": {
+    "dd-dev-runtime": "bin/dd_dev_runtime"
+  }
+}

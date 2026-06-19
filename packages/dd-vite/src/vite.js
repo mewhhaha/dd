@@ -1,0 +1,405 @@
+import { createFetchableDevEnvironment, mergeConfig } from "vite";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
+import { createWorkerTestRuntime } from "./vitest.js";
+
+const DEFAULT_MOUNT = "/__dd";
+const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
+const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
+const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
+
+export function ddEnvironment(options = {}) {
+  const environmentOptions = options.viteEnvironment?.options ?? options.environmentOptions ?? {};
+  return mergeConfig(
+    {
+      consumer: "server",
+      dev: {
+        createEnvironment(name, config) {
+          let runtimePromise;
+          const getRuntime = () => {
+            runtimePromise ??= createWorkerTestRuntime({
+              ...options,
+              name: options.name ?? name,
+            });
+            return runtimePromise;
+          };
+          return createFetchableDevEnvironment(name, config, {
+            async handleRequest(request) {
+              const runtime = await getRuntime();
+              return runtime.fetch(request);
+            },
+          });
+        },
+      },
+    },
+    environmentOptions,
+  );
+}
+
+export function ddVitePlugin(options = {}) {
+  const workerName = options.name ?? "dev-worker";
+  const environmentName = options.viteEnvironment?.name ?? options.environmentName ?? "dd";
+  const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
+  let runtime;
+  let deployment;
+  let deploying;
+  const hotReloadMode = normalizeHotReloadMode(options.reloadOnHotUpdate);
+  const deploymentConfig = normalizeDeploymentConfigOptions(options.deploymentConfig);
+  let deploymentConfigWritten = false;
+  let resolvedConfig;
+
+  async function workerSource() {
+    if (typeof options.source === "function") {
+      return options.source();
+    }
+    if (typeof options.source === "string") {
+      return options.source;
+    }
+    if (!options.entry) {
+      throw new Error("ddVitePlugin requires either source or entry");
+    }
+    return bundleWorkerEntry(options.entry, {
+      viteConfig: options.viteConfig,
+      target: options.target,
+      sourcemap: options.sourcemap,
+      minify: options.minify,
+      logLevel: options.logLevel,
+    });
+  }
+
+  async function ensureDeployed() {
+    runtime ??= createDdRuntime(options.runtimeOptions);
+    if (deployment) {
+      return deployment;
+    }
+    deploying ??= runtime
+      .deploy(workerName, await workerSource(), options.config ?? { public: true })
+      .catch(async (error) => {
+        if (!isRecoverableRuntimeClientError(error)) {
+          throw error;
+        }
+        await runtime?.close().catch(() => {});
+        runtime = createDdRuntime(options.runtimeOptions);
+        return runtime.deploy(workerName, await workerSource(), options.config ?? { public: true });
+      })
+      .finally(() => {
+        deploying = undefined;
+      });
+    deployment = await deploying;
+    return deployment;
+  }
+
+  async function invalidateDeployment() {
+    deployment = undefined;
+    if (options.eager === true) {
+      await ensureDeployed();
+    }
+  }
+
+  return {
+    name: "dd-vite",
+    enforce: "post",
+    config() {
+      if (options.environment === false) {
+        return;
+      }
+      return {
+        environments: {
+          [environmentName]: ddEnvironment({
+            ...options,
+            name: workerName,
+          }),
+        },
+      };
+    },
+    configResolved(config) {
+      resolvedConfig = config;
+    },
+    configureServer(viteServer) {
+      viteServer.httpServer?.once("close", () => {
+        void runtime?.close();
+      });
+      if (options.middleware === false) {
+        return;
+      }
+      viteServer.middlewares.use(async (req, res, next) => {
+        try {
+          const originalUrl = req.url ?? "/";
+          if (!matchesMount(originalUrl, mount)) {
+            next();
+            return;
+          }
+          await ensureDeployed();
+          const request = await nodeRequestToWorkerRequest(req, originalUrl, mount, workerName);
+          const response = await runtime.fetch(workerName, request);
+          await writeNodeResponse(res, response);
+        } catch (error) {
+          next(error);
+        }
+      });
+    },
+    async handleHotUpdate(context) {
+      if (shouldInvalidateOnHotUpdate(context, options, hotReloadMode)) {
+        await invalidateDeployment();
+      }
+    },
+    async writeBundle() {
+      if (
+        deploymentConfigWritten ||
+        !deploymentConfig.enabled ||
+        !hasReloadableWorkerSource(options)
+      ) {
+        return;
+      }
+      deploymentConfigWritten = true;
+      const outDir = resolveViteOutDir(resolvedConfig);
+      const workerFile = normalizeOutputPath(
+        deploymentConfig.entrypoint ?? DEFAULT_DEPLOYMENT_WORKER_FILE,
+        "deploymentConfig.entrypoint",
+      );
+      const configFile = normalizeOutputPath(
+        deploymentConfig.output ?? DEFAULT_DEPLOYMENT_CONFIG_FILE,
+        "deploymentConfig.output",
+      );
+      await writeOutputFile(outDir, workerFile, await workerSource());
+      const config = await buildGeneratedDeploymentConfig({
+        input: deploymentConfig.input,
+        options,
+        workerName,
+        workerFile,
+        configFile,
+        assetsDir: deploymentConfig.assetsDir,
+        assetExcludes: deploymentConfig.assetExcludes,
+      });
+      await writeOutputFile(outDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
+    },
+    async closeBundle() {
+      await runtime?.close();
+    },
+  };
+}
+
+async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
+  const body = await readIncomingBody(req);
+  const path = stripMount(originalUrl, mount);
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        headers.append(name, entry);
+      }
+    } else if (value !== undefined) {
+      headers.append(name, value);
+    }
+  }
+  const url = new URL(path, `http://${workerName}.dd.local`);
+  const init = {
+    method: req.method ?? "GET",
+    headers,
+  };
+  if (body.length > 0 && req.method !== "GET" && req.method !== "HEAD") {
+    init.body = body;
+    init.duplex = "half";
+  }
+  return new Request(url, init);
+}
+
+async function writeNodeResponse(res, response) {
+  res.statusCode = response.status;
+  response.headers.forEach((value, name) => {
+    res.setHeader(name, value);
+  });
+  res.end(Buffer.from(await response.arrayBuffer()));
+}
+
+async function readIncomingBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+function normalizeMount(value) {
+  const mount = `/${String(value).replace(/^\/+|\/+$/g, "")}`;
+  return mount === "/" ? "/" : mount;
+}
+
+function matchesMount(url, mount) {
+  if (mount === "/") {
+    return true;
+  }
+  return url === mount || url.startsWith(`${mount}/`) || url.startsWith(`${mount}?`);
+}
+
+function stripMount(url, mount) {
+  if (mount === "/") {
+    return url;
+  }
+  const stripped = url.slice(mount.length);
+  return stripped.length === 0 ? "/" : stripped;
+}
+
+function normalizeFile(value) {
+  if (value instanceof URL) {
+    return fileURLToPath(value);
+  }
+  return resolve(String(value));
+}
+
+function normalizeHotReloadMode(value) {
+  if (value === undefined || value === true) {
+    return "all";
+  }
+  if (value === false || value === "all" || value === "entry") {
+    return value;
+  }
+  throw new Error("ddVitePlugin reloadOnHotUpdate must be false, true, 'all', or 'entry'");
+}
+
+function shouldInvalidateOnHotUpdate(context, options, mode) {
+  if (mode === false) {
+    return false;
+  }
+  if (mode === "all") {
+    return hasReloadableWorkerSource(options);
+  }
+  if (!options.entry) {
+    return typeof options.source === "function";
+  }
+  return context.file === normalizeFile(options.entry);
+}
+
+function hasReloadableWorkerSource(options) {
+  return Boolean(options.entry || typeof options.source === "function");
+}
+
+function isRecoverableRuntimeClientError(error) {
+  const message = String(error?.message ?? "");
+  return (
+    message.includes("stream was destroyed") ||
+    message.includes("EPIPE") ||
+    message.includes("ERR_STREAM") ||
+    message.includes("dd runtime exited")
+  );
+}
+
+function normalizeDeploymentConfigOptions(value) {
+  if (value === false) {
+    return { enabled: false };
+  }
+  return { enabled: true, ...(value ?? {}) };
+}
+
+function resolveViteOutDir(config) {
+  const root = config?.root ?? process.cwd();
+  const outDir = config?.build?.outDir ?? "dist";
+  return isAbsolute(outDir) ? outDir : resolve(root, outDir);
+}
+
+async function writeOutputFile(outDir, file, contents) {
+  const path = join(outDir, file);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, contents);
+}
+
+async function buildGeneratedDeploymentConfig({
+  input,
+  options,
+  workerName,
+  workerFile,
+  configFile,
+  assetsDir,
+  assetExcludes,
+}) {
+  const base = await loadDeploymentConfigInput(input);
+  const deployment = { ...base };
+  const runtimeConfig =
+    options.config ?? deployment.config ?? topLevelRuntimeConfig(deployment) ?? { public: true };
+
+  delete deployment.public;
+  delete deployment.bindings;
+  delete deployment.internal;
+
+  deployment.name = deployment.name ?? workerName;
+  deployment.entrypoint = workerFile;
+  if (assetsDir === false) {
+    delete deployment.assets_dir;
+  } else {
+    deployment.assets_dir = normalizeConfigRelativePath(
+      assetsDir ?? DEFAULT_DEPLOYMENT_ASSETS_DIR,
+      "deploymentConfig.assetsDir",
+    );
+  }
+  deployment.asset_excludes = uniquePaths([
+    ...arrayOfStrings(deployment.asset_excludes),
+    ...arrayOfStrings(assetExcludes),
+    workerFile,
+    configFile,
+  ]);
+  deployment.config = runtimeConfig;
+  return deployment;
+}
+
+async function loadDeploymentConfigInput(input) {
+  if (!input) {
+    return {};
+  }
+  if (typeof input === "function") {
+    return cloneJson(await input());
+  }
+  if (typeof input === "string" || input instanceof URL) {
+    return JSON.parse(await readFile(normalizeFile(input), "utf8"));
+  }
+  return cloneJson(input);
+}
+
+function topLevelRuntimeConfig(config) {
+  const runtimeConfig = {};
+  let found = false;
+  for (const key of ["public", "bindings", "internal"]) {
+    if (Object.hasOwn(config, key)) {
+      runtimeConfig[key] = config[key];
+      found = true;
+    }
+  }
+  return found ? runtimeConfig : undefined;
+}
+
+function arrayOfStrings(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry) => String(entry));
+}
+
+function uniquePaths(paths) {
+  return [...new Set(paths.map((path) => normalizeConfigRelativePath(path, "asset_excludes")))];
+}
+
+function normalizeOutputPath(value, label) {
+  const normalized = normalizeConfigRelativePath(value, label);
+  if (normalized === ".") {
+    throw new Error(`${label} must be a file path`);
+  }
+  return normalized;
+}
+
+function normalizeConfigRelativePath(value, label) {
+  const normalized = String(value).replaceAll("\\", "/").replace(/^\/+/, "");
+  const parts = normalized.split("/");
+  if (
+    normalized.length === 0 ||
+    parts.some((part) => part.length === 0 || part === "..") ||
+    isAbsolute(String(value))
+  ) {
+    throw new Error(`${label} must be a relative path inside the Vite output directory`);
+  }
+  return normalized;
+}
+
+function cloneJson(value) {
+  return value == null ? {} : JSON.parse(JSON.stringify(value));
+}

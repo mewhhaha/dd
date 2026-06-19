@@ -165,6 +165,30 @@ Static assets can be bundled at deploy time with `--assets-dir`. Files are serve
 
 Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](examples/chat-worker).
 
+## Vite and Vitest dev mode
+
+Workers can be tested and developed against the native runtime without starting
+`dd_server`. The dev package in [packages/dd-vite](packages/dd-vite) launches
+`dd_dev_runtime` over stdio, deploys worker source into `RuntimeService`, and
+invokes it directly from Vitest helpers or a Vite plugin.
+
+This is the debug/dev path where `eval` and `new Function` are allowed. It is
+not a production control plane.
+
+`@dd/vite` can use `@dd/runtime`, a small wrapper with platform-specific optional
+runtime packages, so installs pull only the binary for the current OS/CPU.
+
+The Vite plugin uses Vite's Environment API shape and preserves normal Vite HMR;
+hot updates invalidate the deployed worker and rebuild it lazily on the next
+worker request. Framework SSR environments can be targeted with
+`viteEnvironment: { name: "ssr" }`.
+
+During `vite build`, the plugin emits `dist/dd.deploy.json` and a bundled
+`dist/worker.js`. The generated config preserves deploy settings while pointing
+at the bundled worker and Vite output assets.
+
+See [docs/development.md](docs/development.md#vite-and-vitest-worker-development).
+
 ## How to think about it
 
 If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.

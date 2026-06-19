@@ -1121,11 +1121,17 @@ impl WorkerManager {
     }
 
     pub(super) async fn validate_worker_cached(&mut self, source: &str) -> Result<()> {
-        let source_hash = Sha256::digest(source.as_bytes()).into();
+        let source_hash =
+            hash_source_with_code_generation(source, self.config.debug_code_generation);
         if self.validated_worker_sources.contains(&source_hash) {
             return Ok(());
         }
-        validate_worker(self.bootstrap_snapshot, source).await?;
+        validate_worker(
+            self.bootstrap_snapshot,
+            source,
+            self.config.debug_code_generation,
+        )
+        .await?;
         self.validated_worker_sources.insert(source_hash);
         Ok(())
     }
@@ -1260,7 +1266,8 @@ impl WorkerManager {
         &mut self,
         source: &str,
     ) -> Option<&'static [u8]> {
-        let source_hash: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        let source_hash =
+            hash_source_with_code_generation(source, self.config.debug_code_generation);
         if let Some(snapshot) = self.dynamic_worker_snapshots.get(&source_hash).copied() {
             return Some(snapshot);
         }
@@ -1268,21 +1275,29 @@ impl WorkerManager {
             return None;
         }
 
-        match build_worker_snapshot(self.bootstrap_snapshot, source).await {
-            Ok(snapshot) => match validate_loaded_worker_runtime(snapshot) {
-                Ok(()) => {
-                    self.dynamic_worker_snapshots.insert(source_hash, snapshot);
-                    Some(snapshot)
+        match build_worker_snapshot(
+            self.bootstrap_snapshot,
+            source,
+            self.config.debug_code_generation,
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                match validate_loaded_worker_runtime(snapshot, self.config.debug_code_generation) {
+                    Ok(()) => {
+                        self.dynamic_worker_snapshots.insert(source_hash, snapshot);
+                        Some(snapshot)
+                    }
+                    Err(error) => {
+                        self.dynamic_worker_snapshot_failures.insert(source_hash);
+                        warn!(
+                            error = %error,
+                            "dynamic worker snapshot validation failed; falling back to bootstrap snapshot"
+                        );
+                        None
+                    }
                 }
-                Err(error) => {
-                    self.dynamic_worker_snapshot_failures.insert(source_hash);
-                    warn!(
-                        error = %error,
-                        "dynamic worker snapshot validation failed; falling back to bootstrap snapshot"
-                    );
-                    None
-                }
-            },
+            }
             Err(error) => {
                 self.dynamic_worker_snapshot_failures.insert(source_hash);
                 warn!(
@@ -1293,4 +1308,11 @@ impl WorkerManager {
             }
         }
     }
+}
+
+fn hash_source_with_code_generation(source: &str, allow_code_generation: bool) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([u8::from(allow_code_generation)]);
+    hasher.update(source.as_bytes());
+    hasher.finalize().into()
 }
