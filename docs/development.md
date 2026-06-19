@@ -163,7 +163,9 @@ preserves `name`, `config`, and custom metadata, then replaces `entrypoint` with
 the bundled worker path and `assets_dir` with the Vite output directory. It also
 excludes the generated worker and config file from static asset packaging.
 Fields such as `base_url` are carried into `dist/dd.deploy.json`, so the CLI can
-deploy the generated config without a separate `--server`.
+deploy the generated config without a separate `--server`. The plugin also
+writes `dist/_headers` with an immutable cache policy for Vite's fingerprinted
+build assets, such as `/assets/*`.
 
 ```js
 dd({

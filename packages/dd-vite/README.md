@@ -92,7 +92,9 @@ dist/
 
 By default, `dd.deploy.json` points `entrypoint` at `worker.js`, sets
 `assets_dir` to `.`, excludes `worker.js` and `dd.deploy.json` from static
-asset packaging, and carries over the runtime deploy config.
+asset packaging, and carries over the runtime deploy config. The plugin also
+writes `_headers` with an immutable cache policy for Vite's fingerprinted build
+assets, such as `/assets/*`.
 
 ```js
 export default defineConfig({

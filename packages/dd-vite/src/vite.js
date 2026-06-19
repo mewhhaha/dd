@@ -10,7 +10,9 @@ const DEFAULT_SOURCE_CONFIG_FILE = "dd.json";
 const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
 const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
 const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
+const DEFAULT_ASSET_HEADERS_FILE = "_headers";
 const DEFAULT_WORKER_NAME = "dev-worker";
+const FINGERPRINTED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const VITE_BYPASS_PREFIXES = [
   "/@vite",
   "/@id/",
@@ -248,6 +250,7 @@ export function ddVitePlugin(options = {}) {
         assetExcludes: deploymentConfig.assetExcludes,
       });
       await writeOutputFile(outDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
+      await writeGeneratedAssetPolicy(outDir, resolvedConfig);
     },
     async closeBundle() {
       await runtime?.close();
@@ -444,6 +447,41 @@ async function writeOutputFile(outDir, file, contents) {
   const path = join(outDir, file);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, contents);
+}
+
+async function writeGeneratedAssetPolicy(outDir, config) {
+  const assetsDir = normalizeConfigRelativePath(
+    config?.build?.assetsDir ?? "assets",
+    "build.assetsDir",
+  );
+  const assetPath = assetsDir === "." ? "/*" : `/${assetsDir}/*`;
+  const rule = `${assetPath}\n  Cache-Control: ${FINGERPRINTED_ASSET_CACHE_CONTROL}\n`;
+  const headersPath = join(outDir, DEFAULT_ASSET_HEADERS_FILE);
+  let existing = "";
+  try {
+    existing = await readFile(headersPath, "utf8");
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+  }
+
+  if (hasHeaderPathRule(existing, assetPath)) {
+    return;
+  }
+
+  const prefix = existing.trimEnd();
+  await writeOutputFile(
+    outDir,
+    DEFAULT_ASSET_HEADERS_FILE,
+    prefix.length > 0 ? `${prefix}\n\n${rule}` : rule,
+  );
+}
+
+function hasHeaderPathRule(contents, pathRule) {
+  return contents
+    .split(/\r?\n/)
+    .some((line) => line.trimStart() === line && line.trim() === pathRule);
 }
 
 async function buildGeneratedDeploymentConfig({
