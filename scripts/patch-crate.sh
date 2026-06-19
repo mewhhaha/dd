@@ -24,7 +24,7 @@ download_crate_source() {
 
   mkdir -p "$extract_dir"
   curl -L --fail --show-error --silent \
-    "https://crates.io/api/v1/crates/${crate}/${version}/download" \
+    "https://static.crates.io/crates/${crate}/${crate}-${version}.crate" \
     -o "$archive"
   tar -xzf "$archive" -C "$extract_dir"
   cp -R "$extract_dir/${crate}-${version}" "$output_dir"
