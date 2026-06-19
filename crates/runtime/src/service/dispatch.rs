@@ -1,5 +1,47 @@
 use super::*;
 
+const PRE_CANCELED_TTL: Duration = Duration::from_secs(60);
+const MAX_PRE_CANCELED_REQUESTS_PER_WORKER: usize = 1024;
+
+fn take_pre_canceled_request(
+    pre_canceled: &mut HashMap<String, HashMap<String, Instant>>,
+    worker_name: &str,
+    runtime_request_id: &str,
+    now: Instant,
+) -> bool {
+    let Some(request_ids) = pre_canceled.get_mut(worker_name) else {
+        return false;
+    };
+    request_ids.retain(|_, expires_at| *expires_at > now);
+    let matched = request_ids.remove(runtime_request_id).is_some();
+    if request_ids.is_empty() {
+        pre_canceled.remove(worker_name);
+    }
+    matched
+}
+
+fn remember_pre_canceled_request(
+    pre_canceled: &mut HashMap<String, HashMap<String, Instant>>,
+    worker_name: String,
+    runtime_request_id: String,
+    now: Instant,
+) {
+    let request_ids = pre_canceled.entry(worker_name).or_default();
+    request_ids.retain(|_, expires_at| *expires_at > now);
+    if request_ids.len() >= MAX_PRE_CANCELED_REQUESTS_PER_WORKER
+        && !request_ids.contains_key(&runtime_request_id)
+    {
+        let oldest_id = request_ids
+            .iter()
+            .min_by_key(|(_, expires_at)| **expires_at)
+            .map(|(request_id, _)| request_id.clone());
+        if let Some(request_id) = oldest_id {
+            request_ids.remove(&request_id);
+        }
+    }
+    request_ids.insert(runtime_request_id, now + PRE_CANCELED_TTL);
+}
+
 impl WorkerManager {
     pub(crate) fn register_stream(
         &mut self,
@@ -38,12 +80,12 @@ impl WorkerManager {
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
         let worker_name = worker_name.trim().to_string();
-        if self
-            .pre_canceled
-            .get_mut(&worker_name)
-            .map(|request_ids| request_ids.remove(&runtime_request_id))
-            .unwrap_or(false)
-        {
+        if take_pre_canceled_request(
+            &mut self.pre_canceled,
+            &worker_name,
+            &runtime_request_id,
+            Instant::now(),
+        ) {
             let _ = reply.send(Err(PlatformError::runtime("request was aborted")));
             self.fail_stream_registration(
                 &worker_name,
@@ -53,6 +95,7 @@ impl WorkerManager {
             return;
         }
         let warn_thresholds = self.config.queue_warn_thresholds.clone();
+        let queued_bytes = estimate_pending_invoke_bytes(&request, request_body.is_some());
         let Some(entry) = self.workers.get(&worker_name) else {
             let error = PlatformError::not_found("Worker not found");
             let _ = reply.send(Err(error.clone()));
@@ -64,6 +107,21 @@ impl WorkerManager {
             let error = PlatformError::not_found("Worker generation not found");
             let _ = reply.send(Err(error.clone()));
             self.fail_stream_registration(&worker_name, &runtime_request_id, error);
+            return;
+        }
+
+        let admission_error = entry
+            .pools
+            .get(&generation)
+            .and_then(|pool| self.queue_admission_error(pool, queued_bytes, internal_origin));
+        if let Some(error) = admission_error {
+            self.reject_not_queued_invoke(
+                &worker_name,
+                &runtime_request_id,
+                reply,
+                &reply_kind,
+                error,
+            );
             return;
         }
 
@@ -95,6 +153,7 @@ impl WorkerManager {
                 reply,
                 reply_kind,
                 enqueued_at: Instant::now(),
+                queued_bytes,
             });
             pool.update_queue_warning(&warn_thresholds);
         } else {
@@ -105,6 +164,146 @@ impl WorkerManager {
         }
 
         self.dispatch_pool(&worker_name, generation, event_tx);
+    }
+
+    pub(super) fn queue_admission_error(
+        &self,
+        pool: &WorkerPool,
+        queued_bytes: usize,
+        internal_origin: bool,
+    ) -> Option<PlatformError> {
+        let per_worker_limit = self.config.max_queued_requests_per_worker
+            + if internal_origin {
+                self.config.reserved_internal_queued_requests_per_worker
+            } else {
+                0
+            };
+        if pool.queue.len() >= per_worker_limit {
+            return Some(PlatformError::overloaded(format!(
+                "worker queue is full (max {per_worker_limit} queued requests)"
+            )));
+        }
+
+        let global_limit = self.config.max_global_queued_requests
+            + if internal_origin {
+                self.config.reserved_internal_queued_requests_per_worker
+            } else {
+                0
+            };
+        let total_queued = self.total_queued_requests();
+        if total_queued >= global_limit {
+            return Some(PlatformError::overloaded(format!(
+                "runtime queue is full (max {global_limit} queued requests)"
+            )));
+        }
+
+        let total_bytes = self.total_queued_bytes();
+        if total_bytes.saturating_add(queued_bytes) > self.config.max_global_queued_bytes {
+            return Some(PlatformError::overloaded(format!(
+                "runtime queue byte budget is full (max {} bytes)",
+                self.config.max_global_queued_bytes
+            )));
+        }
+
+        None
+    }
+
+    fn total_queued_requests(&self) -> usize {
+        self.workers
+            .values()
+            .flat_map(|entry| entry.pools.values())
+            .map(|pool| pool.queue.len())
+            .sum()
+    }
+
+    fn total_queued_bytes(&self) -> usize {
+        self.workers
+            .values()
+            .flat_map(|entry| entry.pools.values())
+            .flat_map(|pool| pool.queue.iter())
+            .map(|pending| pending.queued_bytes)
+            .sum()
+    }
+
+    fn reject_not_queued_invoke(
+        &mut self,
+        worker_name: &str,
+        runtime_request_id: &str,
+        reply: oneshot::Sender<Result<WorkerOutput>>,
+        reply_kind: &PendingReplyKind,
+        error: PlatformError,
+    ) {
+        match reply_kind {
+            PendingReplyKind::WebsocketOpen { session_id } => {
+                if let Some(waiter) = self.websocket_open_waiters.remove(session_id) {
+                    let _ = waiter.send(Err(error.clone()));
+                }
+            }
+            PendingReplyKind::TransportOpen { session_id } => {
+                if let Some(waiter) = self.transport_open_waiters.remove(session_id) {
+                    let _ = waiter.send(Err(error.clone()));
+                }
+                self.transport_open_channels.remove(session_id);
+            }
+            PendingReplyKind::Normal
+            | PendingReplyKind::Stream
+            | PendingReplyKind::DynamicInvoke { .. }
+            | PendingReplyKind::DynamicFetch { .. }
+            | PendingReplyKind::WebsocketFrame { .. } => {}
+        }
+        self.fail_stream_registration(worker_name, runtime_request_id, error.clone());
+        let _ = reply.send(Err(error));
+    }
+
+    pub(crate) fn expire_queued_requests(&mut self) {
+        let max_queue_wait = self.config.max_queue_wait;
+        let now = Instant::now();
+        let mut expired = Vec::new();
+
+        for (worker_name, entry) in &mut self.workers {
+            for pool in entry.pools.values_mut() {
+                let mut retained = VecDeque::with_capacity(pool.queue.len());
+                while let Some(pending) = pool.queue.pop_front() {
+                    if now.duration_since(pending.enqueued_at) >= max_queue_wait {
+                        expired.push((worker_name.clone(), pending));
+                    } else {
+                        retained.push_back(pending);
+                    }
+                }
+                pool.queue = retained;
+            }
+        }
+
+        for (worker_name, pending) in expired {
+            let runtime_request_id = pending.runtime_request_id.clone();
+            warn!(
+                worker = %worker_name,
+                runtime_request_id = %runtime_request_id,
+                max_queue_wait_ms = max_queue_wait.as_millis() as u64,
+                "dropping request after queue wait limit"
+            );
+            self.reject_pending_invoke(
+                &worker_name,
+                pending,
+                PlatformError::overloaded("request exceeded queue wait limit"),
+            );
+        }
+    }
+
+    fn reject_pending_invoke(
+        &mut self,
+        worker_name: &str,
+        pending: PendingInvoke,
+        error: PlatformError,
+    ) {
+        let PendingInvoke {
+            runtime_request_id,
+            reply,
+            reply_kind,
+            ..
+        } = pending;
+        self.clear_revalidation_for_request(&runtime_request_id);
+        self.reject_not_queued_invoke(worker_name, &runtime_request_id, reply, &reply_kind, error);
     }
 
     pub(crate) fn try_dispatch_direct_dynamic_fetch(
@@ -341,6 +540,7 @@ impl WorkerManager {
 
         let mut touched_generations = Vec::new();
         let mut abort_commands = Vec::new();
+        let mut retire_isolates = Vec::new();
         let mut matched = false;
         let mut cleared_request_ids = Vec::new();
         let mut websocket_waiters_to_abort = Vec::new();
@@ -368,15 +568,29 @@ impl WorkerManager {
                 }
 
                 for isolate in &mut pool.isolates {
-                    if let Some(pending_reply) =
-                        isolate.pending_replies.get_mut(&runtime_request_id)
-                    {
+                    if let Some(pending_reply) = isolate.pending_replies.get(&runtime_request_id) {
                         if let PendingReplyKind::WebsocketOpen { session_id } = &pending_reply.kind
                         {
                             websocket_waiters_to_abort.push(session_id.clone());
                         }
-                        pending_reply.canceled = true;
-                        abort_commands.push((*generation, isolate.id, isolate.sender.clone()));
+                        if matches!(&pending_reply.kind, PendingReplyKind::Stream) {
+                            let stream_request_ids = isolate
+                                .pending_replies
+                                .iter()
+                                .filter(|(_, pending)| {
+                                    matches!(&pending.kind, PendingReplyKind::Stream)
+                                })
+                                .map(|(request_id, _)| request_id.clone())
+                                .collect::<Vec<_>>();
+                            retire_isolates.push((*generation, isolate.id, stream_request_ids));
+                        } else {
+                            if let Some(pending_reply) =
+                                isolate.pending_replies.get_mut(&runtime_request_id)
+                            {
+                                pending_reply.canceled = true;
+                            }
+                            abort_commands.push((*generation, isolate.id, isolate.sender.clone()));
+                        }
                         generation_touched = true;
                         matched = true;
                     }
@@ -416,16 +630,35 @@ impl WorkerManager {
             }
         }
 
+        for (generation, isolate_id, stream_request_ids) in retire_isolates {
+            for request_id in stream_request_ids {
+                self.fail_stream_registration(
+                    &worker_name,
+                    &request_id,
+                    PlatformError::runtime("request was aborted"),
+                );
+            }
+            let failed = self.remove_isolate_by_id(&worker_name, generation, isolate_id);
+            for (request_id, reply) in failed {
+                self.clear_revalidation_for_request(&request_id);
+                let _ = reply.send(Err(PlatformError::runtime(
+                    "streaming request was aborted; isolate retired",
+                )));
+            }
+        }
+
         touched_generations.sort_unstable();
         touched_generations.dedup();
         for generation in touched_generations {
             self.dispatch_pool(&worker_name, generation, event_tx);
         }
         if !matched {
-            self.pre_canceled
-                .entry(worker_name.clone())
-                .or_default()
-                .insert(runtime_request_id.clone());
+            remember_pre_canceled_request(
+                &mut self.pre_canceled,
+                worker_name.clone(),
+                runtime_request_id.clone(),
+                Instant::now(),
+            );
             self.fail_stream_registration(
                 &worker_name,
                 &runtime_request_id,
@@ -1018,5 +1251,102 @@ impl WorkerManager {
                 }
             }
         });
+    }
+}
+
+pub(super) fn estimate_pending_invoke_bytes(
+    request: &WorkerInvocation,
+    has_streaming_body: bool,
+) -> usize {
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .sum::<usize>();
+    request
+        .method
+        .len()
+        .saturating_add(request.url.len())
+        .saturating_add(request.request_id.len())
+        .saturating_add(request.body.len())
+        .saturating_add(headers)
+        .saturating_add(if has_streaming_body { 1024 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_canceled_request_is_taken_once_before_ttl() {
+        let now = Instant::now();
+        let mut pre_canceled = HashMap::new();
+
+        remember_pre_canceled_request(
+            &mut pre_canceled,
+            "worker".to_string(),
+            "request".to_string(),
+            now,
+        );
+
+        assert!(take_pre_canceled_request(
+            &mut pre_canceled,
+            "worker",
+            "request",
+            now + Duration::from_secs(1)
+        ));
+        assert!(!take_pre_canceled_request(
+            &mut pre_canceled,
+            "worker",
+            "request",
+            now + Duration::from_secs(1)
+        ));
+        assert!(pre_canceled.is_empty());
+    }
+
+    #[test]
+    fn pre_canceled_requests_expire_and_are_capped() {
+        let now = Instant::now();
+        let mut pre_canceled = HashMap::new();
+
+        remember_pre_canceled_request(
+            &mut pre_canceled,
+            "worker".to_string(),
+            "expired".to_string(),
+            now,
+        );
+        assert!(!take_pre_canceled_request(
+            &mut pre_canceled,
+            "worker",
+            "expired",
+            now + PRE_CANCELED_TTL + Duration::from_millis(1)
+        ));
+        assert!(pre_canceled.is_empty());
+
+        for index in 0..(MAX_PRE_CANCELED_REQUESTS_PER_WORKER + 10) {
+            remember_pre_canceled_request(
+                &mut pre_canceled,
+                "worker".to_string(),
+                format!("request-{index}"),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+
+        assert_eq!(
+            pre_canceled.get("worker").expect("worker tombstones").len(),
+            MAX_PRE_CANCELED_REQUESTS_PER_WORKER
+        );
+        assert!(!take_pre_canceled_request(
+            &mut pre_canceled,
+            "worker",
+            "request-0",
+            now + Duration::from_secs(1)
+        ));
+        assert!(take_pre_canceled_request(
+            &mut pre_canceled,
+            "worker",
+            "request-1024",
+            now + Duration::from_secs(1)
+        ));
     }
 }

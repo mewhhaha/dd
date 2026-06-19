@@ -284,6 +284,26 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
             "max_inflight_per_isolate must be greater than 0",
         ));
     }
+    if config.max_queued_requests_per_worker == 0 {
+        return Err(PlatformError::internal(
+            "max_queued_requests_per_worker must be greater than 0",
+        ));
+    }
+    if config.max_global_queued_requests == 0 {
+        return Err(PlatformError::internal(
+            "max_global_queued_requests must be greater than 0",
+        ));
+    }
+    if config.max_global_queued_bytes == 0 {
+        return Err(PlatformError::internal(
+            "max_global_queued_bytes must be greater than 0",
+        ));
+    }
+    if config.max_queue_wait.is_zero() {
+        return Err(PlatformError::internal(
+            "max_queue_wait must be greater than 0",
+        ));
+    }
     if config.min_isolates > config.max_isolates {
         return Err(PlatformError::internal(
             "min_isolates cannot exceed max_isolates",

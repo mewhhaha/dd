@@ -306,6 +306,7 @@ pub(super) fn spawn_runtime_thread(
                             }
                         }
                         _ = ticker.tick() => {
+                            manager.expire_queued_requests();
                             manager.scale_down_idle();
                         }
                         else => {

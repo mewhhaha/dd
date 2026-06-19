@@ -66,7 +66,7 @@ pub use self::facade::{
     DynamicDeployResult, DynamicHandleDebug, DynamicRuntimeDebugDump, HostRpcProviderDebug,
     InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
     RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
-    WorkerDebugRequest, WorkerStats, WorkerStreamOutput,
+    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };
 use self::isolate::*;
 pub(crate) use self::model::DynamicQuotaState;

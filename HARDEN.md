@@ -207,7 +207,7 @@ Verification:
 
 - Added this progress log.
 - Started canonical benchmark history in `BENCHMARK.md`.
-- Updated stale local links from the old `/home/mewhhaha/src/grugd` checkout path to `/home/mewhhaha/src/dd`.
+- Updated stale machine-local documentation links to repository-relative paths.
 - Folded the older `BENCHMARKS.md` full-suite snapshot into `BENCHMARK.md` and removed the duplicate file.
 
 ### Benchmark Harness
@@ -701,3 +701,41 @@ Verification:
 ### General Review Pass 7
 
 No new actionable comments after the STM/op-boundary cleanup and H3 pending-handshake cap.
+
+### External Review Follow-up Pass 8 Comments
+
+- [x] `crates/runtime/src/service/dispatch.rs`: accepted static-worker invokes could still accumulate in unbounded per-worker queues. The warning thresholds did not enforce admission limits, so a slow or stuck worker could retain request metadata and reply channels until memory pressure.
+- [x] `crates/runtime/src/service/facade.rs` and `crates/runtime/src/service/control.rs`: invoke cancellation was armed before the bounded runtime command send completed, and streaming registration plus invoke were separate commands. Dropping a caller while the command channel was saturated could leave unmatched cancellation tombstones.
+- [x] `crates/runtime/src/service/dispatch.rs`: unmatched cancellation tombstones had no TTL or size bound.
+- [x] `crates/runtime/src/service/facade.rs`, `crates/runtime/src/service/lifecycle.rs`, and `crates/api/src/handlers/invocation.rs`: streaming HTTP responses disarmed cancellation as soon as headers were ready. Dropping the response body did not cancel or retire the running stream, so an infinite stream could occupy an isolate indefinitely.
+- [x] `crates/api/src/main.rs`, `crates/api/src/lib.rs`, `crates/cli/src/main.rs`, and `crates/common/src/lib.rs`: CLI/server port defaults were duplicated and inconsistent, and a whitespace-only `DD_PRIVATE_TOKEN` masked a valid `PRIVATE_BEARER_TOKEN`.
+- [x] `README.md`, `docs/development.md`, and example READMEs: documentation links still included machine-local absolute paths.
+- [x] `justfile`: the default contributor check compiled workspace tests with `--no-run` but did not execute them.
+
+Resolution:
+
+- Added per-worker queued request limits, a global queued request limit, a global queued byte budget, a small internal-origin reserve, and queue-wait expiry. Rejected invocations now use `ErrorKind::Overloaded`, which the API maps to `503 Service Unavailable`.
+- Made streaming invoke submission atomic with a single `InvokeStream` runtime command, armed invoke cancellation only after the runtime command send succeeds, and removed the obsolete normal-invoke `stream_response` flag.
+- Added a 60-second TTL and a 1024-entry per-worker cap for pre-canceled request tombstones.
+- Added `WorkerStreamBody`, which owns the cancellation guard until the body reaches EOF or a terminal stream error. Dropping the body before completion now cancels the runtime request; active streaming cancellations retire the affected isolate from the dispatch pool so a stuck stream cannot block replacement work.
+- Centralized the canonical public/private bind defaults and private CLI URL in the common crate, and reused one first-non-empty token helper in the API and CLI.
+- Converted the reviewed README/development/example links to repository-relative paths.
+- Added the current project metrics and benchmark snapshot to the end of the README.
+- Changed `just check` to run `cargo test --workspace` after the public memory naming check.
+
+Residual review items needing dedicated follow-up:
+
+The external review still identifies larger production work that is not closed by this pass: byte-bounded streaming/WebTransport backpressure, hard execution and waitUntil deadlines, canonical worker-name validation, a full structured error taxonomy, centralized response-header policy, graceful server shutdown, global connection/request admission controls, operator-facing runtime configuration, health/readiness/metrics endpoints, stronger worker deployment durability, DNS/IP-aware dynamic egress enforcement, dependency patch maintenance, CI/toolchain hardening, and broader public API documentation.
+
+Verification:
+
+- `cargo fmt --check`
+- `cargo test -p common first_non_empty_trimmed`
+- `cargo test -p dd_server token_selection`
+- `cargo test -p cli`
+- `cargo test -p runtime pre_canceled`
+- `cargo test -p runtime worker_queue_`
+- `cargo test -p runtime invoke_stream_`
+- `cargo test -p dd_server --no-run`
+- `cargo test -p runtime --no-run`
+- `just check`

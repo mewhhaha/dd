@@ -4,7 +4,7 @@ This example shows the deploy-time asset flow:
 
 - `/index.html`, `/styles.css`, and `/app.js` come from `--assets-dir`
 - the worker only handles `/`, `/api/time`, and 404s
-- root [examples/static-assets-site/assets/_headers](/home/mewhhaha/src/dd/examples/static-assets-site/assets/_headers) sets asset-only caching policy
+- root [examples/static-assets-site/assets/_headers](assets/_headers) sets asset-only caching policy
 
 ## Deploy
 

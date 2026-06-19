@@ -3,10 +3,26 @@ use std::{collections::HashMap, fmt};
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
+pub const DEFAULT_PUBLIC_BIND_ADDR: &str = "0.0.0.0:8080";
+pub const DEFAULT_PRIVATE_BIND_ADDR: &str = "[::]:8081";
+pub const DEFAULT_PRIVATE_SERVER_URL: &str = "http://127.0.0.1:8081";
+
+pub fn first_non_empty_trimmed<I, S>(values: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    values
+        .into_iter()
+        .map(|value| value.as_ref().trim().to_string())
+        .find(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     BadRequest,
     NotFound,
+    Overloaded,
     Runtime,
     Internal,
 }
@@ -31,6 +47,10 @@ impl PlatformError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::NotFound, message)
+    }
+
+    pub fn overloaded(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Overloaded, message)
     }
 
     pub fn runtime(message: impl Into<String>) -> Self {
@@ -171,7 +191,7 @@ pub struct WorkerOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::DeployRequest;
+    use super::{first_non_empty_trimmed, DeployRequest};
 
     #[test]
     fn deploy_binding_rejects_legacy_actor_json_type() {
@@ -187,5 +207,14 @@ mod tests {
             }"#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn first_non_empty_trimmed_skips_missing_or_blank_values() {
+        assert_eq!(
+            first_non_empty_trimmed(["", "  ", " fallback "]).as_deref(),
+            Some("fallback")
+        );
+        assert!(first_non_empty_trimmed(["", "  "]).is_none());
     }
 }

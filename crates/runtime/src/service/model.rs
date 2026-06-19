@@ -9,7 +9,7 @@ pub(super) struct WorkerManager {
     pub(super) memory_store: MemoryStore,
     pub(super) cache_store: CacheStore,
     pub(super) workers: HashMap<String, WorkerEntry>,
-    pub(super) pre_canceled: HashMap<String, HashSet<String>>,
+    pub(super) pre_canceled: HashMap<String, HashMap<String, Instant>>,
     pub(super) stream_registrations: HashMap<String, StreamRegistration>,
     pub(super) revalidation_keys: HashSet<String>,
     pub(super) revalidation_requests: HashMap<String, String>,
@@ -232,6 +232,7 @@ pub(super) struct PendingInvoke {
     pub(super) internal_origin: bool,
     pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
     pub(super) enqueued_at: Instant,
+    pub(super) queued_bytes: usize,
 }
 
 #[derive(Clone)]

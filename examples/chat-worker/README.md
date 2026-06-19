@@ -8,8 +8,8 @@ This example is a small browser chat built with:
 
 ## Assets
 
-- browser files live under [examples/chat-worker/assets](/home/mewhhaha/src/dd/examples/chat-worker/assets)
-- the root [examples/chat-worker/assets/_headers](/home/mewhhaha/src/dd/examples/chat-worker/assets/_headers) file applies asset-only response headers
+- browser files live under [examples/chat-worker/assets](assets)
+- the root [examples/chat-worker/assets/_headers](assets/_headers) file applies asset-only response headers
 
 ## Deploy
 

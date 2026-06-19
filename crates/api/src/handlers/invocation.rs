@@ -477,7 +477,10 @@ fn request_method_allows_body(method: &Method) -> bool {
 fn build_worker_stream_response(
     worker_response: runtime::WorkerStreamOutput,
 ) -> ApiResult<Response<ResponseBody>> {
-    let stream = UnboundedReceiverStream::new(worker_response.body).map(|chunk| {
+    let stream = futures_util::stream::unfold(worker_response.body, |mut body| async move {
+        body.recv().await.map(|chunk| (chunk, body))
+    })
+    .map(|chunk| {
         chunk
             .map(Bytes::from)
             .map(Frame::data)

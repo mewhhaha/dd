@@ -24,7 +24,14 @@ pub(crate) enum RuntimeCommand {
         runtime_request_id: String,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
-        stream_response: bool,
+        reply: oneshot::Sender<Result<WorkerOutput>>,
+    },
+    InvokeStream {
+        worker_name: String,
+        runtime_request_id: String,
+        request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
+        ready: oneshot::Sender<Result<WorkerStreamOutput>>,
         reply: oneshot::Sender<Result<WorkerOutput>>,
     },
     DynamicWorkerFetchStart {
@@ -43,11 +50,6 @@ pub(crate) enum RuntimeCommand {
     RetireDynamicWorker {
         worker_name: String,
         reason: String,
-    },
-    RegisterStream {
-        worker_name: String,
-        runtime_request_id: String,
-        ready: oneshot::Sender<Result<WorkerStreamOutput>>,
     },
     Cancel {
         worker_name: String,
@@ -339,7 +341,6 @@ impl WorkerManager {
                 runtime_request_id,
                 request,
                 request_body,
-                stream_response,
                 reply,
             } => {
                 let _ = self.enqueue_invoke(
@@ -354,11 +355,33 @@ impl WorkerManager {
                     None,
                     false,
                     reply,
-                    if stream_response {
-                        PendingReplyKind::Stream
-                    } else {
-                        PendingReplyKind::Normal
-                    },
+                    PendingReplyKind::Normal,
+                    event_tx,
+                );
+                true
+            }
+            RuntimeCommand::InvokeStream {
+                worker_name,
+                runtime_request_id,
+                request,
+                request_body,
+                ready,
+                reply,
+            } => {
+                self.register_stream(worker_name.clone(), runtime_request_id.clone(), ready);
+                self.enqueue_invoke(
+                    worker_name,
+                    runtime_request_id,
+                    request,
+                    request_body,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    reply,
+                    PendingReplyKind::Stream,
                     event_tx,
                 );
                 true
@@ -570,14 +593,6 @@ impl WorkerManager {
                     event_tx,
                 );
                 let _ = reply.send(result);
-                true
-            }
-            RuntimeCommand::RegisterStream {
-                worker_name,
-                runtime_request_id,
-                ready,
-            } => {
-                self.register_stream(worker_name, runtime_request_id, ready);
                 true
             }
             RuntimeCommand::Cancel {

@@ -5,8 +5,7 @@ mod handlers_runtime_tests;
 mod public_quic;
 mod state;
 
-use common::PlatformError;
-use common::Result;
+use common::{PlatformError, Result, DEFAULT_PRIVATE_BIND_ADDR, DEFAULT_PUBLIC_BIND_ADDR};
 use runtime::{RuntimeService, RuntimeServiceConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -31,8 +30,12 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_public_addr: SocketAddr::from(([127, 0, 0, 1], 3000)),
-            bind_private_addr: SocketAddr::from(([127, 0, 0, 1], 3001)),
+            bind_public_addr: DEFAULT_PUBLIC_BIND_ADDR
+                .parse()
+                .expect("default public bind address must parse"),
+            bind_private_addr: DEFAULT_PRIVATE_BIND_ADDR
+                .parse()
+                .expect("default private bind address must parse"),
             public_base_domain: "example.com".to_string(),
             private_bearer_token: None,
             allow_insecure_private_loopback: false,

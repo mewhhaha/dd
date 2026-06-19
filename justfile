@@ -40,4 +40,4 @@ fly-worker-store-deploy name file +flags:
 # Contributor check path.
 check:
   bash scripts/check_public_memory_naming.sh
-  cargo test --workspace --no-run
+  cargo test --workspace

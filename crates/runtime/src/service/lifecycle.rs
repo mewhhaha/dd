@@ -1,3 +1,4 @@
+use super::dispatch::estimate_pending_invoke_bytes;
 use super::*;
 
 impl WorkerManager {
@@ -349,7 +350,7 @@ impl WorkerManager {
                 let _ = ready.send(Ok(WorkerStreamOutput {
                     status,
                     headers,
-                    body,
+                    body: WorkerStreamBody::new(body),
                 }));
             } else {
                 let _ = ready.send(Err(PlatformError::internal("stream body receiver missing")));
@@ -446,6 +447,22 @@ impl WorkerManager {
         };
         let (reply, _receiver) = oneshot::channel();
         let warn_thresholds = self.config.queue_warn_thresholds.clone();
+        let queued_bytes = estimate_pending_invoke_bytes(&invocation, false);
+        let admission_error = self
+            .workers
+            .get(worker_name)
+            .and_then(|entry| entry.pools.get(&generation))
+            .and_then(|pool| self.queue_admission_error(pool, queued_bytes, false));
+        if let Some(error) = admission_error {
+            self.revalidation_keys.remove(&key);
+            warn!(
+                worker = %worker_name,
+                generation,
+                error = %error,
+                "skipping cache revalidation because worker queue is overloaded"
+            );
+            return;
+        }
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             pool.queue.push_back(PendingInvoke {
                 runtime_request_id: runtime_request_id.clone(),
@@ -459,6 +476,7 @@ impl WorkerManager {
                 reply,
                 reply_kind: PendingReplyKind::Normal,
                 enqueued_at: Instant::now(),
+                queued_bytes,
             });
             pool.update_queue_warning(&warn_thresholds);
             self.revalidation_requests.insert(runtime_request_id, key);
@@ -530,7 +548,7 @@ impl WorkerManager {
                             let _ = ready.send(Ok(WorkerStreamOutput {
                                 status,
                                 headers,
-                                body,
+                                body: WorkerStreamBody::new(body),
                             }));
                         } else {
                             let _ = ready

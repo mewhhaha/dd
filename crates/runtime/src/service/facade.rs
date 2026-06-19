@@ -5,6 +5,11 @@ pub struct RuntimeConfig {
     pub min_isolates: usize,
     pub max_isolates: usize,
     pub max_inflight_per_isolate: usize,
+    pub max_queued_requests_per_worker: usize,
+    pub reserved_internal_queued_requests_per_worker: usize,
+    pub max_global_queued_requests: usize,
+    pub max_global_queued_bytes: usize,
+    pub max_queue_wait: Duration,
     pub idle_ttl: Duration,
     pub scale_tick: Duration,
     pub queue_warn_thresholds: Vec<usize>,
@@ -26,6 +31,11 @@ impl Default for RuntimeConfig {
             min_isolates: 0,
             max_isolates: 8,
             max_inflight_per_isolate: 4,
+            max_queued_requests_per_worker: 1024,
+            reserved_internal_queued_requests_per_worker: 64,
+            max_global_queued_requests: 16 * 1024,
+            max_global_queued_bytes: 64 * 1024 * 1024,
+            max_queue_wait: Duration::from_secs(30),
             idle_ttl: Duration::from_secs(30),
             scale_tick: Duration::from_secs(1),
             queue_warn_thresholds: vec![10, 100, 1000],
@@ -164,7 +174,49 @@ pub struct DynamicRuntimeDebugDump {
 pub struct WorkerStreamOutput {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
+    pub body: WorkerStreamBody,
+}
+
+pub struct WorkerStreamBody {
+    receiver: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
+    cancel_guard: Option<InvokeCancelGuard>,
+}
+
+impl std::fmt::Debug for WorkerStreamBody {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerStreamBody")
+            .field("has_cancel_guard", &self.cancel_guard.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkerStreamBody {
+    pub(super) fn new(receiver: mpsc::UnboundedReceiver<Result<Vec<u8>>>) -> Self {
+        Self {
+            receiver,
+            cancel_guard: None,
+        }
+    }
+
+    pub(super) fn attach_cancel_guard(&mut self, cancel_guard: InvokeCancelGuard) {
+        self.cancel_guard = Some(cancel_guard);
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<Vec<u8>>> {
+        let next = self.receiver.recv().await;
+        if next.is_none() || matches!(next, Some(Err(_))) {
+            self.disarm_cancel_guard();
+        }
+        next
+    }
+
+    fn disarm_cancel_guard(&mut self) {
+        if let Some(cancel_guard) = self.cancel_guard.as_mut() {
+            cancel_guard.disarm();
+        }
+        self.cancel_guard = None;
+    }
 }
 
 #[derive(Debug)]
@@ -498,24 +550,20 @@ impl RuntimeService {
             None
         };
         let _invoke_guard = invoke_span.as_ref().map(|span| span.enter());
-        let mut cancel_guard = InvokeCancelGuard::new(
-            self.cancel_sender.clone(),
-            worker_name.clone(),
-            runtime_request_id.clone(),
-        );
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::Invoke {
-                worker_name,
-                runtime_request_id,
+                worker_name: worker_name.clone(),
+                runtime_request_id: runtime_request_id.clone(),
                 request,
                 request_body,
-                stream_response: false,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
 
+        let mut cancel_guard =
+            InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
         let reply = reply_rx.await;
         cancel_guard.disarm();
         reply.map_err(|_| PlatformError::internal("runtime invoke channel closed"))?
@@ -550,42 +598,35 @@ impl RuntimeService {
             None
         };
         let _stream_guard = stream_span.as_ref().map(|span| span.enter());
-        let mut cancel_guard = InvokeCancelGuard::new(
-            self.cancel_sender.clone(),
-            worker_name.clone(),
-            runtime_request_id.clone(),
-        );
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (reply_tx, _reply_rx) = oneshot::channel();
         self.sender
-            .send(RuntimeCommand::RegisterStream {
+            .send(RuntimeCommand::InvokeStream {
                 worker_name: worker_name.clone(),
                 runtime_request_id: runtime_request_id.clone(),
-                ready: ready_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::Invoke {
-                worker_name,
-                runtime_request_id,
                 request,
                 request_body,
-                stream_response: true,
+                ready: ready_tx,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-        tokio::spawn(async move {
-            let _ = reply_rx.await;
-        });
+        let mut cancel_guard =
+            InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
 
         let ready = ready_rx
             .await
             .map_err(|_| PlatformError::internal("runtime stream channel closed"))?;
-        cancel_guard.disarm();
-        ready
+        match ready {
+            Ok(mut output) => {
+                output.body.attach_cancel_guard(cancel_guard);
+                Ok(output)
+            }
+            Err(error) => {
+                cancel_guard.disarm();
+                Err(error)
+            }
+        }
     }
 
     pub async fn open_websocket(

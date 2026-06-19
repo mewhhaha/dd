@@ -178,6 +178,7 @@ impl ApiError {
         let status = match self.0.kind() {
             ErrorKind::BadRequest | ErrorKind::Runtime => StatusCode::BAD_REQUEST,
             ErrorKind::NotFound => StatusCode::NOT_FOUND,
+            ErrorKind::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = serde_json::to_vec(&ErrorBody::from_error(&self.0))

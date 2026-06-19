@@ -1,5 +1,8 @@
 use clap::Parser;
-use common::{PlatformError, Result};
+use common::{
+    first_non_empty_trimmed, PlatformError, Result, DEFAULT_PRIVATE_BIND_ADDR,
+    DEFAULT_PUBLIC_BIND_ADDR,
+};
 use dd_server::ServerConfig;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
@@ -21,10 +24,10 @@ use tracing_subscriber::EnvFilter;
     after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT"
 )]
 struct Cli {
-    #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = DEFAULT_PUBLIC_BIND_ADDR)]
     bind_public_addr: String,
 
-    #[arg(long, env = "BIND_PRIVATE_ADDR", default_value = "[::]:8081")]
+    #[arg(long, env = "BIND_PRIVATE_ADDR", default_value = DEFAULT_PRIVATE_BIND_ADDR)]
     bind_private_addr: String,
 
     #[arg(long, env = "PUBLIC_BASE_DOMAIN", default_value = "example.com")]
@@ -66,7 +69,10 @@ async fn main() -> Result<()> {
         .bind_private_addr
         .parse()
         .map_err(|error| PlatformError::internal(format!("invalid BIND_PRIVATE_ADDR: {error}")))?;
-    let private_bearer_token = first_non_empty_token([cli.private_token, cli.private_bearer_token]);
+    let private_bearer_token = first_non_empty_trimmed([
+        cli.private_token.unwrap_or_default(),
+        cli.private_bearer_token.unwrap_or_default(),
+    ]);
     let allow_insecure_private_loopback =
         cli.dd_allow_insecure_private_loopback || cli.allow_insecure_private_loopback;
 
@@ -86,14 +92,6 @@ async fn main() -> Result<()> {
         let _ = provider.shutdown();
     }
     result
-}
-
-fn first_non_empty_token(tokens: impl IntoIterator<Item = Option<String>>) -> Option<String> {
-    tokens
-        .into_iter()
-        .flatten()
-        .map(|token| token.trim().to_string())
-        .find(|token| !token.is_empty())
 }
 
 fn init_tracing() -> Result<Option<OTelTracerProvider>> {
@@ -136,26 +134,23 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
 
 #[cfg(test)]
 mod tests {
-    use super::first_non_empty_token;
+    use common::first_non_empty_trimmed;
 
     #[test]
     fn token_selection_uses_first_non_empty_token() {
-        let token = first_non_empty_token([
-            Some("  primary  ".to_string()),
-            Some("fallback".to_string()),
-        ]);
+        let token = first_non_empty_trimmed(["  primary  ", "fallback"]);
         assert_eq!(token.as_deref(), Some("primary"));
     }
 
     #[test]
     fn token_selection_skips_empty_preferred_token() {
-        let token = first_non_empty_token([Some("  ".to_string()), Some("fallback".to_string())]);
+        let token = first_non_empty_trimmed(["  ", "fallback"]);
         assert_eq!(token.as_deref(), Some("fallback"));
     }
 
     #[test]
     fn token_selection_returns_none_when_all_tokens_are_empty() {
-        let token = first_non_empty_token([None, Some(" ".to_string())]);
+        let token = first_non_empty_trimmed(["", " "]);
         assert!(token.is_none());
     }
 }

@@ -22,13 +22,13 @@ export DD_PRIVATE_TOKEN=dev-token
 cargo run -p dd_server
 ```
 
-CLI default server is `http://127.0.0.1:3001`, so either pass `--server http://127.0.0.1:8081` explicitly or set:
+CLI default server is `http://127.0.0.1:8081`. To override it, pass `--server` explicitly or set:
 
 ```bash
 export DD_SERVER=http://127.0.0.1:8081
 ```
 
-Normal builds do not scrape old `target/` artifacts for RPC bindings. Checked-in generated bindings live at [crates/runtime/src/generated/memory_rpc_capnp.rs](/home/mewhhaha/src/dd/crates/runtime/src/generated/memory_rpc_capnp.rs) and are fingerprint-checked against [crates/runtime/schema/memory_rpc.capnp](/home/mewhhaha/src/dd/crates/runtime/schema/memory_rpc.capnp) during build.
+Normal builds do not scrape old `target/` artifacts for RPC bindings. Checked-in generated bindings live at [crates/runtime/src/generated/memory_rpc_capnp.rs](../crates/runtime/src/generated/memory_rpc_capnp.rs) and are fingerprint-checked against [crates/runtime/schema/memory_rpc.capnp](../crates/runtime/schema/memory_rpc.capnp) during build.
 
 If you change the schema, regenerate the checked-in bindings on a machine with `capnp` installed, then commit both files together.
 
@@ -54,8 +54,8 @@ just patch-refresh deno_crypto 0.255.0
 
 `dd_server` can run as library through `dd_server::run(ServerConfig { ... })`. Runtime/storage config lives in typed Rust config, not env wiring. See:
 
-- [crates/api/src/lib.rs](/home/mewhhaha/src/dd/crates/api/src/lib.rs)
-- [crates/runtime/src/service.rs](/home/mewhhaha/src/dd/crates/runtime/src/service.rs)
+- [crates/api/src/lib.rs](../crates/api/src/lib.rs)
+- [crates/runtime/src/service.rs](../crates/runtime/src/service.rs)
 
 ## Raw deploy/invoke API
 
@@ -106,4 +106,4 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 - deploy worker through proxy: `just fly-worker-deploy <name> <file> [flags...]`
 - direct store write helper exists as internal recovery path: `just fly-worker-store-deploy ...`
 
-Canonical operational guide: [deploy/fly/README.md](/home/mewhhaha/src/dd/deploy/fly/README.md)
+Canonical operational guide: [deploy/fly/README.md](../deploy/fly/README.md)

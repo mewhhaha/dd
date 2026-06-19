@@ -3,7 +3,7 @@ use super::{
 };
 use common::{
     DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination,
-    WorkerInvocation, WorkerOutput,
+    ErrorKind, WorkerInvocation, WorkerOutput,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +41,188 @@ async fn service_starts_with_deno_runtime_bootstrap() {
         ..RuntimeConfig::default()
     })
     .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn worker_queue_rejects_when_per_worker_limit_is_full() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        max_queued_requests_per_worker: 1,
+        max_global_queued_requests: 16,
+        max_global_queued_bytes: 1024 * 1024,
+        max_queue_wait: Duration::from_secs(5),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "queue-limit".to_string();
+    service
+        .deploy(
+            worker.clone(),
+            r#"
+export default {
+  async fetch(request) {
+    await Deno.core.ops.op_sleep(200);
+    return new Response(new URL(request.url).pathname);
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first_service = service.clone();
+    let first_worker = worker.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .invoke(first_worker, test_invocation_with_path("/one", "queue-one"))
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service.stats(worker.clone()).await.expect("stats");
+            if stats.inflight_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first request should dispatch");
+
+    let second_service = service.clone();
+    let second_worker = worker.clone();
+    let second = tokio::spawn(async move {
+        second_service
+            .invoke(
+                second_worker,
+                test_invocation_with_path("/two", "queue-two"),
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service.stats(worker.clone()).await.expect("stats");
+            if stats.queued == 1 && stats.inflight_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("second request should occupy the queue");
+
+    let error = service
+        .invoke(
+            worker.clone(),
+            test_invocation_with_path("/three", "queue-three"),
+        )
+        .await
+        .expect_err("third request should be rejected");
+    assert_eq!(error.kind(), ErrorKind::Overloaded);
+    assert!(error.to_string().contains("worker queue is full"));
+
+    timeout(Duration::from_secs(3), first)
+        .await
+        .expect("first join")
+        .expect("first request should complete")
+        .expect("first request should succeed");
+    timeout(Duration::from_secs(3), second)
+        .await
+        .expect("second join")
+        .expect("second request should complete")
+        .expect("second request should succeed");
+}
+
+#[tokio::test]
+#[serial]
+async fn worker_queue_expires_requests_after_queue_wait_limit() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        max_queued_requests_per_worker: 8,
+        max_global_queued_requests: 16,
+        max_global_queued_bytes: 1024 * 1024,
+        max_queue_wait: Duration::from_millis(50),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(10),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "queue-timeout".to_string();
+    service
+        .deploy(
+            worker.clone(),
+            r#"
+export default {
+  async fetch(request) {
+    await Deno.core.ops.op_sleep(200);
+    return new Response(new URL(request.url).pathname);
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first_service = service.clone();
+    let first_worker = worker.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .invoke(
+                first_worker,
+                test_invocation_with_path("/one", "queue-wait-one"),
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service.stats(worker.clone()).await.expect("stats");
+            if stats.inflight_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first request should dispatch");
+
+    let queued_service = service.clone();
+    let queued_worker = worker.clone();
+    let queued = tokio::spawn(async move {
+        queued_service
+            .invoke(
+                queued_worker,
+                test_invocation_with_path("/queued", "queue-wait-two"),
+            )
+            .await
+    });
+
+    let error = timeout(Duration::from_secs(2), queued)
+        .await
+        .expect("queued request should complete")
+        .expect("queued join")
+        .expect_err("queued request should expire");
+    assert_eq!(error.kind(), ErrorKind::Overloaded);
+    assert!(error.to_string().contains("queue wait limit"));
+
+    timeout(Duration::from_secs(3), first)
+        .await
+        .expect("first join")
+        .expect("first request should complete")
+        .expect("first request should succeed");
 }
 
 #[tokio::test]
@@ -1894,6 +2076,73 @@ export default {
         body.extend(chunk.expect("chunk should be ok"));
     }
     assert_eq!(String::from_utf8(body).expect("utf8"), "hello");
+}
+
+#[tokio::test]
+#[serial]
+async fn invoke_stream_body_drop_cancels_running_request() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        max_queue_wait: Duration::from_secs(5),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "drop-stream".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/stream") {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue("first");
+        }
+      }));
+    }
+    return new Response("ok");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream(
+            "drop-stream".to_string(),
+            test_invocation_with_path("/stream", "drop-stream-start"),
+        )
+        .await
+        .expect("stream should start");
+    let first = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("first chunk should arrive")
+        .expect("body should still be open")
+        .expect("first chunk should be ok");
+    assert_eq!(String::from_utf8(first).expect("utf8"), "first");
+
+    drop(output);
+
+    let followup = timeout(
+        Duration::from_secs(3),
+        service.invoke(
+            "drop-stream".to_string(),
+            test_invocation_with_path("/ok", "drop-stream-followup"),
+        ),
+    )
+    .await
+    .expect("body drop should cancel the stream and free the isolate")
+    .expect("followup invoke should succeed");
+    assert_eq!(String::from_utf8(followup.body).expect("utf8"), "ok");
 }
 
 #[tokio::test]

@@ -1,8 +1,9 @@
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use common::{
-    DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployRequest, DeployResponse,
-    DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
+    first_non_empty_trimmed, DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig,
+    DeployRequest, DeployResponse, DeployTraceDestination, DynamicDeployRequest,
+    DynamicDeployResponse, ErrorBody, DEFAULT_PRIVATE_SERVER_URL,
 };
 use std::collections::HashMap;
 use std::env;
@@ -386,15 +387,14 @@ fn normalize_path(path: &str) -> String {
 }
 
 fn default_server() -> String {
-    env::var("DD_SERVER").unwrap_or_else(|_| "http://127.0.0.1:3001".to_string())
+    env::var("DD_SERVER").unwrap_or_else(|_| DEFAULT_PRIVATE_SERVER_URL.to_string())
 }
 
 fn private_bearer_token() -> Option<String> {
-    env::var("DD_PRIVATE_TOKEN")
-        .ok()
-        .or_else(|| env::var("PRIVATE_BEARER_TOKEN").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    first_non_empty_trimmed([
+        env::var("DD_PRIVATE_TOKEN").unwrap_or_default(),
+        env::var("PRIVATE_BEARER_TOKEN").unwrap_or_default(),
+    ])
 }
 
 fn with_private_auth(

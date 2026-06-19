@@ -18,5 +18,5 @@ pub use kv::{KvStore, KvUtf8Lookup};
 pub use service::{
     DynamicDeployResult, InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService,
     RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump,
-    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamOutput,
+    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };

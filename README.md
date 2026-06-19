@@ -159,11 +159,11 @@ const child = await env.SANDBOX.get("preview:v1", async () => ({
 }));
 ```
 
-See [examples/dynamic-namespace.js](/home/mewhhaha/src/dd/examples/dynamic-namespace.js), [examples/preview-dynamic.js](/home/mewhhaha/src/dd/examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](/home/mewhhaha/src/dd/examples/llm-dynamic-exec.js).
+See [examples/dynamic-namespace.js](examples/dynamic-namespace.js), [examples/preview-dynamic.js](examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](examples/llm-dynamic-exec.js).
 
-Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](/home/mewhhaha/src/dd/examples/static-assets-site).
+Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](examples/static-assets-site).
 
-Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](/home/mewhhaha/src/dd/examples/chat-worker).
+Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](examples/chat-worker).
 
 ## How to think about it
 
@@ -183,7 +183,7 @@ Canonical flow:
 2. open private tunnel with `just fly-proxy <app>`
 3. deploy worker through tunnel with `just fly-worker-deploy ...`
 
-Full guide: [deploy/fly/README.md](/home/mewhhaha/src/dd/deploy/fly/README.md)
+Full guide: [deploy/fly/README.md](deploy/fly/README.md)
 
 ## Benchmarks and docs
 
@@ -199,4 +199,46 @@ Keyed memory benchmark:
 cargo run -p runtime --bin bench_memory_storage
 ```
 
-Current numbers live in [BENCHMARK.md](/home/mewhhaha/src/dd/BENCHMARK.md). Hardening progress lives in [HARDEN.md](/home/mewhhaha/src/dd/HARDEN.md). Contributor/dev notes live in [docs/development.md](/home/mewhhaha/src/dd/docs/development.md).
+Current numbers live in [BENCHMARK.md](BENCHMARK.md). Hardening progress lives in [HARDEN.md](HARDEN.md). Contributor/dev notes live in [docs/development.md](docs/development.md).
+
+## Current metrics
+
+Measured on `2026-06-19T09:35:25+02:00` from the current worktree on `Linux 7.0.9-1-cachyos x86_64 GNU/Linux` with `rustc 1.96.0-nightly (3645249d7 2026-03-16)`.
+
+Project shape:
+
+| metric | value |
+| --- | ---: |
+| workspace crates | 4 |
+| tracked files | 199 |
+| Rust files | 84 |
+| Rust source lines | 52,475 |
+| total tracked lines | 106,694 |
+| Rust test attributes | 224 |
+
+Release artifacts from `cargo build --release -p dd_server -p cli`:
+
+| artifact | unstripped | stripped temporary copy |
+| --- | ---: | ---: |
+| `target/release/dd_server` | 116,086,200 bytes / 110.71 MiB | 88,256,352 bytes / 84.17 MiB |
+| `target/release/cli` | 7,458,232 bytes / 7.11 MiB | 5,430,640 bytes / 5.18 MiB |
+
+Current focused benchmark results:
+
+| command | scenario | requests | concurrency | throughput | mean | p50 | p95 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `bench_memory_storage` | direct read memory | 300 | 16 | 12,883 req/s | 1.23ms | 0.75ms | 3.96ms | 12.69ms |
+| `bench_memory_storage` | direct write memory | 300 | 16 | 2,077 req/s | 7.52ms | 7.30ms | 10.62ms | 19.53ms |
+| `bench` with `DD_BENCH_ONLY=dynamic` | dynamic baseline, autoscaling-8 | 100 | 16 | 4,259 req/s | 3.72ms | 0.86ms | 17.01ms | 23.32ms |
+| `bench` with `DD_BENCH_ONLY=dynamic` | dynamic hot fetch, autoscaling-8 | 100 | 16 | 3,445 req/s | 4.13ms | 4.50ms | 6.72ms | 7.36ms |
+| `bench` with `DD_BENCH_ONLY=dynamic` | dynamic hot fetch + host RPC, autoscaling-8 | 100 | 16 | 2,091 req/s | 6.92ms | 6.71ms | 8.93ms | 9.65ms |
+
+Benchmark commands:
+
+```bash
+DD_BENCH_MODE=direct-read-memory DD_BENCH_REQUESTS=300 DD_BENCH_CONCURRENCY=16 DD_BENCH_MAX_ISOLATES=4 DD_BENCH_MAX_INFLIGHT=8 cargo run -p runtime --bin bench_memory_storage --release
+DD_BENCH_MODE=direct-write-memory DD_BENCH_REQUESTS=300 DD_BENCH_CONCURRENCY=16 DD_BENCH_MAX_ISOLATES=4 DD_BENCH_MAX_INFLIGHT=8 cargo run -p runtime --bin bench_memory_storage --release
+DD_BENCH_ONLY=dynamic DD_BENCH_DYNAMIC_REQUESTS=100 DD_BENCH_DYNAMIC_CONCURRENCY=16 DD_BENCH_DYNAMIC_COLD_ROUNDS=10 cargo run -p runtime --bin bench --release
+```
+
+Current caveat: the full default `cargo run -p runtime --bin bench --release` benchmark still exits with signal `139` after the first `instant-response` row (`464 req/s`, mean `129.13ms`). The focused memory and dynamic benchmark commands above completed successfully.
