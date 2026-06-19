@@ -202,12 +202,12 @@ impl WorkerManager {
             key: key.to_string(),
             handle: handle.to_string(),
         };
-        self.websocket_sessions
-            .insert(session_id.to_string(), session.clone());
         self.websocket_handle_index.insert(
             memory_handle_key(&session.binding, &session.key, &session.handle),
             session_id.to_string(),
         );
+        self.websocket_sessions
+            .insert(session_id.to_string(), session);
         self.websocket_open_handles
             .entry(memory_owner_key(binding, key))
             .or_default()
@@ -299,12 +299,12 @@ impl WorkerManager {
             inbound_stream_closed: false,
             inbound_datagrams: VecDeque::new(),
         };
-        self.transport_sessions
-            .insert(session_id.to_string(), session.clone());
         self.transport_handle_index.insert(
             memory_handle_key(&session.binding, &session.key, &session.handle),
             session_id.to_string(),
         );
+        self.transport_sessions
+            .insert(session_id.to_string(), session);
         self.transport_open_handles
             .entry(memory_owner_key(binding, key))
             .or_default()
@@ -579,10 +579,20 @@ impl WorkerManager {
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<()> {
         let _ = done;
-        let Some(session) = self.transport_sessions.get(session_id).cloned() else {
+        let Some((session_worker_name, generation, binding, key, handle)) =
+            self.transport_sessions.get(session_id).map(|session| {
+                (
+                    session.worker_name.clone(),
+                    session.generation,
+                    session.binding.clone(),
+                    session.key.clone(),
+                    session.handle.clone(),
+                )
+            })
+        else {
             return Err(PlatformError::not_found("transport session not found"));
         };
-        if session.worker_name != worker_name {
+        if session_worker_name != worker_name {
             return Err(PlatformError::bad_request(
                 "transport session worker mismatch",
             ));
@@ -591,17 +601,13 @@ impl WorkerManager {
             return Ok(());
         }
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-        };
-        let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
-        let transport_handles =
-            self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
+        let route = MemoryRoute::new(binding.clone(), key.clone());
+        let socket_handles = self.websocket_handles_snapshot(&binding, &key, None);
+        let transport_handles = self.transport_handles_snapshot(&binding, &key, Some(&handle));
         let memory_call = MemoryExecutionCall::TransportStream {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-            handle: session.handle.clone(),
+            binding,
+            key,
+            handle,
             data: chunk,
             socket_handles,
             transport_handles,
@@ -615,7 +621,7 @@ impl WorkerManager {
         };
         let (reply, receiver) = oneshot::channel();
         self.enqueue_invoke(
-            session.worker_name,
+            session_worker_name,
             runtime_request_id,
             invoke,
             None,
@@ -623,7 +629,7 @@ impl WorkerManager {
             Some(memory_call),
             None,
             None,
-            Some(session.generation),
+            Some(generation),
             true,
             reply,
             PendingReplyKind::Normal,
@@ -651,10 +657,20 @@ impl WorkerManager {
         datagram: Vec<u8>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) -> Result<()> {
-        let Some(session) = self.transport_sessions.get(session_id).cloned() else {
+        let Some((session_worker_name, generation, binding, key, handle)) =
+            self.transport_sessions.get(session_id).map(|session| {
+                (
+                    session.worker_name.clone(),
+                    session.generation,
+                    session.binding.clone(),
+                    session.key.clone(),
+                    session.handle.clone(),
+                )
+            })
+        else {
             return Err(PlatformError::not_found("transport session not found"));
         };
-        if session.worker_name != worker_name {
+        if session_worker_name != worker_name {
             return Err(PlatformError::bad_request(
                 "transport session worker mismatch",
             ));
@@ -663,17 +679,13 @@ impl WorkerManager {
             return Ok(());
         }
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-        };
-        let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
-        let transport_handles =
-            self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
+        let route = MemoryRoute::new(binding.clone(), key.clone());
+        let socket_handles = self.websocket_handles_snapshot(&binding, &key, None);
+        let transport_handles = self.transport_handles_snapshot(&binding, &key, Some(&handle));
         let memory_call = MemoryExecutionCall::TransportDatagram {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-            handle: session.handle.clone(),
+            binding,
+            key,
+            handle,
             data: datagram,
             socket_handles,
             transport_handles,
@@ -687,7 +699,7 @@ impl WorkerManager {
         };
         let (reply, receiver) = oneshot::channel();
         self.enqueue_invoke(
-            session.worker_name,
+            session_worker_name,
             runtime_request_id,
             invoke,
             None,
@@ -695,7 +707,7 @@ impl WorkerManager {
             Some(memory_call),
             None,
             None,
-            Some(session.generation),
+            Some(generation),
             true,
             reply,
             PendingReplyKind::Normal,
@@ -739,10 +751,7 @@ impl WorkerManager {
         self.queue_transport_close_replay(&session, close_code, close_reason.clone());
 
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-        };
+        let route = MemoryRoute::new(session.binding.clone(), session.key.clone());
         let socket_handles = self.websocket_handles_snapshot(&session.binding, &session.key, None);
         let transport_handles =
             self.transport_handles_snapshot(&session.binding, &session.key, Some(&session.handle));

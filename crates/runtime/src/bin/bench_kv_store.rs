@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[path = "bench_support/cli.rs"]
+mod bench_cli;
+
+use bench_cli::{bench_arg_action, BenchArgAction};
+
 #[derive(Clone, Copy)]
 struct Scenario {
     label: &'static str,
@@ -27,6 +32,14 @@ struct ScenarioResult {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    match bench_arg_action(std::env::args().skip(1))? {
+        BenchArgAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        BenchArgAction::Run => {}
+    }
+
     let requests = env_usize("DD_BENCH_REQUESTS", 20_000);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 128);
     let scenario_name = env_name("DD_BENCH_INTERNAL_SCENARIO");
@@ -62,6 +75,20 @@ async fn main() -> Result<(), String> {
         run_scenario(scenario).await?;
     }
     Ok(())
+}
+
+fn print_help() {
+    println!("kv-store benchmark");
+    println!();
+    println!("Usage:");
+    println!("  cargo run -p runtime --bin bench_kv_store --release");
+    println!("  DD_BENCH_REQUESTS=1000 cargo run -p runtime --bin bench_kv_store --release");
+    println!();
+    println!("This benchmark is configured with environment variables, not CLI flags.");
+    println!();
+    println!("Core env:");
+    println!("  DD_BENCH_REQUESTS              requests per scenario (default 20000)");
+    println!("  DD_BENCH_CONCURRENCY           concurrent requests (default 128)");
 }
 
 async fn run_scenario(scenario: Scenario) -> Result<(), String> {

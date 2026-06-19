@@ -1,5 +1,7 @@
 use common::{DeployBinding, DeployConfig, PlatformError, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -7,8 +9,15 @@ use std::sync::{
     Arc,
 };
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+#[path = "bench_support/cli.rs"]
+mod bench_cli;
+
+use bench_cli::{bench_arg_action, BenchArgAction};
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -19,11 +28,39 @@ struct BenchConfig {
 #[derive(Clone, Copy)]
 struct Scenario {
     name: &'static str,
-    worker_source: &'static str,
+    worker: ScenarioWorker,
     path: &'static str,
-    use_kv_binding: bool,
-    use_memory_binding: bool,
     seed_path: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+enum ScenarioWorker {
+    Static {
+        source: &'static str,
+        binding: ScenarioBinding,
+    },
+    HostFetchLocal,
+}
+
+#[derive(Clone, Copy)]
+enum ScenarioBinding {
+    None,
+    Kv,
+    Memory,
+}
+
+impl ScenarioBinding {
+    fn deploy_bindings(self) -> Vec<DeployBinding> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Kv => vec![DeployBinding::Kv {
+                binding: "MY_KV".to_string(),
+            }],
+            Self::Memory => vec![DeployBinding::Memory {
+                binding: "BENCH_MEMORY".to_string(),
+            }],
+        }
+    }
 }
 
 struct ScenarioResult {
@@ -104,6 +141,14 @@ fn env_custom_config(max_inflight: usize, v8_flags: &[String]) -> Option<BenchCo
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    match bench_arg_action(std::env::args().skip(1))? {
+        BenchArgAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        BenchArgAction::Run => {}
+    }
+
     let requests = env_usize("DD_BENCH_REQUESTS", 4_000);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 128);
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 16);
@@ -159,35 +204,38 @@ async fn main() -> Result<(), String> {
     let scenarios = [
         Scenario {
             name: "instant-text",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   fetch() {
     return new Response("ok");
   },
 };
 "#,
+                binding: ScenarioBinding::None,
+            },
             path: "/",
-            use_kv_binding: false,
-            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
             name: "instant-json",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   fetch() {
     return Response.json({ ok: true, now: 1 });
   },
 };
 "#,
+                binding: ScenarioBinding::None,
+            },
             path: "/",
-            use_kv_binding: false,
-            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
             name: "instant-html",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   fetch() {
     return new Response("<!doctype html><html><body>ok</body></html>", {
@@ -196,42 +244,51 @@ export default {
   },
 };
 "#,
+                binding: ScenarioBinding::None,
+            },
             path: "/",
-            use_kv_binding: false,
-            use_memory_binding: false,
+            seed_path: None,
+        },
+        Scenario {
+            name: "host-fetch-local",
+            worker: ScenarioWorker::HostFetchLocal,
+            path: "/",
             seed_path: None,
         },
         Scenario {
             name: "instant-text-memory-bound",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   fetch() {
     return new Response("ok");
   },
 };
 "#,
+                binding: ScenarioBinding::Memory,
+            },
             path: "/",
-            use_kv_binding: false,
-            use_memory_binding: true,
             seed_path: None,
         },
         Scenario {
             name: "instant-text-kv-bound",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   fetch() {
     return new Response("ok");
   },
 };
 "#,
+                binding: ScenarioBinding::Kv,
+            },
             path: "/",
-            use_kv_binding: true,
-            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
             name: "instant-text-kv-read",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -243,14 +300,15 @@ export default {
   },
 };
 "#,
+                binding: ScenarioBinding::Kv,
+            },
             path: "/",
-            use_kv_binding: true,
-            use_memory_binding: false,
             seed_path: Some("/seed"),
         },
         Scenario {
             name: "instant-text-kv-write",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   async fetch(request, env) {
     const key = request.headers.get("x-bench-request") ?? "0";
@@ -259,14 +317,15 @@ export default {
   },
 };
 "#,
+                binding: ScenarioBinding::Kv,
+            },
             path: "/",
-            use_kv_binding: true,
-            use_memory_binding: false,
             seed_path: None,
         },
         Scenario {
             name: "instant-text-kv-write-unawaited",
-            worker_source: r#"
+            worker: ScenarioWorker::Static {
+                source: r#"
 export default {
   fetch(request, env) {
     const key = request.headers.get("x-bench-request") ?? "0";
@@ -275,9 +334,9 @@ export default {
   },
 };
 "#,
+                binding: ScenarioBinding::Kv,
+            },
             path: "/",
-            use_kv_binding: true,
-            use_memory_binding: false,
             seed_path: None,
         },
     ];
@@ -301,7 +360,7 @@ export default {
 
     println!("# dd fast fetch benchmark");
     println!(
-        "# note: this is the minimal worker fetch path through RuntimeService (no external HTTP network overhead)."
+        "# note: most scenarios measure RuntimeService directly; host-fetch-local uses a loopback HTTP responder."
     );
     println!(
         "# config: requests={} concurrency={} max_inflight={} v8_flags={:?}",
@@ -328,6 +387,29 @@ export default {
     }
 
     Ok(())
+}
+
+fn print_help() {
+    println!("dd fast fetch benchmark");
+    println!();
+    println!("Usage:");
+    println!("  cargo run -p runtime --bin bench_fetch_fast --release");
+    println!("  DD_BENCH_REQUESTS=1000 cargo run -p runtime --bin bench_fetch_fast --release");
+    println!();
+    println!("This benchmark is configured with environment variables, not CLI flags.");
+    println!();
+    println!("Core env:");
+    println!("  DD_BENCH_REQUESTS              requests per scenario (default 4000)");
+    println!("  DD_BENCH_CONCURRENCY           concurrent requests (default 128)");
+    println!("  DD_BENCH_MAX_INFLIGHT          max inflight per isolate (default 16)");
+    println!("  DD_BENCH_AUTOSCALING_ISOLATES  autoscaling config isolate limit (default 8)");
+    println!(
+        "  DD_BENCH_PREWARMED_ISOLATES    prewarmed config isolate count (default autoscaling)"
+    );
+    println!("  DD_BENCH_MIN_ISOLATES          custom config min isolates");
+    println!("  DD_BENCH_MAX_ISOLATES          custom config max isolates");
+    println!("  DD_BENCH_CUSTOM_NAME           custom config display name");
+    println!("  DD_BENCH_V8_FLAGS              whitespace-separated V8 flags");
 }
 
 async fn run_config(
@@ -387,28 +469,38 @@ async fn run_config_scenario(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let worker_name = format!("{}-{}", config.name, scenario.name);
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            scenario.worker_source.to_string(),
-            DeployConfig {
-                bindings: if scenario.use_kv_binding {
-                    vec![DeployBinding::Kv {
-                        binding: "MY_KV".to_string(),
-                    }]
-                } else if scenario.use_memory_binding {
-                    vec![DeployBinding::Memory {
-                        binding: "BENCH_MEMORY".to_string(),
-                    }]
-                } else {
-                    Vec::new()
-                },
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut host_fetch_server = None;
+    let worker_name = match scenario.worker {
+        ScenarioWorker::HostFetchLocal => {
+            let server = start_host_fetch_server().await?;
+            let endpoint = format!("http://{}/host-fetch", server.address);
+            let deployed = service
+                .deploy_dynamic(
+                    host_fetch_worker_source(&endpoint),
+                    HashMap::new(),
+                    vec![server.address.to_string()],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            host_fetch_server = Some(server);
+            deployed.worker
+        }
+        ScenarioWorker::Static { source, binding } => {
+            let worker_name = format!("{}-{}", config.name, scenario.name);
+            service
+                .deploy_with_config(
+                    worker_name.clone(),
+                    source.to_string(),
+                    DeployConfig {
+                        bindings: binding.deploy_bindings(),
+                        ..DeployConfig::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            worker_name
+        }
+    };
     if let Some(seed_path) = scenario.seed_path {
         service
             .invoke(worker_name.clone(), invocation(seed_path, usize::MAX))
@@ -418,8 +510,60 @@ async fn run_config_scenario(
     let result = run_scenario(&service, &worker_name, *scenario, requests, concurrency)
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(server) = host_fetch_server {
+        server.task.abort();
+    }
     println!("{}", format_result(scenario.name, result));
     Ok(())
+}
+
+struct HostFetchServer {
+    address: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_host_fetch_server() -> Result<HostFetchServer, String> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| error.to_string())?;
+    let address = listener.local_addr().map_err(|error| error.to_string())?;
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+            });
+        }
+    });
+    Ok(HostFetchServer { address, task })
+}
+
+fn host_fetch_worker_source(endpoint: &str) -> String {
+    format!(
+        r#"
+export default {{
+  async fetch() {{
+    const response = await fetch("{endpoint}", {{
+      headers: {{
+        "x-bench-host-fetch": "1",
+      }},
+    }});
+    return new Response(await response.text(), {{
+      status: response.status,
+      headers: response.headers,
+    }});
+  }},
+}};
+"#
+    )
 }
 
 async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<RuntimeService> {

@@ -17,7 +17,7 @@ use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheS
 use crate::engine::{
     abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
     ensure_v8_flags, load_worker, new_runtime_from_snapshot, pump_event_loop_once,
-    validate_loaded_worker_runtime, validate_worker, ExecuteHostRpcCall, ExecuteMemoryCall,
+    validate_loaded_worker_runtime, validate_worker,
 };
 use crate::kv::KvStore;
 use crate::memory::MemoryStore;
@@ -29,6 +29,7 @@ use crate::ops::{
     cancel_request_body_stream, clear_request_body_stream, clear_request_secret_context,
     register_memory_request_scope, register_request_body_stream, register_request_secret_context,
     IsolateEventPayload, IsolateEventSender, MemoryInvokeEvent, RequestBodyStreams,
+    RequestExecutionContext,
 };
 use crate::static_assets::{
     compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,

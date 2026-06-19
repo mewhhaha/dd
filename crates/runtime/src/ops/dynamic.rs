@@ -22,37 +22,85 @@ pub(super) fn dynamic_worker_owner_for_request(
     request_id: &str,
     binding: &str,
 ) -> Result<(String, u64, u64)> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
-        return Err(PlatformError::bad_request(
-            "dynamic worker request_id must not be empty",
-        ));
-    }
     let binding = binding.trim();
     if binding.is_empty() {
         return Err(PlatformError::bad_request(
             "dynamic worker binding must not be empty",
         ));
     }
-    let (worker_name, generation, isolate_id) = {
+    request_owner_for_scope(
+        state,
+        request_id,
+        "dynamic worker request_id must not be empty",
+        "dynamic worker request scope is unavailable",
+        |context| {
+            if context.execution.dynamic_bindings.contains(binding) {
+                return Ok(());
+            }
+            Err(PlatformError::runtime(format!(
+                "dynamic worker binding is not allowed: {binding}"
+            )))
+        },
+    )
+}
+
+fn request_owner_for_scope(
+    state: &Rc<RefCell<OpState>>,
+    request_id: &str,
+    empty_request_id: &'static str,
+    unavailable_scope: &'static str,
+    validate: impl FnOnce(&RequestSecretContext) -> Result<()>,
+) -> Result<(String, u64, u64)> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(PlatformError::bad_request(empty_request_id));
+    }
+    let owner = {
         let op_state = state.borrow();
         let contexts = op_state.borrow::<RequestSecretContexts>();
         let context = contexts
             .contexts
             .get(request_id)
-            .ok_or_else(|| PlatformError::runtime("dynamic worker request scope is unavailable"))?;
-        if !context.dynamic_bindings.contains(binding) {
-            return Err(PlatformError::runtime(format!(
-                "dynamic worker binding is not allowed: {binding}"
-            )));
-        }
+            .ok_or_else(|| PlatformError::runtime(unavailable_scope))?;
+        validate(context)?;
         (
-            context.worker_name.clone(),
-            context.generation,
+            context.execution.worker_name.as_ref().to_string(),
+            context.execution.generation,
             context.isolate_id,
         )
     };
-    Ok((worker_name, generation, isolate_id))
+    Ok(owner)
+}
+
+fn allocate_dynamic_pending_reply(
+    state: &Rc<RefCell<OpState>>,
+    worker_name: &str,
+    generation: u64,
+    isolate_id: u64,
+) -> (String, DynamicPendingReplies) {
+    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
+    let reply_id = pending_replies.allocate(PendingReplyOwner {
+        worker_name: worker_name.to_string(),
+        generation,
+        isolate_id,
+    });
+    (reply_id, pending_replies)
+}
+
+fn dynamic_start_ok(reply_id: String) -> DynamicPendingReplyStartResult {
+    DynamicPendingReplyStartResult {
+        ok: true,
+        reply_id,
+        error: String::new(),
+    }
+}
+
+fn dynamic_start_error(error: impl ToString) -> DynamicPendingReplyStartResult {
+    DynamicPendingReplyStartResult {
+        ok: false,
+        reply_id: String::new(),
+        error: error.to_string(),
+    }
 }
 
 pub(super) fn dynamic_host_rpc_owner_for_request(
@@ -60,86 +108,52 @@ pub(super) fn dynamic_host_rpc_owner_for_request(
     request_id: &str,
     binding: &str,
 ) -> Result<(String, u64, u64)> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
-        return Err(PlatformError::bad_request(
-            "dynamic host rpc request_id must not be empty",
-        ));
-    }
     let binding = binding.trim();
     if binding.is_empty() {
         return Err(PlatformError::bad_request(
             "dynamic host rpc binding must not be empty",
         ));
     }
-    let (worker_name, generation, isolate_id) = {
-        let op_state = state.borrow();
-        let contexts = op_state.borrow::<RequestSecretContexts>();
-        let context = contexts.contexts.get(request_id).ok_or_else(|| {
-            PlatformError::runtime("dynamic host rpc request scope is unavailable")
-        })?;
-        if !context.dynamic_rpc_bindings.contains(binding) {
-            return Err(PlatformError::runtime(format!(
+    request_owner_for_scope(
+        state,
+        request_id,
+        "dynamic host rpc request_id must not be empty",
+        "dynamic host rpc request scope is unavailable",
+        |context| {
+            if context.execution.dynamic_rpc_bindings.contains(binding) {
+                return Ok(());
+            }
+            Err(PlatformError::runtime(format!(
                 "dynamic host rpc binding is not allowed: {binding}"
-            )));
-        }
-        (
-            context.worker_name.clone(),
-            context.generation,
-            context.isolate_id,
-        )
-    };
-    Ok((worker_name, generation, isolate_id))
+            )))
+        },
+    )
 }
 
 pub(super) fn memory_invoke_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
 ) -> Result<(String, u64, u64)> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
-        return Err(PlatformError::bad_request(
-            "memory invoke caller_request_id must not be empty",
-        ));
-    }
-    let (worker_name, generation, isolate_id) = {
-        let op_state = state.borrow();
-        let contexts = op_state.borrow::<RequestSecretContexts>();
-        let context = contexts
-            .contexts
-            .get(request_id)
-            .ok_or_else(|| PlatformError::runtime("memory invoke request scope is unavailable"))?;
-        (
-            context.worker_name.clone(),
-            context.generation,
-            context.isolate_id,
-        )
-    };
-    Ok((worker_name, generation, isolate_id))
+    request_owner_for_scope(
+        state,
+        request_id,
+        "memory invoke caller_request_id must not be empty",
+        "memory invoke request scope is unavailable",
+        |_| Ok(()),
+    )
 }
 
 pub(super) fn request_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
 ) -> Result<(String, u64, u64)> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
-        return Err(PlatformError::bad_request("request_id must not be empty"));
-    }
-    let (worker_name, generation, isolate_id) = {
-        let op_state = state.borrow();
-        let contexts = op_state.borrow::<RequestSecretContexts>();
-        let context = contexts
-            .contexts
-            .get(request_id)
-            .ok_or_else(|| PlatformError::runtime("request scope is unavailable"))?;
-        (
-            context.worker_name.clone(),
-            context.generation,
-            context.isolate_id,
-        )
-    };
-    Ok((worker_name, generation, isolate_id))
+    request_owner_for_scope(
+        state,
+        request_id,
+        "request_id must not be empty",
+        "request scope is unavailable",
+        |_| Ok(()),
+    )
 }
 
 #[derive(Deserialize)]
@@ -197,53 +211,37 @@ pub(super) fn op_test_async_reply_start(
 ) -> DynamicPendingReplyStartResult {
     let request_id = payload.request_id.trim();
     if request_id.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "test async reply requires request_id".to_string(),
-        };
+        return dynamic_start_error("test async reply requires request_id");
     }
     let (worker_name, generation, isolate_id) = match request_owner_for_request(&state, request_id)
     {
         Ok(value) => value,
         Err(error) => {
-            return DynamicPendingReplyStartResult {
-                ok: false,
-                reply_id: String::new(),
-                error: error.to_string(),
-            };
+            return dynamic_start_error(error);
         }
     };
     let replies = state.borrow().borrow::<TestAsyncReplies>().clone();
-    let reply_id = replies.allocate(TestAsyncReplyOwner {
+    let reply_id = replies.allocate(PendingReplyOwner {
         worker_name,
         generation,
         isolate_id,
     });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::TestAsyncReply(TestAsyncReplyEvent {
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::TestAsyncReply(TestAsyncReplyEvent {
             reply_id: reply_id.clone(),
             replies,
             delay_ms: payload.delay_ms,
             ok: payload.ok,
             value: payload.value,
             error: payload.error,
-        }))
-        .is_err()
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "test async reply runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("test async reply runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2(fast)]
@@ -260,74 +258,48 @@ pub(super) fn op_test_nested_targeted_invoke_start(
 ) -> DynamicPendingReplyStartResult {
     let request_id = payload.request_id.trim();
     if request_id.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "test nested targeted invoke requires request_id".to_string(),
-        };
+        return dynamic_start_error("test nested targeted invoke requires request_id");
     }
     let target_id = payload.target_id.trim();
     if target_id.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "test nested targeted invoke requires target_id".to_string(),
-        };
+        return dynamic_start_error("test nested targeted invoke requires target_id");
     }
     let method_name = payload.method_name.trim();
     if method_name.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "test nested targeted invoke requires method_name".to_string(),
-        };
+        return dynamic_start_error("test nested targeted invoke requires method_name");
     }
     let (worker_name, generation, isolate_id) = match request_owner_for_request(&state, request_id)
     {
         Ok(value) => value,
         Err(error) => {
-            return DynamicPendingReplyStartResult {
-                ok: false,
-                reply_id: String::new(),
-                error: error.to_string(),
-            };
+            return dynamic_start_error(error);
         }
     };
     let replies = state.borrow().borrow::<TestAsyncReplies>().clone();
-    let reply_id = replies.allocate(TestAsyncReplyOwner {
+    let reply_id = replies.allocate(PendingReplyOwner {
         worker_name: worker_name.clone(),
         generation,
         isolate_id,
     });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::TestNestedTargetedInvoke(
-            TestNestedTargetedInvokeEvent {
-                worker_name,
-                generation,
-                caller_isolate_id: isolate_id,
-                target_mode: payload.target_mode,
-                target_id: target_id.to_string(),
-                method_name: method_name.to_string(),
-                args: payload.args,
-                reply_id: reply_id.clone(),
-                replies,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::TestNestedTargetedInvoke(TestNestedTargetedInvokeEvent {
+            worker_name,
+            generation,
+            caller_isolate_id: isolate_id,
+            target_mode: payload.target_mode,
+            target_id: target_id.to_string(),
+            method_name: method_name.to_string(),
+            args: payload.args,
+            reply_id: reply_id.clone(),
+            replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "test nested targeted invoke runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("test nested targeted invoke runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -338,75 +310,45 @@ pub(super) fn op_dynamic_worker_create(
 ) -> DynamicPendingReplyStartResult {
     let id = payload.id.trim();
     if id.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker id must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker id must not be empty");
     }
     if payload.source.trim().is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker source must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker source must not be empty");
     }
     if payload.timeout == 0 {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker timeout must be greater than 0".to_string(),
-        };
+        return dynamic_start_error("dynamic worker timeout must be greater than 0");
     }
     let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: owner_worker.clone(),
-        generation: owner_generation,
-        isolate_id: owner_isolate_id,
-    });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::DynamicWorkerCreate(
-            DynamicWorkerCreateEvent {
-                owner_worker,
-                owner_generation,
-                owner_isolate_id,
-                binding: payload.binding,
-                id: id.to_string(),
-                source: payload.source,
-                env: payload.env,
-                timeout: payload.timeout,
-                policy: payload.policy,
-                host_rpc_bindings: payload.host_rpc_bindings,
-                reply_id: reply_id.clone(),
-                pending_replies,
-            },
-        ))
-        .is_err()
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::DynamicWorkerCreate(DynamicWorkerCreateEvent {
+            owner_worker,
+            owner_generation,
+            owner_isolate_id,
+            binding: payload.binding,
+            id: id.to_string(),
+            source: payload.source,
+            env: payload.env,
+            timeout: payload.timeout,
+            policy: payload.policy,
+            host_rpc_bindings: payload.host_rpc_bindings,
+            reply_id: reply_id.clone(),
+            pending_replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic worker runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -417,56 +359,34 @@ pub(super) fn op_dynamic_worker_lookup(
 ) -> DynamicPendingReplyStartResult {
     let id = payload.id.trim();
     if id.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker id must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker id must not be empty");
     }
     let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: owner_worker.clone(),
-        generation: owner_generation,
-        isolate_id: owner_isolate_id,
-    });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::DynamicWorkerLookup(
-            DynamicWorkerLookupEvent {
-                owner_worker,
-                owner_generation,
-                owner_isolate_id,
-                binding: payload.binding,
-                id: id.to_string(),
-                reply_id: reply_id.clone(),
-                pending_replies,
-            },
-        ))
-        .is_err()
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::DynamicWorkerLookup(DynamicWorkerLookupEvent {
+            owner_worker,
+            owner_generation,
+            owner_isolate_id,
+            binding: payload.binding,
+            id: id.to_string(),
+            reply_id: reply_id.clone(),
+            pending_replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic worker runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -479,45 +399,27 @@ pub(super) fn op_dynamic_worker_list(
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: owner_worker.clone(),
-        generation: owner_generation,
-        isolate_id: owner_isolate_id,
-    });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::DynamicWorkerList(
-            DynamicWorkerListEvent {
-                owner_worker,
-                owner_generation,
-                owner_isolate_id,
-                binding: payload.binding,
-                reply_id: reply_id.clone(),
-                pending_replies,
-            },
-        ))
-        .is_err()
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::DynamicWorkerList(DynamicWorkerListEvent {
+            owner_worker,
+            owner_generation,
+            owner_isolate_id,
+            binding: payload.binding,
+            reply_id: reply_id.clone(),
+            pending_replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic worker runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -528,56 +430,34 @@ pub(super) fn op_dynamic_worker_delete(
 ) -> DynamicPendingReplyStartResult {
     let id = payload.id.trim();
     if id.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker id must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker id must not be empty");
     }
     let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: owner_worker.clone(),
-        generation: owner_generation,
-        isolate_id: owner_isolate_id,
-    });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::DynamicWorkerDelete(
-            DynamicWorkerDeleteEvent {
-                owner_worker,
-                owner_generation,
-                owner_isolate_id,
-                binding: payload.binding,
-                id: id.to_string(),
-                reply_id: reply_id.clone(),
-                pending_replies,
-            },
-        ))
-        .is_err()
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::DynamicWorkerDelete(DynamicWorkerDeleteEvent {
+            owner_worker,
+            owner_generation,
+            owner_isolate_id,
+            binding: payload.binding,
+            id: id.to_string(),
+            reply_id: reply_id.clone(),
+            pending_replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic worker runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -587,28 +467,16 @@ pub(super) fn op_dynamic_worker_invoke(
     #[serde] payload: DynamicWorkerInvokePayload,
 ) -> DynamicPendingReplyStartResult {
     if payload.subrequest_id.trim().is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker subrequest_id must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker subrequest_id must not be empty");
     }
     if payload.handle.trim().is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker handle must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker handle must not be empty");
     }
     let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
 
@@ -620,40 +488,26 @@ pub(super) fn op_dynamic_worker_invoke(
         request_id: payload.subrequest_id,
     };
 
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: owner_worker.clone(),
-        generation: owner_generation,
-        isolate_id: owner_isolate_id,
-    });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::DynamicWorkerInvoke(
-            DynamicWorkerInvokeEvent {
-                owner_worker,
-                owner_generation,
-                owner_isolate_id,
-                binding: payload.binding,
-                handle: payload.handle,
-                request,
-                reply_id: reply_id.clone(),
-                pending_replies,
-            },
-        ))
-        .is_err()
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::DynamicWorkerInvoke(DynamicWorkerInvokeEvent {
+            owner_worker,
+            owner_generation,
+            owner_isolate_id,
+            binding: payload.binding,
+            handle: payload.handle,
+            request,
+            reply_id: reply_id.clone(),
+            pending_replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic worker runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -663,28 +517,16 @@ pub(super) fn op_dynamic_worker_fetch_start(
     #[serde] payload: DynamicWorkerInvokePayload,
 ) -> DynamicPendingReplyStartResult {
     if payload.subrequest_id.trim().is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker subrequest_id must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker subrequest_id must not be empty");
     }
     if payload.handle.trim().is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker handle must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic worker handle must not be empty");
     }
     let (owner_worker, owner_generation, owner_isolate_id) =
         match dynamic_worker_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
 
@@ -696,12 +538,8 @@ pub(super) fn op_dynamic_worker_fetch_start(
         request_id: payload.subrequest_id,
     };
 
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: owner_worker.clone(),
-        generation: owner_generation,
-        isolate_id: owner_isolate_id,
-    });
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
     let command_sender = state
         .borrow()
         .borrow::<crate::service::RuntimeFastCommandSender>()
@@ -719,17 +557,9 @@ pub(super) fn op_dynamic_worker_fetch_start(
         })
         .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic worker runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic worker runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }
 
 #[deno_core::op2]
@@ -740,55 +570,37 @@ pub(super) fn op_dynamic_host_rpc_invoke(
 ) -> DynamicPendingReplyStartResult {
     let method_name = payload.method_name.trim();
     if method_name.is_empty() {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic host rpc method_name must not be empty".to_string(),
-        };
+        return dynamic_start_error("dynamic host rpc method_name must not be empty");
     }
     let (caller_worker, caller_generation, caller_isolate_id) =
         match dynamic_host_rpc_owner_for_request(&state, &payload.request_id, &payload.binding) {
             Ok(value) => value,
             Err(error) => {
-                return DynamicPendingReplyStartResult {
-                    ok: false,
-                    reply_id: String::new(),
-                    error: error.to_string(),
-                };
+                return dynamic_start_error(error);
             }
         };
-    let pending_replies = state.borrow().borrow::<DynamicPendingReplies>().clone();
-    let reply_id = pending_replies.allocate(DynamicPendingReplyOwner {
-        worker_name: caller_worker.clone(),
-        generation: caller_generation,
-        isolate_id: caller_isolate_id,
-    });
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::DynamicHostRpcInvoke(
-            DynamicHostRpcInvokeEvent {
-                caller_worker,
-                caller_generation,
-                _caller_isolate_id: caller_isolate_id,
-                binding: payload.binding,
-                method_name: method_name.to_string(),
-                args: payload.args,
-                reply_id: reply_id.clone(),
-                pending_replies,
-            },
-        ))
-        .is_err()
+    let (reply_id, pending_replies) = allocate_dynamic_pending_reply(
+        &state,
+        &caller_worker,
+        caller_generation,
+        caller_isolate_id,
+    );
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::DynamicHostRpcInvoke(DynamicHostRpcInvokeEvent {
+            caller_worker,
+            caller_generation,
+            _caller_isolate_id: caller_isolate_id,
+            binding: payload.binding,
+            method_name: method_name.to_string(),
+            args: payload.args,
+            reply_id: reply_id.clone(),
+            pending_replies,
+        }),
+    )
+    .is_err()
     {
-        return DynamicPendingReplyStartResult {
-            ok: false,
-            reply_id: String::new(),
-            error: "dynamic host rpc runtime is unavailable".to_string(),
-        };
+        return dynamic_start_error("dynamic host rpc runtime is unavailable");
     }
-    DynamicPendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
+    dynamic_start_ok(reply_id)
 }

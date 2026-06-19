@@ -13,7 +13,6 @@ use deno_crypto::deno_crypto as deno_crypto_ext;
 use deno_error::JsErrorBox;
 use deno_fetch::Options as DenoFetchOptions;
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
-use serde::Serialize;
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,80 +22,6 @@ use std::task::{Context, Poll, Waker};
 include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 
 static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ExecuteMemoryCall {
-    Method {
-        binding: String,
-        key: String,
-        name: String,
-        args: Vec<u8>,
-    },
-    Message {
-        binding: String,
-        key: String,
-        handle: String,
-        is_text: bool,
-        data: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    Close {
-        binding: String,
-        key: String,
-        handle: String,
-        code: u16,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    #[serde(rename = "transport_datagram")]
-    TransportDatagram {
-        binding: String,
-        key: String,
-        handle: String,
-        data: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    #[serde(rename = "transport_stream")]
-    TransportStream {
-        binding: String,
-        key: String,
-        handle: String,
-        data: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    #[serde(rename = "transport_close")]
-    TransportClose {
-        binding: String,
-        key: String,
-        handle: String,
-        code: u16,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-}
-
-#[derive(Clone, Serialize)]
-pub struct ExecuteHostRpcCall {
-    pub target_id: String,
-    pub method: String,
-    pub args: Vec<u8>,
-}
 
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
@@ -204,7 +129,7 @@ pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
     evaluate_module(runtime, INSTALL_SPECIFIER, &install_code, true).await
 }
 
-pub fn dispatch_worker_request(
+pub fn dispatch_worker_request<MemoryCall, HostRpcCall>(
     runtime: &mut JsRuntime,
     request_id: &str,
     completion_token: &str,
@@ -217,10 +142,14 @@ pub fn dispatch_worker_request(
     dynamic_env_json: &str,
     has_request_body_stream: bool,
     stream_response: bool,
-    memory_call: Option<&ExecuteMemoryCall>,
-    host_rpc_call: Option<&ExecuteHostRpcCall>,
+    memory_call: Option<&MemoryCall>,
+    host_rpc_call: Option<&HostRpcCall>,
     request: WorkerInvocation,
-) -> Result<()> {
+) -> Result<()>
+where
+    MemoryCall: serde::Serialize,
+    HostRpcCall: serde::Serialize,
+{
     let request_json = crate::json::to_string(&request)
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     let memory_call_json = crate::json::to_string(&memory_call)

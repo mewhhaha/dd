@@ -19,7 +19,22 @@ pub(super) fn private_request_is_authorized(state: &AppState, headers: &HeaderMa
     let Some(token) = value.strip_prefix("Bearer ") else {
         return false;
     };
-    token.trim() == expected_token
+    private_token_matches(expected_token, token)
+}
+
+pub(super) fn private_token_matches(expected_token: &str, provided_token: &str) -> bool {
+    constant_time_bytes_eq(expected_token.as_bytes(), provided_token.trim().as_bytes())
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 pub(super) fn private_auth_response() -> Response<ResponseBody> {

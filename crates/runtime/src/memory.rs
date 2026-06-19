@@ -268,6 +268,12 @@ struct MemoryBatchCommitOutcome {
     cache_mutations: Vec<MemoryBatchMutation>,
 }
 
+#[derive(Clone, Copy)]
+enum MemoryWriteConflictPolicy {
+    Overwrite,
+    WriteLast,
+}
+
 impl MemoryStore {
     pub async fn new(
         root_dir: PathBuf,
@@ -956,10 +962,14 @@ impl MemoryStore {
 
             let outcome = async {
                 let validate_started = Instant::now();
-                let current = self.max_version_for_memory(&conn, memory_key).await?.unwrap_or(-1);
+                let current = self
+                    .max_version_for_memory(&conn, memory_key)
+                    .await?
+                    .unwrap_or(-1);
                 if let Some(expected_list_version) = list_gate_version {
                     if current != expected_list_version {
-                        self.observe_memory_version(namespace, memory_key, current).await;
+                        self.observe_memory_version(namespace, memory_key, current)
+                            .await;
                         self.record_profile(
                             MemoryProfileMetricKind::StoreApplyBatchValidate,
                             validate_started.elapsed().as_micros() as u64,
@@ -977,7 +987,8 @@ impl MemoryStore {
                 if !transactional {
                     if let Some(expected) = expected_base_version {
                         if current != expected {
-                            self.observe_memory_version(namespace, memory_key, current).await;
+                            self.observe_memory_version(namespace, memory_key, current)
+                                .await;
                             self.record_profile(
                                 MemoryProfileMetricKind::StoreApplyBatchValidate,
                                 validate_started.elapsed().as_micros() as u64,
@@ -1030,64 +1041,17 @@ impl MemoryStore {
 
                 for mutation in mutations {
                     let version = commit_version.unwrap_or(mutation.version);
-                    let now_ms = epoch_ms_i64()?;
-                    if mutation.deleted {
-                        let empty_blob: &[u8] = &[];
-                        conn.execute(
-                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                             VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
-                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = excluded.value,
-                               value_blob = excluded.value_blob,
-                               encoding = excluded.encoding,
-                               deleted = 1,
-                               version = excluded.version,
-                               updated_at_ms = excluded.updated_at_ms",
-                            (
-                                memory_key,
-                                mutation.key.as_str(),
-                                empty_blob,
-                                ENCODING_UTF8,
-                                version,
-                                now_ms,
-                            ),
-                        )
-                        .await
-                        .map_err(memory_error)?;
-                        continue;
-                    }
-
-                    let value_text = if mutation.encoding == ENCODING_UTF8 {
-                        std::str::from_utf8(&mutation.value)
-                            .map_err(|error| {
-                                PlatformError::bad_request(format!("invalid utf8 value: {error}"))
-                            })?
-                            .to_string()
-                    } else {
-                        String::new()
-                    };
-                    conn.execute(
-                        "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-                         ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                           value = excluded.value,
-                           value_blob = excluded.value_blob,
-                           encoding = excluded.encoding,
-                           deleted = 0,
-                           version = excluded.version,
-                           updated_at_ms = excluded.updated_at_ms",
-                        (
-                            memory_key,
-                            mutation.key.as_str(),
-                            value_text.as_str(),
-                            mutation.value.as_slice(),
-                            mutation.encoding.as_str(),
-                            version,
-                            now_ms,
-                        ),
+                    upsert_memory_state_row(
+                        &conn,
+                        memory_key,
+                        mutation.key.as_str(),
+                        mutation.value.as_slice(),
+                        mutation.encoding.as_str(),
+                        mutation.deleted,
+                        version,
+                        MemoryWriteConflictPolicy::Overwrite,
                     )
-                    .await
-                    .map_err(memory_error)?;
+                    .await?;
                 }
 
                 let max_version = if let Some(version) = commit_version {
@@ -1099,17 +1063,13 @@ impl MemoryStore {
                         .unwrap_or(current)
                 };
                 if !mutations.is_empty() {
-                    let now_ms = epoch_ms_i64()?;
-                    conn.execute(
-                        "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
-                         VALUES (?1, ?2, ?3)
-                         ON CONFLICT(entity_key) DO UPDATE SET
-                           max_version = excluded.max_version,
-                           updated_at_ms = excluded.updated_at_ms",
-                        (memory_key, max_version, now_ms),
+                    upsert_memory_meta_row(
+                        &conn,
+                        memory_key,
+                        max_version,
+                        MemoryWriteConflictPolicy::Overwrite,
                     )
-                    .await
-                    .map_err(memory_error)?;
+                    .await?;
                 }
                 let cache_mutations = mutations
                     .iter()
@@ -1242,81 +1202,32 @@ impl MemoryStore {
             }
 
             let outcome = async {
-                let current = self.max_version_for_memory(&conn, memory_key).await?.unwrap_or(-1);
+                let current = self
+                    .max_version_for_memory(&conn, memory_key)
+                    .await?
+                    .unwrap_or(-1);
                 let write_started = Instant::now();
                 let commit_version = self.reserve_version_after(current);
                 for mutation in mutations {
-                    let now_ms = epoch_ms_i64()?;
-                    if mutation.deleted {
-                        let empty_blob: &[u8] = &[];
-                        conn.execute(
-                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                             VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
-                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = excluded.value,
-                               value_blob = excluded.value_blob,
-                               encoding = excluded.encoding,
-                               deleted = 1,
-                               version = excluded.version,
-                               updated_at_ms = excluded.updated_at_ms",
-                            (
-                                memory_key,
-                                mutation.key.as_str(),
-                                empty_blob,
-                                ENCODING_UTF8,
-                                commit_version,
-                                now_ms,
-                            ),
-                        )
-                        .await
-                        .map_err(memory_error)?;
-                    } else {
-                        let value_text = if mutation.encoding == ENCODING_UTF8 {
-                            std::str::from_utf8(&mutation.value)
-                                .map_err(|error| {
-                                    PlatformError::bad_request(format!(
-                                        "invalid utf8 value: {error}"
-                                    ))
-                                })?
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
-                        conn.execute(
-                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = excluded.value,
-                               value_blob = excluded.value_blob,
-                               encoding = excluded.encoding,
-                               deleted = 0,
-                               version = excluded.version,
-                               updated_at_ms = excluded.updated_at_ms",
-                            (
-                                memory_key,
-                                mutation.key.as_str(),
-                                value_text.as_str(),
-                                mutation.value.as_slice(),
-                                mutation.encoding.as_str(),
-                                commit_version,
-                                now_ms,
-                            ),
-                        )
-                        .await
-                        .map_err(memory_error)?;
-                    }
+                    upsert_memory_state_row(
+                        &conn,
+                        memory_key,
+                        mutation.key.as_str(),
+                        mutation.value.as_slice(),
+                        mutation.encoding.as_str(),
+                        mutation.deleted,
+                        commit_version,
+                        MemoryWriteConflictPolicy::Overwrite,
+                    )
+                    .await?;
                 }
-                let now_ms = epoch_ms_i64()?;
-                conn.execute(
-                    "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(entity_key) DO UPDATE SET
-                       max_version = excluded.max_version,
-                       updated_at_ms = excluded.updated_at_ms",
-                    (memory_key, commit_version, now_ms),
+                upsert_memory_meta_row(
+                    &conn,
+                    memory_key,
+                    commit_version,
+                    MemoryWriteConflictPolicy::Overwrite,
                 )
-                .await
-                .map_err(memory_error)?;
+                .await?;
 
                 let cache_mutations = mutations
                     .iter()
@@ -1489,77 +1400,25 @@ impl MemoryStore {
                     for entry in entries {
                         let version = entry.token as i64;
                         memory_max_version = memory_max_version.max(version);
-                        let now_ms = epoch_ms_i64()?;
-                        if entry.mutation.deleted {
-                            let empty_blob: &[u8] = &[];
-                            conn.execute(
-                                "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                                 VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
-                                 ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                                   value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
-                                   value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
-                                   encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
-                                   deleted = CASE WHEN excluded.version > memory_state.version THEN 1 ELSE memory_state.deleted END,
-                                   version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
-                                   updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
-                                (
-                                    memory_key.as_str(),
-                                    entry.mutation.key.as_str(),
-                                    empty_blob,
-                                    ENCODING_UTF8,
-                                    version,
-                                    now_ms,
-                                ),
-                            )
-                            .await
-                            .map_err(memory_error)?;
-                        } else {
-                            let value_text = if entry.mutation.encoding == ENCODING_UTF8 {
-                                std::str::from_utf8(&entry.mutation.value)
-                                    .map_err(|error| {
-                                        PlatformError::bad_request(format!(
-                                            "invalid utf8 value: {error}"
-                                        ))
-                                    })?
-                                    .to_string()
-                            } else {
-                                String::new()
-                            };
-                            conn.execute(
-                                "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-                                 ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                                   value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
-                                   value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
-                                   encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
-                                   deleted = CASE WHEN excluded.version > memory_state.version THEN 0 ELSE memory_state.deleted END,
-                                   version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
-                                   updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
-                                (
-                                    memory_key.as_str(),
-                                    entry.mutation.key.as_str(),
-                                    value_text.as_str(),
-                                    entry.mutation.value.as_slice(),
-                                    entry.mutation.encoding.as_str(),
-                                    version,
-                                    now_ms,
-                                ),
-                            )
-                            .await
-                            .map_err(memory_error)?;
-                        }
+                        upsert_memory_state_row(
+                            &conn,
+                            memory_key.as_str(),
+                            entry.mutation.key.as_str(),
+                            entry.mutation.value.as_slice(),
+                            entry.mutation.encoding.as_str(),
+                            entry.mutation.deleted,
+                            version,
+                            MemoryWriteConflictPolicy::WriteLast,
+                        )
+                        .await?;
                     }
-                    let now_ms = epoch_ms_i64()?;
-                    conn.execute(
-                        "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
-                         VALUES (?1, ?2, ?3)
-                         ON CONFLICT(entity_key) DO UPDATE SET
-                           max_version = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.max_version ELSE memory_meta.max_version END,
-                           updated_at_ms = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.updated_at_ms ELSE memory_meta.updated_at_ms END",
-                        (memory_key.as_str(), memory_max_version, now_ms),
+                    upsert_memory_meta_row(
+                        &conn,
+                        memory_key.as_str(),
+                        memory_max_version,
+                        MemoryWriteConflictPolicy::WriteLast,
                     )
-                    .await
-                    .map_err(memory_error)?;
+                    .await?;
                 }
                 let delete_started = Instant::now();
                 let mut deleted = 0u64;
@@ -1688,80 +1547,31 @@ impl MemoryStore {
                 for entry in &entries {
                     let version = entry.token as i64;
                     memory_max_version = memory_max_version.max(version);
-                    let now_ms = epoch_ms_i64()?;
-                    if entry.mutation.deleted {
-                        let empty_blob: &[u8] = &[];
-                        conn.execute(
-                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                             VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
-                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
-                               value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
-                               encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
-                               deleted = CASE WHEN excluded.version > memory_state.version THEN 1 ELSE memory_state.deleted END,
-                               version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
-                               updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
-                            (
-                                memory_key.as_str(),
-                                entry.mutation.key.as_str(),
-                                empty_blob,
-                                ENCODING_UTF8,
-                                version,
-                                now_ms,
-                            ),
-                        )
-                        .await
-                        .map_err(memory_error)?;
-                    } else {
-                        let value_text = if entry.mutation.encoding == ENCODING_UTF8 {
-                            std::str::from_utf8(&entry.mutation.value)
-                                .map_err(|error| {
-                                    PlatformError::bad_request(format!(
-                                        "invalid utf8 value: {error}"
-                                    ))
-                                })?
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
-                        conn.execute(
-                            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-                             ON CONFLICT(entity_key, item_key) DO UPDATE SET
-                               value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
-                               value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
-                               encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
-                               deleted = CASE WHEN excluded.version > memory_state.version THEN 0 ELSE memory_state.deleted END,
-                               version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
-                               updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END",
-                            (
-                                memory_key.as_str(),
-                                entry.mutation.key.as_str(),
-                                value_text.as_str(),
-                                entry.mutation.value.as_slice(),
-                                entry.mutation.encoding.as_str(),
-                                version,
-                                now_ms,
-                            ),
-                        )
-                        .await
-                        .map_err(memory_error)?;
-                    }
+                    upsert_memory_state_row(
+                        &conn,
+                        memory_key.as_str(),
+                        entry.mutation.key.as_str(),
+                        entry.mutation.value.as_slice(),
+                        entry.mutation.encoding.as_str(),
+                        entry.mutation.deleted,
+                        version,
+                        MemoryWriteConflictPolicy::WriteLast,
+                    )
+                    .await?;
                 }
-                let now_ms = epoch_ms_i64()?;
-                conn.execute(
-                    "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(entity_key) DO UPDATE SET
-                       max_version = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.max_version ELSE memory_meta.max_version END,
-                       updated_at_ms = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.updated_at_ms ELSE memory_meta.updated_at_ms END",
-                    (memory_key.as_str(), memory_max_version, now_ms),
+                upsert_memory_meta_row(
+                    &conn,
+                    memory_key.as_str(),
+                    memory_max_version,
+                    MemoryWriteConflictPolicy::WriteLast,
                 )
-                .await
-                .map_err(memory_error)?;
+                .await?;
                 let delete_started = Instant::now();
                 let mut deleted = 0u64;
-                for queue_id in entries.iter().flat_map(|entry| entry.queue_ids.iter().copied()) {
+                for queue_id in entries
+                    .iter()
+                    .flat_map(|entry| entry.queue_ids.iter().copied())
+                {
                     conn.execute(
                         "DELETE FROM memory_direct_queue WHERE queue_id = ?1",
                         (queue_id,),
@@ -2493,6 +2303,129 @@ impl MemoryStore {
             snapshots.remove(&key);
         }
     }
+}
+
+async fn upsert_memory_state_row(
+    conn: &Connection,
+    memory_key: &str,
+    item_key: &str,
+    value: &[u8],
+    encoding: &str,
+    deleted: bool,
+    version: i64,
+    policy: MemoryWriteConflictPolicy,
+) -> Result<()> {
+    let now_ms = epoch_ms_i64()?;
+    if deleted {
+        let empty_blob: &[u8] = &[];
+        let sql = match policy {
+            MemoryWriteConflictPolicy::Overwrite => {
+                "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                 VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
+                 ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                   value = excluded.value,
+                   value_blob = excluded.value_blob,
+                   encoding = excluded.encoding,
+                   deleted = 1,
+                   version = excluded.version,
+                   updated_at_ms = excluded.updated_at_ms"
+            }
+            MemoryWriteConflictPolicy::WriteLast => {
+                "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+                 VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
+                 ON CONFLICT(entity_key, item_key) DO UPDATE SET
+                   value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
+                   value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
+                   encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
+                   deleted = CASE WHEN excluded.version > memory_state.version THEN 1 ELSE memory_state.deleted END,
+                   version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
+                   updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END"
+            }
+        };
+        conn.execute(
+            sql,
+            (
+                memory_key,
+                item_key,
+                empty_blob,
+                ENCODING_UTF8,
+                version,
+                now_ms,
+            ),
+        )
+        .await
+        .map_err(memory_error)?;
+        return Ok(());
+    }
+
+    let value_text = if encoding == ENCODING_UTF8 {
+        std::str::from_utf8(value)
+            .map_err(|error| PlatformError::bad_request(format!("invalid utf8 value: {error}")))?
+    } else {
+        ""
+    };
+    let sql = match policy {
+        MemoryWriteConflictPolicy::Overwrite => {
+            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+               value = excluded.value,
+               value_blob = excluded.value_blob,
+               encoding = excluded.encoding,
+               deleted = 0,
+               version = excluded.version,
+               updated_at_ms = excluded.updated_at_ms"
+        }
+        MemoryWriteConflictPolicy::WriteLast => {
+            "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+             ON CONFLICT(entity_key, item_key) DO UPDATE SET
+               value = CASE WHEN excluded.version > memory_state.version THEN excluded.value ELSE memory_state.value END,
+               value_blob = CASE WHEN excluded.version > memory_state.version THEN excluded.value_blob ELSE memory_state.value_blob END,
+               encoding = CASE WHEN excluded.version > memory_state.version THEN excluded.encoding ELSE memory_state.encoding END,
+               deleted = CASE WHEN excluded.version > memory_state.version THEN 0 ELSE memory_state.deleted END,
+               version = CASE WHEN excluded.version > memory_state.version THEN excluded.version ELSE memory_state.version END,
+               updated_at_ms = CASE WHEN excluded.version > memory_state.version THEN excluded.updated_at_ms ELSE memory_state.updated_at_ms END"
+        }
+    };
+    conn.execute(
+        sql,
+        (
+            memory_key, item_key, value_text, value, encoding, version, now_ms,
+        ),
+    )
+    .await
+    .map_err(memory_error)?;
+    Ok(())
+}
+
+async fn upsert_memory_meta_row(
+    conn: &Connection,
+    memory_key: &str,
+    max_version: i64,
+    policy: MemoryWriteConflictPolicy,
+) -> Result<()> {
+    let now_ms = epoch_ms_i64()?;
+    let sql = match policy {
+        MemoryWriteConflictPolicy::Overwrite => {
+            "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(entity_key) DO UPDATE SET
+               max_version = excluded.max_version,
+               updated_at_ms = excluded.updated_at_ms"
+        }
+        MemoryWriteConflictPolicy::WriteLast => {
+            "INSERT INTO memory_meta (entity_key, max_version, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(entity_key) DO UPDATE SET
+               max_version = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.max_version ELSE memory_meta.max_version END,
+               updated_at_ms = CASE WHEN excluded.max_version > memory_meta.max_version THEN excluded.updated_at_ms ELSE memory_meta.updated_at_ms END"
+        }
+    };
+    conn.execute(sql, (memory_key, max_version, now_ms))
+        .await
+        .map_err(memory_error)?;
+    Ok(())
 }
 
 impl MemoryProfileMetric {

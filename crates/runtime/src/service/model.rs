@@ -76,7 +76,6 @@ pub(crate) struct DynamicQuotaState {
     pub(crate) upgrade_deny_count: AtomicU64,
 }
 
-#[derive(Clone)]
 pub(super) struct HostRpcProvider {
     pub(super) owner_worker: String,
     pub(super) owner_generation: u64,
@@ -113,7 +112,6 @@ pub(super) struct DynamicTimeoutDiagnostic {
     pub(super) timeout_ms: u64,
 }
 
-#[derive(Clone)]
 pub(super) struct WorkerWebSocketSession {
     pub(super) worker_name: String,
     pub(super) generation: u64,
@@ -135,7 +133,6 @@ pub(super) struct WebSocketOutboundFrame {
     pub(super) payload: Vec<u8>,
 }
 
-#[derive(Clone)]
 pub(super) struct WorkerTransportSession {
     pub(super) worker_name: String,
     pub(super) generation: u64,
@@ -195,21 +192,17 @@ pub(super) struct WorkerPool {
     pub(super) kv_read_cache_config_json: Arc<str>,
     pub(super) memory_bindings: Vec<String>,
     pub(super) memory_bindings_json: Arc<str>,
-    pub(super) dynamic_bindings: Vec<String>,
     pub(super) dynamic_bindings_json: Arc<str>,
     pub(super) dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     pub(super) dynamic_rpc_bindings_json: Arc<str>,
     pub(super) dynamic_env_json: Arc<str>,
-    pub(super) secret_replacements: Vec<(String, String)>,
-    pub(super) egress_allow_hosts: Vec<String>,
+    pub(super) request_context: RequestExecutionContext,
     pub(super) dynamic_child_policy: Option<ValidatedDynamicWorkerPolicy>,
     pub(super) dynamic_quota_state: Option<Arc<DynamicQuotaState>>,
     pub(super) assets: AssetBundle,
     pub(super) strict_request_isolation: bool,
     pub(super) queue: VecDeque<PendingInvoke>,
     pub(super) isolates: Vec<IsolateHandle>,
-    pub(super) memory_owners: HashMap<String, u64>,
-    pub(super) memory_inflight: HashMap<String, usize>,
     pub(super) stats: PoolStats,
     pub(super) queue_warn_level: usize,
 }
@@ -244,6 +237,7 @@ pub(super) struct PendingInvoke {
 #[derive(Clone)]
 pub(super) enum PendingReplyKind {
     Normal,
+    Stream,
     DynamicInvoke { handle: String },
     DynamicFetch { handle: String },
     WebsocketOpen { session_id: String },
@@ -261,6 +255,7 @@ impl PendingReplyKind {
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::Stream => "stream",
             Self::DynamicInvoke { .. } => "dynamic-invoke",
             Self::DynamicFetch { .. } => "dynamic-fetch",
             Self::WebsocketOpen { .. } => "websocket-open",
@@ -288,6 +283,11 @@ pub(super) struct PendingReplyMeta {
     pub(super) user_request_id: String,
 }
 
+pub(super) struct TraceResultMeta {
+    pub(super) status: Option<u16>,
+    pub(super) error: Option<String>,
+}
+
 pub(super) enum DirectDynamicFetchDispatch {
     Dispatched,
     Fallback {
@@ -300,19 +300,23 @@ pub(super) enum DirectDynamicFetchDispatch {
 pub(super) struct MemoryRoute {
     pub(super) binding: String,
     pub(super) key: String,
+    pub(super) owner_key: String,
 }
 
 impl MemoryRoute {
-    pub(super) fn owner_key(&self) -> String {
-        format!("{}\u{001f}{}", self.binding, self.key)
+    pub(super) fn new(binding: String, key: String) -> Self {
+        let owner_key = memory_owner_key(&binding, &key);
+        Self {
+            binding,
+            key,
+            owner_key,
+        }
     }
 }
 
 pub(super) struct DispatchCandidate {
     pub(super) queue_idx: usize,
     pub(super) isolate_idx: usize,
-    pub(super) memory_key: Option<String>,
-    pub(super) assign_owner: bool,
 }
 
 pub(super) enum DispatchSelection {

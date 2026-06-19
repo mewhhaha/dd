@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn select_dispatch_candidate(
-    pool: &mut WorkerPool,
+    pool: &WorkerPool,
     max_inflight: usize,
     require_wait_until_idle: bool,
 ) -> Option<DispatchSelection> {
@@ -14,21 +14,11 @@ pub(super) fn select_dispatch_candidate(
         if !targeted_nested_call {
             continue;
         }
-        if let Some((isolate_idx, isolate)) = pool
-            .isolates
-            .iter()
-            .enumerate()
-            .find(|(_, isolate)| isolate.id == target_isolate_id)
-        {
-            let memory_key = pending.memory_route.as_ref().map(MemoryRoute::owner_key);
-            if isolate.inflight_count < max_inflight || targeted_nested_call {
-                return Some(DispatchSelection::Dispatch(DispatchCandidate {
-                    queue_idx,
-                    isolate_idx,
-                    memory_key,
-                    assign_owner: false,
-                }));
-            }
+        if let Some(isolate_idx) = target_isolate_idx(pool, target_isolate_id) {
+            return Some(DispatchSelection::Dispatch(DispatchCandidate {
+                queue_idx,
+                isolate_idx,
+            }));
         } else {
             return Some(DispatchSelection::DropStaleTarget { queue_idx });
         }
@@ -36,25 +26,16 @@ pub(super) fn select_dispatch_candidate(
 
     for (queue_idx, pending) in pool.queue.iter().enumerate() {
         if let Some(target_isolate_id) = pending.target_isolate_id {
-            if let Some((isolate_idx, isolate)) = pool
-                .isolates
-                .iter()
-                .enumerate()
-                .find(|(_, isolate)| isolate.id == target_isolate_id)
-            {
-                let targeted_nested_call =
-                    pending.host_rpc_call.is_some() || pending.memory_route.is_some();
-                let memory_key = pending.memory_route.as_ref().map(MemoryRoute::owner_key);
-                if (targeted_nested_call || isolate.inflight_count < max_inflight)
-                    && (targeted_nested_call
-                        || !require_wait_until_idle
-                        || isolate.pending_wait_until.is_empty())
+            if let Some(isolate_idx) = target_isolate_idx(pool, target_isolate_id) {
+                let isolate = &pool.isolates[isolate_idx];
+                debug_assert!(pending.host_rpc_call.is_none());
+                debug_assert!(pending.memory_route.is_none());
+                if isolate.inflight_count < max_inflight
+                    && (!require_wait_until_idle || isolate.pending_wait_until.is_empty())
                 {
                     return Some(DispatchSelection::Dispatch(DispatchCandidate {
                         queue_idx,
                         isolate_idx,
-                        memory_key,
-                        assign_owner: false,
                     }));
                 }
             } else {
@@ -63,19 +44,15 @@ pub(super) fn select_dispatch_candidate(
             continue;
         }
 
-        let Some(route) = &pending.memory_route else {
+        if pending.memory_route.is_none() {
             return least_loaded_isolate_idx(&pool.isolates, max_inflight, require_wait_until_idle)
                 .map(|isolate_idx| {
                     DispatchSelection::Dispatch(DispatchCandidate {
                         queue_idx,
                         isolate_idx,
-                        memory_key: None,
-                        assign_owner: false,
                     })
                 });
-        };
-
-        let memory_key = route.owner_key();
+        }
 
         if let Some(isolate_idx) =
             least_loaded_isolate_any_idx(&pool.isolates, require_wait_until_idle)
@@ -83,12 +60,16 @@ pub(super) fn select_dispatch_candidate(
             return Some(DispatchSelection::Dispatch(DispatchCandidate {
                 queue_idx,
                 isolate_idx,
-                memory_key: Some(memory_key),
-                assign_owner: false,
             }));
         }
     }
     None
+}
+
+fn target_isolate_idx(pool: &WorkerPool, target_isolate_id: u64) -> Option<usize> {
+    pool.isolates
+        .iter()
+        .position(|isolate| isolate.id == target_isolate_id)
 }
 
 pub(super) fn host_rpc_method_blocked(method: &str) -> bool {
@@ -126,66 +107,47 @@ pub(super) fn least_loaded_isolate_any_idx(
         .map(|(idx, _)| idx)
 }
 
-pub(super) fn decrement_memory_inflight(
-    memory_inflight: &mut HashMap<String, usize>,
-    memory_key: &str,
-) {
-    let Some(current) = memory_inflight.get_mut(memory_key) else {
-        return;
-    };
-    *current = current.saturating_sub(1);
-    if *current == 0 {
-        memory_inflight.remove(memory_key);
-    }
-}
-
 impl WorkerPool {
+    pub(super) fn build_execute_command(
+        &self,
+        runtime_request_id: String,
+        completion_token: String,
+        request: WorkerInvocation,
+        request_body: Option<InvokeRequestBodyReceiver>,
+        stream_response: bool,
+        memory_call: Option<MemoryExecutionCall>,
+        host_rpc_call: Option<HostRpcExecutionCall>,
+        memory_route: Option<MemoryRoute>,
+    ) -> IsolateCommand {
+        IsolateCommand::Execute {
+            runtime_request_id,
+            completion_token,
+            worker_name_json: Arc::clone(&self.worker_name_json),
+            kv_bindings_json: Arc::clone(&self.kv_bindings_json),
+            kv_read_cache_config_json: Arc::clone(&self.kv_read_cache_config_json),
+            memory_bindings_json: Arc::clone(&self.memory_bindings_json),
+            dynamic_bindings_json: Arc::clone(&self.dynamic_bindings_json),
+            dynamic_rpc_bindings_json: Arc::clone(&self.dynamic_rpc_bindings_json),
+            dynamic_env_json: Arc::clone(&self.dynamic_env_json),
+            request_context: self.request_context.clone(),
+            request,
+            request_body,
+            stream_response,
+            memory_call,
+            host_rpc_call,
+            memory_route,
+        }
+    }
+
+    pub(super) fn has_dispatch_capacity(&self, max_inflight: usize) -> bool {
+        self.isolates.iter().any(|isolate| {
+            isolate.inflight_count < max_inflight
+                && (!self.strict_request_isolation || isolate.pending_wait_until.is_empty())
+        })
+    }
+
     pub(super) fn is_drained(&self) -> bool {
-        self.queue.is_empty()
-            && self.inflight_total() == 0
-            && self.wait_until_total() == 0
-            && self.active_websocket_total() == 0
-            && self.active_transport_total() == 0
-    }
-
-    pub(super) fn busy_count(&self) -> usize {
-        self.isolates
-            .iter()
-            .filter(|isolate| {
-                isolate.inflight_count > 0
-                    || !isolate.pending_wait_until.is_empty()
-                    || isolate.active_websocket_sessions > 0
-                    || isolate.active_transport_sessions > 0
-            })
-            .count()
-    }
-
-    pub(super) fn inflight_total(&self) -> usize {
-        self.isolates
-            .iter()
-            .map(|isolate| isolate.inflight_count)
-            .sum()
-    }
-
-    pub(super) fn wait_until_total(&self) -> usize {
-        self.isolates
-            .iter()
-            .map(|isolate| isolate.pending_wait_until.len())
-            .sum()
-    }
-
-    pub(super) fn active_websocket_total(&self) -> usize {
-        self.isolates
-            .iter()
-            .map(|isolate| isolate.active_websocket_sessions)
-            .sum()
-    }
-
-    pub(super) fn active_transport_total(&self) -> usize {
-        self.isolates
-            .iter()
-            .map(|isolate| isolate.active_transport_sessions)
-            .sum()
+        self.queue.is_empty() && self.activity_snapshot().is_idle()
     }
 
     pub(super) fn update_queue_warning(&mut self, thresholds: &[usize]) {
@@ -206,18 +168,56 @@ impl WorkerPool {
     }
 
     pub(super) fn stats_snapshot(&self) -> WorkerStats {
+        let activity = self.activity_snapshot();
         WorkerStats {
             generation: self.generation,
             public: self.is_public,
             queued: self.queue.len(),
-            busy: self.busy_count(),
-            inflight_total: self.inflight_total(),
-            wait_until_total: self.wait_until_total(),
+            busy: activity.busy,
+            inflight_total: activity.inflight_total,
+            wait_until_total: activity.wait_until_total,
             isolates_total: self.isolates.len(),
             spawn_count: self.stats.spawn_count,
             reuse_count: self.stats.reuse_count,
             scale_down_count: self.stats.scale_down_count,
         }
+    }
+
+    fn activity_snapshot(&self) -> PoolActivity {
+        let mut activity = PoolActivity::default();
+        for isolate in &self.isolates {
+            let wait_until = isolate.pending_wait_until.len();
+            if isolate.inflight_count > 0
+                || wait_until > 0
+                || isolate.active_websocket_sessions > 0
+                || isolate.active_transport_sessions > 0
+            {
+                activity.busy += 1;
+            }
+            activity.inflight_total += isolate.inflight_count;
+            activity.wait_until_total += wait_until;
+            activity.active_websocket_total += isolate.active_websocket_sessions;
+            activity.active_transport_total += isolate.active_transport_sessions;
+        }
+        activity
+    }
+}
+
+#[derive(Default)]
+struct PoolActivity {
+    busy: usize,
+    inflight_total: usize,
+    wait_until_total: usize,
+    active_websocket_total: usize,
+    active_transport_total: usize,
+}
+
+impl PoolActivity {
+    fn is_idle(&self) -> bool {
+        self.inflight_total == 0
+            && self.wait_until_total == 0
+            && self.active_websocket_total == 0
+            && self.active_transport_total == 0
     }
 }
 
@@ -711,13 +711,7 @@ pub(super) fn handle_isolate_command(
             dynamic_bindings_json,
             dynamic_rpc_bindings_json,
             dynamic_env_json,
-            dynamic_bindings,
-            dynamic_rpc_bindings,
-            secret_replacements,
-            egress_allow_hosts,
-            allow_cache,
-            max_outbound_requests,
-            dynamic_quota_state,
+            request_context,
             request,
             request_body,
             stream_response,
@@ -725,43 +719,30 @@ pub(super) fn handle_isolate_command(
             host_rpc_call,
             memory_route,
         } => {
-            let request_id = request.request_id.clone();
             let has_request_body_stream = request_body.is_some();
-            if let Some(request_body) = request_body {
-                let op_state = js_runtime.op_state();
-                let mut op_state = op_state.borrow_mut();
-                register_request_body_stream(
-                    &mut op_state,
-                    runtime_request_id.clone(),
-                    request_body,
-                );
-            }
-            if let Some(route) = memory_route.as_ref() {
-                let op_state = js_runtime.op_state();
-                let mut op_state = op_state.borrow_mut();
-                register_memory_request_scope(
-                    &mut op_state,
-                    runtime_request_id.clone(),
-                    route.binding.clone(),
-                    route.key.clone(),
-                );
-            }
             {
                 let op_state = js_runtime.op_state();
                 let mut op_state = op_state.borrow_mut();
+                if let Some(request_body) = request_body {
+                    register_request_body_stream(
+                        &mut op_state,
+                        runtime_request_id.clone(),
+                        request_body,
+                    );
+                }
+                if let Some(route) = memory_route {
+                    register_memory_request_scope(
+                        &mut op_state,
+                        runtime_request_id.clone(),
+                        route.binding,
+                        route.key,
+                    );
+                }
                 register_request_secret_context(
                     &mut op_state,
                     runtime_request_id.clone(),
-                    worker_name.to_string(),
-                    generation,
                     isolate_id,
-                    dynamic_bindings.clone(),
-                    dynamic_rpc_bindings.clone(),
-                    secret_replacements,
-                    egress_allow_hosts,
-                    allow_cache,
-                    max_outbound_requests,
-                    dynamic_quota_state,
+                    request_context,
                 );
             }
             let execute_span = if tracing::enabled!(Level::INFO) {
@@ -771,117 +752,15 @@ pub(super) fn handle_isolate_command(
                     worker.generation = generation,
                     isolate.id = isolate_id,
                     runtime.request_id = %runtime_request_id,
-                    request.id = %request_id
+                    request.id = %request.request_id
                 );
-                set_span_parent_from_traceparent(
-                    &span,
-                    traceparent_from_headers(&request.headers).as_deref(),
-                );
+                set_span_parent_from_traceparent(&span, traceparent_from_headers(&request.headers));
                 Some(span)
             } else {
                 None
             };
             let _execute_guard = execute_span.as_ref().map(|span| span.enter());
             let started_at = Instant::now();
-            let dispatch_memory_call = memory_call.as_ref().map(|call| match call {
-                MemoryExecutionCall::Method {
-                    binding,
-                    key,
-                    name,
-                    args,
-                } => ExecuteMemoryCall::Method {
-                    binding: binding.clone(),
-                    key: key.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                },
-                MemoryExecutionCall::Message {
-                    binding,
-                    key,
-                    handle,
-                    is_text,
-                    data,
-                    socket_handles,
-                    transport_handles,
-                } => ExecuteMemoryCall::Message {
-                    binding: binding.clone(),
-                    key: key.clone(),
-                    handle: handle.clone(),
-                    is_text: *is_text,
-                    data: data.clone(),
-                    socket_handles: socket_handles.clone(),
-                    transport_handles: transport_handles.clone(),
-                },
-                MemoryExecutionCall::Close {
-                    binding,
-                    key,
-                    handle,
-                    code,
-                    reason,
-                    socket_handles,
-                    transport_handles,
-                } => ExecuteMemoryCall::Close {
-                    binding: binding.clone(),
-                    key: key.clone(),
-                    handle: handle.clone(),
-                    code: *code,
-                    reason: reason.clone(),
-                    socket_handles: socket_handles.clone(),
-                    transport_handles: transport_handles.clone(),
-                },
-                MemoryExecutionCall::TransportDatagram {
-                    binding,
-                    key,
-                    handle,
-                    data,
-                    socket_handles,
-                    transport_handles,
-                } => ExecuteMemoryCall::TransportDatagram {
-                    binding: binding.clone(),
-                    key: key.clone(),
-                    handle: handle.clone(),
-                    data: data.clone(),
-                    socket_handles: socket_handles.clone(),
-                    transport_handles: transport_handles.clone(),
-                },
-                MemoryExecutionCall::TransportStream {
-                    binding,
-                    key,
-                    handle,
-                    data,
-                    socket_handles,
-                    transport_handles,
-                } => ExecuteMemoryCall::TransportStream {
-                    binding: binding.clone(),
-                    key: key.clone(),
-                    handle: handle.clone(),
-                    data: data.clone(),
-                    socket_handles: socket_handles.clone(),
-                    transport_handles: transport_handles.clone(),
-                },
-                MemoryExecutionCall::TransportClose {
-                    binding,
-                    key,
-                    handle,
-                    code,
-                    reason,
-                    socket_handles,
-                    transport_handles,
-                } => ExecuteMemoryCall::TransportClose {
-                    binding: binding.clone(),
-                    key: key.clone(),
-                    handle: handle.clone(),
-                    code: *code,
-                    reason: reason.clone(),
-                    socket_handles: socket_handles.clone(),
-                    transport_handles: transport_handles.clone(),
-                },
-            });
-            let dispatch_host_rpc_call = host_rpc_call.as_ref().map(|call| ExecuteHostRpcCall {
-                target_id: call.target_id.clone(),
-                method: call.method.clone(),
-                args: call.args.clone(),
-            });
             if let Err(error) = dispatch_worker_request(
                 js_runtime,
                 &runtime_request_id,
@@ -895,8 +774,8 @@ pub(super) fn handle_isolate_command(
                 &dynamic_env_json,
                 has_request_body_stream,
                 stream_response,
-                dispatch_memory_call.as_ref(),
-                dispatch_host_rpc_call.as_ref(),
+                memory_call.as_ref(),
+                host_rpc_call.as_ref(),
                 request,
             ) {
                 {

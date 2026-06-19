@@ -144,13 +144,6 @@ pub struct TestAsyncReplyEvent {
     pub error: String,
 }
 
-#[derive(Clone)]
-pub struct TestAsyncReplyOwner {
-    pub worker_name: String,
-    pub generation: u64,
-    pub isolate_id: u64,
-}
-
 pub struct TestNestedTargetedInvokeEvent {
     pub worker_name: String,
     pub generation: u64,
@@ -176,18 +169,18 @@ pub struct TestAsyncReplies {
 }
 
 pub(crate) struct TestAsyncReplyEntry {
-    pub(crate) owner: TestAsyncReplyOwner,
+    pub(crate) owner: PendingReplyOwner,
 }
 
 #[derive(Clone)]
-pub struct DynamicPendingReplyOwner {
+pub struct PendingReplyOwner {
     pub worker_name: String,
     pub generation: u64,
     pub isolate_id: u64,
 }
 
 pub(crate) struct DynamicPendingReplyEntry {
-    pub(crate) owner: DynamicPendingReplyOwner,
+    pub(crate) owner: PendingReplyOwner,
 }
 
 pub enum DynamicPendingReplyPayload {
@@ -205,7 +198,7 @@ pub enum DynamicPendingReplyPayload {
 }
 
 pub struct DynamicPendingReplyDelivery {
-    pub owner: DynamicPendingReplyOwner,
+    pub owner: PendingReplyOwner,
     pub payload: DynamicPushedReplyPayload,
 }
 
@@ -221,7 +214,7 @@ pub enum DynamicPushedReplyPayload {
 pub struct DynamicPendingReplyResult {
     pub reply_id: String,
     pub(crate) ready: bool,
-    pub(crate) kind: String,
+    pub(crate) kind: &'static str,
     pub(crate) ok: bool,
     pub(crate) found: bool,
     pub(crate) deleted: bool,
@@ -250,6 +243,45 @@ pub struct DynamicFetchReplyResult {
     pub boundary_now_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary_perf_ms: Option<f64>,
+}
+
+impl DynamicFetchReplyResult {
+    fn from_result(
+        reply_id: String,
+        result: Result<WorkerOutput>,
+        stale_handle: bool,
+        boundary: Option<TimeBoundary>,
+    ) -> Self {
+        let boundary_changed = boundary.is_some();
+        let boundary_now_ms = boundary.as_ref().map(|value| value.now_ms);
+        let boundary_perf_ms = boundary.as_ref().map(|value| value.perf_ms);
+        match result {
+            Ok(output) => Self {
+                reply_id,
+                ok: true,
+                status: output.status,
+                headers: output.headers,
+                body: output.body,
+                error: String::new(),
+                stale_handle,
+                boundary_changed,
+                boundary_now_ms,
+                boundary_perf_ms,
+            },
+            Err(error) => Self {
+                reply_id,
+                ok: false,
+                status: 0,
+                headers: Vec::new(),
+                body: Vec::new(),
+                error: error.to_string(),
+                stale_handle,
+                boundary_changed,
+                boundary_now_ms,
+                boundary_perf_ms,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -306,7 +338,7 @@ impl Default for DynamicPendingReplyResult {
         Self {
             reply_id: String::new(),
             ready: false,
-            kind: String::new(),
+            kind: "",
             ok: false,
             found: false,
             deleted: false,
@@ -323,8 +355,20 @@ impl Default for DynamicPendingReplyResult {
     }
 }
 
+impl DynamicPendingReplyResult {
+    fn ready(reply_id: String, kind: &'static str, ok: bool) -> Self {
+        Self {
+            reply_id,
+            ready: true,
+            kind,
+            ok,
+            ..Self::default()
+        }
+    }
+}
+
 impl DynamicPendingReplies {
-    pub fn allocate(&self, owner: DynamicPendingReplyOwner) -> String {
+    pub fn allocate(&self, owner: PendingReplyOwner) -> String {
         let reply_id = format!("dynr-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut entries = self
             .entries
@@ -395,155 +439,83 @@ impl DynamicPendingReplyPayload {
         match self {
             Self::Create(result) => match result {
                 Ok(created) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "create".to_string(),
-                    ok: true,
                     handle: created.handle,
                     worker: created.worker_name,
                     timeout: created.timeout,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "create", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "create".to_string(),
-                    ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "create", false)
                 }),
             },
             Self::Lookup(result) => match result {
                 Ok(Some(found)) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "lookup".to_string(),
-                    ok: true,
                     found: true,
                     handle: found.handle,
                     worker: found.worker_name,
                     timeout: found.timeout,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "lookup", true)
                 }),
                 Ok(None) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "lookup".to_string(),
-                    ok: true,
                     found: false,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "lookup", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "lookup".to_string(),
-                    ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "lookup", false)
                 }),
             },
             Self::List(result) => match result {
                 Ok(ids) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "list".to_string(),
-                    ok: true,
                     ids,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "list", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "list".to_string(),
-                    ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "list", false)
                 }),
             },
             Self::Delete(result) => match result {
                 Ok(deleted) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "delete".to_string(),
-                    ok: true,
                     deleted,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "delete", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "delete".to_string(),
-                    ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "delete", false)
                 }),
             },
             Self::Invoke(result) => match result {
                 Ok(output) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "invoke".to_string(),
-                    ok: true,
                     status: output.status,
                     headers: output.headers,
                     body: output.body,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "invoke", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "invoke".to_string(),
-                    ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "invoke", false)
                 }),
             },
             Self::Fetch {
                 result,
                 stale_handle,
                 boundary,
-            } => match result {
-                Ok(output) => DynamicPushedReplyPayload::Fetch(DynamicFetchReplyResult {
-                    reply_id,
-                    ok: true,
-                    status: output.status,
-                    headers: output.headers,
-                    body: output.body,
-                    error: String::new(),
-                    stale_handle,
-                    boundary_changed: boundary.is_some(),
-                    boundary_now_ms: boundary.as_ref().map(|value| value.now_ms),
-                    boundary_perf_ms: boundary.as_ref().map(|value| value.perf_ms),
-                }),
-                Err(error) => DynamicPushedReplyPayload::Fetch(DynamicFetchReplyResult {
-                    reply_id,
-                    ok: false,
-                    status: 0,
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                    error: error.to_string(),
-                    stale_handle,
-                    boundary_changed: boundary.is_some(),
-                    boundary_now_ms: boundary.as_ref().map(|value| value.now_ms),
-                    boundary_perf_ms: boundary.as_ref().map(|value| value.perf_ms),
-                }),
-            },
+            } => DynamicPushedReplyPayload::Fetch(DynamicFetchReplyResult::from_result(
+                reply_id,
+                result,
+                stale_handle,
+                boundary,
+            )),
             Self::HostRpc(result) => match result {
                 Ok(value) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "host-rpc".to_string(),
-                    ok: true,
                     value,
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "host-rpc", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    reply_id,
-                    ready: true,
-                    kind: "host-rpc".to_string(),
-                    ok: false,
                     error: error.to_string(),
-                    ..DynamicPendingReplyResult::default()
+                    ..DynamicPendingReplyResult::ready(reply_id, "host-rpc", false)
                 }),
             },
         }
@@ -551,7 +523,7 @@ impl DynamicPendingReplyPayload {
 }
 
 impl TestAsyncReplies {
-    pub fn allocate(&self, owner: TestAsyncReplyOwner) -> String {
+    pub fn allocate(&self, owner: PendingReplyOwner) -> String {
         let reply_id = format!("tasr-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut entries = self.entries.lock().expect("test async reply lock poisoned");
         entries.insert(reply_id.clone(), TestAsyncReplyEntry { owner });
@@ -587,7 +559,7 @@ impl TestAsyncReplies {
 }
 
 pub struct TestAsyncReplyDelivery {
-    pub owner: TestAsyncReplyOwner,
+    pub owner: PendingReplyOwner,
     pub payload: TestAsyncReplyResult,
 }
 

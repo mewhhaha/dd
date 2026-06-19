@@ -150,31 +150,6 @@ impl WorkerManager {
                 };
             }
 
-            let worker_name_json = Arc::clone(&pool.worker_name_json);
-            let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
-            let kv_read_cache_config_json = Arc::clone(&pool.kv_read_cache_config_json);
-            let memory_bindings_json = Arc::clone(&pool.memory_bindings_json);
-            let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
-            let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
-            let dynamic_env_json = Arc::clone(&pool.dynamic_env_json);
-            let dynamic_bindings = pool.dynamic_bindings.clone();
-            let dynamic_rpc_bindings = pool
-                .dynamic_rpc_bindings
-                .iter()
-                .map(|binding| binding.binding.clone())
-                .collect::<Vec<_>>();
-            let secret_replacements = pool.secret_replacements.clone();
-            let egress_allow_hosts = pool.egress_allow_hosts.clone();
-            let allow_cache = pool
-                .dynamic_child_policy
-                .as_ref()
-                .map(|policy| policy.allow_state_bindings)
-                .unwrap_or(true);
-            let max_outbound_requests = pool
-                .dynamic_child_policy
-                .as_ref()
-                .map(|policy| policy.max_outbound_requests);
-            let dynamic_quota_state = pool.dynamic_quota_state.clone();
             let counted_reuse = pool.isolates[isolate_idx].served_requests > 0;
             if counted_reuse {
                 pool.stats.reuse_count += 1;
@@ -187,30 +162,16 @@ impl WorkerManager {
                 traceparent: None,
                 user_request_id: request.request_id.clone(),
             });
-            let command = IsolateCommand::Execute {
-                runtime_request_id: runtime_request_id.clone(),
-                completion_token: completion_token.clone(),
-                worker_name_json,
-                kv_bindings_json,
-                kv_read_cache_config_json,
-                memory_bindings_json,
-                dynamic_bindings_json,
-                dynamic_rpc_bindings_json,
-                dynamic_env_json,
-                dynamic_bindings,
-                dynamic_rpc_bindings,
-                secret_replacements,
-                egress_allow_hosts,
-                allow_cache,
-                max_outbound_requests,
-                dynamic_quota_state,
+            let command = pool.build_execute_command(
+                runtime_request_id.clone(),
+                completion_token.clone(),
                 request,
-                request_body: None,
-                stream_response: false,
-                memory_call: None,
-                host_rpc_call: None,
-                memory_route: None,
-            };
+                None,
+                false,
+                None,
+                None,
+                None,
+            );
 
             let isolate = &mut pool.isolates[isolate_idx];
             isolate.served_requests += 1;
@@ -299,10 +260,10 @@ impl WorkerManager {
             }
         };
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute {
-            binding: decoded.binding.trim().to_string(),
-            key: decoded.key.trim().to_string(),
-        };
+        let route = MemoryRoute::new(
+            decoded.binding.trim().to_string(),
+            decoded.key.trim().to_string(),
+        );
         if route.binding.is_empty() || route.key.is_empty() {
             let _ = payload.reply.send(Err(PlatformError::bad_request(
                 "memory binding/key must not be empty",
@@ -324,16 +285,7 @@ impl WorkerManager {
                         .iter()
                         .any(|isolate| isolate.id == payload.caller_isolate_id)
                 {
-                    let owner_key = route.owner_key();
-                    match pool.memory_owners.get(&owner_key).copied() {
-                        Some(owner_id) if owner_id == payload.caller_isolate_id => {
-                            target_isolate_id = Some(payload.caller_isolate_id);
-                        }
-                        None => {
-                            target_isolate_id = Some(payload.caller_isolate_id);
-                        }
-                        _ => {}
-                    }
+                    target_isolate_id = Some(payload.caller_isolate_id);
                 }
             }
         }
@@ -510,14 +462,11 @@ impl WorkerManager {
                 } else {
                     max_inflight_per_isolate
                 };
-                let has_capacity = pool.isolates.iter().any(|isolate| {
-                    isolate.inflight_count < max_inflight
-                        && (!pool.strict_request_isolation || isolate.pending_wait_until.is_empty())
-                });
                 let selection =
                     select_dispatch_candidate(pool, max_inflight, pool.strict_request_isolation);
-                let spawn_needed =
-                    selection.is_none() && !has_capacity && pool.isolates.len() < max_isolates;
+                let spawn_needed = selection.is_none()
+                    && !pool.has_dispatch_capacity(max_inflight)
+                    && pool.isolates.len() < max_isolates;
                 (selection, spawn_needed)
             };
 
@@ -559,6 +508,10 @@ impl WorkerManager {
 
             let runtime_request_id = pending_invoke.runtime_request_id.clone();
             let internal_origin = pending_invoke.internal_origin;
+            let pending_memory_key = pending_invoke
+                .memory_route
+                .as_ref()
+                .map(|route| route.owner_key.clone());
             let info_tracing_enabled = tracing::enabled!(Level::INFO);
             let needs_completion_meta = info_tracing_enabled
                 || self
@@ -566,7 +519,7 @@ impl WorkerManager {
                     .and_then(|pool| pool.internal_trace.as_ref())
                     .is_some();
             let traceparent = if needs_completion_meta {
-                traceparent_from_headers(&pending_invoke.request.headers)
+                traceparent_from_headers(&pending_invoke.request.headers).map(str::to_string)
             } else {
                 None
             };
@@ -602,83 +555,36 @@ impl WorkerManager {
                     continue;
                 }
 
-                let worker_name_json = Arc::clone(&pool.worker_name_json);
-                let kv_bindings_json = Arc::clone(&pool.kv_bindings_json);
-                let kv_read_cache_config_json = Arc::clone(&pool.kv_read_cache_config_json);
-                let memory_bindings_json = Arc::clone(&pool.memory_bindings_json);
-                let dynamic_bindings_json = Arc::clone(&pool.dynamic_bindings_json);
-                let dynamic_rpc_bindings_json = Arc::clone(&pool.dynamic_rpc_bindings_json);
-                let dynamic_env_json = Arc::clone(&pool.dynamic_env_json);
-                let dynamic_bindings = pool.dynamic_bindings.clone();
-                let dynamic_rpc_bindings = pool
-                    .dynamic_rpc_bindings
-                    .iter()
-                    .map(|binding| binding.binding.clone())
-                    .collect::<Vec<_>>();
-                let secret_replacements = pool.secret_replacements.clone();
-                let egress_allow_hosts = pool.egress_allow_hosts.clone();
-                let allow_cache = pool
-                    .dynamic_child_policy
-                    .as_ref()
-                    .map(|policy| policy.allow_state_bindings)
-                    .unwrap_or(true);
-                let max_outbound_requests = pool
-                    .dynamic_child_policy
-                    .as_ref()
-                    .map(|policy| policy.max_outbound_requests);
-                let dynamic_quota_state = pool.dynamic_quota_state.clone();
                 let should_count_reuse = pool.isolates[isolate_idx].served_requests > 0;
                 if should_count_reuse {
                     pool.stats.reuse_count += 1;
                 }
                 let pending_kind = pending_invoke.reply_kind.clone();
-                if let Some(memory_key) = &candidate.memory_key {
-                    if candidate.assign_owner {
-                        let owner_id = pool.isolates[isolate_idx].id;
-                        pool.memory_owners.insert(memory_key.clone(), owner_id);
-                    }
-                    let entry = pool.memory_inflight.entry(memory_key.clone()).or_insert(0);
-                    *entry += 1;
-                }
-                let isolate = &mut pool.isolates[isolate_idx];
-                isolate.served_requests += 1;
                 let completion_meta = Some(PendingReplyMeta {
                     method: pending_invoke.request.method.clone(),
                     url: pending_invoke.request.url.clone(),
                     traceparent: traceparent.clone(),
                     user_request_id: pending_invoke.request.request_id.clone(),
                 });
-                let command = IsolateCommand::Execute {
-                    runtime_request_id: runtime_request_id.clone(),
-                    completion_token: completion_token.clone(),
-                    worker_name_json,
-                    kv_bindings_json,
-                    kv_read_cache_config_json,
-                    memory_bindings_json,
-                    dynamic_bindings_json,
-                    dynamic_rpc_bindings_json,
-                    dynamic_env_json,
-                    dynamic_bindings,
-                    dynamic_rpc_bindings,
-                    secret_replacements,
-                    egress_allow_hosts,
-                    allow_cache,
-                    max_outbound_requests,
-                    dynamic_quota_state,
-                    request: pending_invoke.request,
-                    request_body: pending_invoke.request_body,
+                let command = pool.build_execute_command(
+                    runtime_request_id.clone(),
+                    completion_token.clone(),
+                    pending_invoke.request,
+                    pending_invoke.request_body,
                     stream_response,
-                    memory_call: pending_invoke.memory_call,
-                    host_rpc_call: pending_invoke.host_rpc_call,
-                    memory_route: pending_invoke.memory_route,
-                };
+                    pending_invoke.memory_call,
+                    pending_invoke.host_rpc_call,
+                    pending_invoke.memory_route,
+                );
+                let isolate = &mut pool.isolates[isolate_idx];
+                isolate.served_requests += 1;
                 isolate.inflight_count += 1;
                 isolate.pending_replies.insert(
                     runtime_request_id.clone(),
                     PendingReply {
                         completion_token,
                         canceled: false,
-                        memory_key: candidate.memory_key.clone(),
+                        memory_key: pending_memory_key,
                         internal_origin,
                         reply: pending_reply
                             .take()
@@ -690,12 +596,6 @@ impl WorkerManager {
                 );
                 if isolate.sender.send(command).is_err() {
                     isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
-                    if let Some(memory_key) = candidate.memory_key.as_ref() {
-                        decrement_memory_inflight(&mut pool.memory_inflight, memory_key);
-                        if candidate.assign_owner {
-                            pool.memory_owners.remove(memory_key);
-                        }
-                    }
                     pending_reply = isolate
                         .pending_replies
                         .remove(&runtime_request_id)
@@ -826,9 +726,6 @@ impl WorkerManager {
                     isolate.last_used_at = Instant::now();
                 }
                 if let Some(pending) = isolate.pending_replies.remove(request_id) {
-                    if let Some(memory_key) = &pending.memory_key {
-                        decrement_memory_inflight(&mut pool.memory_inflight, memory_key);
-                    }
                     canceled = pending.canceled;
                     internal_origin = pending.internal_origin;
                     if let Some(meta) = pending.completion_meta {
@@ -882,20 +779,46 @@ impl WorkerManager {
         };
         let _complete_guard = complete_span.as_ref().map(|span| span.enter());
 
-        let stream_result = if stream_registered {
+        let stream_consumes_result =
+            stream_registered && matches!(&pending_kind, PendingReplyKind::Stream);
+        let mut stream_result = if stream_registered && !stream_consumes_result {
             Some(result.clone())
         } else {
             None
         };
         let trace_result = if trace_destination.is_some() {
-            Some(result.clone())
+            Some(match &result {
+                Ok(output) => TraceResultMeta {
+                    status: Some(output.status),
+                    error: None,
+                },
+                Err(error) => TraceResultMeta {
+                    status: None,
+                    error: Some(error.to_string()),
+                },
+            })
         } else {
             None
         };
 
-        if !canceled {
+        if stream_consumes_result {
+            stream_result = Some(result);
+            if canceled {
+                if info_tracing_enabled {
+                    info!(
+                        worker = %worker_name,
+                        generation,
+                        isolate_id,
+                        request_id,
+                        "dropped completion for canceled request"
+                    );
+                }
+            } else if info_tracing_enabled {
+                tracing::info!("request completion delivered");
+            }
+        } else if !canceled {
             match pending_kind {
-                PendingReplyKind::Normal => {
+                PendingReplyKind::Normal | PendingReplyKind::Stream => {
                     if let Some(reply) = reply {
                         let _ = reply.send(result);
                     }
@@ -953,9 +876,7 @@ impl WorkerManager {
                 );
             }
         }
-        if let (Some(trace_destination), Some(trace_result)) =
-            (trace_destination, trace_result.as_ref())
-        {
+        if let (Some(trace_destination), Some(trace_result)) = (trace_destination, trace_result) {
             self.enqueue_trace_forward(
                 worker_name,
                 generation,
@@ -989,7 +910,7 @@ impl WorkerManager {
         request_url: &str,
         runtime_request_id: &str,
         user_request_id: &str,
-        result: &Result<WorkerOutput>,
+        result: TraceResultMeta,
         execution_ms: u64,
         wait_until_count: usize,
         internal_origin: bool,
@@ -1002,11 +923,6 @@ impl WorkerManager {
         if internal_origin {
             return;
         }
-
-        let (status, error) = match result {
-            Ok(output) => (Some(output.status), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
 
         let payload = TraceEventPayload {
             ts_ms: match epoch_ms_i64() {
@@ -1028,9 +944,9 @@ impl WorkerManager {
             runtime_request_id: runtime_request_id.to_string(),
             method: request_method.to_string(),
             url: request_url.to_string(),
-            status,
-            ok: status.is_some(),
-            error,
+            status: result.status,
+            ok: result.status.is_some(),
+            error: result.error,
             execution_ms,
             wait_until_count,
         };

@@ -125,11 +125,14 @@ pub(super) fn memory_handle_key(binding: &str, key: &str, handle: &str) -> Strin
     format!("{binding}\u{001f}{key}\u{001f}{handle}")
 }
 
-pub(super) fn internal_header_value(headers: &[(String, String)], key: &str) -> Option<String> {
+pub(super) fn internal_header_value<'a>(
+    headers: &'a [(String, String)],
+    key: &str,
+) -> Option<&'a str> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| value.as_str())
 }
 
 pub(super) fn parse_websocket_open_metadata(
@@ -150,10 +153,13 @@ pub(super) fn parse_websocket_open_metadata(
         ));
     }
     let handle = internal_header_value(&output.headers, INTERNAL_WS_HANDLE_HEADER)
+        .map(str::to_string)
         .unwrap_or_else(|| expected_session_id.to_string());
     let binding = internal_header_value(&output.headers, INTERNAL_WS_BINDING_HEADER)
+        .map(str::to_string)
         .ok_or_else(|| PlatformError::bad_request("missing websocket memory binding metadata"))?;
     let key = internal_header_value(&output.headers, INTERNAL_WS_KEY_HEADER)
+        .map(str::to_string)
         .ok_or_else(|| PlatformError::bad_request("missing websocket memory key metadata"))?;
     if let Some(session_id) = internal_header_value(&output.headers, INTERNAL_WS_SESSION_HEADER) {
         if session_id != expected_session_id {
@@ -211,10 +217,13 @@ pub(super) fn parse_transport_open_metadata(
         ));
     }
     let handle = internal_header_value(&output.headers, INTERNAL_TRANSPORT_HANDLE_HEADER)
+        .map(str::to_string)
         .unwrap_or_else(|| expected_session_id.to_string());
     let binding = internal_header_value(&output.headers, INTERNAL_TRANSPORT_BINDING_HEADER)
+        .map(str::to_string)
         .ok_or_else(|| PlatformError::bad_request("missing transport memory binding metadata"))?;
     let key = internal_header_value(&output.headers, INTERNAL_TRANSPORT_KEY_HEADER)
+        .map(str::to_string)
         .ok_or_else(|| PlatformError::bad_request("missing transport memory key metadata"))?;
     if let Some(session_id) =
         internal_header_value(&output.headers, INTERNAL_TRANSPORT_SESSION_HEADER)
@@ -253,11 +262,11 @@ pub(super) fn normalize_trace_path(path: &str) -> String {
     }
 }
 
-pub(super) fn traceparent_from_headers(headers: &[(String, String)]) -> Option<String> {
+pub(super) fn traceparent_from_headers(headers: &[(String, String)]) -> Option<&str> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("traceparent"))
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| value.as_str())
 }
 
 pub(super) fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent: Option<&str>) {

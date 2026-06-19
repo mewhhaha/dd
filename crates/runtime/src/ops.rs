@@ -187,6 +187,22 @@ pub enum IsolateEventPayload {
     TestNestedTargetedInvoke(TestNestedTargetedInvokeEvent),
 }
 
+fn emit_isolate_event(
+    state: &OpState,
+    payload: IsolateEventPayload,
+) -> std::result::Result<(), std::sync::mpsc::SendError<IsolateEventPayload>> {
+    let sender = state.borrow::<IsolateEventSender>();
+    sender.0.send(payload)
+}
+
+fn emit_isolate_event_from_rc(
+    state: &Rc<RefCell<OpState>>,
+    payload: IsolateEventPayload,
+) -> std::result::Result<(), std::sync::mpsc::SendError<IsolateEventPayload>> {
+    let state = state.borrow();
+    emit_isolate_event(&state, payload)
+}
+
 pub(crate) fn current_time_boundary() -> TimeBoundary {
     let now_ms = wall_ms();
     let perf_ms = crypto_ops::PROCESS_MONO_START
@@ -324,50 +340,14 @@ pub fn register_memory_request_scope(
 pub fn register_request_secret_context(
     state: &mut OpState,
     request_id: String,
-    worker_name: String,
-    generation: u64,
     isolate_id: u64,
-    dynamic_bindings: Vec<String>,
-    dynamic_rpc_bindings: Vec<String>,
-    replacements: Vec<(String, String)>,
-    egress_allow_hosts: Vec<String>,
-    allow_cache: bool,
-    max_outbound_requests: Option<u64>,
-    dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
+    execution: RequestExecutionContext,
 ) {
-    let dynamic_bindings: HashSet<String> = dynamic_bindings
-        .into_iter()
-        .map(|binding| binding.trim().to_string())
-        .filter(|binding| !binding.is_empty())
-        .collect();
-    let dynamic_rpc_bindings: HashSet<String> = dynamic_rpc_bindings
-        .into_iter()
-        .map(|binding| binding.trim().to_string())
-        .filter(|binding| !binding.is_empty())
-        .collect();
-    let replacements = replacements
-        .into_iter()
-        .filter_map(|(placeholder, value)| {
-            let key = placeholder.trim().to_string();
-            if key.is_empty() {
-                return None;
-            }
-            Some((key, value))
-        })
-        .collect();
     if let Some(previous) = state.borrow_mut::<RequestSecretContexts>().contexts.insert(
         request_id,
         RequestSecretContext {
-            worker_name,
-            generation,
             isolate_id,
-            dynamic_bindings,
-            dynamic_rpc_bindings,
-            replacements,
-            egress_allow_hosts,
-            allow_cache,
-            max_outbound_requests,
-            dynamic_quota_state,
+            execution,
             canceled: Arc::new(AtomicBool::new(false)),
             canceled_notify: Arc::new(Notify::new()),
         },
@@ -422,28 +402,40 @@ fn wall_ms() -> u64 {
 mod tests {
     use super::{
         is_egress_url_allowed, parse_egress_allow_host, DynamicControlInbox, DynamicControlItem,
-        DynamicPendingReplyResult, DynamicPushedReplyPayload,
+        DynamicPendingReplyResult, DynamicPushedReplyPayload, EgressAllowHost,
     };
 
     #[test]
     fn parse_egress_allow_host_supports_exact_and_port_rules() {
         assert_eq!(
             parse_egress_allow_host("api.example.com"),
-            Some(("api.example.com".to_string(), None))
+            Some(EgressAllowHost {
+                host: "api.example.com".to_string(),
+                wildcard: false,
+                port: None,
+            })
         );
         assert_eq!(
             parse_egress_allow_host("api.example.com:8443"),
-            Some(("api.example.com".to_string(), Some(8443)))
+            Some(EgressAllowHost {
+                host: "api.example.com".to_string(),
+                wildcard: false,
+                port: Some(8443),
+            })
         );
         assert_eq!(
             parse_egress_allow_host("*.example.com:8443"),
-            Some(("*.example.com".to_string(), Some(8443)))
+            Some(EgressAllowHost {
+                host: "example.com".to_string(),
+                wildcard: true,
+                port: Some(8443),
+            })
         );
     }
 
     #[test]
     fn egress_url_rules_require_matching_port() {
-        let allowed = vec!["api.example.com".to_string()];
+        let allowed = vec![parse_egress_allow_host("api.example.com").expect("allow host")];
         let https_default = reqwest::Url::parse("https://api.example.com/path").expect("url");
         let https_alt = reqwest::Url::parse("https://api.example.com:8443/path").expect("url");
         assert!(is_egress_url_allowed(&https_default, &allowed));
@@ -453,8 +445,8 @@ mod tests {
     #[test]
     fn egress_url_rules_support_explicit_ports_and_wildcards() {
         let allowed = vec![
-            "api.example.com:8443".to_string(),
-            "*.internal.example.com".to_string(),
+            parse_egress_allow_host("api.example.com:8443").expect("exact allow host"),
+            parse_egress_allow_host("*.internal.example.com").expect("wildcard allow host"),
         ];
         let exact = reqwest::Url::parse("https://api.example.com:8443/path").expect("url");
         let wildcard_ok =

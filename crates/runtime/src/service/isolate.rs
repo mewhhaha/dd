@@ -10,13 +10,7 @@ pub(super) enum IsolateCommand {
         dynamic_bindings_json: Arc<str>,
         dynamic_rpc_bindings_json: Arc<str>,
         dynamic_env_json: Arc<str>,
-        dynamic_bindings: Vec<String>,
-        dynamic_rpc_bindings: Vec<String>,
-        secret_replacements: Vec<(String, String)>,
-        egress_allow_hosts: Vec<String>,
-        allow_cache: bool,
-        max_outbound_requests: Option<u64>,
-        dynamic_quota_state: Option<Arc<DynamicQuotaState>>,
+        request_context: RequestExecutionContext,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         stream_response: bool,
@@ -46,7 +40,8 @@ impl Wake for IsolateEventLoopWaker {
     }
 }
 
-#[derive(Clone)]
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub(super) enum MemoryExecutionCall {
     Method {
         binding: String,
@@ -60,7 +55,9 @@ pub(super) enum MemoryExecutionCall {
         handle: String,
         is_text: bool,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         transport_handles: Vec<String>,
     },
     Close {
@@ -69,37 +66,48 @@ pub(super) enum MemoryExecutionCall {
         handle: String,
         code: u16,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         transport_handles: Vec<String>,
     },
+    #[serde(rename = "transport_datagram")]
     TransportDatagram {
         binding: String,
         key: String,
         handle: String,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         transport_handles: Vec<String>,
     },
+    #[serde(rename = "transport_stream")]
     TransportStream {
         binding: String,
         key: String,
         handle: String,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         transport_handles: Vec<String>,
     },
+    #[serde(rename = "transport_close")]
     TransportClose {
         binding: String,
         key: String,
         handle: String,
         code: u16,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         transport_handles: Vec<String>,
     },
 }
 
-#[derive(Clone)]
+#[derive(serde::Serialize)]
 pub(super) struct HostRpcExecutionCall {
     pub(super) target_id: String,
     pub(super) method: String,

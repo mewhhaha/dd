@@ -80,6 +80,7 @@ use self::websocket::{
 };
 #[cfg(test)]
 mod tests {
+    use super::util::private_token_matches;
     use super::{
         build_public_request_url, parse_invoke_request_uri, parse_worker_from_host, read_json_body,
         validate_deploy_bindings, validate_internal_config,
@@ -270,6 +271,14 @@ mod tests {
     }
 
     #[test]
+    fn private_token_matching_rejects_non_exact_tokens() {
+        assert!(private_token_matches("secret-token", " secret-token "));
+        assert!(!private_token_matches("secret-token", "secret"));
+        assert!(!private_token_matches("secret-token", "secret-token-extra"));
+        assert!(!private_token_matches("secret-token", "different-token"));
+    }
+
+    #[test]
     fn worker_name_is_extracted_from_subdomain_host() {
         let worker = parse_worker_from_host("echo.example.com:443", "example.com").expect("ok");
         assert_eq!(worker, "echo");
@@ -290,6 +299,13 @@ mod tests {
     #[test]
     fn foreign_host_is_rejected() {
         let error = parse_worker_from_host("echo.other.com", "example.com").expect_err("error");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn nested_subdomain_host_is_rejected() {
+        let error =
+            parse_worker_from_host("echo.preview.example.com", "example.com").expect_err("error");
         assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 

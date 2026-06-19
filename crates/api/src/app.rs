@@ -31,7 +31,7 @@ pub async fn serve(
         true => {
             info!("public quic listener on https://{} (http/3)", public_addr);
             tokio::select! {
-                result = serve_public_listener(public_listener, state.clone(), Some(public_addr.port())) => result,
+                result = serve_public_listener(public_listener, state.clone(), build_alt_svc_header(public_addr.port())) => result,
                 result = serve_private_listener(private_listener, state.clone()) => result,
                 result = public_quic::serve_public_h3(public_addr, state) => result,
             }
@@ -53,18 +53,18 @@ fn public_h3_enabled(state: &AppState) -> bool {
 async fn serve_public_listener(
     listener: tokio::net::TcpListener,
     state: AppState,
-    alt_svc_port: Option<u16>,
+    alt_svc_header: Option<HeaderValue>,
 ) -> Result<()> {
-    serve_listener(listener, state, ListenerKind::Public { alt_svc_port }).await
+    serve_listener(listener, state, ListenerKind::Public { alt_svc_header }).await
 }
 
 async fn serve_private_listener(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
     serve_listener(listener, state, ListenerKind::Private).await
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ListenerKind {
-    Public { alt_svc_port: Option<u16> },
+    Public { alt_svc_header: Option<HeaderValue> },
     Private,
 }
 
@@ -80,18 +80,21 @@ async fn serve_listener(
             .map_err(|error| PlatformError::internal(error.to_string()))?;
         let io = TokioIo::new(stream);
         let state = state.clone();
+        let kind = kind.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request: Request<Incoming>| {
                 let state = state.clone();
+                let kind = kind.clone();
                 async move {
-                    let mut response = match kind {
+                    let mut response = match &kind {
                         ListenerKind::Public { .. } => handle_public_request(state, request).await,
                         ListenerKind::Private => handle_private_request(state, request).await,
                     };
-                    if let ListenerKind::Public { alt_svc_port } = kind {
-                        if let Some(port) = alt_svc_port {
-                            annotate_alt_svc_header(&mut response, port);
-                        }
+                    if let ListenerKind::Public {
+                        alt_svc_header: Some(value),
+                    } = &kind
+                    {
+                        annotate_alt_svc_header(&mut response, value);
                     }
                     Ok::<_, Infallible>(response)
                 }
@@ -105,9 +108,11 @@ async fn serve_listener(
     }
 }
 
-fn annotate_alt_svc_header<T>(response: &mut Response<T>, port: u16) {
+fn build_alt_svc_header(port: u16) -> Option<HeaderValue> {
     let value = format!("h3=\":{port}\"; ma=86400");
-    if let Ok(value) = HeaderValue::from_str(&value) {
-        response.headers_mut().insert(ALT_SVC, value);
-    }
+    HeaderValue::from_str(&value).ok()
+}
+
+fn annotate_alt_svc_header<T>(response: &mut Response<T>, value: &HeaderValue) {
+    response.headers_mut().insert(ALT_SVC, value.clone());
 }

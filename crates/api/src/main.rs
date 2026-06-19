@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         .bind_private_addr
         .parse()
         .map_err(|error| PlatformError::internal(format!("invalid BIND_PRIVATE_ADDR: {error}")))?;
-    let private_bearer_token = cli.private_token.or(cli.private_bearer_token);
+    let private_bearer_token = first_non_empty_token([cli.private_token, cli.private_bearer_token]);
     let allow_insecure_private_loopback =
         cli.dd_allow_insecure_private_loopback || cli.allow_insecure_private_loopback;
 
@@ -86,6 +86,14 @@ async fn main() -> Result<()> {
         let _ = provider.shutdown();
     }
     result
+}
+
+fn first_non_empty_token(tokens: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    tokens
+        .into_iter()
+        .flatten()
+        .map(|token| token.trim().to_string())
+        .find(|token| !token.is_empty())
 }
 
 fn init_tracing() -> Result<Option<OTelTracerProvider>> {
@@ -124,4 +132,30 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
         .init();
     global::set_tracer_provider(provider.clone());
     Ok(Some(provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_non_empty_token;
+
+    #[test]
+    fn token_selection_uses_first_non_empty_token() {
+        let token = first_non_empty_token([
+            Some("  primary  ".to_string()),
+            Some("fallback".to_string()),
+        ]);
+        assert_eq!(token.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn token_selection_skips_empty_preferred_token() {
+        let token = first_non_empty_token([Some("  ".to_string()), Some("fallback".to_string())]);
+        assert_eq!(token.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn token_selection_returns_none_when_all_tokens_are_empty() {
+        let token = first_non_empty_token([None, Some(" ".to_string())]);
+        assert!(token.is_none());
+    }
 }

@@ -14,6 +14,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[path = "bench_support/cli.rs"]
+mod bench_cli;
+
+use bench_cli::{bench_arg_action, BenchArgAction};
+
 #[derive(Clone, Copy)]
 struct Scenario {
     label: &'static str,
@@ -189,6 +194,14 @@ export default {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    match bench_arg_action(env::args().skip(1))? {
+        BenchArgAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        BenchArgAction::Run => {}
+    }
+
     let requests = env_usize("DD_BENCH_REQUESTS", 200);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 32);
     let max_inflight = env_usize("DD_BENCH_MAX_INFLIGHT", 4);
@@ -352,6 +365,26 @@ async fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn print_help() {
+    println!("kv benchmark");
+    println!();
+    println!("Usage:");
+    println!("  cargo run -p runtime --bin bench_kv --release");
+    println!("  DD_BENCH_REQUESTS=100 cargo run -p runtime --bin bench_kv --release");
+    println!();
+    println!("This benchmark is configured with environment variables, not CLI flags.");
+    println!();
+    println!("Core env:");
+    println!("  DD_BENCH_REQUESTS              read/noop requests per scenario (default 200)");
+    println!("  DD_BENCH_CONCURRENCY           read/noop concurrency (default 32)");
+    println!("  DD_BENCH_MAX_INFLIGHT          autoscaling max inflight per isolate (default 4)");
+    println!("  DD_BENCH_SINGLE_MAX_INFLIGHT   single-isolate max inflight (default 1)");
+    println!("  DD_BENCH_AUTOSCALING_ISOLATES  autoscaling config isolate limit (default 8)");
+    println!("  DD_BENCH_WRITE_REQUESTS        write requests per scenario (default min(requests, 5000))");
+    println!("  DD_BENCH_WRITE_CONCURRENCY     write concurrency (default min(concurrency, 256))");
+    println!("  DD_BENCH_PROFILE_KV            enable KV profile output");
 }
 
 async fn run_config(config: &BenchConfig, scenarios: &[Scenario]) -> Result<(), String> {

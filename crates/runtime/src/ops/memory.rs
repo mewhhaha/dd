@@ -52,18 +52,18 @@ pub(super) async fn op_memory_invoke_method(
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryInvoke(MemoryInvokeEvent {
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryInvoke(MemoryInvokeEvent {
             request_frame,
             caller_worker_name,
             caller_generation,
             caller_isolate_id,
             prefer_caller_isolate: payload.prefer_caller_isolate,
             reply: reply_tx,
-        }))
-        .is_err()
+        }),
+    )
+    .is_err()
     {
         return MemoryInvokeMethodResult {
             ok: false,
@@ -122,21 +122,7 @@ pub(super) fn memory_scope_for_request(
         .ok_or_else(|| PlatformError::runtime("memory storage scope is unavailable"))
 }
 
-pub(super) fn memory_socket_scope_for_payload(
-    state: &Rc<RefCell<OpState>>,
-    request_id: &str,
-    binding: &str,
-    key: &str,
-) -> Result<(String, String)> {
-    let binding = binding.trim();
-    let key = key.trim();
-    if !binding.is_empty() && !key.is_empty() {
-        return Ok((binding.to_string(), key.to_string()));
-    }
-    memory_scope_for_request(state, request_id)
-}
-
-pub(super) fn memory_storage_scope_for_payload(
+pub(super) fn memory_scope_for_payload(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
     binding: &str,
@@ -157,34 +143,22 @@ pub(super) async fn op_memory_state_get(
     #[serde] payload: MemoryStateGetPayload,
 ) -> MemoryStateGetResult {
     let started = Instant::now();
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateGetResult {
-                ok: false,
-                record: None,
-                max_version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateGetResult {
+                    ok: false,
+                    record: None,
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        };
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    let store_for_read = store.clone();
     let item_key = payload.item_key;
-    let read_result = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_read.point_read(&namespace, &memory_key, &item_key))
-    })
-    .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("memory point read worker panicked")));
+    let read_result = store.point_read(&namespace, &memory_key, &item_key).await;
     match read_result {
         Ok(point) => {
             store.record_profile(
@@ -221,22 +195,19 @@ pub(super) async fn op_memory_state_snapshot(
     #[serde] payload: MemoryStateSnapshotPayload,
 ) -> MemoryStateSnapshotResult {
     let started = Instant::now();
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateSnapshotResult {
-                ok: false,
-                entries: Vec::new(),
-                max_version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateSnapshotResult {
+                    ok: false,
+                    entries: Vec::new(),
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        };
     let store = state.borrow().borrow::<MemoryStore>().clone();
     let keys = payload
         .keys
@@ -245,24 +216,11 @@ pub(super) async fn op_memory_state_snapshot(
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let profile_items = keys.len().max(1) as u64;
-    let store_for_snapshot = store.clone();
-    let snapshot_result = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(async move {
-            if keys.is_empty() {
-                store_for_snapshot.snapshot(&namespace, &memory_key).await
-            } else {
-                store_for_snapshot
-                    .snapshot_keys(&namespace, &memory_key, &keys)
-                    .await
-            }
-        })
-    })
-    .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("memory snapshot worker panicked")));
+    let snapshot_result = if keys.is_empty() {
+        store.snapshot(&namespace, &memory_key).await
+    } else {
+        store.snapshot_keys(&namespace, &memory_key, &keys).await
+    };
     match snapshot_result {
         Ok(snapshot) => {
             store.record_profile(
@@ -303,22 +261,19 @@ pub(super) async fn op_memory_state_version_if_newer(
     #[serde] payload: MemoryStateVersionIfNewerPayload,
 ) -> MemoryStateVersionIfNewerResult {
     let started = Instant::now();
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateVersionIfNewerResult {
-                ok: false,
-                stale: false,
-                max_version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateVersionIfNewerResult {
+                    ok: false,
+                    stale: false,
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        };
     let store = state.borrow().borrow::<MemoryStore>().clone();
     match store
         .version_if_newer(&namespace, &memory_key, payload.known_version)
@@ -366,22 +321,19 @@ pub(super) async fn op_memory_state_validate_reads(
     #[serde] payload: MemoryStateValidateReadsPayload,
 ) -> MemoryStateApplyBatchResult {
     let started = Instant::now();
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateApplyBatchResult {
-                ok: false,
-                conflict: false,
-                max_version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateApplyBatchResult {
+                    ok: false,
+                    conflict: false,
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        };
     let reads = payload
         .reads
         .into_iter()
@@ -472,22 +424,19 @@ pub(super) async fn op_memory_state_apply_batch(
     let started = std::time::Instant::now();
     let mutation_count = payload.mutations.len() as u64;
     let read_count = payload.reads.len() as u64;
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateApplyBatchResult {
-                ok: false,
-                conflict: false,
-                max_version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateApplyBatchResult {
+                    ok: false,
+                    conflict: false,
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        };
     let mutations = payload
         .mutations
         .into_iter()
@@ -518,13 +467,8 @@ pub(super) async fn op_memory_state_apply_batch(
         Some(payload.list_gate_version)
     };
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    let store_for_apply = store.clone();
-    let apply_result = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_apply.apply_batch(
+    let apply_result = store
+        .apply_batch(
             &namespace,
             &memory_key,
             &reads,
@@ -532,10 +476,8 @@ pub(super) async fn op_memory_state_apply_batch(
             expected_base_version,
             list_gate_version,
             payload.transactional,
-        ))
-    })
-    .join()
-    .unwrap_or_else(|_| Err(PlatformError::internal("memory apply worker panicked")));
+        )
+        .await;
     match apply_result {
         Ok(result) => {
             store.record_profile(
@@ -567,22 +509,19 @@ pub(super) async fn op_memory_state_apply_blind_batch(
 ) -> MemoryStateApplyBatchResult {
     let started = std::time::Instant::now();
     let mutation_count = payload.mutations.len() as u64;
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateApplyBatchResult {
-                ok: false,
-                conflict: false,
-                max_version: -1,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateApplyBatchResult {
+                    ok: false,
+                    conflict: false,
+                    max_version: -1,
+                    error: error.to_string(),
+                };
+            }
+        };
     let mutations = payload
         .mutations
         .into_iter()
@@ -595,20 +534,9 @@ pub(super) async fn op_memory_state_apply_blind_batch(
         })
         .collect::<Vec<_>>();
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    let store_for_apply = store.clone();
-    let apply_result = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_apply.apply_blind_batch(&namespace, &memory_key, &mutations))
-    })
-    .join()
-    .unwrap_or_else(|_| {
-        Err(PlatformError::internal(
-            "memory blind apply worker panicked",
-        ))
-    });
+    let apply_result = store
+        .apply_blind_batch(&namespace, &memory_key, &mutations)
+        .await;
     match apply_result {
         Ok(result) => {
             store.record_profile(
@@ -638,21 +566,18 @@ pub(super) async fn op_memory_state_enqueue_batch(
     state: Rc<RefCell<OpState>>,
     #[serde] payload: MemoryStateEnqueueBatchPayload,
 ) -> MemoryStateEnqueueBatchResult {
-    let (namespace, memory_key) = match memory_storage_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            return MemoryStateEnqueueBatchResult {
-                ok: false,
-                submission_id: 0,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateEnqueueBatchResult {
+                    ok: false,
+                    submission_id: 0,
+                    error: error.to_string(),
+                };
+            }
+        };
     let mutations = payload
         .mutations
         .into_iter()
@@ -664,24 +589,9 @@ pub(super) async fn op_memory_state_enqueue_batch(
         })
         .collect::<Vec<_>>();
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    let store_for_enqueue = store.clone();
-    let enqueue_result = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| PlatformError::internal(error.to_string()))?;
-        runtime.block_on(store_for_enqueue.enqueue_direct_batch(
-            &namespace,
-            &memory_key,
-            &mutations,
-        ))
-    })
-    .join()
-    .unwrap_or_else(|_| {
-        Err(PlatformError::internal(
-            "memory direct enqueue worker panicked",
-        ))
-    });
+    let enqueue_result = store
+        .enqueue_direct_batch(&namespace, &memory_key, &mutations)
+        .await;
     match enqueue_result {
         Ok(submission_id) => MemoryStateEnqueueBatchResult {
             ok: true,
@@ -720,7 +630,7 @@ pub(super) async fn op_memory_state_await_submission(
                 };
             }
             Ok(None) if started.elapsed() < Duration::from_secs(30) => {
-                std::thread::sleep(Duration::from_millis(1));
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
             Ok(None) => {
                 return MemoryStateAwaitSubmissionResult {
@@ -775,36 +685,31 @@ pub(super) async fn op_memory_socket_send(
         }
     };
 
-    let (binding, key) = match memory_socket_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketSendResult {
-                ok: false,
-                error: error.to_string(),
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemorySocketSendResult {
+                    ok: false,
+                    error: error.to_string(),
+                }
             }
-        }
-    };
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemorySocketSend(
-            MemorySocketSendEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-                is_text,
-                message: payload.message,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemorySocketSend(MemorySocketSendEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+            is_text,
+            message: payload.message,
+        }),
+    )
+    .is_err()
     {
         return MemorySocketSendResult {
             ok: false,
@@ -838,36 +743,31 @@ pub(super) async fn op_memory_socket_close(
         };
     }
 
-    let (binding, key) = match memory_socket_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketCloseResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemorySocketCloseResult {
+                    ok: false,
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemorySocketClose(
-            MemorySocketCloseEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-                code: payload.code,
-                reason: payload.reason,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemorySocketClose(MemorySocketCloseEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+            code: payload.code,
+            reason: payload.reason,
+        }),
+    )
+    .is_err()
     {
         return MemorySocketCloseResult {
             ok: false,
@@ -896,21 +796,18 @@ pub(super) async fn op_memory_socket_list(
         };
     }
 
-    let (binding, key) = match memory_socket_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketListResult {
-                ok: false,
-                handles: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemorySocketListResult {
+                    ok: false,
+                    handles: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let registry = state.borrow().borrow::<MemoryOpenHandleRegistry>().clone();
     MemorySocketListResult {
@@ -941,35 +838,30 @@ pub(super) async fn op_memory_socket_consume_close(
         };
     }
 
-    let (binding, key) = match memory_socket_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketConsumeCloseResult {
-                ok: false,
-                events: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemorySocketConsumeCloseResult {
+                    ok: false,
+                    events: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemorySocketConsumeClose(
-            MemorySocketConsumeCloseEvent {
-                reply: reply_tx,
-                binding,
-                key,
-                handle: payload.handle,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemorySocketConsumeClose(MemorySocketConsumeCloseEvent {
+            reply: reply_tx,
+            binding,
+            key,
+            handle: payload.handle,
+        }),
+    )
+    .is_err()
     {
         return MemorySocketConsumeCloseResult {
             ok: false,
@@ -1001,20 +893,6 @@ pub(super) async fn op_memory_socket_consume_close(
             error: "memory socket consumeClose response channel closed".to_string(),
         },
     }
-}
-
-pub(super) fn memory_transport_scope_for_payload(
-    state: &Rc<RefCell<OpState>>,
-    request_id: &str,
-    binding: &str,
-    key: &str,
-) -> std::result::Result<(String, String), PlatformError> {
-    let binding = binding.trim();
-    let key = key.trim();
-    if !binding.is_empty() && !key.is_empty() {
-        return Ok((binding.to_string(), key.to_string()));
-    }
-    memory_scope_for_request(state, request_id)
 }
 
 #[deno_core::op2]
@@ -1080,35 +958,30 @@ pub(super) async fn op_memory_transport_send_stream(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportSendResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportSendResult {
+                    ok: false,
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryTransportSendStream(
-            MemoryTransportSendStreamEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-                chunk: payload.chunk,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryTransportSendStream(MemoryTransportSendStreamEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+            chunk: payload.chunk,
+        }),
+    )
+    .is_err()
     {
         return MemoryTransportSendResult {
             ok: false,
@@ -1151,35 +1024,30 @@ pub(super) async fn op_memory_transport_send_datagram(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportSendResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportSendResult {
+                    ok: false,
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryTransportSendDatagram(
-            MemoryTransportSendDatagramEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-                datagram: payload.datagram,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryTransportSendDatagram(MemoryTransportSendDatagramEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+            datagram: payload.datagram,
+        }),
+    )
+    .is_err()
     {
         return MemoryTransportSendResult {
             ok: false,
@@ -1226,36 +1094,31 @@ pub(super) async fn op_memory_transport_recv_stream(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportRecvResult {
-                ok: false,
-                done: true,
-                chunk: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportRecvResult {
+                    ok: false,
+                    done: true,
+                    chunk: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryTransportRecvStream(
-            MemoryTransportRecvStreamEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryTransportRecvStream(MemoryTransportRecvStreamEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+        }),
+    )
+    .is_err()
     {
         return MemoryTransportRecvResult {
             ok: false,
@@ -1310,36 +1173,31 @@ pub(super) async fn op_memory_transport_recv_datagram(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportRecvResult {
-                ok: false,
-                done: true,
-                chunk: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportRecvResult {
+                    ok: false,
+                    done: true,
+                    chunk: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryTransportRecvDatagram(
-            MemoryTransportRecvDatagramEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryTransportRecvDatagram(MemoryTransportRecvDatagramEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+        }),
+    )
+    .is_err()
     {
         return MemoryTransportRecvResult {
             ok: false,
@@ -1390,36 +1248,31 @@ pub(super) async fn op_memory_transport_close(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportCloseResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportCloseResult {
+                    ok: false,
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryTransportClose(
-            MemoryTransportCloseEvent {
-                reply: reply_tx,
-                handle: payload.handle,
-                binding,
-                key,
-                code: payload.code,
-                reason: payload.reason,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryTransportClose(MemoryTransportCloseEvent {
+            reply: reply_tx,
+            handle: payload.handle,
+            binding,
+            key,
+            code: payload.code,
+            reason: payload.reason,
+        }),
+    )
+    .is_err()
     {
         return MemoryTransportCloseResult {
             ok: false,
@@ -1457,21 +1310,18 @@ pub(super) async fn op_memory_transport_list(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportListResult {
-                ok: false,
-                handles: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportListResult {
+                    ok: false,
+                    handles: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let registry = state.borrow().borrow::<MemoryOpenHandleRegistry>().clone();
     MemoryTransportListResult {
@@ -1502,35 +1352,30 @@ pub(super) async fn op_memory_transport_consume_close(
         };
     }
 
-    let (binding, key) = match memory_transport_scope_for_payload(
-        &state,
-        &payload.request_id,
-        &payload.binding,
-        &payload.key,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportConsumeCloseResult {
-                ok: false,
-                events: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        match memory_scope_for_payload(&state, &payload.request_id, &payload.binding, &payload.key)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return MemoryTransportConsumeCloseResult {
+                    ok: false,
+                    events: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
 
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sender = state.borrow().borrow::<IsolateEventSender>().clone();
-    if sender
-        .0
-        .send(IsolateEventPayload::MemoryTransportConsumeClose(
-            MemoryTransportConsumeCloseEvent {
-                reply: reply_tx,
-                binding,
-                key,
-                handle: payload.handle,
-            },
-        ))
-        .is_err()
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::MemoryTransportConsumeClose(MemoryTransportConsumeCloseEvent {
+            reply: reply_tx,
+            binding,
+            key,
+            handle: payload.handle,
+        }),
+    )
+    .is_err()
     {
         return MemoryTransportConsumeCloseResult {
             ok: false,

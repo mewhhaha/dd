@@ -69,16 +69,6 @@ where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let method = parts.method.as_str().to_string();
-    let invoke_span = tracing::info_span!(
-        "http.invoke",
-        worker.name = %worker_name,
-        http.method = %method,
-        http.route = %parts.uri.path()
-    );
-    set_span_parent_from_http_headers(&invoke_span, &parts.headers);
-    let _invoke_guard = invoke_span.enter();
-
     let max_body_bytes = state.invoke_max_body_bytes;
     if request_content_length(&parts.headers).is_some_and(|value| value > max_body_bytes as u64) {
         return Err(PlatformError::bad_request(format!(
@@ -403,7 +393,10 @@ pub(super) fn parse_worker_from_host(
     }
 
     let prefix = &host[..host.len() - suffix.len()];
-    let worker_name = prefix.split('.').next().unwrap_or_default().trim();
+    if prefix.contains('.') {
+        return Err(PlatformError::not_found("not found"));
+    }
+    let worker_name = prefix.trim();
     if worker_name.is_empty() {
         return Err(PlatformError::not_found("not found"));
     }

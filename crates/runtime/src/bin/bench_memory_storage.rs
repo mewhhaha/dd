@@ -37,6 +37,11 @@ use self::support::*;
 use self::watchdog::*;
 use self::workers::*;
 
+#[path = "bench_support/cli.rs"]
+mod bench_cli;
+
+use bench_cli::{bench_arg_action, BenchArgAction};
+
 #[derive(Clone, Copy)]
 struct Scenario {
     requests: usize,
@@ -128,8 +133,286 @@ struct BenchTimings {
     shutdown: Duration,
 }
 
+#[derive(Clone, Copy)]
+enum KeySpaceConfig {
+    One,
+    Env,
+    Wide,
+}
+
+impl KeySpaceConfig {
+    fn resolve(self, options: &BenchOptions) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Env => env_usize("DD_BENCH_KEY_SPACE", 256),
+            Self::Wide => options.wide_key_space,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProfileConfig {
+    Never,
+    Enabled,
+    Always,
+}
+
+impl ProfileConfig {
+    fn resolve(self, profile_enabled: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Enabled => profile_enabled,
+            Self::Always => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BenchCase {
+    mode: &'static str,
+    label: &'static str,
+    source: &'static str,
+    seed: bool,
+    path: &'static str,
+    key_space: KeySpaceConfig,
+    verify_path: Option<&'static str>,
+    profile: ProfileConfig,
+}
+
+const BENCH_CASES: &[BenchCase] = &[
+    BenchCase {
+        mode: "async-storage",
+        label: "memory-read-async-storage",
+        source: MEMORY_READ_ASYNC_STORAGE_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "async-memory",
+        label: "memory-read-async-memory",
+        source: MEMORY_READ_ASYNC_MEMORY_WORKER_SOURCE,
+        seed: false,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "sync-memory",
+        label: "memory-read-sync-memory",
+        source: MEMORY_READ_SYNC_MEMORY_WORKER_SOURCE,
+        seed: false,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "direct-read-memory",
+        label: "memory-direct-read-memory",
+        source: MEMORY_DIRECT_READ_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "direct-write-memory",
+        label: "memory-direct-write-memory",
+        source: MEMORY_DIRECT_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/write",
+        key_space: KeySpaceConfig::One,
+        verify_path: Some("/get-strong"),
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "direct-write-memory-multikey",
+        label: "memory-direct-write-memory-multikey",
+        source: MEMORY_DIRECT_WRITE_WORKER_SOURCE,
+        seed: false,
+        path: "/write",
+        key_space: KeySpaceConfig::Env,
+        verify_path: Some("/sum-read"),
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "direct-read-memory-multikey",
+        label: "memory-direct-read-memory-multikey",
+        source: MEMORY_DIRECT_READ_WORKER_SOURCE,
+        seed: false,
+        path: "/read",
+        key_space: KeySpaceConfig::Env,
+        verify_path: None,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "direct-read-memory-wide",
+        label: "memory-direct-read-memory-wide",
+        source: MEMORY_DIRECT_READ_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::Wide,
+        verify_path: None,
+        profile: ProfileConfig::Always,
+    },
+    BenchCase {
+        mode: "atomic-read-memory",
+        label: "memory-atomic-read-memory",
+        source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "atomic-read-memory-allow-concurrency",
+        label: "memory-atomic-read-memory-allow-concurrency",
+        source: MEMORY_ATOMIC_READ_ALLOW_CONCURRENCY_MEMORY_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "atomic-read-memory-multikey",
+        label: "memory-atomic-read-memory-multikey",
+        source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+        seed: false,
+        path: "/read",
+        key_space: KeySpaceConfig::Env,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
+        mode: "stm-inc",
+        label: "memory-stm-inc",
+        source: MEMORY_STM_INCREMENT_WORKER_SOURCE,
+        seed: true,
+        path: "/inc",
+        key_space: KeySpaceConfig::One,
+        verify_path: Some("/get"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-read",
+        label: "memory-stm-read",
+        source: MEMORY_STM_READ_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-read-multikey",
+        label: "memory-stm-read-multikey",
+        source: MEMORY_STM_READ_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::Env,
+        verify_path: None,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-read-allow-concurrency",
+        label: "memory-stm-read-allow-concurrency",
+        source: MEMORY_STM_READ_WRITE_ALLOW_CONCURRENCY_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::One,
+        verify_path: None,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-read-multikey-allow-concurrency",
+        label: "memory-stm-read-multikey-allow-concurrency",
+        source: MEMORY_STM_READ_WRITE_ALLOW_CONCURRENCY_WORKER_SOURCE,
+        seed: true,
+        path: "/read",
+        key_space: KeySpaceConfig::Env,
+        verify_path: None,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-write",
+        label: "memory-stm-write",
+        source: MEMORY_STM_READ_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/write",
+        key_space: KeySpaceConfig::One,
+        verify_path: Some("/get"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-write-throughput",
+        label: "memory-stm-write-throughput",
+        source: MEMORY_STM_READ_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/write",
+        key_space: KeySpaceConfig::One,
+        verify_path: Some("/get"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-write-multikey",
+        label: "memory-stm-write-multikey",
+        source: MEMORY_STM_READ_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/write",
+        key_space: KeySpaceConfig::Env,
+        verify_path: Some("/sum"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-blind-write",
+        label: "memory-stm-blind-write",
+        source: MEMORY_STM_BLIND_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/write",
+        key_space: KeySpaceConfig::One,
+        verify_path: Some("/get-blind"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "stm-blind-write-multikey",
+        label: "memory-stm-blind-write-multikey",
+        source: MEMORY_STM_BLIND_WRITE_WORKER_SOURCE,
+        seed: true,
+        path: "/write",
+        key_space: KeySpaceConfig::Env,
+        verify_path: Some("/sum-blind"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "atomic-put-inc",
+        label: "memory-atomic-put-inc",
+        source: MEMORY_ATOMIC_PUT_INCREMENT_WORKER_SOURCE,
+        seed: true,
+        path: "/inc",
+        key_space: KeySpaceConfig::One,
+        verify_path: Some("/get"),
+        profile: ProfileConfig::Never,
+    },
+];
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    match bench_arg_action(std::env::args().skip(1))? {
+        BenchArgAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        BenchArgAction::Run => {}
+    }
+
+    let mode = env_mode_checked()?;
     let profile_enabled = env_flag("DD_BENCH_PROFILE_MEMORY");
     let options = bench_options_from_env();
     let runtime = RuntimeConfig {
@@ -156,313 +439,20 @@ async fn main() -> Result<(), String> {
         env_usize("DD_BENCH_MAX_ISOLATES", 1),
         env_usize("DD_BENCH_MAX_INFLIGHT", 1),
     );
-    let mode = env_mode();
 
-    if mode.as_deref().is_none() || mode.as_deref() == Some("async-storage") {
+    for bench_case in BENCH_CASES {
+        if !should_run_case(mode.as_deref(), bench_case.mode) {
+            continue;
+        }
         run_and_print(
             &service,
-            "memory-read-async-storage",
-            MEMORY_READ_ASYNC_STORAGE_WORKER_SOURCE,
-            true,
-            "/read",
-            1,
-            None,
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("async-memory") {
-        run_and_print(
-            &service,
-            "memory-read-async-memory",
-            MEMORY_READ_ASYNC_MEMORY_WORKER_SOURCE,
-            false,
-            "/read",
-            1,
-            None,
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("sync-memory") {
-        run_and_print(
-            &service,
-            "memory-read-sync-memory",
-            MEMORY_READ_SYNC_MEMORY_WORKER_SOURCE,
-            false,
-            "/read",
-            1,
-            None,
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory") {
-        run_and_print(
-            &service,
-            "memory-direct-read-memory",
-            MEMORY_DIRECT_READ_WORKER_SOURCE,
-            true,
-            "/read",
-            1,
-            None,
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-write-memory") {
-        run_and_print(
-            &service,
-            "memory-direct-write-memory",
-            MEMORY_DIRECT_WRITE_WORKER_SOURCE,
-            true,
-            "/write",
-            1,
-            Some("/get-strong"),
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-write-memory-multikey") {
-        run_and_print(
-            &service,
-            "memory-direct-write-memory-multikey",
-            MEMORY_DIRECT_WRITE_WORKER_SOURCE,
-            false,
-            "/write",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            Some("/sum-read"),
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory-multikey") {
-        run_and_print(
-            &service,
-            "memory-direct-read-memory-multikey",
-            MEMORY_DIRECT_READ_WORKER_SOURCE,
-            false,
-            "/read",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            None,
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("direct-read-memory-wide") {
-        run_and_print(
-            &service,
-            "memory-direct-read-memory-wide",
-            MEMORY_DIRECT_READ_WORKER_SOURCE,
-            true,
-            "/read",
-            options.wide_key_space,
-            None,
-            true,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory") {
-        run_and_print(
-            &service,
-            "memory-atomic-read-memory",
-            MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
-            true,
-            "/read",
-            1,
-            None,
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory-allow-concurrency")
-    {
-        run_and_print(
-            &service,
-            "memory-atomic-read-memory-allow-concurrency",
-            MEMORY_ATOMIC_READ_ALLOW_CONCURRENCY_MEMORY_WORKER_SOURCE,
-            true,
-            "/read",
-            1,
-            None,
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-read-memory-multikey") {
-        run_and_print(
-            &service,
-            "memory-atomic-read-memory-multikey",
-            MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
-            false,
-            "/read",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            None,
-            false,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-inc") {
-        run_and_print(
-            &service,
-            "memory-stm-inc",
-            MEMORY_STM_INCREMENT_WORKER_SOURCE,
-            true,
-            "/inc",
-            1,
-            Some("/get"),
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read") {
-        run_and_print(
-            &service,
-            "memory-stm-read",
-            MEMORY_STM_READ_WRITE_WORKER_SOURCE,
-            true,
-            "/read",
-            1,
-            None,
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read-multikey") {
-        run_and_print(
-            &service,
-            "memory-stm-read-multikey",
-            MEMORY_STM_READ_WRITE_WORKER_SOURCE,
-            true,
-            "/read",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            None,
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read-allow-concurrency") {
-        run_and_print(
-            &service,
-            "memory-stm-read-allow-concurrency",
-            MEMORY_STM_READ_WRITE_ALLOW_CONCURRENCY_WORKER_SOURCE,
-            true,
-            "/read",
-            1,
-            None,
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-read-multikey-allow-concurrency") {
-        run_and_print(
-            &service,
-            "memory-stm-read-multikey-allow-concurrency",
-            MEMORY_STM_READ_WRITE_ALLOW_CONCURRENCY_WORKER_SOURCE,
-            true,
-            "/read",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            None,
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-write") {
-        run_and_print(
-            &service,
-            "memory-stm-write",
-            MEMORY_STM_READ_WRITE_WORKER_SOURCE,
-            true,
-            "/write",
-            1,
-            Some("/get"),
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-write-throughput") {
-        run_and_print(
-            &service,
-            "memory-stm-write-throughput",
-            MEMORY_STM_READ_WRITE_WORKER_SOURCE,
-            true,
-            "/write",
-            1,
-            Some("/get"),
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-write-multikey") {
-        run_and_print(
-            &service,
-            "memory-stm-write-multikey",
-            MEMORY_STM_READ_WRITE_WORKER_SOURCE,
-            true,
-            "/write",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            Some("/sum"),
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-blind-write") {
-        run_and_print(
-            &service,
-            "memory-stm-blind-write",
-            MEMORY_STM_BLIND_WRITE_WORKER_SOURCE,
-            true,
-            "/write",
-            1,
-            Some("/get-blind"),
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("stm-blind-write-multikey") {
-        run_and_print(
-            &service,
-            "memory-stm-blind-write-multikey",
-            MEMORY_STM_BLIND_WRITE_WORKER_SOURCE,
-            true,
-            "/write",
-            env_usize("DD_BENCH_KEY_SPACE", 256),
-            Some("/sum-blind"),
-            profile_enabled,
-            &options,
-        )
-        .await?;
-    }
-    if mode.as_deref().is_none() || mode.as_deref() == Some("atomic-put-inc") {
-        run_and_print(
-            &service,
-            "memory-atomic-put-inc",
-            MEMORY_ATOMIC_PUT_INCREMENT_WORKER_SOURCE,
-            true,
-            "/inc",
-            1,
-            Some("/get"),
-            false,
+            bench_case.label,
+            bench_case.source,
+            bench_case.seed,
+            bench_case.path,
+            bench_case.key_space.resolve(&options),
+            bench_case.verify_path,
+            bench_case.profile.resolve(profile_enabled),
             &options,
         )
         .await?;
@@ -473,4 +463,101 @@ async fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn env_mode_checked() -> Result<Option<String>, String> {
+    let Some(mode) = env_mode() else {
+        return Ok(None);
+    };
+    if BENCH_CASES.iter().any(|bench_case| bench_case.mode == mode) {
+        Ok(Some(mode))
+    } else {
+        Err(format!(
+            "unknown DD_BENCH_MODE `{mode}`; expected one of: {}",
+            bench_modes().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+fn should_run_case(selected_mode: Option<&str>, case_mode: &str) -> bool {
+    match selected_mode {
+        Some(selected_mode) => selected_mode == case_mode,
+        None => true,
+    }
+}
+
+fn bench_modes() -> impl Iterator<Item = &'static str> {
+    BENCH_CASES.iter().map(|bench_case| bench_case.mode)
+}
+
+fn print_help() {
+    println!("keyed memory benchmark");
+    println!();
+    println!("Usage:");
+    println!("  cargo run -p runtime --bin bench_memory_storage --release");
+    println!("  DD_BENCH_MODE=direct-read-memory cargo run -p runtime --bin bench_memory_storage --release");
+    println!();
+    println!("This benchmark is configured with environment variables, not CLI flags.");
+    println!();
+    println!("Core env:");
+    println!("  DD_BENCH_MODE                  run one scenario; omit to run all");
+    println!("  DD_BENCH_REQUESTS              requests per scenario (default 1000)");
+    println!("  DD_BENCH_CONCURRENCY           concurrent requests (default 1)");
+    println!("  DD_BENCH_MIN_ISOLATES          runtime min isolates (default 1)");
+    println!("  DD_BENCH_MAX_ISOLATES          runtime max isolates (default 1)");
+    println!("  DD_BENCH_MAX_INFLIGHT          max inflight per isolate (default 1)");
+    println!("  DD_BENCH_KEY_SPACE             multikey scenario key space (default 256)");
+    println!("  DD_BENCH_PROFILE_MEMORY        enable memory profile output");
+    println!();
+    println!("Modes:");
+    for mode in bench_modes() {
+        println!("  {mode}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_cases_have_unique_modes_and_labels() {
+        assert!(!BENCH_CASES.is_empty());
+        for (idx, bench_case) in BENCH_CASES.iter().enumerate() {
+            assert!(!bench_case.mode.trim().is_empty());
+            assert!(!bench_case.label.trim().is_empty());
+            assert_eq!(
+                BENCH_CASES
+                    .iter()
+                    .filter(|candidate| candidate.mode == bench_case.mode)
+                    .count(),
+                1,
+                "duplicate mode at index {}: {}",
+                idx,
+                bench_case.mode
+            );
+            assert_eq!(
+                BENCH_CASES
+                    .iter()
+                    .filter(|candidate| candidate.label == bench_case.label)
+                    .count(),
+                1,
+                "duplicate label at index {}: {}",
+                idx,
+                bench_case.label
+            );
+        }
+    }
+
+    #[test]
+    fn should_run_case_matches_selected_mode_or_all() {
+        assert!(should_run_case(None, "direct-read-memory"));
+        assert!(should_run_case(
+            Some("direct-read-memory"),
+            "direct-read-memory"
+        ));
+        assert!(!should_run_case(
+            Some("direct-write-memory"),
+            "direct-read-memory"
+        ));
+    }
 }

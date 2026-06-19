@@ -24,6 +24,7 @@ pub(crate) enum RuntimeCommand {
         runtime_request_id: String,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
+        stream_response: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
     },
     DynamicWorkerFetchStart {
@@ -338,6 +339,7 @@ impl WorkerManager {
                 runtime_request_id,
                 request,
                 request_body,
+                stream_response,
                 reply,
             } => {
                 let _ = self.enqueue_invoke(
@@ -352,7 +354,11 @@ impl WorkerManager {
                     None,
                     false,
                     reply,
-                    PendingReplyKind::Normal,
+                    if stream_response {
+                        PendingReplyKind::Stream
+                    } else {
+                        PendingReplyKind::Normal
+                    },
                     event_tx,
                 );
                 true
@@ -827,11 +833,21 @@ impl WorkerManager {
         reply: oneshot::Sender<Result<WorkerOutput>>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let Some(session) = self.websocket_sessions.get(session_id).cloned() else {
+        let Some((session_worker_name, generation, binding, key, handle)) =
+            self.websocket_sessions.get(session_id).map(|session| {
+                (
+                    session.worker_name.clone(),
+                    session.generation,
+                    session.binding.clone(),
+                    session.key.clone(),
+                    session.handle.clone(),
+                )
+            })
+        else {
             let _ = reply.send(Err(PlatformError::not_found("websocket session not found")));
             return;
         };
-        if session.worker_name != worker_name {
+        if session_worker_name != worker_name {
             let _ = reply.send(Err(PlatformError::bad_request(
                 "websocket session worker mismatch",
             )));
@@ -839,18 +855,13 @@ impl WorkerManager {
         }
 
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-        };
-        let socket_handles =
-            self.websocket_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
-        let transport_handles =
-            self.transport_handles_snapshot(&session.binding, &session.key, None);
+        let route = MemoryRoute::new(binding.clone(), key.clone());
+        let socket_handles = self.websocket_handles_snapshot(&binding, &key, Some(&handle));
+        let transport_handles = self.transport_handles_snapshot(&binding, &key, None);
         let memory_call = MemoryExecutionCall::Message {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-            handle: session.handle.clone(),
+            binding,
+            key,
+            handle,
             is_text: !is_binary,
             data: frame,
             socket_handles,
@@ -864,7 +875,7 @@ impl WorkerManager {
             request_id: format!("ws-message-{runtime_request_id}"),
         };
         self.enqueue_invoke(
-            session.worker_name,
+            session_worker_name,
             runtime_request_id,
             invoke,
             None,
@@ -872,7 +883,7 @@ impl WorkerManager {
             Some(memory_call),
             None,
             None,
-            Some(session.generation),
+            Some(generation),
             true,
             reply,
             PendingReplyKind::WebsocketFrame {
@@ -905,10 +916,7 @@ impl WorkerManager {
         self.queue_websocket_close_replay(&session, close_code, close_reason.clone());
 
         let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute {
-            binding: session.binding.clone(),
-            key: session.key.clone(),
-        };
+        let route = MemoryRoute::new(session.binding.clone(), session.key.clone());
         let socket_handles =
             self.websocket_handles_snapshot(&session.binding, &session.key, Some(&session.handle));
         let transport_handles =

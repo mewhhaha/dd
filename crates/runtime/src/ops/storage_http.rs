@@ -821,7 +821,7 @@ fn ensure_cache_allowed(
             .borrow::<RequestSecretContexts>()
             .contexts
             .get(request_id)
-            .map(|context| context.allow_cache)
+            .map(|context| context.execution.allow_cache)
             .unwrap_or(true)
     };
     if allowed {
@@ -844,29 +844,21 @@ pub(crate) fn prepare_http_fetch_request(
     ),
     String,
 > {
-    let (
-        worker_name,
-        replacements,
-        egress_allow_hosts,
-        max_outbound_requests,
-        dynamic_quota_state,
-        canceled,
-        canceled_notify,
-    ) = http_fetch_context(state, &payload.request_id)?;
+    let (execution, canceled, canceled_notify) = http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
     }
 
-    let method_raw = replace_placeholders_text(&payload.method, &replacements);
+    let method_raw = replace_placeholders_text(&payload.method, execution.replacements.as_ref());
     let method = reqwest::Method::from_bytes(method_raw.trim().to_ascii_uppercase().as_bytes())
         .map_err(|error| format!("invalid host fetch method: {error}"))?;
 
-    let url = replace_placeholders_text(&payload.url, &replacements);
+    let url = replace_placeholders_text(&payload.url, execution.replacements.as_ref());
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
-    if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
-        if let Some(quota_state) = &dynamic_quota_state {
+    if !is_egress_url_allowed(&parsed_url, execution.egress_allow_hosts.as_ref()) {
+        if let Some(quota_state) = &execution.dynamic_quota_state {
             quota_state
                 .egress_deny_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -880,12 +872,13 @@ pub(crate) fn prepare_http_fetch_request(
             parsed_url.origin().ascii_serialization()
         ));
     }
-    if let Some(quota_state) = &dynamic_quota_state {
+    if let Some(quota_state) = &execution.dynamic_quota_state {
         let next = quota_state
             .outbound_requests
             .fetch_add(1, Ordering::Relaxed)
             + 1;
-        if max_outbound_requests
+        if execution
+            .max_outbound_requests
             .map(|limit| next > limit)
             .unwrap_or(false)
         {
@@ -901,7 +894,7 @@ pub(crate) fn prepare_http_fetch_request(
             let _ = command_sender
                 .0
                 .send(crate::service::RuntimeCommand::RetireDynamicWorker {
-                    worker_name,
+                    worker_name: execution.worker_name.as_ref().to_string(),
                     reason: "dynamic child exceeded max_outbound_requests".to_string(),
                 });
             return Err("dynamic child exceeded max_outbound_requests".to_string());
@@ -912,8 +905,9 @@ pub(crate) fn prepare_http_fetch_request(
         .headers
         .into_iter()
         .filter_map(|(name, value)| {
-            let normalized_name = replace_placeholders_text(&name, &replacements);
-            let normalized_value = replace_placeholders_text(&value, &replacements);
+            let normalized_name = replace_placeholders_text(&name, execution.replacements.as_ref());
+            let normalized_value =
+                replace_placeholders_text(&value, execution.replacements.as_ref());
             let trimmed = normalized_name.trim().to_string();
             if trimmed.eq_ignore_ascii_case("host")
                 || trimmed.eq_ignore_ascii_case("content-length")
@@ -923,7 +917,7 @@ pub(crate) fn prepare_http_fetch_request(
             Some((trimmed, normalized_value))
         })
         .collect::<Vec<_>>();
-    let body = replace_placeholders_in_body(payload.body, &replacements);
+    let body = replace_placeholders_in_body(payload.body, execution.replacements.as_ref());
 
     Ok((method, parsed_url, headers, body, canceled, canceled_notify))
 }
@@ -932,24 +926,16 @@ pub(crate) fn check_http_fetch_url(
     state: &Rc<RefCell<OpState>>,
     payload: HttpUrlCheckPayload,
 ) -> std::result::Result<String, String> {
-    let (
-        _worker_name,
-        replacements,
-        egress_allow_hosts,
-        _max_outbound_requests,
-        dynamic_quota_state,
-        canceled,
-        canceled_notify,
-    ) = http_fetch_context(state, &payload.request_id)?;
+    let (execution, canceled, canceled_notify) = http_fetch_context(state, &payload.request_id)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
     }
-    let url = replace_placeholders_text(&payload.url, &replacements);
+    let url = replace_placeholders_text(&payload.url, execution.replacements.as_ref());
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
-    if !is_egress_url_allowed(&parsed_url, &egress_allow_hosts) {
-        if let Some(quota_state) = &dynamic_quota_state {
+    if !is_egress_url_allowed(&parsed_url, execution.egress_allow_hosts.as_ref()) {
+        if let Some(quota_state) = &execution.dynamic_quota_state {
             quota_state
                 .egress_deny_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -969,18 +955,7 @@ pub(crate) fn check_http_fetch_url(
 pub(crate) fn http_fetch_context(
     state: &Rc<RefCell<OpState>>,
     request_id: &str,
-) -> std::result::Result<
-    (
-        String,
-        HashMap<String, String>,
-        Vec<String>,
-        Option<u64>,
-        Option<Arc<crate::service::DynamicQuotaState>>,
-        Arc<AtomicBool>,
-        Arc<Notify>,
-    ),
-    String,
-> {
+) -> std::result::Result<(RequestExecutionContext, Arc<AtomicBool>, Arc<Notify>), String> {
     let request_id = request_id.trim();
     if request_id.is_empty() {
         return Err("host fetch request_id must not be empty".to_string());
@@ -993,11 +968,7 @@ pub(crate) fn http_fetch_context(
             .get(request_id)
             .map(|context| {
                 (
-                    context.worker_name.clone(),
-                    context.replacements.clone(),
-                    context.egress_allow_hosts.clone(),
-                    context.max_outbound_requests,
-                    context.dynamic_quota_state.clone(),
+                    context.execution.clone(),
                     context.canceled.clone(),
                     context.canceled_notify.clone(),
                 )
@@ -1087,8 +1058,7 @@ pub(crate) fn op_emit_completion(state: &mut OpState, #[string] payload: String)
             clear_request_secret_context(state, &request_id);
         }
     }
-    let sender = state.borrow::<IsolateEventSender>().clone();
-    let _ = sender.0.send(IsolateEventPayload::Completion(payload));
+    let _ = emit_isolate_event(state, IsolateEventPayload::Completion(payload));
 }
 
 #[deno_core::op2(fast)]
@@ -1097,26 +1067,22 @@ pub(crate) fn op_emit_wait_until_done(state: &mut OpState, #[string] payload: St
         clear_memory_request_scope(state, &request_id);
         clear_request_secret_context(state, &request_id);
     }
-    let sender = state.borrow::<IsolateEventSender>().clone();
-    let _ = sender.0.send(IsolateEventPayload::WaitUntilDone(payload));
+    let _ = emit_isolate_event(state, IsolateEventPayload::WaitUntilDone(payload));
 }
 
 #[deno_core::op2(fast)]
 pub(crate) fn op_emit_response_start(state: &mut OpState, #[string] payload: String) {
-    let sender = state.borrow::<IsolateEventSender>().clone();
-    let _ = sender.0.send(IsolateEventPayload::ResponseStart(payload));
+    let _ = emit_isolate_event(state, IsolateEventPayload::ResponseStart(payload));
 }
 
 #[deno_core::op2(fast)]
 pub(crate) fn op_emit_response_chunk(state: &mut OpState, #[string] payload: String) {
-    let sender = state.borrow::<IsolateEventSender>().clone();
-    let _ = sender.0.send(IsolateEventPayload::ResponseChunk(payload));
+    let _ = emit_isolate_event(state, IsolateEventPayload::ResponseChunk(payload));
 }
 
 #[deno_core::op2(fast)]
 pub(crate) fn op_emit_cache_revalidate(state: &mut OpState, #[string] payload: String) {
-    let sender = state.borrow::<IsolateEventSender>().clone();
-    let _ = sender.0.send(IsolateEventPayload::CacheRevalidate(payload));
+    let _ = emit_isolate_event(state, IsolateEventPayload::CacheRevalidate(payload));
 }
 
 pub(crate) fn replace_placeholders_text(
@@ -1149,7 +1115,7 @@ pub(crate) fn replace_placeholders_in_body(
     }
 }
 
-pub(crate) fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[String]) -> bool {
+pub(crate) fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[EgressAllowHost]) -> bool {
     if allow_hosts.is_empty() {
         return false;
     }
@@ -1167,40 +1133,9 @@ pub(crate) fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[String]) 
     let Some(default_port) = default_port_for_scheme(url.scheme()) else {
         return false;
     };
-    allow_hosts.iter().any(|allowed| {
-        let Some((allowed_host, allowed_port)) = parse_egress_allow_host(allowed) else {
-            return false;
-        };
-        let port_matches = match allowed_port {
-            Some(port) => port == request_port,
-            None => request_port == default_port,
-        };
-        if !port_matches {
-            return false;
-        }
-        if let Some(suffix) = allowed_host.strip_prefix("*.") {
-            return host == suffix || host.ends_with(&format!(".{suffix}"));
-        }
-        host == allowed_host
-    })
-}
-
-pub(crate) fn parse_egress_allow_host(allowed: &str) -> Option<(String, Option<u16>)> {
-    let allowed = allowed.trim().to_ascii_lowercase();
-    if allowed.is_empty() {
-        return None;
-    }
-    let (host, port) = match allowed.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|char| char.is_ascii_digit()) => {
-            let parsed = port.parse::<u16>().ok().filter(|port| *port > 0)?;
-            (host.to_string(), Some(parsed))
-        }
-        _ => (allowed, None),
-    };
-    if host.is_empty() {
-        return None;
-    }
-    Some((host, port))
+    allow_hosts
+        .iter()
+        .any(|allowed| allowed.matches(&host, request_port, default_port))
 }
 
 pub(crate) fn default_port_for_scheme(scheme: &str) -> Option<u16> {

@@ -159,11 +159,11 @@ const child = await env.SANDBOX.get("preview:v1", async () => ({
 }));
 ```
 
-See [examples/dynamic-namespace.js](/home/mewhhaha/src/grugd/examples/dynamic-namespace.js), [examples/preview-dynamic.js](/home/mewhhaha/src/grugd/examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](/home/mewhhaha/src/grugd/examples/llm-dynamic-exec.js).
+See [examples/dynamic-namespace.js](/home/mewhhaha/src/dd/examples/dynamic-namespace.js), [examples/preview-dynamic.js](/home/mewhhaha/src/dd/examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](/home/mewhhaha/src/dd/examples/llm-dynamic-exec.js).
 
-Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](/home/mewhhaha/src/grugd/examples/static-assets-site).
+Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](/home/mewhhaha/src/dd/examples/static-assets-site).
 
-Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](/home/mewhhaha/src/grugd/examples/chat-worker).
+Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](/home/mewhhaha/src/dd/examples/chat-worker).
 
 ## How to think about it
 
@@ -183,7 +183,7 @@ Canonical flow:
 2. open private tunnel with `just fly-proxy <app>`
 3. deploy worker through tunnel with `just fly-worker-deploy ...`
 
-Full guide: [deploy/fly/README.md](/home/mewhhaha/src/grugd/deploy/fly/README.md)
+Full guide: [deploy/fly/README.md](/home/mewhhaha/src/dd/deploy/fly/README.md)
 
 ## Benchmarks and docs
 
@@ -199,4 +199,4 @@ Keyed memory benchmark:
 cargo run -p runtime --bin bench_memory_storage
 ```
 
-Current numbers live in [BENCHMARKS.md](/home/mewhhaha/src/grugd/BENCHMARKS.md). Contributor/dev notes live in [docs/development.md](/home/mewhhaha/src/grugd/docs/development.md).
+Current numbers live in [BENCHMARK.md](/home/mewhhaha/src/dd/BENCHMARK.md). Hardening progress lives in [HARDEN.md](/home/mewhhaha/src/dd/HARDEN.md). Contributor/dev notes live in [docs/development.md](/home/mewhhaha/src/dd/docs/development.md).

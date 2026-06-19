@@ -103,13 +103,11 @@ pub(super) fn print_debug_dump(label: &str, dump: &WorkerDebugDump) {
         .collect::<Vec<_>>()
         .join("|");
     println!(
-        "bench-dump label={} outcome=ok generation={} queued={} isolates={} owners={:?} memory_inflight={:?} queued_requests={} pending_requests={}",
+        "bench-dump label={} outcome=ok generation={} queued={} isolates={} queued_requests={} pending_requests={}",
         label,
         dump.generation,
         dump.queued,
         isolate_summary,
-        dump.memory_owners.iter().take(8).collect::<Vec<_>>(),
-        dump.memory_inflight.iter().take(8).collect::<Vec<_>>(),
         queued_requests,
         pending_requests,
     );

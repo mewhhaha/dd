@@ -95,8 +95,6 @@ pub struct WorkerStats {
 pub struct WorkerDebugDump {
     pub generation: u64,
     pub queued: usize,
-    pub memory_owners: Vec<(String, u64)>,
-    pub memory_inflight: Vec<(String, usize)>,
     pub isolates: Vec<WorkerDebugIsolate>,
     pub queued_requests: Vec<WorkerDebugRequest>,
 }
@@ -494,10 +492,7 @@ impl RuntimeService {
                 runtime.request_id = %runtime_request_id,
                 request.id = %request.request_id
             );
-            set_span_parent_from_traceparent(
-                &span,
-                traceparent_from_headers(&request.headers).as_deref(),
-            );
+            set_span_parent_from_traceparent(&span, traceparent_from_headers(&request.headers));
             Some(span)
         } else {
             None
@@ -515,6 +510,7 @@ impl RuntimeService {
                 runtime_request_id,
                 request,
                 request_body,
+                stream_response: false,
                 reply: reply_tx,
             })
             .await
@@ -548,10 +544,7 @@ impl RuntimeService {
                 runtime.request_id = %runtime_request_id,
                 request.id = %request.request_id
             );
-            set_span_parent_from_traceparent(
-                &span,
-                traceparent_from_headers(&request.headers).as_deref(),
-            );
+            set_span_parent_from_traceparent(&span, traceparent_from_headers(&request.headers));
             Some(span)
         } else {
             None
@@ -579,6 +572,7 @@ impl RuntimeService {
                 runtime_request_id,
                 request,
                 request_body,
+                stream_response: true,
                 reply: reply_tx,
             })
             .await

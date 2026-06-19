@@ -1,5 +1,21 @@
 use super::*;
 
+struct DynamicDispatchTarget {
+    worker_name: String,
+    worker_generation: u64,
+    timeout: u64,
+    policy: ValidatedDynamicWorkerPolicy,
+    quota_state: Arc<DynamicQuotaState>,
+    preferred_isolate_id: Option<u64>,
+}
+
+struct HostRpcProviderTarget {
+    owner_worker: String,
+    owner_generation: u64,
+    owner_isolate_id: u64,
+    target_id: String,
+}
+
 impl WorkerManager {
     pub(super) async fn handle_dynamic_worker_create(
         &mut self,
@@ -296,7 +312,11 @@ impl WorkerManager {
             );
             return;
         };
-        let Some(entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
+        let Some((worker_name, timeout)) = self
+            .dynamic_worker_handles
+            .get(&handle)
+            .map(|entry| (entry.worker_name.clone(), entry.timeout))
+        else {
             if let Some(by_id) = self.dynamic_worker_ids.get_mut(&key) {
                 by_id.remove(&id);
             }
@@ -315,8 +335,8 @@ impl WorkerManager {
             crate::ops::DynamicPendingReplyPayload::Lookup(Ok(Some(
                 crate::ops::DynamicWorkerCreateReply {
                     handle,
-                    worker_name: entry.worker_name,
-                    timeout: entry.timeout,
+                    worker_name,
+                    timeout,
                 },
             ))),
         );
@@ -403,7 +423,7 @@ impl WorkerManager {
             );
             return;
         };
-        let Some(_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
+        if !self.dynamic_worker_handles.contains_key(&handle) {
             self.dynamic_profile.record_async_reply_completion();
             self.finish_dynamic_reply(
                 pending_replies,
@@ -437,52 +457,28 @@ impl WorkerManager {
             reply_id,
             pending_replies,
         } = payload;
-        let Some(mut handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::not_found(
-                    "dynamic worker handle not found",
-                ))),
-            );
-            return;
+        let dispatch_target = match self.dynamic_dispatch_target(
+            &handle,
+            &owner_worker,
+            owner_generation,
+            &binding,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Invoke(Err(error)),
+                );
+                return;
+            }
         };
-        if handle_entry.owner_worker != owner_worker {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
-                    "dynamic worker handle owner mismatch",
-                ))),
-            );
-            return;
-        }
-        if handle_entry.owner_generation != owner_generation {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
-                    "dynamic worker handle generation mismatch",
-                ))),
-            );
-            return;
-        }
-        if handle_entry.binding != binding {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::bad_request(
-                    "dynamic worker binding mismatch",
-                ))),
-            );
-            return;
-        }
-        if request.body.len() > handle_entry.policy.max_request_bytes {
-            handle_entry
+        if request.body.len() > dispatch_target.policy.max_request_bytes {
+            dispatch_target
                 .quota_state
                 .total_request_bytes
                 .fetch_add(request.body.len() as u64, Ordering::Relaxed);
-            handle_entry
+            dispatch_target
                 .quota_state
                 .quota_kill_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -498,13 +494,16 @@ impl WorkerManager {
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::runtime(
                     format!(
                         "dynamic child request exceeds max_request_bytes ({})",
-                        handle_entry.policy.max_request_bytes
+                        dispatch_target.policy.max_request_bytes
                     ),
                 ))),
             );
             return;
         }
-        if !self.try_acquire_dynamic_inflight(&handle_entry) {
+        if !self.try_acquire_dynamic_inflight(
+            &dispatch_target.quota_state,
+            dispatch_target.policy.max_concurrency,
+        ) {
             self.dynamic_profile.record_quota_kill();
             self.retire_dynamic_worker_handle(
                 &handle,
@@ -517,24 +516,24 @@ impl WorkerManager {
                 crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::runtime(
                     format!(
                         "dynamic child exceeded max_concurrency ({})",
-                        handle_entry.policy.max_concurrency
+                        dispatch_target.policy.max_concurrency
                     ),
                 ))),
             );
             return;
         }
-        handle_entry
+        dispatch_target
             .quota_state
             .total_request_bytes
             .fetch_add(request.body.len() as u64, Ordering::Relaxed);
 
-        let target_generation = Some(handle_entry.worker_generation);
-        let mut target_isolate_id = handle_entry.preferred_isolate_id;
+        let target_generation = Some(dispatch_target.worker_generation);
+        let mut target_isolate_id = dispatch_target.preferred_isolate_id;
         if let Some(preferred_id) = target_isolate_id {
             let preferred_alive = self
                 .workers
-                .get(&handle_entry.worker_name)
-                .and_then(|entry| entry.pools.get(&handle_entry.worker_generation))
+                .get(&dispatch_target.worker_name)
+                .and_then(|entry| entry.pools.get(&dispatch_target.worker_generation))
                 .map(|pool| {
                     pool.isolates
                         .iter()
@@ -545,7 +544,6 @@ impl WorkerManager {
                 self.dynamic_profile.record_warm_isolate_hit();
             } else {
                 target_isolate_id = None;
-                handle_entry.preferred_isolate_id = None;
                 if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
                     entry.preferred_isolate_id = None;
                 }
@@ -556,14 +554,14 @@ impl WorkerManager {
         }
 
         let runtime_request_id = next_runtime_token("dyn");
-        let timeout = handle_entry.timeout;
+        let timeout = dispatch_target.timeout;
         let timeout_diagnostic = DynamicTimeoutDiagnostic {
             stage: "invoke-reply",
             owner_worker: owner_worker.clone(),
             owner_generation,
             binding: binding.clone(),
             handle: handle.clone(),
-            target_worker: handle_entry.worker_name.clone(),
+            target_worker: dispatch_target.worker_name.clone(),
             target_isolate_id,
             target_generation,
             provider_id: None,
@@ -573,7 +571,7 @@ impl WorkerManager {
         };
         let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
         self.enqueue_invoke(
-            handle_entry.worker_name,
+            dispatch_target.worker_name,
             runtime_request_id,
             request,
             None,
@@ -593,8 +591,8 @@ impl WorkerManager {
         let command_tx = command_tx.clone();
         let profile = self.dynamic_profile.clone();
         let handle_for_task = handle.clone();
-        let policy = handle_entry.policy.clone();
-        let quota_state = handle_entry.quota_state.clone();
+        let policy = dispatch_target.policy;
+        let quota_state = dispatch_target.quota_state;
         tokio::spawn(async move {
             let result =
                 match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
@@ -657,66 +655,32 @@ impl WorkerManager {
         command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
         event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     ) {
-        let Some(mut handle_entry) = self.dynamic_worker_handles.get(&handle).cloned() else {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Fetch {
-                    result: Err(PlatformError::not_found("dynamic worker handle not found")),
-                    stale_handle: true,
-                    boundary: None,
-                },
-            );
-            return;
+        let dispatch_target = match self.dynamic_dispatch_target(
+            &handle,
+            &owner_worker,
+            owner_generation,
+            &binding,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::Fetch {
+                        result: Err(error),
+                        stale_handle: true,
+                        boundary: None,
+                    },
+                );
+                return;
+            }
         };
-        if handle_entry.owner_worker != owner_worker {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Fetch {
-                    result: Err(PlatformError::bad_request(
-                        "dynamic worker handle owner mismatch",
-                    )),
-                    stale_handle: true,
-                    boundary: None,
-                },
-            );
-            return;
-        }
-        if handle_entry.owner_generation != owner_generation {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Fetch {
-                    result: Err(PlatformError::bad_request(
-                        "dynamic worker handle generation mismatch",
-                    )),
-                    stale_handle: true,
-                    boundary: None,
-                },
-            );
-            return;
-        }
-        if handle_entry.binding != binding {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Fetch {
-                    result: Err(PlatformError::bad_request(
-                        "dynamic worker binding mismatch",
-                    )),
-                    stale_handle: true,
-                    boundary: None,
-                },
-            );
-            return;
-        }
-        if request.body.len() > handle_entry.policy.max_request_bytes {
-            handle_entry
+        if request.body.len() > dispatch_target.policy.max_request_bytes {
+            dispatch_target
                 .quota_state
                 .total_request_bytes
                 .fetch_add(request.body.len() as u64, Ordering::Relaxed);
-            handle_entry
+            dispatch_target
                 .quota_state
                 .quota_kill_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -732,7 +696,7 @@ impl WorkerManager {
                 crate::ops::DynamicPendingReplyPayload::Fetch {
                     result: Err(PlatformError::runtime(format!(
                         "dynamic child request exceeds max_request_bytes ({})",
-                        handle_entry.policy.max_request_bytes
+                        dispatch_target.policy.max_request_bytes
                     ))),
                     stale_handle: true,
                     boundary: None,
@@ -740,7 +704,10 @@ impl WorkerManager {
             );
             return;
         }
-        if !self.try_acquire_dynamic_inflight(&handle_entry) {
+        if !self.try_acquire_dynamic_inflight(
+            &dispatch_target.quota_state,
+            dispatch_target.policy.max_concurrency,
+        ) {
             self.dynamic_profile.record_quota_kill();
             self.retire_dynamic_worker_handle(
                 &handle,
@@ -753,7 +720,7 @@ impl WorkerManager {
                 crate::ops::DynamicPendingReplyPayload::Fetch {
                     result: Err(PlatformError::runtime(format!(
                         "dynamic child exceeded max_concurrency ({})",
-                        handle_entry.policy.max_concurrency
+                        dispatch_target.policy.max_concurrency
                     ))),
                     stale_handle: true,
                     boundary: None,
@@ -761,18 +728,18 @@ impl WorkerManager {
             );
             return;
         }
-        handle_entry
+        dispatch_target
             .quota_state
             .total_request_bytes
             .fetch_add(request.body.len() as u64, Ordering::Relaxed);
 
-        let target_generation = Some(handle_entry.worker_generation);
-        let mut target_isolate_id = handle_entry.preferred_isolate_id;
+        let target_generation = Some(dispatch_target.worker_generation);
+        let mut target_isolate_id = dispatch_target.preferred_isolate_id;
         if let Some(preferred_id) = target_isolate_id {
             let preferred_alive = self
                 .workers
-                .get(&handle_entry.worker_name)
-                .and_then(|entry| entry.pools.get(&handle_entry.worker_generation))
+                .get(&dispatch_target.worker_name)
+                .and_then(|entry| entry.pools.get(&dispatch_target.worker_generation))
                 .map(|pool| {
                     pool.isolates
                         .iter()
@@ -783,7 +750,6 @@ impl WorkerManager {
                 self.dynamic_profile.record_warm_isolate_hit();
             } else {
                 target_isolate_id = None;
-                handle_entry.preferred_isolate_id = None;
                 if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
                     entry.preferred_isolate_id = None;
                 }
@@ -794,14 +760,14 @@ impl WorkerManager {
         }
 
         let runtime_request_id = next_runtime_token("dyn");
-        let timeout = handle_entry.timeout;
+        let timeout = dispatch_target.timeout;
         let timeout_diagnostic = DynamicTimeoutDiagnostic {
             stage: "invoke-reply",
             owner_worker: owner_worker.clone(),
             owner_generation,
             binding: binding.clone(),
             handle: handle.clone(),
-            target_worker: handle_entry.worker_name.clone(),
+            target_worker: dispatch_target.worker_name.clone(),
             target_isolate_id,
             target_generation,
             provider_id: None,
@@ -811,12 +777,12 @@ impl WorkerManager {
         };
         let dispatch_started = Instant::now();
         let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
-        let child_worker_name = handle_entry.worker_name.clone();
+        let child_worker_name = dispatch_target.worker_name.clone();
         let mut queue_target_isolate_id = None;
         if let Some(preferred_id) = target_isolate_id {
             match self.try_dispatch_direct_dynamic_fetch(
                 &child_worker_name,
-                handle_entry.worker_generation,
+                dispatch_target.worker_generation,
                 preferred_id,
                 runtime_request_id.clone(),
                 request.clone(),
@@ -834,7 +800,6 @@ impl WorkerManager {
                         .record_direct_fetch_fast_path_fallback();
                     self.dynamic_profile.record_fallback_dispatch();
                     if clear_preferred {
-                        handle_entry.preferred_isolate_id = None;
                         if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
                             entry.preferred_isolate_id = None;
                         }
@@ -886,8 +851,8 @@ impl WorkerManager {
         let command_tx = command_tx.clone();
         let profile = self.dynamic_profile.clone();
         let handle_for_task = handle.clone();
-        let policy = handle_entry.policy.clone();
-        let quota_state = handle_entry.quota_state.clone();
+        let policy = dispatch_target.policy;
+        let quota_state = dispatch_target.quota_state;
         tokio::spawn(async move {
             let child_started = Instant::now();
             let result =
@@ -923,7 +888,6 @@ impl WorkerManager {
                         )))
                     } else if !policy.allow_websocket
                         && internal_header_value(&output.headers, INTERNAL_WS_ACCEPT_HEADER)
-                            .as_deref()
                             == Some("1")
                     {
                         quota_state
@@ -940,7 +904,6 @@ impl WorkerManager {
                         ))
                     } else if !policy.allow_transport
                         && internal_header_value(&output.headers, INTERNAL_TRANSPORT_ACCEPT_HEADER)
-                            .as_deref()
                             == Some("1")
                     {
                         quota_state
@@ -1063,34 +1026,47 @@ impl WorkerManager {
             );
             return;
         };
-        let Some(provider) = self.host_rpc_providers.get(&provider_id).cloned() else {
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::not_found(
-                    "dynamic host rpc provider not found",
-                ))),
-            );
-            return;
+        let provider_target = match self.host_rpc_providers.get(&provider_id) {
+            Some(provider) if provider.methods.contains(&method_name) => HostRpcProviderTarget {
+                owner_worker: provider.owner_worker.clone(),
+                owner_generation: provider.owner_generation,
+                owner_isolate_id: provider.owner_isolate_id,
+                target_id: provider.target_id.clone(),
+            },
+            Some(_) => {
+                self.record_dynamic_rpc_deny_for_pool(&caller_worker, caller_generation);
+                self.dynamic_profile.record_rpc_deny();
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
+                        PlatformError::bad_request(format!(
+                            "dynamic host rpc method is not allowed: {method_name}"
+                        )),
+                    )),
+                );
+                return;
+            }
+            None => {
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::not_found(
+                        "dynamic host rpc provider not found",
+                    ))),
+                );
+                return;
+            }
         };
-        if !provider.methods.contains(&method_name) {
-            self.record_dynamic_rpc_deny_for_pool(&caller_worker, caller_generation);
-            self.dynamic_profile.record_rpc_deny();
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::HostRpc(Err(PlatformError::bad_request(
-                    format!("dynamic host rpc method is not allowed: {method_name}"),
-                ))),
-            );
-            return;
-        }
         let owner_pool_generation = self
-            .get_pool_mut(&provider.owner_worker, provider.owner_generation)
+            .get_pool_mut(
+                &provider_target.owner_worker,
+                provider_target.owner_generation,
+            )
             .and_then(|pool| {
                 pool.isolates
                     .iter()
-                    .any(|isolate| isolate.id == provider.owner_isolate_id)
+                    .any(|isolate| isolate.id == provider_target.owner_isolate_id)
                     .then_some(pool.generation)
             });
         let Some(owner_pool_generation) = owner_pool_generation else {
@@ -1104,11 +1080,11 @@ impl WorkerManager {
             return;
         };
         let provider_delivery = self
-            .get_pool_mut(&provider.owner_worker, owner_pool_generation)
+            .get_pool_mut(&provider_target.owner_worker, owner_pool_generation)
             .and_then(|pool| {
                 pool.isolates
                     .iter()
-                    .find(|isolate| isolate.id == provider.owner_isolate_id)
+                    .find(|isolate| isolate.id == provider_target.owner_isolate_id)
                     .map(|isolate| isolate.id)
             });
         let Some(provider_isolate_id) = provider_delivery else {
@@ -1124,10 +1100,10 @@ impl WorkerManager {
         let reply_id_for_error = reply_id.clone();
         let pending_replies_for_error = pending_replies.clone();
         if let Err(error) = self.start_targeted_host_rpc_invoke(
-            provider.owner_worker,
+            provider_target.owner_worker,
             owner_pool_generation,
             provider_isolate_id,
-            provider.target_id,
+            provider_target.target_id,
             method_name,
             args,
             TargetedHostRpcReply::Dynamic {
@@ -1154,16 +1130,52 @@ impl WorkerManager {
         Ok(())
     }
 
-    pub(super) fn try_acquire_dynamic_inflight(&self, handle: &DynamicWorkerHandle) -> bool {
-        let inflight = handle.quota_state.inflight.fetch_add(1, Ordering::Relaxed) + 1;
-        if inflight <= handle.policy.max_concurrency {
+    fn dynamic_dispatch_target(
+        &self,
+        handle: &str,
+        owner_worker: &str,
+        owner_generation: u64,
+        binding: &str,
+    ) -> Result<DynamicDispatchTarget> {
+        let Some(entry) = self.dynamic_worker_handles.get(handle) else {
+            return Err(PlatformError::not_found("dynamic worker handle not found"));
+        };
+        if entry.owner_worker != owner_worker {
+            return Err(PlatformError::bad_request(
+                "dynamic worker handle owner mismatch",
+            ));
+        }
+        if entry.owner_generation != owner_generation {
+            return Err(PlatformError::bad_request(
+                "dynamic worker handle generation mismatch",
+            ));
+        }
+        if entry.binding != binding {
+            return Err(PlatformError::bad_request(
+                "dynamic worker binding mismatch",
+            ));
+        }
+        Ok(DynamicDispatchTarget {
+            worker_name: entry.worker_name.clone(),
+            worker_generation: entry.worker_generation,
+            timeout: entry.timeout,
+            policy: entry.policy.clone(),
+            quota_state: Arc::clone(&entry.quota_state),
+            preferred_isolate_id: entry.preferred_isolate_id,
+        })
+    }
+
+    pub(super) fn try_acquire_dynamic_inflight(
+        &self,
+        quota_state: &DynamicQuotaState,
+        max_concurrency: usize,
+    ) -> bool {
+        let inflight = quota_state.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        if inflight <= max_concurrency {
             return true;
         }
-        handle.quota_state.inflight.fetch_sub(1, Ordering::Relaxed);
-        handle
-            .quota_state
-            .quota_kill_count
-            .fetch_add(1, Ordering::Relaxed);
+        quota_state.inflight.fetch_sub(1, Ordering::Relaxed);
+        quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
         false
     }
 

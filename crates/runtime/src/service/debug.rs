@@ -2,20 +2,6 @@ use super::*;
 
 impl WorkerPool {
     pub(super) fn debug_dump(&self) -> WorkerDebugDump {
-        let mut memory_owners = self
-            .memory_owners
-            .iter()
-            .map(|(key, isolate_id)| (key.clone(), *isolate_id))
-            .collect::<Vec<_>>();
-        memory_owners.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut memory_inflight = self
-            .memory_inflight
-            .iter()
-            .map(|(key, count)| (key.clone(), *count))
-            .collect::<Vec<_>>();
-        memory_inflight.sort_by(|left, right| left.0.cmp(&right.0));
-
         let queued_requests = self
             .queue
             .iter()
@@ -24,7 +10,10 @@ impl WorkerPool {
                 user_request_id: pending.request.request_id.clone(),
                 method: pending.request.method.clone(),
                 url: pending.request.url.clone(),
-                memory_key: pending.memory_route.as_ref().map(MemoryRoute::owner_key),
+                memory_key: pending
+                    .memory_route
+                    .as_ref()
+                    .map(|route| route.owner_key.clone()),
                 target_isolate_id: pending.target_isolate_id,
                 internal_origin: pending.internal_origin,
                 reply_kind: pending.reply_kind.label().to_string(),
@@ -80,8 +69,6 @@ impl WorkerPool {
         WorkerDebugDump {
             generation: self.generation,
             queued: self.queue.len(),
-            memory_owners,
-            memory_inflight,
             isolates,
             queued_requests,
         }

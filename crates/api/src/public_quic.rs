@@ -34,6 +34,7 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::warn;
 
 const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
+const MAX_PENDING_H3_TRANSPORT_HANDSHAKES: usize = 1024;
 
 pub async fn serve_public_h3(public_addr: std::net::SocketAddr, state: AppState) -> Result<()> {
     let cert_path = state
@@ -125,9 +126,17 @@ pub async fn serve_public_h3(public_addr: std::net::SocketAddr, state: AppState)
                                                 );
                                             }
                                         });
-                                    } else {
+                                    } else if pending_transport_headers.len()
+                                        < MAX_PENDING_H3_TRANSPORT_HANDSHAKES
+                                    {
                                         pending_transport_headers
                                             .insert(flow_id, (parsed, incoming_headers));
+                                    } else {
+                                        warn!(
+                                            flow_id,
+                                            limit = MAX_PENDING_H3_TRANSPORT_HANDSHAKES,
+                                            "dropping public h3 transport headers because pending handshake limit is full"
+                                        );
                                     }
                                 }
                                 Ok(_) | Err(_) => {
@@ -172,8 +181,16 @@ pub async fn serve_public_h3(public_addr: std::net::SocketAddr, state: AppState)
                                             );
                                         }
                                     });
-                                } else {
+                                } else if pending_transport_flows.len()
+                                    < MAX_PENDING_H3_TRANSPORT_HANDSHAKES
+                                {
                                     pending_transport_flows.insert(flow_id, (send, recv));
+                                } else {
+                                    warn!(
+                                        flow_id,
+                                        limit = MAX_PENDING_H3_TRANSPORT_HANDSHAKES,
+                                        "dropping public h3 transport flow because pending handshake limit is full"
+                                    );
                                 }
                             }
                             ServerH3Event::Core(_) => {}

@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
+#[path = "bench_support/cli.rs"]
+mod bench_cli;
+
+use bench_cli::{bench_arg_action, BenchArgAction};
+
 #[derive(Clone)]
 struct BenchConfig {
     name: &'static str,
@@ -208,8 +213,36 @@ fn section_enabled(name: &str) -> bool {
         .any(|value| value.eq_ignore_ascii_case(name))
 }
 
+fn print_help() {
+    println!("dd runtime benchmark");
+    println!();
+    println!("Usage:");
+    println!("  cargo run -p runtime --bin bench --release");
+    println!("  DD_BENCH_ONLY=dynamic cargo run -p runtime --bin bench --release");
+    println!();
+    println!("This benchmark is configured with environment variables, not CLI flags.");
+    println!();
+    println!("Core env:");
+    println!("  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, dynamic, lifecycle, kv-writes");
+    println!("  DD_BENCH_VERBOSE_PROGRESS      print dynamic benchmark progress markers");
+    println!("  DD_BENCH_WS_SESSIONS           websocket sessions (default 24)");
+    println!("  DD_BENCH_WS_MESSAGES_PER_SESSION websocket messages per session (default 24)");
+    println!("  DD_BENCH_DYNAMIC_REQUESTS      dynamic requests per hot scenario (default 500)");
+    println!("  DD_BENCH_DYNAMIC_CONCURRENCY   dynamic concurrency (default 64)");
+    println!("  DD_BENCH_DYNAMIC_COLD_ROUNDS   dynamic create+invoke rounds (default 50)");
+    println!("  DD_BENCH_TIMEOUT_MS            dynamic stage timeout (default 15000)");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    match bench_arg_action(std::env::args().skip(1))? {
+        BenchArgAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        BenchArgAction::Run => {}
+    }
+
     let configs = [
         BenchConfig {
             name: "single-isolate",
