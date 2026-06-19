@@ -5,12 +5,32 @@ import { fileURLToPath } from "node:url";
 import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
 import { createWorkerTestRuntime } from "./vitest.js";
 
-const DEFAULT_MOUNT = "/__dd";
+const DEFAULT_MOUNT = "/";
 const DEFAULT_SOURCE_CONFIG_FILE = "dd.json";
 const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
 const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
 const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
 const DEFAULT_WORKER_NAME = "dev-worker";
+const VITE_BYPASS_PREFIXES = [
+  "/@vite",
+  "/@id/",
+  "/@fs/",
+  "/@react-refresh",
+  "/node_modules/",
+  "/.vite/",
+  "/src/",
+];
+const VITE_BYPASS_QUERY_KEYS = new Set([
+  "direct",
+  "import",
+  "inline",
+  "raw",
+  "sharedworker",
+  "url",
+  "used",
+  "worker",
+]);
+const VITE_BYPASS_FETCH_DESTINATIONS = new Set(["script", "style"]);
 
 export function ddEnvironment(options = {}) {
   const environmentOptions = options.viteEnvironment?.options ?? options.environmentOptions ?? {};
@@ -169,6 +189,10 @@ export function ddVitePlugin(options = {}) {
       viteServer.middlewares.use(async (req, res, next) => {
         try {
           const originalUrl = req.url ?? "/";
+          if (shouldBypassViteRequest(req, originalUrl, mount, resolvedConfig?.base)) {
+            next();
+            return;
+          }
           if (!matchesMount(originalUrl, mount)) {
             next();
             return;
@@ -290,6 +314,72 @@ function stripMount(url, mount) {
   }
   const stripped = url.slice(mount.length);
   return stripped.length === 0 ? "/" : stripped;
+}
+
+function shouldBypassViteRequest(req, originalUrl, mount, viteBase) {
+  if (mount !== "/") {
+    return false;
+  }
+  if (headerValue(req.headers.upgrade)) {
+    return true;
+  }
+
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    return false;
+  }
+
+  const url = new URL(originalUrl, "http://dd-vite.local");
+  if (candidatePathnames(url.pathname, viteBase).some(isViteBypassPath)) {
+    return true;
+  }
+  for (const key of VITE_BYPASS_QUERY_KEYS) {
+    if (url.searchParams.has(key)) {
+      return true;
+    }
+  }
+
+  const fetchDestination = headerValue(req.headers["sec-fetch-dest"]).toLowerCase();
+  return VITE_BYPASS_FETCH_DESTINATIONS.has(fetchDestination);
+}
+
+function candidatePathnames(pathname, viteBase) {
+  const paths = [pathname];
+  const base = normalizeViteBase(viteBase);
+  if (base !== "/" && (pathname === base.slice(0, -1) || pathname.startsWith(base))) {
+    paths.push(`/${pathname.slice(base.length)}`);
+  }
+  return paths;
+}
+
+function isViteBypassPath(pathname) {
+  return VITE_BYPASS_PREFIXES.some((prefix) => {
+    if (prefix.endsWith("/")) {
+      return pathname.startsWith(prefix);
+    }
+    return pathname === prefix || pathname.startsWith(`${prefix}/`);
+  });
+}
+
+function normalizeViteBase(value) {
+  if (typeof value !== "string" || value.length === 0 || value === "./") {
+    return "/";
+  }
+  let base = value;
+  try {
+    base = new URL(value).pathname;
+  } catch {
+    // Vite base is commonly a path. Keep it as-is when it is not an absolute URL.
+  }
+  const normalized = normalizeMount(base);
+  return normalized === "/" ? "/" : `${normalized}/`;
+}
+
+function headerValue(value) {
+  if (Array.isArray(value)) {
+    return value[0] ?? "";
+  }
+  return value ?? "";
 }
 
 function normalizeFile(value) {

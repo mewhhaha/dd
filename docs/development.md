@@ -104,9 +104,7 @@ import dd from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    dd({
-      mount: "/__dd",
-    }),
+    dd(),
   ],
 });
 ```
@@ -117,9 +115,12 @@ the plugin looks for `dd.json` in the nearest package root and uses that file
 for the worker name, source `entrypoint`, and deploy `config`. Inline plugin
 options override `dd.json`.
 
-The plugin also registers a Vite Environment API environment named `dd`, backed
-by Vite's fetchable dev environment API. Framework code can dispatch a `Request`
-to that environment while the worker still runs in the native `dd` runtime.
+By default, app requests to the Vite dev server hit the worker at the root, so
+`localhost:5173/anything` behaves like the eventual deployed app. Vite's own
+HMR, module, and source requests bypass the worker. The plugin also registers a
+Vite Environment API environment named `dd`, backed by Vite's fetchable dev
+environment API. Framework code can dispatch a `Request` to that environment
+while the worker still runs in the native `dd` runtime.
 During Vite hot updates, the plugin leaves Vite's normal browser and framework
 HMR path alone, discards the deployed worker, and lazily rebuilds it on the next
 worker request.
@@ -136,7 +137,6 @@ export default defineConfig({
   plugins: [
     ddWorker({
       viteEnvironment: { name: "ssr" },
-      mount: "/__dd",
     }),
     reactRouter(),
   ],

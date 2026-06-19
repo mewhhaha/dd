@@ -3,6 +3,7 @@ store/
 dd-kv.db
 dd-kv.db-wal
 node_modules/
+**/node_modules/
 dist/
 tmp/
 packages/dd-runtime-*/bin/dd_dev_runtime

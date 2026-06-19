@@ -35,17 +35,16 @@ import dd from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    dd({
-      mount: "/__dd",
-    }),
+    dd(),
   ],
 });
 ```
 
-Requests to `/__dd/*` on the Vite dev server are invoked through the native
-runtime. Vite and framework HMR continue to flow normally; on hot updates the
-plugin discards the deployed worker and lazily rebuilds it on the next worker
-request.
+App requests to the Vite dev server are invoked through the native runtime by
+default, so `localhost:5173/anything` behaves like the eventual deployed worker.
+Vite's own HMR, module, and source requests bypass the worker so the dev client
+keeps working. On hot updates the plugin discards the deployed worker and lazily
+rebuilds it on the next worker request.
 
 The default export is the Vite plugin factory, so you can name it whatever fits
 your config. The named `ddVitePlugin` export remains available. If the package
@@ -69,7 +68,6 @@ export default defineConfig({
   plugins: [
     ddWorker({
       viteEnvironment: { name: "ssr" },
-      mount: "/__dd",
     }),
     reactRouter(),
   ],

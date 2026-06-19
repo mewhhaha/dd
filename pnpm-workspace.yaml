@@ -1,0 +1,6 @@
+packages:
+  - "packages/*"
+  - "examples/*"
+
+overrides:
+  nanoid: "3.3.11"
