@@ -54,29 +54,26 @@ entrypoint, and deploy config. Inline plugin options override values from
 
 The plugin also registers a Vite Environment API environment named `dd`, backed
 by `createFetchableDevEnvironment`, for framework code that wants to dispatch
-`Request` objects directly.
-
-Frameworks that own an SSR environment can bind the worker to that environment
-name, similar to Cloudflare's Vite plugin shape:
+`Request` objects directly. Normal applications should not need to configure
+this environment; `dd()` at the root-mounted default is the path that keeps
+development requests shaped like deployed worker requests.
 
 ```js
-import { reactRouter } from "@react-router/dev/vite";
 import { defineConfig } from "vite";
-import ddWorker from "@dd/vite";
+import dd from "@dd/vite";
 
 export default defineConfig({
   plugins: [
-    ddWorker({
-      viteEnvironment: { name: "ssr" },
-    }),
-    reactRouter(),
+    dd(),
   ],
 });
 ```
 
-This is still a native-runtime deploy/invoke loop, not a full Vite ModuleRunner
-inside the isolate. React Router and RSC integrations that require in-runtime
-module evaluation may need a dedicated runner transport in a follow-up.
+Advanced integrations can rename the registered Vite environment with
+`environmentName` or `viteEnvironment.name`, and can set `mount` to place the
+worker behind a subpath. Those options are intentionally unnecessary for the
+workspace examples: app traffic goes through dd, while Vite-owned module, HMR,
+and source requests bypass the worker.
 
 ## Build output
 

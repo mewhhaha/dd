@@ -1,4 +1,4 @@
-import type { EnvironmentOptions, Plugin, UserConfig } from "vite";
+import type { EnvironmentOptions, InlineConfig, Plugin } from "vite";
 
 export interface DdRuntimeOptions {
   binary?: string;
@@ -9,7 +9,7 @@ export interface DdRuntimeOptions {
 }
 
 export interface DdWorkerBundleOptions {
-  viteConfig?: UserConfig;
+  viteConfig?: InlineConfig;
   target?: string;
   sourcemap?: boolean | "inline" | "hidden";
   minify?: boolean;

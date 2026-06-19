@@ -1357,9 +1357,9 @@
           }
           if (streamResponse) {
             const emitted = await emitResponseChunk(chunk);
-            bodyBytes.push(...emitted);
+            appendBytes(bodyBytes, emitted);
           } else {
-            bodyBytes.push(...chunk);
+            appendBytes(bodyBytes, chunk);
           }
         }
       }

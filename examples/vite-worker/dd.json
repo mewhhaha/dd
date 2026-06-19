@@ -1,7 +1,0 @@
-{
-  "name": "vite-worker",
-  "entrypoint": "src/worker.ts",
-  "config": {
-    "public": true
-  }
-}

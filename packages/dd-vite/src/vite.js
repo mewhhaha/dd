@@ -1,5 +1,5 @@
 import { createFetchableDevEnvironment, mergeConfig } from "vite";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
@@ -13,13 +13,17 @@ const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
 const DEFAULT_ASSET_HEADERS_FILE = "_headers";
 const DEFAULT_WORKER_NAME = "dev-worker";
 const FINGERPRINTED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const DD_VITE_BYPASS_HEADER = "x-dd-vite-bypass";
+const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
 const VITE_BYPASS_PREFIXES = [
   "/@vite",
   "/@id/",
   "/@fs/",
   "/@react-refresh",
+  "/__manifest",
   "/node_modules/",
   "/.vite/",
+  "/app/",
   "/src/",
 ];
 const VITE_BYPASS_QUERY_KEYS = new Set([
@@ -162,7 +166,7 @@ export function ddVitePlugin(options = {}) {
 
   return {
     name: "dd-vite",
-    enforce: "post",
+    enforce: "pre",
     async config(config) {
       if (options.environment === false) {
         return;
@@ -253,6 +257,9 @@ export function ddVitePlugin(options = {}) {
       await writeGeneratedAssetPolicy(outDir, resolvedConfig);
     },
     async closeBundle() {
+      if (deploymentConfigWritten && deploymentConfig.enabled) {
+        await writeGeneratedAssetPolicy(resolveViteOutDir(resolvedConfig), resolvedConfig);
+      }
       await runtime?.close();
     },
   };
@@ -276,7 +283,7 @@ async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
     method: req.method ?? "GET",
     headers,
   };
-  if (body.length > 0 && req.method !== "GET" && req.method !== "HEAD") {
+  if (body.length > 0 && !BODYLESS_METHODS.has(init.method.toUpperCase())) {
     init.body = body;
     init.duplex = "half";
   }
@@ -284,11 +291,17 @@ async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
 }
 
 async function writeNodeResponse(res, response) {
+  const body = Buffer.from(await response.arrayBuffer());
   res.statusCode = response.status;
   response.headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (lower === "content-length" || lower === "transfer-encoding") {
+      return;
+    }
     res.setHeader(name, value);
   });
-  res.end(Buffer.from(await response.arrayBuffer()));
+  res.setHeader("content-length", String(body.length));
+  res.end(body);
 }
 
 async function readIncomingBody(req) {
@@ -320,6 +333,9 @@ function stripMount(url, mount) {
 }
 
 function shouldBypassViteRequest(req, originalUrl, mount, viteBase) {
+  if (headerValue(req.headers[DD_VITE_BYPASS_HEADER]) === "1") {
+    return true;
+  }
   if (mount !== "/") {
     return false;
   }
@@ -454,8 +470,10 @@ async function writeGeneratedAssetPolicy(outDir, config) {
     config?.build?.assetsDir ?? "assets",
     "build.assetsDir",
   );
-  const assetPath = assetsDir === "." ? "/*" : `/${assetsDir}/*`;
-  const rule = `${assetPath}\n  Cache-Control: ${FINGERPRINTED_ASSET_CACHE_CONTROL}\n`;
+  const assetPaths = new Set(await findGeneratedAssetPaths(outDir));
+  if (assetsDir === "." || (await directoryExists(join(outDir, assetsDir)))) {
+    assetPaths.add(assetsDir === "." ? "/*" : `/${assetsDir}/*`);
+  }
   const headersPath = join(outDir, DEFAULT_ASSET_HEADERS_FILE);
   let existing = "";
   try {
@@ -466,7 +484,12 @@ async function writeGeneratedAssetPolicy(outDir, config) {
     }
   }
 
-  if (hasHeaderPathRule(existing, assetPath)) {
+  const rules = [...assetPaths]
+    .sort()
+    .filter((assetPath) => !hasHeaderPathRule(existing, assetPath))
+    .map((assetPath) => `${assetPath}\n  Cache-Control: ${FINGERPRINTED_ASSET_CACHE_CONTROL}\n`);
+
+  if (rules.length === 0) {
     return;
   }
 
@@ -474,8 +497,44 @@ async function writeGeneratedAssetPolicy(outDir, config) {
   await writeOutputFile(
     outDir,
     DEFAULT_ASSET_HEADERS_FILE,
-    prefix.length > 0 ? `${prefix}\n\n${rule}` : rule,
+    prefix.length > 0 ? `${prefix}\n\n${rules.join("\n")}` : rules.join("\n"),
   );
+}
+
+async function findGeneratedAssetPaths(outDir, relativeDir = "") {
+  let entries;
+  try {
+    entries = await readdir(join(outDir, relativeDir), { withFileTypes: true });
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return [];
+    }
+    throw error;
+  }
+
+  const paths = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const child = relativeDir.length > 0 ? `${relativeDir}/${entry.name}` : entry.name;
+    if (entry.name === "assets") {
+      paths.push(`/${child}/*`);
+    }
+    paths.push(...(await findGeneratedAssetPaths(outDir, child)));
+  }
+  return paths;
+}
+
+async function directoryExists(path) {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function hasHeaderPathRule(contents, pathRule) {

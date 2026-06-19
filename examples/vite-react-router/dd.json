@@ -1,0 +1,13 @@
+{
+  "name": "vite-react-router",
+  "entrypoint": "src/worker.ts",
+  "config": {
+    "public": true,
+    "bindings": [
+      {
+        "type": "memory",
+        "binding": "EXAMPLE_MEMORY"
+      }
+    ]
+  }
+}

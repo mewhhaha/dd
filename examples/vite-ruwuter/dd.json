@@ -1,0 +1,13 @@
+{
+  "name": "vite-ruwuter",
+  "entrypoint": "src/worker.tsx",
+  "config": {
+    "public": true,
+    "bindings": [
+      {
+        "type": "memory",
+        "binding": "EXAMPLE_MEMORY"
+      }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "paths": {
+      "@react-router/dev/config/default-rsc-entries/entry.client": [
+        "./app/entry.client.tsx"
+      ],
+      "@react-router/dev/config/default-rsc-entries/entry.rsc": [
+        "./app/default-rsc-entry.d.ts"
+      ]
+    },
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["vite/client", "@vitejs/plugin-rsc/types", "@react-router/dev/rsc-types"]
+  },
+  "include": ["app", "src", "react-router.config.ts", "vite.config.ts"]
+}

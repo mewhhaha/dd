@@ -301,6 +301,12 @@ globalThis.__dd_execute_worker = (payload) => {
     return new TextEncoder().encode(String(value));
   };
 
+  const appendBytes = (target, bytes) => {
+    for (let i = 0; i < bytes.length; i += 1) {
+      target.push(bytes[i]);
+    }
+  };
+
   const createRequestBodyStream = () => {
     let released = false;
     let done = false;

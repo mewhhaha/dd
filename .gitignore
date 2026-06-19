@@ -1,4 +1,5 @@
 target
+.agents
 store/
 dd-kv.db
 dd-kv.db-wal
@@ -6,6 +7,8 @@ node_modules/
 **/node_modules/
 dist/
 **/dist/
+.react-router/
+**/.react-router/
 tmp/
 packages/dd-runtime-*/bin/dd_dev_runtime
 packages/dd-runtime-*/bin/dd_dev_runtime.exe

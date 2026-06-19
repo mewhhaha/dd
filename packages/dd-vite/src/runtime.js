@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_WORKER_NAME = "test-worker";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
+const BODYLESS_RESPONSE_STATUSES = new Set([204, 205, 304]);
 const require = createRequire(import.meta.url);
 
 export function createDdRuntime(options = {}) {
@@ -67,7 +68,10 @@ export class DdRuntimeClient {
       headers: [...request.headers.entries()],
       body_base64,
     });
-    return new Response(Buffer.from(result.body_base64, "base64"), {
+    const body = BODYLESS_RESPONSE_STATUSES.has(result.status)
+      ? undefined
+      : Buffer.from(result.body_base64, "base64");
+    return new Response(body, {
       status: result.status,
       headers: result.headers,
     });
@@ -203,6 +207,10 @@ export class DdRuntimeClient {
   }
 
   #handleLine(line) {
+    if (!isRuntimeProtocolLine(line)) {
+      this.#stderr = `${this.#stderr}${line}\n`.slice(-16_384);
+      return;
+    }
     let message;
     try {
       message = JSON.parse(line);
@@ -234,6 +242,10 @@ export class DdRuntimeClient {
   }
 }
 
+function isRuntimeProtocolLine(line) {
+  return line.startsWith('{"id":');
+}
+
 export async function bundleWorkerEntry(entry, options = {}) {
   const { build, mergeConfig } = await import("vite");
   const entryPath = normalizePath(entry);
@@ -241,6 +253,10 @@ export async function bundleWorkerEntry(entry, options = {}) {
     configFile: false,
     envFile: true,
     logLevel: options.logLevel ?? "warn",
+    mode: "production",
+    esbuild: {
+      jsxDev: false,
+    },
     ssr: {
       noExternal: true,
     },

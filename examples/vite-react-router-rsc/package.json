@@ -1,0 +1,28 @@
+{
+  "name": "dd-vite-react-router-rsc-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json",
+    "smoke": "node smoke.mjs"
+  },
+  "dependencies": {
+    "@dd/vite": "workspace:*",
+    "@react-router/dev": "^8.0.1",
+    "@vitejs/plugin-rsc": "0.5.27",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router": "^8.0.1",
+    "react-server-dom-webpack": "^19.2.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "tailwindcss": "^4.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0"
+  }
+}
