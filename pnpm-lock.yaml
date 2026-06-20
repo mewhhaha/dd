@@ -35,6 +35,9 @@ importers:
       '@mewhhaha/vite-plugin-dd':
         specifier: workspace:*
         version: link:../../packages/dd-vite
+      fixi-js:
+        specifier: ^0.9.4
+        version: 0.9.4
       hono:
         specifier: ^4.12.26
         version: 4.12.26
@@ -79,6 +82,12 @@ importers:
       '@types/react-dom':
         specifier: ^19.2.3
         version: 19.2.3(@types/react@19.2.17)
+      '@vitest/browser-playwright':
+        specifier: ^4.1.9
+        version: 4.1.9(playwright@1.61.0)(vite@8.0.16(@types/node@25.9.3)(jiti@2.7.0)(terser@5.48.0))(vitest@4.1.9)
+      playwright:
+        specifier: ^1.61.0
+        version: 1.61.0
       tailwindcss:
         specifier: ^4.3.1
         version: 4.3.1
@@ -88,6 +97,9 @@ importers:
       vite:
         specifier: ^8.0.0
         version: 8.0.16(@types/node@25.9.3)(jiti@2.7.0)(terser@5.48.0)
+      vitest:
+        specifier: ^4.1.9
+        version: 4.1.9(@types/node@25.9.3)(@vitest/browser-playwright@4.1.9)(vite@8.0.16(@types/node@25.9.3)(jiti@2.7.0)(terser@5.48.0))
 
   examples/vite-react-router-rsc:
     dependencies:
@@ -1022,6 +1034,9 @@ packages:
     peerDependenciesMeta:
       picomatch:
         optional: true
+
+  fixi-js@0.9.4:
+    resolution: {integrity: sha512-ruUKWlM+t6k7YvoVO67z/1jMw04Q6rJCEBeZJPeFzt7U/pXz3S4bp+qxll+nwpOPN/f+pyTdLU70Ic5G+gyk1A==}
 
   fsevents@2.3.2:
     resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
@@ -2472,6 +2487,8 @@ snapshots:
   fdir@6.5.0(picomatch@4.0.4):
     optionalDependencies:
       picomatch: 4.0.4
+
+  fixi-js@0.9.4: {}
 
   fsevents@2.3.2:
     optional: true

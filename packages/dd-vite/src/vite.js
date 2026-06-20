@@ -43,7 +43,6 @@ const VITE_BYPASS_PREFIXES = [
   "/@id/",
   "/@fs/",
   "/@react-refresh",
-  "/__manifest",
   "/__vitest__/",
   "/__vitest_attachment__",
   "/__vitest_browser__/",

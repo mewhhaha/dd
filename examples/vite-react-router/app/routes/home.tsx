@@ -1,4 +1,11 @@
-import { Form, Link, redirect, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
+import {
+  Link,
+  redirect,
+  useFetcher,
+  type ActionFunctionArgs,
+  type LoaderFunctionArgs,
+} from "react-router";
+import { currentRoutePath, isReactRouterDataRequest } from "../action-redirect";
 import { getDdRequestContext } from "../dd-context";
 
 export function meta() {
@@ -37,13 +44,19 @@ export async function action({ context, request }: ActionFunctionArgs) {
     );
   }
 
-  const redirectTo = String(formData.get("redirectTo") ?? new URL(request.url).pathname);
+  if (isReactRouterDataRequest(request)) {
+    return { ok: true };
+  }
+
+  const redirectTo = String(formData.get("redirectTo") ?? currentRoutePath(request));
   return redirect(redirectTo);
 }
 
 type LoaderData = Awaited<ReturnType<typeof loader>>;
 
 export default function Home({ loaderData }: { loaderData: LoaderData }) {
+  const cartFetcher = useFetcher();
+
   return (
     <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_20rem]" data-route="home">
       <div className="grid min-w-0 gap-8">
@@ -125,17 +138,18 @@ export default function Home({ loaderData }: { loaderData: LoaderData }) {
                     <p className="text-base/7 font-medium tabular-nums text-neutral-950 sm:text-sm/6">
                       {product.price}
                     </p>
-                    <Form action="/?index" method="post">
+                    <cartFetcher.Form action="/?index" method="post">
                       <input name="intent" type="hidden" value="add-to-cart" />
                       <input name="slug" type="hidden" value={product.slug} />
                       <input name="quantity" type="hidden" value="1" />
                       <button
+                        data-testid={`home-add-${product.slug}`}
                         className="rounded-md px-3 py-2 text-sm/6 font-medium text-neutral-700 ring-1 ring-neutral-950/10 hover:bg-neutral-950/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-600"
                         type="submit"
                       >
                         Add
                       </button>
-                    </Form>
+                    </cartFetcher.Form>
                   </div>
                 </div>
               </article>
@@ -152,9 +166,11 @@ export default function Home({ loaderData }: { loaderData: LoaderData }) {
                 Cart
               </h2>
               <p className="text-base/7 text-neutral-600 sm:text-sm/6">
-                {loaderData.cart.itemCount === 0
-                  ? "No prints selected."
-                  : `${loaderData.cart.itemCount} item${loaderData.cart.itemCount === 1 ? "" : "s"} in memory.`}
+                <span data-testid="home-cart-count">
+                  {loaderData.cart.itemCount === 0
+                    ? "No prints selected."
+                    : `${loaderData.cart.itemCount} item${loaderData.cart.itemCount === 1 ? "" : "s"} in memory.`}
+                </span>
               </p>
             </div>
             <p className="text-base/7 font-medium tabular-nums text-neutral-950 sm:text-sm/6">
@@ -192,7 +208,7 @@ export default function Home({ loaderData }: { loaderData: LoaderData }) {
             )}
           </div>
 
-          <Form action="/?index" className="grid gap-3" method="post">
+          <cartFetcher.Form action="/?index" className="grid gap-3" method="post">
             <input name="intent" type="hidden" value="checkout" />
             <input
               aria-label="Email"
@@ -208,8 +224,8 @@ export default function Home({ loaderData }: { loaderData: LoaderData }) {
             >
               Checkout
             </button>
-          </Form>
-          <Form action="/?index" method="post">
+          </cartFetcher.Form>
+          <cartFetcher.Form action="/?index" method="post">
             <input name="intent" type="hidden" value="clear-cart" />
             <button
               className="rounded-md px-3 py-2 text-sm/6 font-medium text-neutral-700 ring-1 ring-neutral-950/10 hover:bg-neutral-950/5 disabled:cursor-not-allowed disabled:text-neutral-400"
@@ -218,7 +234,7 @@ export default function Home({ loaderData }: { loaderData: LoaderData }) {
             >
               Clear cart
             </button>
-          </Form>
+          </cartFetcher.Form>
         </section>
 
         <section className="grid gap-3 border-t border-neutral-950/10 pt-5">

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@mewhhaha/vite-plugin-dd": "workspace:*",
+    "fixi-js": "^0.9.4",
     "hono": "^4.12.26"
   },
   "devDependencies": {

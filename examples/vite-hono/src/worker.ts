@@ -181,9 +181,41 @@ const styles = `
   img { max-width: 100%; }
   h1, h2, h3, p, dl, dd, ul { margin: 0; }
 
+  @view-transition {
+    navigation: auto;
+  }
+
+  ::view-transition-old(root) {
+    animation: dd-page-out 160ms ease both;
+  }
+
+  ::view-transition-new(root) {
+    animation: dd-page-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  ::view-transition-group(*) {
+    animation-duration: 520ms;
+    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  ::view-transition-image-pair(*) {
+    isolation: auto;
+  }
+
+  @keyframes dd-page-out {
+    from { opacity: 1; }
+    to { opacity: 0.72; }
+  }
+
+  @keyframes dd-page-in {
+    from { opacity: 0; transform: translateY(0.75rem); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
   .app {
     background: #fafafa;
     display: flex;
+    isolation: isolate;
     flex-direction: column;
     min-height: 100dvh;
   }
@@ -363,6 +395,11 @@ const styles = `
   }
 
   .product-card { overflow: hidden; }
+  .product-image-link {
+    display: block;
+    overflow: hidden;
+  }
+
   .product-card img, .image-frame img {
     aspect-ratio: 4 / 3;
     display: block;
@@ -375,6 +412,14 @@ const styles = `
   .image-frame { min-width: 0; overflow: hidden; }
   .image-frame img { aspect-ratio: 5 / 4; }
   .product-body, .cart-panel, .related-card { gap: 1rem; padding: 1rem; }
+
+  .transition-image, .transition-title, .transition-price {
+    view-transition-name: var(--view-transition-name);
+  }
+
+  .transition-image {
+    contain: layout;
+  }
 
   .badge {
     background: #fef3c7;
@@ -525,6 +570,14 @@ const styles = `
     .detail-grid { grid-template-columns: minmax(0, 1fr) 24rem; }
     .detail-info { align-content: start; }
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    ::view-transition-old(root),
+    ::view-transition-new(root),
+    ::view-transition-group(*) {
+      animation-duration: 1ms;
+    }
+  }
 `;
 
 const app = new Hono<HonoEnv>();
@@ -557,6 +610,10 @@ app.get("/", async (context) => {
 app.post("/", async (context) => {
   const runtime = context.get("runtime");
   await handleStorefrontAction(context.env, runtime.sessionId, await context.req.parseBody());
+  if (isFixiRequest(context.req.raw)) {
+    const data = await loadStorefront(context.env, runtime, "/");
+    return context.html(renderCartPanel(data.cart, data.recentOrders, "/", false));
+  }
   return context.redirect("/", 303);
 });
 
@@ -573,13 +630,18 @@ app.get("/notes/:slug", async (context) => {
 app.post("/notes/:slug", async (context) => {
   const runtime = context.get("runtime");
   const slug = context.req.param("slug");
+  const path = pathFromContext(context);
   await handleStorefrontAction(
     context.env,
     runtime.sessionId,
     await context.req.parseBody(),
     slug,
   );
-  return context.redirect(`/notes/${encodeURIComponent(slug)}`, 303);
+  if (isFixiRequest(context.req.raw)) {
+    const data = await loadStorefront(context.env, runtime, path);
+    return context.html(renderCartPanel(data.cart, data.recentOrders, path, true));
+  }
+  return context.redirect(path, 303);
 });
 
 export default {
@@ -625,7 +687,14 @@ function renderHome(data: StorefrontData): string {
                   handler.
                 </p>
               </div>
-              <a class="secondary-button" href="/notes/runtime">Featured print</a>
+              <a
+                class="secondary-button"
+                data-product-slug="runtime"
+                data-transition-link
+                href="/notes/runtime"
+              >
+                Featured print
+              </a>
             </div>
             <div class="product-grid">
               ${data.products.map((product) => renderProductCard(product, "/", `/notes/${product.slug}`)).join("")}
@@ -647,29 +716,48 @@ function renderProduct(data: ProductData): string {
       <div class="detail-stack" data-route="project" data-path="${escapeAttribute(data.path)}">
         <section class="detail-grid">
           <div class="image-frame">
-            <img alt="" src="${escapeAttribute(data.product.imageUrl)}">
+            <img
+              alt=""
+              class="transition-image"
+              data-product-image="${escapeAttribute(data.product.slug)}"
+              src="${escapeAttribute(data.product.imageUrl)}"
+              ${transitionStyleAttribute(data.product.slug, "image")}
+            >
           </div>
           <div class="detail-info">
             <div class="heading-group">
               <p class="eyebrow">${escapeHtml(data.product.category)}</p>
-              <h1>${escapeHtml(data.product.name)}</h1>
+              <h1 class="transition-title" ${transitionStyleAttribute(data.product.slug, "title")}>
+                ${escapeHtml(data.product.name)}
+              </h1>
               <p class="summary">${escapeHtml(data.product.story)}</p>
             </div>
             <div class="facts">
-              ${renderFact("Price", data.product.price)}
+              ${renderFact("Price", data.product.price, undefined, {
+                slug: data.product.slug,
+                type: "price",
+              })}
               ${renderFact("Stock", `${data.product.stock} prints`)}
               ${renderFact("Route handler", String(data.runtime.stmCount), "data-stm-count")}
               ${renderFact("Timer tick", data.runtime.timerTick)}
             </div>
 
-            <form class="quantity-form" method="post" action="${escapeAttribute(data.path)}">
+            <form
+              class="quantity-form"
+              method="post"
+              action="${escapeAttribute(data.path)}"
+              fx-action="${escapeAttribute(data.path)}"
+              fx-method="post"
+              fx-target="#storefront-cart"
+              fx-swap="outerHTML"
+            >
               <input name="intent" type="hidden" value="add-to-cart">
               <input name="slug" type="hidden" value="${escapeAttribute(data.product.slug)}">
               <label class="label">
                 Quantity
                 <input aria-label="Quantity" max="9" min="1" name="quantity" type="number" value="1">
               </label>
-              <button class="primary-button" type="submit">Add to cart</button>
+              <button class="primary-button" data-testid="detail-add-to-cart" type="submit">Add to cart</button>
             </form>
 
             <p class="summary">
@@ -693,7 +781,12 @@ function renderProduct(data: ProductData): string {
           <h2>More from the catalog</h2>
           <div class="related-grid">
             ${data.relatedProducts.map((product) => `
-              <a class="related-card" href="/notes/${escapeAttribute(product.slug)}">
+              <a
+                class="related-card"
+                data-product-slug="${escapeAttribute(product.slug)}"
+                data-transition-link
+                href="/notes/${escapeAttribute(product.slug)}"
+              >
                 <span class="label">${escapeHtml(product.name)}</span>
                 <span class="muted tabular">${escapeHtml(product.price)}</span>
               </a>
@@ -712,23 +805,55 @@ function renderProductCard(
 ): string {
   return `
     <article class="product-card">
-      <img alt="" src="${escapeAttribute(product.imageUrl)}">
+      <a
+        class="product-image-link"
+        data-product-slug="${escapeAttribute(product.slug)}"
+        data-transition-link
+        href="${escapeAttribute(detailHref)}"
+        aria-label="${escapeAttribute(product.name)}"
+      >
+        <img
+          alt=""
+          class="transition-image"
+          data-product-image="${escapeAttribute(product.slug)}"
+          src="${escapeAttribute(product.imageUrl)}"
+          ${transitionStyleAttribute(product.slug, "image")}
+        >
+      </a>
       <div class="product-body">
         <div class="section">
           <div class="product-meta">
             <p class="eyebrow">${escapeHtml(product.category)}</p>
             <span class="badge">${escapeHtml(product.badge)}</span>
           </div>
-          <h3><a href="${escapeAttribute(detailHref)}">${escapeHtml(product.name)}</a></h3>
+          <h3 class="transition-title" ${transitionStyleAttribute(product.slug, "title")}>
+            <a
+              data-product-slug="${escapeAttribute(product.slug)}"
+              data-transition-link
+              href="${escapeAttribute(detailHref)}"
+            >
+              ${escapeHtml(product.name)}
+            </a>
+          </h3>
           <p class="summary">${escapeHtml(product.description)}</p>
         </div>
         <div class="price-row">
-          <p class="label tabular">${escapeHtml(product.price)}</p>
-          <form class="add-form" method="post" action="${escapeAttribute(action)}">
+          <p class="label tabular transition-price" ${transitionStyleAttribute(product.slug, "price")}>
+            ${escapeHtml(product.price)}
+          </p>
+          <form
+            class="add-form"
+            method="post"
+            action="${escapeAttribute(action)}"
+            fx-action="${escapeAttribute(action)}"
+            fx-method="post"
+            fx-target="#storefront-cart"
+            fx-swap="outerHTML"
+          >
             <input name="intent" type="hidden" value="add-to-cart">
             <input name="slug" type="hidden" value="${escapeAttribute(product.slug)}">
             <input name="quantity" type="hidden" value="1">
-            <button class="secondary-button" type="submit">Add</button>
+            <button class="secondary-button" data-testid="home-add-${escapeAttribute(product.slug)}" type="submit">Add</button>
           </form>
         </div>
       </div>
@@ -746,11 +871,11 @@ function renderCartPanel(
     ? "No prints selected."
     : `${cart.itemCount} item${cart.itemCount === 1 ? "" : "s"} in memory.`;
   return `
-    <aside class="cart-panel" aria-labelledby="cart-heading">
+    <aside class="cart-panel" id="storefront-cart" aria-labelledby="cart-heading">
       <div class="cart-heading">
         <div class="section">
           <h2 id="cart-heading">Cart</h2>
-          <p class="muted">${escapeHtml(itemLabel)}</p>
+          <p class="muted" data-testid="cart-count">${escapeHtml(itemLabel)}</p>
         </div>
         <p class="label tabular">${escapeHtml(cart.subtotal)}</p>
       </div>
@@ -771,7 +896,15 @@ function renderCartPanel(
           `).join("")}
       </div>
 
-      <form class="checkout-form" method="post" action="${escapeAttribute(action)}">
+      <form
+        class="checkout-form"
+        method="post"
+        action="${escapeAttribute(action)}"
+        fx-action="${escapeAttribute(action)}"
+        fx-method="post"
+        fx-target="#storefront-cart"
+        fx-swap="outerHTML"
+      >
         <input name="intent" type="hidden" value="checkout">
         <input aria-label="Email" name="email" placeholder="receipt@example.com" type="email">
         <button class="${compact ? "secondary-button" : "primary-button"}" ${cart.lines.length === 0 ? "disabled" : ""} type="submit">
@@ -780,7 +913,14 @@ function renderCartPanel(
       </form>
 
       ${compact ? "" : `
-        <form method="post" action="${escapeAttribute(action)}">
+        <form
+          method="post"
+          action="${escapeAttribute(action)}"
+          fx-action="${escapeAttribute(action)}"
+          fx-method="post"
+          fx-target="#storefront-cart"
+          fx-swap="outerHTML"
+        >
           <input name="intent" type="hidden" value="clear-cart">
           <button class="secondary-button" ${cart.lines.length === 0 ? "disabled" : ""} type="submit">
             Clear cart
@@ -802,12 +942,21 @@ function renderCartPanel(
   `;
 }
 
-function renderFact(label: string, value: string, dataAttribute?: string): string {
+function renderFact(
+  label: string,
+  value: string,
+  dataAttribute?: string,
+  transition?: { slug: string; type: "price" },
+): string {
   const attribute = dataAttribute ? ` ${dataAttribute}="${escapeAttribute(value)}"` : "";
+  const className = transition ? "label tabular transition-price" : "label tabular";
+  const transitionAttribute = transition
+    ? ` ${transitionStyleAttribute(transition.slug, transition.type)}`
+    : "";
   return `
     <div class="price-row">
       <p class="muted">${escapeHtml(label)}</p>
-      <p class="label tabular"${attribute}>${escapeHtml(value)}</p>
+      <p class="${className}"${attribute}${transitionAttribute}>${escapeHtml(value)}</p>
     </div>
   `;
 }
@@ -1220,6 +1369,10 @@ function pathFromContext(context: Context<HonoEnv>): string {
   return new URL(context.req.url).pathname;
 }
 
+function isFixiRequest(request: Request): boolean {
+  return request.headers.get("fx-request")?.toLowerCase() === "true";
+}
+
 function formField(
   formData: Record<string, FormDataEntryValue | FormDataEntryValue[]>,
   name: string,
@@ -1331,6 +1484,14 @@ function escapeHtml(value: unknown): string {
 
 function escapeAttribute(value: unknown): string {
   return escapeHtml(value);
+}
+
+function transitionStyleAttribute(slug: string, type: "image" | "title" | "price"): string {
+  return `style="--view-transition-name: ${transitionName(slug, type)}"`;
+}
+
+function transitionName(slug: string, type: "image" | "title" | "price"): string {
+  return `product-${type}-${slug.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
 }
 
 function productKey(slug: string): string {

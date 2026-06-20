@@ -31,6 +31,7 @@ try {
     headers: {
       "content-type": "application/x-www-form-urlencoded",
       cookie,
+      "fx-request": "true",
     },
     body: new URLSearchParams({
       intent: "add-to-cart",
@@ -40,8 +41,14 @@ try {
   });
   const cartText = await cartResponse.text();
   const normalizedCartText = stripRendererComments(cartText);
-  if (!normalizedCartText.includes("2 items in memory") || !cartText.includes("$128.00")) {
-    throw new Error(`Hono cart mutation did not persist through dd memory: ${cartText}`);
+  if (
+    cartResponse.redirected ||
+    !normalizedCartText.includes('id="storefront-cart"') ||
+    !normalizedCartText.includes("2 items in memory") ||
+    !cartText.includes("$128.00") ||
+    cartText.includes("<!doctype html>")
+  ) {
+    throw new Error(`Hono fixi cart mutation did not return a cart fragment: ${cartText}`);
   }
 
   const checkoutResponse = await fetch(`${base}/`, {
@@ -85,6 +92,9 @@ try {
   const viteClientText = await viteClientResponse.text();
   if (!viteClientText.includes("createHotContext") || viteClientText.includes("Edge Goods Hono")) {
     throw new Error("Vite client request did not bypass worker");
+  }
+  if (!moduleText.includes("fixi-js")) {
+    throw new Error(`Hono client module did not import fixi-js: ${moduleText}`);
   }
 
   await assertLiveSocket(base, "vite-hono");

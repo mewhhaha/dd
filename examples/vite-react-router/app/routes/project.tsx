@@ -1,10 +1,11 @@
 import {
   Link,
-  Form,
   redirect,
+  useFetcher,
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
+import { currentRoutePath, isReactRouterDataRequest } from "../action-redirect";
 import { getDdRequestContext } from "../dd-context";
 
 export function meta({ params }: { params: { slug?: string } }) {
@@ -38,7 +39,10 @@ export async function action({ context, params, request }: ActionFunctionArgs) {
       Number(formData.get("quantity") ?? 1),
     );
   }
-  return redirect(new URL(request.url).pathname);
+  if (isReactRouterDataRequest(request)) {
+    return { ok: true };
+  }
+  return redirect(currentRoutePath(request));
 }
 
 type LoaderData = Awaited<ReturnType<typeof loader>>;
@@ -51,6 +55,8 @@ export default function Project({
   params: { slug?: string };
 }) {
   const slug = params.slug ?? "unknown";
+  const cartFetcher = useFetcher();
+
   return (
     <div className="grid gap-8" data-route="project" data-path={`/projects/${slug}`}>
       <section className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_24rem]">
@@ -101,7 +107,7 @@ export default function Project({
             </div>
           </div>
 
-          <Form className="grid gap-3 sm:grid-cols-[7rem_1fr]" method="post">
+          <cartFetcher.Form className="grid gap-3 sm:grid-cols-[7rem_1fr]" method="post">
             <input name="intent" type="hidden" value="add-to-cart" />
             <input name="slug" type="hidden" value={loaderData.product.slug} />
             <label className="grid gap-1 text-base/7 font-medium text-neutral-950 sm:text-sm/6">
@@ -116,12 +122,13 @@ export default function Project({
               />
             </label>
             <button
+              data-testid="detail-add-to-cart"
               className="self-end rounded-md bg-emerald-700 px-3 py-2 text-sm/6 font-medium text-white ring-1 ring-emerald-700 hover:bg-emerald-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-600"
               type="submit"
             >
               Add to cart
             </button>
-          </Form>
+          </cartFetcher.Form>
 
           <p className="text-base/7 text-pretty text-neutral-600 sm:text-sm/6">
             dd worker <span className="font-medium text-neutral-950">{loaderData.workerName}</span>{" "}
@@ -147,7 +154,10 @@ export default function Project({
           <div className="flex items-start justify-between gap-4">
             <div>
               <h2 className="text-xl font-semibold tracking-tight text-neutral-950">Cart</h2>
-              <p className="text-base/7 text-neutral-600 sm:text-sm/6">
+              <p
+                className="text-base/7 text-neutral-600 sm:text-sm/6"
+                data-testid="detail-cart-count"
+              >
                 {loaderData.cart.itemCount} item{loaderData.cart.itemCount === 1 ? "" : "s"} selected.
               </p>
             </div>
@@ -155,7 +165,7 @@ export default function Project({
               {loaderData.cart.subtotal}
             </p>
           </div>
-          <Form className="grid gap-3" method="post">
+          <cartFetcher.Form className="grid gap-3" method="post">
             <input name="intent" type="hidden" value="checkout" />
             <input
               aria-label="Email"
@@ -171,7 +181,7 @@ export default function Project({
             >
               Checkout from detail
             </button>
-          </Form>
+          </cartFetcher.Form>
         </aside>
       </section>
 

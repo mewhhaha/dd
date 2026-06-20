@@ -12,6 +12,11 @@ The worker also binds `EXAMPLE_MEMORY` and increments an STM-backed request
 counter with `memory.atomic(...)`. App responses expose the current value in
 `x-dd-stm-count`, and the smoke test requires that value to advance.
 
+Storefront mutations use `fixi-js` attributes on normal HTML forms. Without
+JavaScript they still submit and redirect as plain forms; with fixi loaded from
+`src/client.ts`, Hono sees `FX-Request: true` and returns only the cart panel
+fragment for an in-place swap.
+
 Tailwind CSS is enabled through `@tailwindcss/vite`; `src/client.ts` imports
 `src/tailwind.css`, and the rendered worker HTML uses a Tailwind component
 class.
