@@ -483,6 +483,7 @@ impl ServerHarness {
                 config,
                 assets: Vec::new(),
                 asset_headers: None,
+                temporary: false,
             },
         )
         .await;

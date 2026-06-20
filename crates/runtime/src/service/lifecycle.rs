@@ -10,11 +10,27 @@ impl WorkerManager {
         assets: Vec<DeployAsset>,
         asset_headers: Option<String>,
         persist: bool,
+        temporary: bool,
+        expires_at_ms: Option<i64>,
+        enforce_temporary_transition: bool,
     ) -> Result<String> {
         let worker_name = worker_name.trim().to_string();
         if worker_name.is_empty() {
             return Err(PlatformError::bad_request("Worker name must not be empty"));
         }
+        if temporary
+            && enforce_temporary_transition
+            && self.current_worker_is_permanent(&worker_name)
+        {
+            return Err(PlatformError::conflict(
+                "cannot deploy a permanent worker as temporary; redeploy without --temporary or use a new worker name",
+            ));
+        }
+        let expires_at_ms = if temporary {
+            Some(expires_at_ms.unwrap_or(self.temporary_worker_expires_at_ms()?))
+        } else {
+            None
+        };
         let bindings = extract_bindings(&config)?;
         let compiled_assets = compile_asset_bundle(&assets, asset_headers.as_deref())?;
         self.validate_worker_cached(&source).await?;
@@ -87,6 +103,7 @@ impl WorkerManager {
                 &assets,
                 asset_headers.as_deref(),
                 &deployment_id,
+                expires_at_ms,
             )
             .await?;
         }
@@ -103,6 +120,7 @@ impl WorkerManager {
                     }
                 }),
                 is_public: config.public,
+                expires_at_ms,
                 snapshot,
                 snapshot_preloaded,
                 source: Arc::<str>::from(source.clone()),
@@ -135,8 +153,65 @@ impl WorkerManager {
         entry.current_generation = generation;
         entry.pools.insert(generation, pool);
         self.cleanup_drained_generations_for(&worker_name);
-        info!(worker = %worker_name, generation, deployment_id = %deployment_id, "deployed worker");
+        info!(
+            worker = %worker_name,
+            generation,
+            deployment_id = %deployment_id,
+            temporary = expires_at_ms.is_some(),
+            expires_at_ms,
+            "deployed worker"
+        );
         Ok(deployment_id)
+    }
+
+    fn current_worker_is_permanent(&self, worker_name: &str) -> bool {
+        self.workers
+            .get(worker_name)
+            .and_then(|entry| entry.pools.get(&entry.current_generation))
+            .is_some_and(|pool| pool.expires_at_ms.is_none())
+    }
+
+    fn temporary_worker_expires_at_ms(&self) -> Result<i64> {
+        let now_ms = epoch_ms_i64()?;
+        let ttl_ms = i64::try_from(self.config.temporary_worker_ttl.as_millis())
+            .map_err(|_| PlatformError::internal("temporary worker ttl is too large"))?;
+        now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| PlatformError::internal("temporary worker expiration overflow"))
+    }
+
+    pub(crate) async fn expire_temporary_workers(&mut self) {
+        let now_ms = match epoch_ms_i64() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                warn!(error = %error, "failed to read clock while expiring temporary workers");
+                return;
+            }
+        };
+        let expired = self
+            .workers
+            .iter()
+            .filter_map(|(worker_name, entry)| {
+                let pool = entry.pools.get(&entry.current_generation)?;
+                let expires_at_ms = pool.expires_at_ms?;
+                (expires_at_ms <= now_ms).then(|| worker_name.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for worker_name in expired {
+            self.retire_worker_completely_with_error(
+                &worker_name,
+                PlatformError::not_found("temporary worker expired"),
+            );
+            if let Err(error) = delete_worker_deployment(&self.storage, &worker_name).await {
+                warn!(
+                    worker = %worker_name,
+                    error = %error,
+                    "failed to remove expired worker deployment from local store"
+                );
+            }
+            info!(worker = %worker_name, "expired temporary worker");
+        }
     }
 
     pub(crate) async fn deploy_dynamic(
@@ -232,6 +307,7 @@ impl WorkerManager {
             deployment_id: deployment_id.clone(),
             internal_trace: None,
             is_public: false,
+            expires_at_ms: None,
             snapshot,
             snapshot_preloaded,
             source: Arc::<str>::from(source),
@@ -589,6 +665,17 @@ impl WorkerManager {
     }
 
     pub(crate) fn retire_worker_completely(&mut self, worker_name: &str) {
+        self.retire_worker_completely_with_error(
+            worker_name,
+            PlatformError::internal("dynamic worker was deleted"),
+        );
+    }
+
+    pub(crate) fn retire_worker_completely_with_error(
+        &mut self,
+        worker_name: &str,
+        error: PlatformError,
+    ) {
         let mut clear_request_ids = Vec::new();
         self.reap_owned_sessions(worker_name, None, None);
         if let Some(mut entry) = self.workers.remove(worker_name) {
@@ -597,9 +684,7 @@ impl WorkerManager {
                     let _ = isolate.sender.send(IsolateCommand::Shutdown);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
-                        let _ = pending
-                            .reply
-                            .send(Err(PlatformError::internal("dynamic worker was deleted")));
+                        let _ = pending.reply.send(Err(error.clone()));
                     }
                 }
             }
@@ -607,10 +692,7 @@ impl WorkerManager {
         for request_id in clear_request_ids {
             self.clear_revalidation_for_request(&request_id);
         }
-        self.fail_all_streams_for_worker(
-            worker_name,
-            PlatformError::internal("dynamic worker was deleted"),
-        );
+        self.fail_all_streams_for_worker(worker_name, error);
         self.dynamic_worker_handles
             .retain(|_, handle| handle.worker_name != worker_name);
         let existing_handles: HashSet<String> =

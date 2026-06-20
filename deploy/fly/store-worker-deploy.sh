@@ -66,15 +66,23 @@ trap cleanup EXIT
 
 updated_at_ms="$(date +%s%3N)"
 deployment_id="$(uuidgen)"
+temporary="$(printf '%s' "$packaged_payload" | jq -r '.temporary // false')"
+if [ "$temporary" = "true" ]; then
+  expires_at_ms="$((updated_at_ms + 3600000))"
+else
+  expires_at_ms="null"
+fi
 
 jq -n \
   --argjson payload "$packaged_payload" \
   --arg deployment_id "$deployment_id" \
   --argjson updated_at_ms "$updated_at_ms" \
+  --argjson expires_at_ms "$expires_at_ms" \
   '$payload + {
     deployment_id: $deployment_id,
-    updated_at_ms: $updated_at_ms
-  }' > "$temp_file"
+    updated_at_ms: $updated_at_ms,
+    expires_at_ms: $expires_at_ms
+  } | del(.temporary)' > "$temp_file"
 
 remote_path="/app/store/workers/${encoded_name}.${updated_at_ms}.${deployment_id}.json"
 echo "Uploading ${FILE} to ${APP}:${remote_path}"

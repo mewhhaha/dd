@@ -201,8 +201,14 @@ Package or deploy the generated config with:
 ```bash
 cargo run -p cli -- package-deploy-config dist/dd.deploy.json
 cargo run -p cli -- deploy-config dist/dd.deploy.json
+cargo run -p cli -- deploy-config dist/dd.deploy.json --temporary
 just fly-worker-deploy-config dist/dd.deploy.json
 ```
+
+`--temporary` keeps a worker deployed for one hour. Redeploying the same
+temporary worker with `--temporary` refreshes that hour, and a normal redeploy
+makes it permanent. A temporary deploy over an existing permanent worker is
+rejected.
 
 For CI, mint a scoped token once through the private control plane, then
 deploy through the public endpoint:

@@ -185,6 +185,7 @@ pub(super) struct WorkerPool {
     pub(super) deployment_id: String,
     pub(super) internal_trace: Option<InternalTraceDestination>,
     pub(super) is_public: bool,
+    pub(super) expires_at_ms: Option<i64>,
     pub(super) snapshot: &'static [u8],
     pub(super) snapshot_preloaded: bool,
     pub(super) source: Arc<str>,
@@ -405,6 +406,8 @@ pub(super) struct StoredWorkerDeployment {
     pub(super) asset_headers: Option<String>,
     pub(super) deployment_id: String,
     pub(super) updated_at_ms: i64,
+    #[serde(default)]
+    pub(super) expires_at_ms: Option<i64>,
 }
 
 #[derive(Serialize)]

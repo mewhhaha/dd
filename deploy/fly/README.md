@@ -70,8 +70,14 @@ local admin work:
 
 ```bash
 just fly-worker-deploy hello examples/hello.js --public
+just fly-worker-deploy preview examples/hello.js --public --temporary
 just fly-worker-deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
 ```
+
+Temporary workers expire one hour after deploy. Redeploying with `--temporary`
+refreshes the hour; redeploying without `--temporary` makes that worker
+permanent. Deploying `--temporary` over an existing permanent worker is
+rejected.
 
 Equivalent raw CLI:
 

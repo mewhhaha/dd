@@ -8,6 +8,7 @@ pub(super) async fn persist_worker_deployment(
     assets: &[DeployAsset],
     asset_headers: Option<&str>,
     deployment_id: &str,
+    expires_at_ms: Option<i64>,
 ) -> Result<()> {
     if !storage.worker_store_enabled {
         return Ok(());
@@ -32,6 +33,7 @@ pub(super) async fn persist_worker_deployment(
         asset_headers: asset_headers.map(str::to_string),
         deployment_id: deployment_id.to_string(),
         updated_at_ms: epoch_ms_i64()?,
+        expires_at_ms,
     };
     let body = crate::json::to_vec(&payload).map_err(|error| {
         PlatformError::internal(format!("failed to serialize worker deployment: {error}"))
@@ -50,6 +52,58 @@ pub(super) async fn persist_worker_deployment(
                 final_path.display()
             ))
         })?;
+    Ok(())
+}
+
+pub(super) async fn delete_worker_deployment(
+    storage: &RuntimeStorageConfig,
+    worker_name: &str,
+) -> Result<()> {
+    if !storage.worker_store_enabled {
+        return Ok(());
+    }
+
+    let workers_dir = storage.store_dir.join("workers");
+    let mut read_dir = match tokio::fs::read_dir(&workers_dir).await {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(PlatformError::internal(format!(
+                "failed to read worker store {}: {error}",
+                workers_dir.display()
+            )))
+        }
+    };
+
+    let encoded_name = encoded_worker_name(worker_name);
+    let exact_name = format!("{encoded_name}.json");
+    let timestamped_prefix = format!("{encoded_name}.");
+    while let Some(entry) = read_dir.next_entry().await.map_err(|error| {
+        PlatformError::internal(format!(
+            "failed to read worker store entry in {}: {error}",
+            workers_dir.display()
+        ))
+    })? {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name != exact_name && !file_name.starts_with(&timestamped_prefix) {
+            continue;
+        }
+
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(PlatformError::internal(format!(
+                    "failed to remove worker store file {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 

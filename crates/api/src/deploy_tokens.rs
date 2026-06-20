@@ -529,6 +529,7 @@ mod tests {
                 content_base64: "b2s=".to_string(),
             }],
             asset_headers: None,
+            temporary: false,
         };
         enforce_capabilities(&caps_for_worker("chat"), &request).expect("allowed");
     }
@@ -544,6 +545,7 @@ mod tests {
             },
             assets: Vec::new(),
             asset_headers: None,
+            temporary: false,
         };
         let error = enforce_capabilities(&caps_for_worker("chat"), &request).expect_err("reject");
         assert_eq!(error.kind(), common::ErrorKind::Forbidden);

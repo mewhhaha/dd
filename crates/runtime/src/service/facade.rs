@@ -24,6 +24,7 @@ pub struct RuntimeConfig {
     pub debug_code_generation: bool,
     pub kv_profile_enabled: bool,
     pub memory_profile_enabled: bool,
+    pub temporary_worker_ttl: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -51,6 +52,7 @@ impl Default for RuntimeConfig {
             debug_code_generation: false,
             kv_profile_enabled: false,
             memory_profile_enabled: false,
+            temporary_worker_ttl: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -93,6 +95,8 @@ pub struct RuntimeServiceConfig {
 pub struct WorkerStats {
     pub generation: u64,
     pub public: bool,
+    pub temporary: bool,
+    pub expires_at_ms: Option<i64>,
     pub queued: usize,
     pub busy: usize,
     pub inflight_total: usize,
@@ -402,8 +406,28 @@ impl RuntimeService {
             }
         }
 
+        let now_ms = epoch_ms_i64()?;
         let mut restored = 0usize;
         for (_worker_name, (stored, path)) in latest_by_worker {
+            if stored
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+            {
+                info!(
+                    worker = %stored.name,
+                    path = %path.display(),
+                    "skipping expired temporary worker from local store"
+                );
+                if let Err(error) = delete_worker_deployment(&self.storage, &stored.name).await {
+                    warn!(
+                        worker = %stored.name,
+                        error = %error,
+                        "failed to remove expired worker deployment from local store"
+                    );
+                }
+                continue;
+            }
+
             match self
                 .deploy_with_config_internal(
                     stored.name.clone(),
@@ -411,6 +435,9 @@ impl RuntimeService {
                     stored.config,
                     stored.assets,
                     stored.asset_headers,
+                    false,
+                    stored.expires_at_ms.is_some(),
+                    stored.expires_at_ms,
                     false,
                 )
                 .await
@@ -469,8 +496,57 @@ impl RuntimeService {
         assets: Vec<DeployAsset>,
         asset_headers: Option<String>,
     ) -> Result<String> {
-        self.deploy_with_config_internal(worker_name, source, config, assets, asset_headers, true)
-            .await
+        self.deploy_with_bundle_config_lifecycle(
+            worker_name,
+            source,
+            config,
+            assets,
+            asset_headers,
+            false,
+        )
+        .await
+    }
+
+    pub async fn deploy_temporary_with_bundle_config(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        asset_headers: Option<String>,
+    ) -> Result<String> {
+        self.deploy_with_bundle_config_lifecycle(
+            worker_name,
+            source,
+            config,
+            assets,
+            asset_headers,
+            true,
+        )
+        .await
+    }
+
+    pub async fn deploy_with_bundle_config_lifecycle(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        asset_headers: Option<String>,
+        temporary: bool,
+    ) -> Result<String> {
+        self.deploy_with_config_internal(
+            worker_name,
+            source,
+            config,
+            assets,
+            asset_headers,
+            true,
+            temporary,
+            None,
+            true,
+        )
+        .await
     }
 
     async fn deploy_with_config_internal(
@@ -481,6 +557,9 @@ impl RuntimeService {
         assets: Vec<DeployAsset>,
         asset_headers: Option<String>,
         persist: bool,
+        temporary: bool,
+        expires_at_ms: Option<i64>,
+        enforce_temporary_transition: bool,
     ) -> Result<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
@@ -491,6 +570,9 @@ impl RuntimeService {
                 assets,
                 asset_headers,
                 persist,
+                temporary,
+                expires_at_ms,
+                enforce_temporary_transition,
                 reply: reply_tx,
             })
             .await

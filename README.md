@@ -24,6 +24,11 @@ cargo run -p cli -- --server http://127.0.0.1:8081 invoke hello --method GET --p
 curl -H 'host: hello.example.com' http://127.0.0.1:8080/
 ```
 
+Add `--temporary` to deploy a worker that expires one hour after deployment.
+Redeploying the same temporary worker with `--temporary` refreshes the hour;
+redeploying it without `--temporary` makes it permanent. Deploying
+`--temporary` over an already permanent worker is rejected.
+
 Default ports for `cargo run -p dd_server` are `8080` for public traffic and `8081` for private deploy/invoke traffic.
 
 Project deploy settings can live in `dd.json`:

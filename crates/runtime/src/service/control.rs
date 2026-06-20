@@ -11,6 +11,9 @@ pub(crate) enum RuntimeCommand {
         assets: Vec<DeployAsset>,
         asset_headers: Option<String>,
         persist: bool,
+        temporary: bool,
+        expires_at_ms: Option<i64>,
+        enforce_temporary_transition: bool,
         reply: oneshot::Sender<Result<String>>,
     },
     DeployDynamic {
@@ -317,10 +320,23 @@ impl WorkerManager {
                 assets,
                 asset_headers,
                 persist,
+                temporary,
+                expires_at_ms,
+                enforce_temporary_transition,
                 reply,
             } => {
                 let result = self
-                    .deploy(worker_name, source, config, assets, asset_headers, persist)
+                    .deploy(
+                        worker_name,
+                        source,
+                        config,
+                        assets,
+                        asset_headers,
+                        persist,
+                        temporary,
+                        expires_at_ms,
+                        enforce_temporary_transition,
+                    )
                     .await;
                 let _ = reply.send(result);
                 true

@@ -73,7 +73,7 @@ pub(crate) use self::model::DynamicQuotaState;
 use self::model::*;
 use self::protocol::*;
 use self::runtime::*;
-use self::storage::{epoch_ms_i64, persist_worker_deployment};
+use self::storage::{delete_worker_deployment, epoch_ms_i64, persist_worker_deployment};
 
 const INTERNAL_HEADER: &str = "x-dd-internal";
 const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";

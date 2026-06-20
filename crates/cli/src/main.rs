@@ -97,11 +97,17 @@ struct DeployCmd {
 
     #[arg(long = "trace-path", default_value = "/ingest")]
     trace_path: String,
+
+    #[arg(long)]
+    temporary: bool,
 }
 
 #[derive(Args)]
 struct DeployConfigFileCmd {
     config_file: String,
+
+    #[arg(long)]
+    temporary: bool,
 }
 
 #[derive(Args)]
@@ -169,6 +175,8 @@ struct DeployFileConfig {
     entrypoint: String,
     #[serde(default)]
     assets_dir: Option<String>,
+    #[serde(default)]
+    temporary: bool,
     #[serde(default)]
     asset_excludes: Vec<String>,
     #[serde(default)]
@@ -513,6 +521,7 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
         config,
         assets,
         asset_headers,
+        temporary: command.temporary,
     })
 }
 
@@ -553,6 +562,7 @@ async fn build_deploy_request_from_config_file(
         config: deploy_file.config,
         assets,
         asset_headers,
+        temporary: command.temporary || deploy_file.temporary,
     })
 }
 
@@ -1081,7 +1091,7 @@ mod tests {
     use super::{
         build_deploy_request_from_config_file, build_deploy_token_mint_request, keyring_account,
         load_workspace_cli_config_from, normalize_asset_relative_path, package_assets_dir,
-        resolve_server_from, Cli, CliConfig, DeployConfigFileCmd, MintDeployTokenCmd,
+        resolve_server_from, Cli, CliConfig, Command, DeployConfigFileCmd, MintDeployTokenCmd,
         DEFAULT_PRIVATE_SERVER_URL,
     };
     use clap::Parser;
@@ -1130,6 +1140,7 @@ mod tests {
               "name": "built-worker",
               "entrypoint": "worker.js",
               "assets_dir": ".",
+              "temporary": true,
               "asset_excludes": ["worker.js", "dd.deploy.json"],
               "config": {
                 "public": true,
@@ -1141,6 +1152,7 @@ mod tests {
 
         let request = build_deploy_request_from_config_file(DeployConfigFileCmd {
             config_file: root.join("dd.deploy.json").display().to_string(),
+            temporary: false,
         })
         .await
         .expect("package generated deploy config");
@@ -1148,6 +1160,7 @@ mod tests {
         assert_eq!(request.name, "built-worker");
         assert!(request.source.contains("export default"));
         assert!(request.config.public);
+        assert!(request.temporary);
         assert_eq!(request.config.bindings.len(), 1);
         let asset_paths = request
             .assets
@@ -1193,6 +1206,17 @@ mod tests {
             "ROOMS",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_accepts_temporary_deploy_flag() {
+        let cli =
+            Cli::try_parse_from(["dd", "deploy", "worker", "examples/hello.js", "--temporary"])
+                .expect("parse deploy");
+        let Command::Deploy(command) = cli.command else {
+            panic!("expected deploy command");
+        };
+        assert!(command.temporary);
     }
 
     #[test]

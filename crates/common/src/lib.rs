@@ -114,6 +114,8 @@ pub struct DeployRequest {
     pub assets: Vec<DeployAsset>,
     #[serde(default)]
     pub asset_headers: Option<String>,
+    #[serde(default)]
+    pub temporary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

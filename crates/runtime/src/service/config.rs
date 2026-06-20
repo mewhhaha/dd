@@ -324,6 +324,14 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
             "cache_default_ttl must be greater than 0",
         ));
     }
+    if config.temporary_worker_ttl.is_zero() {
+        return Err(PlatformError::internal(
+            "temporary_worker_ttl must be greater than 0",
+        ));
+    }
+    if config.temporary_worker_ttl.as_millis() > i64::MAX as u128 {
+        return Err(PlatformError::internal("temporary_worker_ttl is too large"));
+    }
     if config.kv_read_cache_max_entries == 0 {
         return Err(PlatformError::internal(
             "kv_read_cache_max_entries must be greater than 0",

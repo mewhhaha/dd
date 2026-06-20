@@ -172,6 +172,8 @@ impl WorkerPool {
         WorkerStats {
             generation: self.generation,
             public: self.is_public,
+            temporary: self.expires_at_ms.is_some(),
+            expires_at_ms: self.expires_at_ms,
             queued: self.queue.len(),
             busy: activity.busy,
             inflight_total: activity.inflight_total,
@@ -306,6 +308,7 @@ pub(super) fn spawn_runtime_thread(
                             }
                         }
                         _ = ticker.tick() => {
+                            manager.expire_temporary_workers().await;
                             manager.expire_queued_requests();
                             manager.scale_down_idle();
                         }

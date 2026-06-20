@@ -430,6 +430,177 @@ async fn deployed_assets_restore_from_worker_store() {
 
 #[tokio::test]
 #[serial]
+async fn temporary_worker_redeploy_refreshes_and_normal_deploy_makes_permanent() {
+    let service = test_service(RuntimeConfig {
+        scale_tick: Duration::from_millis(20),
+        temporary_worker_ttl: Duration::from_secs(60),
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_temporary_with_bundle_config(
+            "preview".to_string(),
+            versioned_worker("temp-one", 0),
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("temporary deploy should succeed");
+    let first = service
+        .stats("preview".to_string())
+        .await
+        .expect("temporary worker stats");
+    assert!(first.temporary);
+    let first_expires_at = first.expires_at_ms.expect("temporary expiration");
+
+    sleep(Duration::from_millis(5)).await;
+    service
+        .deploy_temporary_with_bundle_config(
+            "preview".to_string(),
+            versioned_worker("temp-two", 0),
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("temporary redeploy should refresh expiration");
+    let refreshed = service
+        .stats("preview".to_string())
+        .await
+        .expect("refreshed temporary worker stats");
+    assert!(refreshed.expires_at_ms.expect("refreshed expiration") > first_expires_at);
+
+    service
+        .deploy_with_bundle_config(
+            "preview".to_string(),
+            versioned_worker("permanent", 0),
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("normal deploy should make worker permanent");
+    let permanent = service
+        .stats("preview".to_string())
+        .await
+        .expect("permanent worker stats");
+    assert!(!permanent.temporary);
+    assert_eq!(permanent.expires_at_ms, None);
+
+    let error = service
+        .deploy_temporary_with_bundle_config(
+            "preview".to_string(),
+            versioned_worker("should-not-replace", 0),
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect_err("temporary deploy over permanent worker should fail");
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+
+    let output = service
+        .invoke(
+            "preview".to_string(),
+            test_invocation_with_path("/", "temporary-permanent-check"),
+        )
+        .await
+        .expect("permanent worker should remain deployed");
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "permanent");
+}
+
+#[tokio::test]
+#[serial]
+async fn temporary_worker_expires_and_is_not_restored_from_store() {
+    let root = PathBuf::from(format!("/tmp/dd-temp-workers-{}", Uuid::new_v4()));
+    let db_path = root.join("dd-test.db");
+    let database_url = format!("file:{}", db_path.display());
+    let config = RuntimeConfig {
+        scale_tick: Duration::from_secs(1),
+        temporary_worker_ttl: Duration::from_secs(60),
+        ..RuntimeConfig::default()
+    };
+
+    let service =
+        test_service_with_paths(config.clone(), root.clone(), database_url.clone(), true).await;
+    service
+        .deploy_temporary_with_bundle_config(
+            "preview".to_string(),
+            versioned_worker("temp", 0),
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("temporary deploy should succeed");
+    assert!(service.stats("preview".to_string()).await.is_some());
+    service.shutdown().await.expect("service should shut down");
+    drop(service);
+
+    let worker_store = root.join("workers");
+    let mut entries = tokio::fs::read_dir(&worker_store)
+        .await
+        .expect("worker store should exist");
+    let entry = entries
+        .next_entry()
+        .await
+        .expect("read worker store")
+        .expect("stored worker deployment should exist");
+    let path = entry.path();
+    let body = tokio::fs::read(&path)
+        .await
+        .expect("read stored deployment");
+    let mut stored: Value = serde_json::from_slice(&body).expect("stored deployment json");
+    stored["expires_at_ms"] = Value::from(0);
+    tokio::fs::write(
+        &path,
+        serde_json::to_vec(&stored).expect("updated stored deployment json"),
+    )
+    .await
+    .expect("write expired stored deployment");
+
+    let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
+    assert!(restored.stats("preview".to_string()).await.is_none());
+
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn temporary_worker_expires_while_runtime_is_running() {
+    let service = test_service(RuntimeConfig {
+        scale_tick: Duration::from_millis(10),
+        temporary_worker_ttl: Duration::from_millis(30),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy_temporary_with_bundle_config(
+            "preview-live".to_string(),
+            versioned_worker("temp", 0),
+            DeployConfig::default(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("temporary deploy should succeed");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if service.stats("preview-live".to_string()).await.is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("temporary worker should expire");
+}
+
+#[tokio::test]
+#[serial]
 async fn invalid_asset_headers_fail_deploy() {
     let service = test_service(RuntimeConfig::default()).await;
     let error = service

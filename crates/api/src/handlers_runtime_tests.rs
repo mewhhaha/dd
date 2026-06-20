@@ -142,6 +142,7 @@ async fn private_admin_mints_scoped_deploy_token_for_public_deploy() {
         },
         assets: Vec::new(),
         asset_headers: None,
+        temporary: false,
     };
     let request = Request::builder()
         .method("POST")
@@ -207,6 +208,7 @@ async fn public_deploy_token_rejects_unscoped_binding() {
         },
         assets: Vec::new(),
         asset_headers: None,
+        temporary: false,
     };
     let request = Request::builder()
         .method("POST")
@@ -307,6 +309,7 @@ async fn private_admin_lists_reads_and_deletes_tokens() {
         },
         assets: Vec::new(),
         asset_headers: None,
+        temporary: false,
     };
     let request = Request::builder()
         .method("POST")
@@ -337,6 +340,7 @@ async fn private_deploy_and_invoke_succeeds() {
         },
         assets: Vec::new(),
         asset_headers: None,
+        temporary: false,
     };
     let response = deploy_worker(state.app(), deploy).await.expect("deploy");
     assert!(response.ok);
