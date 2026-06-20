@@ -637,11 +637,13 @@ impl RuntimeService {
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
     ) -> Result<WebSocketOpen> {
+        let runtime_request_id = next_runtime_token("ws");
         let session_id = Uuid::new_v4().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::OpenWebsocket {
-                worker_name,
+                worker_name: worker_name.clone(),
+                runtime_request_id: runtime_request_id.clone(),
                 request,
                 request_body,
                 session_id: session_id.clone(),
@@ -650,8 +652,11 @@ impl RuntimeService {
             .await
             .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
 
-        let mut opened = reply_rx
-            .await
+        let mut cancel_guard =
+            InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
+        let reply = reply_rx.await;
+        cancel_guard.disarm();
+        let mut opened = reply
             .map_err(|_| PlatformError::internal("runtime open websocket channel closed"))??;
         opened.session_id = session_id;
         Ok(opened)

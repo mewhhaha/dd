@@ -5,6 +5,7 @@ import {
   mergeConfig,
 } from "vite";
 import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
@@ -27,12 +28,15 @@ const REACT_ROUTER_RSC_FRAMEWORK = "react-router-rsc";
 const DEFAULT_REACT_ROUTER_WORKER_ENTRY = "src/worker.ts";
 const DEFAULT_REACT_ROUTER_BUILD_DIRECTORY = "dist/react-router";
 const DEFAULT_REACT_ROUTER_RSC_BUILD_DIRECTORY = "dist/react-router-rsc";
-const DEFAULT_REACT_ROUTER_RSC_ASYNC_HOOKS_SHIM = "src/node-async-hooks.ts";
 const DEFAULT_REACT_ROUTER_RSC_ENTRY = "app/entry.rsc.ts";
 const DD_REACT_ROUTER_RSC_SERVER_MODULE = "virtual:dd-react-router-rsc-server";
 const DD_REACT_ROUTER_RSC_SERVER_RESOLVED = "\0dd:react-router-rsc-server";
+const DD_NODE_ASYNC_HOOKS_SHIM_MODULE = "virtual:dd-node-async-hooks";
+const DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED = "\0dd:node-async-hooks";
 const FINGERPRINTED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const DD_VITE_BYPASS_HEADER = "x-dd-vite-bypass";
+const DD_VITE_MODULE_RUNNER_UPDATE_HEADER = "x-dd-vite-module-runner-update";
+const DD_VITE_MODULE_RUNNER_UPDATE_PATH = "/__dd_vite_module_runner_update";
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
 const VITE_BYPASS_PREFIXES = [
   "/@vite",
@@ -40,6 +44,11 @@ const VITE_BYPASS_PREFIXES = [
   "/@fs/",
   "/@react-refresh",
   "/__manifest",
+  "/__vitest__/",
+  "/__vitest_attachment__",
+  "/__vitest_browser__/",
+  "/__vitest_browser_api__",
+  "/__vitest_test__/",
   "/node_modules/",
   "/.vite/",
   "/app/",
@@ -60,6 +69,47 @@ const VITE_BYPASS_QUERY_KEYS = new Set([
   "worker",
 ]);
 const VITE_BYPASS_FETCH_DESTINATIONS = new Set(["script", "style"]);
+const WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_DEV_WEBSOCKET_FRAME_BYTES = 8 * 1024 * 1024;
+const DD_WS_BINARY_HEADER = "x-dd-ws-binary";
+const DD_WS_CLOSE_CODE_HEADER = "x-dd-ws-close-code";
+const DD_WS_CLOSE_REASON_HEADER = "x-dd-ws-close-reason";
+const DD_NODE_ASYNC_HOOKS_SHIM_SOURCE = `
+export class AsyncLocalStorage {
+  #store;
+
+  run(store, callback, ...args) {
+    const previous = this.#store;
+    this.#store = store;
+    let result;
+    try {
+      result = callback(...args);
+    } catch (error) {
+      this.#store = previous;
+      throw error;
+    }
+    if (result && typeof result.then === "function") {
+      return Promise.resolve(result).finally(() => {
+        this.#store = previous;
+      });
+    }
+    this.#store = previous;
+    return result;
+  }
+
+  getStore() {
+    return this.#store;
+  }
+
+  enterWith(store) {
+    this.#store = store;
+  }
+
+  disable() {
+    this.#store = undefined;
+  }
+}
+`;
 
 export function ddEnvironment(options = {}) {
   const environmentOptions = ddEnvironmentUserOptions(options);
@@ -142,8 +192,10 @@ export function ddVitePlugin(options = {}) {
   const environmentName = viteEnvironment?.name ?? options.environmentName ?? "dd";
   const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
   const childEnvironmentNames = arrayOfStrings(viteEnvironment?.childEnvironments);
+  const moduleRunnerUpdateToken = randomUUID();
   let runtime;
   let deployment;
+  let deploymentRuntimeGeneration;
   let deploying;
   const hotReloadMode = normalizeHotReloadMode(options.reloadOnHotUpdate);
   const deploymentConfig = normalizeDeploymentConfigOptions(
@@ -152,6 +204,8 @@ export function ddVitePlugin(options = {}) {
   let deploymentConfigWritten = false;
   let frameworkDevBuildComplete = false;
   let frameworkDevBuildPromise;
+  let reactRouterRscClientUpdateTimer;
+  let reactRouterRscClientUpdateFile;
   let sourceConfigRoot;
   let sourceConfigPromise;
 
@@ -204,20 +258,12 @@ export function ddVitePlugin(options = {}) {
     }
     if (framework) {
       if (viteCommand === "serve" && devServer && options.devModuleRunner !== false) {
-        return viteModuleRunnerWorkerSource(devServer, entry, {
-          environmentName,
-          childEnvironmentNames,
-          root: resolveFrameworkRoot(),
-        });
+        return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions());
       }
       return bundleFrameworkWorkerSource(framework, entry);
     }
     if (viteCommand === "serve" && devServer && options.devModuleRunner !== false) {
-      return viteModuleRunnerWorkerSource(devServer, entry, {
-        environmentName,
-        childEnvironmentNames,
-        root: resolveFrameworkRoot(),
-      });
+      return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions());
     }
     return bundleWorkerEntry(entry, {
       viteConfig: workerBundleViteConfig(),
@@ -255,9 +301,11 @@ export function ddVitePlugin(options = {}) {
 
   async function ensureDeployed() {
     runtime ??= createDdRuntime(options.runtimeOptions);
-    if (deployment) {
+    if (deployment && deploymentRuntimeGeneration === runtime.generation) {
       return deployment;
     }
+    deployment = undefined;
+    deploymentRuntimeGeneration = undefined;
     const workerName = await effectiveWorkerName();
     const deployConfig = await effectiveRuntimeConfig();
     deploying ??= runtime
@@ -274,15 +322,69 @@ export function ddVitePlugin(options = {}) {
         deploying = undefined;
       });
     deployment = await deploying;
+    deploymentRuntimeGeneration = runtime.generation;
     return deployment;
   }
 
   async function invalidateDeployment() {
     frameworkDevBuildComplete = false;
+    if (await updateViteModuleRunnerDeployment()) {
+      return;
+    }
     deployment = undefined;
+    deploymentRuntimeGeneration = undefined;
     if (options.eager === true) {
       await ensureDeployed();
     }
+  }
+
+  function moduleRunnerOptions() {
+    return {
+      environmentName,
+      childEnvironmentNames,
+      root: resolveFrameworkRoot(),
+      updateToken: moduleRunnerUpdateToken,
+    };
+  }
+
+  async function updateViteModuleRunnerDeployment() {
+    if (
+      viteCommand !== "serve" ||
+      !devServer ||
+      options.devModuleRunner === false ||
+      !deployment ||
+      !runtime ||
+      deploymentRuntimeGeneration !== runtime.generation
+    ) {
+      deployment = undefined;
+      deploymentRuntimeGeneration = undefined;
+      return false;
+    }
+    const entry = await effectiveWorkerEntry();
+    if (!entry || typeof options.source === "string" || typeof options.source === "function") {
+      return false;
+    }
+    const workerName = await effectiveWorkerName();
+    const graph = await collectViteModuleRunnerGraph(devServer, entry, moduleRunnerOptions());
+    const response = await runtime.fetch(
+      workerName,
+      new Request(`http://${workerName}.dd.local${DD_VITE_MODULE_RUNNER_UPDATE_PATH}`, {
+        method: "POST",
+        headers: {
+          [DD_VITE_MODULE_RUNNER_UPDATE_HEADER]: moduleRunnerUpdateToken,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(graph),
+      }),
+    );
+    if (!response.ok) {
+      deployment = undefined;
+      deploymentRuntimeGeneration = undefined;
+      throw new Error(
+        `ddVitePlugin failed to update dev module graph: ${response.status} ${await response.text()}`,
+      );
+    }
+    return true;
   }
 
   return {
@@ -341,11 +443,29 @@ export function ddVitePlugin(options = {}) {
     configureServer(viteServer) {
       devServer = viteServer;
       viteServer.httpServer?.once("close", () => {
+        if (reactRouterRscClientUpdateTimer) {
+          clearTimeout(reactRouterRscClientUpdateTimer);
+          reactRouterRscClientUpdateTimer = undefined;
+          reactRouterRscClientUpdateFile = undefined;
+        }
         void runtime?.close();
       });
       if (options.middleware === false) {
         return;
       }
+      const upgradeHandler = (req, socket, head) => {
+        void handleDdWebSocketUpgrade(req, socket, head, {
+          ensureDeployed,
+          effectiveWorkerName,
+          runtime: () => runtime,
+          mount,
+          viteBase: resolvedConfig?.base,
+        });
+      };
+      viteServer.httpServer?.on("upgrade", upgradeHandler);
+      viteServer.httpServer?.once("close", () => {
+        viteServer.httpServer?.off("upgrade", upgradeHandler);
+      });
       viteServer.middlewares.use(async (req, res, next) => {
         try {
           const originalUrl = req.url ?? "/";
@@ -384,9 +504,11 @@ export function ddVitePlugin(options = {}) {
       if (source.path === context.file) {
         sourceConfigPromise = undefined;
         deployment = undefined;
+        deploymentRuntimeGeneration = undefined;
       }
       if (await shouldInvalidateOnHotUpdate(context, hotReloadMode, effectiveWorkerEntry, options)) {
         await invalidateDeployment();
+        scheduleReactRouterRscClientUpdate(context);
       }
     },
     renderStart: {
@@ -423,11 +545,17 @@ export function ddVitePlugin(options = {}) {
       await runtime?.close();
     },
     resolveId(id) {
+      if (id === DD_NODE_ASYNC_HOOKS_SHIM_MODULE) {
+        return DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED;
+      }
       if (framework?.name === REACT_ROUTER_RSC_FRAMEWORK && id === DD_REACT_ROUTER_RSC_SERVER_MODULE) {
         return DD_REACT_ROUTER_RSC_SERVER_RESOLVED;
       }
     },
     load(id) {
+      if (id === DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED) {
+        return DD_NODE_ASYNC_HOOKS_SHIM_SOURCE;
+      }
       if (id !== DD_REACT_ROUTER_RSC_SERVER_RESOLVED || framework?.name !== REACT_ROUTER_RSC_FRAMEWORK) {
         return;
       }
@@ -512,8 +640,8 @@ export function ddVitePlugin(options = {}) {
       [framework.serverBuildModule]: frameworkServerEntry(framework, root),
     };
     if (framework.asyncHooksShim !== false) {
-      const asyncHooksShim = resolveFrameworkPath(root, framework.asyncHooksShim);
-      if (await fileExists(asyncHooksShim)) {
+      const asyncHooksShim = await resolveAsyncHooksShim(framework, root);
+      if (asyncHooksShim) {
         alias["node:async_hooks"] = asyncHooksShim;
         alias.async_hooks = asyncHooksShim;
       }
@@ -525,11 +653,34 @@ export function ddVitePlugin(options = {}) {
       resolve: {
         alias,
       },
+      plugins: [
+        ddNodeAsyncHooksShimPlugin(),
+      ],
     };
   }
 
   function resolveFrameworkRoot() {
     return resolve(resolvedConfig?.root ?? rootHint ?? process.cwd());
+  }
+
+  function scheduleReactRouterRscClientUpdate(context) {
+    if (framework?.name !== REACT_ROUTER_RSC_FRAMEWORK) {
+      return;
+    }
+    reactRouterRscClientUpdateFile = context.file;
+    if (reactRouterRscClientUpdateTimer) {
+      clearTimeout(reactRouterRscClientUpdateTimer);
+    }
+    reactRouterRscClientUpdateTimer = setTimeout(() => {
+      const file = reactRouterRscClientUpdateFile;
+      reactRouterRscClientUpdateTimer = undefined;
+      reactRouterRscClientUpdateFile = undefined;
+      context.server?.environments?.client?.hot?.send?.({
+        type: "custom",
+        event: "rsc:update",
+        data: file ? { file } : {},
+      });
+    }, 25);
   }
 }
 
@@ -537,8 +688,8 @@ async function frameworkDevResolveAlias(framework, root) {
   if (!framework || framework.asyncHooksShim === false) {
     return undefined;
   }
-  const asyncHooksShim = resolveFrameworkPath(root, framework.asyncHooksShim);
-  if (!(await fileExists(asyncHooksShim))) {
+  const asyncHooksShim = await resolveAsyncHooksShim(framework, root);
+  if (!asyncHooksShim) {
     return undefined;
   }
   return {
@@ -571,7 +722,7 @@ function normalizeFrameworkOptions(value) {
         workerEntry: options.workerEntry ?? DEFAULT_REACT_ROUTER_WORKER_ENTRY,
         serverEntry: options.serverEntry,
         serverBuildModule: DD_REACT_ROUTER_RSC_SERVER_MODULE,
-        asyncHooksShim: options.asyncHooksShim ?? DEFAULT_REACT_ROUTER_RSC_ASYNC_HOOKS_SHIM,
+        asyncHooksShim: options.asyncHooksShim ?? DD_NODE_ASYNC_HOOKS_SHIM_MODULE,
         rscEntry: options.rscEntry ?? DEFAULT_REACT_ROUTER_RSC_ENTRY,
       };
     default:
@@ -579,6 +730,36 @@ function normalizeFrameworkOptions(value) {
         `ddVitePlugin framework must be "${REACT_ROUTER_FRAMEWORK}" or "${REACT_ROUTER_RSC_FRAMEWORK}"`,
       );
   }
+}
+
+async function resolveAsyncHooksShim(framework, root) {
+  if (!framework || framework.asyncHooksShim === false) {
+    return undefined;
+  }
+  if (framework.asyncHooksShim === DD_NODE_ASYNC_HOOKS_SHIM_MODULE) {
+    return DD_NODE_ASYNC_HOOKS_SHIM_MODULE;
+  }
+  const asyncHooksShim = resolveFrameworkPath(root, framework.asyncHooksShim);
+  if (!(await fileExists(asyncHooksShim))) {
+    return undefined;
+  }
+  return asyncHooksShim;
+}
+
+function ddNodeAsyncHooksShimPlugin() {
+  return {
+    name: "dd-node-async-hooks-shim",
+    resolveId(id) {
+      if (id === DD_NODE_ASYNC_HOOKS_SHIM_MODULE) {
+        return DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED;
+      }
+    },
+    load(id) {
+      if (id === DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED) {
+        return DD_NODE_ASYNC_HOOKS_SHIM_SOURCE;
+      }
+    },
+  };
 }
 
 function mergeFrameworkViteEnvironment(framework, viteEnvironment) {
@@ -810,6 +991,7 @@ async function collectViteModuleRunnerGraph(viteServer, entry, options) {
     records: [...records.values()],
     aliases: [...aliases.entries()],
     devFetchOrigins: viteDevServerOrigins(viteServer),
+    updateToken: options.updateToken,
   };
 }
 
@@ -989,6 +1171,7 @@ function renderViteModuleRunnerWorkerSource(graph) {
     records: graph.records,
     aliases: graph.aliases,
     devFetchOrigins: graph.devFetchOrigins,
+    updateToken: graph.updateToken,
   };
   return `${VITE_MODULE_RUNNER_WORKER_BOOTSTRAP}
 const __ddViteGraph = ${JSON.stringify(payload)};
@@ -1005,6 +1188,7 @@ async function __ddViteImportGraph(graph) {
   const aliases = new Map(graph.aliases);
   const cache = new Map();
   const devFetchOrigins = new Set(graph.devFetchOrigins ?? []);
+  const updateToken = String(graph.updateToken ?? "");
   const nodeModuleShim = Object.freeze({
     createRequire(url) {
       const require = (id) => {
@@ -1016,22 +1200,7 @@ async function __ddViteImportGraph(graph) {
   });
   const emptyVirtualKey = "__dd_vite_empty_virtual_module__";
   const emptyCssVirtualKey = "__dd_vite_empty_css_virtual_module__";
-  records.set(emptyVirtualKey, {
-    key: emptyVirtualKey,
-    environmentName: graph.entryEnvironment,
-    id: emptyVirtualKey,
-    url: emptyVirtualKey,
-    code: "",
-    importMetaEnv: graph.records[0]?.importMetaEnv ?? {},
-  });
-  records.set(emptyCssVirtualKey, {
-    key: emptyCssVirtualKey,
-    environmentName: graph.entryEnvironment,
-    id: emptyCssVirtualKey,
-    url: emptyCssVirtualKey,
-    code: "__vite_ssr_exportName__(\\"default\\", () => []);",
-    importMetaEnv: graph.records[0]?.importMetaEnv ?? {},
-  });
+  installInternalRecords(graph.records[0]?.importMetaEnv ?? {});
   const firstEnv = graph.records[0]?.importMetaEnv ?? {};
   const nodeEnv = firstEnv.PROD ? "production" : "development";
   globalThis.process ??= { env: {} };
@@ -1088,6 +1257,25 @@ async function __ddViteImportGraph(graph) {
     };
     Object.defineProperty(bridge, "__ddViteDevFetchBridge", { value: true });
     globalThis.fetch = bridge;
+  }
+
+  function installInternalRecords(importMetaEnv) {
+    records.set(emptyVirtualKey, {
+      key: emptyVirtualKey,
+      environmentName: graph.entryEnvironment,
+      id: emptyVirtualKey,
+      url: emptyVirtualKey,
+      code: "",
+      importMetaEnv,
+    });
+    records.set(emptyCssVirtualKey, {
+      key: emptyCssVirtualKey,
+      environmentName: graph.entryEnvironment,
+      id: emptyCssVirtualKey,
+      url: emptyCssVirtualKey,
+      code: "__vite_ssr_exportName__(\\"default\\", () => []);",
+      importMetaEnv,
+    });
   }
 
   function clean(id) {
@@ -1251,18 +1439,87 @@ async function __ddViteImportGraph(graph) {
     return state.promise;
   }
 
-  const entry = await load(graph.entryEnvironment, graph.entryKey, undefined);
-  const worker = entry.default ?? entry;
-  if (!worker || typeof worker.fetch !== "function") {
-    throw new Error("dd Vite module runner entry did not export a Worker fetch handler");
+  installDevFetchBridge();
+
+  let activeWorker;
+  await activateWorker();
+
+  async function activateWorker() {
+    const entry = await load(graph.entryEnvironment, graph.entryKey, undefined);
+    const worker = entry.default ?? entry;
+    if (!worker || typeof worker.fetch !== "function") {
+      throw new Error("dd Vite module runner entry did not export a Worker fetch handler");
+    }
+    activeWorker = worker;
+    return worker;
   }
-  return {
-    ...worker,
-    fetch(...args) {
-      installDevFetchBridge();
-      return worker.fetch(...args);
+
+  async function applyGraphUpdate(nextGraph) {
+    records.clear();
+    for (const record of nextGraph.records ?? []) {
+      records.set(record.key, record);
+    }
+    aliases.clear();
+    for (const [key, value] of nextGraph.aliases ?? []) {
+      aliases.set(key, value);
+    }
+    devFetchOrigins.clear();
+    for (const origin of nextGraph.devFetchOrigins ?? []) {
+      devFetchOrigins.add(origin);
+    }
+    graph.entryEnvironment = nextGraph.entryEnvironment;
+    graph.entryKey = nextGraph.entryKey;
+    graph.records = nextGraph.records ?? [];
+    installInternalRecords(graph.records[0]?.importMetaEnv ?? {});
+    cache.clear();
+    await activateWorker();
+  }
+
+  function isGraphUpdateRequest(request) {
+    if (!(request instanceof Request)) {
+      return false;
+    }
+    if (request.headers.get("x-dd-vite-module-runner-update") !== updateToken) {
+      return false;
+    }
+    try {
+      return new URL(request.url).pathname === "/__dd_vite_module_runner_update";
+    } catch {
+      return false;
+    }
+  }
+
+  return new Proxy({}, {
+    get(_target, property) {
+      if (property === "fetch") {
+        return async (request, ...args) => {
+          installDevFetchBridge();
+          if (isGraphUpdateRequest(request)) {
+            await applyGraphUpdate(await request.json());
+            return new Response(null, { status: 204 });
+          }
+          return activeWorker.fetch(request, ...args);
+        };
+      }
+      const value = activeWorker?.[property];
+      return typeof value === "function" ? value.bind(activeWorker) : value;
     },
-  };
+    has(_target, property) {
+      return property === "fetch" || property in (activeWorker ?? {});
+    },
+    ownKeys() {
+      return Reflect.ownKeys(activeWorker ?? {});
+    },
+    getOwnPropertyDescriptor(_target, property) {
+      if (property === "fetch" || property in (activeWorker ?? {})) {
+        return {
+          configurable: true,
+          enumerable: true,
+          value: this.get(_target, property),
+        };
+      }
+    },
+  });
 }
 `;
 
@@ -1364,7 +1621,7 @@ async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
       headers.append(name, value);
     }
   }
-  const url = new URL(path, `http://${workerName}.dd.local`);
+  const url = nodeRequestWorkerUrl(req, path, workerName);
   const init = {
     method: req.method ?? "GET",
     headers,
@@ -1388,6 +1645,446 @@ async function writeNodeResponse(res, response) {
   });
   res.setHeader("content-length", String(body.length));
   res.end(body);
+}
+
+async function handleDdWebSocketUpgrade(req, socket, head, options) {
+  const originalUrl = req.url ?? "/";
+  if (
+    !isWebSocketUpgrade(req) ||
+    shouldBypassDdWebSocketUpgrade(req, originalUrl, options.mount, options.viteBase)
+  ) {
+    return;
+  }
+
+  socket.pause?.();
+  try {
+    await options.ensureDeployed();
+    const runtime = options.runtime();
+    if (!runtime) {
+      throw new Error("dd runtime is not available for websocket upgrade");
+    }
+    const workerName = await options.effectiveWorkerName();
+    const opened = await runtime.openWebSocket(
+      workerName,
+      nodeUpgradeToWorkerInvocation(req, originalUrl, options.mount, workerName),
+    );
+    if (Number(opened.status) !== 101) {
+      writeRawHttpResponse(socket, opened.status ?? 400, opened.headers, opened.body_base64);
+      return;
+    }
+
+    writeWebSocketHandshake(socket, req, opened.headers);
+    const bridge = new DdWebSocketBridge({
+      runtime,
+      sessionId: opened.session_id,
+      socket,
+      workerName,
+    });
+    bridge.start(head);
+    bridge.forwardRuntimeOutput(opened);
+  } catch (error) {
+    if (!socket.destroyed) {
+      writeRawHttpResponse(socket, 500, [], Buffer.from(String(error?.message ?? error)).toString("base64"));
+    }
+  }
+}
+
+function isWebSocketUpgrade(req) {
+  return headerValue(req.headers.upgrade).toLowerCase() === "websocket";
+}
+
+function shouldBypassDdWebSocketUpgrade(req, originalUrl, mount, viteBase) {
+  if (headerValue(req.headers[DD_VITE_BYPASS_HEADER]) === "1") {
+    return true;
+  }
+  if (!matchesMount(originalUrl, mount)) {
+    return true;
+  }
+  const protocol = headerValue(req.headers["sec-websocket-protocol"])
+    .split(",")
+    .map((value) => value.trim().toLowerCase());
+  if (protocol.includes("vite-hmr")) {
+    return true;
+  }
+  const url = new URL(originalUrl, "http://dd-vite.local");
+  if (url.searchParams.has("token")) {
+    return true;
+  }
+  return candidatePathnames(url.pathname, viteBase).some((pathname) =>
+    isViteBypassPath(pathname) || isViteAnyMethodBypassPath(pathname)
+  );
+}
+
+function nodeUpgradeToWorkerInvocation(req, originalUrl, mount, workerName) {
+  const path = stripMount(originalUrl, mount);
+  const url = nodeRequestWorkerUrl(req, path, workerName);
+  return {
+    method: req.method ?? "GET",
+    url: String(url),
+    headers: nodeRequestHeaders(req),
+    body_base64: "",
+  };
+}
+
+function nodeRequestWorkerUrl(req, path, workerName) {
+  const fallbackOrigin = `http://${workerName}.dd.local`;
+  const host = headerValue(req.headers.host).trim();
+  if (!host) {
+    return new URL(path, fallbackOrigin);
+  }
+  const forwardedProtocol = headerValue(req.headers["x-forwarded-proto"])
+    .split(",")[0]
+    ?.trim();
+  const protocol = forwardedProtocol || (req.socket?.encrypted ? "https" : "http");
+  try {
+    return new URL(path, `${protocol}://${host}`);
+  } catch {
+    return new URL(path, fallbackOrigin);
+  }
+}
+
+function nodeRequestHeaders(req) {
+  const headers = [];
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        headers.push([name, entry]);
+      }
+    } else if (value !== undefined) {
+      headers.push([name, value]);
+    }
+  }
+  return headers;
+}
+
+function writeWebSocketHandshake(socket, req, headers = []) {
+  const key = headerValue(req.headers["sec-websocket-key"]).trim();
+  if (!key) {
+    throw new Error("missing sec-websocket-key");
+  }
+  const accept = createHash("sha1").update(`${key}${WEBSOCKET_ACCEPT_GUID}`).digest("base64");
+  const lines = [
+    "HTTP/1.1 101 Switching Protocols",
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    `Sec-WebSocket-Accept: ${accept}`,
+  ];
+  for (const [name, value] of headers) {
+    if (shouldSkipWebSocketHandshakeHeader(name)) {
+      continue;
+    }
+    lines.push(`${name}: ${value}`);
+  }
+  socket.write(`${lines.join("\r\n")}\r\n\r\n`);
+}
+
+function shouldSkipWebSocketHandshakeHeader(name) {
+  const lower = String(name).toLowerCase();
+  return (
+    lower === "connection" ||
+    lower === "upgrade" ||
+    lower === "sec-websocket-accept" ||
+    lower === "content-length" ||
+    lower === "transfer-encoding"
+  );
+}
+
+function writeRawHttpResponse(socket, status, headers = [], bodyBase64 = "") {
+  const body = bodyBase64 ? Buffer.from(bodyBase64, "base64") : Buffer.alloc(0);
+  const statusCode = Number(status) || 500;
+  const reason = statusReasonPhrase(statusCode);
+  const lines = [
+    `HTTP/1.1 ${statusCode} ${reason}`,
+    "Connection: close",
+    `Content-Length: ${body.length}`,
+  ];
+  for (const [name, value] of headers) {
+    const lower = String(name).toLowerCase();
+    if (lower === "connection" || lower === "content-length" || lower === "transfer-encoding") {
+      continue;
+    }
+    lines.push(`${name}: ${value}`);
+  }
+  socket.end(Buffer.concat([Buffer.from(`${lines.join("\r\n")}\r\n\r\n`), body]));
+}
+
+function statusReasonPhrase(status) {
+  switch (status) {
+    case 400:
+      return "Bad Request";
+    case 404:
+      return "Not Found";
+    case 500:
+      return "Internal Server Error";
+    default:
+      return status >= 200 && status < 300 ? "OK" : "Error";
+  }
+}
+
+class DdWebSocketBridge {
+  constructor({ runtime, sessionId, socket, workerName }) {
+    this.runtime = runtime;
+    this.sessionId = sessionId;
+    this.socket = socket;
+    this.workerName = workerName;
+    this.buffer = Buffer.alloc(0);
+    this.closed = false;
+    this.closeSent = false;
+    this.runtimeClosed = false;
+    this.polling = false;
+    this.frameQueue = Promise.resolve();
+    this.pollTimer = undefined;
+  }
+
+  start(head) {
+    this.socket.setNoDelay?.(true);
+    this.socket.on("data", (chunk) => this.consume(chunk));
+    this.socket.on("close", () => {
+      this.closed = true;
+      this.stopPolling();
+      void this.closeRuntime(1006, "socket closed");
+    });
+    this.socket.on("error", () => {
+      this.closed = true;
+      this.stopPolling();
+      void this.closeRuntime(1011, "socket error");
+    });
+    this.pollTimer = setInterval(() => {
+      void this.pollRuntimeFrames();
+    }, 100);
+    if (head?.length) {
+      this.consume(head);
+    }
+    this.socket.resume?.();
+    void this.pollRuntimeFrames();
+  }
+
+  consume(chunk) {
+    if (this.closed) {
+      return;
+    }
+    this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
+    for (;;) {
+      const parsed = parseClientWebSocketFrame(this.buffer);
+      if (!parsed) {
+        return;
+      }
+      if (parsed.error) {
+        void this.close(1002, parsed.error);
+        return;
+      }
+      this.buffer = parsed.rest;
+      this.frameQueue = this.frameQueue
+        .then(() => this.handleFrame(parsed.frame))
+        .catch((error) => this.fail(error));
+    }
+  }
+
+  async handleFrame(frame) {
+    if (this.closed) {
+      return;
+    }
+    switch (frame.opcode) {
+      case 0x1:
+      case 0x2: {
+        const output = await this.runtime.sendWebSocketFrame(
+          this.workerName,
+          this.sessionId,
+          frame.payload,
+          { binary: frame.opcode === 0x2 },
+        );
+        this.forwardRuntimeOutput(output);
+        await this.pollRuntimeFrames();
+        break;
+      }
+      case 0x8: {
+        const { code, reason } = parseClientClosePayload(frame.payload);
+        await this.close(code, reason);
+        break;
+      }
+      case 0x9:
+        sendServerWebSocketFrame(this.socket, 0xA, frame.payload);
+        break;
+      case 0xA:
+        break;
+      default:
+        await this.close(1003, "unsupported websocket frame");
+        break;
+    }
+  }
+
+  async pollRuntimeFrames() {
+    if (this.closed || this.polling) {
+      return;
+    }
+    this.polling = true;
+    try {
+      for (let index = 0; index < 32 && !this.closed; index += 1) {
+        const result = await this.runtime.drainWebSocketFrame(this.workerName, this.sessionId);
+        if (!result.frame) {
+          break;
+        }
+        this.forwardRuntimeOutput(result.frame);
+      }
+    } catch (error) {
+      this.fail(error);
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  forwardRuntimeOutput(output) {
+    if (this.closed || !output) {
+      return;
+    }
+    const headers = output.headers ?? [];
+    const body = output.body_base64 ? Buffer.from(output.body_base64, "base64") : Buffer.alloc(0);
+    if (body.length > 0) {
+      const binary = headerListValue(headers, DD_WS_BINARY_HEADER) === "1";
+      sendServerWebSocketFrame(this.socket, binary ? 0x2 : 0x1, body);
+    }
+    const closeCode = headerListValue(headers, DD_WS_CLOSE_CODE_HEADER);
+    if (closeCode) {
+      const reason = headerListValue(headers, DD_WS_CLOSE_REASON_HEADER);
+      void this.close(Number(closeCode) || 1000, reason, { closeRuntime: false });
+    }
+  }
+
+  async close(code = 1000, reason = "", options = {}) {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    this.stopPolling();
+    if (options.closeRuntime !== false) {
+      await this.closeRuntime(code, reason);
+    }
+    if (!this.closeSent && !this.socket.destroyed) {
+      this.closeSent = true;
+      sendServerWebSocketFrame(this.socket, 0x8, encodeClosePayload(code, reason));
+    }
+    this.socket.end();
+  }
+
+  async closeRuntime(code, reason) {
+    if (this.runtimeClosed) {
+      return;
+    }
+    this.runtimeClosed = true;
+    await this.runtime.closeWebSocket(this.workerName, this.sessionId, { code, reason }).catch(() => {});
+  }
+
+  fail(error) {
+    if (!this.closed) {
+      void this.close(1011, String(error?.message ?? error));
+    }
+  }
+
+  stopPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+  }
+}
+
+function parseClientWebSocketFrame(buffer) {
+  if (buffer.length < 2) {
+    return undefined;
+  }
+  const first = buffer[0];
+  const second = buffer[1];
+  const fin = (first & 0x80) !== 0;
+  const opcode = first & 0x0f;
+  const masked = (second & 0x80) !== 0;
+  let length = second & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < offset + 2) {
+      return undefined;
+    }
+    length = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (length === 127) {
+    if (buffer.length < offset + 8) {
+      return undefined;
+    }
+    const bigLength = buffer.readBigUInt64BE(offset);
+    if (bigLength > BigInt(MAX_DEV_WEBSOCKET_FRAME_BYTES)) {
+      return { error: "websocket frame is too large", rest: Buffer.alloc(0) };
+    }
+    length = Number(bigLength);
+    offset += 8;
+  }
+  if (length > MAX_DEV_WEBSOCKET_FRAME_BYTES) {
+    return { error: "websocket frame is too large", rest: Buffer.alloc(0) };
+  }
+  if (!masked) {
+    return { error: "client websocket frames must be masked", rest: Buffer.alloc(0) };
+  }
+  if (!fin) {
+    return { error: "fragmented websocket frames are not supported in dd vite dev", rest: Buffer.alloc(0) };
+  }
+  if (buffer.length < offset + 4 + length) {
+    return undefined;
+  }
+  const mask = buffer.subarray(offset, offset + 4);
+  offset += 4;
+  const payload = Buffer.alloc(length);
+  for (let index = 0; index < length; index += 1) {
+    payload[index] = buffer[offset + index] ^ mask[index % 4];
+  }
+  return {
+    frame: { opcode, payload },
+    rest: buffer.subarray(offset + length),
+  };
+}
+
+function sendServerWebSocketFrame(socket, opcode, payload) {
+  if (socket.destroyed) {
+    return;
+  }
+  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload ?? "");
+  let header;
+  if (body.length < 126) {
+    header = Buffer.from([0x80 | opcode, body.length]);
+  } else if (body.length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(body.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(body.length), 2);
+  }
+  socket.write(Buffer.concat([header, body]));
+}
+
+function parseClientClosePayload(payload) {
+  if (payload.length < 2) {
+    return { code: 1000, reason: "" };
+  }
+  return {
+    code: payload.readUInt16BE(0),
+    reason: payload.subarray(2).toString("utf8"),
+  };
+}
+
+function encodeClosePayload(code, reason) {
+  const text = Buffer.from(String(reason ?? "").slice(0, 120));
+  const payload = Buffer.alloc(2 + text.length);
+  payload.writeUInt16BE(Number(code) || 1000, 0);
+  text.copy(payload, 2);
+  return payload;
+}
+
+function headerListValue(headers, name) {
+  const found = (headers ?? []).find(([headerName]) =>
+    String(headerName).toLowerCase() === String(name).toLowerCase()
+  );
+  return found ? String(found[1]) : "";
 }
 
 async function readIncomingBody(req) {

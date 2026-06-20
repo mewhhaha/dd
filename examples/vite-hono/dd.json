@@ -1,12 +1,16 @@
 {
-  "name": "vite-ruwuter",
-  "entrypoint": "src/worker.tsx",
+  "name": "vite-hono",
+  "entrypoint": "src/worker.ts",
   "config": {
     "public": true,
     "bindings": [
       {
         "type": "memory",
         "binding": "EXAMPLE_MEMORY"
+      },
+      {
+        "type": "kv",
+        "binding": "STORE_DB"
       }
     ]
   }

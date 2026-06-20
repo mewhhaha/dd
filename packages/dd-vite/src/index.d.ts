@@ -87,6 +87,33 @@ export class DdRuntimeClient {
   ): Promise<{ status: number; headers: Array<[string, string]>; body_base64: string }>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
   fetch(name: string, input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+  openWebSocket(
+    name: string,
+    request: {
+      method?: string;
+      url?: string;
+      headers?: Array<[string, string]>;
+      body_base64?: string;
+      request_id?: string;
+    },
+  ): Promise<{ session_id: string; status: number; headers: Array<[string, string]>; body_base64: string }>;
+  sendWebSocketFrame(
+    name: string,
+    sessionId: string,
+    body: ArrayBuffer | ArrayBufferView | string,
+    options?: { binary?: boolean },
+  ): Promise<{ status: number; headers: Array<[string, string]>; body_base64: string }>;
+  drainWebSocketFrame(
+    name: string,
+    sessionId: string,
+  ): Promise<{
+    frame: null | { status: number; headers: Array<[string, string]>; body_base64: string };
+  }>;
+  closeWebSocket(
+    name: string,
+    sessionId: string,
+    options?: { code?: number; reason?: string },
+  ): Promise<unknown>;
   stats(name: string): Promise<unknown>;
   request(command: Record<string, unknown>): Promise<unknown>;
   close(): Promise<void>;

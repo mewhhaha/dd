@@ -3,15 +3,22 @@ import { RouterContextProvider } from "react-router";
 import {
   createDdRequestContext,
   ddRequestContext,
+  runWithDdRequestContext,
+  type DdRequestContext,
   type Env,
 } from "./dd-context";
 
-function withStmHeader(response: Response, count: number | undefined): Response {
-  if (count === undefined) {
+function withDdHeaders(response: Response, context: DdRequestContext): Response {
+  if (context.lastStmCount === undefined && !context.sessionCookie) {
     return response;
   }
   const headers = new Headers(response.headers);
-  headers.set("x-dd-stm-count", String(count));
+  if (context.lastStmCount !== undefined) {
+    headers.set("x-dd-stm-count", String(context.lastStmCount));
+  }
+  if (context.sessionCookie) {
+    headers.append("set-cookie", context.sessionCookie);
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -25,11 +32,13 @@ export default {
       return defaultEntry.fetch(request);
     }
 
-    const dd = createDdRequestContext(env, "vite-react-router-rsc");
+    const dd = createDdRequestContext(env, "vite-react-router-rsc", request);
     const context = new RouterContextProvider();
     context.set(ddRequestContext, dd);
-    const response = await defaultEntry.fetch(request, context);
-    return withStmHeader(response, dd.lastStmCount);
+    return await runWithDdRequestContext(dd, async () => {
+      const response = await defaultEntry.fetch(request, context);
+      return withDdHeaders(response, dd);
+    });
   },
 };
 

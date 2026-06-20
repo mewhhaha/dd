@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_WORKER_NAME = "test-worker";
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
 const BODYLESS_RESPONSE_STATUSES = new Set([204, 205, 304]);
 const require = createRequire(import.meta.url);
@@ -16,6 +17,7 @@ export function createDdRuntime(options = {}) {
 
 export class DdRuntimeClient {
   #child;
+  #generation = 0;
   #nextId = 1;
   #pending = new Map();
   #stdout = "";
@@ -25,9 +27,14 @@ export class DdRuntimeClient {
   constructor(options = {}) {
     this.options = {
       timeoutMs: DEFAULT_TIMEOUT_MS,
+      closeTimeoutMs: DEFAULT_CLOSE_TIMEOUT_MS,
       allowCodeGeneration: true,
       ...options,
     };
+  }
+
+  get generation() {
+    return this.#generation;
   }
 
   async deploy(name, source, config = {}) {
@@ -77,6 +84,47 @@ export class DdRuntimeClient {
     });
   }
 
+  async openWebSocket(name, request) {
+    return this.request({
+      op: "open_websocket",
+      name,
+      method: request.method ?? "GET",
+      url: request.url ?? "http://worker/",
+      headers: request.headers ?? [],
+      body_base64: request.body_base64 ?? "",
+      request_id: request.request_id,
+    });
+  }
+
+  async sendWebSocketFrame(name, sessionId, body, options = {}) {
+    const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body ?? "");
+    return this.request({
+      op: "send_websocket_frame",
+      name,
+      session_id: sessionId,
+      body_base64: buffer.toString("base64"),
+      binary: options.binary === true,
+    });
+  }
+
+  async drainWebSocketFrame(name, sessionId) {
+    return this.request({
+      op: "drain_websocket_frame",
+      name,
+      session_id: sessionId,
+    });
+  }
+
+  async closeWebSocket(name, sessionId, options = {}) {
+    return this.request({
+      op: "close_websocket",
+      name,
+      session_id: sessionId,
+      code: options.code ?? 1000,
+      reason: options.reason ?? "",
+    });
+  }
+
   async stats(name) {
     return this.request({ op: "stats", name });
   }
@@ -92,6 +140,13 @@ export class DdRuntimeClient {
     return new Promise((resolveRequest, rejectRequest) => {
       const timeout = setTimeout(() => {
         this.#pending.delete(id);
+        if (this.#child === child) {
+          this.#discardChild(child);
+          child.kill("SIGTERM");
+          this.#rejectAll(
+            new Error(`dd runtime restarted after command timed out: ${command.op}`),
+          );
+        }
         rejectRequest(new Error(`dd runtime command timed out after ${timeoutMs}ms: ${command.op}`));
       }, timeoutMs);
       this.#pending.set(id, {
@@ -106,7 +161,7 @@ export class DdRuntimeClient {
         clearTimeout(timeout);
         this.#pending.delete(id);
         if (this.#child === child) {
-          this.#child = undefined;
+          this.#discardChild(child);
         }
         rejectRequest(error);
       });
@@ -123,11 +178,15 @@ export class DdRuntimeClient {
       return;
     }
     try {
-      await this.request({ op: "shutdown" });
+      await Promise.race([
+        this.request({ op: "shutdown" }),
+        delay(this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS),
+      ]);
     } catch {
       // The process may already be gone; terminate below.
     }
     this.#closed = true;
+    this.#rejectAll(new Error("dd runtime client is closed"));
     child.kill("SIGTERM");
   }
 
@@ -143,6 +202,7 @@ export class DdRuntimeClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.#child = child;
+    this.#generation += 1;
     this.#stdout = "";
     this.#stderr = "";
     child.stdout.setEncoding("utf8");
@@ -153,7 +213,7 @@ export class DdRuntimeClient {
     });
     child.on("error", (error) => {
       if (this.#child === child) {
-        this.#child = undefined;
+        this.#discardChild(child);
         this.#rejectAll(error);
       }
     });
@@ -161,7 +221,7 @@ export class DdRuntimeClient {
       if (this.#child !== child) {
         return;
       }
-      this.#child = undefined;
+      this.#discardChild(child);
       if (this.#closed) {
         return;
       }
@@ -185,10 +245,18 @@ export class DdRuntimeClient {
       child.stdin.destroyed ||
       child.stdin.writableEnded
     ) {
-      this.#child = undefined;
+      this.#discardChild(child);
       return undefined;
     }
     return child;
+  }
+
+  #discardChild(child) {
+    if (this.#child !== child) {
+      return;
+    }
+    this.#child = undefined;
+    this.#generation += 1;
   }
 
   #onStdout(chunk) {
@@ -240,6 +308,13 @@ export class DdRuntimeClient {
       pending.reject(error);
     }
   }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, ms);
+    timeout.unref?.();
+  });
 }
 
 function isRuntimeProtocolLine(line) {

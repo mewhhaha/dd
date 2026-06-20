@@ -1,29 +1,22 @@
 import { createContext } from "react-router";
+import {
+  createStorefront,
+  storefrontSessionFromRequest,
+  type StorefrontEnv,
+} from "./storefront";
 
 const DD_REQUEST_CONTEXTS = Symbol.for("dd.examples.vite-react-router.request-contexts");
 const DD_REQUEST_CONTEXT_HEADER = "x-dd-request-context";
 
-export type MemoryNamespace = {
-  idFromName(name: string): unknown;
-  get(id: unknown): MemoryShard;
-};
-
-type MemoryShard = {
-  atomic<T>(callback: () => T): Promise<T>;
-  tvar<T>(key: string, defaultValue: T): {
-    read(): T;
-    write(value: T): void;
-  };
-};
-
-export type Env = {
-  EXAMPLE_MEMORY: MemoryNamespace;
-};
+export type Env = StorefrontEnv;
 
 export type DdRequestContext = {
   readonly workerName: string;
+  readonly sessionCookie: string | null;
+  readonly storefront: ReturnType<typeof createStorefront>;
   lastStmCount?: number;
   incrementStmRequestCount(): Promise<number>;
+  sampleTimerTick(): Promise<string>;
 };
 
 export const ddRequestContext = createContext<DdRequestContext>();
@@ -43,9 +36,16 @@ export function getDdRequestContext(
   }
 }
 
-export function createDdRequestContext(env: Env, workerName: string): DdRequestContext {
+export function createDdRequestContext(
+  env: Env,
+  workerName: string,
+  request: Request,
+): DdRequestContext {
+  const session = storefrontSessionFromRequest(request);
   const requestContext: DdRequestContext = {
     workerName,
+    sessionCookie: session.setCookie,
+    storefront: createStorefront(env, session.id),
     async incrementStmRequestCount() {
       const memory = env.EXAMPLE_MEMORY.get(env.EXAMPLE_MEMORY.idFromName(workerName));
       const requests = memory.tvar("requests", 0);
@@ -56,6 +56,11 @@ export function createDdRequestContext(env: Env, workerName: string): DdRequestC
       });
       requestContext.lastStmCount = count;
       return count;
+    },
+    async sampleTimerTick() {
+      const started = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return `${Math.max(0, Date.now() - started)} ms`;
     },
   };
   return requestContext;

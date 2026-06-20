@@ -86,6 +86,7 @@ pub(crate) enum RuntimeCommand {
     },
     OpenWebsocket {
         worker_name: String,
+        runtime_request_id: String,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
         session_id: String,
@@ -422,6 +423,7 @@ impl WorkerManager {
             }
             RuntimeCommand::OpenWebsocket {
                 worker_name,
+                runtime_request_id,
                 mut request,
                 request_body,
                 session_id,
@@ -440,7 +442,6 @@ impl WorkerManager {
                 self.websocket_open_waiters
                     .insert(session_id.clone(), reply);
 
-                let runtime_request_id = Uuid::new_v4().to_string();
                 let _ = self.enqueue_invoke(
                     worker_name,
                     runtime_request_id,

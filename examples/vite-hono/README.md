@@ -1,6 +1,6 @@
-# Vite Ruwuter Example
+# Vite Hono Example
 
-Minimal TypeScript example for `@mewhhaha/vite-plugin-dd` using `@mewhhaha/ruwuter` from JSR.
+Minimal TypeScript example for `@mewhhaha/vite-plugin-dd` using Hono.
 
 It uses `dd()` with the default root mount, so normal app requests to the Vite
 dev server hit the worker while Vite's own module/HMR requests bypass it.
@@ -18,10 +18,10 @@ class.
 
 ```bash
 pnpm install
-pnpm --filter dd-vite-ruwuter-example dev
-pnpm --filter dd-vite-ruwuter-example build
-pnpm --filter dd-vite-ruwuter-example smoke
-pnpm --filter dd-vite-ruwuter-example typecheck
+pnpm --filter dd-vite-hono-example dev
+pnpm --filter dd-vite-hono-example build
+pnpm --filter dd-vite-hono-example smoke
+pnpm --filter dd-vite-hono-example typecheck
 ```
 
 The build emits a rewritten deployment config in `dist/dd.deploy.json` and a cache policy for fingerprinted assets in `dist/_headers`.

@@ -1,5 +1,5 @@
 {
-  "name": "dd-vite-ruwuter-example",
+  "name": "dd-vite-hono-example",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@mewhhaha/vite-plugin-dd": "workspace:*",
-    "@mewhhaha/ruwuter": "npm:@jsr/mewhhaha__ruwuter@0.4.0"
+    "hono": "^4.12.26"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.1",

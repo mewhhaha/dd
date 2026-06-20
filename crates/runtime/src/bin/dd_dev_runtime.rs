@@ -36,6 +36,36 @@ enum DevCommand {
         #[serde(default)]
         request_id: Option<String>,
     },
+    OpenWebsocket {
+        name: String,
+        method: String,
+        url: String,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+        #[serde(default)]
+        body_base64: String,
+        #[serde(default)]
+        request_id: Option<String>,
+    },
+    SendWebsocketFrame {
+        name: String,
+        session_id: String,
+        body_base64: String,
+        #[serde(default)]
+        binary: bool,
+    },
+    DrainWebsocketFrame {
+        name: String,
+        session_id: String,
+    },
+    CloseWebsocket {
+        name: String,
+        session_id: String,
+        #[serde(default = "default_websocket_close_code")]
+        code: u16,
+        #[serde(default)]
+        reason: String,
+    },
     Stats {
         name: String,
     },
@@ -70,10 +100,32 @@ enum CommandResult {
         headers: Vec<(String, String)>,
         body_base64: String,
     },
+    WebsocketOpen {
+        session_id: String,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body_base64: String,
+    },
+    WebsocketFrame {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body_base64: String,
+    },
+    WebsocketDrainFrame {
+        frame: Option<WorkerOutputEnvelope>,
+    },
+    WebsocketClose,
     Stats {
         stats: Option<WorkerStatsEnvelope>,
     },
     Shutdown,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerOutputEnvelope {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_base64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +259,52 @@ async fn handle_command(
                 headers: output.headers,
                 body_base64: base64::engine::general_purpose::STANDARD.encode(output.body),
             }),
+        DevCommand::OpenWebsocket {
+            name,
+            method,
+            url,
+            headers,
+            body_base64,
+            request_id,
+        } => open_websocket(service, name, method, url, headers, body_base64, request_id)
+            .await
+            .map(|opened| CommandResult::WebsocketOpen {
+                session_id: opened.session_id,
+                status: opened.output.status,
+                headers: opened.output.headers,
+                body_base64: base64::engine::general_purpose::STANDARD.encode(opened.output.body),
+            }),
+        DevCommand::SendWebsocketFrame {
+            name,
+            session_id,
+            body_base64,
+            binary,
+        } => match decode_base64_body(&body_base64) {
+            Ok(body) => service
+                .websocket_send_frame(name, session_id, body, binary)
+                .await
+                .map(|output| CommandResult::WebsocketFrame {
+                    status: output.status,
+                    headers: output.headers,
+                    body_base64: base64::engine::general_purpose::STANDARD.encode(output.body),
+                }),
+            Err(error) => Err(error),
+        },
+        DevCommand::DrainWebsocketFrame { name, session_id } => service
+            .websocket_drain_frame(name, session_id)
+            .await
+            .map(|frame| CommandResult::WebsocketDrainFrame {
+                frame: frame.map(WorkerOutputEnvelope::from),
+            }),
+        DevCommand::CloseWebsocket {
+            name,
+            session_id,
+            code,
+            reason,
+        } => service
+            .websocket_close(name, session_id, code, reason)
+            .await
+            .map(|()| CommandResult::WebsocketClose),
         DevCommand::Stats { name } => Ok(CommandResult::Stats {
             stats: service.stats(name).await.map(WorkerStatsEnvelope::from),
         }),
@@ -241,13 +339,7 @@ async fn invoke(
     body_base64: String,
     request_id: Option<String>,
 ) -> common::Result<WorkerOutput> {
-    let body = if body_base64.trim().is_empty() {
-        Vec::new()
-    } else {
-        base64::engine::general_purpose::STANDARD
-            .decode(body_base64)
-            .map_err(|error| PlatformError::bad_request(format!("invalid base64 body: {error}")))?
-    };
+    let body = decode_base64_body(&body_base64)?;
     service
         .invoke(
             name,
@@ -262,6 +354,44 @@ async fn invoke(
         .await
 }
 
+async fn open_websocket(
+    service: &RuntimeService,
+    name: String,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body_base64: String,
+    request_id: Option<String>,
+) -> common::Result<runtime::WebSocketOpen> {
+    let body = decode_base64_body(&body_base64)?;
+    service
+        .open_websocket(
+            name,
+            WorkerInvocation {
+                method,
+                url,
+                headers,
+                body,
+                request_id: request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            },
+            None,
+        )
+        .await
+}
+
+fn decode_base64_body(body_base64: &str) -> common::Result<Vec<u8>> {
+    if body_base64.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(body_base64)
+        .map_err(|error| PlatformError::bad_request(format!("invalid base64 body: {error}")))
+}
+
+fn default_websocket_close_code() -> u16 {
+    1000
+}
+
 fn error_kind(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::Unauthorized => "unauthorized",
@@ -272,6 +402,16 @@ fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Overloaded => "overloaded",
         ErrorKind::Runtime => "runtime",
         ErrorKind::Internal => "internal",
+    }
+}
+
+impl From<WorkerOutput> for WorkerOutputEnvelope {
+    fn from(output: WorkerOutput) -> Self {
+        Self {
+            status: output.status,
+            headers: output.headers,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(output.body),
+        }
     }
 }
 

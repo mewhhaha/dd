@@ -7,6 +7,10 @@
       {
         "type": "memory",
         "binding": "EXAMPLE_MEMORY"
+      },
+      {
+        "type": "kv",
+        "binding": "STORE_DB"
       }
     ]
   }
