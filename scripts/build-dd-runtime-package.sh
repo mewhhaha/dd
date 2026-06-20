@@ -10,23 +10,23 @@ if [ -z "$package_name" ]; then
 fi
 
 case "$package_name" in
-  @dd/runtime-linux-x64)
+  @mewhhaha/dd-linux-x64)
     default_target="x86_64-unknown-linux-gnu"
     binary_name="dd_dev_runtime"
     ;;
-  @dd/runtime-linux-arm64)
+  @mewhhaha/dd-linux-arm64)
     default_target="aarch64-unknown-linux-gnu"
     binary_name="dd_dev_runtime"
     ;;
-  @dd/runtime-darwin-x64)
+  @mewhhaha/dd-darwin-x64)
     default_target="x86_64-apple-darwin"
     binary_name="dd_dev_runtime"
     ;;
-  @dd/runtime-darwin-arm64)
+  @mewhhaha/dd-darwin-arm64)
     default_target="aarch64-apple-darwin"
     binary_name="dd_dev_runtime"
     ;;
-  @dd/runtime-win32-x64)
+  @mewhhaha/dd-win32-x64)
     default_target="x86_64-pc-windows-msvc"
     binary_name="dd_dev_runtime.exe"
     ;;
@@ -36,7 +36,7 @@ case "$package_name" in
     ;;
 esac
 
-package_dir="packages/dd-${package_name#@dd/}"
+package_dir="packages/dd-runtime-${package_name#@mewhhaha/dd-}"
 if [ ! -d "$package_dir" ]; then
   echo "runtime package directory not found: $package_dir" >&2
   exit 1

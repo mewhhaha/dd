@@ -28,7 +28,25 @@ export interface DdWorkerRuntimeOptions extends DdWorkerBundleOptions {
 
 export interface DdViteEnvironmentOptions {
   name?: string;
+  childEnvironments?: string[];
   options?: EnvironmentOptions;
+}
+
+export interface DdStaticRoutesOptions {
+  version?: number;
+  include?: string[];
+  exclude?: string[];
+}
+
+export type DdFrameworkName = "react-router" | "react-router-rsc";
+
+export interface DdFrameworkOptions {
+  name: DdFrameworkName;
+  buildDirectory?: string;
+  workerEntry?: string | URL;
+  serverEntry?: string | URL;
+  rscEntry?: string | URL;
+  asyncHooksShim?: string | URL | false;
 }
 
 export interface DdGeneratedDeploymentConfigOptions {
@@ -38,6 +56,7 @@ export interface DdGeneratedDeploymentConfigOptions {
   entrypoint?: string;
   assetsDir?: string | false;
   assetExcludes?: string[];
+  staticRoutes?: DdStaticRoutesOptions | false;
 }
 
 export interface DdVitePluginOptions extends DdWorkerRuntimeOptions {
@@ -48,6 +67,7 @@ export interface DdVitePluginOptions extends DdWorkerRuntimeOptions {
   environmentName?: string;
   environmentOptions?: EnvironmentOptions;
   reloadOnHotUpdate?: boolean | "all" | "entry";
+  devModuleRunner?: boolean;
   deploymentConfig?: false | DdGeneratedDeploymentConfigOptions;
   eager?: boolean;
 }

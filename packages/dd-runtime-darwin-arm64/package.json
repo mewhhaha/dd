@@ -1,5 +1,5 @@
 {
-  "name": "@dd/runtime-darwin-arm64",
+  "name": "@mewhhaha/dd-darwin-arm64",
   "version": "0.1.0",
   "description": "macOS arm64 dd dev runtime binary",
   "os": ["darwin"],

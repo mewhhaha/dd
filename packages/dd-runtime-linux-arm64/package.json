@@ -1,5 +1,5 @@
 {
-  "name": "@dd/runtime-linux-arm64",
+  "name": "@mewhhaha/dd-linux-arm64",
   "version": "0.1.0",
   "description": "Linux arm64 dd dev runtime binary",
   "os": ["linux"],

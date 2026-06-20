@@ -1,6 +1,13 @@
-import { createFetchableDevEnvironment, mergeConfig } from "vite";
+import {
+  createFetchableDevEnvironment,
+  createRunnableDevEnvironment,
+  fetchModule,
+  mergeConfig,
+} from "vite";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
 import { createWorkerTestRuntime } from "./vitest.js";
@@ -11,7 +18,19 @@ const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
 const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
 const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
 const DEFAULT_ASSET_HEADERS_FILE = "_headers";
+const DEFAULT_STATIC_ROUTES_FILE = "_routes.json";
 const DEFAULT_WORKER_NAME = "dev-worker";
+const DD_VITE_FRAMEWORK_BUILD_ONLY_ENV = "DD_VITE_FRAMEWORK_BUILD_ONLY";
+const DD_VITE_WORKER_BUNDLE_ENV = "DD_VITE_WORKER_BUNDLE";
+const REACT_ROUTER_FRAMEWORK = "react-router";
+const REACT_ROUTER_RSC_FRAMEWORK = "react-router-rsc";
+const DEFAULT_REACT_ROUTER_WORKER_ENTRY = "src/worker.ts";
+const DEFAULT_REACT_ROUTER_BUILD_DIRECTORY = "dist/react-router";
+const DEFAULT_REACT_ROUTER_RSC_BUILD_DIRECTORY = "dist/react-router-rsc";
+const DEFAULT_REACT_ROUTER_RSC_ASYNC_HOOKS_SHIM = "src/node-async-hooks.ts";
+const DEFAULT_REACT_ROUTER_RSC_ENTRY = "app/entry.rsc.ts";
+const DD_REACT_ROUTER_RSC_SERVER_MODULE = "virtual:dd-react-router-rsc-server";
+const DD_REACT_ROUTER_RSC_SERVER_RESOLVED = "\0dd:react-router-rsc-server";
 const FINGERPRINTED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const DD_VITE_BYPASS_HEADER = "x-dd-vite-bypass";
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
@@ -26,6 +45,10 @@ const VITE_BYPASS_PREFIXES = [
   "/app/",
   "/src/",
 ];
+const VITE_ANY_METHOD_BYPASS_PATHS = [
+  "/__vite_rsc_findSourceMapURL",
+  "/__vite_rsc_load_module_dev_proxy",
+];
 const VITE_BYPASS_QUERY_KEYS = new Set([
   "direct",
   "import",
@@ -39,10 +62,10 @@ const VITE_BYPASS_QUERY_KEYS = new Set([
 const VITE_BYPASS_FETCH_DESTINATIONS = new Set(["script", "style"]);
 
 export function ddEnvironment(options = {}) {
-  const environmentOptions = options.viteEnvironment?.options ?? options.environmentOptions ?? {};
+  const environmentOptions = ddEnvironmentUserOptions(options);
   return mergeConfig(
     {
-      consumer: "server",
+      ...ddEnvironmentBaseOptions(options),
       dev: {
         createEnvironment(name, config) {
           let runtimePromise;
@@ -66,17 +89,69 @@ export function ddEnvironment(options = {}) {
   );
 }
 
+function ddRunnableEnvironment(options = {}) {
+  const environmentOptions = ddEnvironmentUserOptions(options);
+  return mergeConfig(
+    {
+      ...ddEnvironmentBaseOptions(options),
+      dev: {
+        createEnvironment(name, config) {
+          return createRunnableDevEnvironment(name, config);
+        },
+      },
+    },
+    environmentOptions,
+  );
+}
+
+function ddEnvironmentUserOptions(options) {
+  return options.viteEnvironment?.options ?? options.environmentOptions ?? {};
+}
+
+function ddEnvironmentBaseOptions(options) {
+  const optimizeDepsEntries = arrayOfStrings(options.optimizeDepsEntries);
+  return {
+    consumer: "server",
+    resolve: {
+      noExternal: true,
+    },
+    optimizeDeps: {
+      noDiscovery: false,
+      ignoreOutdatedRequests: true,
+      ...(optimizeDepsEntries.length > 0 ? { entries: optimizeDepsEntries } : {}),
+    },
+  };
+}
+
 export function ddVitePlugin(options = {}) {
-  const environmentName = options.viteEnvironment?.name ?? options.environmentName ?? "dd";
+  if (
+    process.env[DD_VITE_WORKER_BUNDLE_ENV] === "1" ||
+    process.env[DD_VITE_FRAMEWORK_BUILD_ONLY_ENV] === "1"
+  ) {
+    return {
+      name: "dd-vite",
+    };
+  }
+
+  let viteCommand = "serve";
+  let resolvedConfig;
+  let devServer;
+  let rootHint;
+  const framework = normalizeFrameworkOptions(options.framework);
+  const viteEnvironment = mergeFrameworkViteEnvironment(framework, options.viteEnvironment);
+  const environmentName = viteEnvironment?.name ?? options.environmentName ?? "dd";
   const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
+  const childEnvironmentNames = arrayOfStrings(viteEnvironment?.childEnvironments);
   let runtime;
   let deployment;
   let deploying;
   const hotReloadMode = normalizeHotReloadMode(options.reloadOnHotUpdate);
-  const deploymentConfig = normalizeDeploymentConfigOptions(options.deploymentConfig);
+  const deploymentConfig = normalizeDeploymentConfigOptions(
+    mergeFrameworkDeploymentConfig(framework, options.deploymentConfig),
+  );
   let deploymentConfigWritten = false;
-  let resolvedConfig;
-  let rootHint;
+  let frameworkDevBuildComplete = false;
+  let frameworkDevBuildPromise;
   let sourceConfigRoot;
   let sourceConfigPromise;
 
@@ -100,7 +175,10 @@ export function ddVitePlugin(options = {}) {
     }
     const source = await sourceConfig();
     const entrypoint = nonEmptyString(source.config.entrypoint);
-    return entrypoint ? resolve(source.dir, entrypoint) : undefined;
+    if (entrypoint) {
+      return resolve(source.dir, entrypoint);
+    }
+    return framework ? resolveFrameworkPath(source.dir, framework.workerEntry) : undefined;
   }
 
   async function effectiveRuntimeConfig() {
@@ -124,13 +202,55 @@ export function ddVitePlugin(options = {}) {
     if (!entry) {
       throw new Error("ddVitePlugin requires either source or entry");
     }
+    if (framework) {
+      if (viteCommand === "serve" && devServer && options.devModuleRunner !== false) {
+        return viteModuleRunnerWorkerSource(devServer, entry, {
+          environmentName,
+          childEnvironmentNames,
+          root: resolveFrameworkRoot(),
+        });
+      }
+      return bundleFrameworkWorkerSource(framework, entry);
+    }
+    if (viteCommand === "serve" && devServer && options.devModuleRunner !== false) {
+      return viteModuleRunnerWorkerSource(devServer, entry, {
+        environmentName,
+        childEnvironmentNames,
+        root: resolveFrameworkRoot(),
+      });
+    }
     return bundleWorkerEntry(entry, {
-      viteConfig: options.viteConfig,
+      viteConfig: workerBundleViteConfig(),
       target: options.target,
       sourcemap: options.sourcemap,
       minify: options.minify,
       logLevel: options.logLevel,
     });
+  }
+
+  function workerBundleViteConfig() {
+    const projectConfig = {};
+    if (resolvedConfig?.root) {
+      projectConfig.root = resolvedConfig.root;
+    }
+    if (resolvedConfig?.configFile && options.viteConfig?.configFile !== false) {
+      projectConfig.configFile = resolvedConfig.configFile;
+    }
+    return mergeConfig(projectConfig, options.viteConfig ?? {});
+  }
+
+  async function bundledWorkerSource() {
+    const previous = process.env[DD_VITE_WORKER_BUNDLE_ENV];
+    process.env[DD_VITE_WORKER_BUNDLE_ENV] = "1";
+    try {
+      return await workerSource();
+    } finally {
+      if (previous === undefined) {
+        delete process.env[DD_VITE_WORKER_BUNDLE_ENV];
+      } else {
+        process.env[DD_VITE_WORKER_BUNDLE_ENV] = previous;
+      }
+    }
   }
 
   async function ensureDeployed() {
@@ -141,14 +261,14 @@ export function ddVitePlugin(options = {}) {
     const workerName = await effectiveWorkerName();
     const deployConfig = await effectiveRuntimeConfig();
     deploying ??= runtime
-      .deploy(workerName, await workerSource(), deployConfig)
+      .deploy(workerName, await bundledWorkerSource(), deployConfig)
       .catch(async (error) => {
         if (!isRecoverableRuntimeClientError(error)) {
           throw error;
         }
         await runtime?.close().catch(() => {});
         runtime = createDdRuntime(options.runtimeOptions);
-        return runtime.deploy(workerName, await workerSource(), deployConfig);
+        return runtime.deploy(workerName, await bundledWorkerSource(), deployConfig);
       })
       .finally(() => {
         deploying = undefined;
@@ -158,6 +278,7 @@ export function ddVitePlugin(options = {}) {
   }
 
   async function invalidateDeployment() {
+    frameworkDevBuildComplete = false;
     deployment = undefined;
     if (options.eager === true) {
       await ensureDeployed();
@@ -167,18 +288,50 @@ export function ddVitePlugin(options = {}) {
   return {
     name: "dd-vite",
     enforce: "pre",
-    async config(config) {
+    async config(config, env) {
+      viteCommand = env.command;
       if (options.environment === false) {
         return;
       }
       rootHint = resolve(config.root ?? process.cwd());
       const workerName = await effectiveWorkerName();
+      const workerEntry = await effectiveWorkerEntry();
+      const optimizeDepsEntries = workerEntry
+        ? [viteRequestForFile(workerEntry, rootHint)]
+        : [];
+      const frameworkResolveAlias = await frameworkDevResolveAlias(framework, rootHint);
       return {
+        ...(framework?.name === REACT_ROUTER_RSC_FRAMEWORK
+          ? {
+              rsc: {
+                loadModuleDevProxy: true,
+              },
+            }
+          : {}),
+        ...(frameworkResolveAlias
+          ? {
+              resolve: {
+                alias: frameworkResolveAlias,
+              },
+            }
+          : {}),
         environments: {
           [environmentName]: ddEnvironment({
             ...options,
+            viteEnvironment,
             name: workerName,
+            optimizeDepsEntries,
           }),
+          ...Object.fromEntries(
+            childEnvironmentNames.map((name) => [
+              name,
+              ddRunnableEnvironment({
+                ...options,
+                viteEnvironment: { ...(viteEnvironment ?? {}), name },
+                name: workerName,
+              }),
+            ]),
+          ),
         },
       };
     },
@@ -186,6 +339,7 @@ export function ddVitePlugin(options = {}) {
       resolvedConfig = config;
     },
     configureServer(viteServer) {
+      devServer = viteServer;
       viteServer.httpServer?.once("close", () => {
         void runtime?.close();
       });
@@ -203,8 +357,20 @@ export function ddVitePlugin(options = {}) {
             next();
             return;
           }
-          const workerName = await effectiveWorkerName();
           await ensureDeployed();
+          const staticRouting = await loadStaticRouting(
+            await sourceConfig(),
+            resolvedConfig,
+            deploymentConfig,
+          );
+          if (staticRouting && shouldBypassStaticRoutingRequest(req, originalUrl, mount, staticRouting)) {
+            if (await writeStaticAssetResponse(req, res, originalUrl, mount, staticRouting)) {
+              return;
+            }
+            next();
+            return;
+          }
+          const workerName = await effectiveWorkerName();
           const request = await nodeRequestToWorkerRequest(req, originalUrl, mount, workerName);
           const response = await runtime.fetch(workerName, request);
           await writeNodeResponse(res, response);
@@ -223,25 +389,74 @@ export function ddVitePlugin(options = {}) {
         await invalidateDeployment();
       }
     },
-    async writeBundle() {
-      if (
-        deploymentConfigWritten ||
-        !deploymentConfig.enabled ||
-        !(await hasReloadableWorkerSource(options, effectiveWorkerEntry))
-      ) {
+    renderStart: {
+      order: "post",
+      async handler() {
+        if (hasFrameworkBuildEnvironments(resolvedConfig)) {
+          return;
+        }
+        await writeDeploymentArtifacts();
+      },
+    },
+    async generateBundle() {
+      if (hasFrameworkBuildEnvironments(resolvedConfig)) {
         return;
       }
-      deploymentConfigWritten = true;
-      const outDir = resolveViteOutDir(resolvedConfig);
-      const workerFile = normalizeOutputPath(
-        deploymentConfig.entrypoint ?? DEFAULT_DEPLOYMENT_WORKER_FILE,
-        "deploymentConfig.entrypoint",
-      );
-      const configFile = normalizeOutputPath(
-        deploymentConfig.output ?? DEFAULT_DEPLOYMENT_CONFIG_FILE,
-        "deploymentConfig.output",
-      );
-      await writeOutputFile(outDir, workerFile, await workerSource());
+      await writeDeploymentArtifacts();
+    },
+    async writeBundle() {
+      if (hasFrameworkBuildEnvironments(resolvedConfig)) {
+        return;
+      }
+      await writeDeploymentArtifacts();
+    },
+    buildApp: {
+      order: "post",
+      async handler() {
+        await writeDeploymentArtifacts();
+      },
+    },
+    async closeBundle() {
+      if (!hasFrameworkBuildEnvironments(resolvedConfig)) {
+        await writeDeploymentArtifacts();
+      }
+      await runtime?.close();
+    },
+    resolveId(id) {
+      if (framework?.name === REACT_ROUTER_RSC_FRAMEWORK && id === DD_REACT_ROUTER_RSC_SERVER_MODULE) {
+        return DD_REACT_ROUTER_RSC_SERVER_RESOLVED;
+      }
+    },
+    load(id) {
+      if (id !== DD_REACT_ROUTER_RSC_SERVER_RESOLVED || framework?.name !== REACT_ROUTER_RSC_FRAMEWORK) {
+        return;
+      }
+      const root = resolveFrameworkRoot();
+      const entry = resolveFrameworkPath(root, framework.rscEntry);
+      const specifier = viteRequestForFile(entry, root);
+      return `export { default } from ${JSON.stringify(specifier)};\n`;
+    },
+  };
+
+  async function writeDeploymentArtifacts() {
+    const outDir = resolveViteOutDir(resolvedConfig);
+    const workerFile = normalizeOutputPath(
+      deploymentConfig.entrypoint ?? DEFAULT_DEPLOYMENT_WORKER_FILE,
+      "deploymentConfig.entrypoint",
+    );
+    const configFile = normalizeOutputPath(
+      deploymentConfig.output ?? DEFAULT_DEPLOYMENT_CONFIG_FILE,
+      "deploymentConfig.output",
+    );
+    if (!deploymentConfig.enabled || !(await hasReloadableWorkerSource(options, effectiveWorkerEntry))) {
+      return;
+    }
+    const artifactsExist =
+      deploymentConfigWritten &&
+      (await outputFileExists(outDir, workerFile)) &&
+      (await outputFileExists(outDir, configFile));
+    if (!artifactsExist) {
+      await writeOutputFile(outDir, workerFile, await bundledWorkerSource());
       const workerName = await effectiveWorkerName();
       const source = await sourceConfig();
       const config = await buildGeneratedDeploymentConfig({
@@ -252,17 +467,888 @@ export function ddVitePlugin(options = {}) {
         configFile,
         assetsDir: deploymentConfig.assetsDir,
         assetExcludes: deploymentConfig.assetExcludes,
+        staticRoutes: deploymentConfig.staticRoutes,
       });
       await writeOutputFile(outDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
-      await writeGeneratedAssetPolicy(outDir, resolvedConfig);
-    },
-    async closeBundle() {
-      if (deploymentConfigWritten && deploymentConfig.enabled) {
-        await writeGeneratedAssetPolicy(resolveViteOutDir(resolvedConfig), resolvedConfig);
+      deploymentConfigWritten = true;
+    }
+    await writeGeneratedStaticRoutes(outDir, deploymentConfig);
+    await writeGeneratedAssetPolicy(outDir, resolvedConfig, deploymentConfig.assetsDir);
+  }
+
+  async function bundleFrameworkWorkerSource(framework, entry) {
+    if (viteCommand === "serve") {
+      await ensureFrameworkDevBuild(framework);
+    }
+    return bundleWorkerEntry(entry, {
+      viteConfig: mergeConfig(
+        await frameworkWorkerViteConfig(framework),
+        options.viteConfig ?? {},
+      ),
+      target: options.target,
+      sourcemap: options.sourcemap,
+      minify: options.minify,
+      logLevel: options.logLevel,
+    });
+  }
+
+  async function ensureFrameworkDevBuild(framework) {
+    if (frameworkDevBuildComplete) {
+      return;
+    }
+    frameworkDevBuildPromise ??= buildFramework(framework, resolveFrameworkRoot())
+      .then(() => {
+        frameworkDevBuildComplete = true;
+      })
+      .finally(() => {
+        frameworkDevBuildPromise = undefined;
+      });
+    await frameworkDevBuildPromise;
+  }
+
+  async function frameworkWorkerViteConfig(framework) {
+    const root = resolveFrameworkRoot();
+    const alias = {
+      [framework.serverBuildModule]: frameworkServerEntry(framework, root),
+    };
+    if (framework.asyncHooksShim !== false) {
+      const asyncHooksShim = resolveFrameworkPath(root, framework.asyncHooksShim);
+      if (await fileExists(asyncHooksShim)) {
+        alias["node:async_hooks"] = asyncHooksShim;
+        alias.async_hooks = asyncHooksShim;
       }
-      await runtime?.close();
+    }
+    return {
+      define: {
+        "process.env.NODE_ENV": JSON.stringify("production"),
+      },
+      resolve: {
+        alias,
+      },
+    };
+  }
+
+  function resolveFrameworkRoot() {
+    return resolve(resolvedConfig?.root ?? rootHint ?? process.cwd());
+  }
+}
+
+async function frameworkDevResolveAlias(framework, root) {
+  if (!framework || framework.asyncHooksShim === false) {
+    return undefined;
+  }
+  const asyncHooksShim = resolveFrameworkPath(root, framework.asyncHooksShim);
+  if (!(await fileExists(asyncHooksShim))) {
+    return undefined;
+  }
+  return {
+    "node:async_hooks": asyncHooksShim,
+    async_hooks: asyncHooksShim,
+  };
+}
+
+function normalizeFrameworkOptions(value) {
+  if (value == null || value === false) {
+    return undefined;
+  }
+  const options = typeof value === "string" ? { name: value } : value;
+  const name = String(options.name ?? "");
+  switch (name) {
+    case REACT_ROUTER_FRAMEWORK:
+      return {
+        name,
+        buildDirectory: options.buildDirectory ?? DEFAULT_REACT_ROUTER_BUILD_DIRECTORY,
+        workerEntry: options.workerEntry ?? DEFAULT_REACT_ROUTER_WORKER_ENTRY,
+        serverEntry: options.serverEntry,
+        serverBuildModule: "virtual:react-router/server-build",
+        asyncHooksShim: false,
+        rscEntry: undefined,
+      };
+    case REACT_ROUTER_RSC_FRAMEWORK:
+      return {
+        name,
+        buildDirectory: options.buildDirectory ?? DEFAULT_REACT_ROUTER_RSC_BUILD_DIRECTORY,
+        workerEntry: options.workerEntry ?? DEFAULT_REACT_ROUTER_WORKER_ENTRY,
+        serverEntry: options.serverEntry,
+        serverBuildModule: DD_REACT_ROUTER_RSC_SERVER_MODULE,
+        asyncHooksShim: options.asyncHooksShim ?? DEFAULT_REACT_ROUTER_RSC_ASYNC_HOOKS_SHIM,
+        rscEntry: options.rscEntry ?? DEFAULT_REACT_ROUTER_RSC_ENTRY,
+      };
+    default:
+      throw new Error(
+        `ddVitePlugin framework must be "${REACT_ROUTER_FRAMEWORK}" or "${REACT_ROUTER_RSC_FRAMEWORK}"`,
+      );
+  }
+}
+
+function mergeFrameworkViteEnvironment(framework, viteEnvironment) {
+  if (!framework) {
+    return viteEnvironment;
+  }
+  const defaults =
+    framework.name === REACT_ROUTER_RSC_FRAMEWORK
+      ? { name: "rsc", childEnvironments: ["ssr"] }
+      : { name: "ssr" };
+  return {
+    ...defaults,
+    ...(viteEnvironment ?? {}),
+    childEnvironments: uniqueStrings([
+      ...arrayOfStrings(defaults.childEnvironments),
+      ...arrayOfStrings(viteEnvironment?.childEnvironments),
+    ]),
+  };
+}
+
+function mergeFrameworkDeploymentConfig(framework, deploymentConfig) {
+  if (!framework || deploymentConfig === false) {
+    return deploymentConfig;
+  }
+  const defaults = {
+    assetsDir: frameworkClientAssetsDir(framework),
+    staticRoutes: {
+      include: ["/*"],
+      exclude:
+        framework.name === REACT_ROUTER_RSC_FRAMEWORK
+          ? ["/assets/*", "/__manifest"]
+          : ["/assets/*"],
     },
   };
+  if (!deploymentConfig) {
+    return defaults;
+  }
+  return {
+    ...defaults,
+    ...deploymentConfig,
+    staticRoutes:
+      deploymentConfig.staticRoutes === undefined
+        ? defaults.staticRoutes
+        : deploymentConfig.staticRoutes,
+  };
+}
+
+function frameworkClientAssetsDir(framework) {
+  const buildDirectory = normalizeConfigRelativePath(
+    framework.buildDirectory,
+    "framework.buildDirectory",
+  );
+  const relativeBuildDirectory = buildDirectory === "dist"
+    ? ""
+    : buildDirectory.startsWith("dist/")
+      ? buildDirectory.slice("dist/".length)
+      : buildDirectory;
+  return joinConfigRelativePath(relativeBuildDirectory, "client");
+}
+
+function frameworkServerEntry(framework, root) {
+  return resolveFrameworkPath(
+    root,
+    framework.serverEntry ?? joinConfigRelativePath(framework.buildDirectory, "server/index.js"),
+  );
+}
+
+async function buildFramework(framework, root) {
+  await new Promise((resolveBuild, rejectBuild) => {
+    const child = spawn(process.execPath, [viteBinPath(root), "build"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        [DD_VITE_FRAMEWORK_BUILD_ONLY_ENV]: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      output += chunk;
+    });
+    child.on("error", rejectBuild);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolveBuild();
+        return;
+      }
+      rejectBuild(
+        new Error(
+          `${frameworkLabel(framework)} build failed with exit code ${code}\n${output}`,
+        ),
+      );
+    });
+  });
+}
+
+function frameworkLabel(framework) {
+  return framework.name === REACT_ROUTER_RSC_FRAMEWORK
+    ? "React Router RSC"
+    : "React Router";
+}
+
+function viteBinPath(root) {
+  const require = createRequire(join(root, "package.json"));
+  try {
+    return require.resolve("vite/bin/vite.js");
+  } catch {
+    return resolve(root, "node_modules/vite/bin/vite.js");
+  }
+}
+
+function resolveFrameworkPath(root, value) {
+  if (value instanceof URL) {
+    return fileURLToPath(value);
+  }
+  return isAbsolute(String(value)) ? String(value) : resolve(root, String(value));
+}
+
+function joinConfigRelativePath(...parts) {
+  return parts.filter((part) => String(part).length > 0).join("/");
+}
+
+async function fileExists(path) {
+  try {
+    return (await stat(path)).isFile();
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function viteModuleRunnerWorkerSource(viteServer, entry, options) {
+  const graph = await collectViteModuleRunnerGraph(viteServer, entry, options);
+  return renderViteModuleRunnerWorkerSource(graph);
+}
+
+async function collectViteModuleRunnerGraph(viteServer, entry, options) {
+  const root = resolve(options.root ?? viteServer.config.root);
+  const entryRequest = viteRequestForFile(entry, root);
+  const records = new Map();
+  const aliases = new Map();
+  const pending = new Map();
+  patchViteResolvedUrls(viteServer);
+  const environmentNames = uniqueStrings([
+    options.environmentName,
+    ...arrayOfStrings(options.childEnvironmentNames),
+  ]);
+
+  await Promise.all(
+    environmentNames.map(async (name) => {
+      await viteServer.environments[name]?.depsOptimizer?.init?.();
+    }),
+  );
+
+  const visit = async (environmentName, id, importer) => {
+    const environment = viteServer.environments[environmentName];
+    if (!environment) {
+      throw new Error(`ddVitePlugin could not find Vite environment "${environmentName}"`);
+    }
+
+    const requestKey = `${environmentName}\0${id}\0${importer ?? ""}`;
+    const pendingRequest = pending.get(requestKey);
+    if (pendingRequest) {
+      return pendingRequest;
+    }
+
+    const promise = (async () => {
+      let fetched;
+      try {
+        fetched = await fetchViteModule(environment, id, importer);
+      } catch (error) {
+        error.message = `ddVitePlugin failed to fetch ${JSON.stringify(id)} in Vite environment "${environmentName}"` +
+          (importer ? ` imported from ${JSON.stringify(importer)}` : "") +
+          `: ${error.message}`;
+        throw error;
+      }
+      const record = createViteRunnerRecord(environmentName, id, fetched, environment, viteServer);
+      addViteRunnerRecordAliases(record, aliases);
+
+      const existing = records.get(record.key);
+      if (existing) {
+        return existing.key;
+      }
+
+      if (record.externalize && !isSupportedViteRunnerExternal(record.externalize)) {
+        throw new Error(
+          `ddVitePlugin cannot run external module ${record.externalize} in the dd runtime` +
+            ` while loading ${JSON.stringify(record.id)}` +
+            (importer ? ` imported from ${JSON.stringify(importer)}` : "") +
+            ". " +
+            "Make sure the dd Vite environment uses resolve.noExternal/optimizeDeps so dependencies are transformed.",
+        );
+      }
+
+      records.set(record.key, record);
+
+      if (record.code) {
+        const importerId = record.file ?? record.id;
+        await Promise.all([
+          ...extractViteRunnerImports(record.code).map((specifier) =>
+            visit(environmentName, specifier, importerId),
+          ),
+          ...extractViteEnvironmentImports(record.code).map((dependency) =>
+            visit(dependency.environmentName, dependency.id, undefined),
+          ),
+        ]);
+      }
+
+      return record.key;
+    })();
+
+    pending.set(requestKey, promise);
+    try {
+      return await promise;
+    } finally {
+      pending.delete(requestKey);
+    }
+  };
+
+  const entryKey = await visit(options.environmentName, entryRequest, undefined);
+  return {
+    entryEnvironment: options.environmentName,
+    entryKey,
+    records: [...records.values()],
+    aliases: [...aliases.entries()],
+    devFetchOrigins: viteDevServerOrigins(viteServer),
+  };
+}
+
+async function fetchViteModule(environment, id, importer) {
+  const options = { inlineSourceMap: false };
+  if (typeof environment.fetchModule === "function") {
+    return environment.fetchModule(id, importer, options);
+  }
+  return fetchModule(environment, id, importer, options);
+}
+
+function createViteRunnerRecord(environmentName, requestedId, fetched, environment, viteServer) {
+  const id = fetched.id ?? fetched.externalize ?? requestedId;
+  const key = viteRunnerKey(environmentName, id);
+  return {
+    key,
+    environmentName,
+    requestedId,
+    id,
+    url: fetched.url ?? requestedId,
+    file: fetched.file,
+    code: rewriteViteRunnerCode(fetched.code, viteServer, id),
+    externalize: fetched.externalize,
+    type: fetched.type,
+    importMetaEnv: viteRunnerImportMetaEnv(environment),
+  };
+}
+
+function rewriteViteRunnerCode(code, viteServer, id) {
+  let rewritten = rewriteViteDevServerUrls(code, viteServer);
+  if (String(id).includes("virtual:vite-rsc/css?")) {
+    rewritten = rewriteViteRscCssVirtualModule(rewritten);
+  }
+  return rewritten;
+}
+
+function rewriteViteRscCssVirtualModule(code) {
+  if (!code?.includes("virtual:vite-rsc/remove-duplicate-server-css")) {
+    return code;
+  }
+  const importPattern =
+    /const\s+(__vite_ssr_import_\d+__)\s*=\s*await\s+__vite_ssr_import__\("\/@id\/__x00__virtual:vite-rsc\/remove-duplicate-server-css"[^;]*;\n*/;
+  const match = code.match(importPattern);
+  if (!match) {
+    return code;
+  }
+  return code
+    .replace(importPattern, "")
+    .split(`(0,${match[1]}.default)`)
+    .join("undefined");
+}
+
+function addViteRunnerRecordAliases(record, aliases) {
+  for (const value of [
+    record.id,
+    record.url,
+    record.file,
+    record.requestedId,
+    cleanViteRunnerId(record.id),
+    cleanViteRunnerId(record.url),
+    cleanViteRunnerId(record.file),
+    cleanViteRunnerId(record.requestedId),
+  ]) {
+    if (value) {
+      aliases.set(viteRunnerKey(record.environmentName, value), record.key);
+    }
+  }
+}
+
+function viteRunnerImportMetaEnv(environment) {
+  const config = environment.config;
+  return {
+    ...(config.env ?? {}),
+    BASE_URL: config.base ?? "/",
+    MODE: config.mode,
+    DEV: !config.isProduction,
+    PROD: Boolean(config.isProduction),
+    SSR: true,
+  };
+}
+
+function isSupportedViteRunnerExternal(value) {
+  const external = String(value);
+  return external.startsWith("data:") || external === "node:module";
+}
+
+function viteRunnerKey(environmentName, id) {
+  return `${environmentName}\0${id}`;
+}
+
+function cleanViteRunnerId(value) {
+  if (!value) {
+    return undefined;
+  }
+  const index = String(value).search(/[?#]/);
+  return index === -1 ? String(value) : String(value).slice(0, index);
+}
+
+function extractViteRunnerImports(code) {
+  const imports = new Set();
+  const pattern = /__vite_ssr_(?:dynamic_)?import__\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
+  for (const match of code.matchAll(pattern)) {
+    const value = parseJsStringLiteral(match[1]);
+    if (value && !isIgnorableViteRunnerImport(value)) {
+      imports.add(value);
+    }
+  }
+  const stringPattern = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g;
+  for (const match of code.matchAll(stringPattern)) {
+    const value = parseJsStringLiteral(match[0]);
+    const importExpression = String(value).match(/^import\((["'])(.*)\1\)$/);
+    if (importExpression && isLikelyViteModuleSpecifier(importExpression[2])) {
+      imports.add(importExpression[2]);
+      continue;
+    }
+    if (isLikelyViteModuleSpecifier(value)) {
+      imports.add(value);
+    }
+  }
+  return [...imports];
+}
+
+function isLikelyViteModuleSpecifier(value) {
+  const specifier = String(value ?? "");
+  if (isIgnorableViteRunnerImport(specifier)) {
+    return false;
+  }
+  if (specifier.startsWith("import(")) {
+    return false;
+  }
+  return (
+    specifier.startsWith("/@id/") ||
+    specifier.startsWith("/@fs/") ||
+    specifier.startsWith("/node_modules/.vite/") ||
+    specifier.startsWith("virtual:") ||
+    specifier.includes("virtual:vite-rsc")
+  );
+}
+
+function isIgnorableViteRunnerImport(value) {
+  const specifier = String(value ?? "");
+  return (
+    specifier === "\0" ||
+    specifier === "/@id/__x00__" ||
+    (specifier.includes("virtual:vite-rsc/css?") && !specifier.includes("type=")) ||
+    (specifier.includes("virtual:vite-rsc/reference-validation?") && !specifier.includes("type=")) ||
+    specifier.trim() === ""
+  );
+}
+
+function extractViteEnvironmentImports(code) {
+  const imports = [];
+  const pattern =
+    /__VITE_ENVIRONMENT_RUNNER_IMPORT__\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*,\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
+  for (const match of code.matchAll(pattern)) {
+    const environmentName = parseJsStringLiteral(match[1]);
+    const id = parseJsStringLiteral(match[2]);
+    if (environmentName && id) {
+      imports.push({ environmentName, id });
+    }
+  }
+  return imports;
+}
+
+function parseJsStringLiteral(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value.slice(1, -1).replace(/\\(['"\\])/g, "$1");
+  }
+}
+
+function renderViteModuleRunnerWorkerSource(graph) {
+  const payload = {
+    entryEnvironment: graph.entryEnvironment,
+    entryKey: graph.entryKey,
+    records: graph.records,
+    aliases: graph.aliases,
+    devFetchOrigins: graph.devFetchOrigins,
+  };
+  return `${VITE_MODULE_RUNNER_WORKER_BOOTSTRAP}
+const __ddViteGraph = ${JSON.stringify(payload)};
+const __ddViteEntry = await __ddViteImportGraph(__ddViteGraph);
+export default __ddViteEntry;
+`;
+}
+
+const VITE_MODULE_RUNNER_WORKER_BOOTSTRAP = `
+const __ddViteAsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
+async function __ddViteImportGraph(graph) {
+  const records = new Map(graph.records.map((record) => [record.key, record]));
+  const aliases = new Map(graph.aliases);
+  const cache = new Map();
+  const devFetchOrigins = new Set(graph.devFetchOrigins ?? []);
+  const nodeModuleShim = Object.freeze({
+    createRequire(url) {
+      const require = (id) => {
+        throw new Error("createRequire(" + url + ") cannot load " + id + " in the dd Vite dev runner");
+      };
+      require.resolve = require;
+      return require;
+    },
+  });
+  const emptyVirtualKey = "__dd_vite_empty_virtual_module__";
+  const emptyCssVirtualKey = "__dd_vite_empty_css_virtual_module__";
+  records.set(emptyVirtualKey, {
+    key: emptyVirtualKey,
+    environmentName: graph.entryEnvironment,
+    id: emptyVirtualKey,
+    url: emptyVirtualKey,
+    code: "",
+    importMetaEnv: graph.records[0]?.importMetaEnv ?? {},
+  });
+  records.set(emptyCssVirtualKey, {
+    key: emptyCssVirtualKey,
+    environmentName: graph.entryEnvironment,
+    id: emptyCssVirtualKey,
+    url: emptyCssVirtualKey,
+    code: "__vite_ssr_exportName__(\\"default\\", () => []);",
+    importMetaEnv: graph.records[0]?.importMetaEnv ?? {},
+  });
+  const firstEnv = graph.records[0]?.importMetaEnv ?? {};
+  const nodeEnv = firstEnv.PROD ? "production" : "development";
+  globalThis.process ??= { env: {} };
+  globalThis.process.env ??= {};
+  globalThis.process.env.NODE_ENV ??= nodeEnv;
+  if (typeof globalThis.TextEncoderStream === "undefined") {
+    globalThis.TextEncoderStream = class TextEncoderStream {
+      constructor() {
+        const encoder = new TextEncoder();
+        const transform = new TransformStream({
+          transform(chunk, controller) {
+            controller.enqueue(encoder.encode(String(chunk)));
+          },
+        });
+        this.readable = transform.readable;
+        this.writable = transform.writable;
+      }
+    };
+  }
+  if (typeof globalThis.TextDecoderStream === "undefined") {
+    globalThis.TextDecoderStream = class TextDecoderStream {
+      constructor(label = "utf-8", options = {}) {
+        const decoder = new TextDecoder(label, options);
+        const transform = new TransformStream({
+          transform(chunk, controller) {
+            controller.enqueue(decoder.decode(chunk, { stream: true }));
+          },
+          flush(controller) {
+            const tail = decoder.decode();
+            if (tail) controller.enqueue(tail);
+          },
+        });
+        this.readable = transform.readable;
+        this.writable = transform.writable;
+      }
+    };
+  }
+  function installDevFetchBridge() {
+    const rawHostFetch = globalThis.__dd_raw_host_fetch ?? globalThis.__dd_deno_runtime?.fetch;
+    if (devFetchOrigins.size === 0 || !rawHostFetch || globalThis.fetch?.__ddViteDevFetchBridge) {
+      return;
+    }
+    const policyFetch = globalThis.fetch;
+    const bridge = (input, init) => {
+      try {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (devFetchOrigins.has(url.origin)) {
+          return rawHostFetch(input, init);
+        }
+      } catch {
+        // Fall through to the policy fetch.
+      }
+      return policyFetch(input, init);
+    };
+    Object.defineProperty(bridge, "__ddViteDevFetchBridge", { value: true });
+    globalThis.fetch = bridge;
+  }
+
+  function clean(id) {
+    const value = String(id);
+    const index = value.search(/[?#]/);
+    return index === -1 ? value : value.slice(0, index);
+  }
+
+  function normalizePath(path) {
+    const absolute = path.startsWith("/");
+    const parts = path.split("/");
+    const out = [];
+    for (const part of parts) {
+      if (!part || part === ".") continue;
+      if (part === "..") out.pop();
+      else out.push(part);
+    }
+    return (absolute ? "/" : "") + out.join("/");
+  }
+
+  function dirname(path) {
+    const cleaned = clean(path);
+    const index = cleaned.lastIndexOf("/");
+    return index === -1 ? "" : cleaned.slice(0, index);
+  }
+
+  function resolveRelative(base, specifier) {
+    if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
+      return specifier;
+    }
+    return normalizePath(dirname(base) + "/" + specifier);
+  }
+
+  function resolveKey(environmentName, id, importerKey) {
+    if (records.has(String(id))) {
+      return String(id);
+    }
+    const importer = importerKey ? records.get(importerKey) : undefined;
+    const raw = String(id);
+    const resolved = importer ? resolveRelative(importer.url || importer.id, raw) : raw;
+    const candidates = [resolved, clean(resolved)];
+    if (resolved.startsWith("/@fs/")) {
+      candidates.push(resolved.slice("/@fs".length), clean(resolved.slice("/@fs".length)));
+    }
+    for (const candidate of candidates) {
+      const aliasKey = environmentName + "\\0" + candidate;
+      const key = aliases.get(aliasKey) ?? aliasKey;
+      if (records.has(key)) {
+        return key;
+      }
+    }
+    if (raw.includes("virtual:vite-rsc/")) {
+      if (raw.includes("virtual:vite-rsc/reference-validation?")) {
+        return emptyVirtualKey;
+      }
+      if (raw.includes("virtual:vite-rsc/css?") && !raw.includes("type=")) {
+        return emptyCssVirtualKey;
+      }
+      for (const candidate of candidates) {
+        const suffix = "\\0" + candidate;
+        for (const [aliasKey, key] of aliases) {
+          if (aliasKey.endsWith(suffix) && records.has(key)) {
+            return key;
+          }
+        }
+      }
+    }
+    throw new Error("dd Vite module runner could not resolve " + raw + " in " + environmentName);
+  }
+
+  async function load(environmentName, id, importerKey) {
+    const key = resolveKey(environmentName, id, importerKey);
+    const record = records.get(key);
+    if (record.externalize) {
+      if (record.externalize === "node:module") {
+        return nodeModuleShim;
+      }
+      return import(record.externalize);
+    }
+
+    const cached = cache.get(key);
+    if (cached?.evaluated) {
+      return cached.exports;
+    }
+    if (cached?.promise) {
+      return cached.executing ? cached.exports : cached.promise;
+    }
+
+    const exports = Object.create(null);
+    Object.defineProperty(exports, Symbol.toStringTag, {
+      value: "Module",
+      enumerable: false,
+      configurable: false,
+    });
+
+    const state = { exports, evaluated: false, executing: true, promise: undefined };
+    cache.set(key, state);
+
+    const request = (specifier) => load(record.environmentName, String(specifier), key);
+    const dynamicRequest = (specifier) => load(record.environmentName, String(specifier), key);
+    const exportAll = (sourceModule) => {
+      if (
+        sourceModule == null ||
+        exports === sourceModule ||
+        typeof sourceModule !== "object" && typeof sourceModule !== "function"
+      ) {
+        return;
+      }
+      for (const name of Object.keys(sourceModule)) {
+        if (name === "default" || name === "__esModule" || name in exports) continue;
+        Object.defineProperty(exports, name, {
+          enumerable: true,
+          configurable: true,
+          get: () => sourceModule[name],
+        });
+      }
+    };
+    const exportName = (name, getter) => {
+      Object.defineProperty(exports, name, {
+        enumerable: true,
+        configurable: true,
+        get: getter,
+      });
+    };
+
+    globalThis.__VITE_ENVIRONMENT_RUNNER_IMPORT__ = (targetEnvironmentName, targetId) =>
+      load(String(targetEnvironmentName), String(targetId), undefined);
+
+    const meta = {
+      url: record.url || record.id,
+      env: { ...(record.importMetaEnv || {}) },
+      dirname: dirname(record.file || record.id),
+      filename: record.file || record.id,
+      resolve(specifier) {
+        return specifier;
+      },
+      glob() {
+        throw new Error("import.meta.glob is not available in the dd Vite dev runner");
+      },
+    };
+
+    state.promise = (async () => {
+      try {
+        await new __ddViteAsyncFunction(
+          "__vite_ssr_exports__",
+          "__vite_ssr_import_meta__",
+          "__vite_ssr_import__",
+          "__vite_ssr_dynamic_import__",
+          "__vite_ssr_exportAll__",
+          "__vite_ssr_exportName__",
+          "\\"use strict\\";\\n" + record.code,
+        )(exports, meta, request, dynamicRequest, exportAll, exportName);
+        Object.seal(exports);
+        state.evaluated = true;
+        return exports;
+      } finally {
+        state.executing = false;
+      }
+    })();
+
+    return state.promise;
+  }
+
+  const entry = await load(graph.entryEnvironment, graph.entryKey, undefined);
+  const worker = entry.default ?? entry;
+  if (!worker || typeof worker.fetch !== "function") {
+    throw new Error("dd Vite module runner entry did not export a Worker fetch handler");
+  }
+  return {
+    ...worker,
+    fetch(...args) {
+      installDevFetchBridge();
+      return worker.fetch(...args);
+    },
+  };
+}
+`;
+
+function viteRequestForFile(file, root) {
+  const normalizedRoot = toVitePath(resolve(root));
+  const normalizedFile = toVitePath(isAbsolute(String(file)) ? String(file) : resolve(root, String(file)));
+  if (normalizedFile === normalizedRoot) {
+    return "/";
+  }
+  if (normalizedFile.startsWith(`${normalizedRoot}/`)) {
+    return `/${normalizedFile.slice(normalizedRoot.length + 1)}`;
+  }
+  return `/@fs/${normalizedFile}`;
+}
+
+function viteDevServerOrigins(viteServer) {
+  const origins = new Set();
+  for (const url of viteDevServerUrlCandidates(viteServer)) {
+    try {
+      origins.add(new URL(url).origin);
+    } catch {
+      // Ignore malformed debug URLs.
+    }
+  }
+  origins.add("http://127.0.0.1:5173");
+  origins.add("http://localhost:5173");
+  return [...origins];
+}
+
+function rewriteViteDevServerUrls(code, viteServer) {
+  if (!code) {
+    return code;
+  }
+  const actual = viteDevServerActualUrl(viteServer);
+  if (!actual) {
+    return code;
+  }
+  let rewritten = code;
+  for (const candidate of viteDevServerUrlCandidates(viteServer)) {
+    if (candidate !== actual) {
+      rewritten = rewritten.split(candidate).join(actual);
+    }
+  }
+  return rewritten;
+}
+
+function viteDevServerUrlCandidates(viteServer) {
+  const urls = [];
+  for (const entries of Object.values(viteServer.resolvedUrls ?? {})) {
+    urls.push(...(entries ?? []));
+  }
+  const actual = viteDevServerActualUrl(viteServer);
+  if (actual) {
+    urls.push(actual);
+    urls.push("http://127.0.0.1:5173/");
+    urls.push("http://localhost:5173/");
+  }
+  return uniqueStrings(urls);
+}
+
+function viteDevServerActualUrl(viteServer) {
+  const address = viteServer.httpServer?.address?.();
+  if (address && typeof address === "object") {
+    const protocol = viteServer.config.server.https ? "https" : "http";
+    return `${protocol}://127.0.0.1:${address.port}/`;
+  }
+  return undefined;
+}
+
+function patchViteResolvedUrls(viteServer) {
+  const actual = viteDevServerActualUrl(viteServer);
+  if (!actual) {
+    return;
+  }
+  viteServer.resolvedUrls ??= { local: [], network: [] };
+  viteServer.resolvedUrls.local ??= [];
+  if (viteServer.resolvedUrls.local[0] !== actual) {
+    viteServer.resolvedUrls.local = [
+      actual,
+      ...viteServer.resolvedUrls.local.filter((url) => url !== actual),
+    ];
+  }
+}
+
+function toVitePath(value) {
+  return String(value).replace(/\\/g, "/");
 }
 
 async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
@@ -343,12 +1429,16 @@ function shouldBypassViteRequest(req, originalUrl, mount, viteBase) {
     return true;
   }
 
+  const url = new URL(originalUrl, "http://dd-vite.local");
+  if (candidatePathnames(url.pathname, viteBase).some(isViteAnyMethodBypassPath)) {
+    return true;
+  }
+
   const method = (req.method ?? "GET").toUpperCase();
   if (method !== "GET" && method !== "HEAD") {
     return false;
   }
 
-  const url = new URL(originalUrl, "http://dd-vite.local");
   if (candidatePathnames(url.pathname, viteBase).some(isViteBypassPath)) {
     return true;
   }
@@ -380,6 +1470,10 @@ function isViteBypassPath(pathname) {
   });
 }
 
+function isViteAnyMethodBypassPath(pathname) {
+  return VITE_ANY_METHOD_BYPASS_PATHS.includes(pathname);
+}
+
 function normalizeViteBase(value) {
   if (typeof value !== "string" || value.length === 0 || value === "./") {
     return "/";
@@ -399,6 +1493,153 @@ function headerValue(value) {
     return value[0] ?? "";
   }
   return value ?? "";
+}
+
+function shouldBypassStaticRoutingRequest(req, originalUrl, mount, routing) {
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    return false;
+  }
+  const url = new URL(stripMount(originalUrl, mount), "http://dd-vite.local");
+  if (matchesAnyStaticRoute(routing.exclude, url.pathname)) {
+    return true;
+  }
+  return routing.include.length > 0 && !matchesAnyStaticRoute(routing.include, url.pathname);
+}
+
+async function writeStaticAssetResponse(req, res, originalUrl, mount, routing) {
+  const method = (req.method ?? "GET").toUpperCase();
+  let pathname;
+  try {
+    pathname = decodeURIComponent(new URL(stripMount(originalUrl, mount), "http://dd-vite.local").pathname);
+  } catch {
+    return false;
+  }
+
+  const assetRoot = resolve(routing.dir);
+  const file = resolve(assetRoot, pathname.replace(/^\/+/, ""));
+  if (file === assetRoot || !file.startsWith(`${assetRoot}${sep}`)) {
+    return false;
+  }
+
+  let fileStat;
+  try {
+    fileStat = await stat(file);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return false;
+    }
+    throw error;
+  }
+  if (!fileStat.isFile()) {
+    return false;
+  }
+
+  const body = method === "HEAD" ? undefined : await readFile(file);
+  res.statusCode = 200;
+  res.setHeader("content-type", staticAssetContentType(file));
+  res.setHeader("cache-control", "no-store");
+  res.setHeader("content-length", String(fileStat.size));
+  res.end(body);
+  return true;
+}
+
+async function loadStaticRouting(source, viteConfig, deploymentConfig) {
+  const configured = staticRoutingFromDeploymentConfig(viteConfig, deploymentConfig);
+  if (configured) {
+    return configured;
+  }
+  for (const path of await staticRoutingCandidatePaths(source, viteConfig)) {
+    try {
+      const contents = await readFile(path, "utf8");
+      const routes = JSON.parse(contents);
+      return {
+        dir: dirname(path),
+        include: arrayOfStrings(routes?.include),
+        exclude: arrayOfStrings(routes?.exclude),
+      };
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+    }
+  }
+  return undefined;
+}
+
+function staticRoutingFromDeploymentConfig(viteConfig, deploymentConfig) {
+  const routes = deploymentConfig.staticRoutes;
+  if (!routes) {
+    return undefined;
+  }
+  const assetsDir = deploymentAssetsOutputDir(
+    resolveViteOutDir(viteConfig),
+    deploymentConfig.assetsDir,
+  );
+  if (!assetsDir) {
+    return undefined;
+  }
+  return {
+    dir: assetsDir,
+    include: arrayOfStrings(routes.include),
+    exclude: arrayOfStrings(routes.exclude),
+  };
+}
+
+async function staticRoutingCandidatePaths(source, viteConfig) {
+  const outDir = resolveViteOutDir(viteConfig);
+  const paths = [];
+  const sourceAssetsDir = nonEmptyString(source.config.assets_dir);
+  if (sourceAssetsDir) {
+    paths.push(join(source.dir, sourceAssetsDir, DEFAULT_STATIC_ROUTES_FILE));
+  }
+  const generatedConfigPath = join(outDir, DEFAULT_DEPLOYMENT_CONFIG_FILE);
+  try {
+    const generatedConfig = JSON.parse(await readFile(generatedConfigPath, "utf8"));
+    const generatedAssetsDir = nonEmptyString(generatedConfig?.assets_dir);
+    if (generatedAssetsDir) {
+      paths.push(join(outDir, generatedAssetsDir, DEFAULT_STATIC_ROUTES_FILE));
+    }
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+  }
+  paths.push(join(outDir, DEFAULT_STATIC_ROUTES_FILE));
+  return [...new Set(paths)];
+}
+
+function matchesAnyStaticRoute(patterns, pathname) {
+  return patterns.some((pattern) => matchesStaticRoute(pattern, pathname));
+}
+
+function matchesStaticRoute(pattern, pathname) {
+  const normalized = String(pattern).startsWith("/") ? String(pattern) : `/${pattern}`;
+  const regex = new RegExp(`^${normalized.split("*").map(escapeRegex).join(".*")}$`);
+  return regex.test(pathname);
+}
+
+function escapeRegex(value) {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+}
+
+function staticAssetContentType(file) {
+  switch (extname(file)) {
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+    case ".mjs":
+      return "text/javascript; charset=utf-8";
+    case ".json":
+    case ".map":
+      return "application/json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml";
+    default:
+      return "application/octet-stream";
+  }
 }
 
 function normalizeFile(value) {
@@ -459,22 +1700,61 @@ function resolveViteOutDir(config) {
   return isAbsolute(outDir) ? outDir : resolve(root, outDir);
 }
 
+function hasFrameworkBuildEnvironments(config) {
+  return Boolean(config?.environments?.ssr || config?.environments?.rsc);
+}
+
 async function writeOutputFile(outDir, file, contents) {
   const path = join(outDir, file);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, contents);
 }
 
-async function writeGeneratedAssetPolicy(outDir, config) {
+async function outputFileExists(outDir, file) {
+  try {
+    return (await stat(join(outDir, file))).isFile();
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function writeGeneratedStaticRoutes(outDir, deploymentConfig) {
+  const routes = deploymentConfig.staticRoutes;
+  if (!routes) {
+    return;
+  }
+  const assetsOutDir = deploymentAssetsOutputDir(outDir, deploymentConfig.assetsDir);
+  if (!assetsOutDir) {
+    return;
+  }
+  await writeOutputFile(
+    assetsOutDir,
+    DEFAULT_STATIC_ROUTES_FILE,
+    `${JSON.stringify({
+      version: routes.version ?? 1,
+      include: arrayOfStrings(routes.include),
+      exclude: arrayOfStrings(routes.exclude),
+    }, null, 2)}\n`,
+  );
+}
+
+async function writeGeneratedAssetPolicy(outDir, config, deploymentAssetsDir) {
+  const assetsOutDir = deploymentAssetsOutputDir(outDir, deploymentAssetsDir);
+  if (!assetsOutDir) {
+    return;
+  }
   const assetsDir = normalizeConfigRelativePath(
     config?.build?.assetsDir ?? "assets",
     "build.assetsDir",
   );
-  const assetPaths = new Set(await findGeneratedAssetPaths(outDir));
-  if (assetsDir === "." || (await directoryExists(join(outDir, assetsDir)))) {
+  const assetPaths = new Set(await findGeneratedAssetPaths(assetsOutDir));
+  if (assetsDir === "." || (await directoryExists(join(assetsOutDir, assetsDir)))) {
     assetPaths.add(assetsDir === "." ? "/*" : `/${assetsDir}/*`);
   }
-  const headersPath = join(outDir, DEFAULT_ASSET_HEADERS_FILE);
+  const headersPath = join(assetsOutDir, DEFAULT_ASSET_HEADERS_FILE);
   let existing = "";
   try {
     existing = await readFile(headersPath, "utf8");
@@ -495,9 +1775,22 @@ async function writeGeneratedAssetPolicy(outDir, config) {
 
   const prefix = existing.trimEnd();
   await writeOutputFile(
-    outDir,
+    assetsOutDir,
     DEFAULT_ASSET_HEADERS_FILE,
     prefix.length > 0 ? `${prefix}\n\n${rules.join("\n")}` : rules.join("\n"),
+  );
+}
+
+function deploymentAssetsOutputDir(outDir, assetsDir) {
+  if (assetsDir === false) {
+    return undefined;
+  }
+  return join(
+    outDir,
+    normalizeConfigRelativePath(
+      assetsDir ?? DEFAULT_DEPLOYMENT_ASSETS_DIR,
+      "deploymentConfig.assetsDir",
+    ),
   );
 }
 
@@ -551,6 +1844,7 @@ async function buildGeneratedDeploymentConfig({
   configFile,
   assetsDir,
   assetExcludes,
+  staticRoutes,
 }) {
   const deployment = { ...base };
   const runtimeConfig =
@@ -573,6 +1867,7 @@ async function buildGeneratedDeploymentConfig({
   deployment.asset_excludes = uniquePaths([
     ...arrayOfStrings(deployment.asset_excludes),
     ...arrayOfStrings(assetExcludes),
+    ...(staticRoutes ? [DEFAULT_STATIC_ROUTES_FILE] : []),
     workerFile,
     configFile,
   ]);
@@ -663,6 +1958,10 @@ function arrayOfStrings(value) {
     return [];
   }
   return value.map((entry) => String(entry));
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values)];
 }
 
 function uniquePaths(paths) {

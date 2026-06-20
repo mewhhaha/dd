@@ -89,10 +89,10 @@ This path does not start `dd_server` or a separate private control-plane server.
 The JS helper launches `dd_dev_runtime`, then sends JSON commands over stdio to
 deploy and invoke workers through `RuntimeService` directly.
 
-`@dd/vite` can use the optional `@dd/runtime` wrapper package. That wrapper has
-platform-specific optional dependencies such as `@dd/runtime-linux-x64`,
-`@dd/runtime-linux-arm64`, `@dd/runtime-darwin-arm64`, and
-`@dd/runtime-win32-x64`, so package managers install only the runtime binary for
+`@mewhhaha/vite-plugin-dd` can use the optional `@mewhhaha/dd` wrapper package. That wrapper has
+platform-specific optional dependencies such as `@mewhhaha/dd-linux-x64`,
+`@mewhhaha/dd-linux-arm64`, `@mewhhaha/dd-darwin-arm64`, and
+`@mewhhaha/dd-win32-x64`, so package managers install only the runtime binary for
 the current `os` and `cpu`. In this source checkout, the JS client still falls
 back to `cargo run -p runtime --bin dd_dev_runtime` when no packaged binary is
 installed.
@@ -101,7 +101,7 @@ Vitest example:
 
 ```js
 import { afterAll, expect, test } from "vitest";
-import { createWorkerTestRuntime } from "@dd/vite/vitest";
+import { createWorkerTestRuntime } from "@mewhhaha/vite-plugin-dd/vitest";
 
 const worker = await createWorkerTestRuntime({
   entry: new URL("./src/worker.js", import.meta.url),
@@ -119,7 +119,7 @@ Vite example:
 
 ```js
 import { defineConfig } from "vite";
-import dd from "@dd/vite";
+import dd from "@mewhhaha/vite-plugin-dd";
 
 export default defineConfig({
   plugins: [
@@ -144,23 +144,24 @@ During Vite hot updates, the plugin leaves Vite's normal browser and framework
 HMR path alone, discards the deployed worker, and lazily rebuilds it on the next
 worker request.
 
-For frameworks that own the SSR environment, bind `dd` to the same environment
-name:
+For React Router framework mode, use the dedicated subpath preset:
 
 ```js
 import { reactRouter } from "@react-router/dev/vite";
 import { defineConfig } from "vite";
-import ddWorker from "@dd/vite";
+import ddReactRouter from "@mewhhaha/vite-plugin-dd/react-router";
 
 export default defineConfig({
   plugins: [
-    ddWorker({
-      viteEnvironment: { name: "ssr" },
-    }),
+    ddReactRouter(),
     reactRouter(),
   ],
 });
 ```
+
+React Router RSC uses `@mewhhaha/vite-plugin-dd/react-router-rsc`, which sets
+up the dd-backed `rsc` environment and runnable `ssr` child environment expected
+by `@vitejs/plugin-rsc`.
 
 This follows the same broad direction as Cloudflare's Vite plugin integration:
 use Vite's Environment API and let full-stack frameworks merge with their SSR

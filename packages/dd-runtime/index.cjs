@@ -1,11 +1,11 @@
 "use strict";
 
 const RUNTIME_PACKAGES = {
-  "darwin:arm64": "@dd/runtime-darwin-arm64",
-  "darwin:x64": "@dd/runtime-darwin-x64",
-  "linux:arm64": "@dd/runtime-linux-arm64",
-  "linux:x64": "@dd/runtime-linux-x64",
-  "win32:x64": "@dd/runtime-win32-x64",
+  "darwin:arm64": "@mewhhaha/dd-darwin-arm64",
+  "darwin:x64": "@mewhhaha/dd-darwin-x64",
+  "linux:arm64": "@mewhhaha/dd-linux-arm64",
+  "linux:x64": "@mewhhaha/dd-linux-x64",
+  "win32:x64": "@mewhhaha/dd-win32-x64",
 };
 
 function runtimePackageName(options = {}) {

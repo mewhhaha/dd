@@ -9,7 +9,7 @@
     "smoke": "node smoke.mjs"
   },
   "dependencies": {
-    "@dd/vite": "workspace:*",
+    "@mewhhaha/vite-plugin-dd": "workspace:*",
     "@mewhhaha/ruwuter": "npm:@jsr/mewhhaha__ruwuter@0.4.0"
   },
   "devDependencies": {

@@ -196,20 +196,21 @@ invokes it directly from Vitest helpers or a Vite plugin.
 This is the debug/dev path where `eval` and `new Function` are allowed. It is
 not a production control plane.
 
-`@dd/vite` can use `@dd/runtime`, a small wrapper with platform-specific optional
+`@mewhhaha/vite-plugin-dd` can use `@mewhhaha/dd`, a small wrapper with platform-specific optional
 runtime packages, so installs pull only the binary for the current OS/CPU.
 
 The Vite plugin uses Vite's Environment API shape and preserves normal Vite HMR;
 hot updates invalidate the deployed worker and rebuild it lazily on the next
-worker request. Framework SSR environments can be targeted with
-`viteEnvironment: { name: "ssr" }`.
+worker request. Framework integrations use subpath presets such as
+`@mewhhaha/vite-plugin-dd/react-router` and
+`@mewhhaha/vite-plugin-dd/react-router-rsc`.
 
 During `vite build`, the plugin emits `dist/dd.deploy.json` and a bundled
 `dist/worker.js`. The generated config preserves deploy settings while pointing
 at the bundled worker and Vite output assets.
 
-`@dd/vite` has a default plugin export, so configs can use any local name:
-`import dd from "@dd/vite"`. By default it reads `dd.json` from the nearest
+`@mewhhaha/vite-plugin-dd` has a default plugin export, so configs can use any local name:
+`import dd from "@mewhhaha/vite-plugin-dd"`. By default it reads `dd.json` from the nearest
 package root for the worker name, source entrypoint, and deploy config; inline
 plugin options override that file.
 

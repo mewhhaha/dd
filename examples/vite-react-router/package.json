@@ -9,9 +9,8 @@
     "smoke": "node smoke.mjs"
   },
   "dependencies": {
-    "@dd/vite": "workspace:*",
+    "@mewhhaha/vite-plugin-dd": "workspace:*",
     "@react-router/dev": "^8.0.1",
-    "@react-router/node": "^8.0.1",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-router": "^8.0.1"

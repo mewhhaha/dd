@@ -1,5 +1,5 @@
 {
-  "name": "@dd/runtime-win32-x64",
+  "name": "@mewhhaha/dd-win32-x64",
   "version": "0.1.0",
   "description": "Windows x64 dd dev runtime binary",
   "os": ["win32"],

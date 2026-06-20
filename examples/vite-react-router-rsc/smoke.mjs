@@ -44,13 +44,14 @@ try {
   }
 
   const cssHref = appText.match(/href="([^"]+\.css(?:\?[^"]*)?)"/)?.[1];
-  if (!cssHref) {
-    throw new Error(`React Router RSC response did not include a CSS asset link: ${appText}`);
-  }
-  const cssResponse = await fetch(new URL(cssHref, base));
-  const cssText = await cssResponse.text();
-  if (!cssText.includes(".dd-stm-badge") || !cssText.includes("tailwindcss")) {
-    throw new Error(`Tailwind CSS request did not render through the Vite plugin: ${cssText}`);
+  if (cssHref) {
+    const cssResponse = await fetch(new URL(cssHref, base));
+    const cssText = await cssResponse.text();
+    if (!cssText.includes(".dd-stm-badge") || !cssText.includes("tailwindcss")) {
+      throw new Error(`Tailwind CSS request did not render through the Vite plugin: ${cssText}`);
+    }
+  } else if (!appText.includes(".dd-stm-badge") || !appText.includes("tailwindcss")) {
+    throw new Error(`React Router RSC response did not include Tailwind CSS: ${appText}`);
   }
 
   const viteClientResponse = await fetch(`${base}/@vite/client`);

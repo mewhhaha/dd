@@ -1,6 +1,6 @@
 # Vite Ruwuter Example
 
-Minimal TypeScript example for `@dd/vite` using `@mewhhaha/ruwuter` from JSR.
+Minimal TypeScript example for `@mewhhaha/vite-plugin-dd` using `@mewhhaha/ruwuter` from JSR.
 
 It uses `dd()` with the default root mount, so normal app requests to the Vite
 dev server hit the worker while Vite's own module/HMR requests bypass it.

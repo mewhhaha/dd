@@ -1,12 +1,12 @@
 import { Link, type LoaderFunctionArgs } from "react-router";
-import { ddRequestContext } from "../dd-context";
+import { getDdRequestContext } from "../dd-context";
 
 export function meta({ params }: { params: { slug?: string } }) {
   return [{ title: `Project ${params.slug ?? "unknown"}` }];
 }
 
-export async function loader({ context, params }: LoaderFunctionArgs) {
-  const dd = context.get(ddRequestContext);
+export async function loader({ context, params, request }: LoaderFunctionArgs) {
+  const dd = getDdRequestContext(context, request);
   return {
     slug: params.slug ?? "unknown",
     stmCount: await dd.incrementStmRequestCount(),

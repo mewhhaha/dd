@@ -1,10 +1,6 @@
 import type { ReactNode } from "react";
 import { Link, Links, Meta, Outlet, ScrollRestoration } from "react-router";
-import tailwindHref from "./tailwind.css?url";
-
-export function links() {
-  return [{ rel: "stylesheet", href: tailwindHref }];
-}
+import "./tailwind.css";
 
 const styles = `
   :root {

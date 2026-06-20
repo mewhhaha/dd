@@ -1,11 +1,19 @@
 {
-  "name": "@dd/vite",
+  "name": "@mewhhaha/vite-plugin-dd",
   "version": "0.1.0",
   "type": "module",
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
+    },
+    "./react-router": {
+      "types": "./src/react-router.d.ts",
+      "default": "./src/react-router.js"
+    },
+    "./react-router-rsc": {
+      "types": "./src/react-router-rsc.d.ts",
+      "default": "./src/react-router-rsc.js"
     },
     "./runtime": {
       "types": "./src/index.d.ts",
@@ -33,6 +41,6 @@
     }
   },
   "optionalDependencies": {
-    "@dd/runtime": "0.1.0"
+    "@mewhhaha/dd": "0.1.0"
   }
 }

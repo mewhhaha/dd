@@ -1,6 +1,6 @@
-# @dd/runtime
+# @mewhhaha/dd
 
-Small platform selector for the `dd_dev_runtime` binary used by `@dd/vite`.
+Small platform selector for the `dd_dev_runtime` binary used by `@mewhhaha/vite-plugin-dd`.
 
 This package follows the same shape as `workerd`: it is a tiny wrapper with
 platform-specific optional dependencies. Package managers install only the

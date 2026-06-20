@@ -315,7 +315,7 @@ function runtimeCommand(options) {
   const repoRoot = findRepoRoot(options.cwd ?? process.cwd());
   if (!repoRoot) {
     throw new Error(
-      "No dd dev runtime binary found. Install @dd/runtime, set DD_DEV_RUNTIME_BIN, or run inside a dd source checkout.",
+      "No dd dev runtime binary found. Install @mewhhaha/dd, set DD_DEV_RUNTIME_BIN, or run inside a dd source checkout.",
     );
   }
   return {
@@ -327,7 +327,7 @@ function runtimeCommand(options) {
 
 function packagedRuntimeBinary() {
   try {
-    const runtime = require("@dd/runtime");
+    const runtime = require("@mewhhaha/dd");
     return runtime.runtimeBinaryPath();
   } catch {
     return undefined;

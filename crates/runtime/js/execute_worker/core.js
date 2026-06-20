@@ -1008,6 +1008,12 @@ globalThis.__dd_execute_worker = (payload) => {
     if (typeof previousFetch !== "function") {
       throw new TypeError("fetch is not available in this runtime");
     }
+    Object.defineProperty(globalThis, "__dd_raw_host_fetch", {
+      value: previousFetch,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
     const scopedFetch = async (inputValue, initValue = undefined) => {
       const run = async () => {
         const current = currentRequestContext();

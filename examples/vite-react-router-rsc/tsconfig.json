@@ -7,9 +7,6 @@
     "moduleResolution": "Bundler",
     "noEmit": true,
     "paths": {
-      "@react-router/dev/config/default-rsc-entries/entry.client": [
-        "./app/entry.client.tsx"
-      ],
       "@react-router/dev/config/default-rsc-entries/entry.rsc": [
         "./app/default-rsc-entry.d.ts"
       ]

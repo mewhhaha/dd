@@ -1,19 +1,19 @@
-# @dd/vite
+# @mewhhaha/vite-plugin-dd
 
 Vite and Vitest helpers for running `dd` workers against the native runtime in
 debug/dev mode. The helpers do not start a private `dd_server`; they launch
 `dd_dev_runtime` as a stdio child process and send deploy/invoke commands
 directly to `RuntimeService`.
 
-`@dd/vite` optionally installs `@dd/runtime`, which selects a platform-specific
-binary package such as `@dd/runtime-linux-x64` or `@dd/runtime-darwin-arm64`.
+`@mewhhaha/vite-plugin-dd` optionally installs `@mewhhaha/dd`, which selects a platform-specific
+binary package such as `@mewhhaha/dd-linux-x64` or `@mewhhaha/dd-darwin-arm64`.
 Package managers install only the runtime package matching the current platform.
 
 ## Vitest
 
 ```js
 import { afterAll, expect, test } from "vitest";
-import { createWorkerTestRuntime } from "@dd/vite/vitest";
+import { createWorkerTestRuntime } from "@mewhhaha/vite-plugin-dd/vitest";
 
 const worker = await createWorkerTestRuntime({
   entry: new URL("./src/worker.js", import.meta.url),
@@ -31,7 +31,7 @@ test("responds through the real dd runtime", async () => {
 
 ```js
 import { defineConfig } from "vite";
-import dd from "@dd/vite";
+import dd from "@mewhhaha/vite-plugin-dd";
 
 export default defineConfig({
   plugins: [
@@ -43,8 +43,10 @@ export default defineConfig({
 App requests to the Vite dev server are invoked through the native runtime by
 default, so `localhost:5173/anything` behaves like the eventual deployed worker.
 Vite's own HMR, module, and source requests bypass the worker so the dev client
-keeps working. On hot updates the plugin discards the deployed worker and lazily
-rebuilds it on the next worker request.
+keeps working. In dev, the plugin asks Vite for module-runner transformed worker
+modules and evaluates that graph inside the dd worker, so framework examples do
+not need a separate dev-time server-build step. On hot updates the plugin
+discards the deployed worker and lazily rebuilds it on the next worker request.
 
 The default export is the Vite plugin factory, so you can name it whatever fits
 your config. The named `ddVitePlugin` export remains available. If the package
@@ -60,7 +62,7 @@ development requests shaped like deployed worker requests.
 
 ```js
 import { defineConfig } from "vite";
-import dd from "@dd/vite";
+import dd from "@mewhhaha/vite-plugin-dd";
 
 export default defineConfig({
   plugins: [
@@ -74,6 +76,32 @@ Advanced integrations can rename the registered Vite environment with
 worker behind a subpath. Those options are intentionally unnecessary for the
 workspace examples: app traffic goes through dd, while Vite-owned module, HMR,
 and source requests bypass the worker.
+
+Framework examples can use subpath presets instead of wiring the framework
+server build by hand:
+
+```js
+import ddReactRouter from "@mewhhaha/vite-plugin-dd/react-router";
+
+export default defineConfig({
+  plugins: [
+    ddReactRouter(),
+  ],
+});
+```
+
+For React Router RSC, import
+`@mewhhaha/vite-plugin-dd/react-router-rsc`. The presets set the Vite
+environment names, configure React Router's server-build virtual module, keep
+Vite's internal RSC dev proxy endpoints out of the worker middleware, and point
+the generated deployment config at the framework client assets. The RSC preset
+uses a dd-backed `rsc` environment with a runnable `ssr` child environment,
+matching the shape expected by `@vitejs/plugin-rsc`.
+
+If a project uses non-standard React Router paths, pass `buildDirectory`,
+`workerEntry`, `serverEntry`, or, for RSC, `rscEntry` directly to the subpath
+plugin. Set `devModuleRunner: false` to fall back to the production-style
+bundled worker path during Vite dev.
 
 ## Build output
 
@@ -138,7 +166,7 @@ Runtime binary resolution order:
 
 1. `runtimeOptions.binary`
 2. `DD_DEV_RUNTIME_BIN`
-3. the optional `@dd/runtime` platform binary
+3. the optional `@mewhhaha/dd` platform binary
 4. `cargo run -p runtime --bin dd_dev_runtime` when running inside this source checkout
 
 Packaged runtime binaries are built for small install size, not maximum runtime

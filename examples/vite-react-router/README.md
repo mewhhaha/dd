@@ -1,6 +1,12 @@
 # Vite React Router Example
 
-This workspace example uses React Router framework mode through `@react-router/dev/vite`, then runs the generated server build inside the local `dd` runtime during Vite development. Vite still serves its own module graph, client runtime, and React Router development endpoints.
+This workspace example uses React Router framework mode through
+`@react-router/dev/vite`, then runs the worker inside the local `dd` runtime
+during Vite development via
+`@mewhhaha/vite-plugin-dd/react-router`. The dd plugin uses Vite's
+module-runner transforms in dev, so there is no extra React Router server-build
+shim in the example config. Vite still serves its own module graph, client
+runtime, and React Router development endpoints.
 
 The worker binds `EXAMPLE_MEMORY` and passes it through React Router's request
 context. The project route loader increments an STM-backed request counter with
@@ -16,4 +22,10 @@ pnpm --filter dd-vite-react-router-example build
 pnpm --filter dd-vite-react-router-example smoke
 ```
 
-The build emits a rewritten deployment config in `dist/dd.deploy.json` and a cache policy for fingerprinted assets in `dist/_headers`.
+The generated production deployment config points at the bundled dd worker entry and the React Router client asset directory:
+
+```text
+dist/worker.js
+dist/dd.deploy.json
+dist/react-router/client/
+```
