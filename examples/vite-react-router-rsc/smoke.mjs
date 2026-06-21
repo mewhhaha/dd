@@ -80,8 +80,20 @@ try {
     headers: { "sec-fetch-dest": "script" },
   });
   const moduleText = await moduleResponse.text();
-  if (moduleText.includes("<html") || moduleText.includes("Edge Goods RSC")) {
+  const moduleContentType = moduleResponse.headers.get("content-type") ?? "";
+  if (
+    moduleContentType.toLowerCase().includes("text/html") ||
+    moduleText.includes("<!doctype") ||
+    moduleText.includes("<html")
+  ) {
     throw new Error(`Vite module request returned the app shell: ${moduleText}`);
+  }
+  if (
+    !/(?:java|ecma)script/i.test(moduleContentType) ||
+    !moduleText.includes("export function ServerLayout") ||
+    !moduleText.includes("/app/tailwind.css")
+  ) {
+    throw new Error(`Vite module request did not return the transformed root module: ${moduleText}`);
   }
 
   const cssHref = appText.match(/href="([^"]+\.css(?:\?[^"]*)?)"/)?.[1];

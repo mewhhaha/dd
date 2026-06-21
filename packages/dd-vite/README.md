@@ -131,10 +131,10 @@ export default defineConfig({
 
 If `dd.json` points at a TypeScript entrypoint or source asset directory, the
 generated output config replaces those with the bundled worker path and Vite
-output asset path while preserving fields such as `name`, `config`, and custom
-metadata. Non-secret deploy settings such as `base_url` are preserved too, so
-`dd deploy-config dist/dd.deploy.json` can pick the target server from the
-generated config.
+output asset path while preserving the deploy fields the CLI consumes: `name`,
+`config`, `base_url`, and `temporary`. Arbitrary source config keys are not
+copied into `dist/dd.deploy.json`, so local-only settings do not leak into build
+artifacts.
 
 Pass options inline when you want to override the file:
 

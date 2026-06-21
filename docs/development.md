@@ -179,13 +179,13 @@ dist/worker.js
 
 By default, the plugin uses root `dd.json` as the source config. That file can
 point at `src/worker.ts` and source assets. The generated output config
-preserves `name`, `config`, and custom metadata, then replaces `entrypoint` with
-the bundled worker path and `assets_dir` with the Vite output directory. It also
-excludes the generated worker and config file from static asset packaging.
-Fields such as `base_url` are carried into `dist/dd.deploy.json`, so the CLI can
-deploy the generated config without a separate `--server`. The plugin also
-writes `dist/_headers` with an immutable cache policy for Vite's fingerprinted
-build assets, such as `/assets/*`.
+preserves only the deploy fields the CLI consumes, such as `name`, `config`,
+`base_url`, and `temporary`, then replaces `entrypoint` with the bundled worker
+path and `assets_dir` with the Vite output directory. It also excludes the
+generated worker and config file from static asset packaging. Arbitrary
+source-only config keys are not copied into `dist/dd.deploy.json`. The plugin
+also writes `dist/_headers` with an immutable cache policy for Vite's
+fingerprinted build assets, such as `/assets/*`.
 
 ```js
 dd({

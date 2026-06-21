@@ -97,7 +97,29 @@ try {
     throw new Error(`Hono client module did not import fixi-js: ${moduleText}`);
   }
 
+  for (const [path, expected] of [
+    ["/app/status", "worker app namespace"],
+    ["/app/status?url=https%3A%2F%2Fexample.test", "worker app namespace"],
+    ["/app/v1.0", "worker app version route"],
+    ["/src/status", "worker src namespace"],
+    ["/src/status?raw", "worker src namespace"],
+    ["/search?url=https%3A%2F%2Fexample.test", "worker search https://example.test"],
+  ]) {
+    const response = await fetch(`${base}${path}`);
+    const text = await response.text();
+    if (text !== expected) {
+      throw new Error(`worker route ${path} was swallowed by Vite bypass: ${text}`);
+    }
+  }
+
+  const streamResponse = await fetch(`${base}/api/stream`);
+  const streamText = await streamResponse.text();
+  if (streamResponse.headers.has("content-length") || streamText !== "first\nsecond\n") {
+    throw new Error(`worker stream was not forwarded as a stream: ${streamText}`);
+  }
+
   await assertLiveSocket(base, "vite-hono");
+  await assertLiveSocket(base, "vite-hono", "/api/cart/live?token=worker-smoke");
   await assertLiveSocket(localhostBase(base), "vite-hono");
 } finally {
   await server.close();
@@ -124,9 +146,9 @@ function stripRendererComments(text) {
   return text.replace(/<!--\s*-->/g, "");
 }
 
-function assertLiveSocket(base, workerName) {
+function assertLiveSocket(base, workerName, path = "/api/cart/live") {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${base.replace(/^http/, "ws")}/api/cart/live`);
+    const socket = new WebSocket(`${base.replace(/^http/, "ws")}${path}`);
     const timeout = setTimeout(() => {
       socket.close();
       reject(new Error(`timed out waiting for ${workerName} cart websocket`));

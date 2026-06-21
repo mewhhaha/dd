@@ -50,6 +50,8 @@ const VITE_BYPASS_PREFIXES = [
   "/__vitest_test__/",
   "/node_modules/",
   "/.vite/",
+];
+const VITE_SOURCE_PREFIXES = [
   "/app/",
   "/src/",
 ];
@@ -57,17 +59,6 @@ const VITE_ANY_METHOD_BYPASS_PATHS = [
   "/__vite_rsc_findSourceMapURL",
   "/__vite_rsc_load_module_dev_proxy",
 ];
-const VITE_BYPASS_QUERY_KEYS = new Set([
-  "direct",
-  "import",
-  "inline",
-  "raw",
-  "sharedworker",
-  "url",
-  "used",
-  "worker",
-]);
-const VITE_BYPASS_FETCH_DESTINATIONS = new Set(["script", "style"]);
 const WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_DEV_WEBSOCKET_FRAME_BYTES = 8 * 1024 * 1024;
 const DD_WS_BINARY_HEADER = "x-dd-ws-binary";
@@ -109,9 +100,12 @@ export class AsyncLocalStorage {
   }
 }
 `;
+let workerBundleEnvDepth = 0;
+let workerBundleEnvPrevious;
 
 export function ddEnvironment(options = {}) {
   const environmentOptions = ddEnvironmentUserOptions(options);
+  const runtimeOptions = ddEnvironmentRuntimeOptions(options);
   return mergeConfig(
     {
       ...ddEnvironmentBaseOptions(options),
@@ -120,8 +114,8 @@ export function ddEnvironment(options = {}) {
           let runtimePromise;
           const getRuntime = () => {
             runtimePromise ??= createWorkerTestRuntime({
-              ...options,
-              name: options.name ?? name,
+              ...runtimeOptions,
+              name: runtimeOptions.name ?? name,
             });
             return runtimePromise;
           };
@@ -154,7 +148,27 @@ function ddRunnableEnvironment(options = {}) {
 }
 
 function ddEnvironmentUserOptions(options) {
-  return options.viteEnvironment?.options ?? options.environmentOptions ?? {};
+  return mergeConfig(
+    options.environmentOptions ?? {},
+    options.viteEnvironment?.options ?? {},
+  );
+}
+
+function ddEnvironmentRuntimeOptions(options) {
+  return {
+    name: options.name,
+    entry: options.entry,
+    source: options.source,
+    config: options.config,
+    runtime: options.runtime,
+    runtimeOptions: options.runtimeOptions,
+    autoDeploy: options.autoDeploy,
+    viteConfig: options.viteConfig,
+    target: options.target,
+    sourcemap: options.sourcemap,
+    minify: options.minify,
+    logLevel: options.logLevel,
+  };
 }
 
 function ddEnvironmentBaseOptions(options) {
@@ -170,6 +184,27 @@ function ddEnvironmentBaseOptions(options) {
       ...(optimizeDepsEntries.length > 0 ? { entries: optimizeDepsEntries } : {}),
     },
   };
+}
+
+async function withWorkerBundleEnv(callback) {
+  if (workerBundleEnvDepth === 0) {
+    workerBundleEnvPrevious = process.env[DD_VITE_WORKER_BUNDLE_ENV];
+    process.env[DD_VITE_WORKER_BUNDLE_ENV] = "1";
+  }
+  workerBundleEnvDepth += 1;
+  try {
+    return await callback();
+  } finally {
+    workerBundleEnvDepth -= 1;
+    if (workerBundleEnvDepth === 0) {
+      if (workerBundleEnvPrevious === undefined) {
+        delete process.env[DD_VITE_WORKER_BUNDLE_ENV];
+      } else {
+        process.env[DD_VITE_WORKER_BUNDLE_ENV] = workerBundleEnvPrevious;
+      }
+      workerBundleEnvPrevious = undefined;
+    }
+  }
 }
 
 export function ddVitePlugin(options = {}) {
@@ -207,6 +242,10 @@ export function ddVitePlugin(options = {}) {
   let reactRouterRscClientUpdateFile;
   let sourceConfigRoot;
   let sourceConfigPromise;
+  let environmentWorkerName;
+  let environmentWorkerEntry;
+  let environmentRuntimeConfig;
+  let environmentOptimizeDepsEntries = [];
 
   async function sourceConfig() {
     const root = resolve(resolvedConfig?.root ?? rootHint ?? process.cwd());
@@ -256,12 +295,12 @@ export function ddVitePlugin(options = {}) {
       throw new Error("ddVitePlugin requires either source or entry");
     }
     if (framework) {
-      if (viteCommand === "serve" && devServer && options.devModuleRunner !== false) {
+      if (viteCommand === "serve" && devServer && shouldUseDevModuleRunner()) {
         return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions());
       }
       return bundleFrameworkWorkerSource(framework, entry);
     }
-    if (viteCommand === "serve" && devServer && options.devModuleRunner !== false) {
+    if (viteCommand === "serve" && devServer && shouldUseDevModuleRunner()) {
       return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions());
     }
     return bundleWorkerEntry(entry, {
@@ -285,17 +324,7 @@ export function ddVitePlugin(options = {}) {
   }
 
   async function bundledWorkerSource() {
-    const previous = process.env[DD_VITE_WORKER_BUNDLE_ENV];
-    process.env[DD_VITE_WORKER_BUNDLE_ENV] = "1";
-    try {
-      return await workerSource();
-    } finally {
-      if (previous === undefined) {
-        delete process.env[DD_VITE_WORKER_BUNDLE_ENV];
-      } else {
-        process.env[DD_VITE_WORKER_BUNDLE_ENV] = previous;
-      }
-    }
+    return withWorkerBundleEnv(workerSource);
   }
 
   async function ensureDeployed() {
@@ -346,11 +375,18 @@ export function ddVitePlugin(options = {}) {
     };
   }
 
+  function shouldUseDevModuleRunner() {
+    if (options.devModuleRunner === false) {
+      return false;
+    }
+    return framework?.name !== REACT_ROUTER_RSC_FRAMEWORK || options.devModuleRunner === true;
+  }
+
   async function updateViteModuleRunnerDeployment() {
     if (
       viteCommand !== "serve" ||
       !devServer ||
-      options.devModuleRunner === false ||
+      !shouldUseDevModuleRunner() ||
       !deployment ||
       !runtime ||
       deploymentRuntimeGeneration !== runtime.generation
@@ -388,53 +424,64 @@ export function ddVitePlugin(options = {}) {
 
   return {
     name: "dd-vite",
-    enforce: "pre",
-    async config(config, env) {
-      viteCommand = env.command;
+    config: {
+      order: "post",
+      async handler(config, env) {
+        viteCommand = env.command;
+        if (options.environment === false) {
+          return;
+        }
+        rootHint = resolve(config.root ?? process.cwd());
+        environmentWorkerName = await effectiveWorkerName();
+        environmentWorkerEntry = await effectiveWorkerEntry();
+        environmentRuntimeConfig = await effectiveRuntimeConfig();
+        environmentOptimizeDepsEntries = environmentWorkerEntry
+          ? [viteRequestForFile(environmentWorkerEntry, rootHint)]
+          : [];
+        const frameworkResolveAlias = await frameworkDevResolveAlias(framework, rootHint);
+        return {
+          ...(framework?.name === REACT_ROUTER_RSC_FRAMEWORK
+            ? {
+                rsc: {
+                  loadModuleDevProxy: true,
+                },
+              }
+            : {}),
+          ...(frameworkResolveAlias
+            ? {
+                resolve: {
+                  alias: frameworkResolveAlias,
+                },
+              }
+            : {}),
+          environments: registeredEnvironmentOptions([
+            environmentName,
+            ...childEnvironmentNames,
+          ]),
+        };
+      },
+    },
+    configEnvironment(name) {
       if (options.environment === false) {
         return;
       }
-      rootHint = resolve(config.root ?? process.cwd());
-      const workerName = await effectiveWorkerName();
-      const workerEntry = await effectiveWorkerEntry();
-      const optimizeDepsEntries = workerEntry
-        ? [viteRequestForFile(workerEntry, rootHint)]
-        : [];
-      const frameworkResolveAlias = await frameworkDevResolveAlias(framework, rootHint);
-      return {
-        ...(framework?.name === REACT_ROUTER_RSC_FRAMEWORK
-          ? {
-              rsc: {
-                loadModuleDevProxy: true,
-              },
-            }
-          : {}),
-        ...(frameworkResolveAlias
-          ? {
-              resolve: {
-                alias: frameworkResolveAlias,
-              },
-            }
-          : {}),
-        environments: {
-          [environmentName]: ddEnvironment({
-            ...options,
-            viteEnvironment,
-            name: workerName,
-            optimizeDepsEntries,
-          }),
-          ...Object.fromEntries(
-            childEnvironmentNames.map((name) => [
-              name,
-              ddRunnableEnvironment({
-                ...options,
-                viteEnvironment: { ...(viteEnvironment ?? {}), name },
-                name: workerName,
-              }),
-            ]),
-          ),
-        },
-      };
+      if (name === environmentName) {
+        return ddEnvironment({
+          ...options,
+          viteEnvironment,
+          name: environmentWorkerName,
+          entry: environmentWorkerEntry,
+          config: environmentRuntimeConfig,
+          optimizeDepsEntries: environmentOptimizeDepsEntries,
+        });
+      }
+      if (childEnvironmentNames.includes(name)) {
+        return ddRunnableEnvironment({
+          ...options,
+          viteEnvironment: { ...(viteEnvironment ?? {}), name },
+          name: environmentWorkerName,
+        });
+      }
     },
     configResolved(config) {
       resolvedConfig = config;
@@ -513,20 +560,20 @@ export function ddVitePlugin(options = {}) {
     renderStart: {
       order: "post",
       async handler() {
-        if (hasFrameworkBuildEnvironments(resolvedConfig)) {
+        if (hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
           return;
         }
         await writeDeploymentArtifacts();
       },
     },
     async generateBundle() {
-      if (hasFrameworkBuildEnvironments(resolvedConfig)) {
+      if (hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
         return;
       }
       await writeDeploymentArtifacts();
     },
     async writeBundle() {
-      if (hasFrameworkBuildEnvironments(resolvedConfig)) {
+      if (hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
         return;
       }
       await writeDeploymentArtifacts();
@@ -538,7 +585,7 @@ export function ddVitePlugin(options = {}) {
       },
     },
     async closeBundle() {
-      if (!hasFrameworkBuildEnvironments(resolvedConfig)) {
+      if (!hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
         await writeDeploymentArtifacts();
       }
       await runtime?.close();
@@ -777,6 +824,10 @@ function mergeFrameworkViteEnvironment(framework, viteEnvironment) {
       ...arrayOfStrings(viteEnvironment?.childEnvironments),
     ]),
   };
+}
+
+function registeredEnvironmentOptions(names) {
+  return Object.fromEntries(uniqueStrings(names).map((name) => [name, {}]));
 }
 
 function mergeFrameworkDeploymentConfig(framework, deploymentConfig) {
@@ -1157,9 +1208,9 @@ function extractViteEnvironmentImports(code) {
 
 function parseJsStringLiteral(value) {
   try {
-    return JSON.parse(value);
+    return Function(`"use strict";return (${value});`)();
   } catch {
-    return value.slice(1, -1).replace(/\\(['"\\])/g, "$1");
+    return undefined;
   }
 }
 
@@ -1319,19 +1370,23 @@ async function __ddViteImportGraph(graph) {
     if (resolved.startsWith("/@fs/")) {
       candidates.push(resolved.slice("/@fs".length), clean(resolved.slice("/@fs".length)));
     }
-    for (const candidate of candidates) {
+    const recordKey = (candidate) => {
       const aliasKey = environmentName + "\\0" + candidate;
       const key = aliases.get(aliasKey) ?? aliasKey;
-      if (records.has(key)) {
+      return records.has(key) ? key : undefined;
+    };
+    if (raw.includes("virtual:vite-rsc/css?")) {
+      return recordKey(resolved) ?? emptyCssVirtualKey;
+    }
+    for (const candidate of candidates) {
+      const key = recordKey(candidate);
+      if (key) {
         return key;
       }
     }
     if (raw.includes("virtual:vite-rsc/")) {
       if (raw.includes("virtual:vite-rsc/reference-validation?")) {
         return emptyVirtualKey;
-      }
-      if (raw.includes("virtual:vite-rsc/css?") && !raw.includes("type=")) {
-        return emptyCssVirtualKey;
       }
       for (const candidate of candidates) {
         const suffix = "\\0" + candidate;
@@ -1633,7 +1688,6 @@ async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
 }
 
 async function writeNodeResponse(res, response) {
-  const body = Buffer.from(await response.arrayBuffer());
   res.statusCode = response.status;
   response.headers.forEach((value, name) => {
     const lower = name.toLowerCase();
@@ -1642,8 +1696,54 @@ async function writeNodeResponse(res, response) {
     }
     res.setHeader(name, value);
   });
-  res.setHeader("content-length", String(body.length));
-  res.end(body);
+  if (!response.body) {
+    res.setHeader("content-length", "0");
+    res.end();
+    return;
+  }
+  for await (const chunk of response.body) {
+    if (res.destroyed) {
+      return;
+    }
+    if (!res.write(Buffer.from(chunk))) {
+      if (!(await waitForNodeResponseDrain(res))) {
+        return;
+      }
+    }
+  }
+  res.end();
+}
+
+async function waitForNodeResponseDrain(res) {
+  if (res.destroyed) {
+    return false;
+  }
+  return new Promise((resolveWait, rejectWait) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolveWait(!res.destroyed);
+    };
+    const onClose = () => {
+      cleanup();
+      resolveWait(false);
+    };
+    const onError = (error) => {
+      cleanup();
+      if (res.destroyed) {
+        resolveWait(false);
+      } else {
+        rejectWait(error);
+      }
+    };
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+    res.once("error", onError);
+  });
 }
 
 async function handleDdWebSocketUpgrade(req, socket, head, options) {
@@ -1706,9 +1806,6 @@ function shouldBypassDdWebSocketUpgrade(req, originalUrl, mount, viteBase) {
     return true;
   }
   const url = new URL(originalUrl, "http://dd-vite.local");
-  if (url.searchParams.has("token")) {
-    return true;
-  }
   return candidatePathnames(url.pathname, viteBase).some((pathname) =>
     isViteBypassPath(pathname) || isViteAnyMethodBypassPath(pathname)
   );
@@ -2135,17 +2232,15 @@ function shouldBypassViteRequest(req, originalUrl, mount, viteBase) {
     return false;
   }
 
-  if (candidatePathnames(url.pathname, viteBase).some(isViteBypassPath)) {
+  const candidatePaths = candidatePathnames(url.pathname, viteBase);
+  if (candidatePaths.some(isViteBypassPath)) {
     return true;
   }
-  for (const key of VITE_BYPASS_QUERY_KEYS) {
-    if (url.searchParams.has(key)) {
-      return true;
-    }
+  const sourceRequest = candidatePaths.some(isViteSourcePath);
+  if (sourceRequest) {
+    return true;
   }
-
-  const fetchDestination = headerValue(req.headers["sec-fetch-dest"]).toLowerCase();
-  return VITE_BYPASS_FETCH_DESTINATIONS.has(fetchDestination);
+  return false;
 }
 
 function candidatePathnames(pathname, viteBase) {
@@ -2166,8 +2261,33 @@ function isViteBypassPath(pathname) {
   });
 }
 
+function isViteSourcePath(pathname) {
+  if (!isViteSourceNamespacePath(pathname)) {
+    return false;
+  }
+  const cleanPath = cleanUrlPathname(pathname);
+  const slash = cleanPath.lastIndexOf("/");
+  const dot = cleanPath.lastIndexOf(".");
+  if (dot <= slash) {
+    return false;
+  }
+  return /^[A-Za-z][A-Za-z0-9_-]*$/.test(cleanPath.slice(dot + 1));
+}
+
+function isViteSourceNamespacePath(pathname) {
+  return VITE_SOURCE_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+}
+
 function isViteAnyMethodBypassPath(pathname) {
   return VITE_ANY_METHOD_BYPASS_PATHS.includes(pathname);
+}
+
+function cleanUrlPathname(pathname) {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
 }
 
 function normalizeViteBase(value) {
@@ -2396,8 +2516,8 @@ function resolveViteOutDir(config) {
   return isAbsolute(outDir) ? outDir : resolve(root, outDir);
 }
 
-function hasFrameworkBuildEnvironments(config) {
-  return Boolean(config?.environments?.ssr || config?.environments?.rsc);
+function hasPluginFrameworkBuildEnvironment(config, framework, environmentName) {
+  return Boolean(framework && config?.environments?.[environmentName]);
 }
 
 async function writeOutputFile(outDir, file, contents) {
@@ -2447,8 +2567,8 @@ async function writeGeneratedAssetPolicy(outDir, config, deploymentAssetsDir) {
     "build.assetsDir",
   );
   const assetPaths = new Set(await findGeneratedAssetPaths(assetsOutDir));
-  if (assetsDir === "." || (await directoryExists(join(assetsOutDir, assetsDir)))) {
-    assetPaths.add(assetsDir === "." ? "/*" : `/${assetsDir}/*`);
+  if (assetsDir !== "." && (await directoryExists(join(assetsOutDir, assetsDir)))) {
+    assetPaths.add(`/${assetsDir}/*`);
   }
   const headersPath = join(assetsOutDir, DEFAULT_ASSET_HEADERS_FILE);
   let existing = "";
@@ -2542,16 +2662,19 @@ async function buildGeneratedDeploymentConfig({
   assetExcludes,
   staticRoutes,
 }) {
-  const deployment = { ...base };
+  const deployment = {};
   const runtimeConfig =
-    options.config ?? deployment.config ?? topLevelRuntimeConfig(deployment) ?? { public: true };
+    options.config ?? base.config ?? topLevelRuntimeConfig(base) ?? { public: true };
 
-  delete deployment.public;
-  delete deployment.bindings;
-  delete deployment.internal;
-
-  deployment.name = options.name ?? deployment.name ?? workerName;
+  deployment.name = options.name ?? base.name ?? workerName;
   deployment.entrypoint = workerFile;
+  const baseUrl = nonEmptyString(base.base_url) ?? nonEmptyString(base.baseUrl);
+  if (baseUrl) {
+    deployment.base_url = baseUrl;
+  }
+  if (base.temporary === true) {
+    deployment.temporary = true;
+  }
   if (assetsDir === false) {
     delete deployment.assets_dir;
   } else {
@@ -2561,7 +2684,7 @@ async function buildGeneratedDeploymentConfig({
     );
   }
   deployment.asset_excludes = uniquePaths([
-    ...arrayOfStrings(deployment.asset_excludes),
+    ...arrayOfStrings(base.asset_excludes),
     ...arrayOfStrings(assetExcludes),
     ...(staticRoutes ? [DEFAULT_STATIC_ROUTES_FILE] : []),
     workerFile,

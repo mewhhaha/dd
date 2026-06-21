@@ -211,8 +211,8 @@ worker request. Framework integrations use subpath presets such as
 `@mewhhaha/vite-plugin-dd/react-router-rsc`.
 
 During `vite build`, the plugin emits `dist/dd.deploy.json` and a bundled
-`dist/worker.js`. The generated config preserves deploy settings while pointing
-at the bundled worker and Vite output assets.
+`dist/worker.js`. The generated config keeps the deploy fields the CLI consumes
+while pointing at the bundled worker and Vite output assets.
 
 `@mewhhaha/vite-plugin-dd` has a default plugin export, so configs can use any local name:
 `import dd from "@mewhhaha/vite-plugin-dd"`. By default it reads `dd.json` from the nearest

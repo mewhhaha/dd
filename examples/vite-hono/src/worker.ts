@@ -546,6 +546,42 @@ app.get("/api/cart/live", async (context) => {
   return await acceptStorefrontCartSocket(context.req.raw, context.env, WORKER_NAME);
 });
 
+app.get("/app/status", (context) => {
+  return context.text("worker app namespace");
+});
+
+app.get("/app/v1.0", (context) => {
+  return context.text("worker app version route");
+});
+
+app.get("/src/status", (context) => {
+  return context.text("worker src namespace");
+});
+
+app.get("/search", (context) => {
+  return context.text(`worker search ${context.req.query("url") ?? ""}`);
+});
+
+app.get("/api/stream", () => {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode("first\n"));
+        setTimeout(() => {
+          controller.enqueue(encoder.encode("second\n"));
+          controller.close();
+        }, 25);
+      },
+    }),
+    {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+      },
+    },
+  );
+});
+
 app.use("*", async (context, next) => {
   const session = storefrontSessionFromRequest(context.req.raw);
   const runtime: RuntimeContext = {
