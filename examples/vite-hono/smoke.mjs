@@ -126,10 +126,10 @@ function stripRendererComments(text) {
 
 function assertLiveSocket(base, workerName) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${base.replace(/^http/, "ws")}/live`);
+    const socket = new WebSocket(`${base.replace(/^http/, "ws")}/api/cart/live`);
     const timeout = setTimeout(() => {
       socket.close();
-      reject(new Error(`timed out waiting for ${workerName} websocket echo`));
+      reject(new Error(`timed out waiting for ${workerName} cart websocket`));
     }, 5_000);
 
     socket.addEventListener("open", () => {
@@ -141,7 +141,7 @@ function assertLiveSocket(base, workerName) {
         reject(new Error(`unexpected websocket worker: ${event.data}`));
         return;
       }
-      if (payload.message === "smoke") {
+      if (payload.message === "smoke" || payload.message === "connected") {
         clearTimeout(timeout);
         socket.close();
         resolve();

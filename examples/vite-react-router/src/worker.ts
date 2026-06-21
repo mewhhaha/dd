@@ -9,6 +9,7 @@ import {
   type DdRequestContext,
 } from "../app/dd-context";
 import {
+  acceptStorefrontCartSocket,
   acceptStorefrontLiveSocket,
   handleStorefrontLiveSocketWake,
 } from "../app/storefront";
@@ -51,8 +52,11 @@ function withStmHeader(response: Response, context: DdRequestContext): Response 
 export default {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
-    if (url.pathname === "/live") {
+    if (url.pathname === "/api/storefront/live") {
       return await acceptStorefrontLiveSocket(request, env, WORKER_NAME);
+    }
+    if (url.pathname === "/api/cart/live") {
+      return await acceptStorefrontCartSocket(request, env, WORKER_NAME);
     }
     const { ddContext, routerContext } = createRouterContext(env, request);
     const contextId = registerDdRequestContext(ddContext);

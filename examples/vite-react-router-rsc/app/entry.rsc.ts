@@ -26,10 +26,50 @@ function withDdHeaders(response: Response, context: DdRequestContext): Response 
   });
 }
 
+const rscPayloadScriptPattern =
+  /<script>\(self\.__FLIGHT_DATA\|\|=\[\]\)\.push\([\s\S]*?\)<\/script>/g;
+
+function moveRscPayloadScripts(html: string): string {
+  const payloadScripts = html.match(rscPayloadScriptPattern);
+  if (!payloadScripts?.length) {
+    return html;
+  }
+
+  const htmlWithoutPayloadScripts = html.replace(rscPayloadScriptPattern, "");
+  const payload = payloadScripts.join("");
+  const bootstrapIndex = htmlWithoutPayloadScripts.indexOf('<script id="_R_">');
+  if (bootstrapIndex >= 0) {
+    return `${htmlWithoutPayloadScripts.slice(0, bootstrapIndex)}${payload}${htmlWithoutPayloadScripts.slice(bootstrapIndex)}`;
+  }
+
+  const bodyEndIndex = htmlWithoutPayloadScripts.lastIndexOf("</body>");
+  if (bodyEndIndex >= 0) {
+    return `${htmlWithoutPayloadScripts.slice(0, bodyEndIndex)}${payload}${htmlWithoutPayloadScripts.slice(bodyEndIndex)}`;
+  }
+
+  return `${htmlWithoutPayloadScripts}${payload}`;
+}
+
+async function repairHtmlFlightPayload(response: Response): Promise<Response> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("text/html")) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  const html = await response.text();
+  return new Response(moveRscPayloadScripts(html), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 export default {
   async fetch(request: Request, env?: Env): Promise<Response> {
     if (!env) {
-      return defaultEntry.fetch(request);
+      return repairHtmlFlightPayload(await defaultEntry.fetch(request));
     }
 
     const dd = createDdRequestContext(env, "vite-react-router-rsc", request);
@@ -37,7 +77,7 @@ export default {
     context.set(ddRequestContext, dd);
     return await runWithDdRequestContext(dd, async () => {
       const response = await defaultEntry.fetch(request, context);
-      return withDdHeaders(response, dd);
+      return withDdHeaders(await repairHtmlFlightPayload(response), dd);
     });
   },
 };

@@ -44,7 +44,8 @@ run_dd_cli() {
   fi
 }
 
-packaged_payload="$(run_dd_cli package-deploy "$NAME" "$FILE" "$@")"
+payload_file="$(mktemp /tmp/dd-worker-payload.XXXXXX.json)"
+run_dd_cli package-deploy "$NAME" "$FILE" "$@" > "$payload_file"
 
 machine_json="$("$FLYCTL_BIN" machines list --app "$APP" --json)"
 machine_id="$(printf '%s' "$machine_json" | jq -r '.[] | select(.state == "started") | .id' | head -n1)"
@@ -60,13 +61,13 @@ fi
 
 temp_file="$(mktemp /tmp/dd-worker-store.XXXXXX.json)"
 cleanup() {
-  rm -f "$temp_file"
+  rm -f "$payload_file" "$temp_file"
 }
 trap cleanup EXIT
 
 updated_at_ms="$(date +%s%3N)"
 deployment_id="$(uuidgen)"
-temporary="$(printf '%s' "$packaged_payload" | jq -r '.temporary // false')"
+temporary="$(jq -r '.temporary // false' "$payload_file")"
 if [ "$temporary" = "true" ]; then
   expires_at_ms="$((updated_at_ms + 3600000))"
 else
@@ -74,11 +75,11 @@ else
 fi
 
 jq -n \
-  --argjson payload "$packaged_payload" \
+  --slurpfile payload "$payload_file" \
   --arg deployment_id "$deployment_id" \
   --argjson updated_at_ms "$updated_at_ms" \
   --argjson expires_at_ms "$expires_at_ms" \
-  '$payload + {
+  '$payload[0] + {
     deployment_id: $deployment_id,
     updated_at_ms: $updated_at_ms,
     expires_at_ms: $expires_at_ms

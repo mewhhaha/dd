@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Link, Links, Meta, Outlet, ScrollRestoration } from "react-router";
-import { LiveSocketStatus } from "./live-status";
+import { CartLiveSync, LiveSocketStatus } from "./live-status";
 import "./tailwind.css";
 
 export function ServerLayout({ children }: { children: ReactNode }) {
@@ -69,6 +69,7 @@ export function ServerComponent() {
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6 sm:py-10 lg:px-8">
         <Outlet />
       </main>
+      <CartLiveSync />
       <footer className="border-t border-neutral-950/10 bg-white">
         <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-6 text-base/7 text-neutral-600 sm:px-6 sm:text-sm/6 lg:flex-row lg:items-center lg:justify-between lg:px-8">
           <p>

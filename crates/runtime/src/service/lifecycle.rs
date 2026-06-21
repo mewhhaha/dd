@@ -34,19 +34,9 @@ impl WorkerManager {
         let bindings = extract_bindings(&config)?;
         let compiled_assets = compile_asset_bundle(&assets, asset_headers.as_deref())?;
         self.validate_worker_cached(&source).await?;
-        let has_dynamic_bindings = !bindings.dynamic.is_empty();
-        let (snapshot, snapshot_preloaded) = if has_dynamic_bindings {
-            (self.bootstrap_snapshot, false)
-        } else {
-            let worker_snapshot = build_worker_snapshot(
-                self.bootstrap_snapshot,
-                &source,
-                self.config.debug_code_generation,
-            )
-            .await?;
-            validate_loaded_worker_runtime(worker_snapshot, self.config.debug_code_generation)?;
-            (worker_snapshot, true)
-        };
+        // Keep deployed workers on the bootstrap snapshot. Distinct user-code snapshots
+        // can abort V8 when multiple complex workers are instantiated in one process.
+        let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();

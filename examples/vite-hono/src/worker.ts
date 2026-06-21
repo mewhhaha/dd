@@ -122,7 +122,10 @@ const PRODUCT_SLUGS_KEY = "storefront:product-slugs";
 const ORDERS_INDEX_KEY = "storefront:orders";
 const LIVE_SOCKET_HANDLES_KEY = "storefront:live-handles";
 const LIVE_SOCKET_EVENTS_KEY = "storefront:live-events";
+const CART_SOCKET_HANDLES_KEY = "storefront:cart-handles";
+const CART_SOCKET_EVENTS_KEY = "storefront:cart-events";
 const EMPTY_CART: CartState = { lines: [], lastOrderId: null };
+const WORKER_NAME = "vite-hono";
 
 const PRODUCTS: Product[] = [
   {
@@ -180,37 +183,6 @@ const styles = `
   button, input { font: inherit; }
   img { max-width: 100%; }
   h1, h2, h3, p, dl, dd, ul { margin: 0; }
-
-  @view-transition {
-    navigation: auto;
-  }
-
-  ::view-transition-old(root) {
-    animation: dd-page-out 160ms ease both;
-  }
-
-  ::view-transition-new(root) {
-    animation: dd-page-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  }
-
-  ::view-transition-group(*) {
-    animation-duration: 520ms;
-    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
-  }
-
-  ::view-transition-image-pair(*) {
-    isolation: auto;
-  }
-
-  @keyframes dd-page-out {
-    from { opacity: 1; }
-    to { opacity: 0.72; }
-  }
-
-  @keyframes dd-page-in {
-    from { opacity: 0; transform: translateY(0.75rem); }
-    to { opacity: 1; transform: translateY(0); }
-  }
 
   .app {
     background: #fafafa;
@@ -413,14 +385,6 @@ const styles = `
   .image-frame img { aspect-ratio: 5 / 4; }
   .product-body, .cart-panel, .related-card { gap: 1rem; padding: 1rem; }
 
-  .transition-image, .transition-title, .transition-price {
-    view-transition-name: var(--view-transition-name);
-  }
-
-  .transition-image {
-    contain: layout;
-  }
-
   .badge {
     background: #fef3c7;
     border-radius: 6px;
@@ -570,20 +534,16 @@ const styles = `
     .detail-grid { grid-template-columns: minmax(0, 1fr) 24rem; }
     .detail-info { align-content: start; }
   }
-
-  @media (prefers-reduced-motion: reduce) {
-    ::view-transition-old(root),
-    ::view-transition-new(root),
-    ::view-transition-group(*) {
-      animation-duration: 1ms;
-    }
-  }
 `;
 
 const app = new Hono<HonoEnv>();
 
-app.get("/live", async (context) => {
-  return await acceptStorefrontLiveSocket(context.req.raw, context.env, "vite-hono");
+app.get("/api/storefront/live", async (context) => {
+  return await acceptStorefrontLiveSocket(context.req.raw, context.env, WORKER_NAME);
+});
+
+app.get("/api/cart/live", async (context) => {
+  return await acceptStorefrontCartSocket(context.req.raw, context.env, WORKER_NAME);
 });
 
 app.use("*", async (context, next) => {
@@ -605,6 +565,13 @@ app.get("/", async (context) => {
   const runtime = context.get("runtime");
   const data = await loadStorefront(context.env, runtime, pathFromContext(context));
   return context.html(renderHome(data));
+});
+
+app.get("/api/cart", async (context) => {
+  const runtime = context.get("runtime");
+  const path = cartFragmentPath(context.req.raw);
+  const data = await loadStorefront(context.env, runtime, path);
+  return context.html(renderCartPanel(data.cart, data.recentOrders, path, path !== "/"));
 });
 
 app.post("/", async (context) => {
@@ -649,7 +616,7 @@ export default {
     return app.fetch(request, env);
   },
   async wake(event: StorefrontSocketWakeEvent): Promise<void> {
-    await handleStorefrontLiveSocketWake(event, "vite-hono");
+    await handleStorefrontLiveSocketWake(event, WORKER_NAME);
   },
 };
 
@@ -689,8 +656,6 @@ function renderHome(data: StorefrontData): string {
               </div>
               <a
                 class="secondary-button"
-                data-product-slug="runtime"
-                data-transition-link
                 href="/notes/runtime"
               >
                 Featured print
@@ -718,25 +683,19 @@ function renderProduct(data: ProductData): string {
           <div class="image-frame">
             <img
               alt=""
-              class="transition-image"
-              data-product-image="${escapeAttribute(data.product.slug)}"
               src="${escapeAttribute(data.product.imageUrl)}"
-              ${transitionStyleAttribute(data.product.slug, "image")}
             >
           </div>
           <div class="detail-info">
             <div class="heading-group">
               <p class="eyebrow">${escapeHtml(data.product.category)}</p>
-              <h1 class="transition-title" ${transitionStyleAttribute(data.product.slug, "title")}>
+              <h1>
                 ${escapeHtml(data.product.name)}
               </h1>
               <p class="summary">${escapeHtml(data.product.story)}</p>
             </div>
             <div class="facts">
-              ${renderFact("Price", data.product.price, undefined, {
-                slug: data.product.slug,
-                type: "price",
-              })}
+              ${renderFact("Price", data.product.price)}
               ${renderFact("Stock", `${data.product.stock} prints`)}
               ${renderFact("Route handler", String(data.runtime.stmCount), "data-stm-count")}
               ${renderFact("Timer tick", data.runtime.timerTick)}
@@ -783,8 +742,6 @@ function renderProduct(data: ProductData): string {
             ${data.relatedProducts.map((product) => `
               <a
                 class="related-card"
-                data-product-slug="${escapeAttribute(product.slug)}"
-                data-transition-link
                 href="/notes/${escapeAttribute(product.slug)}"
               >
                 <span class="label">${escapeHtml(product.name)}</span>
@@ -807,17 +764,12 @@ function renderProductCard(
     <article class="product-card">
       <a
         class="product-image-link"
-        data-product-slug="${escapeAttribute(product.slug)}"
-        data-transition-link
         href="${escapeAttribute(detailHref)}"
         aria-label="${escapeAttribute(product.name)}"
       >
         <img
           alt=""
-          class="transition-image"
-          data-product-image="${escapeAttribute(product.slug)}"
           src="${escapeAttribute(product.imageUrl)}"
-          ${transitionStyleAttribute(product.slug, "image")}
         >
       </a>
       <div class="product-body">
@@ -826,10 +778,8 @@ function renderProductCard(
             <p class="eyebrow">${escapeHtml(product.category)}</p>
             <span class="badge">${escapeHtml(product.badge)}</span>
           </div>
-          <h3 class="transition-title" ${transitionStyleAttribute(product.slug, "title")}>
+          <h3>
             <a
-              data-product-slug="${escapeAttribute(product.slug)}"
-              data-transition-link
               href="${escapeAttribute(detailHref)}"
             >
               ${escapeHtml(product.name)}
@@ -838,7 +788,7 @@ function renderProductCard(
           <p class="summary">${escapeHtml(product.description)}</p>
         </div>
         <div class="price-row">
-          <p class="label tabular transition-price" ${transitionStyleAttribute(product.slug, "price")}>
+          <p class="label tabular">
             ${escapeHtml(product.price)}
           </p>
           <form
@@ -946,17 +896,12 @@ function renderFact(
   label: string,
   value: string,
   dataAttribute?: string,
-  transition?: { slug: string; type: "price" },
 ): string {
   const attribute = dataAttribute ? ` ${dataAttribute}="${escapeAttribute(value)}"` : "";
-  const className = transition ? "label tabular transition-price" : "label tabular";
-  const transitionAttribute = transition
-    ? ` ${transitionStyleAttribute(transition.slug, transition.type)}`
-    : "";
   return `
     <div class="price-row">
       <p class="muted">${escapeHtml(label)}</p>
-      <p class="${className}"${attribute}${transitionAttribute}>${escapeHtml(value)}</p>
+      <p class="label tabular"${attribute}>${escapeHtml(value)}</p>
     </div>
   `;
 }
@@ -1006,7 +951,7 @@ function documentShell(title: string, body: string): string {
             </div>
           </footer>
         </div>
-        <script type="module" src="/src/client.ts"></script>
+        <script type="module" src="/assets/client.js"></script>
       </body>
     </html>`;
 }
@@ -1067,6 +1012,7 @@ async function handleStorefrontAction(
   const intent = formField(formData, "intent", "add-to-cart");
   if (intent === "clear-cart") {
     await writeCart(env, sessionId, EMPTY_CART);
+    await broadcastStorefrontCartUpdate(env, WORKER_NAME, sessionId);
     return;
   }
   if (intent === "checkout") {
@@ -1095,7 +1041,7 @@ async function addToCart(
   const memory = cartMemory(env, sessionId);
   const cart = memory.tvar<CartState>("cart", EMPTY_CART);
   const safeQuantity = Math.max(1, Math.min(9, Math.trunc(quantity)));
-  return memory.atomic(() => {
+  const nextCart = await memory.atomic(() => {
     const current = normalizeCart(cart.read());
     const lines = [...current.lines];
     const line = lines.find((item) => item.slug === product.slug);
@@ -1108,6 +1054,8 @@ async function addToCart(
     cart.write(next);
     return next;
   });
+  await broadcastStorefrontCartUpdate(env, WORKER_NAME, sessionId);
+  return nextCart;
 }
 
 async function checkout(
@@ -1141,6 +1089,7 @@ async function checkout(
     JSON.stringify([order.id, ...existingOrderIds.filter((id) => id !== order.id)].slice(0, 12)),
   );
   await writeCart(env, sessionId, { lines: [], lastOrderId: order.id });
+  await broadcastStorefrontCartUpdate(env, WORKER_NAME, sessionId);
   return order;
 }
 
@@ -1191,6 +1140,60 @@ async function acceptStorefrontLiveSocket(
   });
 }
 
+async function acceptStorefrontCartSocket(
+  request: Request,
+  env: Env,
+  workerName: string,
+): Promise<Response> {
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return new Response("Expected WebSocket upgrade", {
+      status: 426,
+      headers: { upgrade: "websocket" },
+    });
+  }
+  const runtime = storefrontSessionFromRequest(request);
+  const room = cartSocketRoom(env, workerName, runtime.sessionId);
+  return await room.atomic(() => {
+    const handles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
+    const events = room.tvar<number>(CART_SOCKET_EVENTS_KEY, 0);
+    const { handle, response } = room.accept(request);
+    const nextEvent = Number(events.read()) + 1;
+    const nextHandles = [
+      ...normalizeSocketHandles(handles.read()).filter((value) => value !== handle).slice(-7),
+      handle,
+    ];
+    handles.write(nextHandles);
+    events.write(nextEvent);
+    room.defer(() => {
+      const socket = new WebSocket(handle) as MemoryWebSocket;
+      socket.send(cartSocketPayload(workerName, "connected", nextEvent), "text");
+    });
+    return response;
+  });
+}
+
+async function broadcastStorefrontCartUpdate(
+  env: Env,
+  workerName: string,
+  sessionId: string,
+): Promise<void> {
+  const room = cartSocketRoom(env, workerName, sessionId);
+  await room.atomic(() => {
+    const handles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
+    const events = room.tvar<number>(CART_SOCKET_EVENTS_KEY, 0);
+    const nextEvent = Number(events.read()) + 1;
+    const nextHandles = normalizeSocketHandles(handles.read()).slice(-8);
+    handles.write(nextHandles);
+    events.write(nextEvent);
+    for (const handle of nextHandles) {
+      room.defer(() => {
+        const socket = new WebSocket(handle) as MemoryWebSocket;
+        socket.send(cartSocketPayload(workerName, "updated", nextEvent), "text");
+      });
+    }
+  });
+}
+
 async function handleStorefrontLiveSocketWake(
   event: StorefrontSocketWakeEvent,
   workerName: string,
@@ -1203,7 +1206,9 @@ async function handleStorefrontLiveSocketWake(
   if (event.type === "socketclose") {
     await room.atomic(() => {
       const handles = room.tvar<string[]>(LIVE_SOCKET_HANDLES_KEY, []);
+      const cartHandles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
       handles.write(normalizeSocketHandles(handles.read()).filter((value) => value !== handle));
+      cartHandles.write(normalizeSocketHandles(cartHandles.read()).filter((value) => value !== handle));
     });
     return;
   }
@@ -1223,6 +1228,12 @@ async function handleStorefrontLiveSocketWake(
 
 function cartMemory(env: Env, sessionId: string): MemoryShard {
   return env.EXAMPLE_MEMORY.get(env.EXAMPLE_MEMORY.idFromName(`storefront-cart:${sessionId}`));
+}
+
+function cartSocketRoom(env: Env, workerName: string, sessionId: string): MemoryShard {
+  return env.EXAMPLE_MEMORY.get(
+    env.EXAMPLE_MEMORY.idFromName(`${workerName}:cart-live:${sessionId}`),
+  );
 }
 
 async function ensureCatalog(db: KvNamespace): Promise<void> {
@@ -1350,6 +1361,15 @@ function liveSocketPayload(workerName: string, message: string, eventCount: numb
   });
 }
 
+function cartSocketPayload(workerName: string, message: string, eventCount: number): string {
+  return JSON.stringify({
+    type: "storefront.cart",
+    worker: workerName,
+    message,
+    eventCount,
+  });
+}
+
 function storefrontSessionFromRequest(request: Request): RuntimeContext {
   const cookie = parseCookieHeader(request.headers.get("cookie") ?? "");
   const existing = cookie.get(SESSION_COOKIE);
@@ -1367,6 +1387,11 @@ function storefrontSessionFromRequest(request: Request): RuntimeContext {
 
 function pathFromContext(context: Context<HonoEnv>): string {
   return new URL(context.req.url).pathname;
+}
+
+function cartFragmentPath(request: Request): string {
+  const path = new URL(request.url).searchParams.get("path") ?? "/";
+  return path.startsWith("/notes/") ? path : "/";
 }
 
 function isFixiRequest(request: Request): boolean {
@@ -1484,14 +1509,6 @@ function escapeHtml(value: unknown): string {
 
 function escapeAttribute(value: unknown): string {
   return escapeHtml(value);
-}
-
-function transitionStyleAttribute(slug: string, type: "image" | "title" | "price"): string {
-  return `style="--view-transition-name: ${transitionName(slug, type)}"`;
-}
-
-function transitionName(slug: string, type: "image" | "title" | "price"): string {
-  return `product-${type}-${slug.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
 }
 
 function productKey(slug: string): string {

@@ -3,246 +3,189 @@ import "fixi-js";
 
 export const marker = "vite-hono-client-module";
 
+type FixiConfigWindow = Window & {
+  fixiCfg?: {
+    transition?: false;
+  };
+};
+
 if (import.meta.hot) {
   import.meta.hot.accept();
 }
 
 document.documentElement.dataset.ddExample = "vite-hono";
 document.documentElement.dataset.client = marker;
-
-type ViewTransitionDocument = Document & {
-  startViewTransition?: (callback: () => void | Promise<void>) => {
-    finished: Promise<void>;
-  };
+(window as FixiConfigWindow).fixiCfg = {
+  ...(window as FixiConfigWindow).fixiCfg,
+  transition: false,
 };
 
-let activeLiveSocket: WebSocket | null = null;
-const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+let activeCartSocket: WebSocket | null = null;
 
-connectLiveStatus();
-installProductNavigation();
+setupFragmentForms();
+connectCartSocket();
 
-function connectLiveStatus() {
-  activeLiveSocket?.close();
-  activeLiveSocket = null;
-
+function connectCartSocket() {
+  activeCartSocket?.close();
+  activeCartSocket = null;
   const liveStatus = document.querySelector("[data-storefront-live-status]");
   if (!liveStatus || typeof WebSocket === "undefined") {
+    if (liveStatus) {
+      liveStatus.textContent = "socket unavailable";
+    }
     return;
   }
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${location.host}/live`);
-  activeLiveSocket = socket;
 
-  socket.addEventListener("open", () => {
-    liveStatus.textContent = "socket open";
-    socket.send(JSON.stringify({ type: "hello", path: location.pathname }));
-  });
+  const cancelConnect = runAfterPageLoad(() => {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(`${protocol}//${location.host}/api/cart/live`);
+    activeCartSocket = socket;
 
-  socket.addEventListener("message", (event) => {
-    try {
-      const payload = JSON.parse(String(event.data));
-      liveStatus.textContent = payload.message || "socket message";
-    } catch {
-      liveStatus.textContent = "socket message";
-    }
-  });
+    socket.addEventListener("open", () => {
+      liveStatus.textContent = "socket open";
+    });
 
-  socket.addEventListener("close", () => {
-    liveStatus.textContent = "socket closed";
-  });
+    socket.addEventListener("message", (event) => {
+      const status = cartSocketStatus(event.data);
+      if (status) {
+        liveStatus.textContent = status;
+      }
+      if (isCartUpdateMessage(event.data)) {
+        void refreshCartFragment();
+      }
+    });
 
-  socket.addEventListener("error", () => {
-    liveStatus.textContent = "socket error";
-  });
-}
+    socket.addEventListener("close", () => {
+      liveStatus.textContent = "socket closed";
+    });
 
-function installProductNavigation() {
-  document.addEventListener("click", (event) => {
-    if (
-      event.defaultPrevented ||
-      event.button !== 0 ||
-      event.metaKey ||
-      event.altKey ||
-      event.ctrlKey ||
-      event.shiftKey
-    ) {
-      return;
-    }
-
-    const target = event.target instanceof Element ? event.target : null;
-    const link = target?.closest<HTMLAnchorElement>("a[data-transition-link]");
-    if (!link || link.target || link.hasAttribute("download")) {
-      return;
-    }
-
-    const url = new URL(link.href);
-    if (url.origin !== location.origin || url.href === location.href) {
-      return;
-    }
-
-    event.preventDefault();
-    void navigateWithTransition(url, {
-      productSlug: link.dataset.productSlug,
-      push: true,
+    socket.addEventListener("error", () => {
+      liveStatus.textContent = "socket error";
     });
   });
 
-  window.addEventListener("popstate", () => {
-    void navigateWithTransition(new URL(location.href), { push: false });
-  });
+  window.addEventListener("beforeunload", () => {
+    cancelConnect();
+    activeCartSocket?.close();
+  }, { once: true });
 }
 
-async function navigateWithTransition(
-  url: URL,
-  options: { productSlug?: string; push: boolean },
-) {
-  const productSlug =
-    options.productSlug ?? productSlugFromLocation(new URL(location.href)) ?? productSlugFromLocation(url);
-  let nextDocument: Document;
-
-  try {
-    nextDocument = await fetchDocument(url);
-  } catch {
-    location.href = url.href;
-    return;
-  }
-
-  if (prefersReducedMotion.matches) {
-    applyDocument(nextDocument, url, options.push);
-    return;
-  }
-
-  const startViewTransition = (document as ViewTransitionDocument).startViewTransition;
-  if (startViewTransition) {
-    const transition = startViewTransition.call(document, () => {
-      applyDocument(nextDocument, url, options.push);
-    });
-    await transition.finished.catch(() => undefined);
-    return;
-  }
-
-  await applyDocumentWithFallbackTransition(nextDocument, url, options.push, productSlug);
+function setupFragmentForms() {
+  document.addEventListener("submit", (event) => {
+    void handleFragmentFormSubmit(event);
+  }, true);
 }
 
-async function fetchDocument(url: URL): Promise<Document> {
+async function handleFragmentFormSubmit(event: SubmitEvent) {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement) || !form.hasAttribute("fx-action")) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopImmediatePropagation();
+
+  const submitter = event.submitter instanceof HTMLElement ? event.submitter : undefined;
+  const targetSelector = form.getAttribute("fx-target") || "";
+  const target = targetSelector ? document.querySelector(targetSelector) : null;
+  if (!target) {
+    return;
+  }
+
+  const action = form.getAttribute("fx-action") || form.action || location.href;
+  const method = (form.getAttribute("fx-method") || form.method || "get").toUpperCase();
+  const requestUrl = new URL(action, location.href);
+  const formData = submitter ? new FormData(form, submitter) : new FormData(form);
+  const init: RequestInit = {
+    headers: {
+      accept: "text/html",
+      "fx-request": "true",
+    },
+    method,
+  };
+
+  if (method === "GET") {
+    for (const [name, value] of formData) {
+      requestUrl.searchParams.append(name, String(value));
+    }
+  } else {
+    init.body = formData;
+  }
+
+  const response = await fetch(requestUrl, init);
+  if (!response.ok) {
+    return;
+  }
+
+  replaceCartFragment(await response.text());
+}
+
+async function refreshCartFragment() {
+  const currentCart = document.querySelector("#storefront-cart");
+  if (!currentCart) {
+    return;
+  }
+
+  const url = new URL("/api/cart", location.href);
+  url.searchParams.set("path", location.pathname);
   const response = await fetch(url, {
     headers: { accept: "text/html" },
   });
   if (!response.ok) {
-    throw new Error(`Failed to load ${url.pathname}: ${response.status}`);
-  }
-  const text = await response.text();
-  return new DOMParser().parseFromString(text, "text/html");
-}
-
-function applyDocument(nextDocument: Document, url: URL, push: boolean) {
-  const currentApp = document.querySelector(".app");
-  const nextApp = nextDocument.querySelector(".app");
-  if (!currentApp || !nextApp) {
-    location.href = url.href;
     return;
   }
 
-  document.title = nextDocument.title;
-  currentApp.replaceWith(nextApp);
-  window.scrollTo(0, 0);
-  if (push) {
-    history.pushState({}, "", url);
-  }
-  document.documentElement.dataset.client = marker;
-  document.querySelector(".app")?.dispatchEvent(new CustomEvent("fx:process", {
-    bubbles: true,
-    composed: true,
-  }));
-  connectLiveStatus();
+  replaceCartFragment(await response.text());
 }
 
-async function applyDocumentWithFallbackTransition(
-  nextDocument: Document,
-  url: URL,
-  push: boolean,
-  productSlug?: string,
-) {
-  const sourceImage = productSlug
-    ? document.querySelector<HTMLImageElement>(productImageSelector(productSlug))
-    : null;
-  const sourceRect = sourceImage?.getBoundingClientRect();
-  const clone = sourceImage && sourceRect
-    ? sourceImage.cloneNode(false) as HTMLImageElement
-    : null;
-
-  if (sourceImage && clone && sourceRect) {
-    Object.assign(clone.style, {
-      borderRadius: getComputedStyle(sourceImage).borderRadius || "8px",
-      height: `${sourceRect.height}px`,
-      left: `${sourceRect.left}px`,
-      margin: "0",
-      objectFit: "cover",
-      pointerEvents: "none",
-      position: "fixed",
-      top: `${sourceRect.top}px`,
-      width: `${sourceRect.width}px`,
-      zIndex: "9999",
-    });
-    document.body.append(clone);
-  }
-
-  applyDocument(nextDocument, url, push);
-
-  const targetImage = productSlug
-    ? document.querySelector<HTMLImageElement>(productImageSelector(productSlug))
-    : null;
-  if (!clone || !sourceRect || !targetImage) {
-    await animateAppIn();
-    clone?.remove();
+function replaceCartFragment(html: string) {
+  const currentCart = document.querySelector("#storefront-cart");
+  if (!currentCart) {
     return;
   }
 
-  const targetRect = targetImage.getBoundingClientRect();
-  targetImage.style.visibility = "hidden";
-  await Promise.all([
-    animateAppIn(),
-    clone.animate([
-      {
-        borderRadius: clone.style.borderRadius,
-        height: `${sourceRect.height}px`,
-        left: `${sourceRect.left}px`,
-        top: `${sourceRect.top}px`,
-        width: `${sourceRect.width}px`,
-      },
-      {
-        borderRadius: getComputedStyle(targetImage).borderRadius || "8px",
-        height: `${targetRect.height}px`,
-        left: `${targetRect.left}px`,
-        top: `${targetRect.top}px`,
-        width: `${targetRect.width}px`,
-      },
-    ], {
-      duration: 520,
-      easing: "cubic-bezier(0.22, 1, 0.36, 1)",
-    }).finished.catch(() => undefined),
-  ]);
-  targetImage.style.visibility = "";
-  clone.remove();
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const nextCart = template.content.querySelector("#storefront-cart");
+  if (!nextCart) {
+    return;
+  }
+  currentCart.replaceWith(nextCart);
 }
 
-async function animateAppIn() {
-  const app = document.querySelector(".app");
-  await app?.animate([
-    { opacity: 0.92, transform: "translateY(8px)" },
-    { opacity: 1, transform: "translateY(0)" },
-  ], {
-    duration: 220,
-    easing: "cubic-bezier(0.22, 1, 0.36, 1)",
-  }).finished.catch(() => undefined);
+function runAfterPageLoad(callback: () => void): () => void {
+  if (document.readyState === "complete") {
+    const timeout = window.setTimeout(callback, 0);
+    return () => window.clearTimeout(timeout);
+  }
+
+  window.addEventListener("load", callback, { once: true });
+  return () => window.removeEventListener("load", callback);
 }
 
-function productSlugFromLocation(url: URL): string | undefined {
-  const match = url.pathname.match(/^\/notes\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : undefined;
+function cartSocketStatus(value: unknown): string | null {
+  try {
+    const payload = JSON.parse(String(value)) as { type?: unknown; message?: unknown };
+    if (payload.type !== "storefront.cart") {
+      return null;
+    }
+    if (payload.message === "connected") {
+      return "socket connected";
+    }
+    if (payload.message === "updated") {
+      return "cart synced";
+    }
+    return "socket message";
+  } catch {
+    return null;
+  }
 }
 
-function productImageSelector(slug: string): string {
-  return `[data-product-image="${slug.replace(/["\\]/g, "\\$&")}"]`;
+function isCartUpdateMessage(value: unknown): boolean {
+  try {
+    const payload = JSON.parse(String(value)) as { type?: unknown; message?: unknown };
+    return payload.type === "storefront.cart" && payload.message === "updated";
+  } catch {
+    return false;
+  }
 }

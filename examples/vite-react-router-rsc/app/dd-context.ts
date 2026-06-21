@@ -44,7 +44,7 @@ export function createDdRequestContext(
   const requestContext: DdRequestContext = {
     workerName,
     sessionCookie: session.setCookie,
-    storefront: createStorefront(env, session.id),
+    storefront: createStorefront(env, session.id, workerName),
     async incrementStmRequestCount() {
       const memory = env.EXAMPLE_MEMORY.get(env.EXAMPLE_MEMORY.idFromName(workerName));
       const requests = memory.tvar("requests", 0);
