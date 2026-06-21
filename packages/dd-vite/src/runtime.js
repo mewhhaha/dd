@@ -182,9 +182,7 @@ export class DdRuntimeClient {
         this.request({ op: "shutdown" }),
         delay(this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS),
       ]);
-    } catch {
-      // The process may already be gone; terminate below.
-    }
+    } catch {}
     this.#closed = true;
     this.#rejectAll(new Error("dd runtime client is closed"));
     child.kill("SIGTERM");
@@ -379,6 +377,22 @@ function runtimeCommand(options) {
       cwd: options.cwd ?? process.cwd(),
     };
   }
+  const repoRoot = findRepoRoot(options.cwd ?? process.cwd());
+  if (repoRoot) {
+    const debugBinary = resolve(repoRoot, "target/debug/dd_dev_runtime");
+    if (existsSync(debugBinary)) {
+      return {
+        command: debugBinary,
+        args,
+        cwd: repoRoot,
+      };
+    }
+    return {
+      command: "cargo",
+      args: ["run", "--quiet", "-p", "runtime", "--bin", "dd_dev_runtime", "--", ...args],
+      cwd: repoRoot,
+    };
+  }
   const packagedBinary = packagedRuntimeBinary();
   if (packagedBinary) {
     return {
@@ -387,17 +401,9 @@ function runtimeCommand(options) {
       cwd: options.cwd ?? process.cwd(),
     };
   }
-  const repoRoot = findRepoRoot(options.cwd ?? process.cwd());
-  if (!repoRoot) {
-    throw new Error(
-      "No dd dev runtime binary found. Install @mewhhaha/dd, set DD_DEV_RUNTIME_BIN, or run inside a dd source checkout.",
-    );
-  }
-  return {
-    command: "cargo",
-    args: ["run", "--quiet", "-p", "runtime", "--bin", "dd_dev_runtime", "--", ...args],
-    cwd: repoRoot,
-  };
+  throw new Error(
+    "No dd dev runtime binary found. Install @mewhhaha/dd, set DD_DEV_RUNTIME_BIN, or run inside a dd source checkout.",
+  );
 }
 
 function packagedRuntimeBinary() {

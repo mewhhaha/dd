@@ -119,6 +119,31 @@
     });
   };
 
+  const normalizeDynamicBindings = (value) => {
+    if (value == null) {
+      return [];
+    }
+    if (!Array.isArray(value)) {
+      throw new Error("dynamic worker bindings must be an array");
+    }
+    const seen = new Set();
+    return value.map((entry) => {
+      const type = String(entry?.type ?? "").trim().toLowerCase();
+      const binding = String(entry?.binding ?? "").trim();
+      if (!["kv", "memory", "dynamic"].includes(type)) {
+        throw new Error(`dynamic worker binding type is invalid: ${type}`);
+      }
+      if (!binding) {
+        throw new Error("dynamic worker binding name must not be empty");
+      }
+      if (seen.has(binding)) {
+        throw new Error(`duplicate dynamic worker binding: ${binding}`);
+      }
+      seen.add(binding);
+      return { type, binding };
+    });
+  };
+
   const normalizeModulePath = (value) => {
     const raw = String(value ?? "").replaceAll("\\", "/").trim();
     if (!raw) {
@@ -555,6 +580,7 @@
    * @property {string} [source] Full worker source. If omitted, `entrypoint + modules` are used.
    * @property {string} [entrypoint] Entrypoint module path when using `modules`. Defaults to `worker.js`.
    * @property {Record<string, string>} [modules] Module graph map: `modulePath -> source`.
+   * @property {{type:string,binding:string}[]} [bindings] Runtime bindings for the dynamic worker.
    * @property {Record<string, any>} [env] Env bindings for the dynamic worker.
    * String values stay opaque and are only resolved at host I/O boundaries; `RpcTarget` values become host RPC bindings.
    * @property {number} [timeout] Per-invoke timeout in ms. Default `5000`, max `60000`.
@@ -617,6 +643,7 @@
       const options = await parseDynamicFactoryOptions(factory);
       const source = resolveDynamicWorkerSource(options);
       const policy = normalizeDynamicPolicy(options);
+      const bindings = normalizeDynamicBindings(options.bindings);
       const envInput = options.env;
       const envConfig = splitDynamicEnvInput(envInput, policy);
       const timeout = normalizeDynamicTimeout(options.timeout);
@@ -627,6 +654,7 @@
           binding: bindingName,
           id: instanceId,
           source,
+          bindings,
           env: envConfig.stringEnv,
           policy,
           host_rpc_bindings: envConfig.hostRpcBindings,

@@ -33,6 +33,8 @@ const DD_REACT_ROUTER_RSC_SERVER_MODULE = "virtual:dd-react-router-rsc-server";
 const DD_REACT_ROUTER_RSC_SERVER_RESOLVED = "\0dd:react-router-rsc-server";
 const DD_NODE_ASYNC_HOOKS_SHIM_MODULE = "virtual:dd-node-async-hooks";
 const DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED = "\0dd:node-async-hooks";
+const DD_AUXILIARY_WORKERS_MODULE = "virtual:dd-auxiliary-workers";
+const DD_AUXILIARY_WORKERS_RESOLVED = "\0dd:auxiliary-workers";
 const FINGERPRINTED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const DD_VITE_BYPASS_HEADER = "x-dd-vite-bypass";
 const DD_VITE_MODULE_RUNNER_UPDATE_HEADER = "x-dd-vite-module-runner-update";
@@ -223,6 +225,7 @@ export function ddVitePlugin(options = {}) {
   let rootHint;
   const framework = normalizeFrameworkOptions(options.framework);
   const viteEnvironment = mergeFrameworkViteEnvironment(framework, options.viteEnvironment);
+  const auxiliaryWorkers = normalizeAuxiliaryWorkers(options.auxiliaryWorkers);
   const environmentName = viteEnvironment?.name ?? options.environmentName ?? "dd";
   const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
   const childEnvironmentNames = arrayOfStrings(viteEnvironment?.childEnvironments);
@@ -275,11 +278,12 @@ export function ddVitePlugin(options = {}) {
 
   async function effectiveRuntimeConfig() {
     const source = await sourceConfig();
-    return (
+    return withAuxiliaryRuntimeBindings(
       options.config ??
       source.config.config ??
       topLevelRuntimeConfig(source.config) ??
-      { public: true }
+      { public: true },
+      auxiliaryWorkers,
     );
   }
 
@@ -306,7 +310,7 @@ export function ddVitePlugin(options = {}) {
     return bundleWorkerEntry(entry, {
       viteConfig: workerBundleViteConfig(),
       target: options.target,
-      sourcemap: options.sourcemap,
+      sourcemap: options.sourcemap ?? false,
       minify: options.minify,
       logLevel: options.logLevel,
     });
@@ -320,11 +324,63 @@ export function ddVitePlugin(options = {}) {
     if (resolvedConfig?.configFile && options.viteConfig?.configFile !== false) {
       projectConfig.configFile = resolvedConfig.configFile;
     }
-    return mergeConfig(projectConfig, options.viteConfig ?? {});
+    const auxiliaryPlugin = auxiliaryWorkers.length > 0
+      ? { plugins: [ddAuxiliaryWorkersVirtualPlugin(auxiliaryWorkersModuleSource)] }
+      : {};
+    return mergeConfig(mergeConfig(projectConfig, auxiliaryPlugin), options.viteConfig ?? {});
   }
 
   async function bundledWorkerSource() {
     return withWorkerBundleEnv(workerSource);
+  }
+
+  async function auxiliaryWorkersModuleSource() {
+    const records = Object.fromEntries(
+      await Promise.all(
+        auxiliaryWorkers.map(async (worker) => [
+          worker.name,
+          {
+            name: worker.name,
+            binding: worker.binding,
+            id: worker.id,
+            config: await auxiliaryWorkerDynamicConfig(worker),
+          },
+        ]),
+      ),
+    );
+    return `const workers = ${JSON.stringify(records)};\nexport { workers };\nexport default workers;\n`;
+  }
+
+  async function auxiliaryWorkerDynamicConfig(worker) {
+    const config = cloneJson(worker.config);
+    if (!config.source && !config.modules) {
+      config.source = await auxiliaryWorkerSource(worker);
+    }
+    if (Array.isArray(config.bindings) && config.bindings.length > 0 && config.allow_state_bindings == null) {
+      config.allow_state_bindings = true;
+    }
+    return config;
+  }
+
+  async function auxiliaryWorkerSource(worker) {
+    if (typeof worker.source === "function") {
+      return worker.source();
+    }
+    if (typeof worker.source === "string") {
+      return worker.source;
+    }
+    if (!worker.entry) {
+      throw new Error(`ddVitePlugin auxiliary worker "${worker.name}" requires source or entry`);
+    }
+    return withWorkerBundleEnv(() =>
+      bundleWorkerEntry(worker.entry, {
+        viteConfig: mergeConfig(workerBundleViteConfig(), worker.viteConfig ?? {}),
+        target: worker.target ?? options.target,
+        sourcemap: worker.sourcemap ?? options.sourcemap ?? false,
+        minify: worker.minify ?? options.minify,
+        logLevel: worker.logLevel ?? options.logLevel,
+      })
+    );
   }
 
   async function ensureDeployed() {
@@ -591,6 +647,9 @@ export function ddVitePlugin(options = {}) {
       await runtime?.close();
     },
     resolveId(id) {
+      if (id === DD_AUXILIARY_WORKERS_MODULE) {
+        return DD_AUXILIARY_WORKERS_RESOLVED;
+      }
       if (id === DD_NODE_ASYNC_HOOKS_SHIM_MODULE) {
         return DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED;
       }
@@ -598,7 +657,10 @@ export function ddVitePlugin(options = {}) {
         return DD_REACT_ROUTER_RSC_SERVER_RESOLVED;
       }
     },
-    load(id) {
+    async load(id) {
+      if (id === DD_AUXILIARY_WORKERS_RESOLVED) {
+        return auxiliaryWorkersModuleSource();
+      }
       if (id === DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED) {
         return DD_NODE_ASYNC_HOOKS_SHIM_SOURCE;
       }
@@ -660,7 +722,7 @@ export function ddVitePlugin(options = {}) {
         options.viteConfig ?? {},
       ),
       target: options.target,
-      sourcemap: options.sourcemap,
+      sourcemap: options.sourcemap ?? false,
       minify: options.minify,
       logLevel: options.logLevel,
     });
@@ -828,6 +890,70 @@ function mergeFrameworkViteEnvironment(framework, viteEnvironment) {
 
 function registeredEnvironmentOptions(names) {
   return Object.fromEntries(uniqueStrings(names).map((name) => [name, {}]));
+}
+
+function normalizeAuxiliaryWorkers(value) {
+  if (value == null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("ddVitePlugin auxiliaryWorkers must be an array");
+  }
+  const seen = new Set();
+  return value.map((entry, index) => {
+    const name = nonEmptyString(entry?.name);
+    if (!name) {
+      throw new Error(`ddVitePlugin auxiliaryWorkers[${index}].name must be a non-empty string`);
+    }
+    if (seen.has(name)) {
+      throw new Error(`duplicate ddVitePlugin auxiliary worker name: ${name}`);
+    }
+    seen.add(name);
+    return {
+      ...entry,
+      name,
+      binding: nonEmptyString(entry?.binding) ?? auxiliaryBindingName(name),
+      id: nonEmptyString(entry?.id) ?? name,
+    };
+  });
+}
+
+function auxiliaryBindingName(name) {
+  const binding = String(name).trim().replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
+  return binding ? `${binding}_WORKER` : "AUXILIARY_WORKER";
+}
+
+function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
+  if (auxiliaryWorkers.length === 0) {
+    return config;
+  }
+  const runtimeConfig = cloneJson(config);
+  const bindings = Array.isArray(runtimeConfig.bindings) ? [...runtimeConfig.bindings] : [];
+  for (const worker of auxiliaryWorkers) {
+    if (!bindings.some((binding) =>
+      String(binding?.type ?? "").toLowerCase() === "dynamic" && binding?.binding === worker.binding
+    )) {
+      bindings.push({ type: "dynamic", binding: worker.binding });
+    }
+  }
+  runtimeConfig.bindings = bindings;
+  return runtimeConfig;
+}
+
+function ddAuxiliaryWorkersVirtualPlugin(loadSource) {
+  return {
+    name: "dd-auxiliary-workers",
+    resolveId(id) {
+      if (id === DD_AUXILIARY_WORKERS_MODULE) {
+        return DD_AUXILIARY_WORKERS_RESOLVED;
+      }
+    },
+    load(id) {
+      if (id === DD_AUXILIARY_WORKERS_RESOLVED) {
+        return loadSource();
+      }
+    },
+  };
 }
 
 function mergeFrameworkDeploymentConfig(framework, deploymentConfig) {
@@ -1300,9 +1426,7 @@ async function __ddViteImportGraph(graph) {
         if (devFetchOrigins.has(url.origin)) {
           return rawHostFetch(input, init);
         }
-      } catch {
-        // Fall through to the policy fetch.
-      }
+      } catch {}
       return policyFetch(input, init);
     };
     Object.defineProperty(bridge, "__ddViteDevFetchBridge", { value: true });
@@ -1594,9 +1718,7 @@ function viteDevServerOrigins(viteServer) {
   for (const url of viteDevServerUrlCandidates(viteServer)) {
     try {
       origins.add(new URL(url).origin);
-    } catch {
-      // Ignore malformed debug URLs.
-    }
+    } catch {}
   }
   origins.add("http://127.0.0.1:5173");
   origins.add("http://localhost:5173");
@@ -2297,9 +2419,7 @@ function normalizeViteBase(value) {
   let base = value;
   try {
     base = new URL(value).pathname;
-  } catch {
-    // Vite base is commonly a path. Keep it as-is when it is not an absolute URL.
-  }
+  } catch {}
   const normalized = normalizeMount(base);
   return normalized === "/" ? "/" : `${normalized}/`;
 }
@@ -2663,8 +2783,10 @@ async function buildGeneratedDeploymentConfig({
   staticRoutes,
 }) {
   const deployment = {};
-  const runtimeConfig =
-    options.config ?? base.config ?? topLevelRuntimeConfig(base) ?? { public: true };
+  const runtimeConfig = withAuxiliaryRuntimeBindings(
+    options.config ?? base.config ?? topLevelRuntimeConfig(base) ?? { public: true },
+    normalizeAuxiliaryWorkers(options.auxiliaryWorkers),
+  );
 
   deployment.name = options.name ?? base.name ?? workerName;
   deployment.entrypoint = workerFile;

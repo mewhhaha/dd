@@ -11,6 +11,20 @@ export default defineConfig({
     },
   },
   plugins: [
-    dd(),
+    dd({
+      auxiliaryWorkers: [
+        {
+          name: "auth",
+          binding: "AUTH_WORKER",
+          entry: "src/auth-worker.ts",
+          config: {
+            bindings: [
+              { type: "kv", binding: "AUTH_DB" },
+              { type: "memory", binding: "AUTH_STATE" },
+            ],
+          },
+        },
+      ],
+    }),
   ],
 });

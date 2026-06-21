@@ -61,9 +61,18 @@ export function apiSession(): Effect.Effect<Response, AppError, Storage> {
       },
       session: {
         id: session.id,
+        username: session.username,
         createdAt: session.createdAt,
       },
     });
+  });
+}
+
+export function apiAudit(): Effect.Effect<Response, AppError, Storage> {
+  return Effect.gen(function* () {
+    const storage = yield* Storage;
+    yield* requireAdmin(storage);
+    return jsonResponse(yield* storage.recentAudit);
   });
 }
 

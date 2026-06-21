@@ -28,6 +28,7 @@ impl WorkerManager {
             binding,
             id,
             source,
+            bindings,
             env,
             timeout,
             policy,
@@ -193,6 +194,7 @@ impl WorkerManager {
         }
         let validated_policy = match build_dynamic_worker_config(
             env.clone(),
+            bindings.clone(),
             policy.clone(),
             dynamic_rpc_bindings.clone(),
         ) {
@@ -210,6 +212,7 @@ impl WorkerManager {
             .deploy_dynamic_internal(
                 source,
                 env,
+                bindings,
                 validated_policy.clone(),
                 dynamic_rpc_bindings,
                 false,
@@ -1260,53 +1263,6 @@ impl WorkerManager {
             );
         }
         self.retire_worker_completely(worker_name);
-    }
-
-    pub(super) async fn dynamic_worker_snapshot_cached(
-        &mut self,
-        source: &str,
-    ) -> Option<&'static [u8]> {
-        let source_hash =
-            hash_source_with_code_generation(source, self.config.debug_code_generation);
-        if let Some(snapshot) = self.dynamic_worker_snapshots.get(&source_hash).copied() {
-            return Some(snapshot);
-        }
-        if self.dynamic_worker_snapshot_failures.contains(&source_hash) {
-            return None;
-        }
-
-        match build_worker_snapshot(
-            self.bootstrap_snapshot,
-            source,
-            self.config.debug_code_generation,
-        )
-        .await
-        {
-            Ok(snapshot) => {
-                match validate_loaded_worker_runtime(snapshot, self.config.debug_code_generation) {
-                    Ok(()) => {
-                        self.dynamic_worker_snapshots.insert(source_hash, snapshot);
-                        Some(snapshot)
-                    }
-                    Err(error) => {
-                        self.dynamic_worker_snapshot_failures.insert(source_hash);
-                        warn!(
-                            error = %error,
-                            "dynamic worker snapshot validation failed; falling back to bootstrap snapshot"
-                        );
-                        None
-                    }
-                }
-            }
-            Err(error) => {
-                self.dynamic_worker_snapshot_failures.insert(source_hash);
-                warn!(
-                    error = %error,
-                    "dynamic worker snapshot build failed; falling back to bootstrap snapshot"
-                );
-                None
-            }
-        }
     }
 }
 

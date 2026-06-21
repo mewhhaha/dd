@@ -1,5 +1,5 @@
 import { htmlResponse } from "./http";
-import type { AuditEvent, Session, User } from "./types";
+import type { AuditEvent, AuthSessionView, Session, User } from "./types";
 
 export function renderHome(): Response {
   return htmlResponse(shell("Passkey Auth", `
@@ -9,13 +9,16 @@ export function renderHome(): Response {
       <form data-passkey-register>
         <label>
           Username
-          <input autocomplete="username webauthn" name="username" required value="ada">
+          <input autocomplete="username webauthn" name="username" required>
         </label>
         <label>
           Display name
-          <input autocomplete="name" name="displayName" required value="Ada Lovelace">
+          <input autocomplete="name" name="displayName" required>
         </label>
-        <button type="submit">Create passkey</button>
+        <div class="actions">
+          <button data-passkey-randomize type="button">New test account</button>
+          <button type="submit">Create passkey</button>
+        </div>
       </form>
       <div class="divider"><span>or</span></div>
       <form data-passkey-login>
@@ -39,6 +42,28 @@ export function renderAccount(session: Session, user: User): Response {
       </dl>
       <div class="actions">
         ${user.role === "admin" ? `<a href="/audit">Audit trail</a>` : ""}
+        <a href="/api/session">JSON session</a>
+        <form data-effect-form method="post" action="/logout">
+          <button type="submit">Sign out</button>
+        </form>
+      </div>
+    </section>
+  `));
+}
+
+export function renderAccountSummary(view: AuthSessionView): Response {
+  return htmlResponse(shell("Signed in", `
+    <section class="panel">
+      <p class="eyebrow">Signed in by passkey</p>
+      <h1>${escapeHtml(view.user.displayName)}</h1>
+      <dl>
+        <div><dt>Username</dt><dd>${escapeHtml(view.user.username)}</dd></div>
+        <div><dt>Role</dt><dd>${escapeHtml(view.user.role)}</dd></div>
+        <div><dt>Passkeys</dt><dd>${view.user.passkeys}</dd></div>
+        <div><dt>Session</dt><dd>${escapeHtml(view.session.id.slice(0, 8))}</dd></div>
+      </dl>
+      <div class="actions">
+        ${view.user.role === "admin" ? `<a href="/audit">Audit trail</a>` : ""}
         <a href="/api/session">JSON session</a>
         <form data-effect-form method="post" action="/logout">
           <button type="submit">Sign out</button>
@@ -99,6 +124,8 @@ function shell(title: string, body: string): string {
           .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
           .actions form { display: inline; }
           .actions button { background: #334155; }
+          [data-passkey-register] .actions { display: grid; grid-template-columns: 1fr 1fr; }
+          [data-passkey-randomize] { background: #334155; }
           article { grid-template-columns: 1fr auto; }
           article p { grid-column: 1 / -1; }
         </style>

@@ -2,6 +2,7 @@ import { Effect, Layer } from "effect";
 import { Router, type IRequest } from "itty-router";
 import {
   account,
+  apiAudit,
   apiSession,
   audit,
   beginAuthentication,
@@ -26,13 +27,15 @@ const router = Router<IRequest, [Env], Response>()
   .get("/", effectHandler(home()))
   .get("/me", effectHandler(account()))
   .get("/audit", effectHandler(audit()))
+  .get("/api/audit", effectHandler(apiAudit()))
   .get("/api/session", effectHandler(apiSession()))
   .post("/api/passkeys/register/options", effectHandler(beginRegistration()))
   .post("/api/passkeys/register/verify", effectHandler(finishRegistration()))
   .post("/api/passkeys/authenticate/options", effectHandler(beginAuthentication()))
   .post("/api/passkeys/authenticate/verify", effectHandler(finishAuthentication()))
   .post("/logout", effectHandler(logout()))
-  .get("/src/status", () => textResponse("worker src namespace"))
+  .get("/src/status", () => textResponse("auth worker src namespace"))
+  .get("/__auth/status", () => textResponse("auth worker ready"))
   .all("*", () => errorResponse(notFound("Route not found")));
 
 const app = {

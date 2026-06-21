@@ -15,9 +15,8 @@ mod storage;
 use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
-    abort_worker_request, build_bootstrap_snapshot, build_worker_snapshot, dispatch_worker_request,
-    ensure_v8_flags, load_worker, new_runtime_from_snapshot, pump_event_loop_once,
-    validate_loaded_worker_runtime, validate_worker,
+    abort_worker_request, build_bootstrap_snapshot, dispatch_worker_request, ensure_v8_flags,
+    load_worker, new_runtime_from_snapshot, pump_event_loop_once, validate_worker,
 };
 use crate::kv::KvStore;
 use crate::memory::MemoryStore;
@@ -34,7 +33,9 @@ use crate::ops::{
 use crate::static_assets::{
     compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,
 };
-use common::{DeployAsset, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput};
+use common::{
+    DeployAsset, DeployBinding, DeployConfig, PlatformError, Result, WorkerInvocation, WorkerOutput,
+};
 use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt;

@@ -336,6 +336,7 @@ pub(super) fn op_dynamic_worker_create(
             binding: payload.binding,
             id: id.to_string(),
             source: payload.source,
+            bindings: payload.bindings,
             env: payload.env,
             timeout: payload.timeout,
             policy: payload.policy,

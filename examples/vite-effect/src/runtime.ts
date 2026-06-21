@@ -11,8 +11,12 @@ export class RequestContext extends Context.Tag("vite-effect/RequestContext")<
 export function requestLayer(env: Env, request: Request) {
   return Layer.mergeAll(
     Layer.succeed(WorkerEnv, env),
-    Layer.succeed(RequestContext, { request }),
+    requestContextLayer(request),
   );
+}
+
+export function requestContextLayer(request: Request) {
+  return Layer.succeed(RequestContext, { request });
 }
 
 export const currentRequest = RequestContext.pipe(

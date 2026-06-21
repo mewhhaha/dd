@@ -214,6 +214,7 @@ impl WorkerManager {
         self.deploy_dynamic_internal(
             source,
             env,
+            Vec::new(),
             full_dynamic_internal_policy(egress_allow_hosts),
             dynamic_rpc_bindings,
             true,
@@ -225,6 +226,7 @@ impl WorkerManager {
         &mut self,
         source: String,
         env: HashMap<String, String>,
+        bindings: Vec<DeployBinding>,
         policy: ValidatedDynamicWorkerPolicy,
         dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
         validate_source: bool,
@@ -232,6 +234,7 @@ impl WorkerManager {
         let worker_name = format!("dyn-{}", Uuid::new_v4().simple());
         let dynamic_config = build_dynamic_worker_config(
             env,
+            bindings,
             crate::ops::DynamicWorkerPolicy {
                 egress_allow_hosts: policy.egress_allow_hosts.clone(),
                 allow_host_rpc: policy.allow_host_rpc,
@@ -264,7 +267,7 @@ impl WorkerManager {
         let request_context = RequestExecutionContext::new(
             worker_name.clone(),
             generation,
-            Vec::new(),
+            dynamic_config.bindings.dynamic.clone(),
             dynamic_rpc_binding_names.clone(),
             dynamic_config.secret_replacements,
             dynamic_config.egress_allow_hosts,
@@ -272,11 +275,7 @@ impl WorkerManager {
             Some(dynamic_config.policy.max_outbound_requests),
             Some(Arc::clone(&dynamic_quota_state)),
         );
-        let (snapshot, snapshot_preloaded) =
-            match self.dynamic_worker_snapshot_cached(&source).await {
-                Some(snapshot) => (snapshot, true),
-                None => (self.bootstrap_snapshot, false),
-            };
+        let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
         let kv_read_cache_config_json = Arc::<str>::from(
             crate::json::to_string(&KvReadCacheConfigPayload {
                 max_entries: self.config.kv_read_cache_max_entries,
@@ -302,17 +301,17 @@ impl WorkerManager {
             snapshot_preloaded,
             source: Arc::<str>::from(source),
             kv_bindings_json: Arc::<str>::from(
-                crate::json::to_string(&Vec::<String>::new())
+                crate::json::to_string(&dynamic_config.bindings.kv)
                     .map_err(|error| PlatformError::internal(error.to_string()))?,
             ),
             kv_read_cache_config_json,
-            memory_bindings: Vec::new(),
+            memory_bindings: dynamic_config.bindings.memory.clone(),
             memory_bindings_json: Arc::<str>::from(
-                crate::json::to_string(&Vec::<String>::new())
+                crate::json::to_string(&dynamic_config.bindings.memory)
                     .map_err(|error| PlatformError::internal(error.to_string()))?,
             ),
             dynamic_bindings_json: Arc::<str>::from(
-                crate::json::to_string(&Vec::<String>::new())
+                crate::json::to_string(&dynamic_config.bindings.dynamic)
                     .map_err(|error| PlatformError::internal(error.to_string()))?,
             ),
             dynamic_rpc_bindings: dynamic_config.dynamic_rpc_bindings.clone(),

@@ -18,6 +18,9 @@ try {
   if (!homeText.includes("Passkey Auth") || !homeText.includes('data-worker="vite-effect"')) {
     throw new Error(`home did not render passkey worker: ${homeText}`);
   }
+  if (!homeText.includes("data-passkey-randomize") || homeText.includes('value="ada"')) {
+    throw new Error(`home did not expose generated signup controls: ${homeText}`);
+  }
 
   const anonymousSession = await fetch(`${base}/api/session`);
   if (anonymousSession.status !== 401) {
@@ -38,15 +41,15 @@ try {
   }
 
   const registrationOptions = await postJson(`${base}/api/passkeys/register/options`, {
-    username: "ada",
-    displayName: "Ada Lovelace",
+    username: "guest-smoke",
+    displayName: "Smoke Passkey",
   });
   if (
     !registrationOptions.challenge
     || registrationOptions.rp?.name !== "Vite Effect"
     || registrationOptions.rp?.id !== "localhost"
-    || registrationOptions.user?.name !== "ada"
-    || registrationOptions.user?.displayName !== "Ada Lovelace"
+    || registrationOptions.user?.name !== "guest-smoke"
+    || registrationOptions.user?.displayName !== "Smoke Passkey"
     || registrationOptions.authenticatorSelection?.residentKey !== "required"
     || registrationOptions.authenticatorSelection?.userVerification !== "required"
   ) {
@@ -101,8 +104,14 @@ try {
 
   const workerRoute = await fetch(`${base}/src/status?raw`);
   const workerRouteText = await workerRoute.text();
-  if (workerRouteText !== "worker src namespace") {
+  if (workerRouteText !== "frontend worker src namespace") {
     throw new Error(`worker /src route was swallowed by Vite: ${workerRouteText}`);
+  }
+
+  const authWorkerRoute = await fetch(`${base}/__auth/status`);
+  const authWorkerRouteText = await authWorkerRoute.text();
+  if (authWorkerRouteText !== "auth worker ready") {
+    throw new Error(`auth worker route did not proxy through dynamic binding: ${authWorkerRouteText}`);
   }
 
   const moduleResponse = await fetch(`${base}/src/client.ts`, {

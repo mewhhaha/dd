@@ -11,6 +11,7 @@ pub(super) struct DeployBindings {
 }
 
 pub(super) struct DynamicWorkerConfig {
+    pub(super) bindings: DeployBindings,
     pub(super) dynamic_env: Vec<(String, String)>,
     pub(super) dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     pub(super) secret_replacements: Vec<(String, String)>,
@@ -125,9 +126,20 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
 
 pub(super) fn build_dynamic_worker_config(
     env: HashMap<String, String>,
+    bindings: Vec<DeployBinding>,
     policy_input: DynamicWorkerPolicy,
     dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
 ) -> Result<DynamicWorkerConfig> {
+    if !policy_input.allow_state_bindings && !bindings.is_empty() {
+        return Err(PlatformError::bad_request(
+            "dynamic child policy blocks state bindings; set allow_state_bindings: true",
+        ));
+    }
+    let bindings = extract_bindings(&DeployConfig {
+        public: false,
+        bindings,
+        internal: Default::default(),
+    })?;
     let mut dynamic_env = Vec::new();
     let mut secret_replacements = Vec::new();
     let mut env_placeholders = HashMap::new();
@@ -225,6 +237,7 @@ pub(super) fn build_dynamic_worker_config(
     };
 
     Ok(DynamicWorkerConfig {
+        bindings,
         dynamic_env,
         dynamic_rpc_bindings,
         secret_replacements,

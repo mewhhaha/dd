@@ -26,6 +26,22 @@ export interface DdWorkerRuntimeOptions extends DdWorkerBundleOptions {
   autoDeploy?: boolean;
 }
 
+export interface DdAuxiliaryWorkerOptions extends DdWorkerBundleOptions {
+  name: string;
+  binding?: string;
+  id?: string;
+  entry?: string | URL;
+  source?: string | (() => string | Promise<string>);
+  config?: Record<string, unknown>;
+}
+
+export interface DdAuxiliaryWorkerRecord {
+  name: string;
+  binding: string;
+  id: string;
+  config: Record<string, unknown>;
+}
+
 export interface DdViteEnvironmentOptions {
   name?: string;
   childEnvironments?: string[];
@@ -69,6 +85,7 @@ export interface DdVitePluginOptions extends DdWorkerRuntimeOptions {
   reloadOnHotUpdate?: boolean | "all" | "entry";
   devModuleRunner?: boolean;
   deploymentConfig?: false | DdGeneratedDeploymentConfigOptions;
+  auxiliaryWorkers?: DdAuxiliaryWorkerOptions[];
   eager?: boolean;
 }
 
@@ -143,3 +160,8 @@ export function ddEnvironment(
 ): EnvironmentOptions;
 export function ddVitePlugin(options?: DdVitePluginOptions): Plugin;
 export default ddVitePlugin;
+
+declare module "virtual:dd-auxiliary-workers" {
+  export const workers: Record<string, DdAuxiliaryWorkerRecord>;
+  export default workers;
+}

@@ -2796,6 +2796,7 @@ fn dynamic_worker_config_builds_placeholders() {
     env.insert("OPENAI_API_KEY".to_string(), "sk-test-123".to_string());
     let config = super::build_dynamic_worker_config(
         env,
+        Vec::new(),
         crate::ops::DynamicWorkerPolicy {
             egress_allow_hosts: vec!["api.openai.com".to_string()],
             ..Default::default()
@@ -2822,6 +2823,7 @@ fn dynamic_worker_config_builds_placeholders() {
 fn dynamic_worker_config_rejects_invalid_host() {
     let config = super::build_dynamic_worker_config(
         HashMap::new(),
+        Vec::new(),
         crate::ops::DynamicWorkerPolicy {
             egress_allow_hosts: vec!["http://bad-host".to_string()],
             ..Default::default()
@@ -2832,9 +2834,46 @@ fn dynamic_worker_config_rejects_invalid_host() {
 }
 
 #[test]
+fn dynamic_worker_config_requires_state_policy_for_bindings() {
+    let config = super::build_dynamic_worker_config(
+        HashMap::new(),
+        vec![DeployBinding::Kv {
+            binding: "AUTH_DB".to_string(),
+        }],
+        crate::ops::DynamicWorkerPolicy::default(),
+        Vec::new(),
+    );
+    assert!(config.is_err());
+}
+
+#[test]
+fn dynamic_worker_config_accepts_state_bindings() {
+    let config = super::build_dynamic_worker_config(
+        HashMap::new(),
+        vec![
+            DeployBinding::Kv {
+                binding: "AUTH_DB".to_string(),
+            },
+            DeployBinding::Memory {
+                binding: "AUTH_STATE".to_string(),
+            },
+        ],
+        crate::ops::DynamicWorkerPolicy {
+            allow_state_bindings: true,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .expect("dynamic config should accept state bindings when the policy allows them");
+    assert_eq!(config.bindings.kv, vec!["AUTH_DB".to_string()]);
+    assert_eq!(config.bindings.memory, vec!["AUTH_STATE".to_string()]);
+}
+
+#[test]
 fn dynamic_worker_config_accepts_host_port_and_wildcard_rules() {
     let config = super::build_dynamic_worker_config(
         HashMap::new(),
+        Vec::new(),
         crate::ops::DynamicWorkerPolicy {
             egress_allow_hosts: vec![
                 "api.example.com:8443".to_string(),

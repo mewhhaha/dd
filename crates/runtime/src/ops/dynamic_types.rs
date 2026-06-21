@@ -7,6 +7,7 @@ pub struct DynamicWorkerCreateEvent {
     pub binding: String,
     pub id: String,
     pub source: String,
+    pub bindings: Vec<common::DeployBinding>,
     pub env: HashMap<String, String>,
     pub timeout: u64,
     pub policy: DynamicWorkerPolicy,
@@ -569,6 +570,8 @@ pub(crate) struct DynamicWorkerCreatePayload {
     pub(crate) binding: String,
     pub(crate) id: String,
     pub(crate) source: String,
+    #[serde(default)]
+    pub(crate) bindings: Vec<common::DeployBinding>,
     #[serde(default)]
     pub(crate) env: HashMap<String, String>,
     #[serde(default = "default_dynamic_worker_timeout")]

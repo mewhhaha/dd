@@ -5,6 +5,9 @@ document.documentElement.dataset.effectClient = "vite-effect-client-module";
 const message = document.querySelector<HTMLElement>("[data-passkey-message]");
 const registerForm = document.querySelector<HTMLFormElement>("[data-passkey-register]");
 const loginForm = document.querySelector<HTMLFormElement>("[data-passkey-login]");
+const randomizeButton = document.querySelector<HTMLButtonElement>("[data-passkey-randomize]");
+
+fillFreshSignup();
 
 if (!browserSupportsWebAuthn()) {
   setMessage("This browser cannot use passkeys.");
@@ -23,6 +26,10 @@ registerForm?.addEventListener("submit", async (event) => {
     const result = await postJson<{ redirect?: string }>("/api/passkeys/register/verify", credential);
     location.assign(result.redirect ?? "/me");
   });
+});
+
+randomizeButton?.addEventListener("click", () => {
+  fillFreshSignup(true);
 });
 
 loginForm?.addEventListener("submit", async (event) => {
@@ -73,4 +80,27 @@ function setMessage(value: string): void {
   if (message) {
     message.textContent = value;
   }
+}
+
+function fillFreshSignup(force = false): void {
+  if (!registerForm) {
+    return;
+  }
+  const username = registerForm.elements.namedItem("username");
+  const displayName = registerForm.elements.namedItem("displayName");
+  if (!(username instanceof HTMLInputElement) || !(displayName instanceof HTMLInputElement)) {
+    return;
+  }
+  if (!force && (username.value || displayName.value)) {
+    return;
+  }
+  const suffix = randomSuffix();
+  username.value = `guest-${suffix}`;
+  displayName.value = `Passkey Tester ${suffix.toUpperCase()}`;
+}
+
+function randomSuffix(): string {
+  const bytes = new Uint8Array(5);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(36).padStart(2, "0")).join("").slice(0, 8);
 }
