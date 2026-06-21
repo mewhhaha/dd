@@ -1,0 +1,22 @@
+{
+  "name": "dd-vite-effect-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json",
+    "smoke": "node smoke.mjs"
+  },
+  "dependencies": {
+    "@mewhhaha/vite-plugin-dd": "workspace:*",
+    "@simplewebauthn/browser": "^13.3.0",
+    "@simplewebauthn/server": "^13.3.1",
+    "effect": "^3.19.9",
+    "itty-router": "^5.0.22"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0"
+  }
+}

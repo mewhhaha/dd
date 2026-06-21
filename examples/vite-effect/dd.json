@@ -1,0 +1,17 @@
+{
+  "name": "vite-effect",
+  "entrypoint": "src/worker.ts",
+  "config": {
+    "public": true,
+    "bindings": [
+      {
+        "type": "kv",
+        "binding": "AUTH_DB"
+      },
+      {
+        "type": "memory",
+        "binding": "AUTH_STATE"
+      }
+    ]
+  }
+}
