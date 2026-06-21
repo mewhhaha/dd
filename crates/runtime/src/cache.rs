@@ -1,11 +1,13 @@
 use crate::blob::BlobStore;
+use crate::turso_util::{configure_turso_connection, is_retryable_turso_error, retry_turso_busy};
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use turso::{Builder, Connection, Database};
+use turso::{transaction::TransactionBehavior, Builder, Connection, Database};
 use uuid::Uuid;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -276,15 +278,15 @@ impl CacheStore {
         }
 
         if !selected_id.is_empty() {
-            let changed = conn
-                .execute(
+            let changed = execute_with_retry(|| {
+                conn.execute(
                     "UPDATE worker_cache_entries
-                 SET last_access_seq = ?1
-                 WHERE id = ?2",
+                     SET last_access_seq = ?1
+                     WHERE id = ?2",
                     (self.next_access_seq(), selected_id.as_str()),
                 )
-                .await
-                .map_err(cache_error)?;
+            })
+            .await?;
             debug_assert_eq!(
                 changed, 1,
                 "selected cache hit should update one recency row"
@@ -354,95 +356,126 @@ impl CacheStore {
             body_ref = self.blob_store.put(&response.body).await?;
         }
 
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
         let now_ms = epoch_ms_i64()?;
         let expires_at_ms = now_ms + ttl.as_millis() as i64;
-        let existing_variant = self
-            .load_variant_candidates(
-                &conn,
-                &cache_name,
-                &method,
-                &request.url,
-                &vary_headers_json,
-                &vary_values_json,
-            )
-            .await?;
         let access_seq = self.next_access_seq();
+        let entry_id = Uuid::new_v4().to_string();
+
+        const MAX_ATTEMPTS: usize = 8;
+        let mut commit_attempted = false;
+        let existing_variant = 'write: {
+            for attempt in 0..MAX_ATTEMPTS {
+                let tx = match conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .await
+                {
+                    Ok(tx) => tx,
+                    Err(error)
+                        if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
+                    {
+                        sleep_cache_retry(attempt).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
+                            .await;
+                        return Err(cache_error(error));
+                    }
+                };
+                let existing_variant = match self
+                    .load_variant_candidates(
+                        &tx,
+                        &cache_name,
+                        &method,
+                        &request.url,
+                        &vary_headers_json,
+                        &vary_values_json,
+                    )
+                    .await
+                {
+                    Ok(existing_variant) => existing_variant,
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                let put_result = tx
+                    .execute(
+                        "INSERT INTO worker_cache_entries (
+                           id, cache_name, method, url, vary_headers_json, vary_values_json,
+                           status, headers_json, body_storage, body_inline_hex, body_ref,
+                           body_size, expires_at_ms, last_access_seq, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                         ON CONFLICT(cache_name, method, url, vary_headers_json, vary_values_json)
+                         DO UPDATE SET
+                           status = excluded.status,
+                           headers_json = excluded.headers_json,
+                           body_storage = excluded.body_storage,
+                           body_inline_hex = excluded.body_inline_hex,
+                           body_ref = excluded.body_ref,
+                           body_size = excluded.body_size,
+                           expires_at_ms = excluded.expires_at_ms,
+                           last_access_seq = excluded.last_access_seq,
+                           updated_at_ms = excluded.updated_at_ms",
+                        (
+                            entry_id.as_str(),
+                            cache_name.as_str(),
+                            method.as_str(),
+                            request.url.as_str(),
+                            vary_headers_json.as_str(),
+                            vary_values_json.as_str(),
+                            response.status as i64,
+                            headers_json.as_str(),
+                            body_storage.as_str(),
+                            body_inline_hex.as_str(),
+                            body_ref.as_str(),
+                            size_bytes as i64,
+                            expires_at_ms,
+                            access_seq,
+                            now_ms,
+                        ),
+                    )
+                    .await;
+                if let Err(error) = put_result {
+                    let _ = tx.rollback().await;
+                    if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
+                        sleep_cache_retry(attempt).await;
+                        continue;
+                    }
+                    self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
+                        .await;
+                    return Err(cache_error(error));
+                }
+                commit_attempted = true;
+                if let Err(error) = tx.commit().await {
+                    if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
+                        sleep_cache_retry(attempt).await;
+                        continue;
+                    }
+                    self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
+                        .await;
+                    return Err(cache_error(error));
+                }
+                break 'write existing_variant;
+            }
+            self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
+                .await;
+            return Err(PlatformError::runtime(
+                "cache error: put failed after retries",
+            ));
+        };
+        if existing_variant.len() > 1 {
+            self.remove_records(&conn, &existing_variant[1..]).await?;
+        }
         if let Some(existing) = existing_variant.first() {
-            let old_body_storage = existing.body_storage.clone();
-            let old_body_ref = existing.body_ref.clone();
-            let update_result = conn
-                .execute(
-                    "UPDATE worker_cache_entries
-                     SET status = ?2,
-                         headers_json = ?3,
-                         body_storage = ?4,
-                         body_inline_hex = ?5,
-                         body_ref = ?6,
-                         body_size = ?7,
-                         expires_at_ms = ?8,
-                         last_access_seq = ?9,
-                         updated_at_ms = ?10
-                     WHERE id = ?1",
-                    (
-                        existing.id.as_str(),
-                        response.status as i64,
-                        headers_json.as_str(),
-                        body_storage.as_str(),
-                        body_inline_hex.as_str(),
-                        body_ref.as_str(),
-                        size_bytes as i64,
-                        expires_at_ms,
-                        access_seq,
-                        now_ms,
-                    ),
-                )
-                .await;
-            if let Err(error) = update_result {
-                if body_storage == "blob" && !body_ref.is_empty() {
-                    let _ = self.blob_store.delete(&body_ref).await;
-                }
-                return Err(cache_error(error));
-            }
-            if old_body_storage == "blob" && !old_body_ref.is_empty() && old_body_ref != body_ref {
-                self.blob_store.delete(&old_body_ref).await?;
-            }
-            if existing_variant.len() > 1 {
-                self.remove_records(&conn, &existing_variant[1..]).await?;
-            }
-        } else {
-            let entry_id = Uuid::new_v4().to_string();
-            let insert_result = conn
-                .execute(
-                    "INSERT INTO worker_cache_entries (
-                       id, cache_name, method, url, vary_headers_json, vary_values_json,
-                       status, headers_json, body_storage, body_inline_hex, body_ref,
-                       body_size, expires_at_ms, last_access_seq, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                    (
-                        entry_id.as_str(),
-                        cache_name.as_str(),
-                        method.as_str(),
-                        request.url.as_str(),
-                        vary_headers_json.as_str(),
-                        vary_values_json.as_str(),
-                        response.status as i64,
-                        headers_json.as_str(),
-                        body_storage.as_str(),
-                        body_inline_hex.as_str(),
-                        body_ref.as_str(),
-                        size_bytes as i64,
-                        expires_at_ms,
-                        access_seq,
-                        now_ms,
-                    ),
-                )
-                .await;
-            if let Err(error) = insert_result {
-                if body_storage == "blob" && !body_ref.is_empty() {
-                    let _ = self.blob_store.delete(&body_ref).await;
-                }
-                return Err(cache_error(error));
+            if existing.body_storage == "blob"
+                && !existing.body_ref.is_empty()
+                && existing.body_ref != body_ref
+            {
+                self.blob_store.delete(&existing.body_ref).await?;
             }
         }
         self.cleanup_expired(&conn, now_ms).await?;
@@ -525,8 +558,9 @@ impl CacheStore {
 
     async fn ensure_schema(&self) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS worker_cache_entries (
+        execute_with_retry(|| {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS worker_cache_entries (
                id TEXT PRIMARY KEY,
                cache_name TEXT NOT NULL,
                method TEXT NOT NULL,
@@ -543,38 +577,42 @@ impl CacheStore {
                last_access_seq INTEGER NOT NULL,
                updated_at_ms INTEGER NOT NULL
              )",
-            (),
-        )
-        .await
-        .map_err(cache_error)?;
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_cache_variant
+                (),
+            )
+        })
+        .await?;
+        execute_with_retry(|| {
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_cache_variant
              ON worker_cache_entries(cache_name, method, url, vary_headers_json, vary_values_json)",
-            (),
-        )
-        .await
-        .map_err(cache_error)?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_worker_cache_lookup
+                (),
+            )
+        })
+        .await?;
+        execute_with_retry(|| {
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_cache_lookup
              ON worker_cache_entries(cache_name, method, url)",
-            (),
-        )
-        .await
-        .map_err(cache_error)?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_worker_cache_expiry
+                (),
+            )
+        })
+        .await?;
+        execute_with_retry(|| {
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_cache_expiry
              ON worker_cache_entries(expires_at_ms)",
-            (),
-        )
-        .await
-        .map_err(cache_error)?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_worker_cache_lru
+                (),
+            )
+        })
+        .await?;
+        execute_with_retry(|| {
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_cache_lru
              ON worker_cache_entries(last_access_seq, updated_at_ms)",
-            (),
-        )
-        .await
-        .map_err(cache_error)?;
+                (),
+            )
+        })
+        .await?;
         Ok(())
     }
 
@@ -746,12 +784,13 @@ impl CacheStore {
         records: &[CacheDeleteCandidate],
     ) -> Result<()> {
         for record in records {
-            conn.execute(
-                "DELETE FROM worker_cache_entries WHERE id = ?1",
-                (record.id.as_str(),),
-            )
-            .await
-            .map_err(cache_error)?;
+            execute_with_retry(|| {
+                conn.execute(
+                    "DELETE FROM worker_cache_entries WHERE id = ?1",
+                    (record.id.as_str(),),
+                )
+            })
+            .await?;
             if record.body_storage == "blob" && !record.body_ref.is_empty() {
                 self.blob_store.delete(&record.body_ref).await?;
             }
@@ -759,8 +798,52 @@ impl CacheStore {
         Ok(())
     }
 
+    async fn cleanup_failed_put_blob(
+        &self,
+        body_storage: &str,
+        body_ref: &str,
+        commit_attempted: bool,
+    ) {
+        if body_storage != "blob" || body_ref.is_empty() {
+            return;
+        }
+        if commit_attempted {
+            self.delete_blob_if_unreferenced(body_ref).await;
+            return;
+        }
+        let _ = self.blob_store.delete(body_ref).await;
+    }
+
+    async fn delete_blob_if_unreferenced(&self, body_ref: &str) {
+        let Ok(conn) = self.connect() else {
+            return;
+        };
+        let mut rows = match conn
+            .query(
+                "SELECT 1 FROM worker_cache_entries
+                 WHERE body_storage = 'blob' AND body_ref = ?1
+                 LIMIT 1",
+                (body_ref,),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return,
+        };
+        match rows.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                drop(rows);
+                let _ = self.blob_store.delete(body_ref).await;
+            }
+            Err(_) => {}
+        }
+    }
+
     fn connect(&self) -> Result<Connection> {
-        self.database.connect().map_err(cache_error)
+        let conn = self.database.connect().map_err(cache_error)?;
+        configure_turso_connection(&conn, cache_error)?;
+        Ok(conn)
     }
 
     fn next_access_seq(&self) -> i64 {
@@ -995,6 +1078,18 @@ fn epoch_ms_i64() -> Result<i64> {
     Ok(duration.as_millis() as i64)
 }
 
+async fn execute_with_retry<F, Fut>(execute: F) -> Result<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<u64, turso::Error>>,
+{
+    retry_turso_busy(execute, cache_error).await
+}
+
+async fn sleep_cache_retry(attempt: usize) {
+    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
+}
+
 fn cache_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(format!("cache error: {error}"))
 }
@@ -1015,13 +1110,20 @@ mod tests {
     use super::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
     use crate::blob::local_blob_store_for_tests;
     use common::Result;
+    use std::fs;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Barrier;
     use uuid::Uuid;
 
     async fn test_store(config: CacheConfig) -> CacheStore {
-        let database_path = format!("/tmp/dd-cache-test-{}.db", Uuid::new_v4());
         let blob_dir = format!("/tmp/dd-cache-blob-test-{}", Uuid::new_v4());
-        let blob_store = local_blob_store_for_tests(&blob_dir)
+        test_store_with_blob_dir(config, &blob_dir).await
+    }
+
+    async fn test_store_with_blob_dir(config: CacheConfig, blob_dir: &str) -> CacheStore {
+        let database_path = format!("/tmp/dd-cache-test-{}.db", Uuid::new_v4());
+        let blob_store = local_blob_store_for_tests(blob_dir)
             .await
             .expect("blob store");
         CacheStore::from_local_path(config, database_path, blob_store)
@@ -1045,6 +1147,14 @@ mod tests {
             headers: vec![("cache-control".to_string(), "max-age=60".to_string())],
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    fn local_blob_file_count(blob_dir: &str) -> usize {
+        fs::read_dir(blob_dir)
+            .expect("blob dir should exist")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "blob"))
+            .count()
     }
 
     #[tokio::test]
@@ -1212,6 +1322,48 @@ mod tests {
             CacheLookup::Fresh(value) => assert_eq!(value.body, b"two"),
             other => panic!("expected overwritten cache entry, got {:?}", other),
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_same_variant_are_normal_overwrites() -> Result<()> {
+        let blob_dir = format!("/tmp/dd-cache-blob-test-{}", Uuid::new_v4());
+        let store = test_store_with_blob_dir(
+            CacheConfig {
+                max_entries: 8,
+                max_bytes: 1024 * 1024,
+                default_ttl: Duration::from_secs(60),
+                inline_body_limit_bytes: 1,
+            },
+            &blob_dir,
+        )
+        .await;
+        let req = request("/concurrent-overwrite");
+        let barrier = Arc::new(Barrier::new(16));
+        let mut handles = Vec::new();
+
+        for index in 0..16 {
+            let store = store.clone();
+            let req = req.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store.put(&req, response(&format!("body-{index}"))).await
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.expect("put task should join")?);
+        }
+
+        match store.get(&req).await? {
+            CacheLookup::Fresh(value) => {
+                let body = String::from_utf8(value.body).expect("cache body should be utf8");
+                assert!(body.starts_with("body-"));
+            }
+            other => panic!("expected fresh concurrent overwrite hit, got {:?}", other),
+        }
+        assert_eq!(local_blob_file_count(&blob_dir), 1);
         Ok(())
     }
 

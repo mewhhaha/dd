@@ -404,6 +404,51 @@ async fn public_host_invoke_routes_by_subdomain() {
 
 #[tokio::test]
 #[serial]
+async fn public_router_allows_worker_paths_near_reserved_prefixes() {
+    let state = TestState::new("example.com").await;
+    state
+        .app()
+        .runtime
+        .deploy_with_config(
+            "echo".to_string(),
+            "export default { async fetch(request) { return new Response(new URL(request.url).pathname); } }"
+                .to_string(),
+            DeployConfig {
+                public: true,
+                bindings: vec![],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("deploy");
+
+    for path in [
+        "/v1/deployment-status",
+        "/v1/administer",
+        "/v1/dynamic-page",
+        "/v1/invoker",
+    ] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", "echo.example.com")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        let response = handle_public_request(state.app(), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(body.as_ref(), path.as_bytes());
+    }
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn public_host_invoke_ignores_spoofed_forwarded_request_url() {
     let state = TestState::new("example.com").await;
     state

@@ -67,8 +67,8 @@ pub use self::routing::{handle_private_request, handle_public_h3_request, handle
 pub(crate) use self::util::{annotate_response_with_trace_id, full_body};
 use self::util::{
     bearer_token_from_headers, json_response, private_auth_response, private_request_is_authorized,
-    private_route_requires_auth, read_json_body, respond, set_span_parent_from_http_headers,
-    validate_deploy_bindings, validate_internal_config,
+    private_route_requires_auth, public_route_is_reserved, read_json_body, respond,
+    set_span_parent_from_http_headers, validate_deploy_bindings, validate_internal_config,
 };
 use self::util::{empty_body, inject_current_trace_context};
 pub(crate) use self::websocket::{

@@ -8,6 +8,20 @@ pub(super) fn private_route_requires_auth(path: &str) -> bool {
         || path.starts_with("/v1/invoke/")
 }
 
+pub(super) fn public_route_is_reserved(path: &str) -> bool {
+    path_has_segment_prefix(path, "/v1/deploy")
+        || path_has_segment_prefix(path, "/v1/admin")
+        || path_has_segment_prefix(path, "/v1/dynamic")
+        || path_has_segment_prefix(path, "/v1/invoke")
+}
+
+fn path_has_segment_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub(super) fn private_request_is_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected_token) = state.private_bearer_token.as_deref() else {
         return true;

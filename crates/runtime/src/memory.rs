@@ -789,6 +789,11 @@ impl MemoryStore {
                 },
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
+                    if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
                     return Err(error);
                 }
             }
@@ -1137,6 +1142,11 @@ impl MemoryStore {
                 }
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
+                    if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
                     return Err(error);
                 }
             }
@@ -1293,6 +1303,11 @@ impl MemoryStore {
                 }
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
+                    if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
                     return Err(error);
                 }
             }
@@ -1515,6 +1530,11 @@ impl MemoryStore {
                 },
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
+                    if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
                     return Err(error);
                 }
             }
@@ -1646,6 +1666,11 @@ impl MemoryStore {
                 },
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
+                    if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
+                            .await;
+                        continue;
+                    }
                     return Err(error);
                 }
             }
@@ -2780,6 +2805,10 @@ async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
 }
 
 fn is_retryable_memory_error(error: &turso::Error) -> bool {
+    is_retryable_turso_error(error)
+}
+
+fn is_retryable_platform_memory_error(error: &PlatformError) -> bool {
     is_retryable_turso_error(error)
 }
 

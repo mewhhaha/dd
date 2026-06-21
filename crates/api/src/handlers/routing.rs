@@ -109,11 +109,7 @@ where
         let response = deploy_worker(state, payload).await?;
         return Ok(json_response(StatusCode::OK, &response)?);
     }
-    if path.starts_with("/v1/deploy")
-        || path.starts_with("/v1/admin")
-        || path.starts_with("/v1/dynamic")
-        || path.starts_with("/v1/invoke")
-    {
+    if public_route_is_reserved(&path) {
         return Err(PlatformError::not_found("not found").into());
     }
     let ws_upgrade = if is_websocket_upgrade(request.headers()) {
@@ -130,11 +126,7 @@ async fn route_public_h3_request(
     request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
 ) -> ApiResult<Response<ResponseBody>> {
     let path = request.uri().path().to_string();
-    if path.starts_with("/v1/deploy")
-        || path.starts_with("/v1/admin")
-        || path.starts_with("/v1/dynamic")
-        || path.starts_with("/v1/invoke")
-    {
+    if public_route_is_reserved(&path) {
         return Err(PlatformError::not_found("not found").into());
     }
     if is_websocket_upgrade(request.headers()) {
