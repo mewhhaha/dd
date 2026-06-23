@@ -17,8 +17,8 @@ pub(super) async fn start_service(
 }
 
 pub(super) struct BenchPaths {
-    db_path: PathBuf,
-    store_dir: PathBuf,
+    pub(super) db_path: PathBuf,
+    pub(super) store_dir: PathBuf,
 }
 
 pub(super) fn bench_paths(tag: &str) -> BenchPaths {

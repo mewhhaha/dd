@@ -915,6 +915,62 @@
     );
   };
 
+  const applyDirectMemoryMutations = async (entry, runtimeRequestId, records) => {
+    const mutations = (Array.isArray(records) ? records : []).map((record) => ({
+      key: String(record?.key ?? ""),
+      value_handle: putMemoryBytes(record?.value ?? new Uint8Array()),
+      encoding: String(record?.encoding ?? "utf8"),
+      deleted: record?.deleted === true,
+    }));
+    if (mutations.length === 0) {
+      return;
+    }
+    const started = performance.now();
+    const storageState = ensureMemoryStorageState(entry);
+    const result = await callOp(
+      "op_memory_direct_apply",
+      activeRequestContextHandle(),
+      memoryScopedScopeHandle(entry),
+      entry.binding,
+      entry.memoryKey,
+      mutations,
+    );
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory direct write failed"));
+    }
+    if (result.read_only === true || result.applied !== true) {
+      recordMemoryProfile("js_read_only_total", performance.now() - started, 1);
+      return;
+    }
+    const committedVersion = Number(result.max_version ?? storageState.committedVersion);
+    const committedMutations = Array.isArray(result.mutations)
+      ? result.mutations.map((mutation) => cloneMemoryRecord(mutation))
+      : [];
+    for (const mutation of committedMutations) {
+      storageState.loadedKeys.add(mutation.key);
+      storageState.mirror.set(mutation.key, {
+        ...cloneMemoryRecord(mutation),
+        version: committedVersion,
+      });
+    }
+    storageState.committedVersion = committedVersion;
+    storageState.nextVersion = Math.max(
+      Number(storageState.nextVersion ?? 0),
+      Number(storageState.committedVersion ?? -1) + 1,
+    );
+    storageState.snapshotVersion = committedVersion;
+    storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
+    storageState.freshnessCheckedVersion = committedVersion;
+    storageState.freshnessCheckedAtMs = performance.now();
+    storageState.stale = false;
+    recordMemoryProfile(
+      "js_txn_commit",
+      performance.now() - started,
+      committedMutations.length + 1,
+    );
+  };
+
   const createMemoryStorageBinding = (entry, runtimeRequestId, txn = null) => {
     const rejectStorageOptions = (operation, options) => {
       if (

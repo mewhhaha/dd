@@ -8,44 +8,47 @@
     },
     async write(key, value, options) {
       rejectMemoryDirectOptions("set", options);
-      return await invokeMemoryExecutable(
-        namespace,
-        memoryKey,
-        MEMORY_ATOMIC_METHOD,
-        (state) => {
-          state.set(String(key ?? ""), value);
-          return value;
-        },
-        [],
-      );
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      const encoded = encodeMemoryStorageValue(value);
+      await applyDirectMemoryMutations(entry, runtimeRequestId, [{
+        key: String(key ?? ""),
+        value: encoded.value,
+        encoding: encoded.encoding,
+        deleted: false,
+      }]);
+      return value;
     },
     async delete(key, options) {
       rejectMemoryDirectOptions("delete", options);
-      return await invokeMemoryExecutable(
-        namespace,
-        memoryKey,
-        MEMORY_ATOMIC_METHOD,
-        (state) => {
-          state.delete(String(key ?? ""));
-          return true;
-        },
-        [],
-      );
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      await applyDirectMemoryMutations(entry, runtimeRequestId, [{
+        key: String(key ?? ""),
+        value: new Uint8Array(),
+        encoding: "utf8",
+        deleted: true,
+      }]);
+      return true;
     },
     async writeMany(entries) {
       const normalizedEntries = normalizeMemoryWriteManyEntries(entries);
-      return await invokeMemoryExecutable(
-        namespace,
-        memoryKey,
-        MEMORY_ATOMIC_METHOD,
-        (state) => {
-          for (const item of normalizedEntries) {
-            state.set(item.key, item.value);
-          }
-          return normalizedEntries.length;
-        },
-        [],
+      const runtimeRequestId = activeRequestId();
+      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+      await applyDirectMemoryMutations(
+        entry,
+        runtimeRequestId,
+        normalizedEntries.map((item) => {
+          const encoded = encodeMemoryStorageValue(item.value);
+          return {
+            key: item.key,
+            value: encoded.value,
+            encoding: encoded.encoding,
+            deleted: false,
+          };
+        }),
       );
+      return normalizedEntries.length;
     },
     async list(options = {}) {
       const scope = memoryTxnScopeFor(namespace, memoryKey);

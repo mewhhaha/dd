@@ -1145,6 +1145,196 @@ fn close_memory_command_for_committed_batch(
 
 #[deno_core::op2]
 #[serde]
+pub(super) async fn op_memory_direct_apply(
+    state: Rc<RefCell<OpState>>,
+    request_context_handle: u32,
+    memory_scope_handle: u32,
+    #[string] binding: String,
+    #[string] key: String,
+    #[serde] mutations: Vec<MemoryDirectMutationInput>,
+) -> MemoryStateApplyBatchResult {
+    let started = std::time::Instant::now();
+    let (namespace, memory_key) =
+        match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key) {
+            Ok(scope) => scope,
+            Err(error) => {
+                return MemoryStateApplyBatchResult {
+                    ok: false,
+                    applied: false,
+                    read_only: false,
+                    max_version: -1,
+                    mutation_count: 0,
+                    effect_count: 0,
+                    accepted: false,
+                    output_gate_required: false,
+                    mutations: Vec::new(),
+                    error: error.to_string(),
+                };
+            }
+        };
+    if request_context_handle == 0 {
+        return MemoryStateApplyBatchResult {
+            ok: false,
+            applied: false,
+            read_only: false,
+            max_version: -1,
+            mutation_count: 0,
+            effect_count: 0,
+            accepted: false,
+            output_gate_required: false,
+            mutations: Vec::new(),
+            error: "memory direct apply requires request_context_handle".to_string(),
+        };
+    }
+
+    let mut batch = MemoryBatchHandle {
+        request_context_handle,
+        namespace: namespace.clone(),
+        memory_key: memory_key.clone(),
+        owner_epoch: 0,
+        command_handle: 0,
+        staged_bytes: 0,
+        accepted: false,
+        command_result: None,
+        mutations: Vec::new(),
+        effects: Vec::new(),
+    };
+    for mutation in mutations {
+        let value = if mutation.value_handle == 0 {
+            Bytes::new()
+        } else {
+            match memory_bytes_for_handle_state(
+                &mut state.borrow_mut(),
+                request_context_handle,
+                mutation.value_handle,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return MemoryStateApplyBatchResult {
+                        ok: false,
+                        applied: false,
+                        read_only: false,
+                        max_version: -1,
+                        mutation_count: batch.mutations.len(),
+                        effect_count: 0,
+                        accepted: false,
+                        output_gate_required: false,
+                        mutations: Vec::new(),
+                        error: error.to_string(),
+                    };
+                }
+            }
+        };
+        if let Err(error) = stage_memory_batch_mutation(
+            &mut batch,
+            MemoryBatchMutation {
+                key: mutation.key,
+                value: value.to_vec(),
+                encoding: mutation.encoding,
+                deleted: mutation.deleted,
+            },
+        ) {
+            return MemoryStateApplyBatchResult {
+                ok: false,
+                applied: false,
+                read_only: false,
+                max_version: -1,
+                mutation_count: batch.mutations.len(),
+                effect_count: 0,
+                accepted: false,
+                output_gate_required: false,
+                mutations: Vec::new(),
+                error: error.to_string(),
+            };
+        }
+    }
+
+    let mutation_count = batch.mutations.len();
+    if mutation_count == 0 {
+        return MemoryStateApplyBatchResult {
+            ok: true,
+            applied: false,
+            read_only: true,
+            max_version: -1,
+            mutation_count: 0,
+            effect_count: 0,
+            accepted: false,
+            output_gate_required: false,
+            mutations: Vec::new(),
+            error: String::new(),
+        };
+    }
+
+    let store = state.borrow().borrow::<MemoryStore>().clone();
+    let apply_result = store
+        .apply_batch(&namespace, &memory_key, &batch.mutations, None, &[], None)
+        .await;
+    match apply_result {
+        Ok(result) => {
+            store.record_profile(
+                MemoryProfileMetricKind::OpApplyBatch,
+                started.elapsed().as_micros() as u64,
+                mutation_count as u64 + 1,
+            );
+            let mutations = match batch
+                .mutations
+                .iter()
+                .map(|mutation| {
+                    memory_batch_mutation_entry(
+                        &mut state.borrow_mut(),
+                        request_context_handle,
+                        mutation,
+                        result.max_version,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(mutations) => mutations,
+                Err(error) => {
+                    return MemoryStateApplyBatchResult {
+                        ok: false,
+                        applied: false,
+                        read_only: false,
+                        max_version: -1,
+                        mutation_count,
+                        effect_count: 0,
+                        accepted: false,
+                        output_gate_required: false,
+                        mutations: Vec::new(),
+                        error: error.to_string(),
+                    };
+                }
+            };
+            MemoryStateApplyBatchResult {
+                ok: true,
+                applied: true,
+                read_only: false,
+                max_version: result.max_version,
+                mutation_count,
+                effect_count: 0,
+                accepted: false,
+                output_gate_required: false,
+                mutations,
+                error: String::new(),
+            }
+        }
+        Err(error) => MemoryStateApplyBatchResult {
+            ok: false,
+            applied: false,
+            read_only: false,
+            max_version: -1,
+            mutation_count,
+            effect_count: 0,
+            accepted: false,
+            output_gate_required: false,
+            mutations: Vec::new(),
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2]
+#[serde]
 pub(super) async fn op_memory_batch_apply(
     state: Rc<RefCell<OpState>>,
     batch_handle: u32,

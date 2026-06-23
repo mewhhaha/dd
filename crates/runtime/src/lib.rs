@@ -16,7 +16,7 @@ mod turso_util;
 pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use kv::{KvStore, KvUtf8Lookup};
-pub use memory::stable_memory_shard_index;
+pub use memory::{stable_memory_shard_index, MemoryBatchMutation, MemoryStore};
 pub use service::{
     DynamicDeployResult, InvokeRequestBodyReceiver, PublicRouteAssetResolution, RuntimeConfig,
     RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen,

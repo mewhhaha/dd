@@ -4426,7 +4426,7 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
 }
 
 #[test]
-fn memory_direct_writes_route_through_actor_invocation() {
+fn memory_direct_writes_use_direct_apply_fast_path() {
     let memory_source = include_str!("../../js/execute_worker/memory.js");
     let fetch_cache_source = include_str!("../../js/execute_worker/fetch_cache.js");
     let worker_runtime_source =
@@ -4480,21 +4480,24 @@ fn memory_direct_writes_route_through_actor_invocation() {
 
     assert!(memory_source.contains("async write(key, value, options)"));
     assert!(memory_source.contains("rejectMemoryDirectOptions(\"set\", options)"));
-    assert!(memory_source.contains("return await invokeMemoryExecutable("));
-    assert!(memory_source.contains("MEMORY_ATOMIC_METHOD"));
-    assert!(memory_source.contains("state.set(String(key ?? \"\"), value)"));
+    assert!(memory_source.contains("await applyDirectMemoryMutations(entry, runtimeRequestId"));
+    assert!(memory_source.contains("const encoded = encodeMemoryStorageValue(value)"));
     assert!(memory_source.contains("async delete(key, options)"));
     assert!(memory_source.contains("rejectMemoryDirectOptions(\"delete\", options)"));
-    assert!(memory_source.contains("state.delete(String(key ?? \"\"))"));
+    assert!(memory_source.contains("deleted: true"));
     assert!(memory_source.contains("async writeMany(entries)"));
-    assert!(memory_source.contains("state.set(item.key, item.value)"));
+    assert!(memory_source.contains("normalizedEntries.map((item) =>"));
     assert!(!memory_source.contains("ensureMemoryStorageCommitted(entry, runtimeRequestId)"));
     assert!(!memory_source.contains("createMemoryStorageBinding(entry, runtimeRequestId);"));
+    assert!(worker_runtime_source.contains("op_memory_direct_apply"));
+    assert!(worker_runtime_source.contains("const applyDirectMemoryMutations = async"));
     assert!(worker_runtime_source.contains("op_memory_batch_apply"));
     assert!(!worker_runtime_source.contains("op_memory_batch_next_version"));
     assert!(!memory_ops_source.contains("op_memory_batch_next_version"));
     assert!(!memory_types_source.contains("MemoryBatchNextVersionResult"));
     assert!(!worker_runtime_source.contains("memoryTxnNextVersion"));
+    assert!(memory_ops_source.contains("op_memory_direct_apply"));
+    assert!(memory_ops_source.contains("MemoryDirectMutationInput"));
     assert!(memory_ops_source.contains("MemoryBatchMutationResult"));
     assert!(memory_ops_source.contains("#[buffer] value: JsBuffer"));
     assert!(memory_ops_source.contains("op_memory_bytes_take"));

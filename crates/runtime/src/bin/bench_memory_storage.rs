@@ -1,7 +1,7 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
-    stable_memory_shard_index, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, WorkerDebugDump,
+    stable_memory_shard_index, MemoryBatchMutation, MemoryStore, RuntimeConfig, RuntimeService,
+    RuntimeServiceConfig, RuntimeStorageConfig, WorkerDebugDump,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -257,6 +257,16 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
+        mode: "storage-write-memory-wide",
+        label: "memory-storage-write-memory-wide",
+        source: "",
+        seed: false,
+        path: "/write",
+        key_space: KeySpaceConfig::Wide,
+        verify_path: None,
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
         mode: "atomic-read-memory",
         label: "memory-atomic-read-memory",
         source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
@@ -371,9 +381,16 @@ async fn main() -> Result<(), String> {
         memory_profile_enabled: profile_enabled,
         ..RuntimeConfig::default()
     };
-    let service = start_service("memory-storage", runtime)
-        .await
-        .map_err(|error| error.to_string())?;
+    let selected_storage_only = mode.as_deref() == Some("storage-write-memory-wide");
+    let service = if selected_storage_only {
+        None
+    } else {
+        Some(
+            start_service("memory-storage", runtime)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    };
 
     println!("# keyed memory benchmark");
     println!(
@@ -390,8 +407,20 @@ async fn main() -> Result<(), String> {
         if !should_run_case(mode.as_deref(), bench_case.mode) {
             continue;
         }
+        if bench_case.mode == "storage-write-memory-wide" {
+            run_storage_write_and_print(StorageBenchRun {
+                label: bench_case.label,
+                key_space: bench_case.key_space.resolve(&options),
+                options: &options,
+            })
+            .await?;
+            continue;
+        }
+        let Some(service) = service.as_ref() else {
+            continue;
+        };
         run_and_print(BenchRun {
-            service: &service,
+            service,
             label: bench_case.label,
             source: bench_case.source,
             seed: bench_case.seed,

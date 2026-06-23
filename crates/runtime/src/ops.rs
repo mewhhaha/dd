@@ -322,6 +322,7 @@ deno_core::extension!(
         op_memory_batch_list_overlay,
         op_memory_batch_effect,
         op_memory_batch_command_result,
+        op_memory_direct_apply,
         op_memory_batch_apply,
         op_memory_command_begin,
         op_memory_command_close,

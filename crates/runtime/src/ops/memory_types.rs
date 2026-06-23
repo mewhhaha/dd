@@ -276,6 +276,14 @@ pub(crate) struct MemoryBatchCommandResult {
     pub(crate) value: Vec<u8>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct MemoryDirectMutationInput {
+    pub(crate) key: String,
+    pub(crate) value_handle: u32,
+    pub(crate) encoding: String,
+    pub(crate) deleted: bool,
+}
+
 pub struct MemoryInvokeEvent {
     pub request_frame: Vec<u8>,
     pub caller_worker_name: String,
