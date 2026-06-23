@@ -602,6 +602,7 @@ export function ddVitePlugin(options = {}) {
     return mergeConfig(
       {
         ...environmentBase,
+        define: workerRuntimeDefines("production"),
         build: {
           ssr: true,
           outDir: childBuildOutDir(baseOutDir, worker.outputName),
@@ -611,7 +612,10 @@ export function ddVitePlugin(options = {}) {
           minify: workerBundleMinify(worker.minify ?? options.minify, true),
           rollupOptions: {
             input: entry ? { worker: entry } : undefined,
-            output,
+            output: {
+              ...output,
+              banner: workerRuntimeGlobalsBanner("production"),
+            },
           },
         },
       },
@@ -992,9 +996,7 @@ export function ddVitePlugin(options = {}) {
       }
     }
     return {
-      define: {
-        "process.env.NODE_ENV": JSON.stringify("production"),
-      },
+      define: workerRuntimeDefines("production"),
       resolve: {
         alias,
       },
@@ -1556,6 +1558,21 @@ function viteRunnerImportMetaEnv(environment) {
     PROD: Boolean(config.isProduction),
     SSR: true,
   };
+}
+
+function workerRuntimeDefines(nodeEnv) {
+  return {
+    "process.env.NODE_ENV": JSON.stringify(nodeEnv),
+  };
+}
+
+function workerRuntimeGlobalsBanner(nodeEnv) {
+  return [
+    "globalThis.process ??= { env: {}, emit() { return false; } };",
+    "globalThis.process.env ??= {};",
+    `globalThis.process.env.NODE_ENV ??= ${JSON.stringify(nodeEnv)};`,
+    "globalThis.process.emit ??= function () { return false; };",
+  ].join("\n");
 }
 
 function isSupportedViteRunnerExternal(value) {

@@ -193,9 +193,11 @@ try {
   assert.equal(generatedConfig.public, undefined);
   assert.equal(generatedConfig.bindings, undefined);
   assert.equal(generatedConfig.internal, undefined);
+  const workerArtifact = await readFile(join(root, "dist/config-check-worker/worker.js"), "utf8");
+  assert(workerArtifact, "dd worker artifact should be emitted even when an unrelated ssr environment exists");
   assert(
-    await readFile(join(root, "dist/config-check-worker/worker.js"), "utf8"),
-    "dd worker artifact should be emitted even when an unrelated ssr environment exists",
+    workerArtifact.includes("globalThis.process"),
+    "production worker bundle should install a minimal process global",
   );
   const manifest = JSON.parse(await readFile(join(root, "dist/dd.workers.json"), "utf8"));
   assert.equal(manifest.entry, "config-check-worker");
