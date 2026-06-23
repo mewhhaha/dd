@@ -247,6 +247,16 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Always,
     },
     BenchCase {
+        mode: "direct-write-memory-wide",
+        label: "memory-direct-write-memory-wide",
+        source: MEMORY_DIRECT_WRITE_WORKER_SOURCE,
+        seed: false,
+        path: "/write",
+        key_space: KeySpaceConfig::Wide,
+        verify_path: Some("/sum-read"),
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
         mode: "atomic-read-memory",
         label: "memory-atomic-read-memory",
         source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
@@ -443,6 +453,9 @@ fn print_help() {
     println!("  DD_BENCH_MAX_ISOLATES          runtime max isolates (default 1)");
     println!("  DD_BENCH_MAX_INFLIGHT          max inflight per isolate (default 1)");
     println!("  DD_BENCH_KEY_SPACE             multikey scenario key space (default 256)");
+    println!("  DD_BENCH_WIDE_KEY_SPACE        wide scenario key space (default 256)");
+    println!("  DD_BENCH_MEMORY_KEY_MODE       pool, unique, same-shard, or cross-shard");
+    println!("  DD_BENCH_MEMORY_NAMESPACE_SHARDS memory namespace shards (default 16)");
     println!("  DD_BENCH_PROFILE_MEMORY        enable memory profile output");
     println!();
     println!("Modes:");

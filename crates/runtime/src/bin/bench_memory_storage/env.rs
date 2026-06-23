@@ -15,7 +15,7 @@ pub(crate) fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MemoryKeyMode {
     Pool,
     Unique,
@@ -48,6 +48,10 @@ pub(crate) fn env_mode() -> Option<String> {
 }
 
 pub(crate) const MEMORY_NAMESPACE_SHARDS: usize = 16;
+
+pub(crate) fn env_memory_namespace_shards() -> usize {
+    env_usize("DD_BENCH_MEMORY_NAMESPACE_SHARDS", MEMORY_NAMESPACE_SHARDS)
+}
 
 pub(crate) fn env_duration_ms(name: &str, default: u64) -> Duration {
     Duration::from_millis(

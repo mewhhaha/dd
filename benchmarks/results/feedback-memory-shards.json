@@ -1,0 +1,591 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-06-23T14:27:14.772Z",
+  "metadata": {
+    "git_commit": "60cf94f55d8c652a0e9c894475862e16ac3eb988",
+    "git_dirty": true,
+    "rustc": "rustc 1.96.0-nightly (3645249d7 2026-03-16)",
+    "cargo": "cargo 1.96.0-nightly (cbb9bb8bd 2026-03-13)",
+    "os": "Linux cachyos-x8664 7.0.9-1-cachyos #1 SMP PREEMPT_DYNAMIC Sun, 17 May 2026 16:56:12 +0000 x86_64 GNU/Linux",
+    "logical_cpus": 16
+  },
+  "sample_count": 1,
+  "configs": [
+    {
+      "name": "focused-dynamic.sh",
+      "path": "benchmarks/configs/focused-dynamic.sh",
+      "env": {
+        "DD_BENCH_ONLY": "dynamic",
+        "DD_BENCH_DYNAMIC_REQUESTS": "100",
+        "DD_BENCH_DYNAMIC_CONCURRENCY": "16",
+        "DD_BENCH_DYNAMIC_COLD_ROUNDS": "10"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:14.795Z",
+          "duration_ms": 3964.9,
+          "status": 0,
+          "signal": null,
+          "stdout": "# dd runtime benchmark\n# note: this benchmark measures runtime service behavior directly (no API/HTTP network overhead).\n# note: output includes mean, p50, p95, p99 for each benchmark.\n\n== dynamic: single-isolate ==\ndynamic-baseline   requests=100 concurrency=16 total=21.48ms throughput=4655 req/s mean=3.34ms p50=1.77ms p95=12.15ms p99=12.50ms\ndynamic-hot-fetch  requests=100 concurrency=16 total=25.40ms throughput=3938 req/s mean=3.75ms p50=3.81ms p95=5.19ms p99=5.43ms\ndynamic-hot-fetch-metrics handle_hit_rate=100.0% source_hit_rate=0.0% direct_hits=100 fallback=0 direct_path=100 direct_path_fallback=0 remote=100 remote_fallback=0 fetch_ops=100 fetch_op_fallback=0 normalize_fast=100 normalize_slow=0 async_replies=100 provider_task=0 control_batches=100 control_items=100 reply_batches=100 reply_items=100 provider_batches=0 provider_items=0 time_sync=100/0 normalize_mean=0.000ms start_mean=0.000ms dispatch_mean=0.001ms child_mean=0.123ms reply_mean=0.000ms sync_mean=0.188ms control_mean=0.000ms\ndynamic-hot-fetch-host-rpc requests=100 concurrency=16 total=39.49ms throughput=2532 req/s mean=5.88ms p50=5.89ms p95=8.22ms p99=8.32ms\ndynamic-hot-fetch-host-rpc-metrics handle_hit_rate=100.0% source_hit_rate=0.0% direct_hits=100 fallback=0 direct_path=100 direct_path_fallback=0 remote=100 remote_fallback=0 fetch_ops=100 fetch_op_fallback=0 normalize_fast=100 normalize_slow=0 async_replies=100 provider_task=100 control_batches=200 control_items=200 reply_batches=200 reply_items=200 provider_batches=0 provider_items=0 time_sync=100/0 normalize_mean=0.000ms start_mean=0.279ms dispatch_mean=0.001ms child_mean=0.330ms reply_mean=0.000ms sync_mean=0.112ms control_mean=0.000ms\ndynamic-create+invoke samples=10 mean=10.78ms p50=10.85ms p95=11.41ms p99=11.41ms max=11.41ms\ndynamic-create+invoke-metrics handle_hit_rate=0.0% source_hit_rate=100.0% direct_hits=0 fallback=10 direct_path=0 direct_path_fallback=10 remote=10 remote_fallback=0 fetch_ops=10 fetch_op_fallback=0 normalize_fast=10 normalize_slow=0 async_replies=30 provider_task=0 control_batches=30 control_items=30 reply_batches=30 reply_items=30 provider_batches=0 provider_items=0 time_sync=10/0 normalize_mean=0.000ms start_mean=0.000ms dispatch_mean=0.001ms child_mean=10.338ms reply_mean=0.000ms sync_mean=10.403ms control_mean=0.000ms\ndynamic-gap        baseline=4655req/s plain=3938req/s (84.6%) host_rpc=2532req/s (54.4%)\ndynamic-final      config=single-isolate status=ok\n\n== dynamic: autoscaling-8 ==\ndynamic-baseline   requests=100 concurrency=16 total=17.37ms throughput=5755 req/s mean=2.70ms p50=0.99ms p95=11.44ms p99=15.90ms\ndynamic-hot-fetch  requests=100 concurrency=16 total=7.98ms throughput=12527 req/s mean=1.22ms p50=0.72ms p95=6.17ms p99=6.98ms\ndynamic-hot-fetch-metrics handle_hit_rate=100.0% source_hit_rate=0.0% direct_hits=100 fallback=5 direct_path=95 direct_path_fallback=5 remote=84 remote_fallback=0 fetch_ops=84 fetch_op_fallback=0 normalize_fast=84 normalize_slow=0 async_replies=108 provider_task=0 control_batches=52 control_items=108 reply_batches=52 reply_items=108 provider_batches=0 provider_items=0 time_sync=84/0 normalize_mean=0.000ms start_mean=0.277ms dispatch_mean=0.000ms child_mean=0.222ms reply_mean=0.000ms sync_mean=0.020ms control_mean=0.000ms\ndynamic-hot-fetch-host-rpc requests=100 concurrency=16 total=13.42ms throughput=7453 req/s mean=1.87ms p50=1.25ms p95=6.84ms p99=7.40ms\ndynamic-hot-fetch-host-rpc-metrics handle_hit_rate=100.0% source_hit_rate=0.0% direct_hits=100 fallback=30 direct_path=70 direct_path_fallback=30 remote=63 remote_fallback=0 fetch_ops=63 fetch_op_fallback=0 normalize_fast=63 normalize_slow=0 async_replies=112 provider_task=100 control_batches=111 control_items=212 reply_batches=111 reply_items=212 provider_batches=0 provider_items=0 time_sync=63/0 normalize_mean=0.000ms start_mean=0.923ms dispatch_mean=0.000ms child_mean=0.946ms reply_mean=0.000ms sync_mean=0.023ms control_mean=0.000ms\ndynamic-create+invoke samples=10 mean=10.59ms p50=10.71ms p95=10.93ms p99=10.93ms max=10.93ms\ndynamic-create+invoke-metrics handle_hit_rate=0.0% source_hit_rate=100.0% direct_hits=0 fallback=10 direct_path=0 direct_path_fallback=10 remote=10 remote_fallback=0 fetch_ops=10 fetch_op_fallback=0 normalize_fast=10 normalize_slow=0 async_replies=30 provider_task=0 control_batches=30 control_items=30 reply_batches=30 reply_items=30 provider_batches=0 provider_items=0 time_sync=10/0 normalize_mean=0.000ms start_mean=0.000ms dispatch_mean=0.002ms child_mean=10.162ms reply_mean=0.000ms sync_mean=10.231ms control_mean=0.000ms\ndynamic-gap        baseline=5755req/s plain=12527req/s (217.7%) host_rpc=7453req/s (129.5%)\ndynamic-final      config=autoscaling-8 status=ok\n\n",
+          "stderr": "   Compiling runtime v0.1.0 (/home/mewhhaha/src/dd/crates/runtime)\n    Finished `release` profile [optimized] target(s) in 3.11s\n     Running `target/release/bench`\n",
+          "metrics": [
+            {
+              "workload": "dynamic-baseline",
+              "requests": 100,
+              "concurrency": 16,
+              "total_ms": 21.48,
+              "throughput_rps": 4655,
+              "mean_ms": 3.34,
+              "p50_ms": 1.77,
+              "p95_ms": 12.15,
+              "p99_ms": 12.5
+            },
+            {
+              "workload": "dynamic-hot-fetch",
+              "requests": 100,
+              "concurrency": 16,
+              "total_ms": 25.4,
+              "throughput_rps": 3938,
+              "mean_ms": 3.75,
+              "p50_ms": 3.81,
+              "p95_ms": 5.19,
+              "p99_ms": 5.43
+            },
+            {
+              "workload": "dynamic-hot-fetch-host-rpc",
+              "requests": 100,
+              "concurrency": 16,
+              "total_ms": 39.49,
+              "throughput_rps": 2532,
+              "mean_ms": 5.88,
+              "p50_ms": 5.89,
+              "p95_ms": 8.22,
+              "p99_ms": 8.32
+            },
+            {
+              "workload": "dynamic-baseline",
+              "requests": 100,
+              "concurrency": 16,
+              "total_ms": 17.37,
+              "throughput_rps": 5755,
+              "mean_ms": 2.7,
+              "p50_ms": 0.99,
+              "p95_ms": 11.44,
+              "p99_ms": 15.9
+            },
+            {
+              "workload": "dynamic-hot-fetch",
+              "requests": 100,
+              "concurrency": 16,
+              "total_ms": 7.98,
+              "throughput_rps": 12527,
+              "mean_ms": 1.22,
+              "p50_ms": 0.72,
+              "p95_ms": 6.17,
+              "p99_ms": 6.98
+            },
+            {
+              "workload": "dynamic-hot-fetch-host-rpc",
+              "requests": 100,
+              "concurrency": 16,
+              "total_ms": 13.42,
+              "throughput_rps": 7453,
+              "mean_ms": 1.87,
+              "p50_ms": 1.25,
+              "p95_ms": 6.84,
+              "p99_ms": 7.4
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "dynamic-baseline",
+          "samples": 2,
+          "requests": 100,
+          "concurrency": 16,
+          "isolate_min": null,
+          "isolate_max": null,
+          "max_inflight": null,
+          "total_ms": 19.43,
+          "throughput_rps": 5205,
+          "mean_ms": 3.02,
+          "p50_ms": 1.38,
+          "p95_ms": 11.8,
+          "p99_ms": 14.2
+        },
+        {
+          "workload": "dynamic-hot-fetch",
+          "samples": 2,
+          "requests": 100,
+          "concurrency": 16,
+          "isolate_min": null,
+          "isolate_max": null,
+          "max_inflight": null,
+          "total_ms": 16.69,
+          "throughput_rps": 8232.5,
+          "mean_ms": 2.49,
+          "p50_ms": 2.27,
+          "p95_ms": 5.68,
+          "p99_ms": 6.21
+        },
+        {
+          "workload": "dynamic-hot-fetch-host-rpc",
+          "samples": 2,
+          "requests": 100,
+          "concurrency": 16,
+          "isolate_min": null,
+          "isolate_max": null,
+          "max_inflight": null,
+          "total_ms": 26.46,
+          "throughput_rps": 4992.5,
+          "mean_ms": 3.88,
+          "p50_ms": 3.57,
+          "p95_ms": 7.53,
+          "p99_ms": 7.86
+        }
+      ]
+    },
+    {
+      "name": "focused-memory-read.sh",
+      "path": "benchmarks/configs/focused-memory-read.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-read-memory",
+        "DD_BENCH_REQUESTS": "300",
+        "DD_BENCH_CONCURRENCY": "16",
+        "DD_BENCH_MAX_ISOLATES": "4",
+        "DD_BENCH_MAX_INFLIGHT": "8"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:18.761Z",
+          "duration_ms": 273.72,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=4 max_inflight_per_isolate=8\nmemory-direct-read-memory requests=300 concurrency=16 total=18.59ms throughput=16141 req/s mean=0.95ms p50=0.62ms p95=2.18ms p99=7.75ms\nbench-phases label=memory-direct-read-memory deploy_ms=5.67 seed_ms=14.12 timed_ms=18.59 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=38.40\nbench-final label=memory-direct-read-memory outcome=success phase=done completed_requests=300 total_requests=300\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.16s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-read-memory",
+              "requests": 300,
+              "concurrency": 16,
+              "total_ms": 18.59,
+              "throughput_rps": 16141,
+              "mean_ms": 0.95,
+              "p50_ms": 0.62,
+              "p95_ms": 2.18,
+              "p99_ms": 7.75
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-read-memory",
+          "samples": 1,
+          "requests": 300,
+          "concurrency": 16,
+          "isolate_min": null,
+          "isolate_max": 4,
+          "max_inflight": 8,
+          "total_ms": 18.59,
+          "throughput_rps": 16141,
+          "mean_ms": 0.95,
+          "p50_ms": 0.62,
+          "p95_ms": 2.18,
+          "p99_ms": 7.75
+        }
+      ]
+    },
+    {
+      "name": "focused-memory-write.sh",
+      "path": "benchmarks/configs/focused-memory-write.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-write-memory",
+        "DD_BENCH_REQUESTS": "300",
+        "DD_BENCH_CONCURRENCY": "16",
+        "DD_BENCH_MAX_ISOLATES": "4",
+        "DD_BENCH_MAX_INFLIGHT": "8"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:19.035Z",
+          "duration_ms": 473.3,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=4 max_inflight_per_isolate=8\nmemory-direct-write-memory requests=300 concurrency=16 total=207.69ms throughput=1444 req/s mean=10.83ms p50=10.16ms p95=16.20ms p99=21.62ms\nbench-phases label=memory-direct-write-memory deploy_ms=6.22 seed_ms=14.71 timed_ms=207.69 verify_ms=0.79 profile_ms=0.00 shutdown_ms=0.00 total_ms=229.42\nbench-final label=memory-direct-write-memory outcome=success phase=done completed_requests=300 total_requests=300\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.16s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory",
+              "requests": 300,
+              "concurrency": 16,
+              "total_ms": 207.69,
+              "throughput_rps": 1444,
+              "mean_ms": 10.83,
+              "p50_ms": 10.16,
+              "p95_ms": 16.2,
+              "p99_ms": 21.62
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-write-memory",
+          "samples": 1,
+          "requests": 300,
+          "concurrency": 16,
+          "isolate_min": null,
+          "isolate_max": 4,
+          "max_inflight": 8,
+          "total_ms": 207.69,
+          "throughput_rps": 1444,
+          "mean_ms": 10.83,
+          "p50_ms": 10.16,
+          "p95_ms": 16.2,
+          "p99_ms": 21.62
+        }
+      ]
+    },
+    {
+      "name": "saturated-fast-fetch-instant-text.sh",
+      "path": "benchmarks/configs/saturated-fast-fetch-instant-text.sh",
+      "env": {
+        "DD_BENCH_INTERNAL_CONFIG": "sat-16",
+        "DD_BENCH_INTERNAL_SCENARIO": "instant-text",
+        "DD_BENCH_CUSTOM_NAME": "sat-16",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_REQUESTS": "20000",
+        "DD_BENCH_CONCURRENCY": "256"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:19.509Z",
+          "duration_ms": 2754,
+          "status": 0,
+          "signal": null,
+          "stdout": "instant-text     requests=20000 concurrency=256 throughput=91817 req/s mean=2.72ms p50=2.24ms p95=5.35ms p99=18.30ms\n",
+          "stderr": "   Compiling runtime v0.1.0 (/home/mewhhaha/src/dd/crates/runtime)\n    Finished `release` profile [optimized] target(s) in 2.42s\n     Running `target/release/bench_fetch_fast`\n",
+          "metrics": [
+            {
+              "workload": "instant-text",
+              "requests": 20000,
+              "concurrency": 256,
+              "total_ms": null,
+              "throughput_rps": 91817,
+              "mean_ms": 2.72,
+              "p50_ms": 2.24,
+              "p95_ms": 5.35,
+              "p99_ms": 18.3
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "instant-text",
+          "samples": 1,
+          "requests": 20000,
+          "concurrency": 256,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": null,
+          "throughput_rps": 91817,
+          "mean_ms": 2.72,
+          "p50_ms": 2.24,
+          "p95_ms": 5.35,
+          "p99_ms": 18.3
+        }
+      ]
+    },
+    {
+      "name": "saturated-memory-read-wide.sh",
+      "path": "benchmarks/configs/saturated-memory-read-wide.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-read-memory-wide",
+        "DD_BENCH_REQUESTS": "20000",
+        "DD_BENCH_CONCURRENCY": "256",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "4096",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:22.263Z",
+          "duration_ms": 6751.15,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-read-memory-wide phase=seed health=progressing completed=0/20000 last_completed_request=0 elapsed_ms=1000 stalled_for_ms=994\nbench-status label=memory-direct-read-memory-wide phase=seed health=progressing completed=0/20000 last_completed_request=0 elapsed_ms=2002 stalled_for_ms=1996\nbench-status label=memory-direct-read-memory-wide phase=seed health=stalled completed=0/20000 last_completed_request=0 elapsed_ms=3003 stalled_for_ms=2997\nbench-status label=memory-direct-read-memory-wide phase=seed health=stalled completed=0/20000 last_completed_request=0 elapsed_ms=4004 stalled_for_ms=3998\nbench-status label=memory-direct-read-memory-wide phase=seed health=stalled completed=0/20000 last_completed_request=0 elapsed_ms=5010 stalled_for_ms=5004\nbench-status label=memory-direct-read-memory-wide phase=seed health=stalled completed=0/20000 last_completed_request=0 elapsed_ms=6011 stalled_for_ms=6005\nmemory-direct-read-memory-wide requests=20000 concurrency=256 total=317.75ms throughput=62942 req/s mean=4.02ms p50=0.45ms p95=20.36ms p99=48.25ms\nbench-phases label=memory-direct-read-memory-wide deploy_ms=6.39 seed_ms=6158.19 timed_ms=317.75 verify_ms=0.00 profile_ms=0.52 shutdown_ms=0.00 total_ms=6483.29\nbench-final label=memory-direct-read-memory-wide outcome=success phase=done completed_requests=20000 total_requests=20000\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.16s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-read-memory-wide",
+              "requests": 20000,
+              "concurrency": 256,
+              "total_ms": 317.75,
+              "throughput_rps": 62942,
+              "mean_ms": 4.02,
+              "p50_ms": 0.45,
+              "p95_ms": 20.36,
+              "p99_ms": 48.25
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-read-memory-wide",
+          "samples": 1,
+          "requests": 20000,
+          "concurrency": 256,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 317.75,
+          "throughput_rps": 62942,
+          "mean_ms": 4.02,
+          "p50_ms": 0.45,
+          "p95_ms": 20.36,
+          "p99_ms": 48.25
+        }
+      ]
+    },
+    {
+      "name": "scaling-memory-read-cross-shard.sh",
+      "path": "benchmarks/configs/scaling-memory-read-cross-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-read-memory-wide",
+        "DD_BENCH_REQUESTS": "12000",
+        "DD_BENCH_CONCURRENCY": "192",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "2048",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:29.015Z",
+          "duration_ms": 3573.4,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-read-memory-wide phase=seed health=progressing completed=0/12000 last_completed_request=0 elapsed_ms=1002 stalled_for_ms=996\nbench-status label=memory-direct-read-memory-wide phase=seed health=progressing completed=0/12000 last_completed_request=0 elapsed_ms=2003 stalled_for_ms=1997\nbench-status label=memory-direct-read-memory-wide phase=seed health=stalled completed=0/12000 last_completed_request=0 elapsed_ms=3004 stalled_for_ms=2998\nmemory-direct-read-memory-wide requests=12000 concurrency=192 total=200.83ms throughput=59752 req/s mean=3.19ms p50=0.57ms p95=19.61ms p99=27.26ms\nbench-phases label=memory-direct-read-memory-wide deploy_ms=6.45 seed_ms=3102.41 timed_ms=200.83 verify_ms=0.00 profile_ms=0.44 shutdown_ms=0.00 total_ms=3310.38\nbench-final label=memory-direct-read-memory-wide outcome=success phase=done completed_requests=12000 total_requests=12000\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.17s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-read-memory-wide",
+              "requests": 12000,
+              "concurrency": 192,
+              "total_ms": 200.83,
+              "throughput_rps": 59752,
+              "mean_ms": 3.19,
+              "p50_ms": 0.57,
+              "p95_ms": 19.61,
+              "p99_ms": 27.26
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-read-memory-wide",
+          "samples": 1,
+          "requests": 12000,
+          "concurrency": 192,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 200.83,
+          "throughput_rps": 59752,
+          "mean_ms": 3.19,
+          "p50_ms": 0.57,
+          "p95_ms": 19.61,
+          "p99_ms": 27.26
+        }
+      ]
+    },
+    {
+      "name": "scaling-memory-read-same-shard.sh",
+      "path": "benchmarks/configs/scaling-memory-read-same-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-read-memory-wide",
+        "DD_BENCH_REQUESTS": "12000",
+        "DD_BENCH_CONCURRENCY": "192",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "2048",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "same-shard"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:32.588Z",
+          "duration_ms": 2378.86,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-read-memory-wide phase=seed health=progressing completed=0/12000 last_completed_request=0 elapsed_ms=1000 stalled_for_ms=995\nbench-status label=memory-direct-read-memory-wide phase=invoke health=progressing completed=9418/12000 last_completed_request=9364 elapsed_ms=2001 stalled_for_ms=0\nmemory-direct-read-memory-wide requests=12000 concurrency=192 total=450.11ms throughput=26660 req/s mean=7.13ms p50=8.34ms p95=17.75ms p99=36.81ms\nbench-phases label=memory-direct-read-memory-wide deploy_ms=5.97 seed_ms=1658.54 timed_ms=450.11 verify_ms=0.00 profile_ms=0.39 shutdown_ms=0.00 total_ms=2115.26\nbench-final label=memory-direct-read-memory-wide outcome=success phase=done completed_requests=12000 total_requests=12000\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.17s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-read-memory-wide",
+              "requests": 12000,
+              "concurrency": 192,
+              "total_ms": 450.11,
+              "throughput_rps": 26660,
+              "mean_ms": 7.13,
+              "p50_ms": 8.34,
+              "p95_ms": 17.75,
+              "p99_ms": 36.81
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-read-memory-wide",
+          "samples": 1,
+          "requests": 12000,
+          "concurrency": 192,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 450.11,
+          "throughput_rps": 26660,
+          "mean_ms": 7.13,
+          "p50_ms": 8.34,
+          "p95_ms": 17.75,
+          "p99_ms": 36.81
+        }
+      ]
+    },
+    {
+      "name": "scaling-memory-write-cross-shard.sh",
+      "path": "benchmarks/configs/scaling-memory-write-cross-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:34.967Z",
+          "duration_ms": 5462.81,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-write-memory-wide phase=invoke health=progressing completed=993/4096 last_completed_request=946 elapsed_ms=1000 stalled_for_ms=12\nbench-status label=memory-direct-write-memory-wide phase=invoke health=progressing completed=2079/4096 last_completed_request=2058 elapsed_ms=2002 stalled_for_ms=1\nbench-status label=memory-direct-write-memory-wide phase=invoke health=progressing completed=3016/4096 last_completed_request=3008 elapsed_ms=3003 stalled_for_ms=25\nbench-status label=memory-direct-write-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4085 elapsed_ms=4004 stalled_for_ms=60\nbench-status label=memory-direct-write-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4085 elapsed_ms=5005 stalled_for_ms=1061\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=3939.10ms throughput=1040 req/s mean=121.82ms p50=120.36ms p95=185.85ms p99=222.33ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=5.81 seed_ms=0.00 timed_ms=3939.10 verify_ms=1255.48 profile_ms=0.00 shutdown_ms=0.00 total_ms=5200.82\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.16s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 3939.1,
+              "throughput_rps": 1040,
+              "mean_ms": 121.82,
+              "p50_ms": 120.36,
+              "p95_ms": 185.85,
+              "p99_ms": 222.33
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-write-memory-wide",
+          "samples": 1,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 3939.1,
+          "throughput_rps": 1040,
+          "mean_ms": 121.82,
+          "p50_ms": 120.36,
+          "p95_ms": 185.85,
+          "p99_ms": 222.33
+        }
+      ]
+    },
+    {
+      "name": "scaling-memory-write-same-shard.sh",
+      "path": "benchmarks/configs/scaling-memory-write-same-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "same-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T14:27:40.431Z",
+          "duration_ms": 2898.72,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-write-memory-wide phase=invoke health=progressing completed=2058/4096 last_completed_request=2116 elapsed_ms=1000 stalled_for_ms=4\nbench-status label=memory-direct-write-memory-wide phase=invoke health=progressing completed=3897/4096 last_completed_request=3889 elapsed_ms=2002 stalled_for_ms=26\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=2094.65ms throughput=1955 req/s mean=64.47ms p50=62.07ms p95=106.20ms p99=159.74ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=6.17 seed_ms=0.00 timed_ms=2094.65 verify_ms=528.37 profile_ms=0.00 shutdown_ms=0.00 total_ms=2631.00\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.16s\n     Running `target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 2094.65,
+              "throughput_rps": 1955,
+              "mean_ms": 64.47,
+              "p50_ms": 62.07,
+              "p95_ms": 106.2,
+              "p99_ms": 159.74
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-write-memory-wide",
+          "samples": 1,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 2094.65,
+          "throughput_rps": 1955,
+          "mean_ms": 64.47,
+          "p50_ms": 62.07,
+          "p95_ms": 106.2,
+          "p99_ms": 159.74
+        }
+      ]
+    }
+  ]
+}

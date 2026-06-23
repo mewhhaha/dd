@@ -39,7 +39,7 @@ pub(super) fn runtime_service_config(
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
             database_url: format!("file:{}", db_path.display()),
-            memory_namespace_shards: 16,
+            memory_namespace_shards: env_memory_namespace_shards(),
             memory_db_cache_max_open: 4096,
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,

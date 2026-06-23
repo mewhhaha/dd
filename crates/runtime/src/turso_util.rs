@@ -67,13 +67,6 @@ impl VersionFloor {
             }
         }
     }
-
-    pub(crate) fn observe_i64(counter: &AtomicU64, version: i64) {
-        if version < 0 {
-            return;
-        }
-        Self::set_floor(counter, version as u64 + 1);
-    }
 }
 
 #[cfg(test)]

@@ -167,7 +167,10 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
     if let Some(verify_path) = verify_path {
         set_watchdog_phase(&watchdog_state, started_at, BenchPhase::Verify);
         let expected = if verify_path == "/sum" || verify_path == "/sum-read" {
-            distinct_memory_keys(requests, key_space).len().to_string()
+            MemoryKeySet::from_env(key_space)
+                .distinct_for_requests(requests)
+                .len()
+                .to_string()
         } else if verify_path == "/read" || verify_path == "/get-strong" {
             "1".to_string()
         } else {
@@ -385,7 +388,9 @@ async fn seed_benchmark_state(
         return Ok(());
     }
 
-    for (offset, memory_key) in distinct_memory_keys(requests, key_space)
+    let memory_keys = MemoryKeySet::from_env(key_space);
+    for (offset, memory_key) in memory_keys
+        .distinct_for_requests(requests)
         .into_iter()
         .enumerate()
     {
@@ -428,8 +433,10 @@ async fn verify_distinct_memory_sum(
     } else {
         "/get"
     };
+    let memory_keys = MemoryKeySet::from_env(key_space);
     let mut total = 0usize;
-    for (offset, memory_key) in distinct_memory_keys(requests, key_space)
+    for (offset, memory_key) in memory_keys
+        .distinct_for_requests(requests)
         .into_iter()
         .enumerate()
     {
@@ -479,6 +486,7 @@ pub(crate) async fn run_scenario(
     )));
     let scenario_started_at = Instant::now();
     let mut tasks = Vec::with_capacity(scenario.concurrency);
+    let memory_keys = Arc::new(MemoryKeySet::from_env(scenario.key_space));
 
     for _ in 0..scenario.concurrency {
         let service = service.clone();
@@ -488,6 +496,7 @@ pub(crate) async fn run_scenario(
         let path = scenario.path.to_string();
         let watchdog_state = Arc::clone(&watchdog_state);
         let request_timeout = options.request_timeout;
+        let memory_keys = Arc::clone(&memory_keys);
         tasks.push(tokio::spawn(async move {
             loop {
                 let idx = next.fetch_add(1, Ordering::Relaxed);
@@ -499,7 +508,7 @@ pub(crate) async fn run_scenario(
                     request_timeout,
                     service.invoke(
                         worker_name.clone(),
-                        invocation(&path, idx + 1, scenario.key_space),
+                        invocation_with_memory_keys(&path, idx + 1, &memory_keys),
                     ),
                 )
                 .await
@@ -568,10 +577,17 @@ fn percentile_ms(latencies: &[Duration], quantile: f64) -> f64 {
 }
 
 pub(crate) fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvocation {
-    let memory_key_mode = MemoryKeyMode::from_env();
-    let memory_key = memory_key(idx, key_space, memory_key_mode, MEMORY_NAMESPACE_SHARDS);
+    let memory_keys = MemoryKeySet::from_env(key_space);
+    invocation_with_memory_keys(path, idx, &memory_keys)
+}
 
-    let url = if key_space > 1 {
+fn invocation_with_memory_keys(
+    path: &str,
+    idx: usize,
+    memory_keys: &MemoryKeySet,
+) -> WorkerInvocation {
+    let memory_key = memory_keys.key(idx);
+    let url = if memory_keys.is_multi_key() {
         let separator = if path.contains('?') { '&' } else { '?' };
         format!("http://worker{path}{separator}key={memory_key}")
     } else {
@@ -586,78 +602,133 @@ pub(crate) fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvo
     }
 }
 
+struct MemoryKeySet {
+    key_space: usize,
+    mode: MemoryKeyMode,
+    keys: Vec<String>,
+}
+
+impl MemoryKeySet {
+    fn from_env(key_space: usize) -> Self {
+        let mode = MemoryKeyMode::from_env();
+        let namespace_shards = env_memory_namespace_shards();
+        let keys = if key_space <= 1 || mode == MemoryKeyMode::Unique {
+            Vec::new()
+        } else {
+            build_memory_keys(key_space, mode, namespace_shards)
+        };
+        Self {
+            key_space,
+            mode,
+            keys,
+        }
+    }
+
+    fn is_multi_key(&self) -> bool {
+        self.key_space > 1
+    }
+
+    fn key(&self, idx: usize) -> String {
+        if self.key_space <= 1 {
+            return "hot".to_string();
+        }
+        if self.mode == MemoryKeyMode::Unique {
+            return format!("bench-{idx}");
+        }
+        self.keys[idx % self.key_space].clone()
+    }
+
+    fn distinct_for_requests(&self, requests: usize) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for idx in 1..=requests {
+            let key = self.key(idx);
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+}
+
 fn memory_shard(memory_key: &str, namespace_shards: usize) -> usize {
     stable_memory_shard_index(memory_key, namespace_shards)
 }
 
-fn memory_key(
-    idx: usize,
+fn build_memory_keys(
     key_space: usize,
     mode: MemoryKeyMode,
     namespace_shards: usize,
-) -> String {
-    if key_space == 1 {
-        return "hot".to_string();
-    }
-
-    let memory_slot = idx % key_space;
+) -> Vec<String> {
     match mode {
-        MemoryKeyMode::Pool => format!("bench-{memory_slot}"),
-        MemoryKeyMode::Unique => format!("bench-{idx}"),
+        MemoryKeyMode::Pool => (0..key_space)
+            .map(|memory_slot| format!("bench-{memory_slot}"))
+            .collect(),
+        MemoryKeyMode::Unique => Vec::new(),
         MemoryKeyMode::SameShard => {
             let shard = memory_shard("bench-direct-same-shard-anchor", namespace_shards);
-            memory_key_for_shard_occurrence(
+            memory_keys_for_single_shard(
+                key_space,
                 shard,
-                memory_slot,
                 namespace_shards,
                 "bench-direct-sameshard",
             )
         }
         MemoryKeyMode::CrossShard => {
-            let target_shard = memory_slot % namespace_shards;
-            let occurrence = memory_slot / namespace_shards;
-            memory_key_for_shard_occurrence(
-                target_shard,
-                occurrence,
-                namespace_shards,
-                "bench-direct-cross-shard",
-            )
+            memory_keys_across_shards(key_space, namespace_shards, "bench-direct-cross-shard")
         }
     }
 }
 
-fn distinct_memory_keys(requests: usize, key_space: usize) -> Vec<String> {
-    let memory_key_mode = MemoryKeyMode::from_env();
-    let mut keys = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for idx in 1..=requests {
-        let key = memory_key(idx, key_space, memory_key_mode, MEMORY_NAMESPACE_SHARDS);
-        if seen.insert(key.clone()) {
-            keys.push(key);
+fn memory_keys_for_single_shard(
+    key_space: usize,
+    target_shard: usize,
+    namespace_shards: usize,
+    prefix: &str,
+) -> Vec<String> {
+    if namespace_shards <= 1 {
+        return (0..key_space)
+            .map(|occurrence| format!("{prefix}-{occurrence}"))
+            .collect();
+    }
+    let mut keys = Vec::with_capacity(key_space);
+    let mut sequence = 0usize;
+    while keys.len() < key_space {
+        let candidate = format!("{prefix}-{sequence}");
+        if memory_shard(&candidate, namespace_shards) == target_shard {
+            keys.push(candidate);
         }
+        sequence += 1;
     }
     keys
 }
 
-fn memory_key_for_shard_occurrence(
-    target_shard: usize,
-    occurrence: usize,
+fn memory_keys_across_shards(
+    key_space: usize,
     namespace_shards: usize,
     prefix: &str,
-) -> String {
+) -> Vec<String> {
     if namespace_shards <= 1 {
-        return format!("{prefix}-{occurrence}");
+        return (0..key_space)
+            .map(|occurrence| format!("{prefix}-{occurrence}"))
+            .collect();
     }
-    let mut sequence = 0;
-    let mut seen = 0;
-    loop {
+
+    let mut keys = vec![String::new(); key_space];
+    let mut seen_by_shard = vec![0usize; namespace_shards];
+    let mut filled = 0usize;
+    let mut sequence = 0usize;
+    while filled < key_space {
         let candidate = format!("{prefix}-{sequence}");
-        if memory_shard(&candidate, namespace_shards) == target_shard {
-            if seen == occurrence {
-                return candidate;
-            }
-            seen += 1;
+        let shard = memory_shard(&candidate, namespace_shards);
+        let occurrence = seen_by_shard[shard];
+        seen_by_shard[shard] += 1;
+        let memory_slot = shard + occurrence * namespace_shards;
+        if memory_slot < key_space {
+            keys[memory_slot] = candidate;
+            filled += 1;
         }
         sequence += 1;
     }
+    keys
 }

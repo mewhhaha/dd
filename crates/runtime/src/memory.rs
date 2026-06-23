@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value};
 
-use crate::turso_util::{configure_turso_connection, is_retryable_turso_error, VersionFloor};
+use crate::turso_util::{configure_turso_connection, is_retryable_turso_error};
 
 const MEMORY_SHARD_HASH_DOMAIN: &[u8] = b"dd-memory-shard-v1\0";
 
@@ -26,17 +26,51 @@ struct MemorySharedSnapshotEntry {
     last_used_at: Instant,
 }
 
+struct MemoryShard {
+    databases: Mutex<HashMap<String, MemoryDatabaseEntry>>,
+    memory_versions: Mutex<HashMap<String, i64>>,
+    shared_snapshots: Mutex<HashMap<String, MemorySharedSnapshotEntry>>,
+    version: AtomicU64,
+}
+
+impl MemoryShard {
+    fn new(version_floor: u64) -> Self {
+        Self {
+            databases: Mutex::new(HashMap::new()),
+            memory_versions: Mutex::new(HashMap::new()),
+            shared_snapshots: Mutex::new(HashMap::new()),
+            version: AtomicU64::new(version_floor.max(1)),
+        }
+    }
+
+    fn observe_version(&self, version: i64) {
+        if version < 0 {
+            return;
+        }
+        let floor = version as u64 + 1;
+        let mut current = self.version.load(Ordering::Relaxed);
+        while current < floor {
+            match self.version.compare_exchange_weak(
+                current,
+                floor,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MemoryStore {
     root_dir: Arc<PathBuf>,
-    databases: Arc<Mutex<HashMap<String, MemoryDatabaseEntry>>>,
-    memory_versions: Arc<Mutex<HashMap<String, i64>>>,
-    shared_snapshots: Arc<Mutex<HashMap<String, MemorySharedSnapshotEntry>>>,
+    shards: Arc<[MemoryShard]>,
     db_cache_max_open: usize,
     db_idle_ttl: Duration,
     namespace_shards: usize,
     snapshot_cache_max_entries: usize,
-    version: Arc<AtomicU64>,
     owner_epoch_floor: Arc<AtomicU64>,
     profile: Arc<MemoryProfile>,
 }
@@ -222,17 +256,20 @@ impl MemoryStore {
                 "memory_db_idle_ttl must be greater than 0",
             ));
         }
-        let floors = detect_memory_floors(&root_dir).await?;
+        let floors = detect_memory_floors(&root_dir, namespace_shards).await?;
+        let shards = floors
+            .version_floors
+            .iter()
+            .copied()
+            .map(MemoryShard::new)
+            .collect::<Vec<_>>();
         let store = Self {
             root_dir: Arc::new(root_dir),
-            databases: Arc::new(Mutex::new(HashMap::new())),
-            memory_versions: Arc::new(Mutex::new(HashMap::new())),
-            shared_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            shards: Arc::from(shards),
             db_cache_max_open,
             db_idle_ttl,
             namespace_shards,
             snapshot_cache_max_entries: db_cache_max_open.max(64),
-            version: Arc::new(AtomicU64::new(floors.version_floor.max(1))),
             owner_epoch_floor: Arc::new(AtomicU64::new(floors.owner_epoch_floor.max(1))),
             profile: Arc::new(MemoryProfile::default()),
         };
@@ -262,7 +299,7 @@ impl MemoryStore {
     pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<MemorySnapshot> {
         let started = Instant::now();
         if let Some(snapshot) = self.cached_full_snapshot(namespace, memory_key).await {
-            self.observe_version(snapshot.max_version);
+            self.observe_version(memory_key, snapshot.max_version);
             self.observe_memory_version(namespace, memory_key, snapshot.max_version)
                 .await;
             self.record_profile(
@@ -303,7 +340,7 @@ impl MemoryStore {
                 deleted: deleted != 0,
             });
         }
-        self.observe_version(max_version);
+        self.observe_version(memory_key, max_version);
         self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         let snapshot = MemorySnapshot {
@@ -335,7 +372,7 @@ impl MemoryStore {
             .cached_point_read(namespace, memory_key, item_key)
             .await
         {
-            self.observe_version(point.max_version);
+            self.observe_version(memory_key, point.max_version);
             self.observe_memory_version(namespace, memory_key, point.max_version)
                 .await;
             self.record_profile(
@@ -352,7 +389,7 @@ impl MemoryStore {
             .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
-        self.observe_version(max_version);
+        self.observe_version(memory_key, max_version);
         self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         self.put_partial_snapshot(
@@ -396,7 +433,7 @@ impl MemoryStore {
                 .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
-            self.observe_version(max_version);
+            self.observe_version(memory_key, max_version);
             return Ok(MemorySnapshot {
                 entries: Vec::new(),
                 max_version,
@@ -453,7 +490,7 @@ impl MemoryStore {
             .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
-        self.observe_version(max_version);
+        self.observe_version(memory_key, max_version);
         self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         self.put_partial_snapshot(
@@ -488,7 +525,14 @@ impl MemoryStore {
             return Err(PlatformError::runtime("memory key must not be empty"));
         }
         let version_key = Self::memory_version_key(namespace, memory_key);
-        if let Some(current) = self.memory_versions.lock().await.get(&version_key).copied() {
+        if let Some(current) = self
+            .shard_for_key(memory_key)
+            .memory_versions
+            .lock()
+            .await
+            .get(&version_key)
+            .copied()
+        {
             self.record_profile(
                 MemoryProfileMetricKind::StoreVersionIfNewer,
                 started.elapsed().as_micros() as u64,
@@ -521,18 +565,13 @@ impl MemoryStore {
         owner_epoch: Option<i64>,
     ) -> Result<MemoryBatchApplyResult> {
         let started = Instant::now();
-        let conn = if mutations.is_empty() && command_result.is_none() && outbox_effects.is_empty()
-        {
-            self.connect(namespace, memory_key).await?
-        } else {
-            self.connect_uncached(namespace, memory_key).await?
-        };
+        let conn = self.connect(namespace, memory_key).await?;
         if mutations.is_empty() && command_result.is_none() && outbox_effects.is_empty() {
             let max_version = self
                 .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
-            self.observe_version(max_version);
+            self.observe_version(memory_key, max_version);
             self.record_profile(
                 MemoryProfileMetricKind::StoreApplyBatch,
                 started.elapsed().as_micros() as u64,
@@ -606,7 +645,7 @@ impl MemoryStore {
 
                 let write_started = Instant::now();
                 let commit_version = if !mutations.is_empty() || !outbox_effects.is_empty() {
-                    Some(self.reserve_version_after(current))
+                    Some(self.reserve_version_after(memory_key, current))
                 } else {
                     None
                 };
@@ -685,7 +724,7 @@ impl MemoryStore {
                             return Err(memory_error(error));
                         }
                     }
-                    self.observe_version(result.max_version);
+                    self.observe_version(memory_key, result.max_version);
                     self.observe_memory_version(namespace, memory_key, result.max_version)
                         .await;
                     if !outcome.cache_mutations.is_empty() {
@@ -793,7 +832,7 @@ impl MemoryStore {
         let now_ms = epoch_ms_i64()?;
         let lease_until_ms = now_ms.saturating_add(duration_ms_i64(lease_for)?);
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let conn = self.connect_uncached(namespace, memory_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -939,7 +978,7 @@ impl MemoryStore {
             ));
         }
         let now_ms = epoch_ms_i64()?;
-        let conn = self.connect_uncached(namespace, memory_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         conn.execute(
             "UPDATE memory_outbox
              SET status = 'delivered',
@@ -969,7 +1008,7 @@ impl MemoryStore {
         }
         let now_ms = epoch_ms_i64()?;
         let next_attempt_at_ms = now_ms.saturating_add(duration_ms_i64(retry_after)?);
-        let conn = self.connect_uncached(namespace, memory_key).await?;
+        let conn = self.connect(namespace, memory_key).await?;
         conn.execute(
             "UPDATE memory_outbox
              SET status = 'pending',
@@ -1029,7 +1068,7 @@ impl MemoryStore {
                 .map(|prefix| Value::Text(format!("{}%", escape_sql_like_prefix(prefix)))),
         );
         select_params.push(Value::Integer(limit));
-        let conn = self.connect_shard_uncached(namespace, shard_index).await?;
+        let conn = self.connect_shard(namespace, shard_index).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
@@ -1122,16 +1161,17 @@ impl MemoryStore {
         }
     }
 
-    fn reserve_version_after(&self, floor: i64) -> i64 {
+    fn reserve_version_after(&self, memory_key: &str, floor: i64) -> i64 {
         let minimum = floor.saturating_add(1).max(1) as u64;
-        let mut current = self.version.load(Ordering::SeqCst);
+        let shard = self.shard_for_key(memory_key);
+        let mut current = shard.version.load(Ordering::Relaxed);
         loop {
             let next = current.max(minimum);
-            match self.version.compare_exchange(
+            match shard.version.compare_exchange(
                 current,
                 next.saturating_add(1),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return next as i64,
                 Err(actual) => current = actual,
@@ -1153,33 +1193,26 @@ impl MemoryStore {
             .await
     }
 
-    async fn connect_uncached(&self, namespace: &str, memory_key: &str) -> Result<Connection> {
-        let namespace = namespace.trim();
-        if namespace.is_empty() {
-            return Err(PlatformError::runtime("memory namespace must not be empty"));
-        }
-        let memory_key = memory_key.trim();
-        if memory_key.is_empty() {
-            return Err(PlatformError::runtime("memory key must not be empty"));
-        }
-
-        self.connect_shard_uncached(namespace, self.shard_index(memory_key))
-            .await
-    }
-
     async fn connect_shard(&self, namespace: &str, shard_index: usize) -> Result<Connection> {
+        let shard = self.shard_for_index(shard_index);
         let db_key = self.database_key(namespace, shard_index);
         let now = Instant::now();
-        let existing = {
-            let mut databases = self.databases.lock().await;
-            self.prune_databases_locked(&mut databases, now);
-            databases.get_mut(&db_key).map(|entry| {
-                entry.last_used_at = now;
-                Arc::clone(&entry.database)
-            })
-        };
-        if let Some(existing) = existing {
-            let conn = existing.connect().map_err(memory_error)?;
+        let mut databases = shard.databases.lock().await;
+        if let Some(entry) = databases.get_mut(&db_key) {
+            entry.last_used_at = now;
+            let database = Arc::clone(&entry.database);
+            drop(databases);
+            let conn = database.connect().map_err(memory_error)?;
+            configure_connection(&conn).await?;
+            return Ok(conn);
+        }
+
+        self.prune_databases_locked(&mut databases, now);
+        if let Some(entry) = databases.get_mut(&db_key) {
+            entry.last_used_at = now;
+            let database = Arc::clone(&entry.database);
+            drop(databases);
+            let conn = database.connect().map_err(memory_error)?;
             configure_connection(&conn).await?;
             return Ok(conn);
         }
@@ -1193,39 +1226,16 @@ impl MemoryStore {
             .map_err(memory_error)?;
         let database = Arc::new(database);
         ensure_schema(&database).await?;
+        databases.insert(
+            db_key,
+            MemoryDatabaseEntry {
+                database: Arc::clone(&database),
+                last_used_at: now,
+            },
+        );
+        self.prune_databases_locked(&mut databases, now);
+        drop(databases);
 
-        let database = {
-            let mut databases = self.databases.lock().await;
-            self.prune_databases_locked(&mut databases, now);
-            let database = databases
-                .entry(db_key)
-                .or_insert_with(|| MemoryDatabaseEntry {
-                    database: database.clone(),
-                    last_used_at: now,
-                })
-                .database
-                .clone();
-            self.prune_databases_locked(&mut databases, now);
-            database
-        };
-        let conn = database.connect().map_err(memory_error)?;
-        configure_connection(&conn).await?;
-        Ok(conn)
-    }
-
-    async fn connect_shard_uncached(
-        &self,
-        namespace: &str,
-        shard_index: usize,
-    ) -> Result<Connection> {
-        let path = self.db_path(namespace, shard_index);
-        ensure_parent_dir(&path)?;
-        let path_str = path.to_string_lossy().to_string();
-        let database = Builder::new_local(&path_str)
-            .build()
-            .await
-            .map_err(memory_error)?;
-        ensure_schema(&database).await?;
         let conn = database.connect().map_err(memory_error)?;
         configure_connection(&conn).await?;
         Ok(conn)
@@ -1391,15 +1401,24 @@ impl MemoryStore {
         stable_memory_shard_index(memory_key, self.namespace_shards)
     }
 
-    fn observe_version(&self, version: i64) {
-        VersionFloor::observe_i64(&self.version, version);
+    fn shard_for_key(&self, memory_key: &str) -> &MemoryShard {
+        self.shard_for_index(self.shard_index(memory_key))
+    }
+
+    fn shard_for_index(&self, shard_index: usize) -> &MemoryShard {
+        &self.shards[shard_index % self.shards.len()]
+    }
+
+    fn observe_version(&self, memory_key: &str, version: i64) {
+        self.shard_for_key(memory_key).observe_version(version);
     }
 
     async fn observe_memory_version(&self, namespace: &str, memory_key: &str, version: i64) {
         if version < 0 {
             return;
         }
-        self.memory_versions
+        self.shard_for_key(memory_key)
+            .memory_versions
             .lock()
             .await
             .insert(Self::memory_version_key(namespace, memory_key), version);
@@ -1468,13 +1487,14 @@ impl MemoryStore {
     ) -> Option<MemorySharedSnapshotEntry> {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let current_version = self
+            .shard_for_key(memory_key)
             .memory_versions
             .lock()
             .await
             .get(&Self::memory_version_key(namespace, memory_key))
             .copied();
         let now = Instant::now();
-        let mut snapshots = self.shared_snapshots.lock().await;
+        let mut snapshots = self.shard_for_key(memory_key).shared_snapshots.lock().await;
         self.prune_snapshots_locked(&mut snapshots, now);
         let entry = snapshots.get_mut(&key)?;
         if current_version.is_some_and(|current| current > entry.max_version) {
@@ -1521,7 +1541,7 @@ impl MemoryStore {
     {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
-        let mut snapshots = self.shared_snapshots.lock().await;
+        let mut snapshots = self.shard_for_key(memory_key).shared_snapshots.lock().await;
         self.prune_snapshots_locked(&mut snapshots, now);
         let entry = snapshots
             .entry(key)
@@ -1581,7 +1601,7 @@ impl MemoryStore {
     ) {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
-        let mut snapshots = self.shared_snapshots.lock().await;
+        let mut snapshots = self.shard_for_key(memory_key).shared_snapshots.lock().await;
         self.prune_snapshots_locked(&mut snapshots, now);
         let Some(entry) = snapshots.get_mut(&key) else {
             return;
@@ -2031,18 +2051,21 @@ async fn ensure_schema(database: &Database) -> Result<()> {
 }
 
 struct MemoryDurabilityFloors {
-    version_floor: u64,
+    version_floors: Vec<u64>,
     owner_epoch_floor: u64,
 }
 
-async fn detect_memory_floors(root_dir: &Path) -> Result<MemoryDurabilityFloors> {
-    let mut max_version = 0u64;
+async fn detect_memory_floors(
+    root_dir: &Path,
+    namespace_shards: usize,
+) -> Result<MemoryDurabilityFloors> {
+    let mut max_versions = vec![0u64; namespace_shards];
     let mut max_owner_epoch = 0u64;
     let entries = match std::fs::read_dir(root_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(MemoryDurabilityFloors {
-                version_floor: 1,
+                version_floors: vec![1; namespace_shards],
                 owner_epoch_floor: 1,
             });
         }
@@ -2061,6 +2084,12 @@ async fn detect_memory_floors(root_dir: &Path) -> Result<MemoryDurabilityFloors>
             if shard_path.extension().and_then(|ext| ext.to_str()) != Some("db") {
                 continue;
             }
+            let Some(shard_index) = shard_index_from_db_path(&shard_path) else {
+                continue;
+            };
+            if shard_index >= namespace_shards {
+                continue;
+            }
             let path_str = shard_path.to_string_lossy().to_string();
             let database = Builder::new_local(&path_str)
                 .build()
@@ -2068,7 +2097,7 @@ async fn detect_memory_floors(root_dir: &Path) -> Result<MemoryDurabilityFloors>
                 .map_err(memory_error)?;
             let conn = database.connect().map_err(memory_error)?;
             configure_connection(&conn).await?;
-            max_version = max_version.max(
+            max_versions[shard_index] = max_versions[shard_index].max(
                 read_single_i64(&conn, "SELECT MAX(max_version) FROM memory_meta").await? as u64,
             );
             max_owner_epoch = max_owner_epoch.max(
@@ -2077,9 +2106,18 @@ async fn detect_memory_floors(root_dir: &Path) -> Result<MemoryDurabilityFloors>
         }
     }
     Ok(MemoryDurabilityFloors {
-        version_floor: max_version.saturating_add(1).max(1),
+        version_floors: max_versions
+            .into_iter()
+            .map(|version| version.saturating_add(1).max(1))
+            .collect(),
         owner_epoch_floor: max_owner_epoch.saturating_add(1).max(1),
     })
+}
+
+fn shard_index_from_db_path(path: &Path) -> Option<usize> {
+    let name = path.file_stem()?.to_str()?;
+    let index = name.strip_prefix("shard-")?;
+    index.parse::<usize>().ok()
 }
 
 async fn read_single_i64(conn: &Connection, sql: &str) -> Result<i64> {
@@ -2370,6 +2408,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_versions_are_shard_local() -> Result<()> {
+        let store =
+            MemoryStore::new(temp_root("shard-versions"), 4, 4, Duration::from_secs(60)).await?;
+        assert_ne!(store.shard_index("memory-a"), store.shard_index("memory-b"));
+
+        let first = store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+        let second = store
+            .apply_batch(
+                "ns",
+                "memory-b",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+
+        assert_eq!(first.max_version, 1);
+        assert_eq!(second.max_version, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn memory_db_cache_eviction_keeps_persisted_state() -> Result<()> {
         let store = MemoryStore::new(temp_root("eviction"), 1, 1, Duration::from_secs(60)).await?;
         store
@@ -2395,7 +2465,10 @@ mod tests {
 
         let warm_snapshot = store.snapshot("ns", "memory-b").await?;
         assert_eq!(warm_snapshot.entries.len(), 1);
-        assert_eq!(store.databases.lock().await.len(), 1);
+        assert_eq!(
+            store.shard_for_key("memory-b").databases.lock().await.len(),
+            1
+        );
 
         let snapshot = store.snapshot("ns", "memory-a").await?;
         assert_eq!(snapshot.entries.len(), 1);
@@ -2487,7 +2560,11 @@ mod tests {
         assert_eq!(result.max_version, 1);
 
         let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
-        let snapshots = store.shared_snapshots.lock().await;
+        let snapshots = store
+            .shard_for_key("memory-a")
+            .shared_snapshots
+            .lock()
+            .await;
         let entry = snapshots
             .get(&key)
             .expect("shared cache entry should be updated after commit");
@@ -3070,7 +3147,11 @@ mod tests {
         assert_eq!(result.max_version, 1);
 
         let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
-        let snapshots = store.shared_snapshots.lock().await;
+        let snapshots = store
+            .shard_for_key("memory-a")
+            .shared_snapshots
+            .lock()
+            .await;
         let entry = snapshots
             .get(&key)
             .expect("shared cache entry should be updated after commit");
@@ -3123,7 +3204,11 @@ mod tests {
 
         let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
         {
-            let snapshots = store.shared_snapshots.lock().await;
+            let snapshots = store
+                .shard_for_key("memory-a")
+                .shared_snapshots
+                .lock()
+                .await;
             let entry = snapshots
                 .get(&key)
                 .expect("shared cache entry should exist");
@@ -3136,7 +3221,11 @@ mod tests {
         assert_eq!(miss.max_version, 1);
         assert!(miss.record.is_none());
 
-        let snapshots = store.shared_snapshots.lock().await;
+        let snapshots = store
+            .shard_for_key("memory-a")
+            .shared_snapshots
+            .lock()
+            .await;
         let entry = snapshots
             .get(&key)
             .expect("shared cache entry should exist");
