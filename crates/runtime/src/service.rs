@@ -19,6 +19,7 @@ use crate::engine::{
     dispatch_worker_request, drain_dynamic_control_queue, ensure_v8_flags,
     install_worker_deployment_config, new_runtime_from_snapshot,
     new_runtime_from_snapshot_with_heap_limit, pump_event_loop_once, validate_worker,
+    WorkerDispatchRequest,
 };
 use crate::kv::KvStore;
 use crate::memory::{MemoryOutboxClaim, MemoryStore};
@@ -30,7 +31,7 @@ use crate::ops::{
     clear_request_body_stream, clear_request_secret_context, register_memory_request_scope,
     register_request_body_stream, register_request_secret_context, CacheRevalidatePayload,
     IsolateEventPayload, IsolateEventSender, MemoryInvokeEvent, RequestBodyStreams,
-    RequestExecutionContext,
+    RequestExecutionContext, RequestExecutionContextInit,
 };
 use crate::static_assets::{
     compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,
@@ -71,6 +72,7 @@ use self::config::{
 use self::control::RuntimeEvent;
 type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
 type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
+type AssetCatalogSnapshot = Arc<StdMutex<Arc<HashMap<String, Arc<AssetCatalogEntry>>>>>;
 pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
     DynamicDeployResult, DynamicHandleDebug, DynamicRuntimeDebugDump, HostRpcProviderDebug,
@@ -81,7 +83,7 @@ pub use self::facade::{
 
 #[derive(Clone, Default)]
 struct AssetCatalog {
-    snapshot: Arc<StdMutex<Arc<HashMap<String, Arc<AssetCatalogEntry>>>>>,
+    snapshot: AssetCatalogSnapshot,
 }
 
 impl AssetCatalog {
@@ -123,7 +125,9 @@ pub(crate) use self::model::DynamicQuotaState;
 use self::model::*;
 use self::protocol::*;
 use self::runtime::*;
-use self::storage::{delete_worker_deployment, epoch_ms_i64, persist_worker_deployment};
+use self::storage::{
+    delete_worker_deployment, epoch_ms_i64, persist_worker_deployment, PersistWorkerDeployment,
+};
 
 const INTERNAL_HEADER: &str = "x-dd-internal";
 const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";

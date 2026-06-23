@@ -2,7 +2,8 @@ use crate::handlers::{
     annotate_response_with_trace_id, build_public_request_url, ensure_public_worker, full_body,
     handle_public_h3_request, handle_websocket_session, open_transport_session_from_parts,
     open_websocket_session_from_parts, parse_public_worker_name_from_request,
-    sanitize_websocket_handshake_headers, ResponseBody,
+    request_body_not_supported, request_method_forbids_body, sanitize_websocket_handshake_headers,
+    validate_request_body_headers, ResponseBody,
 };
 use crate::state::AppState;
 use bytes::Bytes;
@@ -230,13 +231,24 @@ async fn handle_public_h3_headers(
         };
     }
 
-    let request_body_stream = if request_method_allows_body(&parsed.method) {
+    validate_request_body_headers(
+        &parsed.method,
+        parsed.request.headers(),
+        state.invoke_max_body_bytes,
+    )?;
+    let request_body_stream = if request_method_forbids_body(&parsed.method) {
+        drain_forbidden_quiche_request_body(
+            &parsed.method,
+            incoming_headers.recv,
+            state.invoke_max_body_bytes,
+        )
+        .await?;
+        None
+    } else {
         Some(stream_quiche_request_body(
             incoming_headers.recv,
             state.invoke_max_body_bytes,
         ))
-    } else {
-        None
     };
     let response = handle_public_h3_request(state, parsed.request, request_body_stream).await;
     send_quiche_response(incoming_headers.send, response).await
@@ -516,10 +528,10 @@ pub(crate) async fn websocket_stream_over_h3(
         while let Some(frame) = recv.recv().await {
             match frame {
                 InboundFrame::Body(body, fin) => {
-                    if !body.as_ref().is_empty() {
-                        if transport_writer.write_all(body.as_ref()).await.is_err() {
-                            return;
-                        }
+                    if !body.as_ref().is_empty()
+                        && transport_writer.write_all(body.as_ref()).await.is_err()
+                    {
+                        return;
                     }
                     if fin {
                         let _ = transport_writer.shutdown().await;
@@ -642,6 +654,34 @@ fn stream_quiche_request_body(
     rx
 }
 
+async fn drain_forbidden_quiche_request_body(
+    method: &Method,
+    mut recv: InboundFrameStream,
+    max_body_bytes: usize,
+) -> Result<()> {
+    let mut total = 0usize;
+    while let Some(frame) = recv.recv().await {
+        match frame {
+            InboundFrame::Body(body, fin) => {
+                if !body.as_ref().is_empty() {
+                    total = total.saturating_add(body.as_ref().len());
+                    if total > max_body_bytes {
+                        return Err(PlatformError::bad_request(format!(
+                            "request body too large (max {max_body_bytes} bytes)"
+                        )));
+                    }
+                    return Err(request_body_not_supported(method));
+                }
+                if fin {
+                    return Ok(());
+                }
+            }
+            InboundFrame::Datagram(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn build_synthetic_websocket_parts(parts: http::request::Parts) -> Result<http::request::Parts> {
     let mut builder = Request::builder()
         .method(Method::GET)
@@ -726,10 +766,6 @@ fn clone_outbound_sender(
     send.get_ref()
         .cloned()
         .ok_or_else(|| PlatformError::internal("missing h3 outbound sender"))
-}
-
-fn request_method_allows_body(method: &Method) -> bool {
-    *method != Method::GET && *method != Method::HEAD
 }
 
 fn response_to_quiche_headers(status: StatusCode, headers: &HeaderMap) -> Vec<quiche::h3::Header> {

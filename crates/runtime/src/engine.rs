@@ -229,18 +229,33 @@ pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
     Ok(())
 }
 
+pub struct WorkerDispatchRequest<'a> {
+    pub request_id: &'a str,
+    pub request_context_handle: u32,
+    pub completion_handle: u32,
+    pub memory_request_scope_handle: u32,
+    pub request_body_stream_handle: u32,
+    pub stream_response: bool,
+    pub memory_call: Option<&'a MemoryExecutionCall>,
+    pub host_rpc_call: Option<&'a HostRpcExecutionCall>,
+    pub request: WorkerInvocation,
+}
+
 pub fn dispatch_worker_request(
     runtime: &mut JsRuntime,
-    request_id: &str,
-    request_context_handle: u32,
-    completion_handle: u32,
-    memory_request_scope_handle: u32,
-    request_body_stream_handle: u32,
-    stream_response: bool,
-    memory_call: Option<&MemoryExecutionCall>,
-    host_rpc_call: Option<&HostRpcExecutionCall>,
-    mut request: WorkerInvocation,
+    dispatch: WorkerDispatchRequest<'_>,
 ) -> Result<()> {
+    let WorkerDispatchRequest {
+        request_id,
+        request_context_handle,
+        completion_handle,
+        memory_request_scope_handle,
+        request_body_stream_handle,
+        stream_response,
+        memory_call,
+        host_rpc_call,
+        mut request,
+    } = dispatch;
     let request_handle = {
         let op_state = runtime.op_state();
         let mut op_state = op_state.borrow_mut();

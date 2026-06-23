@@ -730,6 +730,15 @@ fn ensure_cache_allowed(
     Err("dynamic child policy blocks cache access".to_string())
 }
 
+type PreparedHttpFetchRequest = (
+    reqwest::Method,
+    reqwest::Url,
+    Vec<(String, String)>,
+    Vec<u8>,
+    Arc<AtomicBool>,
+    Arc<Notify>,
+);
+
 pub(crate) fn prepare_http_fetch_request(
     state: &Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -737,17 +746,7 @@ pub(crate) fn prepare_http_fetch_request(
     url: &str,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-) -> std::result::Result<
-    (
-        reqwest::Method,
-        reqwest::Url,
-        Vec<(String, String)>,
-        Vec<u8>,
-        Arc<AtomicBool>,
-        Arc<Notify>,
-    ),
-    String,
-> {
+) -> std::result::Result<PreparedHttpFetchRequest, String> {
     let (execution, canceled, canceled_notify) = http_fetch_context(state, request_context_handle)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();

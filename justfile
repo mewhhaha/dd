@@ -67,6 +67,7 @@ check:
   just check-js
   cargo fmt --all -- --check
   cargo check --workspace --all-targets --all-features
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
   cargo test --workspace
 
 # Build the full dd_server artifact and write a size report.
@@ -88,6 +89,7 @@ size-report-all profile="dist":
 
 # Syntax-check source-only JS integration package.
 check-js:
+  node --check benchmarks/run.mjs
   node --check packages/dd-vite/src/index.js
   node --check packages/dd-runtime/index.cjs
   node --check packages/dd-vite/src/runtime.js

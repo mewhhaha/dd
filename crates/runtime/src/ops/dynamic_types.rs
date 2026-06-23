@@ -214,7 +214,7 @@ pub enum DynamicPushedReplyPayload {
     TestAsync(TestAsyncReplyResult),
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub struct DynamicPendingReplyResult {
     pub reply_id: String,
     pub(crate) ready: bool,
@@ -336,26 +336,6 @@ impl Default for DynamicControlInbox {
     fn default() -> Self {
         Self {
             inner: Arc::new(StdMutex::new(DrainInboxState::default())),
-        }
-    }
-}
-
-impl Default for DynamicPendingReplyResult {
-    fn default() -> Self {
-        Self {
-            reply_id: String::new(),
-            ready: false,
-            kind: "",
-            ok: false,
-            found: false,
-            deleted: false,
-            handle: String::new(),
-            worker: String::new(),
-            timeout: 0,
-            ids: Vec::new(),
-            value_handle: 0,
-            pending_value: None,
-            error: String::new(),
         }
     }
 }

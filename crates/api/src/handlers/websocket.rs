@@ -139,7 +139,7 @@ pub(crate) async fn open_websocket_session_from_parts(
     worker_name: String,
     url: String,
 ) -> Result<runtime::WebSocketOpen, PlatformError> {
-    if parts.method.as_str().to_ascii_uppercase() != "GET" {
+    if !parts.method.as_str().eq_ignore_ascii_case("GET") {
         return Err(PlatformError::bad_request("websocket upgrade requires GET"));
     }
     if !is_websocket_upgrade(&parts.headers) {

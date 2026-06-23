@@ -108,6 +108,9 @@ struct DeployConfigFileCmd {
 
     #[arg(long)]
     temporary: bool,
+
+    #[arg(long = "allow-outside-config-root")]
+    allow_outside_config_root: bool,
 }
 
 #[derive(Args)]
@@ -541,14 +544,24 @@ async fn build_deploy_request_from_config_file(
     }
 
     let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let entry_path = config_relative_path(base_dir, &deploy_file.entrypoint);
+    let entry_path = resolve_config_file_path(
+        base_dir,
+        &deploy_file.entrypoint,
+        command.allow_outside_config_root,
+        "entrypoint",
+    )?;
     let source = tokio::fs::read_to_string(&entry_path)
         .await
         .map_err(|error| format!("failed to read {}: {error}", entry_path.display()))?;
 
     let mut asset_excludes = deploy_file.asset_excludes;
     let (assets, asset_headers) = if let Some(assets_dir) = deploy_file.assets_dir.as_deref() {
-        let assets_path = config_relative_path(base_dir, assets_dir);
+        let assets_path = resolve_config_file_path(
+            base_dir,
+            assets_dir,
+            command.allow_outside_config_root,
+            "assets_dir",
+        )?;
         push_asset_exclude_if_within(&mut asset_excludes, &assets_path, &entry_path)?;
         push_asset_exclude_if_within(&mut asset_excludes, &assets_path, &config_path)?;
         package_assets_dir_with_excludes(Some(&path_to_string(&assets_path)?), &asset_excludes)?
@@ -1041,6 +1054,28 @@ fn config_relative_path(base_dir: &Path, value: &str) -> PathBuf {
     }
 }
 
+fn resolve_config_file_path(
+    base_dir: &Path,
+    value: &str,
+    allow_outside_config_root: bool,
+    field: &str,
+) -> Result<PathBuf, String> {
+    let path = config_relative_path(base_dir, value);
+    if allow_outside_config_root {
+        return Ok(path);
+    }
+
+    let root = canonical_or_absolute_path(base_dir)?;
+    let target = canonical_or_absolute_path(&path)?;
+    if target.strip_prefix(&root).is_err() {
+        return Err(format!(
+            "deploy config {field} must stay within the config directory (use --allow-outside-config-root to allow {})",
+            target.display()
+        ));
+    }
+    Ok(target)
+}
+
 fn push_asset_exclude_if_within(
     excludes: &mut Vec<String>,
     assets_root: &Path,
@@ -1153,6 +1188,7 @@ mod tests {
         let request = build_deploy_request_from_config_file(DeployConfigFileCmd {
             config_file: root.join("dd.deploy.json").display().to_string(),
             temporary: false,
+            allow_outside_config_root: false,
         })
         .await
         .expect("package generated deploy config");
@@ -1169,6 +1205,107 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(asset_paths, vec!["/assets/app.js", "/index.html"]);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn deploy_config_rejects_parent_relative_entrypoint_escape() {
+        let root = temp_dir("deploy-config-entry-escape");
+        let app = root.join("app");
+        fs::create_dir_all(&app).expect("create app");
+        fs::write(root.join("worker.js"), "export default { fetch() {} };").expect("write worker");
+        fs::write(
+            app.join("dd.deploy.json"),
+            r#"{
+              "name": "escaped-worker",
+              "entrypoint": "../worker.js",
+              "config": { "public": true, "bindings": [] }
+            }"#,
+        )
+        .expect("write deploy config");
+
+        let error = build_deploy_request_from_config_file(DeployConfigFileCmd {
+            config_file: app.join("dd.deploy.json").display().to_string(),
+            temporary: false,
+            allow_outside_config_root: false,
+        })
+        .await
+        .expect_err("entrypoint escape should fail");
+
+        assert!(error.contains("entrypoint must stay within the config directory"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn deploy_config_rejects_absolute_assets_dir_escape() {
+        let root = temp_dir("deploy-config-assets-escape");
+        let app = root.join("app");
+        let assets = root.join("assets");
+        fs::create_dir_all(&app).expect("create app");
+        fs::create_dir_all(&assets).expect("create assets");
+        fs::write(app.join("worker.js"), "export default { fetch() {} };").expect("write worker");
+        fs::write(assets.join("app.js"), "console.log('asset');").expect("write asset");
+        fs::write(
+            app.join("dd.deploy.json"),
+            format!(
+                r#"{{
+                  "name": "escaped-assets",
+                  "entrypoint": "worker.js",
+                  "assets_dir": "{}",
+                  "config": {{ "public": true, "bindings": [] }}
+                }}"#,
+                assets.display()
+            ),
+        )
+        .expect("write deploy config");
+
+        let error = build_deploy_request_from_config_file(DeployConfigFileCmd {
+            config_file: app.join("dd.deploy.json").display().to_string(),
+            temporary: false,
+            allow_outside_config_root: false,
+        })
+        .await
+        .expect_err("assets dir escape should fail");
+
+        assert!(error.contains("assets_dir must stay within the config directory"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn deploy_config_allows_outside_paths_with_explicit_flag() {
+        let root = temp_dir("deploy-config-allow-outside");
+        let app = root.join("app");
+        let assets = root.join("assets");
+        fs::create_dir_all(&app).expect("create app");
+        fs::create_dir_all(&assets).expect("create assets");
+        fs::write(root.join("worker.js"), "export default { fetch() {} };").expect("write worker");
+        fs::write(assets.join("app.js"), "console.log('asset');").expect("write asset");
+        fs::write(
+            app.join("dd.deploy.json"),
+            format!(
+                r#"{{
+                  "name": "outside-worker",
+                  "entrypoint": "../worker.js",
+                  "assets_dir": "{}",
+                  "config": {{ "public": true, "bindings": [] }}
+                }}"#,
+                assets.display()
+            ),
+        )
+        .expect("write deploy config");
+
+        let request = build_deploy_request_from_config_file(DeployConfigFileCmd {
+            config_file: app.join("dd.deploy.json").display().to_string(),
+            temporary: false,
+            allow_outside_config_root: true,
+        })
+        .await
+        .expect("outside paths should be allowed with flag");
+
+        assert_eq!(request.name, "outside-worker");
+        assert!(request.source.contains("export default"));
+        assert_eq!(request.assets.len(), 1);
+        assert_eq!(request.assets[0].path, "/app.js");
         let _ = fs::remove_dir_all(root);
     }
 

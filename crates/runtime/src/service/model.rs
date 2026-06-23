@@ -44,6 +44,17 @@ pub(super) struct WorkerManager {
     pub(super) next_memory_entity_epoch: u64,
 }
 
+pub(super) struct WorkerManagerInit {
+    pub(super) bootstrap_snapshot: &'static [u8],
+    pub(super) kv_store: KvStore,
+    pub(super) memory_store: MemoryStore,
+    pub(super) cache_store: CacheStore,
+    pub(super) config: RuntimeConfig,
+    pub(super) storage: RuntimeStorageConfig,
+    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) asset_catalog: AssetCatalog,
+}
+
 pub(crate) struct PreparedWorkerDeployment {
     pub(super) worker_name: String,
     pub(super) source: String,
@@ -373,10 +384,10 @@ impl PendingInvokeQueue {
         &mut self,
         runtime_request_id: &str,
     ) -> Option<PendingInvoke> {
-        let key = match self.by_runtime_request_id.get(runtime_request_id).copied() {
-            Some(key) => key,
-            None => return None,
-        };
+        let key = self
+            .by_runtime_request_id
+            .get(runtime_request_id)
+            .copied()?;
         let removed = self.remove(key);
         if removed.is_none() {
             self.by_runtime_request_id.remove(runtime_request_id);
@@ -683,20 +694,38 @@ pub(super) struct PendingInvoke {
     pub(super) queued_bytes: usize,
 }
 
-#[derive(Clone)]
-pub(super) enum PendingReplyKind {
-    Normal,
-    Stream,
-    DynamicFetch { handle: String },
-    WebsocketOpen { session_id: String },
-    WebsocketFrame { session_id: String },
-    TransportOpen { session_id: String },
+pub(super) struct EnqueueInvokeRequest {
+    pub(super) worker_name: String,
+    pub(super) runtime_request_id: String,
+    pub(super) request: WorkerInvocation,
+    pub(super) request_body: Option<InvokeRequestBodyReceiver>,
+    pub(super) memory_route: Option<MemoryRoute>,
+    pub(super) memory_call: Option<MemoryExecutionCall>,
+    pub(super) host_rpc_call: Option<HostRpcExecutionCall>,
+    pub(super) target_isolate_id: Option<u64>,
+    pub(super) target_generation: Option<u64>,
+    pub(super) internal_origin: bool,
+    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) reply_kind: PendingReplyKind,
 }
 
-impl Default for PendingReplyKind {
-    fn default() -> Self {
-        Self::Normal
-    }
+#[derive(Clone, Default)]
+pub(super) enum PendingReplyKind {
+    #[default]
+    Normal,
+    Stream,
+    DynamicFetch {
+        handle: String,
+    },
+    WebsocketOpen {
+        session_id: String,
+    },
+    WebsocketFrame {
+        session_id: String,
+    },
+    TransportOpen {
+        session_id: String,
+    },
 }
 
 impl PendingReplyKind {
@@ -757,12 +786,132 @@ pub(super) struct TraceResultMeta {
     pub(super) error: Option<String>,
 }
 
+pub(super) struct DirectDynamicFetchRequest {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) target_isolate_id: u64,
+    pub(super) runtime_request_id: String,
+    pub(super) request: WorkerInvocation,
+    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) handle: String,
+}
+
 pub(super) enum DirectDynamicFetchDispatch {
     Dispatched,
     Fallback {
         reply: oneshot::Sender<Result<WorkerOutput>>,
         clear_preferred: bool,
     },
+}
+
+pub(super) struct FinishRequest {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) isolate_id: u64,
+    pub(super) request_id: String,
+    pub(super) completion_token: String,
+    pub(super) wait_until_count: usize,
+    pub(super) result: Result<WorkerOutput>,
+}
+
+pub(super) struct TraceForwardRequest {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) request_method: String,
+    pub(super) request_url: String,
+    pub(super) runtime_request_id: String,
+    pub(super) user_request_id: String,
+    pub(super) result: TraceResultMeta,
+    pub(super) execution_ms: u64,
+    pub(super) wait_until_count: usize,
+    pub(super) internal_origin: bool,
+    pub(super) trace_destination: Option<InternalTraceDestination>,
+}
+
+pub(super) struct BuildExecuteCommand {
+    pub(super) runtime_request_id: String,
+    pub(super) completion_token: String,
+    pub(super) request: WorkerInvocation,
+    pub(super) request_body: Option<InvokeRequestBodyReceiver>,
+    pub(super) stream_response: bool,
+    pub(super) memory_call: Option<MemoryExecutionCall>,
+    pub(super) host_rpc_call: Option<HostRpcExecutionCall>,
+    pub(super) memory_route: Option<MemoryRoute>,
+}
+
+pub(super) struct TargetedHostRpcInvoke {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) isolate_id: u64,
+    pub(super) target_id: String,
+    pub(super) method_name: String,
+    pub(super) args: Vec<u8>,
+    pub(super) reply: TargetedHostRpcReply,
+}
+
+pub(super) struct DynamicWorkerFetchStart {
+    pub(super) owner_worker: String,
+    pub(super) owner_generation: u64,
+    pub(super) binding: String,
+    pub(super) handle: String,
+    pub(super) request: WorkerInvocation,
+    pub(super) reply_id: String,
+    pub(super) pending_replies: crate::ops::DynamicPendingReplies,
+    pub(super) command_tx: mpsc::Sender<RuntimeCommand>,
+}
+
+pub(super) struct RuntimeThreadStart {
+    pub(super) receiver: mpsc::Receiver<RuntimeCommand>,
+    pub(super) cancel_receiver: mpsc::Receiver<RuntimeCommand>,
+    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) asset_catalog: AssetCatalog,
+    pub(super) bootstrap_snapshot: &'static [u8],
+    pub(super) kv_store: KvStore,
+    pub(super) memory_store: MemoryStore,
+    pub(super) cache_store: CacheStore,
+    pub(super) config: RuntimeConfig,
+    pub(super) storage: RuntimeStorageConfig,
+}
+
+pub(super) struct IsolateThreadStart {
+    pub(super) snapshot: &'static [u8],
+    pub(super) snapshot_preloaded: bool,
+    pub(super) source: crate::ops::WorkerSource,
+    pub(super) deployment_config: Arc<crate::ops::WorkerDeploymentPayload>,
+    pub(super) allow_code_generation: bool,
+    pub(super) kv_store: KvStore,
+    pub(super) memory_store: MemoryStore,
+    pub(super) cache_store: CacheStore,
+    pub(super) open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
+    pub(super) dynamic_profile: crate::ops::DynamicProfile,
+    pub(super) execution_limits: crate::ops::RuntimeExecutionLimits,
+    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) isolate_id: u64,
+    pub(super) event_tx: RuntimeEventSender,
+}
+
+pub(super) struct WebSocketSessionRegistration {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) isolate_id: u64,
+    pub(super) session_id: String,
+    pub(super) binding: String,
+    pub(super) key: String,
+    pub(super) handle: String,
+}
+
+pub(super) struct TransportSessionRegistration {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) isolate_id: u64,
+    pub(super) session_id: String,
+    pub(super) binding: String,
+    pub(super) key: String,
+    pub(super) handle: String,
+    pub(super) stream_sender: mpsc::Sender<Vec<u8>>,
+    pub(super) datagram_sender: mpsc::Sender<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]

@@ -54,28 +54,28 @@ impl WorkerManager {
             dynamic_rpc_bindings: Vec::new(),
             dynamic_env: Vec::new(),
         });
-        let request_context = RequestExecutionContext::new(
-            worker_name.clone(),
+        let request_context = RequestExecutionContext::new(RequestExecutionContextInit {
+            worker_name: worker_name.clone(),
             generation,
-            bindings.dynamic.clone(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            true,
-            None,
-            None,
-        );
+            dynamic_bindings: bindings.dynamic.clone(),
+            dynamic_rpc_bindings: Vec::new(),
+            replacements: Vec::new(),
+            egress_allow_hosts: Vec::new(),
+            allow_cache: true,
+            max_outbound_requests: None,
+            dynamic_quota_state: None,
+        });
         if persist {
-            persist_worker_deployment(
-                &self.storage,
-                &worker_name,
-                &source,
-                &config,
-                &assets,
-                asset_headers.as_deref(),
-                &deployment_id,
+            persist_worker_deployment(PersistWorkerDeployment {
+                storage: &self.storage,
+                worker_name: &worker_name,
+                source: &source,
+                config: &config,
+                assets: &assets,
+                asset_headers: asset_headers.as_deref(),
+                deployment_id: &deployment_id,
                 expires_at_ms,
-            )
+            })
             .await?;
         }
         let asset_catalog_entry = AssetCatalogEntry {
@@ -244,17 +244,17 @@ impl WorkerManager {
             .map(|binding| binding.binding.clone())
             .collect::<Vec<_>>();
         let dynamic_quota_state = Arc::new(DynamicQuotaState::default());
-        let request_context = RequestExecutionContext::new(
-            worker_name.clone(),
+        let request_context = RequestExecutionContext::new(RequestExecutionContextInit {
+            worker_name: worker_name.clone(),
             generation,
-            dynamic_config.bindings.dynamic.clone(),
-            dynamic_rpc_binding_names.clone(),
-            dynamic_config.secret_replacements,
-            dynamic_config.egress_allow_hosts,
-            dynamic_config.policy.allow_state_bindings,
-            Some(dynamic_config.policy.max_outbound_requests),
-            Some(Arc::clone(&dynamic_quota_state)),
-        );
+            dynamic_bindings: dynamic_config.bindings.dynamic.clone(),
+            dynamic_rpc_bindings: dynamic_rpc_binding_names.clone(),
+            replacements: dynamic_config.secret_replacements,
+            egress_allow_hosts: dynamic_config.egress_allow_hosts,
+            allow_cache: dynamic_config.policy.allow_state_bindings,
+            max_outbound_requests: Some(dynamic_config.policy.max_outbound_requests),
+            dynamic_quota_state: Some(Arc::clone(&dynamic_quota_state)),
+        });
         let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
         let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
             worker_name: worker_name.clone(),

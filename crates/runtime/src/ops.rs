@@ -625,15 +625,13 @@ mod tests {
                 if payload.reply_id == "dynr-1"
         ));
 
-        assert!(
-            inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-                DynamicPendingReplyResult {
-                    reply_id: "dynr-2".to_string(),
-                    ready: true,
-                    ..DynamicPendingReplyResult::default()
-                }
-            )) == false
-        );
+        assert!(!inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
+            DynamicPendingReplyResult {
+                reply_id: "dynr-2".to_string(),
+                ready: true,
+                ..DynamicPendingReplyResult::default()
+            }
+        )));
         let second = inbox.take_batch();
         assert_eq!(second.len(), 1);
         assert!(matches!(

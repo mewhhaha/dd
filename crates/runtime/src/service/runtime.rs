@@ -150,27 +150,27 @@ pub(super) fn least_loaded_isolate_any_idx(
 }
 
 impl WorkerPool {
-    pub(super) fn build_execute_command(
-        &self,
-        runtime_request_id: String,
-        completion_token: String,
-        request: WorkerInvocation,
-        request_body: Option<InvokeRequestBodyReceiver>,
-        stream_response: bool,
-        memory_call: Option<MemoryExecutionCall>,
-        host_rpc_call: Option<HostRpcExecutionCall>,
-        memory_route: Option<MemoryRoute>,
-    ) -> IsolateCommand {
-        IsolateCommand::Execute {
+    pub(super) fn build_execute_command(&self, command: BuildExecuteCommand) -> IsolateCommand {
+        let BuildExecuteCommand {
             runtime_request_id,
             completion_token,
-            request_context: self.request_context.clone(),
             request,
             request_body,
             stream_response,
             memory_call,
             host_rpc_call,
             memory_route,
+        } = command;
+        IsolateCommand::Execute {
+            runtime_request_id,
+            completion_token,
+            request_context: Box::new(self.request_context.clone()),
+            request: Box::new(request),
+            request_body,
+            stream_response,
+            memory_call: Box::new(memory_call),
+            host_rpc_call,
+            memory_route: Box::new(memory_route),
         }
     }
 
@@ -265,18 +265,19 @@ impl PoolActivity {
     }
 }
 
-pub(super) fn spawn_runtime_thread(
-    mut receiver: mpsc::Receiver<RuntimeCommand>,
-    mut cancel_receiver: mpsc::Receiver<RuntimeCommand>,
-    runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
-    asset_catalog: AssetCatalog,
-    bootstrap_snapshot: &'static [u8],
-    kv_store: KvStore,
-    memory_store: MemoryStore,
-    cache_store: CacheStore,
-    config: RuntimeConfig,
-    storage: RuntimeStorageConfig,
-) -> Result<()> {
+pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
+    let RuntimeThreadStart {
+        mut receiver,
+        mut cancel_receiver,
+        runtime_fast_sender,
+        asset_catalog,
+        bootstrap_snapshot,
+        kv_store,
+        memory_store,
+        cache_store,
+        config,
+        storage,
+    } = start;
     thread::Builder::new()
         .name("dd-runtime".to_string())
         .spawn(move || {
@@ -287,16 +288,16 @@ pub(super) fn spawn_runtime_thread(
 
             runtime.block_on(async move {
                 let (event_tx, mut event_rx) = mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY);
-                let mut manager = WorkerManager::new(
+                let mut manager = WorkerManager::new(WorkerManagerInit {
                     bootstrap_snapshot,
                     kv_store,
                     memory_store,
                     cache_store,
-                    config.clone(),
+                    config: config.clone(),
                     storage,
                     runtime_fast_sender,
                     asset_catalog,
-                );
+                });
                 let mut ticker = tokio::time::interval(config.scale_tick);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 manager.drain_memory_outbox().await;
@@ -562,24 +563,25 @@ pub(super) fn runtime_event_from_isolate_payload(
     }
 }
 
-pub(super) fn spawn_isolate_thread(
-    snapshot: &'static [u8],
-    snapshot_preloaded: bool,
-    source: crate::ops::WorkerSource,
-    deployment_config: Arc<crate::ops::WorkerDeploymentPayload>,
-    allow_code_generation: bool,
-    kv_store: KvStore,
-    memory_store: MemoryStore,
-    cache_store: CacheStore,
-    open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
-    dynamic_profile: crate::ops::DynamicProfile,
-    execution_limits: crate::ops::RuntimeExecutionLimits,
-    runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
-    worker_name: String,
-    generation: u64,
-    isolate_id: u64,
-    event_tx: RuntimeEventSender,
-) -> Result<IsolateHandle> {
+pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateHandle> {
+    let IsolateThreadStart {
+        snapshot,
+        snapshot_preloaded,
+        source,
+        deployment_config,
+        allow_code_generation,
+        kv_store,
+        memory_store,
+        cache_store,
+        open_handle_registry,
+        dynamic_profile,
+        execution_limits,
+        runtime_fast_sender,
+        worker_name,
+        generation,
+        isolate_id,
+        event_tx,
+    } = start;
     let (command_tx, mut command_rx) = mpsc::channel(ISOLATE_COMMAND_CHANNEL_CAPACITY);
     let dynamic_control_inbox = crate::ops::DynamicControlInbox::default();
     let thread_dynamic_control_inbox = dynamic_control_inbox.clone();
@@ -828,6 +830,10 @@ pub(super) async fn handle_isolate_command(
             host_rpc_call,
             memory_route,
         } => {
+            let request_context = *request_context;
+            let request = *request;
+            let memory_call = *memory_call;
+            let memory_route = *memory_route;
             let mut request_body_stream_handle = 0;
             let request_context_handle;
             let completion_handle;
@@ -880,15 +886,17 @@ pub(super) async fn handle_isolate_command(
             let started_at = Instant::now();
             if let Err(error) = dispatch_worker_request(
                 js_runtime,
-                &runtime_request_id,
-                request_context_handle,
-                completion_handle,
-                memory_request_scope_handle,
-                request_body_stream_handle,
-                stream_response,
-                memory_call.as_ref(),
-                host_rpc_call.as_ref(),
-                request,
+                WorkerDispatchRequest {
+                    request_id: &runtime_request_id,
+                    request_context_handle,
+                    completion_handle,
+                    memory_request_scope_handle,
+                    request_body_stream_handle,
+                    stream_response,
+                    memory_call: memory_call.as_ref(),
+                    host_rpc_call: host_rpc_call.as_ref(),
+                    request,
+                },
             ) {
                 {
                     let op_state = js_runtime.op_state();

@@ -216,16 +216,17 @@ pub(super) enum RuntimeEvent {
     },
 }
 impl WorkerManager {
-    pub(super) fn new(
-        bootstrap_snapshot: &'static [u8],
-        kv_store: KvStore,
-        memory_store: MemoryStore,
-        cache_store: CacheStore,
-        config: RuntimeConfig,
-        storage: RuntimeStorageConfig,
-        runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
-        asset_catalog: AssetCatalog,
-    ) -> Self {
+    pub(super) fn new(init: WorkerManagerInit) -> Self {
+        let WorkerManagerInit {
+            bootstrap_snapshot,
+            kv_store,
+            memory_store,
+            cache_store,
+            config,
+            storage,
+            runtime_fast_sender,
+            asset_catalog,
+        } = init;
         let next_memory_entity_epoch = memory_store.owner_epoch_floor();
         Self {
             config,
@@ -347,19 +348,21 @@ impl WorkerManager {
                 request_body,
                 reply,
             } => {
-                let _ = self.enqueue_invoke(
-                    worker_name,
-                    runtime_request_id,
-                    request,
-                    request_body,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    reply,
-                    PendingReplyKind::Normal,
+                self.enqueue_invoke(
+                    EnqueueInvokeRequest {
+                        worker_name,
+                        runtime_request_id,
+                        request,
+                        request_body,
+                        memory_route: None,
+                        memory_call: None,
+                        host_rpc_call: None,
+                        target_isolate_id: None,
+                        target_generation: None,
+                        internal_origin: false,
+                        reply,
+                        reply_kind: PendingReplyKind::Normal,
+                    },
                     event_tx,
                 );
                 true
@@ -374,18 +377,20 @@ impl WorkerManager {
             } => {
                 self.register_stream(worker_name.clone(), runtime_request_id.clone(), ready);
                 self.enqueue_invoke(
-                    worker_name,
-                    runtime_request_id,
-                    request,
-                    request_body,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    reply,
-                    PendingReplyKind::Stream,
+                    EnqueueInvokeRequest {
+                        worker_name,
+                        runtime_request_id,
+                        request,
+                        request_body,
+                        memory_route: None,
+                        memory_call: None,
+                        host_rpc_call: None,
+                        target_isolate_id: None,
+                        target_generation: None,
+                        internal_origin: false,
+                        reply,
+                        reply_kind: PendingReplyKind::Stream,
+                    },
                     event_tx,
                 );
                 true
@@ -401,14 +406,16 @@ impl WorkerManager {
             } => {
                 let runtime_fast_sender = self.runtime_fast_sender.clone();
                 self.start_dynamic_worker_fetch(
-                    owner_worker,
-                    owner_generation,
-                    binding,
-                    handle,
-                    request,
-                    reply_id,
-                    pending_replies,
-                    &runtime_fast_sender,
+                    DynamicWorkerFetchStart {
+                        owner_worker,
+                        owner_generation,
+                        binding,
+                        handle,
+                        request,
+                        reply_id,
+                        pending_replies,
+                        command_tx: runtime_fast_sender,
+                    },
                     event_tx,
                 );
                 true
@@ -445,19 +452,21 @@ impl WorkerManager {
                 self.websocket_open_waiters
                     .insert(session_id.clone(), reply);
 
-                let _ = self.enqueue_invoke(
-                    worker_name,
-                    runtime_request_id,
-                    request,
-                    request_body,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    inner_tx,
-                    PendingReplyKind::WebsocketOpen { session_id },
+                self.enqueue_invoke(
+                    EnqueueInvokeRequest {
+                        worker_name,
+                        runtime_request_id,
+                        request,
+                        request_body,
+                        memory_route: None,
+                        memory_call: None,
+                        host_rpc_call: None,
+                        target_isolate_id: None,
+                        target_generation: None,
+                        internal_origin: false,
+                        reply: inner_tx,
+                        reply_kind: PendingReplyKind::WebsocketOpen { session_id },
+                    },
                     event_tx,
                 );
                 true
@@ -542,19 +551,21 @@ impl WorkerManager {
                 );
 
                 let runtime_request_id = Uuid::new_v4().to_string();
-                let _ = self.enqueue_invoke(
-                    worker_name,
-                    runtime_request_id,
-                    request,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    inner_tx,
-                    PendingReplyKind::TransportOpen { session_id },
+                self.enqueue_invoke(
+                    EnqueueInvokeRequest {
+                        worker_name,
+                        runtime_request_id,
+                        request,
+                        request_body: None,
+                        memory_route: None,
+                        memory_call: None,
+                        host_rpc_call: None,
+                        target_isolate_id: None,
+                        target_generation: None,
+                        internal_origin: false,
+                        reply: inner_tx,
+                        reply_kind: PendingReplyKind::TransportOpen { session_id },
+                    },
                     event_tx,
                 );
                 true
@@ -666,13 +677,15 @@ impl WorkerManager {
                 result,
             } => {
                 self.finish_request(
-                    &worker_name,
-                    generation,
-                    isolate_id,
-                    &request_id,
-                    &completion_token,
-                    wait_until_count,
-                    result,
+                    FinishRequest {
+                        worker_name: worker_name.clone(),
+                        generation,
+                        isolate_id,
+                        request_id,
+                        completion_token,
+                        wait_until_count,
+                        result,
+                    },
                     event_tx,
                 )
                 .await;
@@ -885,19 +898,21 @@ impl WorkerManager {
             request_id: format!("ws-message-{runtime_request_id}"),
         };
         self.enqueue_invoke(
-            session_worker_name,
-            runtime_request_id,
-            invoke,
-            None,
-            Some(route),
-            Some(memory_call),
-            None,
-            None,
-            Some(generation),
-            true,
-            reply,
-            PendingReplyKind::WebsocketFrame {
-                session_id: session_id.to_string(),
+            EnqueueInvokeRequest {
+                worker_name: session_worker_name,
+                runtime_request_id,
+                request: invoke,
+                request_body: None,
+                memory_route: Some(route),
+                memory_call: Some(memory_call),
+                host_rpc_call: None,
+                target_isolate_id: None,
+                target_generation: Some(generation),
+                internal_origin: true,
+                reply,
+                reply_kind: PendingReplyKind::WebsocketFrame {
+                    session_id: session_id.to_string(),
+                },
             },
             event_tx,
         );
@@ -949,27 +964,26 @@ impl WorkerManager {
         };
         let (reply, receiver) = oneshot::channel();
         self.enqueue_invoke(
-            session.worker_name,
-            runtime_request_id,
-            invoke,
-            None,
-            Some(route),
-            Some(memory_call),
-            None,
-            None,
-            Some(session.generation),
-            true,
-            reply,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name: session.worker_name,
+                runtime_request_id,
+                request: invoke,
+                request_body: None,
+                memory_route: Some(route),
+                memory_call: Some(memory_call),
+                host_rpc_call: None,
+                target_isolate_id: None,
+                target_generation: Some(session.generation),
+                internal_origin: true,
+                reply,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            match receiver.await {
-                Ok(Err(error)) => {
-                    warn!(session_id, error = %error, "websocket close wake dispatch failed");
-                }
-                Ok(Ok(_)) | Err(_) => {}
+            if let Ok(Err(error)) = receiver.await {
+                warn!(session_id, error = %error, "websocket close wake dispatch failed");
             }
         });
         Ok(())
@@ -1227,16 +1241,18 @@ impl WorkerManager {
         let reply_id = payload.reply_id;
         let replies = payload.replies;
         if let Err(error) = self.start_targeted_host_rpc_invoke(
-            payload.worker_name,
-            payload.generation,
-            target_isolate_id,
-            payload.target_id,
-            payload.method_name,
-            payload.args,
-            TargetedHostRpcReply::Test {
-                reply_id: reply_id.clone(),
-                replies: replies.clone(),
-                success_value: format!("ok:{target_isolate_id}"),
+            TargetedHostRpcInvoke {
+                worker_name: payload.worker_name,
+                generation: payload.generation,
+                isolate_id: target_isolate_id,
+                target_id: payload.target_id,
+                method_name: payload.method_name,
+                args: payload.args,
+                reply: TargetedHostRpcReply::Test {
+                    reply_id: reply_id.clone(),
+                    replies: replies.clone(),
+                    success_value: format!("ok:{target_isolate_id}"),
+                },
             },
             event_tx,
         ) {
@@ -1311,15 +1327,18 @@ impl WorkerManager {
 
     pub(super) fn start_targeted_host_rpc_invoke(
         &mut self,
-        worker_name: String,
-        generation: u64,
-        isolate_id: u64,
-        target_id: String,
-        method_name: String,
-        args: Vec<u8>,
-        reply: TargetedHostRpcReply,
+        invoke: TargetedHostRpcInvoke,
         event_tx: &RuntimeEventSender,
     ) -> Result<()> {
+        let TargetedHostRpcInvoke {
+            worker_name,
+            generation,
+            isolate_id,
+            target_id,
+            method_name,
+            args,
+            reply,
+        } = invoke;
         let provider_available = self
             .workers
             .get(&worker_name)
@@ -1341,22 +1360,24 @@ impl WorkerManager {
         };
         let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
         self.enqueue_invoke(
-            worker_name,
-            runtime_request_id,
-            request,
-            None,
-            None,
-            None,
-            Some(HostRpcExecutionCall {
-                target_id,
-                method: method_name,
-                args,
-            }),
-            Some(isolate_id),
-            Some(generation),
-            true,
-            inner_reply_tx,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name,
+                runtime_request_id,
+                request,
+                request_body: None,
+                memory_route: None,
+                memory_call: None,
+                host_rpc_call: Some(HostRpcExecutionCall {
+                    target_id,
+                    method: method_name,
+                    args,
+                }),
+                target_isolate_id: Some(isolate_id),
+                target_generation: Some(generation),
+                internal_origin: true,
+                reply: inner_reply_tx,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         let event_tx = event_tx.clone();

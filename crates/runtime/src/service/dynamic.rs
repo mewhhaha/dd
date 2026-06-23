@@ -454,16 +454,19 @@ impl WorkerManager {
 
     pub(super) fn start_dynamic_worker_fetch(
         &mut self,
-        owner_worker: String,
-        owner_generation: u64,
-        binding: String,
-        handle: String,
-        request: WorkerInvocation,
-        reply_id: String,
-        pending_replies: crate::ops::DynamicPendingReplies,
-        command_tx: &mpsc::Sender<RuntimeCommand>,
+        fetch: DynamicWorkerFetchStart,
         event_tx: &RuntimeEventSender,
     ) {
+        let DynamicWorkerFetchStart {
+            owner_worker,
+            owner_generation,
+            binding,
+            handle,
+            request,
+            reply_id,
+            pending_replies,
+            command_tx,
+        } = fetch;
         let dispatch_target = match self.dynamic_dispatch_target(
             &handle,
             &owner_worker,
@@ -589,15 +592,15 @@ impl WorkerManager {
         let child_worker_name = dispatch_target.worker_name.clone();
         let mut queue_target_isolate_id = None;
         if let Some(preferred_id) = target_isolate_id {
-            match self.try_dispatch_direct_dynamic_fetch(
-                &child_worker_name,
-                dispatch_target.worker_generation,
-                preferred_id,
-                runtime_request_id.clone(),
-                request.clone(),
-                inner_reply_tx,
-                handle.clone(),
-            ) {
+            match self.try_dispatch_direct_dynamic_fetch(DirectDynamicFetchRequest {
+                worker_name: child_worker_name.clone(),
+                generation: dispatch_target.worker_generation,
+                target_isolate_id: preferred_id,
+                runtime_request_id: runtime_request_id.clone(),
+                request: request.clone(),
+                reply: inner_reply_tx,
+                handle: handle.clone(),
+            }) {
                 DirectDynamicFetchDispatch::Dispatched => {
                     self.dynamic_profile.record_direct_fetch_fast_path_hit();
                 }
@@ -614,19 +617,21 @@ impl WorkerManager {
                         }
                     }
                     self.enqueue_invoke(
-                        child_worker_name,
-                        runtime_request_id,
-                        request,
-                        None,
-                        None,
-                        None,
-                        None,
-                        queue_target_isolate_id.take(),
-                        target_generation,
-                        true,
-                        reply,
-                        PendingReplyKind::DynamicFetch {
-                            handle: handle.clone(),
+                        EnqueueInvokeRequest {
+                            worker_name: child_worker_name,
+                            runtime_request_id,
+                            request,
+                            request_body: None,
+                            memory_route: None,
+                            memory_call: None,
+                            host_rpc_call: None,
+                            target_isolate_id: queue_target_isolate_id.take(),
+                            target_generation,
+                            internal_origin: true,
+                            reply,
+                            reply_kind: PendingReplyKind::DynamicFetch {
+                                handle: handle.clone(),
+                            },
                         },
                         event_tx,
                     );
@@ -636,19 +641,21 @@ impl WorkerManager {
             self.dynamic_profile
                 .record_direct_fetch_fast_path_fallback();
             self.enqueue_invoke(
-                child_worker_name,
-                runtime_request_id,
-                request,
-                None,
-                None,
-                None,
-                None,
-                queue_target_isolate_id.take(),
-                target_generation,
-                true,
-                inner_reply_tx,
-                PendingReplyKind::DynamicFetch {
-                    handle: handle.clone(),
+                EnqueueInvokeRequest {
+                    worker_name: child_worker_name,
+                    runtime_request_id,
+                    request,
+                    request_body: None,
+                    memory_route: None,
+                    memory_call: None,
+                    host_rpc_call: None,
+                    target_isolate_id: queue_target_isolate_id.take(),
+                    target_generation,
+                    internal_origin: true,
+                    reply: inner_reply_tx,
+                    reply_kind: PendingReplyKind::DynamicFetch {
+                        handle: handle.clone(),
+                    },
                 },
                 event_tx,
             );
@@ -657,7 +664,6 @@ impl WorkerManager {
             .record_direct_fetch_dispatch(dispatch_started.elapsed());
 
         let event_tx = event_tx.clone();
-        let command_tx = command_tx.clone();
         let profile = self.dynamic_profile.clone();
         let handle_for_task = handle.clone();
         let policy = dispatch_target.policy;
@@ -912,15 +918,17 @@ impl WorkerManager {
         let reply_id_for_error = reply_id.clone();
         let pending_replies_for_error = pending_replies.clone();
         if let Err(error) = self.start_targeted_host_rpc_invoke(
-            provider_target.owner_worker,
-            owner_pool_generation,
-            provider_isolate_id,
-            provider_target.target_id,
-            method_name,
-            args,
-            TargetedHostRpcReply::Dynamic {
-                reply_id,
-                pending_replies,
+            TargetedHostRpcInvoke {
+                worker_name: provider_target.owner_worker,
+                generation: owner_pool_generation,
+                isolate_id: provider_isolate_id,
+                target_id: provider_target.target_id,
+                method_name,
+                args,
+                reply: TargetedHostRpcReply::Dynamic {
+                    reply_id,
+                    pending_replies,
+                },
             },
             event_tx,
         ) {

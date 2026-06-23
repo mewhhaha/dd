@@ -9,7 +9,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    for arg in args {
+    if let Some(arg) = args.into_iter().next() {
         let arg = arg.as_ref();
         match arg {
             "-h" | "--help" => return Ok(BenchArgAction::Help),
@@ -19,7 +19,7 @@ where
                 ));
             }
         }
-    }
+    };
     Ok(BenchArgAction::Run)
 }
 

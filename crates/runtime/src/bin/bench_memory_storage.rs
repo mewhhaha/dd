@@ -1,10 +1,9 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
-    RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, WorkerDebugDump,
+    stable_memory_shard_index, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
+    RuntimeStorageConfig, WorkerDebugDump,
 };
 use serde::Deserialize;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -381,17 +380,17 @@ async fn main() -> Result<(), String> {
         if !should_run_case(mode.as_deref(), bench_case.mode) {
             continue;
         }
-        run_and_print(
-            &service,
-            bench_case.label,
-            bench_case.source,
-            bench_case.seed,
-            bench_case.path,
-            bench_case.key_space.resolve(&options),
-            bench_case.verify_path,
-            bench_case.profile.resolve(profile_enabled),
-            &options,
-        )
+        run_and_print(BenchRun {
+            service: &service,
+            label: bench_case.label,
+            source: bench_case.source,
+            seed: bench_case.seed,
+            path: bench_case.path,
+            key_space: bench_case.key_space.resolve(&options),
+            verify_path: bench_case.verify_path,
+            profile_enabled: bench_case.profile.resolve(profile_enabled),
+            options: &options,
+        })
         .await?;
     }
 

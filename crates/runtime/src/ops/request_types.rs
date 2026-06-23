@@ -548,17 +548,18 @@ mod tests {
 }
 
 impl RequestExecutionContext {
-    pub(crate) fn new(
-        worker_name: String,
-        generation: u64,
-        dynamic_bindings: Vec<String>,
-        dynamic_rpc_bindings: Vec<String>,
-        replacements: Vec<(String, String)>,
-        egress_allow_hosts: Vec<String>,
-        allow_cache: bool,
-        max_outbound_requests: Option<u64>,
-        dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
-    ) -> Self {
+    pub(crate) fn new(init: RequestExecutionContextInit) -> Self {
+        let RequestExecutionContextInit {
+            worker_name,
+            generation,
+            dynamic_bindings,
+            dynamic_rpc_bindings,
+            replacements,
+            egress_allow_hosts,
+            allow_cache,
+            max_outbound_requests,
+            dynamic_quota_state,
+        } = init;
         let dynamic_bindings = dynamic_bindings
             .into_iter()
             .map(|binding| binding.trim().to_string())
@@ -596,6 +597,18 @@ impl RequestExecutionContext {
             dynamic_quota_state,
         }
     }
+}
+
+pub(crate) struct RequestExecutionContextInit {
+    pub(crate) worker_name: String,
+    pub(crate) generation: u64,
+    pub(crate) dynamic_bindings: Vec<String>,
+    pub(crate) dynamic_rpc_bindings: Vec<String>,
+    pub(crate) replacements: Vec<(String, String)>,
+    pub(crate) egress_allow_hosts: Vec<String>,
+    pub(crate) allow_cache: bool,
+    pub(crate) max_outbound_requests: Option<u64>,
+    pub(crate) dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
 }
 
 pub(crate) struct RequestSecretContext {

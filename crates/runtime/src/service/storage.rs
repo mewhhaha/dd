@@ -1,15 +1,27 @@
 use super::*;
 
-pub(super) async fn persist_worker_deployment(
-    storage: &RuntimeStorageConfig,
-    worker_name: &str,
-    source: &str,
-    config: &DeployConfig,
-    assets: &[DeployAsset],
-    asset_headers: Option<&str>,
-    deployment_id: &str,
-    expires_at_ms: Option<i64>,
-) -> Result<()> {
+pub(super) struct PersistWorkerDeployment<'a> {
+    pub(super) storage: &'a RuntimeStorageConfig,
+    pub(super) worker_name: &'a str,
+    pub(super) source: &'a str,
+    pub(super) config: &'a DeployConfig,
+    pub(super) assets: &'a [DeployAsset],
+    pub(super) asset_headers: Option<&'a str>,
+    pub(super) deployment_id: &'a str,
+    pub(super) expires_at_ms: Option<i64>,
+}
+
+pub(super) async fn persist_worker_deployment(request: PersistWorkerDeployment<'_>) -> Result<()> {
+    let PersistWorkerDeployment {
+        storage,
+        worker_name,
+        source,
+        config,
+        assets,
+        asset_headers,
+        deployment_id,
+        expires_at_ms,
+    } = request;
     if !storage.worker_store_enabled {
         return Ok(());
     }

@@ -3,13 +3,13 @@ pub(super) enum IsolateCommand {
     Execute {
         runtime_request_id: String,
         completion_token: String,
-        request_context: RequestExecutionContext,
-        request: WorkerInvocation,
+        request_context: Box<RequestExecutionContext>,
+        request: Box<WorkerInvocation>,
         request_body: Option<InvokeRequestBodyReceiver>,
         stream_response: bool,
-        memory_call: Option<MemoryExecutionCall>,
+        memory_call: Box<Option<MemoryExecutionCall>>,
         host_rpc_call: Option<HostRpcExecutionCall>,
-        memory_route: Option<MemoryRoute>,
+        memory_route: Box<Option<MemoryRoute>>,
     },
     Abort {
         runtime_request_id: String,

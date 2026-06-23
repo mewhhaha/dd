@@ -71,16 +71,12 @@ where
     B::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let max_body_bytes = state.invoke_max_body_bytes;
-    if request_content_length(&parts.headers).is_some_and(|value| value > max_body_bytes as u64) {
-        return Err(PlatformError::bad_request(format!(
-            "request body too large (max {max_body_bytes} bytes)"
-        ))
-        .into());
-    }
-    let request_body_stream = if request_method_allows_body(&parts.method) {
-        Some(build_request_body_stream(body, max_body_bytes))
-    } else {
+    validate_request_body_headers(&parts.method, &parts.headers, max_body_bytes)?;
+    let request_body_stream = if request_method_forbids_body(&parts.method) {
+        drain_forbidden_request_body(&parts.method, body, max_body_bytes).await?;
         None
+    } else {
+        Some(build_request_body_stream(body, max_body_bytes))
     };
     invoke_worker_from_body_stream(
         state,
@@ -145,7 +141,7 @@ async fn invoke_worker_from_body_stream(
     };
     tracing::info!(request_id = %request_id, "invoke request accepted");
 
-    if !is_cacheable_request(&invocation) {
+    if !is_cacheable_request(&invocation, request_body_stream.is_some()) {
         let output = state
             .runtime
             .invoke_stream_with_request_body(worker_name, invocation, request_body_stream)
@@ -492,15 +488,34 @@ where
     rx
 }
 
-fn request_content_length(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-}
-
-fn request_method_allows_body(method: &Method) -> bool {
-    *method != Method::GET && *method != Method::HEAD
+async fn drain_forbidden_request_body<B>(
+    method: &Method,
+    body: B,
+    max_bytes: usize,
+) -> ApiResult<()>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut stream = body.into_data_stream();
+    let mut total = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            PlatformError::bad_request(format!("failed to read request body: {error}"))
+        })?;
+        if chunk.is_empty() {
+            continue;
+        }
+        total = total.saturating_add(chunk.len());
+        if total > max_bytes {
+            return Err(PlatformError::bad_request(format!(
+                "request body too large (max {max_bytes} bytes)"
+            ))
+            .into());
+        }
+        return Err(request_body_not_supported(method).into());
+    }
+    Ok(())
 }
 
 fn build_worker_stream_response(
@@ -532,8 +547,8 @@ fn build_worker_stream_response(
     Ok(response)
 }
 
-fn is_cacheable_request(invocation: &WorkerInvocation) -> bool {
-    if !invocation.method.eq_ignore_ascii_case("GET") {
+fn is_cacheable_request(invocation: &WorkerInvocation, has_body_stream: bool) -> bool {
+    if has_body_stream || !invocation.method.eq_ignore_ascii_case("GET") {
         return false;
     }
     !invocation.headers.iter().any(|(name, value)| {

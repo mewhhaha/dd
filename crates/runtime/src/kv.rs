@@ -758,7 +758,7 @@ impl KvWriterInner {
                         .as_mut()
                         .expect("kv writer connection should be initialized"),
                     &profile,
-                    &batch,
+                    batch,
                 )
                 .await
             });
@@ -1470,11 +1470,13 @@ mod tests {
         let committed_newer = scheduled_mutation("newer", "committed-newer", 4);
         let untouched = scheduled_mutation("other", "other", 2);
 
-        let mut state = KvWriteActorState::default();
-        state.pending_bytes = older
-            .size_bytes
-            .saturating_add(newer.size_bytes)
-            .saturating_add(untouched.size_bytes);
+        let mut state = KvWriteActorState {
+            pending_bytes: older
+                .size_bytes
+                .saturating_add(newer.size_bytes)
+                .saturating_add(untouched.size_bytes),
+            ..KvWriteActorState::default()
+        };
         state.pending.insert(older.key.clone(), older.clone());
         state.pending.insert(newer.key.clone(), newer.clone());
         state

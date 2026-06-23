@@ -1,16 +1,29 @@
 use super::*;
 
-pub(crate) async fn run_and_print(
-    service: &RuntimeService,
-    label: &str,
-    source: &str,
-    seed: bool,
-    path: &'static str,
-    key_space: usize,
-    verify_path: Option<&'static str>,
-    profile_enabled: bool,
-    options: &BenchOptions,
-) -> Result<(), String> {
+pub(crate) struct BenchRun<'a> {
+    pub(crate) service: &'a RuntimeService,
+    pub(crate) label: &'a str,
+    pub(crate) source: &'a str,
+    pub(crate) seed: bool,
+    pub(crate) path: &'static str,
+    pub(crate) key_space: usize,
+    pub(crate) verify_path: Option<&'static str>,
+    pub(crate) profile_enabled: bool,
+    pub(crate) options: &'a BenchOptions,
+}
+
+pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
+    let BenchRun {
+        service,
+        label,
+        source,
+        seed,
+        path,
+        key_space,
+        verify_path,
+        profile_enabled,
+        options,
+    } = run;
     let requests = env_usize("DD_BENCH_REQUESTS", 1_000);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 1);
     let worker_name = format!("{label}-{}", Uuid::new_v4());
@@ -574,12 +587,7 @@ pub(crate) fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvo
 }
 
 fn memory_shard(memory_key: &str, namespace_shards: usize) -> usize {
-    if namespace_shards <= 1 {
-        return 0;
-    }
-    let mut hasher = DefaultHasher::new();
-    memory_key.hash(&mut hasher);
-    (hasher.finish() as usize) % namespace_shards
+    stable_memory_shard_index(memory_key, namespace_shards)
 }
 
 fn memory_key(

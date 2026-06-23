@@ -1434,7 +1434,7 @@ async fn open_websocket_sessions(
     worker_name: &str,
     sessions: usize,
 ) -> common::Result<(Distribution, Vec<String>)> {
-    let concurrency = sessions.min(16).max(1);
+    let concurrency = sessions.clamp(1, 16);
     let next = Arc::new(AtomicUsize::new(0));
     let latencies = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(sessions)));
     let session_ids = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(sessions)));

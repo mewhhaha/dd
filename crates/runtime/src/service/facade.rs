@@ -3,6 +3,18 @@ use tracing::{info, warn};
 
 const RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY: usize = 4096;
 
+struct DeployWithConfigRequest {
+    worker_name: String,
+    source: String,
+    config: DeployConfig,
+    assets: Vec<DeployAsset>,
+    asset_headers: Option<String>,
+    persist: bool,
+    temporary: bool,
+    expires_at_ms: Option<i64>,
+    enforce_temporary_transition: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub min_isolates: usize,
@@ -365,18 +377,18 @@ impl RuntimeService {
         let (sender, receiver) = mpsc::channel(256);
         let (cancel_sender, cancel_receiver) = mpsc::channel(RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY);
         let asset_catalog = AssetCatalog::default();
-        spawn_runtime_thread(
+        spawn_runtime_thread(RuntimeThreadStart {
             receiver,
             cancel_receiver,
-            cancel_sender.clone(),
-            asset_catalog.clone(),
+            runtime_fast_sender: cancel_sender.clone(),
+            asset_catalog: asset_catalog.clone(),
             bootstrap_snapshot,
             kv_store,
             memory_store,
-            cache_store.clone(),
-            runtime,
-            storage.clone(),
-        )?;
+            cache_store: cache_store.clone(),
+            config: runtime,
+            storage: storage.clone(),
+        })?;
         let service = Self {
             sender,
             cancel_sender,
@@ -474,17 +486,17 @@ impl RuntimeService {
             }
 
             match self
-                .deploy_with_config_internal(
-                    stored.name.clone(),
-                    stored.source,
-                    stored.config,
-                    stored.assets,
-                    stored.asset_headers,
-                    false,
-                    stored.expires_at_ms.is_some(),
-                    stored.expires_at_ms,
-                    false,
-                )
+                .deploy_with_config_internal(DeployWithConfigRequest {
+                    worker_name: stored.name.clone(),
+                    source: stored.source,
+                    config: stored.config,
+                    assets: stored.assets,
+                    asset_headers: stored.asset_headers,
+                    persist: false,
+                    temporary: stored.expires_at_ms.is_some(),
+                    expires_at_ms: stored.expires_at_ms,
+                    enforce_temporary_transition: false,
+                })
                 .await
             {
                 Ok(deployment_id) => {
@@ -580,32 +592,35 @@ impl RuntimeService {
         asset_headers: Option<String>,
         temporary: bool,
     ) -> Result<String> {
-        self.deploy_with_config_internal(
+        self.deploy_with_config_internal(DeployWithConfigRequest {
             worker_name,
             source,
             config,
             assets,
             asset_headers,
-            true,
+            persist: true,
             temporary,
-            None,
-            true,
-        )
+            expires_at_ms: None,
+            enforce_temporary_transition: true,
+        })
         .await
     }
 
     async fn deploy_with_config_internal(
         &self,
-        worker_name: String,
-        source: String,
-        config: DeployConfig,
-        assets: Vec<DeployAsset>,
-        asset_headers: Option<String>,
-        persist: bool,
-        temporary: bool,
-        expires_at_ms: Option<i64>,
-        enforce_temporary_transition: bool,
+        request: DeployWithConfigRequest,
     ) -> Result<String> {
+        let DeployWithConfigRequest {
+            worker_name,
+            source,
+            config,
+            assets,
+            asset_headers,
+            persist,
+            temporary,
+            expires_at_ms,
+            enforce_temporary_transition,
+        } = request;
         let prepared =
             prepare_worker_deployment(worker_name, source, config, assets, asset_headers)?;
         let (reply_tx, reply_rx) = oneshot::channel();

@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -205,12 +206,25 @@ impl DeployTokenStore {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|error| PlatformError::internal(format!("token encode failed: {error}")))?;
         let temp_path = temp_store_path(&self.path);
-        tokio::fs::write(&temp_path, bytes).await.map_err(|error| {
+        let mut temp_file = tokio::fs::File::create(&temp_path).await.map_err(|error| {
+            PlatformError::internal(format!(
+                "failed to create token store {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        temp_file.write_all(&bytes).await.map_err(|error| {
             PlatformError::internal(format!(
                 "failed to write token store {}: {error}",
                 temp_path.display()
             ))
         })?;
+        temp_file.sync_all().await.map_err(|error| {
+            PlatformError::internal(format!(
+                "failed to sync token store {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        drop(temp_file);
         tokio::fs::rename(&temp_path, &self.path)
             .await
             .map_err(|error| {
@@ -219,6 +233,7 @@ impl DeployTokenStore {
                     self.path.display()
                 ))
             })?;
+        sync_parent_directory(&self.path).await?;
         Ok(())
     }
 }
@@ -482,6 +497,30 @@ fn temp_store_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("tokens.json");
     path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()))
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = tokio::fs::File::open(parent).await.map_err(|error| {
+        PlatformError::internal(format!(
+            "failed to open token store dir {}: {error}",
+            parent.display()
+        ))
+    })?;
+    directory.sync_all().await.map_err(|error| {
+        PlatformError::internal(format!(
+            "failed to sync token store dir {}: {error}",
+            parent.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

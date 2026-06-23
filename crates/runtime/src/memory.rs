@@ -2,7 +2,6 @@ use common::{PlatformError, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,6 +10,8 @@ use tokio::sync::Mutex;
 use turso::{Builder, Connection, Database, Value};
 
 use crate::turso_util::{configure_turso_connection, is_retryable_turso_error, VersionFloor};
+
+const MEMORY_SHARD_HASH_DOMAIN: &[u8] = b"dd-memory-shard-v1\0";
 
 struct MemoryDatabaseEntry {
     database: Arc<Database>,
@@ -1387,12 +1388,7 @@ impl MemoryStore {
     }
 
     fn shard_index(&self, memory_key: &str) -> usize {
-        if self.namespace_shards == 1 {
-            return 0;
-        }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        memory_key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.namespace_shards
+        stable_memory_shard_index(memory_key, self.namespace_shards)
     }
 
     fn observe_version(&self, version: i64) {
@@ -2285,7 +2281,7 @@ fn snapshot_entries_from_records(
 }
 
 fn hex_decode_to_utf8(input: &str) -> Option<String> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(input.len() / 2);
@@ -2298,6 +2294,20 @@ fn hex_decode_to_utf8(input: &str) -> Option<String> {
         index += 2;
     }
     String::from_utf8(bytes).ok()
+}
+
+/// Stable storage-format hash for persisted memory shard routing.
+pub fn stable_memory_shard_index(memory_key: &str, namespace_shards: usize) -> usize {
+    if namespace_shards <= 1 {
+        return 0;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(MEMORY_SHARD_HASH_DOMAIN);
+    hasher.update(memory_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut shard_bytes = [0u8; 8];
+    shard_bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(shard_bytes) as usize) % namespace_shards
 }
 
 const ENCODING_UTF8: &str = "utf8";
@@ -2346,6 +2356,17 @@ mod tests {
         assert_eq!(ns_a, ns_a_again);
         assert_ne!(ns_a, ns_b);
         Ok(())
+    }
+
+    #[test]
+    fn memory_shard_index_is_pinned_to_stable_sha256_routing() {
+        assert_eq!(stable_memory_shard_index("", 1), 0);
+        assert_eq!(stable_memory_shard_index("memory-a", 4), 2);
+        assert_eq!(stable_memory_shard_index("memory-b", 4), 3);
+        assert_eq!(stable_memory_shard_index("room/42", 16), 0);
+        assert_eq!(stable_memory_shard_index("alpha", 16), 6);
+        assert_eq!(stable_memory_shard_index("memory-a", 4096), 3386);
+        assert_eq!(stable_memory_shard_index("memory-b", 4096), 2551);
     }
 
     #[tokio::test]

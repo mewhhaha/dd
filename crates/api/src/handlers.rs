@@ -19,7 +19,8 @@ use futures_util::StreamExt;
 #[cfg(feature = "websocket")]
 use futures_util::{stream::SplitSink, SinkExt};
 use http::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, HOST, WWW_AUTHENTICATE,
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+    WWW_AUTHENTICATE,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body::Body as HttpBody;
@@ -76,6 +77,66 @@ const HEADER_WS_BINARY: &str = "x-dd-ws-binary";
 const HEADER_WS_CLOSE_CODE: &str = "x-dd-ws-close-code";
 #[cfg(feature = "websocket")]
 const HEADER_WS_CLOSE_REASON: &str = "x-dd-ws-close-reason";
+
+pub(crate) fn request_method_forbids_body(method: &Method) -> bool {
+    *method == Method::GET || *method == Method::HEAD
+}
+
+pub(crate) fn request_content_length(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<u64>, PlatformError> {
+    headers
+        .get(CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|error| {
+                    PlatformError::bad_request(format!("invalid content-length header: {error}"))
+                })
+                .and_then(|value| {
+                    value.trim().parse::<u64>().map_err(|error| {
+                        PlatformError::bad_request(format!(
+                            "invalid content-length header: {error}"
+                        ))
+                    })
+                })
+        })
+        .transpose()
+}
+
+pub(crate) fn request_headers_declare_body(
+    headers: &HeaderMap,
+) -> std::result::Result<bool, PlatformError> {
+    if request_content_length(headers)?.is_some_and(|value| value > 0) {
+        return Ok(true);
+    }
+    Ok(headers
+        .get(TRANSFER_ENCODING)
+        .is_some_and(|value| !value.as_bytes().is_empty()))
+}
+
+pub(crate) fn validate_request_body_headers(
+    method: &Method,
+    headers: &HeaderMap,
+    max_body_bytes: usize,
+) -> std::result::Result<(), PlatformError> {
+    if request_content_length(headers)?.is_some_and(|value| value > max_body_bytes as u64) {
+        return Err(PlatformError::bad_request(format!(
+            "request body too large (max {max_body_bytes} bytes)"
+        )));
+    }
+    if request_method_forbids_body(method) && request_headers_declare_body(headers)? {
+        return Err(request_body_not_supported(method));
+    }
+    Ok(())
+}
+
+pub(crate) fn request_body_not_supported(method: &Method) -> PlatformError {
+    PlatformError::bad_request(format!(
+        "{} request bodies are not supported",
+        method.as_str()
+    ))
+}
 
 #[cfg(all(test, not(feature = "websocket")))]
 use self::invocation::build_public_request_url;

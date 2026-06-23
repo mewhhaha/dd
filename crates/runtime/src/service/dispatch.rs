@@ -98,20 +98,23 @@ impl WorkerManager {
 
     pub(crate) fn enqueue_invoke(
         &mut self,
-        worker_name: String,
-        runtime_request_id: String,
-        request: WorkerInvocation,
-        request_body: Option<InvokeRequestBodyReceiver>,
-        memory_route: Option<MemoryRoute>,
-        memory_call: Option<MemoryExecutionCall>,
-        host_rpc_call: Option<HostRpcExecutionCall>,
-        target_isolate_id: Option<u64>,
-        target_generation: Option<u64>,
-        internal_origin: bool,
-        reply: oneshot::Sender<Result<WorkerOutput>>,
-        reply_kind: PendingReplyKind,
+        invoke: EnqueueInvokeRequest,
         event_tx: &RuntimeEventSender,
     ) {
+        let EnqueueInvokeRequest {
+            worker_name,
+            runtime_request_id,
+            request,
+            request_body,
+            memory_route,
+            memory_call,
+            host_rpc_call,
+            target_isolate_id,
+            target_generation,
+            internal_origin,
+            reply,
+            reply_kind,
+        } = invoke;
         let worker_name = worker_name.trim().to_string();
         if take_pre_canceled_request(
             &mut self.pre_canceled,
@@ -345,10 +348,10 @@ impl WorkerManager {
                     let expired_request_ids = isolate
                         .pending_replies
                         .iter()
-                        .filter_map(|(request_id, pending)| {
-                            (now.duration_since(pending.dispatched_at) >= request_wall_timeout)
-                                .then(|| request_id.clone())
+                        .filter(|(_, pending)| {
+                            now.duration_since(pending.dispatched_at) >= request_wall_timeout
                         })
+                        .map(|(request_id, _)| request_id.clone())
                         .collect::<Vec<_>>();
                     if expired_request_ids.is_empty() {
                         continue;
@@ -466,14 +469,17 @@ impl WorkerManager {
 
     pub(crate) fn try_dispatch_direct_dynamic_fetch(
         &mut self,
-        worker_name: &str,
-        generation: u64,
-        target_isolate_id: u64,
-        runtime_request_id: String,
-        request: WorkerInvocation,
-        reply: oneshot::Sender<Result<WorkerOutput>>,
-        handle: String,
+        dispatch: DirectDynamicFetchRequest,
     ) -> DirectDynamicFetchDispatch {
+        let DirectDynamicFetchRequest {
+            worker_name,
+            generation,
+            target_isolate_id,
+            runtime_request_id,
+            request,
+            reply,
+            handle,
+        } = dispatch;
         if request.body.len() > self.config.max_request_body_bytes {
             let _ = reply.send(Err(PlatformError::bad_request(format!(
                 "request body exceeded max_request_body_bytes ({} bytes)",
@@ -483,7 +489,7 @@ impl WorkerManager {
         }
         let config_max_inflight = self.config.max_inflight_per_isolate;
         let dispatch_result = {
-            let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            let Some(pool) = self.get_pool_mut(&worker_name, generation) else {
                 return DirectDynamicFetchDispatch::Fallback {
                     reply,
                     clear_preferred: true,
@@ -522,16 +528,16 @@ impl WorkerManager {
                 traceparent: None,
                 user_request_id: request.request_id.clone(),
             });
-            let command = pool.build_execute_command(
-                runtime_request_id.clone(),
-                completion_token.clone(),
+            let command = pool.build_execute_command(BuildExecuteCommand {
+                runtime_request_id: runtime_request_id.clone(),
+                completion_token: completion_token.clone(),
                 request,
-                None,
-                false,
-                None,
-                None,
-                None,
-            );
+                request_body: None,
+                stream_response: false,
+                memory_call: None,
+                host_rpc_call: None,
+                memory_route: None,
+            });
 
             let isolate = &mut pool.isolates[isolate_idx];
             isolate.served_requests += 1;
@@ -568,7 +574,7 @@ impl WorkerManager {
             (isolate_idx, restored_reply)
         };
         let (isolate_idx, restored_reply) = dispatch_result;
-        let failed = self.remove_isolate(worker_name, generation, isolate_idx);
+        let failed = self.remove_isolate(&worker_name, generation, isolate_idx);
         for (request_id, reply) in failed.replies {
             if request_id != runtime_request_id {
                 let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
@@ -652,18 +658,20 @@ impl WorkerManager {
         }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.enqueue_invoke(
-            decoded.worker_name,
-            runtime_request_id,
-            request,
-            None,
-            Some(route),
-            Some(memory_call),
-            None,
-            target_isolate_id,
-            target_generation,
-            false,
-            reply_tx,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name: decoded.worker_name,
+                runtime_request_id,
+                request,
+                request_body: None,
+                memory_route: Some(route),
+                memory_call: Some(memory_call),
+                host_rpc_call: None,
+                target_isolate_id,
+                target_generation,
+                internal_origin: false,
+                reply: reply_tx,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         tokio::spawn(async move {
@@ -995,16 +1003,16 @@ impl WorkerManager {
                     (Some(route), Some(epoch)) => Some(route.with_owner_epoch(epoch)),
                     (route, _) => route,
                 };
-                let command = pool.build_execute_command(
-                    runtime_request_id.clone(),
-                    completion_token.clone(),
-                    pending_invoke.request,
-                    pending_invoke.request_body,
+                let command = pool.build_execute_command(BuildExecuteCommand {
+                    runtime_request_id: runtime_request_id.clone(),
+                    completion_token: completion_token.clone(),
+                    request: pending_invoke.request,
+                    request_body: pending_invoke.request_body,
                     stream_response,
-                    pending_invoke.memory_call,
-                    pending_invoke.host_rpc_call,
+                    memory_call: pending_invoke.memory_call,
+                    host_rpc_call: pending_invoke.host_rpc_call,
                     memory_route,
-                );
+                });
                 let isolate = &mut pool.isolates[isolate_idx];
                 isolate.served_requests += 1;
                 isolate.inflight_count += 1;
@@ -1088,7 +1096,7 @@ impl WorkerManager {
             max_request_body_bytes: self.config.max_request_body_bytes,
             max_isolate_heap_bytes: self.config.max_isolate_heap_bytes,
         };
-        let isolate = spawn_isolate_thread(
+        let isolate = spawn_isolate_thread(IsolateThreadStart {
             snapshot,
             snapshot_preloaded,
             source,
@@ -1100,12 +1108,12 @@ impl WorkerManager {
             open_handle_registry,
             dynamic_profile,
             execution_limits,
-            self.runtime_fast_sender.clone(),
-            worker_name.to_string(),
+            runtime_fast_sender: self.runtime_fast_sender.clone(),
+            worker_name: worker_name.to_string(),
             generation,
             isolate_id,
-            event_tx,
-        )?;
+            event_tx: event_tx.clone(),
+        })?;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             pool.stats.spawn_count += 1;
             pool.push_isolate(isolate);
@@ -1118,15 +1126,21 @@ impl WorkerManager {
 
     pub(crate) async fn finish_request(
         &mut self,
-        worker_name: &str,
-        generation: u64,
-        isolate_id: u64,
-        request_id: &str,
-        completion_token: &str,
-        wait_until_count: usize,
-        mut result: Result<WorkerOutput>,
+        finish: FinishRequest,
         event_tx: &RuntimeEventSender,
     ) {
+        let FinishRequest {
+            worker_name,
+            generation,
+            isolate_id,
+            request_id,
+            completion_token,
+            wait_until_count,
+            mut result,
+        } = finish;
+        let worker_name = worker_name.as_str();
+        let request_id = request_id.as_str();
+        let completion_token = completion_token.as_str();
         let mut reply = None;
         let mut canceled = false;
         let mut clear_revalidation = false;
@@ -1346,17 +1360,19 @@ impl WorkerManager {
         }
         if let (Some(trace_destination), Some(trace_result)) = (trace_destination, trace_result) {
             self.enqueue_trace_forward(
-                worker_name,
-                generation,
-                &request_method,
-                &request_url,
-                request_id,
-                &user_request_id,
-                trace_result,
-                execution_ms.unwrap_or_default(),
-                wait_until_count,
-                internal_origin,
-                Some(trace_destination),
+                TraceForwardRequest {
+                    worker_name: worker_name.to_string(),
+                    generation,
+                    request_method,
+                    request_url,
+                    runtime_request_id: request_id.to_string(),
+                    user_request_id,
+                    result: trace_result,
+                    execution_ms: execution_ms.unwrap_or_default(),
+                    wait_until_count,
+                    internal_origin,
+                    trace_destination: Some(trace_destination),
+                },
                 event_tx,
             );
         }
@@ -1373,19 +1389,27 @@ impl WorkerManager {
 
     pub(crate) fn enqueue_trace_forward(
         &mut self,
-        worker_name: &str,
-        generation: u64,
-        request_method: &str,
-        request_url: &str,
-        runtime_request_id: &str,
-        user_request_id: &str,
-        result: TraceResultMeta,
-        execution_ms: u64,
-        wait_until_count: usize,
-        internal_origin: bool,
-        trace_destination: Option<InternalTraceDestination>,
+        forward: TraceForwardRequest,
         event_tx: &RuntimeEventSender,
     ) {
+        let TraceForwardRequest {
+            worker_name,
+            generation,
+            request_method,
+            request_url,
+            runtime_request_id,
+            user_request_id,
+            result,
+            execution_ms,
+            wait_until_count,
+            internal_origin,
+            trace_destination,
+        } = forward;
+        let worker_name = worker_name.as_str();
+        let request_method = request_method.as_str();
+        let request_url = request_url.as_str();
+        let runtime_request_id = runtime_request_id.as_str();
+        let user_request_id = user_request_id.as_str();
         let Some(trace_destination) = trace_destination else {
             return;
         };
@@ -1453,18 +1477,20 @@ impl WorkerManager {
         };
         let (reply, reply_rx) = oneshot::channel();
         self.enqueue_invoke(
-            trace_destination.worker,
-            Uuid::new_v4().to_string(),
-            trace_request,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            true,
-            reply,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name: trace_destination.worker,
+                runtime_request_id: Uuid::new_v4().to_string(),
+                request: trace_request,
+                request_body: None,
+                memory_route: None,
+                memory_call: None,
+                host_rpc_call: None,
+                target_isolate_id: None,
+                target_generation: None,
+                internal_origin: true,
+                reply,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         let request_id_for_warning = runtime_request_id.to_string();

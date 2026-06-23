@@ -171,15 +171,15 @@ impl WorkerManager {
                 return;
             }
         };
-        if let Err(error) = self.register_websocket_session(
-            worker_name,
+        if let Err(error) = self.register_websocket_session(WebSocketSessionRegistration {
+            worker_name: worker_name.to_string(),
             generation,
             isolate_id,
-            &session_id,
-            &binding,
-            &key,
-            &handle,
-        ) {
+            session_id: session_id.clone(),
+            binding,
+            key,
+            handle,
+        }) {
             let _ = waiter.send(Err(error));
             return;
         }
@@ -194,39 +194,44 @@ impl WorkerManager {
 
     pub(super) fn register_websocket_session(
         &mut self,
-        worker_name: &str,
-        generation: u64,
-        isolate_id: u64,
-        session_id: &str,
-        binding: &str,
-        key: &str,
-        handle: &str,
+        registration: WebSocketSessionRegistration,
     ) -> Result<()> {
-        if self.websocket_sessions.contains_key(session_id) {
-            let _ = self.unregister_websocket_session(session_id);
+        let WebSocketSessionRegistration {
+            worker_name,
+            generation,
+            isolate_id,
+            session_id,
+            binding,
+            key,
+            handle,
+        } = registration;
+        if self.websocket_sessions.contains_key(&session_id) {
+            let _ = self.unregister_websocket_session(&session_id);
         }
-        self.increment_websocket_session_count(worker_name, generation, isolate_id)?;
+        self.increment_websocket_session_count(&worker_name, generation, isolate_id)?;
 
+        let owner_key = memory_owner_key(&binding, &key);
+        let handle_key = memory_handle_key(&binding, &key, &handle);
         let session = WorkerWebSocketSession {
-            worker_name: worker_name.to_string(),
+            worker_name,
             generation,
             owner_isolate_id: isolate_id,
-            binding: binding.to_string(),
-            key: key.to_string(),
-            handle: handle.to_string(),
+            binding,
+            key,
+            handle,
         };
-        self.websocket_handle_index.insert(
-            memory_handle_key(&session.binding, &session.key, &session.handle),
-            session_id.to_string(),
-        );
-        self.websocket_sessions
-            .insert(session_id.to_string(), session);
+        self.websocket_handle_index
+            .insert(handle_key, session_id.clone());
         self.websocket_open_handles
-            .entry(memory_owner_key(binding, key))
+            .entry(owner_key)
             .or_default()
-            .insert(handle.to_string());
-        self.open_handle_registry
-            .add_socket_handle(binding, key, handle);
+            .insert(session.handle.clone());
+        self.open_handle_registry.add_socket_handle(
+            &session.binding,
+            &session.key,
+            &session.handle,
+        );
+        self.websocket_sessions.insert(session_id, session);
         Ok(())
     }
 
@@ -284,43 +289,48 @@ impl WorkerManager {
 
     pub(super) fn register_transport_session(
         &mut self,
-        worker_name: &str,
-        generation: u64,
-        isolate_id: u64,
-        session_id: &str,
-        binding: &str,
-        key: &str,
-        handle: &str,
-        stream_sender: mpsc::Sender<Vec<u8>>,
-        datagram_sender: mpsc::Sender<Vec<u8>>,
+        registration: TransportSessionRegistration,
     ) -> Result<()> {
-        if self.transport_sessions.contains_key(session_id) {
-            let _ = self.unregister_transport_session(session_id);
+        let TransportSessionRegistration {
+            worker_name,
+            generation,
+            isolate_id,
+            session_id,
+            binding,
+            key,
+            handle,
+            stream_sender,
+            datagram_sender,
+        } = registration;
+        if self.transport_sessions.contains_key(&session_id) {
+            let _ = self.unregister_transport_session(&session_id);
         }
-        self.increment_transport_session_count(worker_name, generation, isolate_id)?;
+        self.increment_transport_session_count(&worker_name, generation, isolate_id)?;
 
+        let owner_key = memory_owner_key(&binding, &key);
+        let handle_key = memory_handle_key(&binding, &key, &handle);
         let session = WorkerTransportSession {
-            worker_name: worker_name.to_string(),
+            worker_name,
             generation,
             owner_isolate_id: isolate_id,
-            binding: binding.to_string(),
-            key: key.to_string(),
-            handle: handle.to_string(),
+            binding,
+            key,
+            handle,
             stream_sender,
             datagram_sender,
         };
-        self.transport_handle_index.insert(
-            memory_handle_key(&session.binding, &session.key, &session.handle),
-            session_id.to_string(),
-        );
-        self.transport_sessions
-            .insert(session_id.to_string(), session);
+        self.transport_handle_index
+            .insert(handle_key, session_id.clone());
         self.transport_open_handles
-            .entry(memory_owner_key(binding, key))
+            .entry(owner_key)
             .or_default()
-            .insert(handle.to_string());
-        self.open_handle_registry
-            .add_transport_handle(binding, key, handle);
+            .insert(session.handle.clone());
+        self.open_handle_registry.add_transport_handle(
+            &session.binding,
+            &session.key,
+            &session.handle,
+        );
+        self.transport_sessions.insert(session_id, session);
         Ok(())
     }
 
@@ -448,17 +458,17 @@ impl WorkerManager {
             )));
             return;
         };
-        if let Err(error) = self.register_transport_session(
-            worker_name,
+        if let Err(error) = self.register_transport_session(TransportSessionRegistration {
+            worker_name: worker_name.to_string(),
             generation,
             isolate_id,
-            &session_id,
-            &binding,
-            &key,
-            &handle,
-            channels.stream_sender,
-            channels.datagram_sender,
-        ) {
+            session_id: session_id.clone(),
+            binding,
+            key,
+            handle,
+            stream_sender: channels.stream_sender,
+            datagram_sender: channels.datagram_sender,
+        }) {
             let _ = waiter.send(Err(error));
             return;
         }
@@ -653,18 +663,20 @@ impl WorkerManager {
         };
         let (reply, receiver) = oneshot::channel();
         self.enqueue_invoke(
-            session_worker_name,
-            runtime_request_id,
-            invoke,
-            None,
-            Some(route),
-            Some(memory_call),
-            None,
-            None,
-            Some(generation),
-            true,
-            reply,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name: session_worker_name,
+                runtime_request_id,
+                request: invoke,
+                request_body: None,
+                memory_route: Some(route),
+                memory_call: Some(memory_call),
+                host_rpc_call: None,
+                target_isolate_id: None,
+                target_generation: Some(generation),
+                internal_origin: true,
+                reply,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         let session_id = session_id.to_string();
@@ -731,18 +743,20 @@ impl WorkerManager {
         };
         let (reply, receiver) = oneshot::channel();
         self.enqueue_invoke(
-            session_worker_name,
-            runtime_request_id,
-            invoke,
-            None,
-            Some(route),
-            Some(memory_call),
-            None,
-            None,
-            Some(generation),
-            true,
-            reply,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name: session_worker_name,
+                runtime_request_id,
+                request: invoke,
+                request_body: None,
+                memory_route: Some(route),
+                memory_call: Some(memory_call),
+                host_rpc_call: None,
+                target_isolate_id: None,
+                target_generation: Some(generation),
+                internal_origin: true,
+                reply,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         let session_id = session_id.to_string();
@@ -805,18 +819,20 @@ impl WorkerManager {
         };
         let (reply, receiver) = oneshot::channel();
         self.enqueue_invoke(
-            session.worker_name,
-            runtime_request_id,
-            invoke,
-            None,
-            Some(route),
-            Some(memory_call),
-            None,
-            None,
-            Some(session.generation),
-            true,
-            reply,
-            PendingReplyKind::Normal,
+            EnqueueInvokeRequest {
+                worker_name: session.worker_name,
+                runtime_request_id,
+                request: invoke,
+                request_body: None,
+                memory_route: Some(route),
+                memory_call: Some(memory_call),
+                host_rpc_call: None,
+                target_isolate_id: None,
+                target_generation: Some(session.generation),
+                internal_origin: true,
+                reply,
+                reply_kind: PendingReplyKind::Normal,
+            },
             event_tx,
         );
         let session_id = session_id.to_string();
