@@ -139,25 +139,25 @@ node benchmarks/run.mjs --samples 1 \
 ## Atomic Scheduler Implementation Matrix
 
 This clean `main` worktree run was captured after the shard-aware atomic scheduler
-and background outbox drain implementation commit was pushed. The source JSON is
+ready-head and bounded outbox drain update was pushed. The source JSON is
 [`results/feedback-atomic-sharded-scheduler.json`](results/feedback-atomic-sharded-scheduler.json).
 Regenerate from a clean worktree whenever using these numbers as release evidence.
 
-- Date: `2026-06-23T20:18:12.193Z`
-- Runtime code commit: `259efb3`
-- Worktree: clean repository `main` worktree after implementation commit
+- Date: `2026-06-23T21:33:34.233Z`
+- Runtime code commit: `5e4c92f`
+- Worktree: clean repository `main` worktree after ready-head scheduler update
 - Samples: `5`
 
 | Config | Workload | Samples | Requests | Concurrency | Isolates | Max inflight | Throughput | Mean | P95 | P99 |
 | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| [`storage-memory-write-cross-shard.sh`](configs/storage-memory-write-cross-shard.sh) | storage-only direct write, cross-shard matrix | 5 | 4,096 | 128 | n/a | n/a | 12,207 req/s | 10.36ms | 11.72ms | 15.59ms |
-| [`storage-memory-write-same-shard.sh`](configs/storage-memory-write-same-shard.sh) | storage-only direct write, same-shard matrix | 5 | 4,096 | 128 | n/a | n/a | 2,622 req/s | 28.62ms | 39.11ms | 552.54ms |
-| [`scaling-memory-write-cross-shard.sh`](configs/scaling-memory-write-cross-shard.sh) | keyed memory direct write, cross-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 14,223 req/s | 6.60ms | 25.47ms | 42.70ms |
-| [`scaling-memory-write-same-shard.sh`](configs/scaling-memory-write-same-shard.sh) | keyed memory direct write, same-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 4,441 req/s | 24.92ms | 104.29ms | 335.39ms |
-| [`atomic-memory-readwrite-cross-shard.sh`](configs/atomic-memory-readwrite-cross-shard.sh) | keyed memory `atomic(...)` read+write, cross-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 8,701 req/s | 14.63ms | 22.03ms | 103.25ms |
-| [`atomic-memory-readwrite-same-shard.sh`](configs/atomic-memory-readwrite-same-shard.sh) | keyed memory `atomic(...)` read+write, same-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 2,438 req/s | 50.64ms | 116.55ms | 196.18ms |
-| [`atomic-memory-write-cross-shard.sh`](configs/atomic-memory-write-cross-shard.sh) | keyed memory `atomic(...)` write+effect, cross-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 3,839 req/s | 33.07ms | 46.13ms | 122.68ms |
-| [`atomic-memory-write-same-shard.sh`](configs/atomic-memory-write-same-shard.sh) | keyed memory `atomic(...)` write+effect, same-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 713 req/s | 162.75ms | 649.88ms | 1,158.23ms |
+| [`storage-memory-write-cross-shard.sh`](configs/storage-memory-write-cross-shard.sh) | storage-only direct write, cross-shard matrix | 5 | 4,096 | 128 | n/a | n/a | 11,623 req/s | 10.87ms | 13.91ms | 19.12ms |
+| [`storage-memory-write-same-shard.sh`](configs/storage-memory-write-same-shard.sh) | storage-only direct write, same-shard matrix | 5 | 4,096 | 128 | n/a | n/a | 2,174 req/s | 30.27ms | 52.74ms | 378.46ms |
+| [`scaling-memory-write-cross-shard.sh`](configs/scaling-memory-write-cross-shard.sh) | keyed memory direct write, cross-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 13,206 req/s | 7.11ms | 32.22ms | 48.38ms |
+| [`scaling-memory-write-same-shard.sh`](configs/scaling-memory-write-same-shard.sh) | keyed memory direct write, same-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 4,237 req/s | 25.92ms | 108.42ms | 330.45ms |
+| [`atomic-memory-readwrite-cross-shard.sh`](configs/atomic-memory-readwrite-cross-shard.sh) | keyed memory `atomic(...)` read+write, cross-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 8,620 req/s | 14.75ms | 21.75ms | 107.82ms |
+| [`atomic-memory-readwrite-same-shard.sh`](configs/atomic-memory-readwrite-same-shard.sh) | keyed memory `atomic(...)` read+write, same-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 2,342 req/s | 52.76ms | 130.8ms | 182.9ms |
+| [`atomic-memory-write-cross-shard.sh`](configs/atomic-memory-write-cross-shard.sh) | keyed memory `atomic(...)` write+effect, cross-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 3,521 req/s | 36.01ms | 50.5ms | 132.99ms |
+| [`atomic-memory-write-same-shard.sh`](configs/atomic-memory-write-same-shard.sh) | keyed memory `atomic(...)` write+effect, same-shard matrix | 5 | 4,096 | 128 | 16-16 | 16 | 715 req/s | 166.12ms | 590.64ms | 1,081.91ms |
 
 ## Current Write Matrix
 
