@@ -21,6 +21,7 @@ pub(crate) enum MemoryKeyMode {
     Unique,
     SameShard,
     CrossShard,
+    SkewedHotspot,
 }
 
 impl MemoryKeyMode {
@@ -35,6 +36,7 @@ impl MemoryKeyMode {
             "unique" => Self::Unique,
             "same-shard" => Self::SameShard,
             "cross-shard" => Self::CrossShard,
+            "skewed-hotspot" => Self::SkewedHotspot,
             _ => Self::Pool,
         }
     }

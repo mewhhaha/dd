@@ -907,6 +907,7 @@ fn build_memory_keys(
         MemoryKeyMode::CrossShard => {
             memory_keys_across_shards(key_space, namespace_shards, "bench-direct-cross-shard")
         }
+        MemoryKeyMode::SkewedHotspot => memory_keys_skewed_hotspot(key_space, namespace_shards),
     }
 }
 
@@ -960,5 +961,23 @@ fn memory_keys_across_shards(
         }
         sequence += 1;
     }
+    keys
+}
+
+fn memory_keys_skewed_hotspot(key_space: usize, namespace_shards: usize) -> Vec<String> {
+    let hot_key_space = ((key_space.saturating_mul(4)) / 5).clamp(1, key_space);
+    let cold_key_space = key_space.saturating_sub(hot_key_space);
+    let hot_shard = memory_shard("bench-skewed-hotspot-anchor", namespace_shards);
+    let mut keys = memory_keys_for_single_shard(
+        hot_key_space,
+        hot_shard,
+        namespace_shards,
+        "bench-skewed-hot",
+    );
+    keys.extend(memory_keys_across_shards(
+        cold_key_space,
+        namespace_shards,
+        "bench-skewed-cold",
+    ));
     keys
 }

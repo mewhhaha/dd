@@ -101,6 +101,41 @@ clean worktree before treating the medians as release or main-branch evidence.
 | [`atomic-memory-write-cross-shard.sh`](configs/atomic-memory-write-cross-shard.sh) | keyed memory `atomic(...)` write+effect, cross-shard matrix | 4,096 | 128 | 16-16 | 16 | 1,024 | 16 |
 | [`atomic-memory-write-same-shard.sh`](configs/atomic-memory-write-same-shard.sh) | keyed memory `atomic(...)` write+effect, same-shard matrix | 4,096 | 128 | 16-16 | 16 | 1,024 | 16 |
 
+## Atomic Scaling Matrix
+
+Use [`scaling-atomic-memory-matrix.sh`](configs/scaling-atomic-memory-matrix.sh)
+to measure whether write throughput improves as isolate and memory-shard counts
+increase. The runner expands the matrix variables in that config into one JSON
+config entry per combination:
+
+```bash
+node benchmarks/run.mjs --samples 5 \
+  --config scaling-atomic-memory-matrix.sh \
+  --out benchmarks/results/local-atomic-memory-scaling-matrix.json
+```
+
+Default dimensions:
+
+| Dimension | Values |
+| --- | --- |
+| Isolates | `1`, `2`, `4`, `8`, `16`, `32` |
+| Memory shards | `1`, `2`, `4`, `8`, `16`, `32`, `64` |
+| Key modes | `same-shard`, `cross-shard`, `skewed-hotspot` |
+| Workloads | `direct-write-memory-wide`, `atomic-readwrite-memory-wide`, `atomic-write-memory-wide` |
+
+The full matrix is intentionally large. For a local smoke check, override any
+matrix dimension from the shell:
+
+```bash
+DD_BENCH_MATRIX_ISOLATES="1 2" \
+DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="1 2" \
+DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
+DD_BENCH_MATRIX_MODES="atomic-readwrite-memory-wide" \
+node benchmarks/run.mjs --samples 1 \
+  --config scaling-atomic-memory-matrix.sh \
+  --out benchmarks/results/local-atomic-memory-scaling-smoke.json
+```
+
 ## Atomic Scheduler Implementation Matrix
 
 This clean `main` worktree run was captured after the shard-aware atomic scheduler
@@ -153,9 +188,14 @@ claim.
 - Saturated wide memory read also prestarts `16` isolates with `256`
   concurrency, but it measures keyed memory routing and read hydration rather
   than the plain fetch path.
-- The scaling memory matrix fixes `DD_BENCH_MEMORY_NAMESPACE_SHARDS=16` and
-  compares `DD_BENCH_MEMORY_KEY_MODE=same-shard` against `cross-shard` for wide
-  direct reads, direct writes, and atomic writes.
+- The legacy `scaling-memory-*` configs fix
+  `DD_BENCH_MEMORY_NAMESPACE_SHARDS=16` and compare
+  `DD_BENCH_MEMORY_KEY_MODE=same-shard` against `cross-shard` for wide direct
+  reads and direct writes.
+- `scaling-atomic-memory-matrix.sh` is the core-scaling sweep for direct writes,
+  atomic read+write, and atomic write+effect workloads across isolate counts,
+  memory-shard counts, and `same-shard`/`cross-shard`/`skewed-hotspot` key
+  distributions.
 - The storage-only write configs use `MemoryStore.apply_batch()` directly with
   the same request count, concurrency, keyspace, shard count, and key generator
   as the runtime direct-write matrix. They isolate storage behavior from JS and

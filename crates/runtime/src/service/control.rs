@@ -884,7 +884,8 @@ impl WorkerManager {
                 self.cleanup_drained_generations_for(&worker_name);
             }
             RuntimeEvent::MemoryOutboxDrain { shard_index } => {
-                self.drain_scheduled_memory_outbox_shard(shard_index).await;
+                self.drain_scheduled_memory_outbox_shard(shard_index, event_tx)
+                    .await;
             }
         }
     }

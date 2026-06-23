@@ -1,7 +1,8 @@
 use super::*;
 
 const MEMORY_OUTBOX_DRAIN_LIMIT: usize = 64;
-const MEMORY_OUTBOX_MAX_DRAIN_BATCHES: usize = 64;
+const MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES: usize = 1;
+const MEMORY_OUTBOX_TICK_DRAIN_BATCHES: usize = 4;
 const MEMORY_OUTBOX_LEASE: Duration = Duration::from_secs(30);
 const MEMORY_OUTBOX_EFFECT_KINDS: &[&str] = &[
     "audit.*",
@@ -12,6 +13,11 @@ const MEMORY_OUTBOX_EFFECT_KINDS: &[&str] = &[
     "transport.datagram",
     "transport.close",
 ];
+
+struct MemoryOutboxDrainResult {
+    processed: usize,
+    saturated: bool,
+}
 
 impl WorkerManager {
     pub(super) fn schedule_memory_outbox_drain_shard(
@@ -36,9 +42,16 @@ impl WorkerManager {
     pub(super) async fn drain_scheduled_memory_outbox_shard(
         &mut self,
         shard_index: usize,
+        event_tx: &RuntimeEventSender,
     ) -> usize {
         self.pending_memory_outbox_shards.remove(&shard_index);
-        self.drain_memory_outbox_shard(shard_index).await
+        let result = self
+            .drain_memory_outbox_shard_budget(shard_index, MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES)
+            .await;
+        if result.saturated {
+            self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
+        }
+        result.processed
     }
 
     fn increment_websocket_session_count(
@@ -1062,9 +1075,16 @@ impl WorkerManager {
     }
 
     pub(super) async fn drain_memory_outbox(&mut self) -> usize {
+        self.drain_memory_outbox_budget(MEMORY_OUTBOX_TICK_DRAIN_BATCHES)
+            .await
+            .processed
+    }
+
+    async fn drain_memory_outbox_budget(&mut self, max_batches: usize) -> MemoryOutboxDrainResult {
         let started_at = Instant::now();
         let mut processed = 0usize;
-        for _ in 0..MEMORY_OUTBOX_MAX_DRAIN_BATCHES {
+        let mut saturated = false;
+        for _ in 0..max_batches {
             let claims = match self
                 .memory_store
                 .claim_due_outbox_records(
@@ -1077,16 +1097,21 @@ impl WorkerManager {
                 Ok(claims) => claims,
                 Err(error) => {
                     warn!(error = %error, "memory outbox claim failed");
-                    return processed;
+                    return MemoryOutboxDrainResult {
+                        processed,
+                        saturated: false,
+                    };
                 }
             };
             let claimed = claims.len();
             if claimed == 0 {
+                saturated = false;
                 break;
             }
             processed = processed.saturating_add(claimed);
             self.deliver_memory_outbox_claims(claims).await;
-            if claimed < MEMORY_OUTBOX_DRAIN_LIMIT {
+            saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
+            if !saturated {
                 break;
             }
         }
@@ -1095,13 +1120,21 @@ impl WorkerManager {
             duration_us(started_at.elapsed()),
             processed as u64,
         );
-        processed
+        MemoryOutboxDrainResult {
+            processed,
+            saturated,
+        }
     }
 
-    pub(super) async fn drain_memory_outbox_shard(&mut self, shard_index: usize) -> usize {
+    async fn drain_memory_outbox_shard_budget(
+        &mut self,
+        shard_index: usize,
+        max_batches: usize,
+    ) -> MemoryOutboxDrainResult {
         let started_at = Instant::now();
         let mut processed = 0usize;
-        for _ in 0..MEMORY_OUTBOX_MAX_DRAIN_BATCHES {
+        let mut saturated = false;
+        for _ in 0..max_batches {
             let claims = match self
                 .memory_store
                 .claim_due_outbox_records_for_shard_index(
@@ -1120,11 +1153,13 @@ impl WorkerManager {
             };
             let claimed = claims.len();
             if claimed == 0 {
+                saturated = false;
                 break;
             }
             processed = processed.saturating_add(claimed);
             self.deliver_memory_outbox_claims(claims).await;
-            if claimed < MEMORY_OUTBOX_DRAIN_LIMIT {
+            saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
+            if !saturated {
                 break;
             }
         }
@@ -1133,7 +1168,10 @@ impl WorkerManager {
             duration_us(started_at.elapsed()),
             processed as u64,
         );
-        processed
+        MemoryOutboxDrainResult {
+            processed,
+            saturated,
+        }
     }
 
     async fn deliver_memory_outbox_claims(&mut self, claims: Vec<MemoryOutboxClaim>) {

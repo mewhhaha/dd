@@ -4509,7 +4509,11 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(model_source.contains("by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>"));
     assert!(model_source.contains("memory_shard_affinity: HashMap<usize, u64>"));
     assert!(model_source.contains("memory_shards: BTreeMap<usize, BTreeMap<u64, PendingInvoke>>"));
+    assert!(model_source.contains("memory_next_shard_cursor: Option<usize>"));
     assert!(model_source.contains("memory_shard_index: Option<usize>"));
+    assert!(model_source.contains("pub(super) fn find_fair_map<T>("));
+    assert!(model_source.contains("fn find_memory_round_robin_head_map<T>("));
+    assert!(model_source.contains("memory_shard.first_key_value()"));
     assert!(model_source.contains("targeted: BTreeMap<u64, PendingInvoke>"));
     assert!(!model_source.contains("memory: BTreeMap<u64, PendingInvoke>"));
     assert!(model_source.contains("pub(super) fn drain_target_isolate_id("));
@@ -4520,6 +4524,7 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(dispatch_source.contains("remove_by_runtime_request_id(&runtime_request_id)"));
     assert!(dispatch_source.contains("RuntimeAtomicQueueWait"));
     assert!(dispatch_source.contains("memory_shard_affinity"));
+    assert!(runtime_source_contains_fair_memory_dispatch());
     assert!(remove_isolate_source.contains("pool.queue.drain_target_isolate_id(isolate.id)"));
     assert!(remove_isolate_source.contains("pool.memory_shard_affinity"));
     assert!(remove_isolate_source
@@ -4531,6 +4536,31 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(expire_queue_source.contains("pool.queue.next_expiry_at(max_queue_wait)"));
     assert!(!expire_queue_source.contains("duration_since(pending.enqueued_at)"));
     assert!(!expire_queue_source.contains("for pending in pool.queue.iter()"));
+}
+
+fn runtime_source_contains_fair_memory_dispatch() -> bool {
+    let runtime_source = include_str!("runtime.rs");
+    runtime_source.contains("pool.queue.find_fair_map(")
+        && runtime_source.contains("memory_shard_affinity_isolate_idx(")
+}
+
+#[test]
+fn memory_outbox_scheduled_drains_are_bounded_and_requeued() {
+    let sessions_source = include_str!("sessions.rs");
+    let control_source = include_str!("control.rs");
+
+    assert!(sessions_source.contains("MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES: usize = 1"));
+    assert!(sessions_source.contains("MEMORY_OUTBOX_TICK_DRAIN_BATCHES: usize = 4"));
+    assert!(sessions_source.contains("struct MemoryOutboxDrainResult"));
+    assert!(sessions_source.contains(
+        "drain_memory_outbox_shard_budget(shard_index, MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES)"
+    ));
+    assert!(sessions_source.contains("if result.saturated"));
+    assert!(
+        sessions_source.contains("self.schedule_memory_outbox_drain_shard(shard_index, event_tx)")
+    );
+    assert!(control_source.contains("drain_scheduled_memory_outbox_shard(shard_index, event_tx)"));
+    assert!(!sessions_source.contains("MEMORY_OUTBOX_MAX_DRAIN_BATCHES"));
 }
 
 #[test]

@@ -8,7 +8,7 @@ const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const configsDir = join(repoRoot, "benchmarks", "configs");
 
 const options = parseArgs(process.argv.slice(2));
-const configs = await discoverConfigs(options.configs);
+const configs = await expandConfigs(await discoverConfigs(options.configs));
 
 if (options.list) {
   for (const config of configs) {
@@ -27,8 +27,8 @@ const run = {
 };
 
 for (const config of configs) {
-  const script = await readFile(config.path, "utf8");
-  const env = parseConfigEnv(script);
+  const script = config.script ?? (await readFile(config.path, "utf8"));
+  const env = { ...parseConfigEnv(script), ...(config.envOverrides ?? {}) };
   const configRun = {
     name: config.name,
     path: relativePath(config.path),
@@ -40,7 +40,7 @@ for (const config of configs) {
 
   for (let index = 1; index <= options.samples; index += 1) {
     console.error(`[bench] ${config.name} sample ${index}/${options.samples}`);
-    const sample = await runConfig(config.path, index);
+    const sample = await runConfig(config.path, index, config.envOverrides ?? {});
     configRun.samples.push(sample);
   }
 
@@ -89,7 +89,11 @@ function printHelp() {
 
 Runs benchmark config scripts, captures raw output, parses standard result rows,
 computes medians, and writes JSON. Pass --config more than once to select a
-subset; values may be script names or paths under benchmarks/configs.`);
+subset; values may be script names or paths under benchmarks/configs.
+
+Configs may define DD_BENCH_MATRIX_* variables. The runner expands those into
+one sampled config per matrix combination and passes selected values as
+environment overrides to the config script.`);
 }
 
 async function discoverConfigs(selected) {
@@ -106,6 +110,101 @@ async function discoverConfigs(selected) {
   }
   const selectedNames = new Set(selected.map((value) => basename(value)));
   return all.filter((config) => selectedNames.has(config.name));
+}
+
+async function expandConfigs(configs) {
+  const expanded = [];
+  for (const config of configs) {
+    const script = await readFile(config.path, "utf8");
+    const env = parseConfigEnv(script);
+    for (const variant of expandMatrixVariants(env)) {
+      expanded.push({
+        ...config,
+        script,
+        name:
+          variant.labels.length === 0
+            ? config.name
+            : `${config.name}::${variant.labels.join(",")}`,
+        envOverrides: variant.envOverrides,
+      });
+    }
+  }
+  return expanded;
+}
+
+function expandMatrixVariants(env) {
+  const dimensions = [];
+  const isolates = envList(process.env.DD_BENCH_MATRIX_ISOLATES ?? env.DD_BENCH_MATRIX_ISOLATES);
+  if (isolates.length > 0) {
+    dimensions.push(
+      isolates.map((value) => ({
+        label: `isolates=${value}`,
+        env: {
+          DD_BENCH_MIN_ISOLATES: value,
+          DD_BENCH_MAX_ISOLATES: value,
+        },
+      })),
+    );
+  }
+
+  const memoryShards = envList(
+    process.env.DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS ??
+      env.DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS,
+  );
+  if (memoryShards.length > 0) {
+    dimensions.push(
+      memoryShards.map((value) => ({
+        label: `shards=${value}`,
+        env: { DD_BENCH_MEMORY_NAMESPACE_SHARDS: value },
+      })),
+    );
+  }
+
+  const keyModes = envList(process.env.DD_BENCH_MATRIX_KEY_MODES ?? env.DD_BENCH_MATRIX_KEY_MODES);
+  if (keyModes.length > 0) {
+    dimensions.push(
+      keyModes.map((value) => ({
+        label: `keys=${value}`,
+        env: { DD_BENCH_MEMORY_KEY_MODE: value },
+      })),
+    );
+  }
+
+  const modes = envList(process.env.DD_BENCH_MATRIX_MODES ?? env.DD_BENCH_MATRIX_MODES);
+  if (modes.length > 0) {
+    dimensions.push(
+      modes.map((value) => ({
+        label: `mode=${value}`,
+        env: { DD_BENCH_MODE: value },
+      })),
+    );
+  }
+
+  if (dimensions.length === 0) {
+    return [{ labels: [], envOverrides: {} }];
+  }
+
+  let variants = [{ labels: [], envOverrides: {} }];
+  for (const dimension of dimensions) {
+    const next = [];
+    for (const variant of variants) {
+      for (const entry of dimension) {
+        next.push({
+          labels: [...variant.labels, entry.label],
+          envOverrides: { ...variant.envOverrides, ...entry.env },
+        });
+      }
+    }
+    variants = next;
+  }
+  return variants;
+}
+
+function envList(value) {
+  return (value ?? "")
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
 function collectMetadata() {
@@ -142,6 +241,14 @@ function parseConfigEnv(script) {
   const env = {};
   for (const line of script.split(/\r?\n/)) {
     const trimmed = line.trim().replace(/\\$/, "").trim();
+    const defaultMatch =
+      /^([A-Z][A-Z0-9_]*)=(?:"\$\{[A-Z][A-Z0-9_]*:-([^}]*)\}"|\$\{[A-Z][A-Z0-9_]*:-([^}]*)\})$/.exec(
+        trimmed,
+      );
+    if (defaultMatch) {
+      env[defaultMatch[1]] = defaultMatch[2] ?? defaultMatch[3] ?? "";
+      continue;
+    }
     const match = /^([A-Z][A-Z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^ \t]+))$/.exec(trimmed);
     if (!match) {
       continue;
@@ -151,12 +258,12 @@ function parseConfigEnv(script) {
   return env;
 }
 
-async function runConfig(path, sample) {
+async function runConfig(path, sample, envOverrides) {
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const child = spawn("bash", [path], {
     cwd: repoRoot,
-    env: process.env,
+    env: { ...process.env, ...envOverrides },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";

@@ -263,10 +263,6 @@ impl WorkerPool {
         self.isolate_indices.clear();
     }
 
-    pub(super) fn memory_entity_is_leased(&self, owner_key: &str) -> bool {
-        self.memory_entity_leases.contains_key(owner_key)
-    }
-
     pub(super) fn acquire_memory_entity_lease(
         &mut self,
         owner_key: String,
@@ -327,6 +323,7 @@ pub(super) struct PendingInvokeQueue {
     targeted_nested: BTreeMap<u64, PendingInvoke>,
     targeted: BTreeMap<u64, PendingInvoke>,
     memory_shards: BTreeMap<usize, BTreeMap<u64, PendingInvoke>>,
+    memory_next_shard_cursor: Option<usize>,
     general: BTreeMap<u64, PendingInvoke>,
 }
 
@@ -341,6 +338,7 @@ impl PendingInvokeQueue {
             targeted_nested: BTreeMap::new(),
             targeted: BTreeMap::new(),
             memory_shards: BTreeMap::new(),
+            memory_next_shard_cursor: None,
             general: BTreeMap::new(),
         }
     }
@@ -540,25 +538,69 @@ impl PendingInvokeQueue {
                 }
                 PendingQueueLane::Memory => {
                     for (shard_index, memory_shard) in &self.memory_shards {
-                        for (sequence, pending) in memory_shard {
-                            let key = PendingQueueKey {
-                                lane,
-                                sequence: *sequence,
-                                memory_shard_index: Some(*shard_index),
-                            };
-                            let Some(value) = map(key, pending) else {
-                                continue;
-                            };
-                            if selected
-                                .as_ref()
-                                .is_none_or(|(selected_sequence, _)| sequence < selected_sequence)
-                            {
-                                selected = Some((*sequence, value));
-                            }
+                        let Some((sequence, pending)) = memory_shard.first_key_value() else {
+                            continue;
+                        };
+                        let key = PendingQueueKey {
+                            lane,
+                            sequence: *sequence,
+                            memory_shard_index: Some(*shard_index),
+                        };
+                        let Some(value) = map(key, pending) else {
+                            continue;
+                        };
+                        if selected
+                            .as_ref()
+                            .is_none_or(|(selected_sequence, _)| sequence < selected_sequence)
+                        {
+                            selected = Some((*sequence, value));
                         }
                     }
                 }
             }
+        }
+        selected.map(|(_, value)| value)
+    }
+
+    pub(super) fn find_fair_map<T>(
+        &mut self,
+        lanes: impl IntoIterator<Item = PendingQueueLane>,
+        mut map: impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,
+    ) -> Option<T> {
+        let mut selected = None;
+        let mut selected_key = None;
+        for lane in lanes {
+            let candidate = match lane {
+                PendingQueueLane::Memory => self.find_memory_round_robin_head_map(&mut map),
+                PendingQueueLane::TargetedNested
+                | PendingQueueLane::Targeted
+                | PendingQueueLane::General => self.find_lane_oldest_map(lane, &mut map),
+            };
+            let Some((key, sequence, value)) = candidate else {
+                continue;
+            };
+            if selected
+                .as_ref()
+                .is_none_or(|(selected_sequence, _)| sequence < *selected_sequence)
+            {
+                selected = Some((sequence, value));
+                selected_key = Some(key);
+            }
+        }
+        if matches!(
+            selected_key,
+            Some(PendingQueueKey {
+                lane: PendingQueueLane::Memory,
+                memory_shard_index: Some(_),
+                ..
+            })
+        ) {
+            self.advance_memory_shard_cursor(
+                selected_key
+                    .expect("selected memory key must exist")
+                    .memory_shard_index
+                    .expect("selected memory key must include shard"),
+            );
         }
         selected.map(|(_, value)| value)
     }
@@ -743,6 +785,66 @@ impl PendingInvokeQueue {
             }
             PendingQueueLane::General => &self.general,
         }
+    }
+
+    fn find_lane_oldest_map<T>(
+        &self,
+        lane: PendingQueueLane,
+        map: &mut impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,
+    ) -> Option<(PendingQueueKey, u64, T)> {
+        let mut selected = None;
+        for (sequence, pending) in self.lane(lane) {
+            let key = PendingQueueKey {
+                lane,
+                sequence: *sequence,
+                memory_shard_index: None,
+            };
+            let Some(value) = map(key, pending) else {
+                continue;
+            };
+            selected = Some((key, *sequence, value));
+            break;
+        }
+        selected
+    }
+
+    fn find_memory_round_robin_head_map<T>(
+        &self,
+        map: &mut impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,
+    ) -> Option<(PendingQueueKey, u64, T)> {
+        if self.memory_shards.is_empty() {
+            return None;
+        }
+
+        let cursor = self.memory_next_shard_cursor.unwrap_or(0);
+        for (shard_index, memory_shard) in self
+            .memory_shards
+            .range(cursor..)
+            .chain(self.memory_shards.range(..cursor))
+        {
+            let Some((sequence, pending)) = memory_shard.first_key_value() else {
+                continue;
+            };
+            let key = PendingQueueKey {
+                lane: PendingQueueLane::Memory,
+                sequence: *sequence,
+                memory_shard_index: Some(*shard_index),
+            };
+            let Some(value) = map(key, pending) else {
+                continue;
+            };
+            return Some((key, *sequence, value));
+        }
+        None
+    }
+
+    fn advance_memory_shard_cursor(&mut self, shard_index: usize) {
+        self.memory_next_shard_cursor = self
+            .memory_shards
+            .range((shard_index.saturating_add(1))..)
+            .next()
+            .map(|(next_shard, _)| *next_shard)
+            .or_else(|| self.memory_shards.keys().next().copied());
     }
 
     fn drain_lane_matching(
@@ -1310,6 +1412,95 @@ mod tests {
             Some("general".to_string())
         );
         assert!(queue.memory_shards.is_empty());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn pending_invoke_queue_memory_lookup_only_considers_shard_heads() {
+        let mut queue = PendingInvokeQueue::new();
+        queue.push_back(pending_invoke(
+            "memory-shard-3-head",
+            None,
+            Some(memory_route_on_shard("room-a", 3)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "memory-shard-3-tail",
+            None,
+            Some(memory_route_on_shard("room-b", 3)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "memory-shard-7-head",
+            None,
+            Some(memory_route_on_shard("room-c", 7)),
+            None,
+        ));
+
+        let hidden_tail = queue.find_oldest_map([PendingQueueLane::Memory], |key, pending| {
+            (pending.runtime_request_id == "memory-shard-3-tail").then_some(key)
+        });
+        assert!(hidden_tail.is_none());
+
+        assert_eq!(
+            queue.pop_front().map(|pending| pending.runtime_request_id),
+            Some("memory-shard-3-head".to_string())
+        );
+        let exposed_tail = queue
+            .find_oldest_map([PendingQueueLane::Memory], |key, pending| {
+                (pending.runtime_request_id == "memory-shard-3-tail").then_some(key)
+            })
+            .expect("tail becomes selectable after the shard head is removed");
+        assert_eq!(exposed_tail.memory_shard_index, Some(3));
+    }
+
+    #[test]
+    fn pending_invoke_queue_fair_memory_lookup_rotates_across_shard_heads() {
+        let mut queue = PendingInvokeQueue::new();
+        queue.push_back(pending_invoke(
+            "hot-1",
+            None,
+            Some(memory_route_on_shard("hot-a", 1)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "hot-2",
+            None,
+            Some(memory_route_on_shard("hot-b", 1)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "cold-1",
+            None,
+            Some(memory_route_on_shard("cold-a", 2)),
+            None,
+        ));
+
+        let first_key = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
+            .expect("first shard head should be selectable");
+        assert_eq!(
+            queue
+                .remove(first_key)
+                .map(|pending| pending.runtime_request_id),
+            Some("hot-1".to_string())
+        );
+
+        let second_key = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
+            .expect("cold shard head should be selected before hot shard backlog");
+        assert_eq!(second_key.memory_shard_index, Some(2));
+        assert_eq!(
+            queue
+                .remove(second_key)
+                .map(|pending| pending.runtime_request_id),
+            Some("cold-1".to_string())
+        );
+
+        assert_eq!(
+            queue.pop_front().map(|pending| pending.runtime_request_id),
+            Some("hot-2".to_string())
+        );
         assert!(queue.is_empty());
     }
 

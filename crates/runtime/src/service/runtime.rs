@@ -8,22 +8,27 @@ const ISOLATE_COMMAND_CHANNEL_CAPACITY: usize = 1024;
 const ISOLATE_EVENT_QUEUE_CAPACITY: usize = 8192;
 
 pub(super) fn select_dispatch_candidate(
-    pool: &WorkerPool,
+    pool: &mut WorkerPool,
     max_inflight: usize,
     require_wait_until_idle: bool,
     allow_memory_atomic_overflow: bool,
 ) -> Option<DispatchSelection> {
+    let isolates = &pool.isolates;
+    let isolate_indices = &pool.isolate_indices;
+    let memory_entity_leases = &pool.memory_entity_leases;
+    let memory_shard_affinity = &pool.memory_shard_affinity;
+
     if let Some(selection) =
         pool.queue
             .find_oldest_map([PendingQueueLane::TargetedNested], |queue_key, pending| {
                 let target_isolate_id = pending
                     .target_isolate_id
                     .expect("targeted nested queue entries must have a target isolate");
-                if memory_atomic_route_is_active(pool, pending) {
+                if memory_atomic_route_is_active(memory_entity_leases, pending) {
                     return None;
                 }
-                if let Some(isolate_idx) = target_isolate_idx(pool, target_isolate_id) {
-                    if pool.isolates[isolate_idx].startup.is_ready() {
+                if let Some(isolate_idx) = target_isolate_idx(isolate_indices, target_isolate_id) {
+                    if isolates[isolate_idx].startup.is_ready() {
                         Some(DispatchSelection::Dispatch(DispatchCandidate {
                             queue_key,
                             isolate_idx,
@@ -39,7 +44,7 @@ pub(super) fn select_dispatch_candidate(
         return Some(selection);
     }
 
-    pool.queue.find_oldest_map(
+    pool.queue.find_fair_map(
         [
             PendingQueueLane::Targeted,
             PendingQueueLane::Memory,
@@ -49,7 +54,7 @@ pub(super) fn select_dispatch_candidate(
             let Some(target_isolate_id) = pending.target_isolate_id else {
                 if pending.memory_route.is_none() {
                     return least_loaded_isolate_idx(
-                        &pool.isolates,
+                        isolates,
                         max_inflight,
                         require_wait_until_idle,
                     )
@@ -61,13 +66,15 @@ pub(super) fn select_dispatch_candidate(
                     });
                 }
 
-                if memory_atomic_route_is_active(pool, pending) {
+                if memory_atomic_route_is_active(memory_entity_leases, pending) {
                     return None;
                 }
                 let isolate_idx = memory_route_is_atomic(pending)
                     .then(|| {
                         memory_shard_affinity_isolate_idx(
-                            pool,
+                            isolates,
+                            isolate_indices,
+                            memory_shard_affinity,
                             pending,
                             max_inflight,
                             require_wait_until_idle,
@@ -75,15 +82,11 @@ pub(super) fn select_dispatch_candidate(
                     })
                     .flatten()
                     .or_else(|| {
-                        least_loaded_isolate_idx(
-                            &pool.isolates,
-                            max_inflight,
-                            require_wait_until_idle,
-                        )
+                        least_loaded_isolate_idx(isolates, max_inflight, require_wait_until_idle)
                     })
                     .or_else(|| {
                         (allow_memory_atomic_overflow && memory_route_is_atomic(pending))
-                            .then(|| least_loaded_isolate_any_idx(&pool.isolates))
+                            .then(|| least_loaded_isolate_any_idx(isolates))
                             .flatten()
                     });
                 return isolate_idx.map(|isolate_idx| {
@@ -94,8 +97,8 @@ pub(super) fn select_dispatch_candidate(
                 });
             };
 
-            if let Some(isolate_idx) = target_isolate_idx(pool, target_isolate_id) {
-                let isolate = &pool.isolates[isolate_idx];
+            if let Some(isolate_idx) = target_isolate_idx(isolate_indices, target_isolate_id) {
+                let isolate = &isolates[isolate_idx];
                 debug_assert!(pending.host_rpc_call.is_none());
                 debug_assert!(pending.memory_route.is_none());
                 if isolate.startup.is_ready()
@@ -116,14 +119,17 @@ pub(super) fn select_dispatch_candidate(
     )
 }
 
-fn memory_atomic_route_is_active(pool: &WorkerPool, pending: &PendingInvoke) -> bool {
+fn memory_atomic_route_is_active(
+    memory_entity_leases: &HashMap<String, MemoryEntityLease>,
+    pending: &PendingInvoke,
+) -> bool {
     let Some(memory_route) = pending.memory_route.as_ref() else {
         return false;
     };
     if !memory_route_is_atomic(pending) {
         return false;
     }
-    pool.memory_entity_is_leased(&memory_route.owner_key)
+    memory_entity_leases.contains_key(&memory_route.owner_key)
 }
 
 fn memory_route_is_atomic(pending: &PendingInvoke) -> bool {
@@ -134,15 +140,17 @@ fn memory_route_is_atomic(pending: &PendingInvoke) -> bool {
 }
 
 fn memory_shard_affinity_isolate_idx(
-    pool: &WorkerPool,
+    isolates: &[IsolateHandle],
+    isolate_indices: &HashMap<u64, usize>,
+    memory_shard_affinity: &HashMap<usize, u64>,
     pending: &PendingInvoke,
     max_inflight: usize,
     require_wait_until_idle: bool,
 ) -> Option<usize> {
     let shard_index = pending.memory_route.as_ref()?.shard_index?;
-    let isolate_id = *pool.memory_shard_affinity.get(&shard_index)?;
-    let isolate_idx = pool.isolate_idx(isolate_id)?;
-    let isolate = &pool.isolates[isolate_idx];
+    let isolate_id = *memory_shard_affinity.get(&shard_index)?;
+    let isolate_idx = target_isolate_idx(isolate_indices, isolate_id)?;
+    let isolate = &isolates[isolate_idx];
     if isolate.startup.is_ready()
         && isolate.inflight_count < max_inflight
         && (!require_wait_until_idle || isolate.pending_wait_until.is_empty())
@@ -153,8 +161,11 @@ fn memory_shard_affinity_isolate_idx(
     }
 }
 
-fn target_isolate_idx(pool: &WorkerPool, target_isolate_id: u64) -> Option<usize> {
-    pool.isolate_idx(target_isolate_id)
+fn target_isolate_idx(
+    isolate_indices: &HashMap<u64, usize>,
+    target_isolate_id: u64,
+) -> Option<usize> {
+    isolate_indices.get(&target_isolate_id).copied()
 }
 
 pub(super) fn host_rpc_method_blocked(method: &str) -> bool {
