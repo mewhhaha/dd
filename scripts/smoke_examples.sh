@@ -58,22 +58,22 @@ check_contains "cache-vary greet" "$(fetch_text GET "$(url cache-vary /greet)" "
 check_contains "cache-delete root" "$(fetch_text GET "$(url cache-delete /)" "")" "deleted=true"
 check_contains "stream root" "$(fetch_text GET "$(url stream /)" "")" "hello world"
 check_regex "kv root" "$(fetch_text GET "$(url kv /)" "")" '^hits=[0-9]+$'
-check_contains "kv-counter root docs" "$(fetch_text GET "$(url kv-counter /)" "")" ""routes""
+check_contains "kv-counter root docs" "$(fetch_text GET "$(url kv-counter /)" "")" '"routes"'
 check_regex "kv-counter value" "$(fetch_text GET "$(url kv-counter /value)" "")" '^[0-9]+$'
 check_contains "bg root" "$(fetch_text GET "$(url bg /)" "")" "response sent first"
-check_contains "bg-kv root docs" "$(fetch_text GET "$(url bg-kv /)" "")" ""wait-until-kv""
-check_contains "bg-kv request" "$(fetch_text GET "$(url bg-kv /)" "" -H 'x-request-id: smoke-script')" "queued:smoke-script"
-check_contains "memory root docs" "$(fetch_text GET "$(url memory /)" "")" ""worker":"memory-namespace""
-check_contains "memory ping" "$(fetch_text GET "$(url memory '/ping?user=smoke')" "")" ""ok":true"
-check_contains "receipts root" "$(fetch_text GET "$(url receipts /)" "")" ""receipts worker""
-check_contains "trace-hub root" "$(fetch_text GET "$(url trace-hub /)" "")" ""routes""
+check_contains "bg-kv root docs" "$(fetch_text GET "$(url bg-kv /)" "")" '"wait-until-kv"'
+check_contains "bg-kv request" "$(fetch_text GET "$(url bg-kv /queue)" "" -H 'x-request-id: smoke-script')" "queued:smoke-script"
+check_contains "memory root docs" "$(fetch_text GET "$(url memory /)" "")" '"worker":"memory-namespace"'
+check_contains "memory ping" "$(fetch_text GET "$(url memory '/ping?user=smoke')" "")" '"ok":true'
+check_contains "receipts root" "$(fetch_text GET "$(url receipts /)" "")" '"receipts worker"'
+check_contains "trace-hub root" "$(fetch_text GET "$(url trace-hub /)" "")" '"routes"'
 check_contains "trace-sink root" "$(fetch_text GET "$(url trace-sink /)" "")" "worker traces receiver"
 check_contains "hello-traced root" "$(fetch_text GET "$(url hello-traced /)" "")" "hello-traced"
 check_contains "dynamic root" "$(fetch_text GET "$(url dynamic /)" "")" "dynamic namespace demo"
-check_contains "dynamic run" "$(fetch_text GET "$(url dynamic '/run?path=/hello')" "")" ""ok":true"
+check_contains "dynamic run" "$(fetch_text GET "$(url dynamic '/run?path=/hello')" "")" '"ok":true'
 check_contains "llm root" "$(fetch_text GET "$(url llm-dynamic /)" "")" "pretend-llm dynamic executor"
-check_contains "llm run" "$(fetch_text GET "$(url llm-dynamic '/run?prompt=echo&input=hello')" "")" ""output":"HELLO""
+check_contains "llm run" "$(fetch_text GET "$(url llm-dynamic '/run?prompt=echo&input=hello')" "")" '"output":"HELLO"'
 check_contains "preview root" "$(fetch_text GET "$(url preview-dynamic /)" "")" "Dynamic Preview Manager"
-check_contains "preview health" "$(fetch_text GET "$(url preview-dynamic '/preview/pr-123/api/health')" "")" ""ok":true"
+check_contains "preview health" "$(fetch_text GET "$(url preview-dynamic '/preview/pr-123/api/health')" "")" '"ok":true'
 check_contains "swr root" "$(fetch_text GET "$(url swr-site /)" "")" "dd SWR demo"
-check_contains "bundled-router root" "$(fetch_text GET "$(url bundled-router /)" "")" ""service":"bundled-router""
+check_contains "bundled-router root" "$(fetch_text GET "$(url bundled-router /)" "")" '"service":"bundled-router"'

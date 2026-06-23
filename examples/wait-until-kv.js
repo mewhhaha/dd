@@ -4,32 +4,41 @@ export default {
     if (!kv) {
       return new Response("missing KV binding: MY_KV", { status: 500 });
     }
+    const url = new URL(request.url);
 
     if (
       request.method === "GET"
-      && new URL(request.url).pathname === "/"
-      && !request.headers.get("x-request-id")
+      && url.pathname === "/"
     ) {
       return Response.json({
         ok: true,
         worker: "wait-until-kv",
         routes: [
-          "GET / with x-request-id header",
+          "GET /queue with x-request-id header",
         ],
         note: "bg task writes done:{id} in waitUntil",
+      }, {
+        headers: { "cache-control": "no-store" },
       });
+    }
+
+    if (url.pathname !== "/queue") {
+      return new Response("not found", { status: 404 });
     }
 
     const requestId = request.headers.get("x-request-id") ?? String(Date.now());
     ctx.waitUntil(
       (async () => {
         await Deno.core.ops.op_sleep(20);
-        await kv.set(`done:${requestId}`, "1");
+        await kv.put(`done:${requestId}`, "1");
       })(),
     );
 
     return new Response(`queued:${requestId}`, {
-      headers: { "content-type": "text/plain; charset=utf-8" },
+      headers: {
+        "cache-control": "no-store",
+        "content-type": "text/plain; charset=utf-8",
+      },
     });
   },
 };

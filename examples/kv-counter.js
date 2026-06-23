@@ -35,7 +35,7 @@ export default {
 
     if (path === "/inc" && request.method === "POST") {
       const next = current + 1;
-      await kv.set("counter", String(next));
+      await kv.put("counter", String(next));
       return new Response(String(next), {
         headers: { "content-type": "text/plain; charset=utf-8" },
       });

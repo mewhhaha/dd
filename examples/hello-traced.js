@@ -85,13 +85,13 @@ export default {
 
     if (url.pathname === "/api/hit" && request.method === "POST") {
       const total = (await readTotal(kv)) + 1;
-      await kv.set("stats:total", String(total));
+      await kv.put("stats:total", String(total));
       const event = {
         user,
         total,
         at: new Date().toISOString(),
       };
-      await kv.set(`event:last:${user}`, event);
+      await kv.put(`event:last:${user}`, event);
       return json({ ok: true, feature: "kv", event });
     }
 

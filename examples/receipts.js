@@ -84,7 +84,7 @@ function createStore(kv) {
       }
     },
     async set(id, receipt) {
-      await kv.set(`receipt:${id}`, JSON.stringify(receipt));
+      await kv.put(`receipt:${id}`, JSON.stringify(receipt));
     },
     async delete(id) {
       await kv.delete(`receipt:${id}`);
@@ -114,7 +114,7 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const method = request.method.toUpperCase();
     const kv = env?.RECEIPTS;
-    if (!kv || typeof kv.get !== "function" || typeof kv.set !== "function") {
+    if (!kv || typeof kv.get !== "function" || typeof kv.put !== "function") {
       return internalError("missing KV binding: RECEIPTS");
     }
     const store = createStore(kv);

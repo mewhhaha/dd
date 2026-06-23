@@ -2,7 +2,7 @@ export default {
   async fetch(_request, env) {
     const current = Number((await env.MY_KV?.get("hits")) ?? "0") || 0;
     const next = current + 1;
-    await env.MY_KV?.set("hits", String(next));
+    await env.MY_KV?.put("hits", String(next));
 
     return new Response(`hits=${next}`, {
       headers: {
