@@ -25,7 +25,8 @@ pnpm --filter dd-vite-react-router-example smoke
 The generated production deployment config points at the bundled dd worker entry and the React Router client asset directory:
 
 ```text
-dist/worker.js
-dist/dd.deploy.json
+dist/vite-react-router/worker.js
+dist/vite-react-router/dd.deploy.json
 dist/react-router/client/
+dist/dd.workers.json
 ```

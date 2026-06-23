@@ -43,10 +43,10 @@ export default defineConfig({
 App requests to the Vite dev server are invoked through the native runtime by
 default, so `localhost:5173/anything` behaves like the eventual deployed worker.
 Vite's own HMR, module, and source requests bypass the worker so the dev client
-keeps working. In dev, the plugin asks Vite for module-runner transformed worker
-modules and evaluates that graph inside the dd worker, so framework examples do
-not need a separate dev-time server-build step. On hot updates the plugin
-discards the deployed worker and lazily rebuilds it on the next worker request.
+keeps working. In dev, each dd worker is a first-class Vite environment. The
+runtime deploys a small dev runner that fetches Vite-transformed modules on
+demand, so no Vite module graph is embedded into the worker source. On hot
+updates the plugin clears the runner cache and reloads the worker entry.
 
 The default export is the Vite plugin factory, so you can name it whatever fits
 your config. The named `ddVitePlugin` export remains available. If the package
@@ -54,11 +54,11 @@ root contains `dd.json`, the plugin reads it by default for the worker name,
 entrypoint, and deploy config. Inline plugin options override values from
 `dd.json`.
 
-The plugin also registers a Vite Environment API environment named `dd`, backed
-by `createFetchableDevEnvironment`, for framework code that wants to dispatch
-`Request` objects directly. Normal applications should not need to configure
-this environment; `dd()` at the root-mounted default is the path that keeps
-development requests shaped like deployed worker requests.
+The plugin also registers a Vite Environment API environment for the entry
+worker, backed by `createFetchableDevEnvironment`, for framework code that wants
+to dispatch `Request` objects directly. The environment name defaults to the
+worker name from `dd.json`, normalized for Vite, and can be overridden with the
+top-level `viteEnvironment.name`.
 
 ```js
 import { defineConfig } from "vite";
@@ -71,11 +71,10 @@ export default defineConfig({
 });
 ```
 
-Advanced integrations can rename the registered Vite environment with
-`environmentName` or `viteEnvironment.name`, and can set `mount` to place the
-worker behind a subpath. Those options are intentionally unnecessary for the
-workspace examples: app traffic goes through dd, while Vite-owned module, HMR,
-and source requests bypass the worker.
+Advanced integrations can set `mount` to place the worker behind a subpath.
+Options such as `name`, `entry`, `config`, `viteEnvironment`, and
+`deploymentConfig` apply to the entry worker directly at the top level of
+`dd({ ... })`. If omitted, `dd.json` remains the source of truth.
 
 Framework examples can use subpath presets instead of wiring the framework
 server build by hand:
@@ -100,24 +99,26 @@ matching the shape expected by `@vitejs/plugin-rsc`.
 
 If a project uses non-standard React Router paths, pass `buildDirectory`,
 `workerEntry`, `serverEntry`, or, for RSC, `rscEntry` directly to the subpath
-plugin. Set `devModuleRunner: false` to fall back to the production-style
-bundled worker path during Vite dev.
+plugin.
 
 ## Build output
 
-During `vite build`, the plugin writes a bundled worker and deployment config
-into Vite's output directory:
+During `vite build`, the plugin builds the client first, then builds each dd
+worker as its own Vite build environment:
 
 ```text
 dist/
-  dd.deploy.json
-  worker.js
-  ...
+  client/
+  <entry-worker>/
+    worker.js
+    dd.deploy.json
+  dd.workers.json
 ```
 
-By default, `dd.deploy.json` points `entrypoint` at `worker.js`, sets
-`assets_dir` to `.`, excludes `worker.js` and `dd.deploy.json` from static
-asset packaging, and carries over the runtime deploy config. The plugin also
+By default, each worker deploy config points `entrypoint` at its local
+`worker.js`. The entry worker points `assets_dir` at `../client` when client
+assets were built. The root `dd.workers.json` manifest lists every worker,
+environment name, output directory, and deploy config path. The plugin also
 writes `_headers` with an immutable cache policy for Vite's fingerprinted build
 assets, such as `/assets/*`.
 
@@ -130,10 +131,10 @@ export default defineConfig({
 ```
 
 If `dd.json` points at a TypeScript entrypoint or source asset directory, the
-generated output config replaces those with the bundled worker path and Vite
-output asset path while preserving the deploy fields the CLI consumes: `name`,
+generated output config replaces those with the environment-built worker path
+and Vite output asset path while preserving the deploy fields the CLI consumes: `name`,
 `config`, `base_url`, and `temporary`. Arbitrary source config keys are not
-copied into `dist/dd.deploy.json`, so local-only settings do not leak into build
+copied into generated deploy configs, so local-only settings do not leak into build
 artifacts.
 
 Pass options inline when you want to override the file:
@@ -143,17 +144,51 @@ dd({
   entry: new URL("./src/dev-worker.ts", import.meta.url),
   config: { public: true },
   deploymentConfig: {
-    input: { name: "local-dev", entrypoint: "src/worker.ts", config: { public: true } },
+    input: {
+      name: "local-dev",
+      entrypoint: "src/worker.ts",
+      config: {
+        public: false,
+        bindings: [
+          { type: "service", binding: "AUTH", service: "auth-worker" },
+        ],
+      },
+    },
   },
 });
 ```
 
-The generated config can be packaged or deployed by the CLI:
+With the default layout, deploy the entry worker from its output directory:
 
 ```bash
-cargo run -p cli -- package-deploy-config dist/dd.deploy.json
-cargo run -p cli -- deploy-config dist/dd.deploy.json
+cargo run -p cli -- package-deploy-config dist/<entry-worker>/dd.deploy.json
+cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json
 ```
+
+Auxiliary workers can also be built as private service-bound workers:
+
+```js
+dd({
+  auxiliaryWorkers: [
+    {
+      name: "auth",
+      kind: "service",
+      binding: "AUTH",
+      service: "my-app-auth",
+      entry: "src/auth-worker.ts",
+      config: {
+        public: false,
+        bindings: [{ type: "kv", binding: "AUTH_DB" }],
+      },
+    },
+  ],
+});
+```
+
+The frontend deploy config gets `{ type: "service", binding: "AUTH", service:
+"my-app-auth" }`. Production builds also write
+`dist/auth/dd.deploy.json` and `dist/auth/worker.js` for the private auth
+worker.
 
 Store the deploy token once with the OS credential store instead of putting it
 in `dd.json`:

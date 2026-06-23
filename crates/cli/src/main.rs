@@ -92,6 +92,9 @@ struct DeployCmd {
     #[arg(long = "dynamic-binding")]
     dynamic_bindings: Vec<String>,
 
+    #[arg(long = "service-binding")]
+    service_bindings: Vec<String>,
+
     #[arg(long = "trace-worker")]
     trace_worker: Option<String>,
 
@@ -146,6 +149,9 @@ struct MintDeployTokenCmd {
 
     #[arg(long = "dynamic-binding")]
     dynamic_bindings: Vec<String>,
+
+    #[arg(long = "service-binding")]
+    service_bindings: Vec<String>,
 
     #[arg(long = "any-binding")]
     allow_any_bindings: bool,
@@ -461,6 +467,13 @@ fn build_deploy_token_mint_request(
                 binding: binding.trim().to_string(),
             }),
     );
+    bindings.extend(
+        command
+            .service_bindings
+            .into_iter()
+            .map(parse_service_binding)
+            .collect::<Result<Vec<_>, _>>()?,
+    );
 
     Ok(DeployTokenMintRequest {
         id: command.id,
@@ -507,6 +520,13 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
             .map(|binding| DeployBinding::Dynamic {
                 binding: binding.trim().to_string(),
             }),
+    );
+    bindings.extend(
+        command
+            .service_bindings
+            .into_iter()
+            .map(parse_service_binding)
+            .collect::<Result<Vec<_>, _>>()?,
     );
     let config = DeployConfig {
         public: command.public,
@@ -625,6 +645,26 @@ fn parse_memory_binding(value: String) -> Result<DeployBinding, String> {
     }
     Ok(DeployBinding::Memory {
         binding: binding.to_string(),
+    })
+}
+
+fn parse_service_binding(value: String) -> Result<DeployBinding, String> {
+    let trimmed = value.trim();
+    let Some((binding, service)) = trimmed.split_once('=') else {
+        return Err(format!(
+            "invalid service binding {trimmed:?}, expected BINDING=worker"
+        ));
+    };
+    let binding = binding.trim();
+    let service = service.trim();
+    if binding.is_empty() || service.is_empty() {
+        return Err(format!(
+            "invalid service binding {trimmed:?}, expected BINDING=worker"
+        ));
+    }
+    Ok(DeployBinding::Service {
+        binding: binding.to_string(),
+        service: service.to_string(),
     })
 }
 
@@ -1368,6 +1408,7 @@ mod tests {
             kv_bindings: vec!["CACHE".to_string()],
             memory_bindings: vec!["ROOM".to_string()],
             dynamic_bindings: Vec::new(),
+            service_bindings: vec!["AUTH=auth-worker".to_string()],
             allow_any_bindings: false,
             allow_internal_trace: false,
             max_source_bytes: Some(1024),
@@ -1383,7 +1424,7 @@ mod tests {
         assert_eq!(request.id.as_deref(), None);
         assert_eq!(request.capabilities.workers, vec!["chat"]);
         assert!(request.capabilities.allow_public);
-        assert_eq!(request.capabilities.bindings.len(), 2);
+        assert_eq!(request.capabilities.bindings.len(), 3);
         assert_eq!(request.expires_in_seconds, Some(3600));
         assert_eq!(request.max_uses, Some(1));
     }

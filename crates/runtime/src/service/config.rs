@@ -9,6 +9,13 @@ pub(super) struct DeployBindings {
     pub(super) kv: Vec<String>,
     pub(super) memory: Vec<String>,
     pub(super) dynamic: Vec<String>,
+    pub(super) service: Vec<ServiceBinding>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ServiceBinding {
+    pub(super) binding: String,
+    pub(super) service: String,
 }
 
 pub(super) struct DynamicWorkerConfig {
@@ -77,6 +84,7 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
     let mut kv = Vec::new();
     let mut memory = Vec::new();
     let mut dynamic = Vec::new();
+    let mut service = Vec::new();
     let mut seen = HashSet::new();
     for binding in &config.bindings {
         match binding {
@@ -116,12 +124,37 @@ pub(super) fn extract_bindings(config: &DeployConfig) -> Result<DeployBindings> 
                 }
                 dynamic.push(name.to_string());
             }
+            DeployBinding::Service {
+                binding,
+                service: target,
+            } => {
+                let name = binding.trim();
+                if name.is_empty() {
+                    return Err(PlatformError::bad_request("binding name must not be empty"));
+                }
+                let service_name = target.trim();
+                if service_name.is_empty() {
+                    return Err(PlatformError::bad_request(
+                        "service binding target must not be empty",
+                    ));
+                }
+                if !seen.insert(name.to_string()) {
+                    return Err(PlatformError::bad_request(format!(
+                        "duplicate binding name: {name}"
+                    )));
+                }
+                service.push(ServiceBinding {
+                    binding: name.to_string(),
+                    service: service_name.to_string(),
+                });
+            }
         }
     }
     Ok(DeployBindings {
         kv,
         memory,
         dynamic,
+        service,
     })
 }
 

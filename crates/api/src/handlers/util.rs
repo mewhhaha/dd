@@ -79,13 +79,20 @@ pub(super) fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(),
             DeployBinding::Kv { binding }
             | DeployBinding::Memory { binding }
             | DeployBinding::Dynamic { binding }
+            | DeployBinding::Service { binding, .. }
                 if binding.trim().is_empty() =>
             {
                 return Err(PlatformError::bad_request("binding name must not be empty"));
             }
+            DeployBinding::Service { service, .. } if service.trim().is_empty() => {
+                return Err(PlatformError::bad_request(
+                    "service binding target must not be empty",
+                ));
+            }
             DeployBinding::Kv { binding }
             | DeployBinding::Memory { binding }
-            | DeployBinding::Dynamic { binding } => {
+            | DeployBinding::Dynamic { binding }
+            | DeployBinding::Service { binding, .. } => {
                 let normalized = binding.trim().to_string();
                 if !seen.insert(normalized.clone()) {
                     return Err(PlatformError::bad_request(format!(

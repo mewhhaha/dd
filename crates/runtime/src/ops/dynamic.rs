@@ -165,6 +165,43 @@ pub(super) fn dynamic_host_rpc_owner_for_request(
     )
 }
 
+pub(super) fn service_binding_owner_for_request(
+    state: &Rc<RefCell<OpState>>,
+    request_context_handle: u32,
+    binding: &str,
+) -> Result<(String, u64, u64, String)> {
+    let binding = binding.trim();
+    if binding.is_empty() {
+        return Err(PlatformError::bad_request(
+            "service binding must not be empty",
+        ));
+    }
+    if request_context_handle == 0 {
+        return Err(PlatformError::bad_request(
+            "service binding request context handle must not be empty",
+        ));
+    }
+    let op_state = state.borrow();
+    let contexts = op_state.borrow::<RequestSecretContexts>();
+    let context = contexts
+        .get(request_context_handle)
+        .ok_or_else(|| PlatformError::runtime("service binding request scope is unavailable"))?;
+    let target_worker = context
+        .execution
+        .service_bindings
+        .get(binding)
+        .cloned()
+        .ok_or_else(|| {
+            PlatformError::runtime(format!("service binding is not allowed: {binding}"))
+        })?;
+    Ok((
+        context.execution.worker_name.as_ref().to_string(),
+        context.execution.generation,
+        context.isolate_id,
+        target_worker,
+    ))
+}
+
 pub(super) fn memory_invoke_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -640,6 +677,87 @@ pub(super) fn op_dynamic_worker_fetch_start(
     {
         pending_replies.cancel(&reply_id);
         return dynamic_start_error("dynamic worker runtime is unavailable");
+    }
+    dynamic_start_ok(reply_id)
+}
+
+#[deno_core::op2]
+#[serde]
+pub(super) fn op_service_binding_fetch_start(
+    state: Rc<RefCell<OpState>>,
+    request_context_handle: u32,
+    #[string] binding: String,
+    #[string] method: String,
+    #[string] url: String,
+    headers_handle: u32,
+    body_handle: u32,
+) -> DynamicPendingReplyStartResult {
+    let (headers, body) = {
+        let mut op_state = state.borrow_mut();
+        let headers = op_state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .take(headers_handle)
+            .unwrap_or_default();
+        let body = op_state
+            .borrow_mut::<HttpPreparedBodies>()
+            .take(body_handle)
+            .unwrap_or_default();
+        (headers, body)
+    };
+    let caller_request_id = {
+        let op_state = state.borrow();
+        match op_state
+            .borrow::<ActiveRequestContextHandles>()
+            .get_handle(request_context_handle)
+        {
+            Some(context) => context.request_id.clone(),
+            None => {
+                return dynamic_start_error("service binding fetch request context is unavailable");
+            }
+        }
+    };
+    let (owner_worker, owner_generation, owner_isolate_id, target_worker) =
+        match service_binding_owner_for_request(&state, request_context_handle, &binding) {
+            Ok(value) => value,
+            Err(error) => {
+                return dynamic_start_error(error);
+            }
+        };
+    let subrequest_id = format!(
+        "{}:service:{}",
+        caller_request_id,
+        DYNAMIC_FETCH_REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let request = WorkerInvocation {
+        method,
+        url,
+        headers,
+        body: body.to_vec(),
+        request_id: subrequest_id,
+    };
+
+    let (reply_id, pending_replies) =
+        allocate_dynamic_pending_reply(&state, &owner_worker, owner_generation, owner_isolate_id);
+    let command_sender = state
+        .borrow()
+        .borrow::<crate::service::RuntimeFastCommandSender>()
+        .clone();
+    if command_sender
+        .0
+        .try_send(crate::service::RuntimeCommand::ServiceBindingFetchStart {
+            owner_worker,
+            owner_generation,
+            binding,
+            target_worker,
+            request,
+            reply_id: reply_id.clone(),
+            pending_replies: pending_replies.clone(),
+        })
+        .is_err()
+    {
+        pending_replies.cancel(&reply_id);
+        return dynamic_start_error("service binding runtime is unavailable");
     }
     dynamic_start_ok(reply_id)
 }

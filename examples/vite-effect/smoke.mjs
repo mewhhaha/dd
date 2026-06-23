@@ -111,7 +111,7 @@ try {
   const authWorkerRoute = await fetch(`${base}/__auth/status`);
   const authWorkerRouteText = await authWorkerRoute.text();
   if (authWorkerRouteText !== "auth worker ready") {
-    throw new Error(`auth worker route did not proxy through dynamic binding: ${authWorkerRouteText}`);
+    throw new Error(`auth worker route did not proxy through service binding: ${authWorkerRouteText}`);
   }
 
   const moduleResponse = await fetch(`${base}/src/client.ts`, {

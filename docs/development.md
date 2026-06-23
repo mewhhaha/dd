@@ -312,7 +312,8 @@ curl -X POST http://127.0.0.1:8081/v1/deploy \
     "public": true,
     "bindings": [
       { "type": "kv", "binding": "MY_KV" },
-      { "type": "dynamic", "binding": "SANDBOX" }
+      { "type": "dynamic", "binding": "SANDBOX" },
+      { "type": "service", "binding": "AUTH", "service": "auth-worker" }
     ]
   }
 }

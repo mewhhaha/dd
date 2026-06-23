@@ -133,7 +133,14 @@ pub(crate) struct WorkerDeploymentPayload {
     pub(crate) memory_bindings: Vec<String>,
     pub(crate) dynamic_bindings: Vec<String>,
     pub(crate) dynamic_rpc_bindings: Vec<String>,
+    pub(crate) service_bindings: Vec<WorkerServiceBindingPayload>,
     pub(crate) dynamic_env: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct WorkerServiceBindingPayload {
+    pub(crate) binding: String,
+    pub(crate) service: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -388,6 +395,7 @@ pub(crate) struct RequestExecutionContext {
     pub(crate) generation: u64,
     pub(crate) dynamic_bindings: Arc<HashSet<String>>,
     pub(crate) dynamic_rpc_bindings: Arc<HashSet<String>>,
+    pub(crate) service_bindings: Arc<HashMap<String, String>>,
     pub(crate) replacements: Arc<HashMap<String, String>>,
     pub(crate) egress_allow_hosts: Arc<Vec<EgressAllowHost>>,
     pub(crate) allow_cache: bool,
@@ -402,6 +410,7 @@ impl Default for RequestExecutionContext {
             generation: 0,
             dynamic_bindings: Arc::new(HashSet::new()),
             dynamic_rpc_bindings: Arc::new(HashSet::new()),
+            service_bindings: Arc::new(HashMap::new()),
             replacements: Arc::new(HashMap::new()),
             egress_allow_hosts: Arc::new(Vec::new()),
             allow_cache: true,
@@ -554,6 +563,7 @@ impl RequestExecutionContext {
             generation,
             dynamic_bindings,
             dynamic_rpc_bindings,
+            service_bindings,
             replacements,
             egress_allow_hosts,
             allow_cache,
@@ -569,6 +579,17 @@ impl RequestExecutionContext {
             .into_iter()
             .map(|binding| binding.trim().to_string())
             .filter(|binding| !binding.is_empty())
+            .collect();
+        let service_bindings = service_bindings
+            .into_iter()
+            .filter_map(|binding| {
+                let env_name = binding.binding.trim().to_string();
+                let service = binding.service.trim().to_string();
+                if env_name.is_empty() || service.is_empty() {
+                    return None;
+                }
+                Some((env_name, service))
+            })
             .collect();
         let replacements = replacements
             .into_iter()
@@ -590,6 +611,7 @@ impl RequestExecutionContext {
             generation,
             dynamic_bindings: Arc::new(dynamic_bindings),
             dynamic_rpc_bindings: Arc::new(dynamic_rpc_bindings),
+            service_bindings: Arc::new(service_bindings),
             replacements: Arc::new(replacements),
             egress_allow_hosts: Arc::new(egress_allow_hosts),
             allow_cache,
@@ -604,6 +626,7 @@ pub(crate) struct RequestExecutionContextInit {
     pub(crate) generation: u64,
     pub(crate) dynamic_bindings: Vec<String>,
     pub(crate) dynamic_rpc_bindings: Vec<String>,
+    pub(crate) service_bindings: Vec<WorkerServiceBindingPayload>,
     pub(crate) replacements: Vec<(String, String)>,
     pub(crate) egress_allow_hosts: Vec<String>,
     pub(crate) allow_cache: bool,

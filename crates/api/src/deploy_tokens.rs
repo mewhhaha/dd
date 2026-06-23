@@ -361,6 +361,11 @@ fn validate_capabilities(capabilities: &DeployTokenCapabilities) -> Result<()> {
                 "token binding names must not be empty",
             ));
         }
+        if service_target(binding).is_some_and(|target| target.trim().is_empty()) {
+            return Err(PlatformError::bad_request(
+                "token service binding targets must not be empty",
+            ));
+        }
     }
     Ok(())
 }
@@ -460,13 +465,22 @@ fn normalized_workers(capabilities: &DeployTokenCapabilities) -> Vec<String> {
 fn bindings_match(left: &DeployBinding, right: &DeployBinding) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
         && binding_name(left).trim() == binding_name(right).trim()
+        && service_target(left).map(str::trim) == service_target(right).map(str::trim)
 }
 
 fn binding_name(binding: &DeployBinding) -> &str {
     match binding {
         DeployBinding::Kv { binding }
         | DeployBinding::Memory { binding }
-        | DeployBinding::Dynamic { binding } => binding,
+        | DeployBinding::Dynamic { binding }
+        | DeployBinding::Service { binding, .. } => binding,
+    }
+}
+
+fn service_target(binding: &DeployBinding) -> Option<&str> {
+    match binding {
+        DeployBinding::Service { service, .. } => Some(service),
+        _ => None,
     }
 }
 
@@ -571,6 +585,48 @@ mod tests {
             temporary: false,
         };
         enforce_capabilities(&caps_for_worker("chat"), &request).expect("allowed");
+    }
+
+    #[test]
+    fn capabilities_scope_service_binding_target() {
+        let capabilities = DeployTokenCapabilities {
+            workers: vec!["app".to_string()],
+            allow_private: true,
+            bindings: vec![DeployBinding::Service {
+                binding: "AUTH".to_string(),
+                service: "auth-worker".to_string(),
+            }],
+            ..DeployTokenCapabilities::default()
+        };
+        let allowed = DeployRequest {
+            name: "app".to_string(),
+            source: "export default {}".to_string(),
+            config: DeployConfig {
+                public: false,
+                bindings: vec![DeployBinding::Service {
+                    binding: "AUTH".to_string(),
+                    service: "auth-worker".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+            assets: Vec::new(),
+            asset_headers: None,
+            temporary: false,
+        };
+        enforce_capabilities(&capabilities, &allowed).expect("target should match");
+
+        let rejected = DeployRequest {
+            config: DeployConfig {
+                bindings: vec![DeployBinding::Service {
+                    binding: "AUTH".to_string(),
+                    service: "other-worker".to_string(),
+                }],
+                ..allowed.config.clone()
+            },
+            ..allowed
+        };
+        let error = enforce_capabilities(&capabilities, &rejected).expect_err("reject");
+        assert_eq!(error.kind(), common::ErrorKind::Forbidden);
     }
 
     #[test]

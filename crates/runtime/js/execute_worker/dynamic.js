@@ -258,17 +258,21 @@
     return value.map((entry) => {
       const type = String(entry?.type ?? "").trim().toLowerCase();
       const binding = String(entry?.binding ?? "").trim();
-      if (!["kv", "memory", "dynamic"].includes(type)) {
+      if (!["kv", "memory", "dynamic", "service"].includes(type)) {
         throw new Error(`dynamic worker binding type is invalid: ${type}`);
       }
       if (!binding) {
         throw new Error("dynamic worker binding name must not be empty");
       }
+      const service = String(entry?.service ?? "").trim();
+      if (type === "service" && !service) {
+        throw new Error("dynamic worker service binding target must not be empty");
+      }
       if (seen.has(binding)) {
         throw new Error(`duplicate dynamic worker binding: ${binding}`);
       }
       seen.add(binding);
-      return { type, binding };
+      return type === "service" ? { type, binding, service } : { type, binding };
     });
   };
 
@@ -418,6 +422,69 @@
     recordDynamicStageMetric("replyMaterialize", performance.now() - materializeStarted);
     return response;
   };
+
+  const invokeServiceBindingFetch = async (
+    bindingName,
+    targetWorker,
+    request,
+    requestContextHandle,
+  ) => {
+    const invokeLabel = `service binding fetch (${bindingName} -> ${targetWorker})`;
+    const startStarted = performance.now();
+    const headersHandle = storeResponseHeaders(request.headers);
+    const bodyHandle = Math.max(
+      0,
+      Math.trunc(Number(callOp(
+        "op_http_store_prepared_body",
+        request.body ?? new Uint8Array(),
+      ) ?? 0) || 0),
+    );
+    const result = await awaitDynamicReply(
+      invokeLabel,
+      () => callOp(
+        "op_service_binding_fetch_start",
+        requestContextHandle,
+        bindingName,
+        request.method,
+        request.url,
+        headersHandle,
+        bodyHandle,
+      ),
+      30_000,
+      { syncTime: false },
+    ).finally(() => {
+      recordDynamicStageMetric("serviceStartOp", performance.now() - startStarted);
+    });
+    if (!result || typeof result !== "object" || result.ok === false) {
+      applyDynamicReplyBoundary(result);
+      throw new Error(formatDynamicFailure("service binding fetch failed", result));
+    }
+    applyDynamicReplyBoundary(result);
+    const materializeStarted = performance.now();
+    const replyHeadersHandle = Math.max(0, Math.trunc(Number(result.headers_handle ?? 0) || 0));
+    const replyBodyHandle = Math.max(0, Math.trunc(Number(result.body_handle ?? 0) || 0));
+    const response = new Response(callOp("op_http_take_prepared_body", replyBodyHandle), {
+      status: Number(result.status ?? 200),
+      headers: callOp("op_http_take_prepared_headers", replyHeadersHandle),
+    });
+    recordDynamicStageMetric("replyMaterialize", performance.now() - materializeStarted);
+    return response;
+  };
+
+  const createServiceBinding = (bindingName, targetWorker) => Object.freeze({
+    worker: targetWorker,
+    async fetch(inputValue, initValue = undefined) {
+      const normalizeStarted = performance.now();
+      const request = await normalizeDynamicFetchInput(inputValue, initValue);
+      recordDynamicStageMetric("jsRequestNormalize", performance.now() - normalizeStarted);
+      return invokeServiceBindingFetch(
+        bindingName,
+        targetWorker,
+        request,
+        activeRequestContextHandle(),
+      );
+    },
+  });
 
   const createDynamicWorkerStub = (bindingName, entry, cacheKey = "") => {
     let activeEntry = entry;
@@ -904,6 +971,17 @@
         env,
         envName,
         () => createDynamicHostRpcNamespace(bindingName || envName),
+      );
+    }
+
+    for (const [envName, targetWorker] of serviceBindingsConfig) {
+      if (!envName || !targetWorker) {
+        continue;
+      }
+      defineLazyValue(
+        env,
+        envName,
+        () => createServiceBinding(envName, targetWorker),
       );
     }
 
@@ -1554,6 +1632,25 @@ globalThis.__dd_install_worker_deployment_handle = (deploymentHandle) => {
       .map((entry) => String(entry ?? "").trim())
       .filter((entry) => entry.length > 0),
   );
+  const normalizeServiceBindings = (input) => Object.freeze(
+    (Array.isArray(input) ? input : [])
+      .map((entry) => {
+        if (Array.isArray(entry)) {
+          return Object.freeze([
+            String(entry[0] ?? "").trim(),
+            String(entry[1] ?? "").trim(),
+          ]);
+        }
+        if (entry && typeof entry === "object") {
+          return Object.freeze([
+            String(entry.binding ?? "").trim(),
+            String(entry.service ?? "").trim(),
+          ]);
+        }
+        return Object.freeze(["", ""]);
+      })
+      .filter(([envName, targetWorker]) => envName.length > 0 && targetWorker.length > 0),
+  );
   const normalizeEnv = (input) => Object.freeze(
     (Array.isArray(input) ? input : [])
       .map((entry) => {
@@ -1595,6 +1692,7 @@ globalThis.__dd_install_worker_deployment_handle = (deploymentHandle) => {
     memory_bindings: normalizeNames(payload.memory_bindings),
     dynamic_bindings: normalizeBindingPairs(payload.dynamic_bindings),
     dynamic_rpc_bindings: normalizeBindingPairs(payload.dynamic_rpc_bindings),
+    service_bindings: normalizeServiceBindings(payload.service_bindings),
     dynamic_env: normalizeEnv(payload.dynamic_env),
   });
 };

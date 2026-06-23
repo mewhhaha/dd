@@ -42,6 +42,15 @@ pub(crate) enum RuntimeCommand {
         reply_id: String,
         pending_replies: crate::ops::DynamicPendingReplies,
     },
+    ServiceBindingFetchStart {
+        owner_worker: String,
+        owner_generation: u64,
+        binding: String,
+        target_worker: String,
+        request: WorkerInvocation,
+        reply_id: String,
+        pending_replies: crate::ops::DynamicPendingReplies,
+    },
     RetireDynamicWorkerHandle {
         handle: String,
         reason: String,
@@ -415,6 +424,29 @@ impl WorkerManager {
                         reply_id,
                         pending_replies,
                         command_tx: runtime_fast_sender,
+                    },
+                    event_tx,
+                );
+                true
+            }
+            RuntimeCommand::ServiceBindingFetchStart {
+                owner_worker,
+                owner_generation,
+                binding,
+                target_worker,
+                request,
+                reply_id,
+                pending_replies,
+            } => {
+                self.start_service_binding_fetch(
+                    ServiceBindingFetchStart {
+                        owner_worker,
+                        owner_generation,
+                        binding,
+                        target_worker,
+                        request,
+                        reply_id,
+                        pending_replies,
                     },
                     event_tx,
                 );

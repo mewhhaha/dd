@@ -40,6 +40,14 @@ impl WorkerManager {
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
+        let service_bindings = bindings
+            .service
+            .iter()
+            .map(|binding| crate::ops::WorkerServiceBindingPayload {
+                binding: binding.binding.clone(),
+                service: binding.service.clone(),
+            })
+            .collect::<Vec<_>>();
         let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
             worker_name: worker_name.clone(),
             kv_bindings: bindings.kv.clone(),
@@ -52,6 +60,7 @@ impl WorkerManager {
             memory_bindings: bindings.memory.clone(),
             dynamic_bindings: bindings.dynamic.clone(),
             dynamic_rpc_bindings: Vec::new(),
+            service_bindings: service_bindings.clone(),
             dynamic_env: Vec::new(),
         });
         let request_context = RequestExecutionContext::new(RequestExecutionContextInit {
@@ -59,6 +68,7 @@ impl WorkerManager {
             generation,
             dynamic_bindings: bindings.dynamic.clone(),
             dynamic_rpc_bindings: Vec::new(),
+            service_bindings,
             replacements: Vec::new(),
             egress_allow_hosts: Vec::new(),
             allow_cache: true,
@@ -243,12 +253,22 @@ impl WorkerManager {
             .iter()
             .map(|binding| binding.binding.clone())
             .collect::<Vec<_>>();
+        let service_bindings = dynamic_config
+            .bindings
+            .service
+            .iter()
+            .map(|binding| crate::ops::WorkerServiceBindingPayload {
+                binding: binding.binding.clone(),
+                service: binding.service.clone(),
+            })
+            .collect::<Vec<_>>();
         let dynamic_quota_state = Arc::new(DynamicQuotaState::default());
         let request_context = RequestExecutionContext::new(RequestExecutionContextInit {
             worker_name: worker_name.clone(),
             generation,
             dynamic_bindings: dynamic_config.bindings.dynamic.clone(),
             dynamic_rpc_bindings: dynamic_rpc_binding_names.clone(),
+            service_bindings: service_bindings.clone(),
             replacements: dynamic_config.secret_replacements,
             egress_allow_hosts: dynamic_config.egress_allow_hosts,
             allow_cache: dynamic_config.policy.allow_state_bindings,
@@ -268,6 +288,7 @@ impl WorkerManager {
             memory_bindings: dynamic_config.bindings.memory.clone(),
             dynamic_bindings: dynamic_config.bindings.dynamic.clone(),
             dynamic_rpc_bindings: dynamic_rpc_binding_names,
+            service_bindings,
             dynamic_env: dynamic_config.dynamic_env.clone(),
         });
 

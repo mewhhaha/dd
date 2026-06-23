@@ -29,4 +29,5 @@ pnpm --filter dd-vite-hono-example smoke
 pnpm --filter dd-vite-hono-example typecheck
 ```
 
-The build emits a rewritten deployment config in `dist/dd.deploy.json` and a cache policy for fingerprinted assets in `dist/_headers`.
+The build emits `dist/vite-hono/worker.js`, `dist/vite-hono/dd.deploy.json`,
+`dist/client/` assets, and `dist/dd.workers.json`.

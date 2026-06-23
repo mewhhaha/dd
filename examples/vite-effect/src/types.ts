@@ -1,36 +1,12 @@
 import type { AuthenticatorTransportFuture } from "@simplewebauthn/server";
 
-export type DynamicWorkerConfig = {
-  source?: string;
-  entrypoint?: string;
-  modules?: Record<string, string>;
-  bindings?: Array<{ type: "kv" | "memory" | "dynamic"; binding: string }>;
-  env?: Record<string, unknown>;
-  timeout?: number;
-  egress_allow_hosts?: string[];
-  allow_host_rpc?: boolean;
-  allow_websocket?: boolean;
-  allow_transport?: boolean;
-  allow_state_bindings?: boolean;
-  max_request_bytes?: number;
-  max_response_bytes?: number;
-  max_outbound_requests?: number;
-  max_concurrency?: number;
-};
-
-export type DynamicWorkerStub = {
-  worker: string;
-  fetch(input: Request | string, init?: RequestInit): Promise<Response>;
-};
-
-export type DynamicWorkerNamespace = {
-  get(id: string, factory: () => DynamicWorkerConfig | Promise<DynamicWorkerConfig>): Promise<DynamicWorkerStub>;
-  list(): Promise<string[]>;
-  delete(id: string): Promise<unknown>;
+export type ServiceBinding = {
+  readonly worker?: string;
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
 };
 
 export type AppEnv = {
-  AUTH_WORKER: DynamicWorkerNamespace;
+  AUTH: ServiceBinding;
   [binding: string]: unknown;
 };
 

@@ -295,6 +295,7 @@ deno_core::extension!(
         op_dynamic_worker_list,
         op_dynamic_worker_delete,
         op_dynamic_worker_fetch_start,
+        op_service_binding_fetch_start,
         op_dynamic_host_rpc_invoke,
         op_request_invocation_descriptor,
         op_take_worker_deployment_config,

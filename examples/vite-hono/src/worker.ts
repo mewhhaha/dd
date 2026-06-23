@@ -13,12 +13,19 @@ type MemoryNamespace = {
 
 type MemoryShard = {
   atomic<T>(callback: () => T): Promise<T>;
+  apply(effects: MemoryEffect[]): Promise<void>;
   accept(request: Request): { handle: string; response: Response };
-  defer(callback: () => void | Promise<void>): void;
   tvar<T>(key: string, defaultValue: T): {
     read(): T;
     write(value: T): void;
   };
+};
+
+type MemoryEffect = {
+  type: "socket.send";
+  handle: string;
+  payload: string;
+  kind?: "text";
 };
 
 type Env = {
@@ -109,10 +116,6 @@ type StorefrontSocketWakeEvent = {
   stub?: MemoryShard;
   handle?: string;
   data?: unknown;
-};
-
-type MemoryWebSocket = WebSocket & {
-  send(value: string, kind?: "text"): void;
 };
 
 const SESSION_COOKIE = "dd_storefront_session";
@@ -649,6 +652,13 @@ app.post("/notes/:slug", async (context) => {
 
 export default {
   fetch(request: Request, env: Env): Response | Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/storefront/live") {
+      return acceptStorefrontLiveSocket(request, env, WORKER_NAME);
+    }
+    if (url.pathname === "/api/cart/live") {
+      return acceptStorefrontCartSocket(request, env, WORKER_NAME);
+    }
     return app.fetch(request, env);
   },
   async wake(event: StorefrontSocketWakeEvent): Promise<void> {
@@ -1168,10 +1178,6 @@ async function acceptStorefrontLiveSocket(
     ];
     handles.write(nextHandles);
     events.write(nextEvent);
-    room.defer(() => {
-      const socket = new WebSocket(handle) as MemoryWebSocket;
-      socket.send(liveSocketPayload(workerName, "connected", nextEvent), "text");
-    });
     return response;
   });
 }
@@ -1200,10 +1206,6 @@ async function acceptStorefrontCartSocket(
     ];
     handles.write(nextHandles);
     events.write(nextEvent);
-    room.defer(() => {
-      const socket = new WebSocket(handle) as MemoryWebSocket;
-      socket.send(cartSocketPayload(workerName, "connected", nextEvent), "text");
-    });
     return response;
   });
 }
@@ -1214,20 +1216,19 @@ async function broadcastStorefrontCartUpdate(
   sessionId: string,
 ): Promise<void> {
   const room = cartSocketRoom(env, workerName, sessionId);
-  await room.atomic(() => {
+  const effects = await room.atomic(() => {
     const handles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
     const events = room.tvar<number>(CART_SOCKET_EVENTS_KEY, 0);
     const nextEvent = Number(events.read()) + 1;
     const nextHandles = normalizeSocketHandles(handles.read()).slice(-8);
     handles.write(nextHandles);
     events.write(nextEvent);
-    for (const handle of nextHandles) {
-      room.defer(() => {
-        const socket = new WebSocket(handle) as MemoryWebSocket;
-        socket.send(cartSocketPayload(workerName, "updated", nextEvent), "text");
-      });
-    }
+    return nextHandles.map((handle) => socketSendEffect(
+      handle,
+      cartSocketPayload(workerName, "updated", nextEvent),
+    ));
   });
+  await room.apply(effects);
 }
 
 async function handleStorefrontLiveSocketWake(
@@ -1251,15 +1252,18 @@ async function handleStorefrontLiveSocketWake(
   if (event.type !== "socketmessage") {
     return;
   }
-  await room.atomic(() => {
+  const effects = await room.atomic(() => {
     const events = room.tvar<number>(LIVE_SOCKET_EVENTS_KEY, 0);
     const nextEvent = Number(events.read()) + 1;
     events.write(nextEvent);
-    room.defer(() => {
-      const socket = new WebSocket(handle) as MemoryWebSocket;
-      socket.send(liveSocketPayload(workerName, String(event.data ?? "message"), nextEvent), "text");
-    });
+    return [
+      socketSendEffect(
+        handle,
+        liveSocketPayload(workerName, String(event.data ?? "message"), nextEvent),
+      ),
+    ];
   });
+  await room.apply(effects);
 }
 
 function cartMemory(env: Env, sessionId: string): MemoryShard {
@@ -1270,6 +1274,15 @@ function cartSocketRoom(env: Env, workerName: string, sessionId: string): Memory
   return env.EXAMPLE_MEMORY.get(
     env.EXAMPLE_MEMORY.idFromName(`${workerName}:cart-live:${sessionId}`),
   );
+}
+
+function socketSendEffect(handle: string, payload: string): MemoryEffect {
+  return {
+    type: "socket.send",
+    handle,
+    payload,
+    kind: "text",
+  };
 }
 
 async function ensureCatalog(db: KvNamespace): Promise<void> {

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ddVitePlugin } from "../packages/dd-vite/src/vite.js";
 
 const require = createRequire(new URL("../packages/dd-vite/package.json", import.meta.url));
-const { build, resolveConfig } = await import(require.resolve("vite"));
+const { createBuilder, resolveConfig } = await import(require.resolve("vite"));
 const root = await mkdtemp(join(tmpdir(), "dd-vite-config-"));
 const workerBundleEnv = "DD_VITE_WORKER_BUNDLE";
 const previousWorkerBundleEnv = process.env[workerBundleEnv];
@@ -159,7 +159,7 @@ try {
   );
   assert.equal(typeof ddEnvironment.dev.createEnvironment, "function");
 
-  await build({
+  await buildApp({
     root,
     configFile: false,
     logLevel: "silent",
@@ -180,9 +180,10 @@ try {
     ],
   });
 
-  const generatedConfig = JSON.parse(await readFile(join(root, "dist/dd.deploy.json"), "utf8"));
+  const generatedConfig = JSON.parse(await readFile(join(root, "dist/config-check-worker/dd.deploy.json"), "utf8"));
   assert.equal(generatedConfig.name, "config-check-worker");
   assert.equal(generatedConfig.entrypoint, "worker.js");
+  assert.equal(generatedConfig.assets_dir, "../client");
   assert.equal(generatedConfig.base_url, "https://dd.example.test");
   assert.equal(generatedConfig.temporary, true);
   assert(generatedConfig.asset_excludes.includes("secret-local.txt"));
@@ -193,16 +194,19 @@ try {
   assert.equal(generatedConfig.bindings, undefined);
   assert.equal(generatedConfig.internal, undefined);
   assert(
-    await readFile(join(root, "dist/worker.js"), "utf8"),
+    await readFile(join(root, "dist/config-check-worker/worker.js"), "utf8"),
     "dd worker artifact should be emitted even when an unrelated ssr environment exists",
   );
+  const manifest = JSON.parse(await readFile(join(root, "dist/dd.workers.json"), "utf8"));
+  assert.equal(manifest.entry, "config-check-worker");
+  assert.equal(manifest.workers[0].deployConfig, "config-check-worker/dd.deploy.json");
   assert.equal(
     process.env[workerBundleEnv],
     undefined,
     "dd worker bundle guard should not leak into later Vite plugin initialization",
   );
 
-  await build({
+  await buildApp({
     root,
     configFile: false,
     logLevel: "silent",
@@ -223,7 +227,7 @@ try {
 
   let flatHeaders = "";
   try {
-    flatHeaders = await readFile(join(root, "flat-dist/_headers"), "utf8");
+    flatHeaders = await readFile(join(root, "flat-dist/client/_headers"), "utf8");
   } catch (error) {
     if (error?.code !== "ENOENT") {
       throw error;
@@ -258,6 +262,9 @@ try {
       plugins: [
         ddVitePlugin({
           middleware: false,
+          viteEnvironment: {
+            name: "dd",
+          },
           runtimeOptions: {
             binary: "/does/not/exist",
           },
@@ -317,4 +324,9 @@ try {
     process.env[workerBundleEnv] = previousWorkerBundleEnv;
   }
   await rm(root, { recursive: true, force: true });
+}
+
+async function buildApp(config) {
+  const builder = await createBuilder(config);
+  await builder.buildApp();
 }

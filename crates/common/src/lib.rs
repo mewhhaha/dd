@@ -164,6 +164,10 @@ pub enum DeployBinding {
     Dynamic {
         binding: String,
     },
+    Service {
+        binding: String,
+        service: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

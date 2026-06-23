@@ -8,6 +8,7 @@ node_modules/
 **/node_modules/
 dist/
 **/dist/
+**/dd-env.d.ts
 .react-router/
 **/.react-router/
 tmp/

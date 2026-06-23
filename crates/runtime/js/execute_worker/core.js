@@ -10,6 +10,7 @@ globalThis.__dd_execute_worker = (payload) => {
   const memoryBindingsConfig = deploymentConfig?.memory_bindings ?? [];
   const dynamicBindingsConfig = deploymentConfig?.dynamic_bindings ?? [];
   const dynamicRpcBindingsConfig = deploymentConfig?.dynamic_rpc_bindings ?? [];
+  const serviceBindingsConfig = deploymentConfig?.service_bindings ?? [];
   const dynamicEnvConfig = deploymentConfig?.dynamic_env ?? [];
   const memoryCallConfig = payload?.memory_call ?? null;
   const hostRpcCallConfig = payload?.host_rpc_call ?? null;

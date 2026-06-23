@@ -24,8 +24,8 @@ use crate::engine::{
 use crate::kv::KvStore;
 use crate::memory::{MemoryOutboxClaim, MemoryStore};
 use crate::memory_rpc::{
-    decode_memory_invoke_request, encode_memory_invoke_response, MemoryInvokeCall,
-    MemoryInvokeResponse,
+    decode_memory_invoke_request, decode_memory_invoke_response, encode_memory_invoke_request,
+    encode_memory_invoke_response, MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse,
 };
 use crate::ops::{
     clear_request_body_stream, clear_request_secret_context, register_memory_request_scope,

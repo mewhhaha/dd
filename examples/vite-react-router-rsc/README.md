@@ -29,7 +29,8 @@ Vite still serves its own client, module, RSC proxy, and HMR endpoints directly.
 The generated production deployment config points at the bundled dd worker entry and the React Router RSC client asset directory:
 
 ```text
-dist/worker.js
-dist/dd.deploy.json
+dist/vite-react-router-rsc/worker.js
+dist/vite-react-router-rsc/dd.deploy.json
 dist/react-router-rsc/client/
+dist/dd.workers.json
 ```

@@ -317,6 +317,26 @@ mod tests {
     }
 
     #[test]
+    fn service_binding_requires_target_and_unique_name() {
+        let missing_target = vec![DeployBinding::Service {
+            binding: "AUTH".to_string(),
+            service: String::new(),
+        }];
+        assert!(validate_deploy_bindings(&missing_target).is_err());
+
+        let duplicate = vec![
+            DeployBinding::Memory {
+                binding: "AUTH".to_string(),
+            },
+            DeployBinding::Service {
+                binding: "AUTH".to_string(),
+                service: "auth-worker".to_string(),
+            },
+        ];
+        assert!(validate_deploy_bindings(&duplicate).is_err());
+    }
+
+    #[test]
     fn accepts_no_trace_config() {
         let config = DeployInternalConfig::default();
         assert!(validate_internal_config(&config).is_ok());

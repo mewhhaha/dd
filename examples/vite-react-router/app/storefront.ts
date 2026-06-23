@@ -12,12 +12,19 @@ export type MemoryNamespace = {
 
 type MemoryShard = {
   atomic<T>(callback: () => T): Promise<T>;
+  apply(effects: MemoryEffect[]): Promise<void>;
   accept(request: Request): { handle: string; response: Response };
-  defer(callback: () => void | Promise<void>): void;
   tvar<T>(key: string, defaultValue: T): {
     read(): T;
     write(value: T): void;
   };
+};
+
+type MemoryEffect = {
+  type: "socket.send";
+  handle: string;
+  payload: string;
+  kind?: "text";
 };
 
 export type StorefrontEnv = {
@@ -93,10 +100,6 @@ type StorefrontSocketWakeEvent = {
   stub?: MemoryShard;
   handle?: string;
   data?: unknown;
-};
-
-type MemoryWebSocket = WebSocket & {
-  send(value: string, kind?: "text"): void;
 };
 
 export const FEATURED_PRODUCT_SLUG = "runtime";
@@ -316,10 +319,6 @@ export async function acceptStorefrontLiveSocket(
     ];
     handles.write(nextHandles);
     events.write(nextEvent);
-    room.defer(() => {
-      const socket = new WebSocket(handle) as MemoryWebSocket;
-      socket.send(liveSocketPayload(workerName, "connected", nextEvent), "text");
-    });
     return response;
   });
 }
@@ -348,10 +347,6 @@ export async function acceptStorefrontCartSocket(
     ];
     handles.write(nextHandles);
     events.write(nextEvent);
-    room.defer(() => {
-      const socket = new WebSocket(handle) as MemoryWebSocket;
-      socket.send(cartSocketPayload(workerName, "connected", nextEvent), "text");
-    });
     return response;
   });
 }
@@ -362,20 +357,19 @@ export async function broadcastStorefrontCartUpdate(
   sessionId: string,
 ): Promise<void> {
   const room = cartSocketRoom(env, workerName, sessionId);
-  await room.atomic(() => {
+  const effects = await room.atomic(() => {
     const handles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
     const events = room.tvar<number>(CART_SOCKET_EVENTS_KEY, 0);
     const nextEvent = Number(events.read()) + 1;
     const nextHandles = normalizeSocketHandles(handles.read()).slice(-8);
     handles.write(nextHandles);
     events.write(nextEvent);
-    for (const handle of nextHandles) {
-      room.defer(() => {
-        const socket = new WebSocket(handle) as MemoryWebSocket;
-        socket.send(cartSocketPayload(workerName, "updated", nextEvent), "text");
-      });
-    }
+    return nextHandles.map((handle) => socketSendEffect(
+      handle,
+      cartSocketPayload(workerName, "updated", nextEvent),
+    ));
   });
+  await room.apply(effects);
 }
 
 export async function handleStorefrontLiveSocketWake(
@@ -399,15 +393,18 @@ export async function handleStorefrontLiveSocketWake(
   if (event.type !== "socketmessage") {
     return;
   }
-  await room.atomic(() => {
+  const effects = await room.atomic(() => {
     const events = room.tvar<number>(LIVE_SOCKET_EVENTS_KEY, 0);
     const nextEvent = Number(events.read()) + 1;
     events.write(nextEvent);
-    room.defer(() => {
-      const socket = new WebSocket(handle) as MemoryWebSocket;
-      socket.send(liveSocketPayload(workerName, String(event.data ?? "message"), nextEvent), "text");
-    });
+    return [
+      socketSendEffect(
+        handle,
+        liveSocketPayload(workerName, String(event.data ?? "message"), nextEvent),
+      ),
+    ];
   });
+  await room.apply(effects);
 }
 
 async function ensureCatalog(db: KvNamespace): Promise<void> {
@@ -622,6 +619,15 @@ function cartSocketRoom(env: StorefrontEnv, workerName: string, sessionId: strin
   return env.EXAMPLE_MEMORY.get(
     env.EXAMPLE_MEMORY.idFromName(`${workerName}:cart-live:${sessionId}`),
   );
+}
+
+function socketSendEffect(handle: string, payload: string): MemoryEffect {
+  return {
+    type: "socket.send",
+    handle,
+    payload,
+    kind: "text",
+  };
 }
 
 function productKey(slug: string): string {

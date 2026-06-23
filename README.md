@@ -52,6 +52,30 @@ cargo run -p cli -- deploy-config dist/dd.deploy.json
 CLI server precedence is `--server`, `DD_SERVER`, config `base_url`, then the
 local private default.
 
+Workers are private unless `config.public` is `true`. A private worker can still
+be called from another worker with a service binding:
+
+```json
+{
+  "name": "frontend",
+  "entrypoint": "worker.js",
+  "config": {
+    "public": true,
+    "bindings": [
+      { "type": "service", "binding": "AUTH", "service": "auth-worker" }
+    ]
+  }
+}
+```
+
+```js
+export default {
+  async fetch(request, env) {
+    return env.AUTH.fetch(new URL("/session", request.url));
+  },
+};
+```
+
 ## Memory namespaces
 
 Memory namespace is the main coordination primitive. You pick a key, get the actor for that key, and run a synchronous `atomic(...)` command against it. Commands for one key are ordered, the callback runs once, and state plus emitted effects commit together.

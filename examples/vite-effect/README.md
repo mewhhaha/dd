@@ -12,6 +12,13 @@ The worker is a passkey auth app. Effect owns the worker architecture:
 - Tagged errors model expected HTTP failures.
 - `Schedule` retries transient KV operations.
 
+It is also a multi-worker deployment. The public frontend worker declares an
+`AUTH` service binding, and the auth worker is deployed separately as
+`vite-effect-auth` with `public: false`. Build output includes
+`dist/vite-effect/dd.deploy.json` for the frontend and
+`dist/auth/dd.deploy.json` for the private auth worker. The private auth worker
+is called through the `AUTH` service binding during dev and production.
+
 ```bash
 pnpm install
 pnpm --filter dd-vite-effect-example dev

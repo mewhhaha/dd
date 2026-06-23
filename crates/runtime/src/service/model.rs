@@ -860,6 +860,16 @@ pub(super) struct DynamicWorkerFetchStart {
     pub(super) command_tx: mpsc::Sender<RuntimeCommand>,
 }
 
+pub(super) struct ServiceBindingFetchStart {
+    pub(super) owner_worker: String,
+    pub(super) owner_generation: u64,
+    pub(super) binding: String,
+    pub(super) target_worker: String,
+    pub(super) request: WorkerInvocation,
+    pub(super) reply_id: String,
+    pub(super) pending_replies: crate::ops::DynamicPendingReplies,
+}
+
 pub(super) struct RuntimeThreadStart {
     pub(super) receiver: mpsc::Receiver<RuntimeCommand>,
     pub(super) cancel_receiver: mpsc::Receiver<RuntimeCommand>,

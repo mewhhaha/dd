@@ -1147,6 +1147,101 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
 
 #[tokio::test]
 #[serial]
+async fn private_worker_can_call_private_service_binding() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 2,
+        max_inflight_per_isolate: 2,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "private-auth".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const body = await request.text();
+    return new Response(
+      JSON.stringify({
+        method: request.method,
+        path: url.pathname,
+        service: request.headers.get("x-service"),
+        body,
+      }),
+      { status: 201, headers: { "x-target-worker": "private-auth" } },
+    );
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                public: false,
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("target deploy should succeed");
+
+    service
+        .deploy_with_config(
+            "private-app".to_string(),
+            r#"
+export default {
+  async fetch(_request, env) {
+    const response = await env.AUTH.fetch("/session", {
+      method: "POST",
+      headers: { "x-service": "app" },
+      body: "hello",
+    });
+    return new Response(
+      `${response.status}|${response.headers.get("x-target-worker")}|${await response.text()}`,
+    );
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                public: false,
+                bindings: vec![DeployBinding::Service {
+                    binding: "AUTH".to_string(),
+                    service: "private-auth".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("caller deploy should succeed");
+
+    assert!(!service.worker_is_public("private-auth"));
+    let public_lookup = service
+        .resolve_public_asset("private-auth", "GET", Some("auth.example.com"), "/", &[])
+        .expect("public lookup should not fail");
+    assert!(public_lookup.is_none());
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "private-app",
+        test_invocation_with_path("/", "service-binding-private"),
+        "service binding invoke",
+    )
+    .await;
+    assert_eq!(output.status, 200);
+    let body = String::from_utf8(output.body).expect("utf8");
+    assert!(body.starts_with("201|private-auth|"), "body was {body}");
+    assert!(body.contains("\"method\":\"POST\""), "body was {body}");
+    assert!(body.contains("\"path\":\"/session\""), "body was {body}");
+    assert!(body.contains("\"service\":\"app\""), "body was {body}");
+    assert!(body.contains("\"body\":\"hello\""), "body was {body}");
+}
+
+#[tokio::test]
+#[serial]
 async fn deployed_assets_restore_from_worker_store() {
     let root = PathBuf::from(format!("/tmp/dd-assets-{}", Uuid::new_v4()));
     let db_path = root.join("dd-test.db");
@@ -4629,6 +4724,10 @@ fn extract_bindings_collects_dynamic_bindings() {
             DeployBinding::Dynamic {
                 binding: "SANDBOX".to_string(),
             },
+            DeployBinding::Service {
+                binding: "AUTH".to_string(),
+                service: "auth-worker".to_string(),
+            },
         ],
         ..DeployConfig::default()
     })
@@ -4636,6 +4735,9 @@ fn extract_bindings_collects_dynamic_bindings() {
 
     assert_eq!(bindings.kv, vec!["MY_KV".to_string()]);
     assert_eq!(bindings.dynamic, vec!["SANDBOX".to_string()]);
+    assert_eq!(bindings.service.len(), 1);
+    assert_eq!(bindings.service[0].binding, "AUTH");
+    assert_eq!(bindings.service[0].service, "auth-worker");
 }
 
 #[test]

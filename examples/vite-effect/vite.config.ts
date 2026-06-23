@@ -12,12 +12,21 @@ export default defineConfig({
   },
   plugins: [
     dd({
+      viteEnvironment: {
+        name: "vite_effect",
+      },
       auxiliaryWorkers: [
         {
           name: "auth",
-          binding: "AUTH_WORKER",
+          kind: "service",
+          binding: "AUTH",
+          service: "vite-effect-auth",
+          viteEnvironment: {
+            name: "auth",
+          },
           entry: "src/auth-worker.ts",
           config: {
+            public: false,
             bindings: [
               { type: "kv", binding: "AUTH_DB" },
               { type: "memory", binding: "AUTH_STATE" },

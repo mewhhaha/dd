@@ -6,9 +6,9 @@ import {
 } from "vite";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
 import { createWorkerTestRuntime } from "./vitest.js";
@@ -18,6 +18,9 @@ const DEFAULT_SOURCE_CONFIG_FILE = "dd.json";
 const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
 const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
 const DEFAULT_DEPLOYMENT_ASSETS_DIR = ".";
+const DEFAULT_WORKERS_MANIFEST_FILE = "dd.workers.json";
+const DEFAULT_ENV_TYPES_FILE = "dd-env.d.ts";
+const DEFAULT_CLIENT_OUTPUT_DIR = "client";
 const DEFAULT_ASSET_HEADERS_FILE = "_headers";
 const DEFAULT_STATIC_ROUTES_FILE = "_routes.json";
 const DEFAULT_WORKER_NAME = "dev-worker";
@@ -37,8 +40,9 @@ const DD_AUXILIARY_WORKERS_MODULE = "virtual:dd-auxiliary-workers";
 const DD_AUXILIARY_WORKERS_RESOLVED = "\0dd:auxiliary-workers";
 const FINGERPRINTED_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const DD_VITE_BYPASS_HEADER = "x-dd-vite-bypass";
-const DD_VITE_MODULE_RUNNER_UPDATE_HEADER = "x-dd-vite-module-runner-update";
-const DD_VITE_MODULE_RUNNER_UPDATE_PATH = "/__dd_vite_module_runner_update";
+const DD_VITE_MODULE_HEADER = "x-dd-vite-module-token";
+const DD_VITE_MODULE_ENDPOINT_PATH = "/__dd_vite/module";
+const DD_VITE_MODULE_INVALIDATE_PATH = "/__dd_vite/invalidate";
 const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
 const VITE_BYPASS_PREFIXES = [
   "/@vite",
@@ -226,10 +230,8 @@ export function ddVitePlugin(options = {}) {
   const framework = normalizeFrameworkOptions(options.framework);
   const viteEnvironment = mergeFrameworkViteEnvironment(framework, options.viteEnvironment);
   const auxiliaryWorkers = normalizeAuxiliaryWorkers(options.auxiliaryWorkers);
-  const environmentName = viteEnvironment?.name ?? options.environmentName ?? "dd";
   const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
-  const childEnvironmentNames = arrayOfStrings(viteEnvironment?.childEnvironments);
-  const moduleRunnerUpdateToken = randomUUID();
+  const moduleRunnerToken = randomUUID();
   let runtime;
   let deployment;
   let deploymentRuntimeGeneration;
@@ -238,17 +240,18 @@ export function ddVitePlugin(options = {}) {
   const deploymentConfig = normalizeDeploymentConfigOptions(
     mergeFrameworkDeploymentConfig(framework, options.deploymentConfig),
   );
-  let deploymentConfigWritten = false;
   let frameworkDevBuildComplete = false;
   let frameworkDevBuildPromise;
   let reactRouterRscClientUpdateTimer;
   let reactRouterRscClientUpdateFile;
   let sourceConfigRoot;
   let sourceConfigPromise;
-  let environmentWorkerName;
+  let resolvedWorkersRoot;
+  let resolvedWorkersPromise;
+  let resolvedWorkersSnapshot = [];
   let environmentWorkerEntry;
-  let environmentRuntimeConfig;
-  let environmentOptimizeDepsEntries = [];
+  let buildOutputRoot;
+  let buildClientOutputDir = DEFAULT_CLIENT_OUTPUT_DIR;
 
   async function sourceConfig() {
     const root = resolve(resolvedConfig?.root ?? rootHint ?? process.cwd());
@@ -287,33 +290,116 @@ export function ddVitePlugin(options = {}) {
     );
   }
 
-  async function workerSource() {
-    if (typeof options.source === "function") {
-      return options.source();
+  async function resolvedWorkers() {
+    const root = resolveFrameworkRoot();
+    if (!resolvedWorkersPromise || resolvedWorkersRoot !== root) {
+      resolvedWorkersRoot = root;
+      resolvedWorkersPromise = createResolvedWorkers(root).then((workers) => {
+        resolvedWorkersSnapshot = workers;
+        return workers;
+      });
     }
-    if (typeof options.source === "string") {
-      return options.source;
-    }
-    const entry = await effectiveWorkerEntry();
-    if (!entry) {
-      throw new Error("ddVitePlugin requires either source or entry");
-    }
-    if (framework) {
-      if (viteCommand === "serve" && devServer && shouldUseDevModuleRunner()) {
-        return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions());
-      }
-      return bundleFrameworkWorkerSource(framework, entry);
-    }
-    if (viteCommand === "serve" && devServer && shouldUseDevModuleRunner()) {
-      return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions());
-    }
-    return bundleWorkerEntry(entry, {
-      viteConfig: workerBundleViteConfig(),
+    return resolvedWorkersPromise;
+  }
+
+  async function createResolvedWorkers(root) {
+    const source = await sourceConfig();
+    const entryName = options.name ?? nonEmptyString(source.config.name) ?? DEFAULT_WORKER_NAME;
+    const entryWorker = {
+      role: "entry",
+      kind: "entry",
+      name: entryName,
+      runtimeName: entryName,
+      outputName: workerOutputName(entryName),
+      environmentName: viteEnvironment?.name ?? defaultEntryWorkerEnvironmentName(framework, viteCommand, entryName),
+      childEnvironmentNames: uniqueStrings([
+        ...defaultEntryWorkerChildEnvironmentNames(framework, viteCommand),
+        ...arrayOfStrings(viteEnvironment?.childEnvironments),
+      ]),
+      viteEnvironment,
+      entry: await effectiveWorkerEntry(),
+      source: options.source,
+      config: await effectiveRuntimeConfig(),
+      deploymentConfig,
       target: options.target,
-      sourcemap: options.sourcemap ?? false,
+      sourcemap: options.sourcemap,
       minify: options.minify,
       logLevel: options.logLevel,
+      viteConfig: options.viteConfig,
+    };
+    const workers = [
+      entryWorker,
+      ...auxiliaryWorkers.map((worker) => {
+        const workerViteEnvironment = worker.viteEnvironment;
+        const runtimeName = worker.kind === "service" ? worker.service : worker.id;
+        return {
+          ...worker,
+          role: "auxiliary",
+          runtimeName,
+          outputName: workerOutputName(worker.name),
+          environmentName: workerViteEnvironment?.name ?? workerEnvironmentName(worker.name),
+          childEnvironmentNames: arrayOfStrings(workerViteEnvironment?.childEnvironments),
+          viteEnvironment: workerViteEnvironment,
+          entry: worker.entry ? resolveFrameworkPath(root, worker.entry) : undefined,
+          source: worker.source,
+          config: worker.kind === "service" ? auxiliaryWorkerServiceConfig(worker) : cloneJson(worker.config),
+        };
+      }),
+    ];
+    validateResolvedWorkers(workers);
+    return workers;
+  }
+
+  async function resolvedEntryWorker() {
+    return (await resolvedWorkers())[0];
+  }
+
+  function currentResolvedWorkerByEnvironment(name) {
+    return resolvedWorkersSnapshot.find((worker) => worker.environmentName === name);
+  }
+
+  function currentResolvedWorkerByChildEnvironment(name) {
+    return resolvedWorkersSnapshot.find((worker) => worker.childEnvironmentNames.includes(name));
+  }
+
+  async function workerSource(workerOrOptions = {}, maybeSourceOptions = {}) {
+    const worker = workerOrOptions?.role ? workerOrOptions : await resolvedEntryWorker();
+    const sourceOptions = workerOrOptions?.role ? maybeSourceOptions : workerOrOptions;
+    const production = sourceOptions.production === true;
+    if (typeof worker.source === "function") {
+      return worker.source();
+    }
+    if (typeof worker.source === "string") {
+      return worker.source;
+    }
+    const entry = worker.entry ?? (worker.role === "entry" ? await effectiveWorkerEntry() : undefined);
+    if (!entry) {
+      throw new Error(
+        worker.role === "entry"
+          ? "ddVitePlugin requires either source or entry"
+          : `ddVitePlugin auxiliary worker "${worker.name}" requires source or entry`,
+      );
+    }
+    if (framework && worker.role === "entry") {
+      if (usesViteModuleRunner(worker, sourceOptions)) {
+        return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions(worker));
+      }
+      return bundleFrameworkWorkerSource(framework, entry, { production });
+    }
+    if (usesViteModuleRunner(worker, sourceOptions)) {
+      return viteModuleRunnerWorkerSource(devServer, entry, moduleRunnerOptions(worker));
+    }
+    return bundleWorkerEntry(entry, {
+      viteConfig: mergeConfig(workerBundleViteConfig(), worker.viteConfig ?? {}),
+      target: worker.target ?? options.target,
+      sourcemap: worker.sourcemap ?? options.sourcemap ?? false,
+      minify: workerBundleMinify(worker.minify ?? options.minify, production),
+      logLevel: worker.logLevel ?? options.logLevel,
     });
+  }
+
+  function workerBundleMinify(minify, production = false) {
+    return minify ?? (production || viteCommand === "build");
   }
 
   function workerBundleViteConfig() {
@@ -330,8 +416,8 @@ export function ddVitePlugin(options = {}) {
     return mergeConfig(mergeConfig(projectConfig, auxiliaryPlugin), options.viteConfig ?? {});
   }
 
-  async function bundledWorkerSource() {
-    return withWorkerBundleEnv(workerSource);
+  async function bundledWorkerSource(sourceOptions) {
+    return withWorkerBundleEnv(() => workerSource(sourceOptions));
   }
 
   async function auxiliaryWorkersModuleSource() {
@@ -341,9 +427,11 @@ export function ddVitePlugin(options = {}) {
           worker.name,
           {
             name: worker.name,
+            kind: worker.kind,
             binding: worker.binding,
             id: worker.id,
-            config: await auxiliaryWorkerDynamicConfig(worker),
+            service: worker.service,
+            config: worker.kind === "dynamic" ? await auxiliaryWorkerDynamicConfig(worker) : cloneJson(worker.config),
           },
         ]),
       ),
@@ -363,24 +451,8 @@ export function ddVitePlugin(options = {}) {
   }
 
   async function auxiliaryWorkerSource(worker) {
-    if (typeof worker.source === "function") {
-      return worker.source();
-    }
-    if (typeof worker.source === "string") {
-      return worker.source;
-    }
-    if (!worker.entry) {
-      throw new Error(`ddVitePlugin auxiliary worker "${worker.name}" requires source or entry`);
-    }
-    return withWorkerBundleEnv(() =>
-      bundleWorkerEntry(worker.entry, {
-        viteConfig: mergeConfig(workerBundleViteConfig(), worker.viteConfig ?? {}),
-        target: worker.target ?? options.target,
-        sourcemap: worker.sourcemap ?? options.sourcemap ?? false,
-        minify: worker.minify ?? options.minify,
-        logLevel: worker.logLevel ?? options.logLevel,
-      })
-    );
+    const resolved = (await resolvedWorkers()).find((entry) => entry.role === "auxiliary" && entry.name === worker.name) ?? worker;
+    return withWorkerBundleEnv(() => workerSource(resolved));
   }
 
   async function ensureDeployed() {
@@ -390,17 +462,20 @@ export function ddVitePlugin(options = {}) {
     }
     deployment = undefined;
     deploymentRuntimeGeneration = undefined;
-    const workerName = await effectiveWorkerName();
-    const deployConfig = await effectiveRuntimeConfig();
-    deploying ??= runtime
-      .deploy(workerName, await bundledWorkerSource(), deployConfig)
+    const entryWorker = await resolvedEntryWorker();
+    const deployAll = async () => {
+      await deployAuxiliaryServiceWorkers(runtime);
+      return runtime.deploy(entryWorker.runtimeName, await bundledWorkerSource(), entryWorker.config);
+    };
+    deploying ??= deployAll()
       .catch(async (error) => {
         if (!isRecoverableRuntimeClientError(error)) {
           throw error;
         }
         await runtime?.close().catch(() => {});
         runtime = createDdRuntime(options.runtimeOptions);
-        return runtime.deploy(workerName, await bundledWorkerSource(), deployConfig);
+        await deployAuxiliaryServiceWorkers(runtime);
+        return runtime.deploy(entryWorker.runtimeName, await bundledWorkerSource(), entryWorker.config);
       })
       .finally(() => {
         deploying = undefined;
@@ -408,6 +483,19 @@ export function ddVitePlugin(options = {}) {
     deployment = await deploying;
     deploymentRuntimeGeneration = runtime.generation;
     return deployment;
+  }
+
+  async function deployAuxiliaryServiceWorkers(targetRuntime) {
+    for (const worker of await resolvedWorkers()) {
+      if (worker.kind !== "service") {
+        continue;
+      }
+      await targetRuntime.deploy(
+        worker.runtimeName,
+        await workerSource(worker),
+        worker.config,
+      );
+    }
   }
 
   async function invalidateDeployment() {
@@ -422,27 +510,19 @@ export function ddVitePlugin(options = {}) {
     }
   }
 
-  function moduleRunnerOptions() {
+  function moduleRunnerOptions(worker) {
     return {
-      environmentName,
-      childEnvironmentNames,
+      environmentName: worker.environmentName,
+      childEnvironmentNames: worker.childEnvironmentNames,
       root: resolveFrameworkRoot(),
-      updateToken: moduleRunnerUpdateToken,
+      token: moduleRunnerToken,
     };
-  }
-
-  function shouldUseDevModuleRunner() {
-    if (options.devModuleRunner === false) {
-      return false;
-    }
-    return framework?.name !== REACT_ROUTER_RSC_FRAMEWORK || options.devModuleRunner === true;
   }
 
   async function updateViteModuleRunnerDeployment() {
     if (
       viteCommand !== "serve" ||
       !devServer ||
-      !shouldUseDevModuleRunner() ||
       !deployment ||
       !runtime ||
       deploymentRuntimeGeneration !== runtime.generation
@@ -451,35 +531,220 @@ export function ddVitePlugin(options = {}) {
       deploymentRuntimeGeneration = undefined;
       return false;
     }
-    const entry = await effectiveWorkerEntry();
-    if (!entry || typeof options.source === "string" || typeof options.source === "function") {
-      return false;
-    }
-    const workerName = await effectiveWorkerName();
-    const graph = await collectViteModuleRunnerGraph(devServer, entry, moduleRunnerOptions());
-    const response = await runtime.fetch(
-      workerName,
-      new Request(`http://${workerName}.dd.local${DD_VITE_MODULE_RUNNER_UPDATE_PATH}`, {
-        method: "POST",
-        headers: {
-          [DD_VITE_MODULE_RUNNER_UPDATE_HEADER]: moduleRunnerUpdateToken,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(graph),
-      }),
-    );
-    if (!response.ok) {
-      deployment = undefined;
-      deploymentRuntimeGeneration = undefined;
-      throw new Error(
-        `ddVitePlugin failed to update dev module graph: ${response.status} ${await response.text()}`,
+    for (const worker of await resolvedWorkers()) {
+      if (!worker.entry || typeof worker.source === "string" || typeof worker.source === "function") {
+        continue;
+      }
+      if (worker.role !== "entry" && worker.kind !== "service") {
+        continue;
+      }
+      if (!usesViteModuleRunner(worker)) {
+        deployment = undefined;
+        deploymentRuntimeGeneration = undefined;
+        return false;
+      }
+      const response = await runtime.fetch(
+        worker.runtimeName,
+        new Request(`http://${worker.runtimeName}.dd.local${DD_VITE_MODULE_INVALIDATE_PATH}`, {
+          method: "POST",
+          headers: {
+            [DD_VITE_MODULE_HEADER]: moduleRunnerToken,
+          },
+        }),
       );
+      if (!response.ok) {
+        deployment = undefined;
+        deploymentRuntimeGeneration = undefined;
+        throw new Error(
+          `ddVitePlugin failed to invalidate dev module cache for ${worker.runtimeName}: ` +
+            `${response.status} ${await response.text()}`,
+        );
+      }
     }
     return true;
   }
 
+  function usesViteModuleRunner(worker, sourceOptions = {}) {
+    if (sourceOptions.allowDevModuleRunner === false || viteCommand !== "serve" || !devServer) {
+      return false;
+    }
+    if (!worker.entry || typeof worker.source === "string" || typeof worker.source === "function") {
+      return false;
+    }
+    return !(framework && worker.role === "entry" && framework.name === REACT_ROUTER_RSC_FRAMEWORK);
+  }
+
+  function registeredWorkerEnvironmentOptions(workers, baseOutDir) {
+    const entries = [];
+    for (const worker of workers) {
+      entries.push([worker.environmentName, workerBuildEnvironmentOptions(worker, baseOutDir)]);
+      for (const childName of worker.childEnvironmentNames) {
+        entries.push([childName, {}]);
+      }
+    }
+    return Object.fromEntries(entries);
+  }
+
+  function workerBuildEnvironmentOptions(worker, baseOutDir) {
+    const entry = worker.entry;
+    if (viteCommand === "build" && !entry) {
+      throw new Error(`ddVitePlugin worker "${worker.name}" requires an entry for production builds`);
+    }
+    const environmentBase = ddEnvironmentBaseOptions({
+      optimizeDepsEntries: entry ? [viteRequestForFile(entry, rootHint ?? process.cwd())] : [],
+    });
+    const output = {
+      entryFileNames: DEFAULT_DEPLOYMENT_WORKER_FILE,
+      chunkFileNames: "assets/[name]-[hash].js",
+      assetFileNames: "assets/[name]-[hash][extname]",
+      codeSplitting: false,
+    };
+    return mergeConfig(
+      {
+        ...environmentBase,
+        build: {
+          ssr: true,
+          outDir: childBuildOutDir(baseOutDir, worker.outputName),
+          emptyOutDir: true,
+          copyPublicDir: false,
+          sourcemap: worker.sourcemap ?? options.sourcemap ?? false,
+          minify: workerBundleMinify(worker.minify ?? options.minify, true),
+          rollupOptions: {
+            input: entry ? { worker: entry } : undefined,
+            output,
+          },
+        },
+      },
+      worker.viteEnvironment?.options ?? {},
+    );
+  }
+
+  async function buildDdApp(builder) {
+    if (options.environment === false) {
+      return;
+    }
+    const workers = await resolvedWorkers();
+    await emptyBuildOutputRoot(builder.config);
+    if (framework) {
+      await ensureFrameworkDevBuild(framework);
+    } else if (builder.environments.client && !builder.environments.client.isBuilt) {
+      await builder.build(builder.environments.client);
+    }
+    const buildOrder = [
+      ...workers.filter((worker) => worker.role !== "entry"),
+      ...workers.filter((worker) => worker.role === "entry"),
+    ];
+    for (const worker of buildOrder) {
+      const environment = builder.environments[worker.environmentName];
+      if (!environment) {
+        throw new Error(`ddVitePlugin could not find Vite build environment "${worker.environmentName}"`);
+      }
+      if (!environment.isBuilt) {
+        await builder.build(environment);
+      }
+    }
+    await writeWorkerDeploymentArtifacts(workers);
+  }
+
+  async function emptyBuildOutputRoot(config) {
+    if (config?.build?.emptyOutDir === false) {
+      return;
+    }
+    const outRoot = buildOutputRoot ?? resolveBuildOutputRoot(config, resolveFrameworkRoot());
+    await rm(outRoot, { recursive: true, force: true });
+  }
+
+  async function writeWorkerDeploymentArtifacts(workers) {
+    if (viteCommand !== "build") {
+      return;
+    }
+    const outRoot = buildOutputRoot ?? resolveBuildOutputRoot(resolvedConfig, resolveFrameworkRoot());
+    const clientAssetsRel = await resolveClientAssetsDir(outRoot);
+    const manifestWorkers = [];
+    for (const worker of workers) {
+      const workerOutDir = join(outRoot, worker.outputName);
+      const workerFile = DEFAULT_DEPLOYMENT_WORKER_FILE;
+      const configFile = DEFAULT_DEPLOYMENT_CONFIG_FILE;
+      const config = await buildWorkerDeploymentConfig({
+        worker,
+        workerFile,
+        configFile,
+        clientAssetsRel,
+      });
+      await writeOutputFile(workerOutDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
+      manifestWorkers.push({
+        name: worker.name,
+        role: worker.role,
+        kind: worker.kind,
+        service: worker.kind === "service" ? worker.service : undefined,
+        binding: worker.binding,
+        environment: worker.environmentName,
+        outDir: worker.outputName,
+        worker: joinConfigRelativePath(worker.outputName, workerFile),
+        deployConfig: joinConfigRelativePath(worker.outputName, configFile),
+      });
+      if (worker.role === "entry") {
+        const generatedDeploymentConfig = {
+          ...worker.deploymentConfig,
+          assetsDir: config.assets_dir ?? false,
+        };
+        await writeGeneratedStaticRoutes(workerOutDir, generatedDeploymentConfig);
+        await writeGeneratedAssetPolicy(workerOutDir, resolvedConfig, generatedDeploymentConfig.assetsDir);
+      }
+    }
+    const entry = workers.find((worker) => worker.role === "entry");
+    await writeOutputFile(
+      outRoot,
+      DEFAULT_WORKERS_MANIFEST_FILE,
+      `${JSON.stringify({
+        version: 1,
+        entry: entry?.name,
+        workers: manifestWorkers,
+      }, null, 2)}\n`,
+    );
+  }
+
+  async function resolveClientAssetsDir(outRoot) {
+    if (deploymentConfig.assetsDir === false) {
+      return false;
+    }
+    if (deploymentConfig.assetsDir != null) {
+      return normalizeDeploymentAssetsDir(deploymentConfig.assetsDir, "deploymentConfig.assetsDir");
+    }
+    const candidate = framework
+      ? frameworkClientAssetsDir(framework)
+      : buildClientOutputDir;
+    if (await directoryExists(join(outRoot, candidate))) {
+      return candidate;
+    }
+    return false;
+  }
+
+  async function buildWorkerDeploymentConfig({ worker, workerFile, configFile, clientAssetsRel }) {
+    const source = await sourceConfig();
+    if (worker.role === "entry") {
+      return buildGeneratedDeploymentConfig({
+        base: source.config,
+        options,
+        workerName: worker.runtimeName,
+        workerFile,
+        configFile,
+        assetsDir: clientAssetsRel === false ? false : relativeDeploymentAssetsDir(worker.outputName, clientAssetsRel),
+        assetExcludes: deploymentConfig.assetExcludes,
+        extraAssetExcludes: [],
+        staticRoutes: deploymentConfig.staticRoutes,
+      });
+    }
+    return buildAuxiliaryServiceDeploymentConfig({
+      base: source.config,
+      worker,
+      workerFile,
+    });
+  }
+
   return {
     name: "dd-vite",
+    sharedDuringBuild: true,
     config: {
       order: "post",
       async handler(config, env) {
@@ -488,14 +753,26 @@ export function ddVitePlugin(options = {}) {
           return;
         }
         rootHint = resolve(config.root ?? process.cwd());
-        environmentWorkerName = await effectiveWorkerName();
-        environmentWorkerEntry = await effectiveWorkerEntry();
-        environmentRuntimeConfig = await effectiveRuntimeConfig();
-        environmentOptimizeDepsEntries = environmentWorkerEntry
-          ? [viteRequestForFile(environmentWorkerEntry, rootHint)]
-          : [];
-        const frameworkResolveAlias = await frameworkDevResolveAlias(framework, rootHint);
+        const workers = await resolvedWorkers();
+        const entryWorker = workers[0];
+        environmentWorkerEntry = entryWorker.entry;
+        const frameworkResolveAlias = await frameworkViteResolveAlias(framework, rootHint, viteCommand);
+        buildOutputRoot = resolveBuildOutputRoot(config, rootHint);
+        buildClientOutputDir = framework
+          ? frameworkClientAssetsDir(framework)
+          : DEFAULT_CLIENT_OUTPUT_DIR;
+        await writeDdEnvTypes(rootHint, workers);
         return {
+          builder: {
+            sharedPlugins: true,
+          },
+          ...(env.command === "build" && !framework
+            ? {
+                build: {
+                  outDir: childBuildOutDir(config.build?.outDir, DEFAULT_CLIENT_OUTPUT_DIR),
+                },
+              }
+            : {}),
           ...(framework?.name === REACT_ROUTER_RSC_FRAMEWORK
             ? {
                 rsc: {
@@ -510,10 +787,7 @@ export function ddVitePlugin(options = {}) {
                 },
               }
             : {}),
-          environments: registeredEnvironmentOptions([
-            environmentName,
-            ...childEnvironmentNames,
-          ]),
+          environments: registeredWorkerEnvironmentOptions(workers, config.build?.outDir),
         };
       },
     },
@@ -521,26 +795,34 @@ export function ddVitePlugin(options = {}) {
       if (options.environment === false) {
         return;
       }
-      if (name === environmentName) {
+      const worker = currentResolvedWorkerByEnvironment(name);
+      if (worker) {
         return ddEnvironment({
           ...options,
-          viteEnvironment,
-          name: environmentWorkerName,
-          entry: environmentWorkerEntry,
-          config: environmentRuntimeConfig,
-          optimizeDepsEntries: environmentOptimizeDepsEntries,
+          ...worker,
+          viteEnvironment: worker.viteEnvironment,
+          name: worker.runtimeName,
+          entry: worker.entry,
+          config: worker.config,
+          optimizeDepsEntries: worker.entry
+            ? [viteRequestForFile(worker.entry, resolveFrameworkRoot())]
+            : [],
         });
       }
-      if (childEnvironmentNames.includes(name)) {
+      const parentWorker = currentResolvedWorkerByChildEnvironment(name);
+      if (parentWorker) {
         return ddRunnableEnvironment({
           ...options,
-          viteEnvironment: { ...(viteEnvironment ?? {}), name },
-          name: environmentWorkerName,
+          viteEnvironment: { ...(parentWorker.viteEnvironment ?? {}), name },
+          name: parentWorker.runtimeName,
         });
       }
     },
     configResolved(config) {
       resolvedConfig = config;
+      if (viteCommand === "build") {
+        isolateFrameworkPluginsForWorkerEnvironments(config, resolvedWorkersSnapshot);
+      }
     },
     configureServer(viteServer) {
       devServer = viteServer;
@@ -555,6 +837,9 @@ export function ddVitePlugin(options = {}) {
       if (options.middleware === false) {
         return;
       }
+      installViteModuleMiddleware(viteServer, {
+        token: moduleRunnerToken,
+      });
       const upgradeHandler = (req, socket, head) => {
         void handleDdWebSocketUpgrade(req, socket, head, {
           ensureDeployed,
@@ -605,6 +890,8 @@ export function ddVitePlugin(options = {}) {
       const source = await sourceConfig();
       if (source.path === context.file) {
         sourceConfigPromise = undefined;
+        resolvedWorkersPromise = undefined;
+        resolvedWorkersSnapshot = [];
         deployment = undefined;
         deploymentRuntimeGeneration = undefined;
       }
@@ -613,37 +900,13 @@ export function ddVitePlugin(options = {}) {
         scheduleReactRouterRscClientUpdate(context);
       }
     },
-    renderStart: {
-      order: "post",
-      async handler() {
-        if (hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
-          return;
-        }
-        await writeDeploymentArtifacts();
-      },
-    },
-    async generateBundle() {
-      if (hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
-        return;
-      }
-      await writeDeploymentArtifacts();
-    },
-    async writeBundle() {
-      if (hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
-        return;
-      }
-      await writeDeploymentArtifacts();
-    },
     buildApp: {
       order: "post",
-      async handler() {
-        await writeDeploymentArtifacts();
+      async handler(builder) {
+        await buildDdApp(builder);
       },
     },
     async closeBundle() {
-      if (!hasPluginFrameworkBuildEnvironment(resolvedConfig, framework, environmentName)) {
-        await writeDeploymentArtifacts();
-      }
       await runtime?.close();
     },
     resolveId(id) {
@@ -653,7 +916,15 @@ export function ddVitePlugin(options = {}) {
       if (id === DD_NODE_ASYNC_HOOKS_SHIM_MODULE) {
         return DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED;
       }
-      if (framework?.name === REACT_ROUTER_RSC_FRAMEWORK && id === DD_REACT_ROUTER_RSC_SERVER_MODULE) {
+      if (
+        viteCommand === "build" &&
+        framework &&
+        id === framework.serverBuildModule &&
+        currentResolvedWorkerByEnvironment(this.environment?.name)
+      ) {
+        return frameworkServerEntry(framework, resolveFrameworkRoot());
+      }
+      if (viteCommand === "serve" && framework?.name === REACT_ROUTER_RSC_FRAMEWORK && id === DD_REACT_ROUTER_RSC_SERVER_MODULE) {
         return DD_REACT_ROUTER_RSC_SERVER_RESOLVED;
       }
     },
@@ -664,7 +935,11 @@ export function ddVitePlugin(options = {}) {
       if (id === DD_NODE_ASYNC_HOOKS_SHIM_RESOLVED) {
         return DD_NODE_ASYNC_HOOKS_SHIM_SOURCE;
       }
-      if (id !== DD_REACT_ROUTER_RSC_SERVER_RESOLVED || framework?.name !== REACT_ROUTER_RSC_FRAMEWORK) {
+      if (
+        viteCommand !== "serve" ||
+        id !== DD_REACT_ROUTER_RSC_SERVER_RESOLVED ||
+        framework?.name !== REACT_ROUTER_RSC_FRAMEWORK
+      ) {
         return;
       }
       const root = resolveFrameworkRoot();
@@ -674,45 +949,7 @@ export function ddVitePlugin(options = {}) {
     },
   };
 
-  async function writeDeploymentArtifacts() {
-    const outDir = resolveViteOutDir(resolvedConfig);
-    const workerFile = normalizeOutputPath(
-      deploymentConfig.entrypoint ?? DEFAULT_DEPLOYMENT_WORKER_FILE,
-      "deploymentConfig.entrypoint",
-    );
-    const configFile = normalizeOutputPath(
-      deploymentConfig.output ?? DEFAULT_DEPLOYMENT_CONFIG_FILE,
-      "deploymentConfig.output",
-    );
-    if (!deploymentConfig.enabled || !(await hasReloadableWorkerSource(options, effectiveWorkerEntry))) {
-      return;
-    }
-    const artifactsExist =
-      deploymentConfigWritten &&
-      (await outputFileExists(outDir, workerFile)) &&
-      (await outputFileExists(outDir, configFile));
-    if (!artifactsExist) {
-      await writeOutputFile(outDir, workerFile, await bundledWorkerSource());
-      const workerName = await effectiveWorkerName();
-      const source = await sourceConfig();
-      const config = await buildGeneratedDeploymentConfig({
-        base: source.config,
-        options,
-        workerName,
-        workerFile,
-        configFile,
-        assetsDir: deploymentConfig.assetsDir,
-        assetExcludes: deploymentConfig.assetExcludes,
-        staticRoutes: deploymentConfig.staticRoutes,
-      });
-      await writeOutputFile(outDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
-      deploymentConfigWritten = true;
-    }
-    await writeGeneratedStaticRoutes(outDir, deploymentConfig);
-    await writeGeneratedAssetPolicy(outDir, resolvedConfig, deploymentConfig.assetsDir);
-  }
-
-  async function bundleFrameworkWorkerSource(framework, entry) {
+  async function bundleFrameworkWorkerSource(framework, entry, sourceOptions = {}) {
     if (viteCommand === "serve") {
       await ensureFrameworkDevBuild(framework);
     }
@@ -723,7 +960,7 @@ export function ddVitePlugin(options = {}) {
       ),
       target: options.target,
       sourcemap: options.sourcemap ?? false,
-      minify: options.minify,
+      minify: workerBundleMinify(options.minify, sourceOptions.production === true),
       logLevel: options.logLevel,
     });
   }
@@ -792,18 +1029,19 @@ export function ddVitePlugin(options = {}) {
   }
 }
 
-async function frameworkDevResolveAlias(framework, root) {
-  if (!framework || framework.asyncHooksShim === false) {
+async function frameworkViteResolveAlias(framework, root, command) {
+  if (!framework) {
     return undefined;
   }
-  const asyncHooksShim = await resolveAsyncHooksShim(framework, root);
-  if (!asyncHooksShim) {
-    return undefined;
+  const alias = {};
+  if (framework.asyncHooksShim !== false) {
+    const asyncHooksShim = await resolveAsyncHooksShim(framework, root);
+    if (asyncHooksShim) {
+      alias["node:async_hooks"] = asyncHooksShim;
+      alias.async_hooks = asyncHooksShim;
+    }
   }
-  return {
-    "node:async_hooks": asyncHooksShim,
-    async_hooks: asyncHooksShim,
-  };
+  return Object.keys(alias).length > 0 ? alias : undefined;
 }
 
 function normalizeFrameworkOptions(value) {
@@ -870,26 +1108,104 @@ function ddNodeAsyncHooksShimPlugin() {
   };
 }
 
-function mergeFrameworkViteEnvironment(framework, viteEnvironment) {
-  if (!framework) {
-    return viteEnvironment;
+function isolateFrameworkPluginsForWorkerEnvironments(config, workers) {
+  const workerEnvironmentNames = new Set(workers.map((worker) => worker.environmentName));
+  if (workerEnvironmentNames.size === 0) {
+    return;
   }
-  const defaults =
-    framework.name === REACT_ROUTER_RSC_FRAMEWORK
-      ? { name: "rsc", childEnvironments: ["ssr"] }
-      : { name: "ssr" };
-  return {
-    ...defaults,
-    ...(viteEnvironment ?? {}),
-    childEnvironments: uniqueStrings([
-      ...arrayOfStrings(defaults.childEnvironments),
-      ...arrayOfStrings(viteEnvironment?.childEnvironments),
-    ]),
-  };
+  for (const plugin of config.plugins ?? []) {
+    if (!shouldSkipPluginInDdWorkerEnvironment(plugin)) {
+      continue;
+    }
+    if (plugin.__ddViteWorkerIsolation === true) {
+      continue;
+    }
+    const applyToEnvironment = plugin.applyToEnvironment?.bind(plugin);
+    plugin.applyToEnvironment = async (environment) => {
+      if (workerEnvironmentNames.has(environment.name)) {
+        return false;
+      }
+      return applyToEnvironment ? applyToEnvironment(environment) : true;
+    };
+    Object.defineProperty(plugin, "__ddViteWorkerIsolation", {
+      value: true,
+      enumerable: false,
+    });
+  }
 }
 
-function registeredEnvironmentOptions(names) {
-  return Object.fromEntries(uniqueStrings(names).map((name) => [name, {}]));
+function shouldSkipPluginInDdWorkerEnvironment(plugin) {
+  const name = String(plugin?.name ?? "");
+  return name === "react-router" || name.startsWith("react-router:");
+}
+
+function mergeFrameworkViteEnvironment(framework, viteEnvironment) {
+  return viteEnvironment;
+}
+
+function workerEnvironmentName(name) {
+  return sanitizeViteEnvironmentIdentifier(name) || "dd";
+}
+
+function defaultEntryWorkerEnvironmentName(framework, command, workerName) {
+  if (command === "serve" && framework?.name === REACT_ROUTER_FRAMEWORK) {
+    return "ssr";
+  }
+  if (command === "serve" && framework?.name === REACT_ROUTER_RSC_FRAMEWORK) {
+    return "rsc";
+  }
+  return workerEnvironmentName(workerName);
+}
+
+function defaultEntryWorkerChildEnvironmentNames(framework, command) {
+  if (command === "serve" && framework?.name === REACT_ROUTER_RSC_FRAMEWORK) {
+    return ["ssr"];
+  }
+  return [];
+}
+
+function workerOutputName(name) {
+  return sanitizeWorkerIdentifier(name) || "worker";
+}
+
+function sanitizeViteEnvironmentIdentifier(name) {
+  return String(name ?? "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_$]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
+}
+
+function sanitizeWorkerIdentifier(name) {
+  return String(name ?? "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase();
+}
+
+function validateResolvedWorkers(workers) {
+  const names = new Set();
+  const environments = new Set();
+  const outputs = new Set();
+  for (const worker of workers) {
+    for (const [set, value, label] of [
+      [names, worker.name, "worker name"],
+      [environments, worker.environmentName, "Vite environment name"],
+      [outputs, worker.outputName, "worker output directory"],
+    ]) {
+      if (set.has(value)) {
+        throw new Error(`duplicate ddVitePlugin ${label}: ${value}`);
+      }
+      set.add(value);
+    }
+    for (const childName of worker.childEnvironmentNames) {
+      if (environments.has(childName)) {
+        throw new Error(`duplicate ddVitePlugin Vite environment name: ${childName}`);
+      }
+      environments.add(childName);
+    }
+  }
 }
 
 function normalizeAuxiliaryWorkers(value) {
@@ -909,13 +1225,32 @@ function normalizeAuxiliaryWorkers(value) {
       throw new Error(`duplicate ddVitePlugin auxiliary worker name: ${name}`);
     }
     seen.add(name);
+    const kind = normalizeAuxiliaryWorkerKind(entry?.kind);
     return {
       ...entry,
+      kind,
       name,
       binding: nonEmptyString(entry?.binding) ?? auxiliaryBindingName(name),
       id: nonEmptyString(entry?.id) ?? name,
+      service: kind === "service"
+        ? nonEmptyString(entry?.service) ?? nonEmptyString(entry?.workerName) ?? name
+        : undefined,
+      deployment: entry?.deployment && typeof entry.deployment === "object"
+        ? cloneJson(entry.deployment)
+        : undefined,
     };
   });
+}
+
+function normalizeAuxiliaryWorkerKind(value) {
+  if (value == null) {
+    return "dynamic";
+  }
+  const kind = String(value).trim().toLowerCase();
+  if (kind !== "dynamic" && kind !== "service") {
+    throw new Error(`ddVitePlugin auxiliary worker kind is invalid: ${kind}`);
+  }
+  return kind;
 }
 
 function auxiliaryBindingName(name) {
@@ -930,7 +1265,13 @@ function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
   const runtimeConfig = cloneJson(config);
   const bindings = Array.isArray(runtimeConfig.bindings) ? [...runtimeConfig.bindings] : [];
   for (const worker of auxiliaryWorkers) {
-    if (!bindings.some((binding) =>
+    if (worker.kind === "service") {
+      if (!bindings.some((binding) =>
+        String(binding?.type ?? "").toLowerCase() === "service" && binding?.binding === worker.binding
+      )) {
+        bindings.push({ type: "service", binding: worker.binding, service: worker.service });
+      }
+    } else if (!bindings.some((binding) =>
       String(binding?.type ?? "").toLowerCase() === "dynamic" && binding?.binding === worker.binding
     )) {
       bindings.push({ type: "dynamic", binding: worker.binding });
@@ -938,6 +1279,14 @@ function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
   }
   runtimeConfig.bindings = bindings;
   return runtimeConfig;
+}
+
+function auxiliaryWorkerServiceConfig(worker) {
+  const config = cloneJson(worker.config);
+  if (config.public == null) {
+    config.public = false;
+  }
+  return config;
 }
 
 function ddAuxiliaryWorkersVirtualPlugin(loadSource) {
@@ -1072,42 +1421,54 @@ async function fileExists(path) {
   }
 }
 
-async function viteModuleRunnerWorkerSource(viteServer, entry, options) {
-  const graph = await collectViteModuleRunnerGraph(viteServer, entry, options);
-  return renderViteModuleRunnerWorkerSource(graph);
+function viteModuleRunnerWorkerSource(viteServer, entry, options) {
+  const root = resolve(options.root ?? viteServer.config.root);
+  patchViteResolvedUrls(viteServer);
+  const endpointBase = viteDevServerActualUrl(viteServer) ?? viteDevServerUrlCandidates(viteServer)[0] ?? "http://127.0.0.1:5173/";
+  const payload = {
+    entryEnvironment: options.environmentName,
+    entryId: viteRequestForFile(entry, root),
+    moduleEndpoint: new URL(DD_VITE_MODULE_ENDPOINT_PATH, endpointBase).href,
+    invalidatePath: DD_VITE_MODULE_INVALIDATE_PATH,
+    devFetchOrigins: viteDevServerOrigins(viteServer),
+    token: options.token,
+  };
+  return `${VITE_MODULE_RUNNER_WORKER_BOOTSTRAP}
+const __ddViteConfig = ${JSON.stringify(payload)};
+const __ddViteEntry = await __ddViteImportDev(__ddViteConfig);
+export default __ddViteEntry;
+`;
 }
 
-async function collectViteModuleRunnerGraph(viteServer, entry, options) {
-  const root = resolve(options.root ?? viteServer.config.root);
-  const entryRequest = viteRequestForFile(entry, root);
-  const records = new Map();
-  const aliases = new Map();
-  const pending = new Map();
-  patchViteResolvedUrls(viteServer);
-  const environmentNames = uniqueStrings([
-    options.environmentName,
-    ...arrayOfStrings(options.childEnvironmentNames),
-  ]);
-
-  await Promise.all(
-    environmentNames.map(async (name) => {
-      await viteServer.environments[name]?.depsOptimizer?.init?.();
-    }),
-  );
-
-  const visit = async (environmentName, id, importer) => {
-    const environment = viteServer.environments[environmentName];
-    if (!environment) {
-      throw new Error(`ddVitePlugin could not find Vite environment "${environmentName}"`);
-    }
-
-    const requestKey = `${environmentName}\0${id}\0${importer ?? ""}`;
-    const pendingRequest = pending.get(requestKey);
-    if (pendingRequest) {
-      return pendingRequest;
-    }
-
-    const promise = (async () => {
+function installViteModuleMiddleware(viteServer, options) {
+  viteServer.middlewares.use(DD_VITE_MODULE_ENDPOINT_PATH, async (req, res, next) => {
+    try {
+      if ((req.method ?? "GET").toUpperCase() !== "POST") {
+        res.statusCode = 405;
+        res.end("method not allowed");
+        return;
+      }
+      if (headerValue(req.headers[DD_VITE_MODULE_HEADER]) !== options.token) {
+        res.statusCode = 403;
+        res.end("forbidden");
+        return;
+      }
+      const body = JSON.parse((await readIncomingBody(req)).toString("utf8") || "{}");
+      const environmentName = nonEmptyString(body.environmentName);
+      const id = nonEmptyString(body.id);
+      const importer = nonEmptyString(body.importer);
+      if (!environmentName || !id) {
+        res.statusCode = 400;
+        res.end("environmentName and id are required");
+        return;
+      }
+      const environment = viteServer.environments[environmentName];
+      if (!environment) {
+        res.statusCode = 404;
+        res.end(`unknown Vite environment ${environmentName}`);
+        return;
+      }
+      await environment.depsOptimizer?.init?.();
       let fetched;
       try {
         fetched = await fetchViteModule(environment, id, importer);
@@ -1118,13 +1479,6 @@ async function collectViteModuleRunnerGraph(viteServer, entry, options) {
         throw error;
       }
       const record = createViteRunnerRecord(environmentName, id, fetched, environment, viteServer);
-      addViteRunnerRecordAliases(record, aliases);
-
-      const existing = records.get(record.key);
-      if (existing) {
-        return existing.key;
-      }
-
       if (record.externalize && !isSupportedViteRunnerExternal(record.externalize)) {
         throw new Error(
           `ddVitePlugin cannot run external module ${record.externalize} in the dd runtime` +
@@ -1134,41 +1488,13 @@ async function collectViteModuleRunnerGraph(viteServer, entry, options) {
             "Make sure the dd Vite environment uses resolve.noExternal/optimizeDeps so dependencies are transformed.",
         );
       }
-
-      records.set(record.key, record);
-
-      if (record.code) {
-        const importerId = record.file ?? record.id;
-        await Promise.all([
-          ...extractViteRunnerImports(record.code).map((specifier) =>
-            visit(environmentName, specifier, importerId),
-          ),
-          ...extractViteEnvironmentImports(record.code).map((dependency) =>
-            visit(dependency.environmentName, dependency.id, undefined),
-          ),
-        ]);
-      }
-
-      return record.key;
-    })();
-
-    pending.set(requestKey, promise);
-    try {
-      return await promise;
-    } finally {
-      pending.delete(requestKey);
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify(record));
+    } catch (error) {
+      next(error);
     }
-  };
-
-  const entryKey = await visit(options.environmentName, entryRequest, undefined);
-  return {
-    entryEnvironment: options.environmentName,
-    entryKey,
-    records: [...records.values()],
-    aliases: [...aliases.entries()],
-    devFetchOrigins: viteDevServerOrigins(viteServer),
-    updateToken: options.updateToken,
-  };
+  });
 }
 
 async function fetchViteModule(environment, id, importer) {
@@ -1220,23 +1546,6 @@ function rewriteViteRscCssVirtualModule(code) {
     .join("undefined");
 }
 
-function addViteRunnerRecordAliases(record, aliases) {
-  for (const value of [
-    record.id,
-    record.url,
-    record.file,
-    record.requestedId,
-    cleanViteRunnerId(record.id),
-    cleanViteRunnerId(record.url),
-    cleanViteRunnerId(record.file),
-    cleanViteRunnerId(record.requestedId),
-  ]) {
-    if (value) {
-      aliases.set(viteRunnerKey(record.environmentName, value), record.key);
-    }
-  }
-}
-
 function viteRunnerImportMetaEnv(environment) {
   const config = environment.config;
   return {
@@ -1258,113 +1567,17 @@ function viteRunnerKey(environmentName, id) {
   return `${environmentName}\0${id}`;
 }
 
-function cleanViteRunnerId(value) {
-  if (!value) {
-    return undefined;
-  }
-  const index = String(value).search(/[?#]/);
-  return index === -1 ? String(value) : String(value).slice(0, index);
-}
-
-function extractViteRunnerImports(code) {
-  const imports = new Set();
-  const pattern = /__vite_ssr_(?:dynamic_)?import__\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
-  for (const match of code.matchAll(pattern)) {
-    const value = parseJsStringLiteral(match[1]);
-    if (value && !isIgnorableViteRunnerImport(value)) {
-      imports.add(value);
-    }
-  }
-  const stringPattern = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g;
-  for (const match of code.matchAll(stringPattern)) {
-    const value = parseJsStringLiteral(match[0]);
-    const importExpression = String(value).match(/^import\((["'])(.*)\1\)$/);
-    if (importExpression && isLikelyViteModuleSpecifier(importExpression[2])) {
-      imports.add(importExpression[2]);
-      continue;
-    }
-    if (isLikelyViteModuleSpecifier(value)) {
-      imports.add(value);
-    }
-  }
-  return [...imports];
-}
-
-function isLikelyViteModuleSpecifier(value) {
-  const specifier = String(value ?? "");
-  if (isIgnorableViteRunnerImport(specifier)) {
-    return false;
-  }
-  if (specifier.startsWith("import(")) {
-    return false;
-  }
-  return (
-    specifier.startsWith("/@id/") ||
-    specifier.startsWith("/@fs/") ||
-    specifier.startsWith("/node_modules/.vite/") ||
-    specifier.startsWith("virtual:") ||
-    specifier.includes("virtual:vite-rsc")
-  );
-}
-
-function isIgnorableViteRunnerImport(value) {
-  const specifier = String(value ?? "");
-  return (
-    specifier === "\0" ||
-    specifier === "/@id/__x00__" ||
-    (specifier.includes("virtual:vite-rsc/css?") && !specifier.includes("type=")) ||
-    (specifier.includes("virtual:vite-rsc/reference-validation?") && !specifier.includes("type=")) ||
-    specifier.trim() === ""
-  );
-}
-
-function extractViteEnvironmentImports(code) {
-  const imports = [];
-  const pattern =
-    /__VITE_ENVIRONMENT_RUNNER_IMPORT__\(\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*,\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
-  for (const match of code.matchAll(pattern)) {
-    const environmentName = parseJsStringLiteral(match[1]);
-    const id = parseJsStringLiteral(match[2]);
-    if (environmentName && id) {
-      imports.push({ environmentName, id });
-    }
-  }
-  return imports;
-}
-
-function parseJsStringLiteral(value) {
-  try {
-    return Function(`"use strict";return (${value});`)();
-  } catch {
-    return undefined;
-  }
-}
-
-function renderViteModuleRunnerWorkerSource(graph) {
-  const payload = {
-    entryEnvironment: graph.entryEnvironment,
-    entryKey: graph.entryKey,
-    records: graph.records,
-    aliases: graph.aliases,
-    devFetchOrigins: graph.devFetchOrigins,
-    updateToken: graph.updateToken,
-  };
-  return `${VITE_MODULE_RUNNER_WORKER_BOOTSTRAP}
-const __ddViteGraph = ${JSON.stringify(payload)};
-const __ddViteEntry = await __ddViteImportGraph(__ddViteGraph);
-export default __ddViteEntry;
-`;
-}
-
 const VITE_MODULE_RUNNER_WORKER_BOOTSTRAP = `
 const __ddViteAsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
-async function __ddViteImportGraph(graph) {
-  const records = new Map(graph.records.map((record) => [record.key, record]));
-  const aliases = new Map(graph.aliases);
+async function __ddViteImportDev(config) {
+  const records = new Map();
+  const aliases = new Map();
+  const pending = new Map();
   const cache = new Map();
-  const devFetchOrigins = new Set(graph.devFetchOrigins ?? []);
-  const updateToken = String(graph.updateToken ?? "");
+  const devFetchOrigins = new Set(config.devFetchOrigins ?? []);
+  const token = String(config.token ?? "");
+  const moduleEndpoint = String(config.moduleEndpoint);
   const nodeModuleShim = Object.freeze({
     createRequire(url) {
       const require = (id) => {
@@ -1376,9 +1589,8 @@ async function __ddViteImportGraph(graph) {
   });
   const emptyVirtualKey = "__dd_vite_empty_virtual_module__";
   const emptyCssVirtualKey = "__dd_vite_empty_css_virtual_module__";
-  installInternalRecords(graph.records[0]?.importMetaEnv ?? {});
-  const firstEnv = graph.records[0]?.importMetaEnv ?? {};
-  const nodeEnv = firstEnv.PROD ? "production" : "development";
+  installInternalRecords(config.entryEnvironment, {});
+  const nodeEnv = "development";
   globalThis.process ??= { env: {} };
   globalThis.process.env ??= {};
   globalThis.process.env.NODE_ENV ??= nodeEnv;
@@ -1433,10 +1645,10 @@ async function __ddViteImportGraph(graph) {
     globalThis.fetch = bridge;
   }
 
-  function installInternalRecords(importMetaEnv) {
+  function installInternalRecords(environmentName, importMetaEnv) {
     records.set(emptyVirtualKey, {
       key: emptyVirtualKey,
-      environmentName: graph.entryEnvironment,
+      environmentName,
       id: emptyVirtualKey,
       url: emptyVirtualKey,
       code: "",
@@ -1444,7 +1656,7 @@ async function __ddViteImportGraph(graph) {
     });
     records.set(emptyCssVirtualKey, {
       key: emptyCssVirtualKey,
-      environmentName: graph.entryEnvironment,
+      environmentName,
       id: emptyCssVirtualKey,
       url: emptyCssVirtualKey,
       code: "__vite_ssr_exportName__(\\"default\\", () => []);",
@@ -1483,50 +1695,112 @@ async function __ddViteImportGraph(graph) {
     return normalizePath(dirname(base) + "/" + specifier);
   }
 
-  function resolveKey(environmentName, id, importerKey) {
-    if (records.has(String(id))) {
-      return String(id);
-    }
-    const importer = importerKey ? records.get(importerKey) : undefined;
-    const raw = String(id);
-    const resolved = importer ? resolveRelative(importer.url || importer.id, raw) : raw;
-    const candidates = [resolved, clean(resolved)];
-    if (resolved.startsWith("/@fs/")) {
-      candidates.push(resolved.slice("/@fs".length), clean(resolved.slice("/@fs".length)));
-    }
-    const recordKey = (candidate) => {
-      const aliasKey = environmentName + "\\0" + candidate;
-      const key = aliases.get(aliasKey) ?? aliasKey;
-      return records.has(key) ? key : undefined;
-    };
-    if (raw.includes("virtual:vite-rsc/css?")) {
-      return recordKey(resolved) ?? emptyCssVirtualKey;
-    }
-    for (const candidate of candidates) {
-      const key = recordKey(candidate);
-      if (key) {
-        return key;
+  function addAliases(record, importer, requestedId) {
+    const values = [
+      record.id,
+      record.url,
+      record.file,
+      record.requestedId,
+      requestedId,
+      clean(record.id),
+      clean(record.url),
+      clean(record.file),
+      clean(record.requestedId),
+      clean(requestedId),
+    ];
+    for (const value of values) {
+      if (value) {
+        aliases.set(record.environmentName + "\\0" + value + "\\0" + (importer ?? ""), record.key);
+        aliases.set(record.environmentName + "\\0" + value, record.key);
       }
     }
-    if (raw.includes("virtual:vite-rsc/")) {
-      if (raw.includes("virtual:vite-rsc/reference-validation?")) {
-        return emptyVirtualKey;
-      }
-      for (const candidate of candidates) {
-        const suffix = "\\0" + candidate;
-        for (const [aliasKey, key] of aliases) {
-          if (aliasKey.endsWith(suffix) && records.has(key)) {
-            return key;
-          }
-        }
-      }
-    }
-    throw new Error("dd Vite module runner could not resolve " + raw + " in " + environmentName);
   }
 
-  async function load(environmentName, id, importerKey) {
-    const key = resolveKey(environmentName, id, importerKey);
-    const record = records.get(key);
+  function fallbackRecord(environmentName, id) {
+    if (String(id).includes("virtual:vite-rsc/css?")) {
+      return records.get(emptyCssVirtualKey);
+    }
+    if (String(id).includes("virtual:vite-rsc/reference-validation?")) {
+      return records.get(emptyVirtualKey);
+    }
+    return undefined;
+  }
+
+  async function fetchRecord(environmentName, id, importerRecord) {
+    const importer = importerRecord?.file || importerRecord?.id || importerRecord?.url;
+    const raw = String(id);
+    const aliasKey = environmentName + "\\0" + raw + "\\0" + (importer ?? "");
+    const alias = aliases.get(aliasKey) ?? aliases.get(environmentName + "\\0" + raw);
+    if (alias && records.has(alias)) {
+      return records.get(alias);
+    }
+    const fallback = fallbackRecord(environmentName, raw);
+    if (fallback) {
+      return fallback;
+    }
+    const pendingKey = aliasKey;
+    if (pending.has(pendingKey)) {
+      return pending.get(pendingKey);
+    }
+    const promise = (async () => {
+      const response = await hostFetch(moduleEndpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-dd-vite-module-token": token,
+        },
+        body: JSON.stringify({ environmentName, id: raw, importer }),
+      });
+      if (!response.ok) {
+        throw new Error("dd Vite dev runner failed to fetch " + raw + ": " + response.status + " " + await response.text());
+      }
+      const record = await response.json();
+      records.set(record.key, record);
+      addAliases(record, importer, raw);
+      installInternalRecords(record.environmentName, record.importMetaEnv ?? {});
+      return record;
+    })();
+    pending.set(pendingKey, promise);
+    try {
+      return await promise;
+    } finally {
+      pending.delete(pendingKey);
+    }
+  }
+
+  function hostFetch(input, init) {
+    const rawHostFetch = globalThis.__dd_raw_host_fetch ?? globalThis.__dd_deno_runtime?.fetch ?? globalThis.fetch;
+    return rawHostFetch(input, init);
+  }
+
+  function resolveKey(environmentName, id, importerRecord) {
+    const importer = importerRecord?.file || importerRecord?.id || importerRecord?.url;
+    const raw = String(id);
+    const alias = aliases.get(environmentName + "\\0" + raw + "\\0" + (importer ?? "")) ??
+      aliases.get(environmentName + "\\0" + raw);
+    if (alias && records.has(alias)) {
+      return alias;
+    }
+    const resolved = importerRecord ? resolveRelative(importerRecord.url || importerRecord.id, raw) : raw;
+    const resolvedAlias = aliases.get(environmentName + "\\0" + resolved + "\\0" + (importer ?? "")) ??
+      aliases.get(environmentName + "\\0" + resolved);
+    if (resolvedAlias && records.has(resolvedAlias)) {
+      return resolvedAlias;
+    }
+    const fallback = fallbackRecord(environmentName, raw);
+    if (fallback) {
+      return fallback.key;
+    }
+    return undefined;
+  }
+
+  async function load(environmentName, id, importerRecord) {
+    let key = resolveKey(environmentName, id, importerRecord);
+    let record = key ? records.get(key) : undefined;
+    if (!record) {
+      record = await fetchRecord(environmentName, id, importerRecord);
+      key = record.key;
+    }
     if (record.externalize) {
       if (record.externalize === "node:module") {
         return nodeModuleShim;
@@ -1552,8 +1826,8 @@ async function __ddViteImportGraph(graph) {
     const state = { exports, evaluated: false, executing: true, promise: undefined };
     cache.set(key, state);
 
-    const request = (specifier) => load(record.environmentName, String(specifier), key);
-    const dynamicRequest = (specifier) => load(record.environmentName, String(specifier), key);
+    const request = (specifier) => load(record.environmentName, String(specifier), record);
+    const dynamicRequest = (specifier) => load(record.environmentName, String(specifier), record);
     const exportAll = (sourceModule) => {
       if (
         sourceModule == null ||
@@ -1623,7 +1897,7 @@ async function __ddViteImportGraph(graph) {
   await activateWorker();
 
   async function activateWorker() {
-    const entry = await load(graph.entryEnvironment, graph.entryKey, undefined);
+    const entry = await load(config.entryEnvironment, config.entryId, undefined);
     const worker = entry.default ?? entry;
     if (!worker || typeof worker.fetch !== "function") {
       throw new Error("dd Vite module runner entry did not export a Worker fetch handler");
@@ -1632,36 +1906,22 @@ async function __ddViteImportGraph(graph) {
     return worker;
   }
 
-  async function applyGraphUpdate(nextGraph) {
+  async function invalidateModules() {
     records.clear();
-    for (const record of nextGraph.records ?? []) {
-      records.set(record.key, record);
-    }
     aliases.clear();
-    for (const [key, value] of nextGraph.aliases ?? []) {
-      aliases.set(key, value);
-    }
-    devFetchOrigins.clear();
-    for (const origin of nextGraph.devFetchOrigins ?? []) {
-      devFetchOrigins.add(origin);
-    }
-    graph.entryEnvironment = nextGraph.entryEnvironment;
-    graph.entryKey = nextGraph.entryKey;
-    graph.records = nextGraph.records ?? [];
-    installInternalRecords(graph.records[0]?.importMetaEnv ?? {});
     cache.clear();
     await activateWorker();
   }
 
-  function isGraphUpdateRequest(request) {
+  function isInvalidateRequest(request) {
     if (!(request instanceof Request)) {
       return false;
     }
-    if (request.headers.get("x-dd-vite-module-runner-update") !== updateToken) {
+    if (request.headers.get("x-dd-vite-module-token") !== token) {
       return false;
     }
     try {
-      return new URL(request.url).pathname === "/__dd_vite_module_runner_update";
+      return new URL(request.url).pathname === config.invalidatePath;
     } catch {
       return false;
     }
@@ -1672,8 +1932,8 @@ async function __ddViteImportGraph(graph) {
       if (property === "fetch") {
         return async (request, ...args) => {
           installDevFetchBridge();
-          if (isGraphUpdateRequest(request)) {
-            await applyGraphUpdate(await request.json());
+          if (isInvalidateRequest(request)) {
+            await invalidateModules();
             return new Response(null, { status: 204 });
           }
           return activeWorker.fetch(request, ...args);
@@ -1760,9 +2020,21 @@ function viteDevServerActualUrl(viteServer) {
   const address = viteServer.httpServer?.address?.();
   if (address && typeof address === "object") {
     const protocol = viteServer.config.server.https ? "https" : "http";
-    return `${protocol}://127.0.0.1:${address.port}/`;
+    const host = viteDevServerAddressHost(address.address);
+    return `${protocol}://${host}:${address.port}/`;
   }
   return undefined;
+}
+
+function viteDevServerAddressHost(address) {
+  const value = String(address ?? "");
+  if (!value || value === "::" || value === "0.0.0.0") {
+    return "127.0.0.1";
+  }
+  if (value.includes(":")) {
+    return `[${value}]`;
+  }
+  return value;
 }
 
 function patchViteResolvedUrls(viteServer) {
@@ -2635,25 +2907,72 @@ function resolveViteOutDir(config) {
   return isAbsolute(outDir) ? outDir : resolve(root, outDir);
 }
 
-function hasPluginFrameworkBuildEnvironment(config, framework, environmentName) {
-  return Boolean(framework && config?.environments?.[environmentName]);
+function resolveBuildOutputRoot(config, root) {
+  const configured = config?.build?.outDir ?? "dist";
+  return isAbsolute(configured) ? configured : resolve(root ?? config?.root ?? process.cwd(), configured);
+}
+
+function childBuildOutDir(baseOutDir, child) {
+  const base = baseOutDir ?? "dist";
+  if (isAbsolute(base)) {
+    return join(base, child);
+  }
+  return joinConfigRelativePath(normalizeConfigRelativePath(base, "build.outDir"), child);
+}
+
+function relativeDeploymentAssetsDir(workerOutputName, assetsOutputName) {
+  const from = workerOutputName;
+  const to = assetsOutputName;
+  const path = relative(from, to).replaceAll("\\", "/");
+  return normalizeDeploymentAssetsDir(path || ".", "deploymentConfig.assetsDir");
+}
+
+async function writeDdEnvTypes(root, workers) {
+  const lines = [
+    "/* Generated by @mewhhaha/vite-plugin-dd. */",
+    "export interface DdServiceBinding {",
+    "  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;",
+    "}",
+    "",
+    "export type DdStateBinding = unknown;",
+    "",
+    "export interface DdWorkerEnvMap {",
+  ];
+  for (const worker of workers) {
+    lines.push(`  ${JSON.stringify(worker.name)}: {`);
+    for (const binding of workerEnvBindings(worker)) {
+      lines.push(`    ${JSON.stringify(binding.name)}: ${binding.type};`);
+    }
+    lines.push("  };");
+  }
+  lines.push(
+    "}",
+    "",
+    "export type DdWorkerEnv<Name extends keyof DdWorkerEnvMap> = DdWorkerEnvMap[Name];",
+    "",
+  );
+  await writeFile(join(root, DEFAULT_ENV_TYPES_FILE), `${lines.join("\n")}`);
+}
+
+function workerEnvBindings(worker) {
+  const bindings = [];
+  for (const binding of Array.isArray(worker.config?.bindings) ? worker.config.bindings : []) {
+    const name = nonEmptyString(binding?.binding);
+    if (!name) {
+      continue;
+    }
+    const type = String(binding?.type ?? "").toLowerCase() === "service"
+      ? "DdServiceBinding"
+      : "DdStateBinding";
+    bindings.push({ name, type });
+  }
+  return bindings;
 }
 
 async function writeOutputFile(outDir, file, contents) {
   const path = join(outDir, file);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, contents);
-}
-
-async function outputFileExists(outDir, file) {
-  try {
-    return (await stat(join(outDir, file))).isFile();
-  } catch (error) {
-    if (isMissingFileError(error)) {
-      return false;
-    }
-    throw error;
-  }
 }
 
 async function writeGeneratedStaticRoutes(outDir, deploymentConfig) {
@@ -2722,7 +3041,7 @@ function deploymentAssetsOutputDir(outDir, assetsDir) {
   }
   return join(
     outDir,
-    normalizeConfigRelativePath(
+    normalizeDeploymentAssetsDir(
       assetsDir ?? DEFAULT_DEPLOYMENT_ASSETS_DIR,
       "deploymentConfig.assetsDir",
     ),
@@ -2779,6 +3098,7 @@ async function buildGeneratedDeploymentConfig({
   configFile,
   assetsDir,
   assetExcludes,
+  extraAssetExcludes = [],
   staticRoutes,
 }) {
   const deployment = {};
@@ -2799,7 +3119,7 @@ async function buildGeneratedDeploymentConfig({
   if (assetsDir === false) {
     delete deployment.assets_dir;
   } else {
-    deployment.assets_dir = normalizeConfigRelativePath(
+    deployment.assets_dir = normalizeDeploymentAssetsDir(
       assetsDir ?? DEFAULT_DEPLOYMENT_ASSETS_DIR,
       "deploymentConfig.assetsDir",
     );
@@ -2807,11 +3127,32 @@ async function buildGeneratedDeploymentConfig({
   deployment.asset_excludes = uniquePaths([
     ...arrayOfStrings(base.asset_excludes),
     ...arrayOfStrings(assetExcludes),
+    ...arrayOfStrings(extraAssetExcludes),
     ...(staticRoutes ? [DEFAULT_STATIC_ROUTES_FILE] : []),
     workerFile,
     configFile,
   ]);
   deployment.config = runtimeConfig;
+  return deployment;
+}
+
+function buildAuxiliaryServiceDeploymentConfig({
+  base,
+  worker,
+  workerFile,
+}) {
+  const deployment = {
+    name: worker.kind === "service" ? worker.service : worker.runtimeName,
+    entrypoint: workerFile,
+    config: worker.kind === "service" ? auxiliaryWorkerServiceConfig(worker) : cloneJson(worker.config),
+  };
+  const baseUrl = nonEmptyString(base.base_url) ?? nonEmptyString(base.baseUrl);
+  if (baseUrl) {
+    deployment.base_url = baseUrl;
+  }
+  if (base.temporary === true) {
+    deployment.temporary = true;
+  }
   return deployment;
 }
 
@@ -2912,6 +3253,22 @@ function normalizeOutputPath(value, label) {
   const normalized = normalizeConfigRelativePath(value, label);
   if (normalized === ".") {
     throw new Error(`${label} must be a file path`);
+  }
+  return normalized;
+}
+
+function normalizeDeploymentAssetsDir(value, label) {
+  const normalized = String(value).replaceAll("\\", "/").replace(/^\/+/, "");
+  if (normalized === ".") {
+    return ".";
+  }
+  const parts = normalized.split("/");
+  if (
+    normalized.length === 0 ||
+    parts.some((part) => part.length === 0 || part === ".") ||
+    isAbsolute(String(value))
+  ) {
+    throw new Error(`${label} must be a relative asset directory`);
   }
   return normalized;
 }

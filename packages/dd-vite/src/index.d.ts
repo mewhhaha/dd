@@ -28,17 +28,26 @@ export interface DdWorkerRuntimeOptions extends DdWorkerBundleOptions {
 
 export interface DdAuxiliaryWorkerOptions extends DdWorkerBundleOptions {
   name: string;
+  kind?: "dynamic" | "service";
   binding?: string;
   id?: string;
+  service?: string;
+  viteEnvironment?: DdViteEnvironmentOptions;
   entry?: string | URL;
   source?: string | (() => string | Promise<string>);
   config?: Record<string, unknown>;
+  deployment?: {
+    entrypoint?: string;
+    output?: string;
+  };
 }
 
 export interface DdAuxiliaryWorkerRecord {
   name: string;
+  kind: "dynamic" | "service";
   binding: string;
   id: string;
+  service?: string;
   config: Record<string, unknown>;
 }
 
@@ -80,10 +89,8 @@ export interface DdVitePluginOptions extends DdWorkerRuntimeOptions {
   middleware?: boolean;
   environment?: boolean;
   viteEnvironment?: DdViteEnvironmentOptions;
-  environmentName?: string;
   environmentOptions?: EnvironmentOptions;
   reloadOnHotUpdate?: boolean | "all" | "entry";
-  devModuleRunner?: boolean;
   deploymentConfig?: false | DdGeneratedDeploymentConfigOptions;
   auxiliaryWorkers?: DdAuxiliaryWorkerOptions[];
   eager?: boolean;

@@ -1,9 +1,11 @@
 declare module "virtual:dd-auxiliary-workers" {
   export type AuxiliaryWorkerRecord = {
     name: string;
+    kind: "dynamic" | "service";
     binding: string;
     id: string;
-    config: import("./types").DynamicWorkerConfig;
+    service?: string;
+    config: Record<string, unknown>;
   };
 
   export const workers: Record<string, AuxiliaryWorkerRecord>;
