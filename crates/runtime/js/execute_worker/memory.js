@@ -216,7 +216,7 @@
     ];
     const argsBytes = await encodeRpcArgs(payload);
     try {
-      const preferCallerIsolate = methodName === MEMORY_ATOMIC_METHOD || !descriptor.export_name;
+      const preferCallerIsolate = !descriptor.export_name;
       const result = await callOp(
         "op_memory_invoke_method",
         scopedRequestContextHandle,

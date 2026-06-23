@@ -1,0 +1,817 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-06-23T20:12:24.542Z",
+  "metadata": {
+    "git_commit": "cc4075fcb8abbbc2a2d1fae4c748bc69d38117f2",
+    "git_dirty": false,
+    "rustc": "rustc 1.96.0-nightly (3645249d7 2026-03-16)",
+    "cargo": "cargo 1.96.0-nightly (cbb9bb8bd 2026-03-13)",
+    "os": "Linux cachyos-x8664 7.0.9-1-cachyos #1 SMP PREEMPT_DYNAMIC Sun, 17 May 2026 16:56:12 +0000 x86_64 GNU/Linux",
+    "logical_cpus": 16
+  },
+  "sample_count": 3,
+  "configs": [
+    {
+      "name": "atomic-memory-readwrite-cross-shard.sh",
+      "path": "benchmarks/configs/atomic-memory-readwrite-cross-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "atomic-readwrite-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:12:24.567Z",
+          "duration_ms": 1290.7,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-readwrite-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4040 elapsed_ms=1001 stalled_for_ms=426\nmemory-atomic-readwrite-memory-wide requests=4096 concurrency=128 total=568.63ms throughput=7203 req/s mean=17.62ms p50=13.98ms p95=25.91ms p99=115.51ms\nbench-phases label=memory-atomic-readwrite-memory-wide deploy_ms=6.47 seed_ms=0.00 timed_ms=568.63 verify_ms=438.25 profile_ms=0.00 shutdown_ms=0.00 total_ms=1014.01\nbench-final label=memory-atomic-readwrite-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.17s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-readwrite-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 568.63,
+              "throughput_rps": 7203,
+              "mean_ms": 17.62,
+              "p50_ms": 13.98,
+              "p95_ms": 25.91,
+              "p99_ms": 115.51
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:12:25.858Z",
+          "duration_ms": 1425.28,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-readwrite-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4064 elapsed_ms=1001 stalled_for_ms=398\nmemory-atomic-readwrite-memory-wide requests=4096 concurrency=128 total=596.10ms throughput=6871 req/s mean=18.49ms p50=14.64ms p95=28.84ms p99=130.03ms\nbench-phases label=memory-atomic-readwrite-memory-wide deploy_ms=7.54 seed_ms=0.00 timed_ms=596.10 verify_ms=501.03 profile_ms=0.00 shutdown_ms=0.00 total_ms=1105.13\nbench-final label=memory-atomic-readwrite-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.20s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-readwrite-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 596.1,
+              "throughput_rps": 6871,
+              "mean_ms": 18.49,
+              "p50_ms": 14.64,
+              "p95_ms": 28.84,
+              "p99_ms": 130.03
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:12:27.284Z",
+          "duration_ms": 1397.38,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-readwrite-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4071 elapsed_ms=1001 stalled_for_ms=415\nmemory-atomic-readwrite-memory-wide requests=4096 concurrency=128 total=577.02ms throughput=7099 req/s mean=17.91ms p50=14.04ms p95=27.92ms p99=114.34ms\nbench-phases label=memory-atomic-readwrite-memory-wide deploy_ms=9.06 seed_ms=0.00 timed_ms=577.02 verify_ms=517.14 profile_ms=0.00 shutdown_ms=0.00 total_ms=1103.68\nbench-final label=memory-atomic-readwrite-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-readwrite-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 577.02,
+              "throughput_rps": 7099,
+              "mean_ms": 17.91,
+              "p50_ms": 14.04,
+              "p95_ms": 27.92,
+              "p99_ms": 114.34
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-atomic-readwrite-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 577.02,
+          "throughput_rps": 7099,
+          "mean_ms": 17.91,
+          "p50_ms": 14.04,
+          "p95_ms": 27.92,
+          "p99_ms": 115.51
+        }
+      ]
+    },
+    {
+      "name": "atomic-memory-readwrite-same-shard.sh",
+      "path": "benchmarks/configs/atomic-memory-readwrite-same-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "atomic-readwrite-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "same-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:12:28.682Z",
+          "duration_ms": 2670.48,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-readwrite-memory-wide phase=invoke health=progressing completed=2310/4096 last_completed_request=2309 elapsed_ms=1001 stalled_for_ms=0\nbench-status label=memory-atomic-readwrite-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=3923 elapsed_ms=2002 stalled_for_ms=192\nmemory-atomic-readwrite-memory-wide requests=4096 concurrency=128 total=1804.09ms throughput=2270 req/s mean=54.89ms p50=46.38ms p95=122.54ms p99=148.43ms\nbench-phases label=memory-atomic-readwrite-memory-wide deploy_ms=6.78 seed_ms=0.00 timed_ms=1804.09 verify_ms=557.05 profile_ms=0.00 shutdown_ms=0.00 total_ms=2369.64\nbench-final label=memory-atomic-readwrite-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-readwrite-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1804.09,
+              "throughput_rps": 2270,
+              "mean_ms": 54.89,
+              "p50_ms": 46.38,
+              "p95_ms": 122.54,
+              "p99_ms": 148.43
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:12:31.353Z",
+          "duration_ms": 2845.48,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-readwrite-memory-wide phase=invoke health=progressing completed=1952/4096 last_completed_request=1958 elapsed_ms=1001 stalled_for_ms=42\nbench-status label=memory-atomic-readwrite-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=3908 elapsed_ms=2002 stalled_for_ms=35\nmemory-atomic-readwrite-memory-wide requests=4096 concurrency=128 total=1960.00ms throughput=2090 req/s mean=59.99ms p50=53.63ms p95=122.70ms p99=177.18ms\nbench-phases label=memory-atomic-readwrite-memory-wide deploy_ms=6.95 seed_ms=0.00 timed_ms=1960.00 verify_ms=566.17 profile_ms=0.00 shutdown_ms=0.00 total_ms=2535.47\nbench-final label=memory-atomic-readwrite-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-readwrite-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1960,
+              "throughput_rps": 2090,
+              "mean_ms": 59.99,
+              "p50_ms": 53.63,
+              "p95_ms": 122.7,
+              "p99_ms": 177.18
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:12:34.198Z",
+          "duration_ms": 2781.73,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-readwrite-memory-wide phase=invoke health=progressing completed=1950/4096 last_completed_request=2011 elapsed_ms=1001 stalled_for_ms=2\nbench-status label=memory-atomic-readwrite-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=3724 elapsed_ms=2001 stalled_for_ms=48\nmemory-atomic-readwrite-memory-wide requests=4096 concurrency=128 total=1944.56ms throughput=2106 req/s mean=59.45ms p50=47.84ms p95=139.85ms p99=206.30ms\nbench-phases label=memory-atomic-readwrite-memory-wide deploy_ms=9.09 seed_ms=0.00 timed_ms=1944.56 verify_ms=497.24 profile_ms=0.00 shutdown_ms=0.00 total_ms=2452.62\nbench-final label=memory-atomic-readwrite-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.22s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-readwrite-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1944.56,
+              "throughput_rps": 2106,
+              "mean_ms": 59.45,
+              "p50_ms": 47.84,
+              "p95_ms": 139.85,
+              "p99_ms": 206.3
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-atomic-readwrite-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 1944.56,
+          "throughput_rps": 2106,
+          "mean_ms": 59.45,
+          "p50_ms": 47.84,
+          "p95_ms": 122.7,
+          "p99_ms": 177.18
+        }
+      ]
+    },
+    {
+      "name": "atomic-memory-write-cross-shard.sh",
+      "path": "benchmarks/configs/atomic-memory-write-cross-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "atomic-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:12:36.980Z",
+          "duration_ms": 2206.12,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3209/4096 last_completed_request=3222 elapsed_ms=1001 stalled_for_ms=7\nmemory-atomic-write-effect-memory-wide requests=4096 concurrency=128 total=1265.65ms throughput=3236 req/s mean=39.15ms p50=36.53ms p95=56.95ms p99=130.63ms\nbench-phases label=memory-atomic-write-effect-memory-wide deploy_ms=6.25 seed_ms=0.00 timed_ms=1265.65 verify_ms=614.34 profile_ms=0.00 shutdown_ms=0.00 total_ms=1886.88\nbench-final label=memory-atomic-write-effect-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.21s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-write-effect-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1265.65,
+              "throughput_rps": 3236,
+              "mean_ms": 39.15,
+              "p50_ms": 36.53,
+              "p95_ms": 56.95,
+              "p99_ms": 130.63
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:12:39.187Z",
+          "duration_ms": 2561.11,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=2920/4096 last_completed_request=2930 elapsed_ms=1002 stalled_for_ms=1\nbench-status label=memory-atomic-write-effect-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4091 elapsed_ms=2002 stalled_for_ms=594\nmemory-atomic-write-effect-memory-wide requests=4096 concurrency=128 total=1398.86ms throughput=2928 req/s mean=43.15ms p50=40.19ms p95=61.41ms p99=143.76ms\nbench-phases label=memory-atomic-write-effect-memory-wide deploy_ms=9.64 seed_ms=0.00 timed_ms=1398.86 verify_ms=838.07 profile_ms=0.00 shutdown_ms=0.00 total_ms=2247.04\nbench-final label=memory-atomic-write-effect-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.20s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-write-effect-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1398.86,
+              "throughput_rps": 2928,
+              "mean_ms": 43.15,
+              "p50_ms": 40.19,
+              "p95_ms": 61.41,
+              "p99_ms": 143.76
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:12:41.748Z",
+          "duration_ms": 2182.94,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3153/4096 last_completed_request=3144 elapsed_ms=1001 stalled_for_ms=18\nmemory-atomic-write-effect-memory-wide requests=4096 concurrency=128 total=1268.50ms throughput=3229 req/s mean=39.19ms p50=36.09ms p95=59.54ms p99=134.74ms\nbench-phases label=memory-atomic-write-effect-memory-wide deploy_ms=6.27 seed_ms=0.00 timed_ms=1268.50 verify_ms=612.79 profile_ms=0.00 shutdown_ms=0.00 total_ms=1888.22\nbench-final label=memory-atomic-write-effect-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-write-effect-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1268.5,
+              "throughput_rps": 3229,
+              "mean_ms": 39.19,
+              "p50_ms": 36.09,
+              "p95_ms": 59.54,
+              "p99_ms": 134.74
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-atomic-write-effect-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 1268.5,
+          "throughput_rps": 3229,
+          "mean_ms": 39.19,
+          "p50_ms": 36.53,
+          "p95_ms": 59.54,
+          "p99_ms": 134.74
+        }
+      ]
+    },
+    {
+      "name": "atomic-memory-write-same-shard.sh",
+      "path": "benchmarks/configs/atomic-memory-write-same-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "atomic-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "same-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:12:43.931Z",
+          "duration_ms": 9291.48,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=1279/4096 last_completed_request=1292 elapsed_ms=1000 stalled_for_ms=35\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=2382/4096 last_completed_request=2402 elapsed_ms=2001 stalled_for_ms=56\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=2982/4096 last_completed_request=3032 elapsed_ms=3003 stalled_for_ms=11\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3493/4096 last_completed_request=3539 elapsed_ms=4005 stalled_for_ms=153\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3725/4096 last_completed_request=3721 elapsed_ms=5007 stalled_for_ms=358\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3824/4096 last_completed_request=3789 elapsed_ms=6008 stalled_for_ms=839\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=4081/4096 last_completed_request=4025 elapsed_ms=7009 stalled_for_ms=25\nbench-status label=memory-atomic-write-effect-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4042 elapsed_ms=8010 stalled_for_ms=819\nmemory-atomic-write-effect-memory-wide requests=4096 concurrency=128 total=7185.56ms throughput=570 req/s mean=212.06ms p50=123.55ms p95=841.88ms p99=1169.38ms\nbench-phases label=memory-atomic-write-effect-memory-wide deploy_ms=6.05 seed_ms=0.00 timed_ms=7185.56 verify_ms=1801.02 profile_ms=0.00 shutdown_ms=0.00 total_ms=8994.68\nbench-final label=memory-atomic-write-effect-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-write-effect-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 7185.56,
+              "throughput_rps": 570,
+              "mean_ms": 212.06,
+              "p50_ms": 123.55,
+              "p95_ms": 841.88,
+              "p99_ms": 1169.38
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:12:53.223Z",
+          "duration_ms": 7676.01,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=1203/4096 last_completed_request=1226 elapsed_ms=1001 stalled_for_ms=13\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=2353/4096 last_completed_request=2411 elapsed_ms=2002 stalled_for_ms=147\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3350/4096 last_completed_request=3225 elapsed_ms=3004 stalled_for_ms=2\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3794/4096 last_completed_request=3772 elapsed_ms=4006 stalled_for_ms=161\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=4059/4096 last_completed_request=3970 elapsed_ms=5007 stalled_for_ms=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4018 elapsed_ms=6009 stalled_for_ms=524\nbench-status label=memory-atomic-write-effect-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=4018 elapsed_ms=7011 stalled_for_ms=1526\nmemory-atomic-write-effect-memory-wide requests=4096 concurrency=128 total=5477.58ms throughput=748 req/s mean=154.17ms p50=104.88ms p95=492.73ms p99=1061.60ms\nbench-phases label=memory-atomic-write-effect-memory-wide deploy_ms=7.91 seed_ms=0.00 timed_ms=5477.58 verify_ms=1855.80 profile_ms=0.00 shutdown_ms=0.00 total_ms=7342.99\nbench-final label=memory-atomic-write-effect-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.21s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-write-effect-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 5477.58,
+              "throughput_rps": 748,
+              "mean_ms": 154.17,
+              "p50_ms": 104.88,
+              "p95_ms": 492.73,
+              "p99_ms": 1061.6
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:13:00.899Z",
+          "duration_ms": 7011.48,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=1380/4096 last_completed_request=1376 elapsed_ms=1001 stalled_for_ms=15\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=2491/4096 last_completed_request=2547 elapsed_ms=2002 stalled_for_ms=25\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3391/4096 last_completed_request=3428 elapsed_ms=3004 stalled_for_ms=14\nbench-status label=memory-atomic-write-effect-memory-wide phase=invoke health=progressing completed=3882/4096 last_completed_request=3988 elapsed_ms=4006 stalled_for_ms=105\nbench-status label=memory-atomic-write-effect-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=3856 elapsed_ms=5007 stalled_for_ms=100\nbench-status label=memory-atomic-write-effect-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=3856 elapsed_ms=6007 stalled_for_ms=1100\nmemory-atomic-write-effect-memory-wide requests=4096 concurrency=128 total=4901.57ms throughput=836 req/s mean=141.45ms p50=98.40ms p95=363.04ms p99=1070.76ms\nbench-phases label=memory-atomic-write-effect-memory-wide deploy_ms=6.22 seed_ms=0.00 timed_ms=4901.57 verify_ms=1796.88 profile_ms=0.00 shutdown_ms=0.00 total_ms=6707.00\nbench-final label=memory-atomic-write-effect-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-atomic-write-effect-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 4901.57,
+              "throughput_rps": 836,
+              "mean_ms": 141.45,
+              "p50_ms": 98.4,
+              "p95_ms": 363.04,
+              "p99_ms": 1070.76
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-atomic-write-effect-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 5477.58,
+          "throughput_rps": 748,
+          "mean_ms": 154.17,
+          "p50_ms": 104.88,
+          "p95_ms": 492.73,
+          "p99_ms": 1070.76
+        }
+      ]
+    },
+    {
+      "name": "scaling-memory-write-cross-shard.sh",
+      "path": "benchmarks/configs/scaling-memory-write-cross-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:13:07.911Z",
+          "duration_ms": 1121.39,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=267.08ms throughput=15336 req/s mean=6.71ms p50=2.72ms p95=28.02ms p99=39.56ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=5.92 seed_ms=0.00 timed_ms=267.08 verify_ms=563.90 profile_ms=0.00 shutdown_ms=0.00 total_ms=837.37\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 267.08,
+              "throughput_rps": 15336,
+              "mean_ms": 6.71,
+              "p50_ms": 2.72,
+              "p95_ms": 28.02,
+              "p99_ms": 39.56
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:13:09.032Z",
+          "duration_ms": 1095.18,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=243.50ms throughput=16821 req/s mean=6.67ms p50=2.70ms p95=25.10ms p99=41.66ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=6.11 seed_ms=0.00 timed_ms=243.50 verify_ms=564.46 profile_ms=0.00 shutdown_ms=0.00 total_ms=814.55\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 243.5,
+              "throughput_rps": 16821,
+              "mean_ms": 6.67,
+              "p50_ms": 2.7,
+              "p95_ms": 25.1,
+              "p99_ms": 41.66
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:13:10.127Z",
+          "duration_ms": 1073.98,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=242.07ms throughput=16921 req/s mean=6.46ms p50=3.27ms p95=19.99ms p99=37.25ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=6.23 seed_ms=0.00 timed_ms=242.07 verify_ms=556.46 profile_ms=0.00 shutdown_ms=0.00 total_ms=805.22\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.17s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 242.07,
+              "throughput_rps": 16921,
+              "mean_ms": 6.46,
+              "p50_ms": 3.27,
+              "p95_ms": 19.99,
+              "p99_ms": 37.25
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-write-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 243.5,
+          "throughput_rps": 16821,
+          "mean_ms": 6.67,
+          "p50_ms": 2.72,
+          "p95_ms": 25.1,
+          "p99_ms": 39.56
+        }
+      ]
+    },
+    {
+      "name": "scaling-memory-write-same-shard.sh",
+      "path": "benchmarks/configs/scaling-memory-write-same-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "direct-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_MIN_ISOLATES": "16",
+        "DD_BENCH_MAX_ISOLATES": "16",
+        "DD_BENCH_MAX_INFLIGHT": "16",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "same-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:13:11.202Z",
+          "duration_ms": 1811.65,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-write-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=1727 elapsed_ms=1001 stalled_for_ms=36\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=958.93ms throughput=4271 req/s mean=25.49ms p50=4.43ms p95=82.58ms p99=430.17ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=6.28 seed_ms=0.00 timed_ms=958.93 verify_ms=565.14 profile_ms=0.00 shutdown_ms=0.00 total_ms=1532.00\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 958.93,
+              "throughput_rps": 4271,
+              "mean_ms": 25.49,
+              "p50_ms": 4.43,
+              "p95_ms": 82.58,
+              "p99_ms": 430.17
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:13:13.013Z",
+          "duration_ms": 1802.71,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-write-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=1266 elapsed_ms=1001 stalled_for_ms=45\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=949.66ms throughput=4313 req/s mean=25.27ms p50=4.17ms p95=104.44ms p99=428.95ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=6.51 seed_ms=0.00 timed_ms=949.66 verify_ms=570.71 profile_ms=0.00 shutdown_ms=0.00 total_ms=1528.52\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.17s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 949.66,
+              "throughput_rps": 4313,
+              "mean_ms": 25.27,
+              "p50_ms": 4.17,
+              "p95_ms": 104.44,
+              "p99_ms": 428.95
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:13:14.816Z",
+          "duration_ms": 1842.8,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=16 max_isolates=16 max_inflight_per_isolate=16\nbench-status label=memory-direct-write-memory-wide phase=verify health=progressing completed=4096/4096 last_completed_request=3211 elapsed_ms=1001 stalled_for_ms=33\nmemory-direct-write-memory-wide requests=4096 concurrency=128 total=961.68ms throughput=4259 req/s mean=26.54ms p50=5.01ms p95=124.47ms p99=329.62ms\nbench-phases label=memory-direct-write-memory-wide deploy_ms=7.04 seed_ms=0.00 timed_ms=961.68 verify_ms=583.38 profile_ms=0.00 shutdown_ms=0.00 total_ms=1554.89\nbench-final label=memory-direct-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-direct-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 961.68,
+              "throughput_rps": 4259,
+              "mean_ms": 26.54,
+              "p50_ms": 5.01,
+              "p95_ms": 124.47,
+              "p99_ms": 329.62
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-direct-write-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": 16,
+          "isolate_max": 16,
+          "max_inflight": 16,
+          "total_ms": 958.93,
+          "throughput_rps": 4271,
+          "mean_ms": 25.49,
+          "p50_ms": 4.43,
+          "p95_ms": 104.44,
+          "p99_ms": 428.95
+        }
+      ]
+    },
+    {
+      "name": "storage-memory-write-cross-shard.sh",
+      "path": "benchmarks/configs/storage-memory-write-cross-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "storage-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "cross-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:13:16.659Z",
+          "duration_ms": 611.14,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=1 max_inflight_per_isolate=1\nmemory-storage-write-memory-wide requests=4096 concurrency=128 total=344.14ms throughput=11902 req/s mean=10.64ms p50=11.05ms p95=12.91ms p99=13.64ms\nbench-phases label=memory-storage-write-memory-wide deploy_ms=0.00 seed_ms=0.00 timed_ms=344.14 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=392.52\nbench-final label=memory-storage-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-storage-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 344.14,
+              "throughput_rps": 11902,
+              "mean_ms": 10.64,
+              "p50_ms": 11.05,
+              "p95_ms": 12.91,
+              "p99_ms": 13.64
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:13:17.270Z",
+          "duration_ms": 620.76,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=1 max_inflight_per_isolate=1\nmemory-storage-write-memory-wide requests=4096 concurrency=128 total=353.43ms throughput=11589 req/s mean=10.96ms p50=11.00ms p95=13.85ms p99=22.77ms\nbench-phases label=memory-storage-write-memory-wide deploy_ms=0.00 seed_ms=0.00 timed_ms=353.43 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=403.05\nbench-final label=memory-storage-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-storage-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 353.43,
+              "throughput_rps": 11589,
+              "mean_ms": 10.96,
+              "p50_ms": 11,
+              "p95_ms": 13.85,
+              "p99_ms": 22.77
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:13:17.891Z",
+          "duration_ms": 634.27,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=1 max_inflight_per_isolate=1\nmemory-storage-write-memory-wide requests=4096 concurrency=128 total=351.93ms throughput=11639 req/s mean=10.88ms p50=11.21ms p95=12.95ms p99=15.33ms\nbench-phases label=memory-storage-write-memory-wide deploy_ms=0.00 seed_ms=0.00 timed_ms=351.93 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=399.94\nbench-final label=memory-storage-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-storage-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 351.93,
+              "throughput_rps": 11639,
+              "mean_ms": 10.88,
+              "p50_ms": 11.21,
+              "p95_ms": 12.95,
+              "p99_ms": 15.33
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-storage-write-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": null,
+          "isolate_max": null,
+          "max_inflight": null,
+          "total_ms": 351.93,
+          "throughput_rps": 11639,
+          "mean_ms": 10.88,
+          "p50_ms": 11.05,
+          "p95_ms": 12.95,
+          "p99_ms": 15.33
+        }
+      ]
+    },
+    {
+      "name": "storage-memory-write-same-shard.sh",
+      "path": "benchmarks/configs/storage-memory-write-same-shard.sh",
+      "env": {
+        "DD_BENCH_MODE": "storage-write-memory-wide",
+        "DD_BENCH_REQUESTS": "4096",
+        "DD_BENCH_CONCURRENCY": "128",
+        "DD_BENCH_WIDE_KEY_SPACE": "1024",
+        "DD_BENCH_MEMORY_NAMESPACE_SHARDS": "16",
+        "DD_BENCH_MEMORY_KEY_MODE": "same-shard",
+        "DD_BENCH_VERIFY_TIMEOUT_MS": "20000"
+      },
+      "samples": [
+        {
+          "sample": 1,
+          "started_at": "2026-06-23T20:13:18.526Z",
+          "duration_ms": 1898.13,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=1 max_inflight_per_isolate=1\nbench-status label=memory-storage-write-memory-wide phase=invoke health=progressing completed=4059/4096 last_completed_request=2555 elapsed_ms=1000 stalled_for_ms=11\nmemory-storage-write-memory-wide requests=4096 concurrency=128 total=1610.64ms throughput=2543 req/s mean=30.44ms p50=0.15ms p95=62.23ms p99=812.09ms\nbench-phases label=memory-storage-write-memory-wide deploy_ms=0.00 seed_ms=0.00 timed_ms=1610.64 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=1663.23\nbench-final label=memory-storage-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.20s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-storage-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1610.64,
+              "throughput_rps": 2543,
+              "mean_ms": 30.44,
+              "p50_ms": 0.15,
+              "p95_ms": 62.23,
+              "p99_ms": 812.09
+            }
+          ]
+        },
+        {
+          "sample": 2,
+          "started_at": "2026-06-23T20:13:20.424Z",
+          "duration_ms": 1470.34,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=1 max_inflight_per_isolate=1\nbench-status label=memory-storage-write-memory-wide phase=invoke health=progressing completed=4090/4096 last_completed_request=3192 elapsed_ms=1001 stalled_for_ms=13\nmemory-storage-write-memory-wide requests=4096 concurrency=128 total=1186.63ms throughput=3452 req/s mean=27.69ms p50=16.15ms p95=37.34ms p99=277.00ms\nbench-phases label=memory-storage-write-memory-wide deploy_ms=0.00 seed_ms=0.00 timed_ms=1186.63 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=1240.61\nbench-final label=memory-storage-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.19s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-storage-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1186.63,
+              "throughput_rps": 3452,
+              "mean_ms": 27.69,
+              "p50_ms": 16.15,
+              "p95_ms": 37.34,
+              "p99_ms": 277
+            }
+          ]
+        },
+        {
+          "sample": 3,
+          "started_at": "2026-06-23T20:13:21.895Z",
+          "duration_ms": 1620.02,
+          "status": 0,
+          "signal": null,
+          "stdout": "# keyed memory benchmark\n# compares hosted keyed-memory paths under configurable isolate and inflight settings.\n# runtime min_isolates=1 max_isolates=1 max_inflight_per_isolate=1\nbench-status label=memory-storage-write-memory-wide phase=invoke health=progressing completed=4089/4096 last_completed_request=133 elapsed_ms=1001 stalled_for_ms=40\nmemory-storage-write-memory-wide requests=4096 concurrency=128 total=1346.56ms throughput=3042 req/s mean=28.10ms p50=18.54ms p95=43.33ms p99=54.31ms\nbench-phases label=memory-storage-write-memory-wide deploy_ms=0.00 seed_ms=0.00 timed_ms=1346.56 verify_ms=0.00 profile_ms=0.00 shutdown_ms=0.00 total_ms=1399.59\nbench-final label=memory-storage-write-memory-wide outcome=success phase=done completed_requests=4096 total_requests=4096\n",
+          "stderr": "    Finished `release` profile [optimized] target(s) in 0.18s\n     Running `/home/mewhhaha/src/dd/target/release/bench_memory_storage`\n",
+          "metrics": [
+            {
+              "workload": "memory-storage-write-memory-wide",
+              "requests": 4096,
+              "concurrency": 128,
+              "total_ms": 1346.56,
+              "throughput_rps": 3042,
+              "mean_ms": 28.1,
+              "p50_ms": 18.54,
+              "p95_ms": 43.33,
+              "p99_ms": 54.31
+            }
+          ]
+        }
+      ],
+      "summaries": [
+        {
+          "workload": "memory-storage-write-memory-wide",
+          "samples": 3,
+          "requests": 4096,
+          "concurrency": 128,
+          "isolate_min": null,
+          "isolate_max": null,
+          "max_inflight": null,
+          "total_ms": 1346.56,
+          "throughput_rps": 3042,
+          "mean_ms": 28.1,
+          "p50_ms": 16.15,
+          "p95_ms": 43.33,
+          "p99_ms": 277
+        }
+      ]
+    }
+  ]
+}

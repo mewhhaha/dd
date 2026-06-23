@@ -91,6 +91,12 @@ struct MemoryProfileSnapshot {
     store_apply_batch: MemoryProfileMetric,
     store_apply_batch_validate: MemoryProfileMetric,
     store_apply_batch_write: MemoryProfileMetric,
+    runtime_atomic_invoke_event_wait: MemoryProfileMetric,
+    runtime_atomic_queue_wait: MemoryProfileMetric,
+    runtime_atomic_dispatch_wait: MemoryProfileMetric,
+    runtime_atomic_execution: MemoryProfileMetric,
+    runtime_atomic_completion_wait: MemoryProfileMetric,
+    runtime_atomic_outbox_drain: MemoryProfileMetric,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

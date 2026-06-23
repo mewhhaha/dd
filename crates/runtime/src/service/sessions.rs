@@ -14,6 +14,33 @@ const MEMORY_OUTBOX_EFFECT_KINDS: &[&str] = &[
 ];
 
 impl WorkerManager {
+    pub(super) fn schedule_memory_outbox_drain_shard(
+        &mut self,
+        shard_index: usize,
+        event_tx: &RuntimeEventSender,
+    ) {
+        let shard_count = self.memory_store.namespace_shards().max(1);
+        let shard_index = shard_index % shard_count;
+        if !self.pending_memory_outbox_shards.insert(shard_index) {
+            return;
+        }
+        if let Err(error) = event_tx.try_send(RuntimeEvent::MemoryOutboxDrain { shard_index }) {
+            warn!(
+                shard_index,
+                error = %error,
+                "memory outbox drain request queued for later retry"
+            );
+        }
+    }
+
+    pub(super) async fn drain_scheduled_memory_outbox_shard(
+        &mut self,
+        shard_index: usize,
+    ) -> usize {
+        self.pending_memory_outbox_shards.remove(&shard_index);
+        self.drain_memory_outbox_shard(shard_index).await
+    }
+
     fn increment_websocket_session_count(
         &mut self,
         worker_name: &str,
@@ -1035,6 +1062,7 @@ impl WorkerManager {
     }
 
     pub(super) async fn drain_memory_outbox(&mut self) -> usize {
+        let started_at = Instant::now();
         let mut processed = 0usize;
         for _ in 0..MEMORY_OUTBOX_MAX_DRAIN_BATCHES {
             let claims = match self
@@ -1057,60 +1085,107 @@ impl WorkerManager {
                 break;
             }
             processed = processed.saturating_add(claimed);
-            for claim in claims {
-                let effect_id = claim.record.effect_id.clone();
-                let namespace = claim.namespace.clone();
-                let memory_key = claim.memory_key.clone();
-                let delivery = self.deliver_memory_outbox_claim(&claim);
-                let store_result = match delivery {
-                    Ok(()) => {
-                        self.memory_store
-                            .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
-                            .await
-                    }
-                    Err(error) if is_terminal_memory_outbox_delivery_error(&error) => {
-                        warn!(
-                            namespace = %namespace,
-                            memory_key = %memory_key,
-                            effect_id = %effect_id,
-                            kind = %claim.record.kind,
-                            error = %error,
-                            "memory outbox effect dropped"
-                        );
-                        self.memory_store
-                            .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
-                            .await
-                    }
-                    Err(error) => {
-                        let retry_after = memory_outbox_retry_after(claim.record.attempt_count);
-                        warn!(
-                            namespace = %namespace,
-                            memory_key = %memory_key,
-                            effect_id = %effect_id,
-                            kind = %claim.record.kind,
-                            error = %error,
-                            "memory outbox delivery failed"
-                        );
-                        self.memory_store
-                            .retry_outbox_record(&namespace, &memory_key, &effect_id, retry_after)
-                            .await
-                    }
-                };
-                if let Err(error) = store_result {
-                    warn!(
-                        namespace = %namespace,
-                        memory_key = %memory_key,
-                        effect_id = %effect_id,
-                        error = %error,
-                        "memory outbox state update failed"
-                    );
-                }
-            }
+            self.deliver_memory_outbox_claims(claims).await;
             if claimed < MEMORY_OUTBOX_DRAIN_LIMIT {
                 break;
             }
         }
+        self.memory_store.record_profile(
+            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
+            duration_us(started_at.elapsed()),
+            processed as u64,
+        );
         processed
+    }
+
+    pub(super) async fn drain_memory_outbox_shard(&mut self, shard_index: usize) -> usize {
+        let started_at = Instant::now();
+        let mut processed = 0usize;
+        for _ in 0..MEMORY_OUTBOX_MAX_DRAIN_BATCHES {
+            let claims = match self
+                .memory_store
+                .claim_due_outbox_records_for_shard_index(
+                    shard_index,
+                    MEMORY_OUTBOX_DRAIN_LIMIT,
+                    MEMORY_OUTBOX_LEASE,
+                    MEMORY_OUTBOX_EFFECT_KINDS,
+                )
+                .await
+            {
+                Ok(claims) => claims,
+                Err(error) => {
+                    warn!(shard_index, error = %error, "memory outbox shard claim failed");
+                    break;
+                }
+            };
+            let claimed = claims.len();
+            if claimed == 0 {
+                break;
+            }
+            processed = processed.saturating_add(claimed);
+            self.deliver_memory_outbox_claims(claims).await;
+            if claimed < MEMORY_OUTBOX_DRAIN_LIMIT {
+                break;
+            }
+        }
+        self.memory_store.record_profile(
+            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
+            duration_us(started_at.elapsed()),
+            processed as u64,
+        );
+        processed
+    }
+
+    async fn deliver_memory_outbox_claims(&mut self, claims: Vec<MemoryOutboxClaim>) {
+        for claim in claims {
+            let effect_id = claim.record.effect_id.clone();
+            let namespace = claim.namespace.clone();
+            let memory_key = claim.memory_key.clone();
+            let delivery = self.deliver_memory_outbox_claim(&claim);
+            let store_result = match delivery {
+                Ok(()) => {
+                    self.memory_store
+                        .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
+                        .await
+                }
+                Err(error) if is_terminal_memory_outbox_delivery_error(&error) => {
+                    warn!(
+                        namespace = %namespace,
+                        memory_key = %memory_key,
+                        effect_id = %effect_id,
+                        kind = %claim.record.kind,
+                        error = %error,
+                        "memory outbox effect dropped"
+                    );
+                    self.memory_store
+                        .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
+                        .await
+                }
+                Err(error) => {
+                    let retry_after = memory_outbox_retry_after(claim.record.attempt_count);
+                    warn!(
+                        namespace = %namespace,
+                        memory_key = %memory_key,
+                        effect_id = %effect_id,
+                        kind = %claim.record.kind,
+                        error = %error,
+                        "memory outbox delivery failed"
+                    );
+                    self.memory_store
+                        .retry_outbox_record(&namespace, &memory_key, &effect_id, retry_after)
+                        .await
+                }
+            };
+            if let Err(error) = store_result {
+                warn!(
+                    namespace = %namespace,
+                    memory_key = %memory_key,
+                    effect_id = %effect_id,
+                    error = %error,
+                    "memory outbox state update failed"
+                );
+            }
+        }
     }
 
     fn deliver_memory_outbox_claim(&mut self, claim: &MemoryOutboxClaim) -> Result<()> {

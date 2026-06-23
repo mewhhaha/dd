@@ -4507,14 +4507,21 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(model_source.contains("by_target_isolate_id: HashMap<u64, HashSet<PendingQueueKey>>"));
     assert!(model_source.contains("by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>"));
     assert!(model_source.contains("by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>"));
+    assert!(model_source.contains("memory_shard_affinity: HashMap<usize, u64>"));
+    assert!(model_source.contains("memory_shards: BTreeMap<usize, BTreeMap<u64, PendingInvoke>>"));
+    assert!(model_source.contains("memory_shard_index: Option<usize>"));
     assert!(model_source.contains("targeted: BTreeMap<u64, PendingInvoke>"));
+    assert!(!model_source.contains("memory: BTreeMap<u64, PendingInvoke>"));
     assert!(model_source.contains("pub(super) fn drain_target_isolate_id("));
     assert!(model_source.contains("pub(super) fn drain_expired("));
     assert!(model_source.contains("pub(super) fn next_expiry_at("));
     assert!(!model_source.contains("VecDeque<QueuedPendingInvoke>"));
     assert!(!model_source.contains("lane.remove(index)"));
     assert!(dispatch_source.contains("remove_by_runtime_request_id(&runtime_request_id)"));
+    assert!(dispatch_source.contains("RuntimeAtomicQueueWait"));
+    assert!(dispatch_source.contains("memory_shard_affinity"));
     assert!(remove_isolate_source.contains("pool.queue.drain_target_isolate_id(isolate.id)"));
+    assert!(remove_isolate_source.contains("pool.memory_shard_affinity"));
     assert!(remove_isolate_source
         .contains("self.account_dequeued_many(stale_targeted_count, stale_targeted_bytes)"));
     assert!(
@@ -4580,6 +4587,10 @@ fn memory_direct_writes_use_direct_apply_fast_path() {
         &memory_types_source[memory_invoke_method_start..memory_invoke_method_end];
 
     assert!(memory_source.contains("async write(key, value, options)"));
+    assert!(memory_source.contains("const preferCallerIsolate = !descriptor.export_name"));
+    assert!(
+        !memory_source.contains("methodName === MEMORY_ATOMIC_METHOD || !descriptor.export_name")
+    );
     assert!(memory_source.contains("rejectMemoryDirectOptions(\"set\", options)"));
     assert!(memory_source.contains("await applyDirectMemoryMutations(entry, runtimeRequestId"));
     assert!(memory_source.contains("const encoded = encodeMemoryStorageValue(value)"));

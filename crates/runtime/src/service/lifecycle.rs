@@ -127,6 +127,7 @@ impl WorkerManager {
                 dynamic_quota_state: None,
                 strict_request_isolation: false,
                 memory_entity_leases: HashMap::new(),
+                memory_shard_affinity: HashMap::new(),
                 queue: PendingInvokeQueue::new(),
                 isolates: Vec::new(),
                 isolate_indices: HashMap::new(),
@@ -319,6 +320,7 @@ impl WorkerManager {
             dynamic_quota_state: Some(dynamic_quota_state),
             strict_request_isolation: false,
             memory_entity_leases: HashMap::new(),
+            memory_shard_affinity: HashMap::new(),
             queue: PendingInvokeQueue::new(),
             isolates: Vec::new(),
             isolate_indices: HashMap::new(),
@@ -817,6 +819,8 @@ impl WorkerManager {
             if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
                 let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                 removed_isolate_id = Some(isolate.id);
+                pool.memory_shard_affinity
+                    .retain(|_, owner_isolate_id| *owner_isolate_id != isolate.id);
                 stale_targeted_pending = pool.queue.drain_target_isolate_id(isolate.id);
                 stale_targeted_count = stale_targeted_pending.len();
                 stale_targeted_bytes = stale_targeted_pending

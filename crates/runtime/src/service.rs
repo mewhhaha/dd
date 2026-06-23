@@ -22,7 +22,9 @@ use crate::engine::{
     WorkerDispatchRequest,
 };
 use crate::kv::KvStore;
-use crate::memory::{MemoryOutboxClaim, MemoryStore};
+use crate::memory::{
+    stable_memory_shard_index, MemoryOutboxClaim, MemoryProfileMetricKind, MemoryStore,
+};
 use crate::memory_rpc::{
     decode_memory_invoke_request, decode_memory_invoke_response, encode_memory_invoke_request,
     encode_memory_invoke_response, MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse,
@@ -153,6 +155,10 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 const MEMORY_ATOMIC_METHOD: &str = "__dd_atomic";
 
 static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn duration_us(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 mod tests;

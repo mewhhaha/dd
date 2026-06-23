@@ -286,6 +286,7 @@ pub(crate) struct MemoryDirectMutationInput {
 
 pub struct MemoryInvokeEvent {
     pub request_frame: Vec<u8>,
+    pub created_at: Instant,
     pub caller_worker_name: String,
     pub caller_generation: u64,
     pub caller_isolate_id: u64,

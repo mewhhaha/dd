@@ -152,6 +152,7 @@ pub(super) enum RuntimeEvent {
         isolate_id: u64,
         request_id: String,
         completion_token: String,
+        finished_at: Instant,
         wait_until_count: usize,
         result: Result<WorkerOutput>,
     },
@@ -223,6 +224,9 @@ pub(super) enum RuntimeEvent {
         isolate_id: u64,
         error: PlatformError,
     },
+    MemoryOutboxDrain {
+        shard_index: usize,
+    },
 }
 impl WorkerManager {
     pub(super) fn new(init: WorkerManagerInit) -> Self {
@@ -276,6 +280,7 @@ impl WorkerManager {
             runtime_batch_depth: 0,
             pending_dispatches: HashSet::new(),
             pending_cleanup_workers: HashSet::new(),
+            pending_memory_outbox_shards: HashSet::new(),
             next_generation: 1,
             next_isolate_id: 1,
             next_memory_entity_epoch,
@@ -705,6 +710,7 @@ impl WorkerManager {
                 isolate_id,
                 request_id,
                 completion_token,
+                finished_at,
                 wait_until_count,
                 result,
             } => {
@@ -715,6 +721,7 @@ impl WorkerManager {
                         isolate_id,
                         request_id,
                         completion_token,
+                        finished_at,
                         wait_until_count,
                         result,
                     },
@@ -875,6 +882,9 @@ impl WorkerManager {
                 self.fail_isolate(&worker_name, generation, isolate_id, error);
                 self.dispatch_pool(&worker_name, generation, event_tx);
                 self.cleanup_drained_generations_for(&worker_name);
+            }
+            RuntimeEvent::MemoryOutboxDrain { shard_index } => {
+                self.drain_scheduled_memory_outbox_shard(shard_index).await;
             }
         }
     }

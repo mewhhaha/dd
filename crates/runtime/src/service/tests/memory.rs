@@ -145,6 +145,75 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
 
 #[tokio::test]
 #[serial]
+async fn memory_exported_atomic_commands_do_not_target_busy_caller_isolates() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 2,
+        max_isolates: 16,
+        max_inflight_per_isolate: 1,
+        request_wall_timeout: Duration::from_secs(5),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut tasks = Vec::new();
+    for idx in 0..8 {
+        let svc = service.clone();
+        tasks.push(tokio::spawn(async move {
+            svc.invoke(
+                "memory".to_string(),
+                test_invocation_with_path(
+                    &format!("/inc-cas?key=exported-{idx}"),
+                    &format!("exported-atomic-{idx}"),
+                ),
+            )
+            .await
+        }));
+    }
+
+    timeout(Duration::from_secs(10), async {
+        for task in tasks {
+            let output = task.await.expect("join").expect("invoke should succeed");
+            assert_eq!(output.status, 200);
+        }
+    })
+    .await
+    .expect("exported atomic invokes should not wait on saturated caller isolates");
+
+    for idx in 0..8 {
+        let output = service
+            .invoke(
+                "memory".to_string(),
+                test_invocation_with_path(
+                    &format!("/get?key=exported-{idx}"),
+                    &format!("exported-atomic-get-{idx}"),
+                ),
+            )
+            .await
+            .expect("get should succeed");
+        assert_eq!(String::from_utf8(output.body).expect("utf8"), "1");
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn memory_atomic_callback_executes_once_for_cold_read() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -709,15 +778,134 @@ async fn memory_atomic_can_emit_durable_effect_records() {
         crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
             .await
             .expect("memory store should open");
-    let outbox = memory_store
-        .outbox_records("MY_MEMORY", "user-effect")
-        .await
-        .expect("outbox records should load");
+    let outbox = timeout(Duration::from_secs(2), async {
+        loop {
+            let outbox = memory_store
+                .outbox_records("MY_MEMORY", "user-effect")
+                .await
+                .expect("outbox records should load");
+            if outbox.len() == 2 && outbox.iter().all(|record| record.status == "delivered") {
+                break outbox;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("outbox effects should drain after response completion");
     assert_eq!(outbox.len(), 2);
     assert!(outbox.iter().all(|record| record.status == "delivered"));
     assert!(outbox
         .iter()
         .all(|record| record.kind.starts_with("audit.")));
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_profile_reports_atomic_scheduler_breakdown() {
+    let root = PathBuf::from(format!("/tmp/dd-memory-profile-atomic-{}", Uuid::new_v4()));
+    let db_path = root.join("dd-test.db");
+    let database_url = format!("file:{}", db_path.display());
+    let service = test_service_with_paths(
+        RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            memory_profile_enabled: true,
+            ..RuntimeConfig::default()
+        },
+        root.clone(),
+        database_url,
+        false,
+    )
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/__profile_reset", "atomic-profile-reset"),
+        )
+        .await
+        .expect("profile reset should succeed");
+
+    let output = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/emit-effect?key=profile-effect", "atomic-profile-effect"),
+        )
+        .await
+        .expect("emit invoke should succeed");
+    assert_eq!(output.status, 200);
+
+    let memory_store =
+        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
+            .await
+            .expect("memory store should open");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let outbox = memory_store
+                .outbox_records("MY_MEMORY", "profile-effect")
+                .await
+                .expect("outbox records should load");
+            if outbox.len() == 2 && outbox.iter().all(|record| record.status == "delivered") {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("profile outbox effects should drain");
+
+    let profile = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/__profile", "atomic-profile"),
+        )
+        .await
+        .expect("profile should succeed");
+    let profile: Value = crate::json::from_string(
+        String::from_utf8(profile.body).expect("profile body should be utf8"),
+    )
+    .expect("profile should parse");
+    let snapshot = &profile["snapshot"];
+    for metric in [
+        "runtime_atomic_invoke_event_wait",
+        "runtime_atomic_queue_wait",
+        "runtime_atomic_dispatch_wait",
+        "runtime_atomic_execution",
+        "runtime_atomic_completion_wait",
+        "runtime_atomic_outbox_drain",
+    ] {
+        assert!(
+            snapshot[metric]["calls"].as_u64().unwrap_or_default() >= 1,
+            "expected {metric} to record at least one call: {snapshot:?}"
+        );
+    }
+    assert!(
+        snapshot["runtime_atomic_outbox_drain"]["total_items"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 2
+    );
+
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 

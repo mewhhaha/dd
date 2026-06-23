@@ -95,6 +95,12 @@ pub enum MemoryProfileMetricKind {
     StoreApplyBatch,
     StoreApplyBatchValidate,
     StoreApplyBatchWrite,
+    RuntimeAtomicInvokeEventWait,
+    RuntimeAtomicQueueWait,
+    RuntimeAtomicDispatchWait,
+    RuntimeAtomicExecution,
+    RuntimeAtomicCompletionWait,
+    RuntimeAtomicOutboxDrain,
 }
 
 #[derive(Default)]
@@ -134,6 +140,12 @@ pub struct MemoryProfileSnapshot {
     pub store_apply_batch: MemoryProfileMetricSnapshot,
     pub store_apply_batch_validate: MemoryProfileMetricSnapshot,
     pub store_apply_batch_write: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_invoke_event_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_queue_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_dispatch_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_execution: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_completion_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_outbox_drain: MemoryProfileMetricSnapshot,
 }
 
 #[derive(Default)]
@@ -157,6 +169,12 @@ pub struct MemoryProfile {
     store_apply_batch: MemoryProfileMetric,
     store_apply_batch_validate: MemoryProfileMetric,
     store_apply_batch_write: MemoryProfileMetric,
+    runtime_atomic_invoke_event_wait: MemoryProfileMetric,
+    runtime_atomic_queue_wait: MemoryProfileMetric,
+    runtime_atomic_dispatch_wait: MemoryProfileMetric,
+    runtime_atomic_execution: MemoryProfileMetric,
+    runtime_atomic_completion_wait: MemoryProfileMetric,
+    runtime_atomic_outbox_drain: MemoryProfileMetric,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +312,14 @@ impl MemoryStore {
 
     pub fn reset_profile(&self) {
         self.profile.reset();
+    }
+
+    pub fn namespace_shards(&self) -> usize {
+        self.namespace_shards
+    }
+
+    pub fn shard_index_for_key(&self, memory_key: &str) -> usize {
+        self.shard_index(memory_key)
     }
 
     pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<MemorySnapshot> {
@@ -942,26 +968,43 @@ impl MemoryStore {
             if claims.len() >= limit {
                 break;
             }
-            let namespaces = self.discover_namespaces_for_shard(shard_index).await?;
-            for namespace in namespaces {
-                if claims.len() >= limit {
-                    break;
-                }
-                let remaining = limit.saturating_sub(claims.len());
-                let mut shard_claims = self
-                    .claim_due_outbox_records_for_shard(
-                        &namespace,
-                        shard_index,
-                        remaining,
-                        lease_for,
-                        &exact_kinds,
-                        &kind_prefixes,
-                    )
-                    .await?;
-                claims.append(&mut shard_claims);
-            }
+            let remaining = limit.saturating_sub(claims.len());
+            let mut shard_claims = self
+                .claim_due_outbox_records_for_shard_index_with_selectors(
+                    shard_index,
+                    remaining,
+                    lease_for,
+                    &exact_kinds,
+                    &kind_prefixes,
+                )
+                .await?;
+            claims.append(&mut shard_claims);
         }
         Ok(claims)
+    }
+
+    pub async fn claim_due_outbox_records_for_shard_index(
+        &self,
+        shard_index: usize,
+        limit: usize,
+        lease_for: Duration,
+        kinds: &[&str],
+    ) -> Result<Vec<MemoryOutboxClaim>> {
+        if limit == 0 || kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (exact_kinds, kind_prefixes) = normalize_outbox_kind_selectors(kinds);
+        if exact_kinds.is_empty() && kind_prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.claim_due_outbox_records_for_shard_index_with_selectors(
+            shard_index,
+            limit,
+            lease_for,
+            &exact_kinds,
+            &kind_prefixes,
+        )
+        .await
     }
 
     #[allow(dead_code)]
@@ -1023,7 +1066,41 @@ impl MemoryStore {
         Ok(())
     }
 
-    async fn claim_due_outbox_records_for_shard(
+    async fn claim_due_outbox_records_for_shard_index_with_selectors(
+        &self,
+        shard_index: usize,
+        limit: usize,
+        lease_for: Duration,
+        exact_kinds: &[String],
+        kind_prefixes: &[String],
+    ) -> Result<Vec<MemoryOutboxClaim>> {
+        if limit == 0 || (exact_kinds.is_empty() && kind_prefixes.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let shard_index = shard_index % self.namespace_shards.max(1);
+        let mut claims = Vec::new();
+        let namespaces = self.discover_namespaces_for_shard(shard_index).await?;
+        for namespace in namespaces {
+            if claims.len() >= limit {
+                break;
+            }
+            let remaining = limit.saturating_sub(claims.len());
+            let mut namespace_claims = self
+                .claim_due_outbox_records_for_namespace_shard(
+                    &namespace,
+                    shard_index,
+                    remaining,
+                    lease_for,
+                    exact_kinds,
+                    kind_prefixes,
+                )
+                .await?;
+            claims.append(&mut namespace_claims);
+        }
+        Ok(claims)
+    }
+
+    async fn claim_due_outbox_records_for_namespace_shard(
         &self,
         namespace: &str,
         shard_index: usize,
@@ -1898,6 +1975,18 @@ impl MemoryProfile {
             MemoryProfileMetricKind::StoreApplyBatch => &self.store_apply_batch,
             MemoryProfileMetricKind::StoreApplyBatchValidate => &self.store_apply_batch_validate,
             MemoryProfileMetricKind::StoreApplyBatchWrite => &self.store_apply_batch_write,
+            MemoryProfileMetricKind::RuntimeAtomicInvokeEventWait => {
+                &self.runtime_atomic_invoke_event_wait
+            }
+            MemoryProfileMetricKind::RuntimeAtomicQueueWait => &self.runtime_atomic_queue_wait,
+            MemoryProfileMetricKind::RuntimeAtomicDispatchWait => {
+                &self.runtime_atomic_dispatch_wait
+            }
+            MemoryProfileMetricKind::RuntimeAtomicExecution => &self.runtime_atomic_execution,
+            MemoryProfileMetricKind::RuntimeAtomicCompletionWait => {
+                &self.runtime_atomic_completion_wait
+            }
+            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain => &self.runtime_atomic_outbox_drain,
         };
         target.record(duration_us, items.max(1));
     }
@@ -1923,6 +2012,12 @@ impl MemoryProfile {
             store_apply_batch: self.store_apply_batch.snapshot(),
             store_apply_batch_validate: self.store_apply_batch_validate.snapshot(),
             store_apply_batch_write: self.store_apply_batch_write.snapshot(),
+            runtime_atomic_invoke_event_wait: self.runtime_atomic_invoke_event_wait.snapshot(),
+            runtime_atomic_queue_wait: self.runtime_atomic_queue_wait.snapshot(),
+            runtime_atomic_dispatch_wait: self.runtime_atomic_dispatch_wait.snapshot(),
+            runtime_atomic_execution: self.runtime_atomic_execution.snapshot(),
+            runtime_atomic_completion_wait: self.runtime_atomic_completion_wait.snapshot(),
+            runtime_atomic_outbox_drain: self.runtime_atomic_outbox_drain.snapshot(),
         };
         self.reset();
         snapshot
@@ -1947,6 +2042,12 @@ impl MemoryProfile {
         self.store_apply_batch.reset();
         self.store_apply_batch_validate.reset();
         self.store_apply_batch_write.reset();
+        self.runtime_atomic_invoke_event_wait.reset();
+        self.runtime_atomic_queue_wait.reset();
+        self.runtime_atomic_dispatch_wait.reset();
+        self.runtime_atomic_execution.reset();
+        self.runtime_atomic_completion_wait.reset();
+        self.runtime_atomic_outbox_drain.reset();
     }
 }
 

@@ -11,6 +11,7 @@ pub(super) fn select_dispatch_candidate(
     pool: &WorkerPool,
     max_inflight: usize,
     require_wait_until_idle: bool,
+    allow_memory_atomic_overflow: bool,
 ) -> Option<DispatchSelection> {
     if let Some(selection) =
         pool.queue
@@ -63,14 +64,34 @@ pub(super) fn select_dispatch_candidate(
                 if memory_atomic_route_is_active(pool, pending) {
                     return None;
                 }
-                return least_loaded_isolate_any_idx(&pool.isolates, require_wait_until_idle).map(
-                    |isolate_idx| {
-                        DispatchSelection::Dispatch(DispatchCandidate {
-                            queue_key,
-                            isolate_idx,
-                        })
-                    },
-                );
+                let isolate_idx = memory_route_is_atomic(pending)
+                    .then(|| {
+                        memory_shard_affinity_isolate_idx(
+                            pool,
+                            pending,
+                            max_inflight,
+                            require_wait_until_idle,
+                        )
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        least_loaded_isolate_idx(
+                            &pool.isolates,
+                            max_inflight,
+                            require_wait_until_idle,
+                        )
+                    })
+                    .or_else(|| {
+                        (allow_memory_atomic_overflow && memory_route_is_atomic(pending))
+                            .then(|| least_loaded_isolate_any_idx(&pool.isolates))
+                            .flatten()
+                    });
+                return isolate_idx.map(|isolate_idx| {
+                    DispatchSelection::Dispatch(DispatchCandidate {
+                        queue_key,
+                        isolate_idx,
+                    })
+                });
             };
 
             if let Some(isolate_idx) = target_isolate_idx(pool, target_isolate_id) {
@@ -99,13 +120,37 @@ fn memory_atomic_route_is_active(pool: &WorkerPool, pending: &PendingInvoke) -> 
     let Some(memory_route) = pending.memory_route.as_ref() else {
         return false;
     };
-    if !matches!(
-        pending.memory_call.as_ref(),
-        Some(MemoryExecutionCall::Method { name, .. }) if name == MEMORY_ATOMIC_METHOD
-    ) {
+    if !memory_route_is_atomic(pending) {
         return false;
     }
     pool.memory_entity_is_leased(&memory_route.owner_key)
+}
+
+fn memory_route_is_atomic(pending: &PendingInvoke) -> bool {
+    matches!(
+        pending.memory_call.as_ref(),
+        Some(MemoryExecutionCall::Method { name, .. }) if name == MEMORY_ATOMIC_METHOD
+    )
+}
+
+fn memory_shard_affinity_isolate_idx(
+    pool: &WorkerPool,
+    pending: &PendingInvoke,
+    max_inflight: usize,
+    require_wait_until_idle: bool,
+) -> Option<usize> {
+    let shard_index = pending.memory_route.as_ref()?.shard_index?;
+    let isolate_id = *pool.memory_shard_affinity.get(&shard_index)?;
+    let isolate_idx = pool.isolate_idx(isolate_id)?;
+    let isolate = &pool.isolates[isolate_idx];
+    if isolate.startup.is_ready()
+        && isolate.inflight_count < max_inflight
+        && (!require_wait_until_idle || isolate.pending_wait_until.is_empty())
+    {
+        Some(isolate_idx)
+    } else {
+        None
+    }
 }
 
 fn target_isolate_idx(pool: &WorkerPool, target_isolate_id: u64) -> Option<usize> {
@@ -136,15 +181,11 @@ pub(super) fn least_loaded_isolate_idx(
         .map(|(idx, _)| idx)
 }
 
-pub(super) fn least_loaded_isolate_any_idx(
-    isolates: &[IsolateHandle],
-    require_wait_until_idle: bool,
-) -> Option<usize> {
+pub(super) fn least_loaded_isolate_any_idx(isolates: &[IsolateHandle]) -> Option<usize> {
     isolates
         .iter()
         .enumerate()
         .filter(|(_, isolate)| isolate.startup.is_ready())
-        .filter(|(_, isolate)| !require_wait_until_idle || isolate.pending_wait_until.is_empty())
         .min_by_key(|(_, isolate)| isolate.inflight_count)
         .map(|(idx, _)| idx)
 }
@@ -160,6 +201,8 @@ impl WorkerPool {
             memory_call,
             host_rpc_call,
             memory_route,
+            dispatched_at,
+            profile_memory_atomic,
         } = command;
         IsolateCommand::Execute {
             runtime_request_id,
@@ -171,6 +214,8 @@ impl WorkerPool {
             memory_call: Box::new(memory_call),
             host_rpc_call,
             memory_route: Box::new(memory_route),
+            dispatched_at,
+            profile_memory_atomic,
         }
     }
 
@@ -359,6 +404,7 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                             manager.expire_starting_isolates(&event_tx);
                             manager.expire_inflight_requests(&event_tx);
                             manager.drain_memory_outbox().await;
+                            manager.pending_memory_outbox_shards.clear();
                             manager.scale_down_idle();
                         }
                         else => {
@@ -475,6 +521,7 @@ pub(super) fn runtime_event_from_isolate_payload(
             isolate_id,
             request_id,
             completion_token,
+            finished_at: Instant::now(),
             wait_until_count,
             result,
         },
@@ -829,7 +876,21 @@ pub(super) async fn handle_isolate_command(
             memory_call,
             host_rpc_call,
             memory_route,
+            dispatched_at,
+            profile_memory_atomic,
         } => {
+            if profile_memory_atomic {
+                let store = js_runtime
+                    .op_state()
+                    .borrow()
+                    .borrow::<MemoryStore>()
+                    .clone();
+                store.record_profile(
+                    MemoryProfileMetricKind::RuntimeAtomicDispatchWait,
+                    duration_us(dispatched_at.elapsed()),
+                    1,
+                );
+            }
             let request_context = *request_context;
             let request = *request;
             let memory_call = *memory_call;
@@ -923,6 +984,7 @@ pub(super) async fn handle_isolate_command(
                         isolate_id,
                         request_id: runtime_request_id,
                         completion_token,
+                        finished_at: Instant::now(),
                         wait_until_count: 0,
                         result: Err(error),
                     })

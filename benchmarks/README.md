@@ -79,7 +79,7 @@ and atomic write+effect behavior:
 
 ```bash
 git diff --quiet
-node benchmarks/run.mjs --samples 1 \
+node benchmarks/run.mjs --samples 5 \
   --config storage-memory-write-cross-shard.sh \
   --config storage-memory-write-same-shard.sh \
   --config scaling-memory-write-cross-shard.sh \
@@ -91,6 +91,9 @@ node benchmarks/run.mjs --samples 1 \
   --out benchmarks/results/local-atomic-memory-write-matrix.json
 ```
 
+Use `--samples 3` for a shorter development check. Use `--samples 5` on a
+clean worktree before treating the medians as release or main-branch evidence.
+
 | Config | Workload | Requests | Concurrency | Isolates | Max inflight | Key space | Shards |
 | --- | --- | ---: | ---: | --- | ---: | ---: | ---: |
 | [`atomic-memory-readwrite-cross-shard.sh`](configs/atomic-memory-readwrite-cross-shard.sh) | keyed memory `atomic(...)` read+write, cross-shard matrix | 4,096 | 128 | 16-16 | 16 | 1,024 | 16 |
@@ -98,10 +101,36 @@ node benchmarks/run.mjs --samples 1 \
 | [`atomic-memory-write-cross-shard.sh`](configs/atomic-memory-write-cross-shard.sh) | keyed memory `atomic(...)` write+effect, cross-shard matrix | 4,096 | 128 | 16-16 | 16 | 1,024 | 16 |
 | [`atomic-memory-write-same-shard.sh`](configs/atomic-memory-write-same-shard.sh) | keyed memory `atomic(...)` write+effect, same-shard matrix | 4,096 | 128 | 16-16 | 16 | 1,024 | 16 |
 
+## Atomic Scheduler Implementation Matrix
+
+This clean temporary `main` snapshot run is implementation feedback for the
+shard-aware atomic scheduler and background outbox drain changes. The source JSON is
+[`results/feedback-atomic-sharded-scheduler.json`](results/feedback-atomic-sharded-scheduler.json).
+Regenerate from the real repository worktree before using these numbers as
+release evidence.
+
+- Date: `2026-06-23T20:12:24.542Z`
+- Runtime code commit: `cc4075f`
+- Worktree: clean temporary `main` snapshot with shard-aware atomic scheduler and background outbox drain changes
+- Samples: `3`
+
+| Config | Workload | Samples | Requests | Concurrency | Isolates | Max inflight | Throughput | Mean | P95 | P99 |
+| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| [`storage-memory-write-cross-shard.sh`](configs/storage-memory-write-cross-shard.sh) | storage-only direct write, cross-shard matrix | 3 | 4,096 | 128 | n/a | n/a | 11,639 req/s | 10.88ms | 12.95ms | 15.33ms |
+| [`storage-memory-write-same-shard.sh`](configs/storage-memory-write-same-shard.sh) | storage-only direct write, same-shard matrix | 3 | 4,096 | 128 | n/a | n/a | 3,042 req/s | 28.10ms | 43.33ms | 277.00ms |
+| [`scaling-memory-write-cross-shard.sh`](configs/scaling-memory-write-cross-shard.sh) | keyed memory direct write, cross-shard matrix | 3 | 4,096 | 128 | 16-16 | 16 | 16,821 req/s | 6.67ms | 25.10ms | 39.56ms |
+| [`scaling-memory-write-same-shard.sh`](configs/scaling-memory-write-same-shard.sh) | keyed memory direct write, same-shard matrix | 3 | 4,096 | 128 | 16-16 | 16 | 4,271 req/s | 25.49ms | 104.44ms | 428.95ms |
+| [`atomic-memory-readwrite-cross-shard.sh`](configs/atomic-memory-readwrite-cross-shard.sh) | keyed memory `atomic(...)` read+write, cross-shard matrix | 3 | 4,096 | 128 | 16-16 | 16 | 7,099 req/s | 17.91ms | 27.92ms | 115.51ms |
+| [`atomic-memory-readwrite-same-shard.sh`](configs/atomic-memory-readwrite-same-shard.sh) | keyed memory `atomic(...)` read+write, same-shard matrix | 3 | 4,096 | 128 | 16-16 | 16 | 2,106 req/s | 59.45ms | 122.70ms | 177.18ms |
+| [`atomic-memory-write-cross-shard.sh`](configs/atomic-memory-write-cross-shard.sh) | keyed memory `atomic(...)` write+effect, cross-shard matrix | 3 | 4,096 | 128 | 16-16 | 16 | 3,229 req/s | 39.19ms | 59.54ms | 134.74ms |
+| [`atomic-memory-write-same-shard.sh`](configs/atomic-memory-write-same-shard.sh) | keyed memory `atomic(...)` write+effect, same-shard matrix | 3 | 4,096 | 128 | 16-16 | 16 | 748 req/s | 154.17ms | 492.73ms | 1070.76ms |
+
 ## Current Write Matrix
 
 This one-sample run used the full write matrix on commit `cc3b9a5`. Treat it as
-implementation feedback, not release benchmark evidence.
+implementation feedback, not release benchmark evidence. Replace it with a
+clean-worktree `--samples 3` to `--samples 5` result before making a release
+claim.
 
 | Config | Workload | Requests | Concurrency | Isolates | Max inflight | Throughput | Mean | P50 | P95 | P99 |
 | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |

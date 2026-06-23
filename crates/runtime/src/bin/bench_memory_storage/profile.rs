@@ -49,6 +49,16 @@ pub(super) fn print_profile(profile: &MemoryProfileSnapshot) {
         metric_mean_ms(&profile.store_apply_batch_validate),
         metric_mean_ms(&profile.store_apply_batch_write),
     );
+    println!(
+        "profile-memory-atomic event_wait={:.2}ms queue_wait={:.2}ms dispatch_wait={:.2}ms execution={:.2}ms completion_wait={:.2}ms outbox_drain={:.2}ms outbox_items={}",
+        metric_mean_ms(&profile.runtime_atomic_invoke_event_wait),
+        metric_mean_ms(&profile.runtime_atomic_queue_wait),
+        metric_mean_ms(&profile.runtime_atomic_dispatch_wait),
+        metric_mean_ms(&profile.runtime_atomic_execution),
+        metric_mean_ms(&profile.runtime_atomic_completion_wait),
+        metric_mean_ms(&profile.runtime_atomic_outbox_drain),
+        profile.runtime_atomic_outbox_drain.total_items,
+    );
 }
 
 pub(super) fn metric_mean_ms(metric: &MemoryProfileMetric) -> f64 {

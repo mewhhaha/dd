@@ -10,6 +10,8 @@ pub(super) enum IsolateCommand {
         memory_call: Box<Option<MemoryExecutionCall>>,
         host_rpc_call: Option<HostRpcExecutionCall>,
         memory_route: Box<Option<MemoryRoute>>,
+        dispatched_at: Instant,
+        profile_memory_atomic: bool,
     },
     Abort {
         runtime_request_id: String,

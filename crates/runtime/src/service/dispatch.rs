@@ -106,7 +106,7 @@ impl WorkerManager {
             runtime_request_id,
             request,
             request_body,
-            memory_route,
+            mut memory_route,
             memory_call,
             host_rpc_call,
             target_isolate_id,
@@ -170,6 +170,7 @@ impl WorkerManager {
             return;
         }
 
+        let memory_namespace_shards = self.storage.memory_namespace_shards;
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
             if let Some(route) = &memory_route {
                 if !pool
@@ -184,6 +185,14 @@ impl WorkerManager {
                     let _ = reply.send(Err(error.clone()));
                     self.fail_stream_registration(&worker_name, &runtime_request_id, error);
                     return;
+                }
+            }
+            if let Some(route) = memory_route.as_mut() {
+                if route.shard_index.is_none() {
+                    route.shard_index = Some(stable_memory_shard_index(
+                        &route.key,
+                        memory_namespace_shards,
+                    ));
                 }
             }
             let enqueued_at = Instant::now();
@@ -522,6 +531,7 @@ impl WorkerManager {
             }
 
             let completion_token = next_runtime_token("done");
+            let dispatched_at = Instant::now();
             let completion_meta = Some(PendingReplyMeta {
                 method: request.method.clone(),
                 url: request.url.clone(),
@@ -537,6 +547,8 @@ impl WorkerManager {
                 memory_call: None,
                 host_rpc_call: None,
                 memory_route: None,
+                dispatched_at,
+                profile_memory_atomic: false,
             });
 
             let isolate = &mut pool.isolates[isolate_idx];
@@ -549,11 +561,12 @@ impl WorkerManager {
                     canceled: false,
                     memory_key: None,
                     active_memory_lease: None,
+                    memory_outbox_shard: None,
                     internal_origin: true,
                     reply,
                     completion_meta,
                     kind: PendingReplyKind::DynamicFetch { handle },
-                    dispatched_at: Instant::now(),
+                    dispatched_at,
                 },
             );
 
@@ -636,6 +649,16 @@ impl WorkerManager {
                 "memory binding/key must not be empty",
             )));
             return;
+        }
+        if matches!(
+            &memory_call,
+            MemoryExecutionCall::Method { name, .. } if name == MEMORY_ATOMIC_METHOD
+        ) {
+            self.memory_store.record_profile(
+                MemoryProfileMetricKind::RuntimeAtomicInvokeEventWait,
+                duration_us(payload.created_at.elapsed()),
+                1,
+            );
         }
         let mut target_generation = None;
         let mut target_isolate_id = None;
@@ -865,8 +888,13 @@ impl WorkerManager {
                 } else {
                     max_inflight_per_isolate
                 };
-                let selection =
-                    select_dispatch_candidate(pool, max_inflight, pool.strict_request_isolation);
+                let allow_memory_atomic_overflow = pool.isolates.len() >= max_isolates;
+                let selection = select_dispatch_candidate(
+                    pool,
+                    max_inflight,
+                    pool.strict_request_isolation,
+                    allow_memory_atomic_overflow,
+                );
                 let spawn_needed = selection.is_none()
                     && !pool.has_dispatch_capacity(max_inflight)
                     && !pool.has_starting_isolate()
@@ -927,6 +955,18 @@ impl WorkerManager {
                     Some(MemoryExecutionCall::Method { name, .. }) if name == MEMORY_ATOMIC_METHOD
                 )
             });
+            let profile_memory_atomic = active_memory_entity.is_some();
+            let memory_outbox_shard = pending_invoke
+                .memory_route
+                .as_ref()
+                .and_then(|route| route.shard_index);
+            if profile_memory_atomic {
+                self.memory_store.record_profile(
+                    MemoryProfileMetricKind::RuntimeAtomicQueueWait,
+                    duration_us(pending_invoke.enqueued_at.elapsed()),
+                    1,
+                );
+            }
             let info_tracing_enabled = tracing::enabled!(Level::INFO);
             let needs_completion_meta = info_tracing_enabled
                 || self
@@ -958,6 +998,7 @@ impl WorkerManager {
 
             let mut pending_reply = Some(pending_invoke.reply);
             let completion_token = next_runtime_token("done");
+            let dispatched_at = Instant::now();
             if let Some(registration) = self.stream_registrations.get_mut(&runtime_request_id) {
                 if registration.worker_name == worker_name {
                     registration.completion_token = Some(completion_token.clone());
@@ -990,6 +1031,10 @@ impl WorkerManager {
                 });
                 let active_memory_lease = active_memory_entity.as_ref().map(|owner_key| {
                     let owner_isolate_id = pool.isolates[isolate_idx].id;
+                    if let Some(shard_index) = memory_outbox_shard {
+                        pool.memory_shard_affinity
+                            .insert(shard_index, owner_isolate_id);
+                    }
                     pool.acquire_memory_entity_lease(
                         (*owner_key).clone(),
                         owner_isolate_id,
@@ -1012,6 +1057,8 @@ impl WorkerManager {
                     memory_call: pending_invoke.memory_call,
                     host_rpc_call: pending_invoke.host_rpc_call,
                     memory_route,
+                    dispatched_at,
+                    profile_memory_atomic,
                 });
                 let isolate = &mut pool.isolates[isolate_idx];
                 isolate.served_requests += 1;
@@ -1023,13 +1070,14 @@ impl WorkerManager {
                         canceled: false,
                         memory_key: pending_memory_key,
                         active_memory_lease: active_memory_lease.clone(),
+                        memory_outbox_shard,
                         internal_origin,
                         reply: pending_reply
                             .take()
                             .expect("pending reply must exist before dispatch"),
                         completion_meta,
                         kind: pending_kind,
-                        dispatched_at: Instant::now(),
+                        dispatched_at,
                     },
                 );
                 if isolate.sender.try_send(command).is_err() {
@@ -1135,9 +1183,11 @@ impl WorkerManager {
             isolate_id,
             request_id,
             completion_token,
+            finished_at,
             wait_until_count,
             mut result,
         } = finish;
+        let completion_started_at = Instant::now();
         let worker_name = worker_name.as_str();
         let request_id = request_id.as_str();
         let completion_token = completion_token.as_str();
@@ -1151,7 +1201,9 @@ impl WorkerManager {
         let mut execution_ms: Option<u64> = None;
         let mut internal_origin = false;
         let mut pending_kind = PendingReplyKind::Normal;
-        let mut should_drain_memory_outbox = false;
+        let mut memory_outbox_shard = None;
+        let mut atomic_execution_duration = None;
+        let mut atomic_completion_wait = None;
         let trace_destination = self
             .get_pool_mut(worker_name, generation)
             .and_then(|pool| pool.internal_trace.clone());
@@ -1193,6 +1245,7 @@ impl WorkerManager {
                     canceled = pending.canceled;
                     internal_origin = pending.internal_origin;
                     active_memory_lease = pending.active_memory_lease.clone();
+                    memory_outbox_shard = pending.memory_outbox_shard;
                     if let Some(meta) = pending.completion_meta {
                         request_method = meta.method;
                         request_url = meta.url;
@@ -1210,15 +1263,34 @@ impl WorkerManager {
                     }
                     clear_revalidation = true;
                     execution_ms = Some(pending.dispatched_at.elapsed().as_millis() as u64);
+                    if pending.active_memory_lease.is_some() {
+                        atomic_execution_duration =
+                            finished_at.checked_duration_since(pending.dispatched_at);
+                        atomic_completion_wait =
+                            completion_started_at.checked_duration_since(finished_at);
+                    }
                     pending_kind = pending.kind;
                     reply = Some(pending.reply);
                 }
                 if let Some(active_memory_lease) = active_memory_lease {
-                    should_drain_memory_outbox = true;
                     pool.release_memory_entity_lease(&active_memory_lease);
                 }
             }
             pool.log_stats("complete");
+        }
+        if let Some(execution_duration) = atomic_execution_duration {
+            self.memory_store.record_profile(
+                MemoryProfileMetricKind::RuntimeAtomicExecution,
+                duration_us(execution_duration),
+                1,
+            );
+        }
+        if let Some(completion_wait) = atomic_completion_wait {
+            self.memory_store.record_profile(
+                MemoryProfileMetricKind::RuntimeAtomicCompletionWait,
+                duration_us(completion_wait),
+                1,
+            );
         }
         if clear_revalidation {
             self.clear_revalidation_for_request(request_id);
@@ -1279,10 +1351,6 @@ impl WorkerManager {
         } else {
             None
         };
-
-        if should_drain_memory_outbox {
-            self.drain_memory_outbox().await;
-        }
 
         if stream_consumes_result {
             stream_result = Some(result);
@@ -1357,6 +1425,9 @@ impl WorkerManager {
                     "dropped completion for canceled request"
                 );
             }
+        }
+        if let Some(shard_index) = memory_outbox_shard {
+            self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
         }
         if let (Some(trace_destination), Some(trace_result)) = (trace_destination, trace_result) {
             self.enqueue_trace_forward(

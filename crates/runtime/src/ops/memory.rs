@@ -85,6 +85,7 @@ pub(super) async fn op_memory_invoke_method(
         &state,
         IsolateEventPayload::MemoryInvoke(MemoryInvokeEvent {
             request_frame,
+            created_at: Instant::now(),
             caller_worker_name,
             caller_generation,
             caller_isolate_id,
