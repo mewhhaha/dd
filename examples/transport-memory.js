@@ -15,8 +15,8 @@ export default {
       return text("not found", 404);
     }
     const media = env.MEDIA.get(env.MEDIA.idFromName("global"));
-    return await media.atomic((state) => {
-      const { response } = state.accept(request);
+    return await media.atomic(() => {
+      const { response } = media.accept(request);
       return response;
     });
   },

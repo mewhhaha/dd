@@ -16,8 +16,9 @@ export default {
       return text("connect a websocket to /ws");
     }
 
-    return await room(env).atomic((state) => {
-      const { response } = state.accept(request);
+    const stub = room(env);
+    return await stub.atomic(() => {
+      const { response } = stub.accept(request);
       return response;
     });
   },
