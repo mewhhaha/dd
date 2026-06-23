@@ -2049,9 +2049,8 @@ class DdWebSocketBridge {
     this.closed = false;
     this.closeSent = false;
     this.runtimeClosed = false;
-    this.polling = false;
+    this.drainLoopRunning = false;
     this.frameQueue = Promise.resolve();
-    this.pollTimer = undefined;
   }
 
   start(head) {
@@ -2059,22 +2058,17 @@ class DdWebSocketBridge {
     this.socket.on("data", (chunk) => this.consume(chunk));
     this.socket.on("close", () => {
       this.closed = true;
-      this.stopPolling();
       void this.closeRuntime(1006, "socket closed");
     });
     this.socket.on("error", () => {
       this.closed = true;
-      this.stopPolling();
       void this.closeRuntime(1011, "socket error");
     });
-    this.pollTimer = setInterval(() => {
-      void this.pollRuntimeFrames();
-    }, 100);
     if (head?.length) {
       this.consume(head);
     }
     this.socket.resume?.();
-    void this.pollRuntimeFrames();
+    void this.runRuntimeFrameLoop();
   }
 
   consume(chunk) {
@@ -2112,7 +2106,7 @@ class DdWebSocketBridge {
           { binary: frame.opcode === 0x2 },
         );
         this.forwardRuntimeOutput(output);
-        await this.pollRuntimeFrames();
+        void this.runRuntimeFrameLoop();
         break;
       }
       case 0x8: {
@@ -2131,24 +2125,37 @@ class DdWebSocketBridge {
     }
   }
 
-  async pollRuntimeFrames() {
-    if (this.closed || this.polling) {
+  async runRuntimeFrameLoop() {
+    if (this.closed || this.drainLoopRunning) {
       return;
     }
-    this.polling = true;
+    this.drainLoopRunning = true;
     try {
-      for (let index = 0; index < 32 && !this.closed; index += 1) {
-        const result = await this.runtime.drainWebSocketFrame(this.workerName, this.sessionId);
-        if (!result.frame) {
-          break;
+      while (!this.closed) {
+        const drained = await this.drainRuntimeFrames();
+        if (this.closed || drained > 0) {
+          continue;
         }
-        this.forwardRuntimeOutput(result.frame);
+        await this.runtime.waitWebSocketFrame(this.workerName, this.sessionId);
       }
     } catch (error) {
       this.fail(error);
     } finally {
-      this.polling = false;
+      this.drainLoopRunning = false;
     }
+  }
+
+  async drainRuntimeFrames() {
+    let drained = 0;
+    for (let index = 0; index < 32 && !this.closed; index += 1) {
+      const result = await this.runtime.drainWebSocketFrame(this.workerName, this.sessionId);
+      if (!result.frame) {
+        break;
+      }
+      drained += 1;
+      this.forwardRuntimeOutput(result.frame);
+    }
+    return drained;
   }
 
   forwardRuntimeOutput(output) {
@@ -2173,7 +2180,6 @@ class DdWebSocketBridge {
       return;
     }
     this.closed = true;
-    this.stopPolling();
     if (options.closeRuntime !== false) {
       await this.closeRuntime(code, reason);
     }
@@ -2195,13 +2201,6 @@ class DdWebSocketBridge {
   fail(error) {
     if (!this.closed) {
       void this.close(1011, String(error?.message ?? error));
-    }
-  }
-
-  stopPolling() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = undefined;
     }
   }
 }

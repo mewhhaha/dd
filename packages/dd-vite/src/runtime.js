@@ -115,6 +115,14 @@ export class DdRuntimeClient {
     });
   }
 
+  async waitWebSocketFrame(name, sessionId) {
+    return this.request({
+      op: "wait_websocket_frame",
+      name,
+      session_id: sessionId,
+    }, { timeoutMs: 0 });
+  }
+
   async closeWebSocket(name, sessionId, options = {}) {
     return this.request({
       op: "close_websocket",
@@ -129,26 +137,29 @@ export class DdRuntimeClient {
     return this.request({ op: "stats", name });
   }
 
-  async request(command) {
+  async request(command, options = {}) {
     if (this.#closed) {
       throw new Error("dd runtime client is closed");
     }
     const child = this.#ensureStarted();
     const id = String(this.#nextId++);
-    const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timeoutMs = options.timeoutMs ?? this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const useTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
     const payload = JSON.stringify({ id, ...command });
     return new Promise((resolveRequest, rejectRequest) => {
-      const timeout = setTimeout(() => {
-        this.#pending.delete(id);
-        if (this.#child === child) {
-          this.#discardChild(child);
-          child.kill("SIGTERM");
-          this.#rejectAll(
-            new Error(`dd runtime restarted after command timed out: ${command.op}`),
-          );
-        }
-        rejectRequest(new Error(`dd runtime command timed out after ${timeoutMs}ms: ${command.op}`));
-      }, timeoutMs);
+      const timeout = useTimeout
+        ? setTimeout(() => {
+          this.#pending.delete(id);
+          if (this.#child === child) {
+            this.#discardChild(child);
+            child.kill("SIGTERM");
+            this.#rejectAll(
+              new Error(`dd runtime restarted after command timed out: ${command.op}`),
+            );
+          }
+          rejectRequest(new Error(`dd runtime command timed out after ${timeoutMs}ms: ${command.op}`));
+        }, timeoutMs)
+        : undefined;
       this.#pending.set(id, {
         resolve: resolveRequest,
         reject: rejectRequest,

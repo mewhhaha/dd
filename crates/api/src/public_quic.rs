@@ -5,6 +5,7 @@ use crate::handlers::{
     sanitize_websocket_handshake_headers, ResponseBody,
 };
 use crate::state::AppState;
+use bytes::Bytes;
 use common::{PlatformError, Result};
 use futures_util::SinkExt;
 use http::header::{HeaderName, HeaderValue};
@@ -35,6 +36,7 @@ use tracing::warn;
 
 const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
 const MAX_PENDING_H3_TRANSPORT_HANDSHAKES: usize = 1024;
+const TRANSPORT_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 
 pub async fn serve_public_h3(public_addr: std::net::SocketAddr, state: AppState) -> Result<()> {
     let cert_path = state
@@ -253,7 +255,7 @@ async fn handle_public_h3_websocket(
         &parts.uri,
         &state.public_base_domain,
     )?;
-    ensure_public_worker(&state, &worker_name).await?;
+    ensure_public_worker(&state, &worker_name)?;
     let url = build_public_request_url(&parts.headers, &parts.uri)?;
     let synthetic_parts = build_synthetic_websocket_parts(parts)?;
 
@@ -319,12 +321,14 @@ async fn handle_public_h3_transport(
         &parts.uri,
         &state.public_base_domain,
     )?;
-    ensure_public_worker(&state, &worker_name).await?;
+    ensure_public_worker(&state, &worker_name)?;
     let url = build_public_request_url(&parts.headers, &parts.uri)?;
     let synthetic_parts = build_synthetic_transport_parts(parts)?;
 
-    let (outbound_stream_tx, mut outbound_stream_rx) = mpsc::unbounded_channel();
-    let (outbound_datagram_tx, mut outbound_datagram_rx) = mpsc::unbounded_channel();
+    let (outbound_stream_tx, mut outbound_stream_rx) =
+        mpsc::channel(TRANSPORT_OUTBOUND_CHANNEL_CAPACITY);
+    let (outbound_datagram_tx, mut outbound_datagram_rx) =
+        mpsc::channel(TRANSPORT_OUTBOUND_CHANNEL_CAPACITY);
     let runtime::TransportOpen {
         session_id,
         worker_name: runtime_worker_name,
@@ -619,7 +623,11 @@ fn stream_quiche_request_body(
                                 .await;
                             return;
                         }
-                        if tx.send(Ok(body.as_ref().to_vec())).await.is_err() {
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(body.as_ref())))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }

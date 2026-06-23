@@ -1,4 +1,5 @@
 use crate::handlers::{handle_private_request, handle_public_request};
+#[cfg(feature = "http3")]
 use crate::public_quic;
 use crate::state::AppState;
 use common::{PlatformError, Result};
@@ -30,11 +31,14 @@ pub async fn serve(
     match public_h3_enabled(&state) {
         true => {
             info!("public quic listener on https://{} (http/3)", public_addr);
+            #[cfg(feature = "http3")]
             tokio::select! {
                 result = serve_public_listener(public_listener, state.clone(), build_alt_svc_header(public_addr.port())) => result,
                 result = serve_private_listener(private_listener, state.clone()) => result,
                 result = public_quic::serve_public_h3(public_addr, state) => result,
             }
+            #[cfg(not(feature = "http3"))]
+            unreachable!("public_h3_enabled is false without the http3 feature")
         }
         false => {
             warn!("public http/3 disabled because PUBLIC_TLS_CERT_PATH/PUBLIC_TLS_KEY_PATH are not configured");
@@ -46,8 +50,14 @@ pub async fn serve(
     }
 }
 
+#[cfg(feature = "http3")]
 fn public_h3_enabled(state: &AppState) -> bool {
     state.public_tls_cert_path.is_some() && state.public_tls_key_path.is_some()
+}
+
+#[cfg(not(feature = "http3"))]
+fn public_h3_enabled(_state: &AppState) -> bool {
+    false
 }
 
 async fn serve_public_listener(
@@ -108,6 +118,7 @@ async fn serve_listener(
     }
 }
 
+#[cfg(feature = "http3")]
 fn build_alt_svc_header(port: u16) -> Option<HeaderValue> {
     let value = format!("h3=\":{port}\"; ma=86400");
     HeaderValue::from_str(&value).ok()

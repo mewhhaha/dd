@@ -29,7 +29,7 @@ where
         &parts.uri,
         &state.public_base_domain,
     )?;
-    ensure_public_worker(&state, &worker_name).await?;
+    ensure_public_worker(&state, &worker_name)?;
     let url = build_public_request_url(&parts.headers, &parts.uri)?;
     invoke_worker_websocket_with_target(state, parts, body, worker_name, url, ws_upgrade).await
 }
@@ -181,8 +181,8 @@ pub(crate) async fn open_transport_session_from_parts(
     parts: &http::request::Parts,
     worker_name: String,
     url: String,
-    stream_sender: mpsc::UnboundedSender<Vec<u8>>,
-    datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+    stream_sender: mpsc::Sender<Vec<u8>>,
+    datagram_sender: mpsc::Sender<Vec<u8>>,
 ) -> Result<runtime::TransportOpen, PlatformError> {
     if parts.method != Method::CONNECT {
         return Err(PlatformError::bad_request(

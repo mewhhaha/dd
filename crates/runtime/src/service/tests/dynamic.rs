@@ -272,6 +272,24 @@ struct DynamicFastFetchMetrics {
     direct_fetch_dispatch_count: u64,
     #[serde(default, rename = "control_drain_batch")]
     control_drain_batch: u64,
+    #[serde(default, rename = "sourceCacheHit")]
+    source_cache_hit: u64,
+    #[serde(default, rename = "sourceCacheMiss")]
+    source_cache_miss: u64,
+    #[serde(default, rename = "sourceCacheEntries")]
+    source_cache_entries: u64,
+    #[serde(default, rename = "sourceCacheBytes")]
+    source_cache_bytes: u64,
+    #[serde(default, rename = "sourceCacheEvictions")]
+    source_cache_evictions: u64,
+    #[serde(default, rename = "handleCacheEntries")]
+    handle_cache_entries: u64,
+    #[serde(default, rename = "handleCacheBytes")]
+    handle_cache_bytes: u64,
+    #[serde(default, rename = "handleCacheEvictions")]
+    handle_cache_evictions: u64,
+    #[serde(default, rename = "canceledReplyEntries")]
+    canceled_reply_entries: u64,
 }
 
 #[tokio::test]
@@ -1049,12 +1067,12 @@ async fn dynamic_handle_cache_clears_on_owner_generation_change() {
 
 #[tokio::test]
 #[serial]
-async fn dynamic_snapshot_cache_reuses_snapshot_for_same_source() {
+async fn dynamic_source_cache_reuses_bounded_entry_for_same_modules() {
     let service = test_service(dynamic_single_isolate_config()).await;
 
     service
         .deploy_with_config(
-            "dynamic-snapshot-cache".to_string(),
+            "dynamic-source-cache".to_string(),
             dynamic_snapshot_cache_worker(),
             DeployConfig {
                 bindings: vec![DeployBinding::Dynamic {
@@ -1068,29 +1086,66 @@ async fn dynamic_snapshot_cache_reuses_snapshot_for_same_source() {
 
     let first = invoke_with_timeout_and_dump(
         &service,
-        "dynamic-snapshot-cache",
-        test_invocation_with_path("/?id=one", "dynamic-snapshot-cache-one"),
-        "dynamic snapshot cache first create",
+        "dynamic-source-cache",
+        test_invocation_with_path("/?id=one", "dynamic-source-cache-one"),
+        "dynamic source cache first create",
     )
     .await;
     assert_eq!(first.status, 200);
 
-    let after_first = service.dynamic_debug_dump().await;
-    assert_eq!(after_first.snapshot_cache_entries, 1);
-    assert_eq!(after_first.snapshot_cache_failures, 0);
+    let metrics_output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-source-cache",
+        test_invocation_with_path("/__dynamic_metrics", "dynamic-source-cache-metrics-one"),
+        "dynamic source cache metrics after first create",
+    )
+    .await;
+    let after_first: DynamicFastFetchMetrics = crate::json::from_string(
+        String::from_utf8(metrics_output.body).expect("metrics body should be utf8"),
+    )
+    .expect("metrics should parse");
+    assert_eq!(after_first.source_cache_miss, 1);
+    assert_eq!(after_first.source_cache_hit, 0);
+    assert_eq!(after_first.source_cache_entries, 1);
+    assert!(after_first.source_cache_bytes > 0);
+    assert_eq!(after_first.source_cache_evictions, 0);
+    assert_eq!(after_first.handle_cache_entries, 1);
+    assert!(after_first.handle_cache_bytes > 0);
+    assert_eq!(after_first.handle_cache_evictions, 0);
+    assert_eq!(after_first.canceled_reply_entries, 0);
 
     let second = invoke_with_timeout_and_dump(
         &service,
-        "dynamic-snapshot-cache",
-        test_invocation_with_path("/?id=two", "dynamic-snapshot-cache-two"),
-        "dynamic snapshot cache second create",
+        "dynamic-source-cache",
+        test_invocation_with_path("/?id=two", "dynamic-source-cache-two"),
+        "dynamic source cache second create",
     )
     .await;
     assert_eq!(second.status, 200);
 
-    let after_second = service.dynamic_debug_dump().await;
-    assert_eq!(after_second.snapshot_cache_entries, 1);
-    assert_eq!(after_second.snapshot_cache_failures, 0);
+    let metrics_output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-source-cache",
+        test_invocation_with_path("/__dynamic_metrics", "dynamic-source-cache-metrics-two"),
+        "dynamic source cache metrics after second create",
+    )
+    .await;
+    let after_second: DynamicFastFetchMetrics = crate::json::from_string(
+        String::from_utf8(metrics_output.body).expect("metrics body should be utf8"),
+    )
+    .expect("metrics should parse");
+    assert_eq!(after_second.source_cache_miss, 1);
+    assert_eq!(after_second.source_cache_hit, 1);
+    assert_eq!(after_second.source_cache_entries, 1);
+    assert_eq!(
+        after_second.source_cache_bytes,
+        after_first.source_cache_bytes
+    );
+    assert_eq!(after_second.source_cache_evictions, 0);
+    assert_eq!(after_second.handle_cache_entries, 2);
+    assert!(after_second.handle_cache_bytes >= after_first.handle_cache_bytes);
+    assert_eq!(after_second.handle_cache_evictions, 0);
+    assert_eq!(after_second.canceled_reply_entries, 0);
 }
 
 #[tokio::test]
@@ -1148,6 +1203,115 @@ export default {
         .iter()
         .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
             && value == "application/json"));
+}
+
+#[tokio::test]
+#[serial]
+async fn dynamic_namespace_module_graph_allows_cycles() {
+    let service = test_service(dynamic_single_isolate_config()).await;
+
+    service
+        .deploy_with_config(
+            "dynamic-cycle".to_string(),
+            r#"
+let child = null;
+
+export default {
+  async fetch(_request, env) {
+    if (!child) {
+      child = await env.SANDBOX.get("cycle-child", async () => ({
+        entrypoint: "worker.js",
+        modules: {
+          "worker.js": "import { label } from './a.js'; export default { async fetch() { return new Response(label()); } };",
+          "a.js": "import { suffix } from './b.js'; export const name = 'a'; export function label() { return name + suffix(); }",
+          "b.js": "import { name } from './a.js'; export function suffix() { return ':' + name; }",
+        },
+        timeout: 1500,
+      }));
+    }
+    return child.fetch("http://worker/");
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-cycle",
+        test_invocation(),
+        "dynamic cycle child invoke",
+    )
+    .await;
+
+    assert_eq!(output.status, 200);
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "a:a");
+}
+
+#[tokio::test]
+#[serial]
+async fn dynamic_namespace_module_graph_rejects_bare_imports() {
+    let service = test_service(dynamic_single_isolate_config()).await;
+
+    service
+        .deploy_with_config(
+            "dynamic-bare-import".to_string(),
+            r#"
+let child = null;
+
+export default {
+  async fetch(_request, env) {
+    try {
+      if (!child) {
+        child = await env.SANDBOX.get("bare-import-child", async () => ({
+          entrypoint: "worker.js",
+          modules: {
+            "worker.js": "import { value } from 'lib/value.js'; export default { async fetch() { return new Response(value); } };",
+            "lib/value.js": "export const value = 'bad';",
+          },
+          timeout: 1500,
+        }));
+      }
+      return await child.fetch("http://worker/");
+    } catch (error) {
+      return new Response(String(error?.message ?? error), { status: 418 });
+    }
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Dynamic {
+                    binding: "SANDBOX".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "dynamic-bare-import",
+        test_invocation(),
+        "dynamic bare import child invoke",
+    )
+    .await;
+
+    assert_eq!(output.status, 418);
+    let body = String::from_utf8(output.body).expect("utf8");
+    assert!(
+        body.contains("dynamic module bare imports are unsupported: lib/value.js"),
+        "body was {body}"
+    );
 }
 
 #[tokio::test]

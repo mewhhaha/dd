@@ -1,3 +1,120 @@
+  const DYNAMIC_HANDLE_CACHE_MAX_ENTRIES = 1_024;
+  const DYNAMIC_HANDLE_CACHE_MAX_BYTES = 512 * 1024;
+  const DYNAMIC_SOURCE_CACHE_MAX_ENTRIES = 64;
+  const DYNAMIC_SOURCE_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+  const DYNAMIC_CANCELED_REPLY_MAX_ENTRIES = 4_096;
+  const DYNAMIC_CANCELED_REPLY_TTL_MS = 5 * 60 * 1000;
+
+  const incrementDynamicMetric = (metrics, name, count = 1) => {
+    if (!metrics || typeof metrics !== "object") {
+      return;
+    }
+    metrics[name] = Number(metrics[name] ?? 0) + Number(count ?? 0);
+  };
+
+  const estimateDynamicStringBytes = (value) => String(value ?? "").length * 2;
+
+  const publishDynamicCacheMetrics = (metrics, prefix, entries, bytes) => {
+    if (!metrics || typeof metrics !== "object") {
+      return;
+    }
+    metrics[`${prefix}Entries`] = entries;
+    metrics[`${prefix}Bytes`] = bytes;
+  };
+
+  const createDynamicLruCache = ({
+    maxEntries,
+    maxBytes,
+    metrics,
+    metricPrefix,
+    estimateEntryBytes,
+  }) => {
+    const entries = new Map();
+    let totalBytes = 0;
+
+    const publish = () => publishDynamicCacheMetrics(
+      metrics,
+      metricPrefix,
+      entries.size,
+      totalBytes,
+    );
+    const remove = (key) => {
+      const entry = entries.get(key);
+      if (!entry) {
+        return false;
+      }
+      entries.delete(key);
+      totalBytes = Math.max(0, totalBytes - entry.bytes);
+      return true;
+    };
+    const evictOldest = () => {
+      const oldest = entries.keys().next();
+      if (oldest.done) {
+        return false;
+      }
+      remove(oldest.value);
+      incrementDynamicMetric(metrics, `${metricPrefix}Evictions`);
+      return true;
+    };
+
+    const cache = {
+      get(key) {
+        const entry = entries.get(key);
+        if (!entry) {
+          return undefined;
+        }
+        entries.delete(key);
+        entries.set(key, entry);
+        publish();
+        return entry.value;
+      },
+      set(key, value) {
+        remove(key);
+        const entryBytes = Math.max(
+          0,
+          Number(estimateEntryBytes?.(key, value) ?? 0),
+        );
+        if (
+          maxEntries <= 0
+          || maxBytes <= 0
+          || entryBytes > maxBytes
+        ) {
+          incrementDynamicMetric(metrics, `${metricPrefix}Evictions`);
+          publish();
+          return cache;
+        }
+        entries.set(key, { value, bytes: entryBytes });
+        totalBytes += entryBytes;
+        while (
+          (entries.size > maxEntries || totalBytes > maxBytes)
+          && evictOldest()
+        ) {}
+        publish();
+        return cache;
+      },
+      delete(key) {
+        const removed = remove(key);
+        if (removed) {
+          publish();
+        }
+        return removed;
+      },
+      clear() {
+        entries.clear();
+        totalBytes = 0;
+        publish();
+      },
+      get size() {
+        return entries.size;
+      },
+      get bytes() {
+        return totalBytes;
+      },
+    };
+    publish();
+    return cache;
+  };
+
   const getDynamicCacheState = () => {
     const shared = getSharedEnv();
     return {
@@ -9,7 +126,7 @@
 
   const recordDynamicMetric = (name, count = 1) => {
     const metrics = getDynamicCacheState().metrics;
-    metrics[name] = Number(metrics[name] ?? 0) + Number(count ?? 0);
+    incrementDynamicMetric(metrics, name, count);
   };
 
   const recordDynamicStageMetric = (prefix, durationMs) => {
@@ -144,173 +261,43 @@
     });
   };
 
-  const normalizeModulePath = (value) => {
-    const raw = String(value ?? "").replaceAll("\\", "/").trim();
-    if (!raw) {
-      throw new Error("dynamic worker module path must not be empty");
+  const buildModuleWorkerSource = (entrypointInput, modulesInput) => {
+    const entrypoint = String(entrypointInput || "worker.js").trim();
+    if (!entrypoint) {
+      throw new Error("dynamic worker entrypoint must not be empty");
     }
-    const absolute = raw.startsWith("/");
-    const parts = raw.split("/");
-    const out = [];
-    for (const part of parts) {
-      if (!part || part === ".") {
-        continue;
-      }
-      if (part === "..") {
-        if (out.length > 0) {
-          out.pop();
-        }
-        continue;
-      }
-      out.push(part);
-    }
-    const normalized = out.join("/");
-    return absolute ? normalized : normalized;
-  };
-
-  const resolveModuleSpecifier = (fromPath, specifier) => {
-    const spec = String(specifier ?? "").trim();
-    if (!spec) {
-      return null;
-    }
-    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec) || spec.startsWith("//")) {
-      return null;
-    }
-    if (!spec.startsWith("./") && !spec.startsWith("../") && !spec.startsWith("/")) {
-      return normalizeModulePath(spec);
-    }
-    const baseParts = normalizeModulePath(fromPath).split("/");
-    if (baseParts.length > 0) {
-      baseParts.pop();
-    }
-    const relative = spec.startsWith("/") ? spec.slice(1) : spec;
-    const merged = spec.startsWith("/") ? relative : `${baseParts.join("/")}/${relative}`;
-    return normalizeModulePath(merged);
-  };
-
-  const replaceModuleSpecifiers = (modulePath, source, mapResolver) => {
-    let out = String(source ?? "");
-    const fromReplace = /(\bfrom\s*['"])([^'"]+)(['"])/g;
-    out = out.replace(fromReplace, (full, prefix, spec, suffix) => {
-      const replacement = mapResolver(modulePath, spec);
-      if (!replacement) {
-        return full;
-      }
-      return `${prefix}${replacement}${suffix}`;
-    });
-    const sideEffectImport = /(\bimport\s*['"])([^'"]+)(['"])/g;
-    out = out.replace(sideEffectImport, (full, prefix, spec, suffix) => {
-      const replacement = mapResolver(modulePath, spec);
-      if (!replacement) {
-        return full;
-      }
-      return `${prefix}${replacement}${suffix}`;
-    });
-    const dynamicImport = /(\bimport\s*\(\s*['"])([^'"]+)(['"]\s*\))/g;
-    out = out.replace(dynamicImport, (full, prefix, spec, suffix) => {
-      const replacement = mapResolver(modulePath, spec);
-      if (!replacement) {
-        return full;
-      }
-      return `${prefix}${replacement}${suffix}`;
-    });
-    return out;
-  };
-
-  const buildSourceFromModules = (entrypointInput, modulesInput) => {
-    const entrypoint = normalizeModulePath(entrypointInput || "worker.js");
     if (!isPlainObject(modulesInput)) {
       throw new Error("dynamic worker modules must be an object");
     }
 
-    const modules = new Map();
+    const modules = {};
     for (const [rawPath, rawCode] of Object.entries(modulesInput)) {
-      const modulePath = normalizeModulePath(rawPath);
-      const source = String(rawCode ?? "");
-      if (!source.trim()) {
-        throw new Error(`dynamic worker module must not be empty: ${modulePath}`);
-      }
-      modules.set(modulePath, source);
-    }
-    if (modules.size === 0) {
-      throw new Error("dynamic worker modules must not be empty");
-    }
-    if (!modules.has(entrypoint)) {
-      throw new Error(`dynamic worker missing entrypoint module: ${entrypoint}`);
+      modules[String(rawPath ?? "")] = String(rawCode ?? "");
     }
 
-    const encodedByPath = new Map();
-    const rewrittenByPath = new Map();
-    const urlsByPath = new Map();
-    const unresolved = new Set();
-    const maxRounds = 16;
-    for (let round = 0; round < maxRounds; round += 1) {
-      unresolved.clear();
-      let changed = false;
-      for (const [modulePath, moduleSource] of modules.entries()) {
-        const rewritten = replaceModuleSpecifiers(
-          modulePath,
-          moduleSource,
-          (fromPath, specifier) => {
-            const resolved = resolveModuleSpecifier(fromPath, specifier);
-            if (!resolved) {
-              return null;
-            }
-            if (!modules.has(resolved)) {
-              unresolved.add(`${fromPath} -> ${specifier}`);
-              return null;
-            }
-            const url = urlsByPath.get(resolved);
-            if (!url) {
-              unresolved.add(`${fromPath} -> ${specifier}`);
-              return null;
-            }
-            return url;
-          },
-        );
-        rewrittenByPath.set(modulePath, rewritten);
-        const encoded = `data:text/javascript;charset=utf-8,${encodeURIComponent(rewritten)}`;
-        if (encodedByPath.get(modulePath) !== encoded) {
-          encodedByPath.set(modulePath, encoded);
-          urlsByPath.set(modulePath, encoded);
-          changed = true;
-        }
-      }
-      if (!changed && unresolved.size === 0) {
-        break;
-      }
-      if (round === maxRounds - 1) {
-        if (unresolved.size > 0) {
-          throw new Error(
-            `dynamic worker module graph did not resolve after ${maxRounds} rounds; unresolved imports: ${Array.from(unresolved).slice(0, 5).join(", ")}`,
-          );
-        }
-        throw new Error(
-          "dynamic worker module graph did not stabilize; avoid circular imports in dynamic modules",
-        );
-      }
+    const result = Deno.core.ops.op_dynamic_module_graph_register(
+      entrypoint,
+      modules,
+    );
+    if (!result || result.ok === false) {
+      throw new Error(String(result?.error ?? "dynamic module graph registration failed"));
     }
-
-    const entrySource = rewrittenByPath.get(entrypoint);
-    if (!entrySource) {
-      throw new Error("dynamic worker entrypoint source could not be built");
-    }
-    return `${entrySource}\n`;
+    return Object.freeze({
+      module_graph_id: String(result.graph_id ?? ""),
+      module_entrypoint: String(result.entrypoint ?? ""),
+    });
   };
 
-  const dynamicSourceCacheKey = (entrypointInput, modulesInput) => {
-    const entrypoint = normalizeModulePath(entrypointInput || "worker.js");
-    if (!isPlainObject(modulesInput)) {
-      throw new Error("dynamic worker modules must be an object");
+  const estimateDynamicWorkerSourceBytes = (source) => {
+    if (!source || typeof source !== "object") {
+      return 0;
     }
-    const keys = Object.keys(modulesInput).sort();
-    let out = `${entrypoint}\u001f`;
-    for (const key of keys) {
-      const modulePath = normalizeModulePath(key);
-      const source = String(modulesInput[key] ?? "");
-      out += `${modulePath.length}:${modulePath}\u001e${source.length}:${source}\u001f`;
+    if (typeof source.source === "string") {
+      return estimateDynamicStringBytes(source.source);
     }
-    return out;
+    return estimateDynamicStringBytes(source.module_graph_id)
+      + estimateDynamicStringBytes(source.module_entrypoint)
+      + 32;
   };
 
   const resolveDynamicWorkerSource = (options) => {
@@ -319,7 +306,7 @@
       if (!source.trim()) {
         throw new Error("dynamic worker source must not be empty");
       }
-      return source;
+      return Object.freeze({ source });
     }
 
     const entrypoint = String(options.entrypoint ?? "worker.js").trim();
@@ -330,15 +317,15 @@
     if (!isPlainObject(modules)) {
       throw new Error("dynamic worker modules must be an object");
     }
+    const built = buildModuleWorkerSource(entrypoint, modules);
     const { sourceCache } = getDynamicCacheState();
-    const cacheKey = dynamicSourceCacheKey(entrypoint, modules);
+    const cacheKey = `${built.module_graph_id}\u001f${built.module_entrypoint}`;
     const cached = sourceCache.get(cacheKey);
-    if (typeof cached === "string" && cached.length > 0) {
+    if (cached && typeof cached === "object") {
       recordDynamicMetric("sourceCacheHit");
       return cached;
     }
     recordDynamicMetric("sourceCacheMiss");
-    const built = buildSourceFromModules(entrypoint, modules);
     sourceCache.set(cacheKey, built);
     return built;
   };
@@ -366,8 +353,7 @@
     bindingName,
     entry,
     request,
-    requestId,
-    invokeSeq,
+    requestContextHandle,
     timeout,
     cacheKey,
   ) => {
@@ -378,18 +364,26 @@
     });
     const startStarted = performance.now();
     recordDynamicMetric("remoteFetchHit");
+    const headersHandle = storeResponseHeaders(request.headers);
+    const bodyHandle = Math.max(
+      0,
+      Math.trunc(Number(callOp(
+        "op_http_store_prepared_body",
+        request.body ?? new Uint8Array(),
+      ) ?? 0) || 0),
+    );
     const result = await awaitDynamicReply(
       invokeLabel,
-      () => callOp("op_dynamic_worker_fetch_start", {
-        request_id: requestId,
-        subrequest_id: `${requestId}:dynamic:${invokeSeq}`,
-        binding: invokeBase.binding,
-        handle: invokeBase.handle,
-        method: request.method,
-        url: request.url,
-        headers: request.headers,
-        body: Array.from(request.body),
-      }),
+      () => callOp(
+        "op_dynamic_worker_fetch_start",
+        requestContextHandle,
+        invokeBase.binding,
+        invokeBase.handle,
+        request.method,
+        request.url,
+        headersHandle,
+        bodyHandle,
+      ),
       timeout,
       { syncTime: false },
     ).finally(() => {
@@ -404,9 +398,11 @@
     }
     applyDynamicReplyBoundary(result);
     const materializeStarted = performance.now();
-    const response = new Response(toArrayBytes(result.body), {
+    const replyHeadersHandle = Math.max(0, Math.trunc(Number(result.headers_handle ?? 0) || 0));
+    const replyBodyHandle = Math.max(0, Math.trunc(Number(result.body_handle ?? 0) || 0));
+    const response = new Response(callOp("op_http_take_prepared_body", replyBodyHandle), {
       status: Number(result.status ?? 200),
-      headers: Array.isArray(result.headers) ? result.headers : [],
+      headers: callOp("op_http_take_prepared_headers", replyHeadersHandle),
     });
     recordDynamicStageMetric("replyMaterialize", performance.now() - materializeStarted);
     return response;
@@ -421,15 +417,13 @@
         const request = await normalizeDynamicFetchInput(inputValue, initValue);
         recordDynamicStageMetric("jsRequestNormalize", performance.now() - normalizeStarted);
 
-        const scopedRequestId = activeRequestId();
-        const invokeSeq = nextMemoryInvokeSeq();
+        const scopedRequestContextHandle = activeRequestContextHandle();
         recordDynamicMetric("fastFetchPathHit");
         return invokeRemoteDynamicWorkerFetch(
           bindingName,
           activeEntry,
           request,
-          scopedRequestId,
-          invokeSeq,
+          scopedRequestContextHandle,
           activeEntry.timeout,
           cacheKey,
         );
@@ -461,7 +455,57 @@
 
   const dynamicReplyWaiters = () => (globalThis.__dd_dynamic_reply_waiters ??= new Map());
   const dynamicReplyReady = () => (globalThis.__dd_dynamic_reply_ready ??= new Map());
-  const dynamicReplyCanceled = () => (globalThis.__dd_dynamic_reply_canceled ??= new Set());
+  const dynamicReplyCanceled = () => (globalThis.__dd_dynamic_reply_canceled ??= new Map());
+  const dynamicReplyNow = () => (
+    globalThis.performance && typeof globalThis.performance.now === "function"
+      ? globalThis.performance.now()
+      : Date.now()
+  );
+
+  const publishCanceledReplyMetrics = (canceled) => {
+    const metrics = getDynamicCacheState().metrics;
+    if (metrics && typeof metrics === "object") {
+      metrics.canceledReplyEntries = canceled.size;
+    }
+  };
+
+  const sweepDynamicReplyCanceled = (canceled, now = dynamicReplyNow()) => {
+    let evictions = 0;
+    for (const [replyId, expiresAt] of canceled.entries()) {
+      if (expiresAt > now && canceled.size <= DYNAMIC_CANCELED_REPLY_MAX_ENTRIES) {
+        break;
+      }
+      canceled.delete(replyId);
+      evictions += 1;
+    }
+    while (canceled.size > DYNAMIC_CANCELED_REPLY_MAX_ENTRIES) {
+      const oldest = canceled.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      canceled.delete(oldest.value);
+      evictions += 1;
+    }
+    if (evictions > 0) {
+      recordDynamicMetric("canceledReplyEvictions", evictions);
+    }
+    publishCanceledReplyMetrics(canceled);
+  };
+
+  const discardDynamicReplyHandles = (payload) => {
+    const headersHandle = Math.max(0, Math.trunc(Number(payload?.headers_handle ?? 0) || 0));
+    if (headersHandle > 0) {
+      callOp("op_http_take_prepared_headers", headersHandle);
+    }
+    const bodyHandle = Math.max(0, Math.trunc(Number(payload?.body_handle ?? 0) || 0));
+    if (bodyHandle > 0) {
+      callOp("op_http_take_prepared_body", bodyHandle);
+    }
+    const valueHandle = Math.max(0, Math.trunc(Number(payload?.value_handle ?? 0) || 0));
+    if (valueHandle > 0) {
+      callOp("op_http_take_prepared_body", valueHandle);
+    }
+  };
 
   const deliverDynamicReply = (payload) => {
     const replyId = String(payload?.reply_id ?? "").trim();
@@ -469,11 +513,17 @@
       return;
     }
     const canceled = dynamicReplyCanceled();
-    const waiters = dynamicReplyWaiters();
-    const ready = dynamicReplyReady();
-    if (canceled.delete(replyId)) {
+    const canceledUntil = canceled.get(replyId);
+    if (canceledUntil !== undefined) {
+      canceled.delete(replyId);
+      discardDynamicReplyHandles(payload);
+      recordDynamicMetric("lateCanceledReply");
+      publishCanceledReplyMetrics(canceled);
       return;
     }
+    sweepDynamicReplyCanceled(canceled);
+    const waiters = dynamicReplyWaiters();
+    const ready = dynamicReplyReady();
     const waiter = waiters.get(replyId);
     if (waiter) {
       waiters.delete(replyId);
@@ -499,8 +549,17 @@
     if (!replyId) {
       return;
     }
-    dynamicReplyCanceled().add(replyId);
-    dynamicReplyReady().delete(replyId);
+    const canceled = dynamicReplyCanceled();
+    const now = dynamicReplyNow();
+    sweepDynamicReplyCanceled(canceled, now);
+    canceled.set(replyId, now + DYNAMIC_CANCELED_REPLY_TTL_MS);
+    sweepDynamicReplyCanceled(canceled, now);
+    const ready = dynamicReplyReady();
+    const readyPayload = ready.get(replyId);
+    if (readyPayload) {
+      discardDynamicReplyHandles(readyPayload);
+    }
+    ready.delete(replyId);
     const waiters = dynamicReplyWaiters();
     const waiter = waiters.get(replyId);
     if (waiter) {
@@ -618,14 +677,10 @@
         return createDynamicWorkerStub(bindingName, cached, cacheKey);
       }
       recordDynamicMetric("handleCacheMiss");
-      const scopedRequestId = activeRequestId();
+      const scopedRequestContextHandle = activeRequestContextHandle();
       const lookup = await awaitDynamicReply(
         `dynamic worker lookup (${bindingName}/${instanceId})`,
-        () => callOp("op_dynamic_worker_lookup", {
-          request_id: scopedRequestId,
-          binding: bindingName,
-          id: instanceId,
-        }),
+        () => callOp("op_dynamic_worker_lookup", scopedRequestContextHandle, bindingName, instanceId),
       );
       if (!lookup || typeof lookup !== "object" || lookup.ok === false) {
         throw new Error(formatDynamicFailure("dynamic worker lookup failed", lookup));
@@ -641,7 +696,7 @@
       }
 
       const options = await parseDynamicFactoryOptions(factory);
-      const source = resolveDynamicWorkerSource(options);
+      const workerSource = resolveDynamicWorkerSource(options);
       const policy = normalizeDynamicPolicy(options);
       const bindings = normalizeDynamicBindings(options.bindings);
       const envInput = options.env;
@@ -649,17 +704,20 @@
       const timeout = normalizeDynamicTimeout(options.timeout);
       const result = await awaitDynamicReply(
         `dynamic worker create (${bindingName}/${instanceId})`,
-        () => callOp("op_dynamic_worker_create", {
-          request_id: scopedRequestId,
-          binding: bindingName,
-          id: instanceId,
-          source,
+        () => callOp(
+          "op_dynamic_worker_create",
+          scopedRequestContextHandle,
+          bindingName,
+          instanceId,
+          String(workerSource.source ?? ""),
+          String(workerSource.module_graph_id ?? ""),
+          String(workerSource.module_entrypoint ?? ""),
           bindings,
-          env: envConfig.stringEnv,
-          policy,
-          host_rpc_bindings: envConfig.hostRpcBindings,
+          envConfig.stringEnv,
           timeout,
-        }),
+          policy,
+          envConfig.hostRpcBindings,
+        ),
       );
       if (!result || typeof result !== "object" || result.ok === false) {
         throw new Error(formatDynamicFailure("dynamic worker create failed", result));
@@ -682,13 +740,10 @@
      * @returns {Promise<string[]>}
      */
     async list() {
-      const scopedRequestId = activeRequestId();
+      const scopedRequestContextHandle = activeRequestContextHandle();
       const result = await awaitDynamicReply(
         `dynamic worker list (${bindingName})`,
-        () => callOp("op_dynamic_worker_list", {
-          request_id: scopedRequestId,
-          binding: bindingName,
-        }),
+        () => callOp("op_dynamic_worker_list", scopedRequestContextHandle, bindingName),
       );
       if (!result || typeof result !== "object" || result.ok === false) {
         throw new Error(formatDynamicFailure("dynamic worker list failed", result));
@@ -705,14 +760,10 @@
      */
     async delete(id) {
       const instanceId = normalizeDynamicInstanceId(id);
-      const scopedRequestId = activeRequestId();
+      const scopedRequestContextHandle = activeRequestContextHandle();
       const result = await awaitDynamicReply(
         `dynamic worker delete (${bindingName}/${instanceId})`,
-        () => callOp("op_dynamic_worker_delete", {
-          request_id: scopedRequestId,
-          binding: bindingName,
-          id: instanceId,
-        }),
+        () => callOp("op_dynamic_worker_delete", scopedRequestContextHandle, bindingName, instanceId),
       );
       if (!result || typeof result !== "object" || result.ok === false) {
         throw new Error(formatDynamicFailure("dynamic worker delete failed", result));
@@ -738,29 +789,59 @@
       return cached;
     }
     const env = {};
+    const dynamicMetrics = {
+      handleCacheHit: 0,
+      handleCacheMiss: 0,
+      handleCacheEntries: 0,
+      handleCacheBytes: 0,
+      handleCacheEvictions: 0,
+      sourceCacheHit: 0,
+      sourceCacheMiss: 0,
+      sourceCacheEntries: 0,
+      sourceCacheBytes: 0,
+      sourceCacheEvictions: 0,
+      canceledReplyEntries: 0,
+      canceledReplyEvictions: 0,
+      lateCanceledReply: 0,
+      remoteFetchHit: 0,
+      remoteFetchFallback: 0,
+      normalizeFastPathHit: 0,
+      normalizeSlowPathHit: 0,
+    };
+    Object.defineProperty(env, "__dd_dynamic_metrics", {
+      value: dynamicMetrics,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
     Object.defineProperty(env, "__dd_dynamic_handle_cache", {
-      value: new Map(),
+      value: createDynamicLruCache({
+        maxEntries: DYNAMIC_HANDLE_CACHE_MAX_ENTRIES,
+        maxBytes: DYNAMIC_HANDLE_CACHE_MAX_BYTES,
+        metrics: dynamicMetrics,
+        metricPrefix: "handleCache",
+        estimateEntryBytes: (key, entry) => (
+          estimateDynamicStringBytes(key)
+          + estimateDynamicStringBytes(entry?.handle)
+          + estimateDynamicStringBytes(entry?.worker)
+          + 32
+        ),
+      }),
       enumerable: false,
       configurable: false,
       writable: false,
     });
     Object.defineProperty(env, "__dd_dynamic_source_cache", {
-      value: new Map(),
-      enumerable: false,
-      configurable: false,
-      writable: false,
-    });
-    Object.defineProperty(env, "__dd_dynamic_metrics", {
-      value: {
-        handleCacheHit: 0,
-        handleCacheMiss: 0,
-        sourceCacheHit: 0,
-        sourceCacheMiss: 0,
-        remoteFetchHit: 0,
-        remoteFetchFallback: 0,
-        normalizeFastPathHit: 0,
-        normalizeSlowPathHit: 0,
-      },
+      value: createDynamicLruCache({
+        maxEntries: DYNAMIC_SOURCE_CACHE_MAX_ENTRIES,
+        maxBytes: DYNAMIC_SOURCE_CACHE_MAX_BYTES,
+        metrics: dynamicMetrics,
+        metricPrefix: "sourceCache",
+        estimateEntryBytes: (key, source) => (
+          estimateDynamicStringBytes(key)
+          + estimateDynamicWorkerSourceBytes(source)
+        ),
+      }),
       enumerable: false,
       configurable: false,
       writable: false,
@@ -780,71 +861,40 @@
         },
       });
     };
-    const kvBindings = Array.isArray(kvBindingsConfig)
-      ? kvBindingsConfig
-      : kvBindingsConfig && typeof kvBindingsConfig === "object"
-        ? Object.entries(kvBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
-        : [];
-
-    for (const binding of kvBindings) {
-      const [envName, bindingName] = Array.isArray(binding)
-        ? binding
-        : [binding, binding];
-      if (typeof envName !== "string" || envName.length === 0) {
+    for (const [envName, bindingName] of kvBindingsConfig) {
+      if (!envName) {
         continue;
       }
       defineLazyValue(env, envName, () => createKvBinding(bindingName));
     }
 
-    const dynamicBindings = Array.isArray(dynamicBindingsConfig)
-      ? dynamicBindingsConfig
-      : dynamicBindingsConfig && typeof dynamicBindingsConfig === "object"
-        ? Object.entries(dynamicBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
-        : [];
-    for (const binding of dynamicBindings) {
-      const [envName, bindingName] = Array.isArray(binding)
-        ? binding
-        : [binding, binding];
-      if (typeof envName !== "string" || envName.trim().length === 0) {
+    for (const [envName, bindingName] of dynamicBindingsConfig) {
+      if (!envName) {
         continue;
       }
       defineLazyValue(
         env,
-        envName.trim(),
-        () => createDynamicNamespace(String(bindingName ?? envName).trim()),
+        envName,
+        () => createDynamicNamespace(bindingName || envName),
       );
     }
 
-    const dynamicRpcBindings = Array.isArray(dynamicRpcBindingsConfig)
-      ? dynamicRpcBindingsConfig
-      : dynamicRpcBindingsConfig && typeof dynamicRpcBindingsConfig === "object"
-        ? Object.entries(dynamicRpcBindingsConfig).map(([name, binding]) => [name, typeof binding === "string" ? binding : name])
-        : [];
-    for (const binding of dynamicRpcBindings) {
-      const [envName, bindingName] = Array.isArray(binding)
-        ? binding
-        : [binding, binding];
-      if (typeof envName !== "string" || envName.trim().length === 0) {
+    for (const [envName, bindingName] of dynamicRpcBindingsConfig) {
+      if (!envName) {
         continue;
       }
       defineLazyValue(
         env,
-        envName.trim(),
-        () => createDynamicHostRpcNamespace(String(bindingName ?? envName).trim()),
+        envName,
+        () => createDynamicHostRpcNamespace(bindingName || envName),
       );
     }
 
-    const dynamicEnv = Array.isArray(dynamicEnvConfig)
-      ? dynamicEnvConfig
-      : dynamicEnvConfig && typeof dynamicEnvConfig === "object"
-        ? Object.entries(dynamicEnvConfig)
-        : [];
-    for (const entry of dynamicEnv) {
-      const [envName, value] = Array.isArray(entry) ? entry : [null, null];
-      if (typeof envName !== "string" || envName.trim().length === 0) {
+    for (const [envName, value] of dynamicEnvConfig) {
+      if (!envName) {
         continue;
       }
-      Object.defineProperty(env, envName.trim(), {
+      Object.defineProperty(env, envName, {
         value: String(value ?? ""),
         enumerable: true,
         configurable: true,
@@ -852,18 +902,11 @@
       });
     }
 
-    const memoryBindings = Array.isArray(memoryBindingsConfig) ? memoryBindingsConfig : [];
-    for (const entry of memoryBindings) {
-      const bindingName = Array.isArray(entry)
-        ? String(entry[0] ?? "").trim()
-        : entry && typeof entry === "object"
-          ? String(entry.binding ?? "").trim()
-          : String(entry ?? "").trim();
+    for (const bindingName of memoryBindingsConfig) {
       if (!bindingName) {
         continue;
       }
-      const envName = bindingName;
-      defineLazyValue(env, envName, () => createMemoryNamespace(bindingName));
+      defineLazyValue(env, bindingName, () => createMemoryNamespace(bindingName));
     }
 
     Object.freeze(env);
@@ -885,11 +928,14 @@
     const exportName = String(descriptor?.export_name ?? descriptor?.exportName ?? "").trim();
     const liveToken = String(descriptor?.live_token ?? descriptor?.liveToken ?? "").trim();
     const source = String(descriptor?.source ?? "").trim();
+    const idempotencyKey = String(
+      descriptor?.idempotency_key ?? descriptor?.idempotencyKey ?? "",
+    ).trim();
     if (!liveToken && !exportName && !source) {
       throw new Error("memory operation executable descriptor must not be empty");
     }
     return {
-      descriptor: { liveToken, exportName, source },
+      descriptor: { liveToken, exportName, source, idempotencyKey },
       args,
     };
   };
@@ -928,103 +974,56 @@
     runtimeRequestId,
     executable,
     args,
+    options = undefined,
   ) => {
-    const maxRetries = 256;
-    let lastConflict = null;
-    for (let attempt = 0; attempt < maxRetries; attempt += 1) {
-      for (;;) {
-        const txn = createMemoryTxn(entry);
-        const txnStarted = performance.now();
-        const scopedState = createMemoryAtomicState(
-          entry,
-          runtimeRequestId,
-          true,
-          true,
-          txn,
-        );
-        const current = currentRequestContext();
-        const previousMemoryEntry = current.memoryEntry;
-        const previousMemoryRequestId = current.memoryRequestId;
-        const previousSocketRuntimeProvider = current.socketRuntimeProvider;
-        const previousTransportRuntimeProvider = current.transportRuntimeProvider;
-        current.memoryEntry = entry;
-        current.memoryRequestId = runtimeRequestId;
-        current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
-        current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
-        try {
-          const value = withMemoryTxnScope(
-            {
-              binding: entry.binding,
-              memoryKey: entry.memoryKey,
-              state: scopedState,
-              stub: scopedState.stub,
-            },
-            () => executable(scopedState, ...args),
-          );
-          if (value instanceof Promise) {
-            throw new Error("stub.atomic callback must be synchronous");
-          }
-          if (memoryTxnIsSnapshotOnly(txn)) {
-            recordMemoryProfile("js_read_only_total", performance.now() - txnStarted, 1);
-            return value;
-          }
-          if (memoryTxnIsReadOnly(txn)) {
-            const fresh = await ensureMemoryReadTxnFresh(txn, runtimeRequestId);
-            if (!fresh) {
-              lastConflict = new Error("memory transaction conflicted");
-              await Promise.resolve();
-              break;
-            }
-            recordMemoryProfile("js_read_only_total", performance.now() - txnStarted, 1);
-            return value;
-          }
-          const committed = memoryTxnIsBlindWrite(txn)
-            ? await commitMemoryBlindTxn(txn, runtimeRequestId)
-            : txn.writes.size === 0 && txn.accepted !== true
-            ? await validateMemoryTxnReads(txn, runtimeRequestId)
-            : await commitMemoryTxn(txn, runtimeRequestId);
-          if (!committed) {
-            lastConflict = new Error("memory transaction conflicted");
-            await Promise.resolve();
-            break;
-          }
-          for (const deferred of txn.deferred) {
-            const deferredResult = deferred();
-            if (deferredResult instanceof Promise) {
-              await deferredResult;
-            }
-          }
-          return value;
-        } catch (error) {
-          if (error instanceof MemoryHydrationNeeded && error.__dd_memory_hydration_needed === true) {
-            if (error.mode === "full") {
-              await ensureMemoryStorageHydrated(entry, runtimeRequestId);
-            } else {
-              await ensureMemoryStorageKeysHydrated(entry, runtimeRequestId, error.keys);
-            }
-            continue;
-          }
-          if (txn.committed) {
-            throw error;
-          }
-          if (
-            error instanceof Error
-            && String(error.message ?? "").includes("conflicted")
-          ) {
-            lastConflict = error;
-            await Promise.resolve();
-            break;
-          }
-          throw error;
-        } finally {
-          current.memoryEntry = previousMemoryEntry;
-          current.memoryRequestId = previousMemoryRequestId;
-          current.socketRuntimeProvider = previousSocketRuntimeProvider;
-          current.transportRuntimeProvider = previousTransportRuntimeProvider;
-        }
+    await ensureMemoryStorageHydrated(entry, runtimeRequestId, { force: true });
+    const commandHandle = Math.max(0, Math.trunc(Number(options?.commandHandle ?? 0) || 0));
+    const txn = createMemoryTxn(entry, { commandHandle });
+    let encodedResult = null;
+    const scopedState = createMemoryAtomicState(
+      entry,
+      runtimeRequestId,
+      true,
+      true,
+      txn,
+    );
+    const current = currentRequestContext();
+    const previousMemoryEntry = current.memoryEntry;
+    const previousMemoryRequestId = current.memoryRequestId;
+    const previousSocketRuntimeProvider = current.socketRuntimeProvider;
+    const previousTransportRuntimeProvider = current.transportRuntimeProvider;
+    current.memoryEntry = entry;
+    current.memoryRequestId = runtimeRequestId;
+    current.socketRuntimeProvider = () => scopedState.__dd_socket_runtime;
+    current.transportRuntimeProvider = () => scopedState.__dd_transport_runtime;
+    try {
+      const value = withMemoryTxnScope(
+        {
+          binding: entry.binding,
+          memoryKey: entry.memoryKey,
+          state: scopedState,
+          stub: scopedState.stub,
+        },
+        () => executable(scopedState, ...args),
+      );
+      if (value instanceof Promise) {
+        throw new Error("stub.atomic callback must be synchronous");
       }
+      if (commandHandle > 0) {
+        if (encodedResult === null) {
+          encodedResult = await encodeRpcResult(value);
+        }
+        setMemoryBatchCommandResult(txn, encodedResult);
+      }
+      await finishMemoryTxn(txn, runtimeRequestId);
+      return { value, encodedResult };
+    } finally {
+      closeMemoryTxnBatch(txn);
+      current.memoryEntry = previousMemoryEntry;
+      current.memoryRequestId = previousMemoryRequestId;
+      current.socketRuntimeProvider = previousSocketRuntimeProvider;
+      current.transportRuntimeProvider = previousTransportRuntimeProvider;
     }
-    throw lastConflict ?? new Error("memory transaction exceeded retry limit");
   };
 
   const buildWakeEvent = (memoryCall, stub) => {
@@ -1128,18 +1127,33 @@
           throw new Error(`unsupported memory method: ${methodName}`);
         }
         const { descriptor, args } = decodeExecPayload(memoryCall.args);
-        const executable = instantiateExecutable(descriptor);
-        const value = await executeMemoryTransaction(
+        const command = await beginMemoryCommand(
           entry,
-          runtimeRequestId,
-          executable,
-          args,
+          descriptor.idempotencyKey,
         );
-        const encoded = await encodeRpcResult(value);
-        return new Response(encoded, {
-          status: 200,
-          headers: [["content-type", "application/octet-stream"]],
-        });
+        if (command.hit === true) {
+          return new Response(command.value ?? new Uint8Array(), {
+            status: 200,
+            headers: [["content-type", "application/octet-stream"]],
+          });
+        }
+        try {
+          const executable = instantiateExecutable(descriptor);
+          const transaction = await executeMemoryTransaction(
+            entry,
+            runtimeRequestId,
+            executable,
+            args,
+            { commandHandle: command.handle },
+          );
+          const encoded = transaction.encodedResult ?? await encodeRpcResult(transaction.value);
+          return new Response(encoded, {
+            status: 200,
+            headers: [["content-type", "application/octet-stream"]],
+          });
+        } finally {
+          closeMemoryCommand(command.handle);
+        }
       }
       if (
         kind === "message"
@@ -1201,46 +1215,55 @@
     });
   };
   const emitWaitUntilDone = async (timedOut) => {
-    if (requestContext.waitUntilDoneSent) {
+    await syncFrozenTime();
+    const emitted = callOp(
+      "op_emit_wait_until_done",
+      requestContext.completionHandle,
+    );
+    if (emitted === false) {
       return;
     }
-    requestContext.waitUntilDoneSent = true;
-    await syncFrozenTime();
-    callOp(
-      "op_emit_wait_until_done",
-      JSON.stringify({
-        request_id: requestId,
-        completion_token: completionToken,
-        wait_until_count: requestContext.waitUntilPromises.length,
-        timed_out: timedOut,
-      }),
+    if (requestContext.memoryRequestScopeHandle > 0) {
+      callOp("op_memory_request_scope_close", requestContext.memoryRequestScopeHandle);
+      requestContext.memoryRequestScopeHandle = 0;
+    }
+    if (requestContext.requestContextHandle > 0) {
+      callOp("op_request_context_close", requestContext.requestContextHandle);
+      requestContext.requestContextHandle = 0;
+    }
+  };
+
+  const storeResponseHeaders = (headers) => {
+    return Math.max(
+      0,
+      Math.trunc(Number(callOp(
+        "op_http_store_prepared_headers",
+        Array.isArray(headers) ? headers : [],
+      ) ?? 0) || 0),
     );
   };
 
-  const emitResponseStart = async (status, headers) => {
+  const emitResponseStart = async (status, headersHandle) => {
     await syncFrozenTime();
     callOp(
       "op_emit_response_start",
-      JSON.stringify({
-        request_id: requestId,
-        completion_token: completionToken,
-        status,
-        headers,
-      }),
+      requestContext.completionHandle,
+      status,
+      headersHandle,
     );
   };
 
   const emitResponseChunk = async (chunk) => {
     await syncFrozenTime();
-    const bytes = toUtf8Bytes(chunk);
-    callOp(
+    const bytes = toByteChunk(chunk);
+    const result = await callOp(
       "op_emit_response_chunk",
-      JSON.stringify({
-        request_id: requestId,
-        completion_token: completionToken,
-        chunk: Array.from(bytes),
-      }),
+      requestContext.completionHandle,
+      bytes,
     );
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "response stream chunk failed"));
+    }
     return bytes;
   };
 
@@ -1262,6 +1285,7 @@
   };
 
   function trackWaitUntil(promise) {
+    callOp("op_request_wait_until_register", requestContext.completionHandle);
     const tracked = Promise.resolve(promise).then(
       async (value) => {
         await syncFrozenTime();
@@ -1289,10 +1313,9 @@
   };
 
   asyncContext.run(requestContext, () => (async () => {
-    let restoreHostFetch = null;
     try {
       await syncFrozenTime();
-      restoreHostFetch = installHostFetch();
+      installHostFetch();
       const requestBody = hasRequestBodyStream
         ? createRequestBodyStream()
         : input.body?.length
@@ -1368,9 +1391,10 @@
           ? Number(response.status ?? 200)
           : response.status;
       const headers = Array.from(responseHeaders.entries());
-      const bodyBytes = [];
+      const bodyChunks = streamResponse ? null : [];
+      let bodyLength = 0;
       if (streamResponse) {
-        await emitResponseStart(status, headers);
+        await emitResponseStart(status, storeResponseHeaders(headers));
       }
       if (!isWebSocketAcceptResponse && response.body) {
         const reader = response.body.getReader();
@@ -1379,27 +1403,37 @@
           if (done) {
             break;
           }
-          const chunk = toUtf8Bytes(value);
+          const chunk = toByteChunk(value);
           if (chunk.length === 0) {
             continue;
           }
           if (streamResponse) {
-            const emitted = await emitResponseChunk(chunk);
-            appendBytes(bodyBytes, emitted);
+            await emitResponseChunk(chunk);
           } else {
-            appendBytes(bodyBytes, chunk);
+            bodyChunks.push(chunk);
+            bodyLength += chunk.byteLength;
           }
         }
       }
 
-      return {
+      const result = {
         status,
-        headers,
-        body: bodyBytes,
+        headersHandle: streamResponse ? 0 : storeResponseHeaders(headers),
+        bodyHandle: 0,
       };
+      if (!streamResponse) {
+        result.bodyHandle = callOp(
+          "op_http_store_prepared_body",
+          concatByteChunks(bodyChunks, bodyLength),
+        );
+      }
+      return result;
     } finally {
-      if (typeof restoreHostFetch === "function") {
-        restoreHostFetch();
+      if (requestContext.requestBodyStreamHandle > 0) {
+        try {
+          await callOp("op_request_body_cancel", requestContext.requestBodyStreamHandle);
+        } catch {
+        }
       }
       inflightRequests.delete(requestId);
     }
@@ -1407,14 +1441,11 @@
     .then(async (result) => {
       await settlePendingKvWriteScheduling();
       callOp(
-        "op_emit_completion",
-        JSON.stringify({
-          request_id: requestId,
-          completion_token: completionToken,
-          ok: true,
-          wait_until_count: requestContext.waitUntilPromises.length,
-          result,
-        }),
+        "op_emit_completion_ok",
+        requestContext.completionHandle,
+        Number(result.status ?? 200),
+        Math.max(0, Math.trunc(Number(result.headersHandle ?? 0) || 0)),
+        Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0)),
       );
 
       await emitWaitUntilDone(!(await waitForWaitUntils()));
@@ -1423,16 +1454,159 @@
       await settlePendingKvWriteScheduling();
       const message = String((error && (error.stack || error.message)) || error);
       callOp(
-        "op_emit_completion",
-        JSON.stringify({
-          request_id: requestId,
-          completion_token: completionToken,
-          ok: false,
-          wait_until_count: requestContext.waitUntilPromises.length,
-          error: message,
-        }),
+        "op_emit_completion_error",
+        requestContext.completionHandle,
+        message,
       );
 
       await emitWaitUntilDone(!(await waitForWaitUntils()));
     });
+};
+
+globalThis.__dd_execute_worker_handle = (requestHandle) => {
+  const handle = Number(requestHandle);
+  const descriptor = Deno.core.ops.op_request_invocation_descriptor(handle);
+  if (descriptor === null || descriptor === undefined) {
+    throw new Error(`Request handle ${requestHandle} is unavailable`);
+  }
+  const requestHeadersHandle = Math.max(
+    0,
+    Math.trunc(Number(descriptor.request_headers_handle ?? 0) || 0),
+  );
+  const requestBodyHandle = Math.max(
+    0,
+    Math.trunc(Number(descriptor.request_body_handle ?? 0) || 0),
+  );
+  const headers = Deno.core.ops.op_http_take_prepared_headers(requestHeadersHandle);
+  const body = Deno.core.ops.op_http_take_prepared_body(requestBodyHandle);
+  const payload = {
+    request_id: String(descriptor.request_id ?? ""),
+    request_context_handle: Math.max(
+      0,
+      Math.trunc(Number(descriptor.request_context_handle ?? 0) || 0),
+    ),
+    completion_handle: Math.max(
+      0,
+      Math.trunc(Number(descriptor.completion_handle ?? 0) || 0),
+    ),
+    memory_request_scope_handle: Math.max(
+      0,
+      Math.trunc(Number(descriptor.memory_request_scope_handle ?? 0) || 0),
+    ),
+    memory_call: descriptor.memory_call ?? null,
+    host_rpc_call: descriptor.host_rpc_call ?? null,
+    request_body_stream_handle: Math.max(
+      0,
+      Math.trunc(Number(descriptor.request_body_stream_handle ?? 0) || 0),
+    ),
+    stream_response: descriptor.stream_response === true,
+    method: String(descriptor.method ?? "GET"),
+    url: String(descriptor.url ?? ""),
+    headers: Array.isArray(headers) ? headers : [],
+    input_request_id: String(descriptor.input_request_id ?? ""),
+    body,
+  };
+  return globalThis.__dd_execute_worker(payload);
+};
+
+globalThis.__dd_install_worker_deployment_handle = (deploymentHandle) => {
+  const payload = Deno.core.ops.op_take_worker_deployment_config(Number(deploymentHandle));
+  if (payload === null || payload === undefined) {
+    throw new Error(`Worker deployment handle ${deploymentHandle} is unavailable`);
+  }
+  const normalizeBindingPairs = (input) => Object.freeze(
+    (Array.isArray(input) ? input : [])
+      .map((entry) => {
+        const envName = Array.isArray(entry)
+          ? String(entry[0] ?? "").trim()
+          : String(entry ?? "").trim();
+        const bindingName = Array.isArray(entry)
+          ? String(entry[1] ?? entry[0] ?? "").trim()
+          : envName;
+        return Object.freeze([envName, bindingName || envName]);
+      })
+      .filter(([envName]) => envName.length > 0),
+  );
+  const normalizeNames = (input) => Object.freeze(
+    (Array.isArray(input) ? input : [])
+      .map((entry) => String(entry ?? "").trim())
+      .filter((entry) => entry.length > 0),
+  );
+  const normalizeEnv = (input) => Object.freeze(
+    (Array.isArray(input) ? input : [])
+      .map((entry) => {
+        const envName = Array.isArray(entry)
+          ? String(entry[0] ?? "").trim()
+          : "";
+        return Object.freeze([envName, String(Array.isArray(entry) ? entry[1] ?? "" : "")]);
+      })
+      .filter(([envName]) => envName.length > 0),
+  );
+  const normalizeKvReadCacheConfig = (input) => {
+    const maxEntries = Math.max(
+      1,
+      Math.trunc(Number(input?.max_entries ?? 16384) || 16384),
+    );
+    const maxBytes = Math.max(
+      1024,
+      Math.trunc(Number(input?.max_bytes ?? 16 * 1024 * 1024) || (16 * 1024 * 1024)),
+    );
+    const hitTtlMs = Math.max(
+      1,
+      Math.trunc(Number(input?.hit_ttl_ms ?? 300_000) || 300_000),
+    );
+    const missTtlMs = Math.max(
+      1,
+      Math.trunc(Number(input?.miss_ttl_ms ?? 30_000) || 30_000),
+    );
+    return Object.freeze({
+      maxEntries,
+      maxBytes,
+      hitTtlMs,
+      missTtlMs,
+    });
+  };
+  globalThis.__dd_worker_deployment = Object.freeze({
+    worker_name: String(payload.worker_name ?? ""),
+    kv_bindings: normalizeBindingPairs(payload.kv_bindings),
+    kv_read_cache_config: normalizeKvReadCacheConfig(payload.kv_read_cache_config ?? null),
+    memory_bindings: normalizeNames(payload.memory_bindings),
+    dynamic_bindings: normalizeBindingPairs(payload.dynamic_bindings),
+    dynamic_rpc_bindings: normalizeBindingPairs(payload.dynamic_rpc_bindings),
+    dynamic_env: normalizeEnv(payload.dynamic_env),
+  });
+};
+
+globalThis.__dd_drain_dynamic_control_queue_handle = () => {
+  const drain = globalThis.__dd_drain_dynamic_control_queue;
+  if (typeof drain !== "function") {
+    return;
+  }
+  void Promise.resolve(drain()).catch(() => undefined);
+};
+
+globalThis.__dd_abort_worker_request = (requestId) => {
+  const inflightRequests = globalThis.__dd_inflight_requests;
+  const inflight = inflightRequests?.get(String(requestId));
+  if (inflight?.requestBodyStreamHandle > 0) {
+    try {
+      Deno.core.ops.op_request_body_cancel(inflight.requestBodyStreamHandle);
+    } catch {
+    }
+  }
+  if (inflight?.requestContextHandle > 0) {
+    try {
+      Deno.core.ops.op_request_context_cancel(inflight.requestContextHandle);
+    } catch {
+    }
+  }
+  if (inflight?.memoryRequestScopeHandle > 0) {
+    try {
+      Deno.core.ops.op_memory_request_scope_close(inflight.memoryRequestScopeHandle);
+    } catch {
+    }
+  }
+  if (inflight?.controller) {
+    inflight.controller.abort(new Error("Request aborted by caller"));
+  }
 };

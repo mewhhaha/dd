@@ -1,5 +1,8 @@
 use super::*;
 use tracing::{info, warn};
+
+const RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub min_isolates: usize,
@@ -10,6 +13,11 @@ pub struct RuntimeConfig {
     pub max_global_queued_requests: usize,
     pub max_global_queued_bytes: usize,
     pub max_queue_wait: Duration,
+    pub request_wall_timeout: Duration,
+    pub max_request_body_bytes: usize,
+    pub max_response_body_bytes: usize,
+    pub max_isolate_heap_bytes: usize,
+    pub isolate_startup_timeout: Duration,
     pub idle_ttl: Duration,
     pub scale_tick: Duration,
     pub queue_warn_thresholds: Vec<usize>,
@@ -38,6 +46,11 @@ impl Default for RuntimeConfig {
             max_global_queued_requests: 16 * 1024,
             max_global_queued_bytes: 64 * 1024 * 1024,
             max_queue_wait: Duration::from_secs(30),
+            request_wall_timeout: Duration::from_secs(30),
+            max_request_body_bytes: 64 * 1024 * 1024,
+            max_response_body_bytes: 64 * 1024 * 1024,
+            max_isolate_heap_bytes: 128 * 1024 * 1024,
+            isolate_startup_timeout: Duration::from_secs(5),
             idle_ttl: Duration::from_secs(30),
             scale_tick: Duration::from_secs(1),
             queue_warn_thresholds: vec![10, 100, 1000],
@@ -172,8 +185,6 @@ pub struct HostRpcProviderDebug {
 pub struct DynamicRuntimeDebugDump {
     pub handles: Vec<DynamicHandleDebug>,
     pub providers: Vec<HostRpcProviderDebug>,
-    pub snapshot_cache_entries: usize,
-    pub snapshot_cache_failures: usize,
 }
 
 #[derive(Debug)]
@@ -184,7 +195,7 @@ pub struct WorkerStreamOutput {
 }
 
 pub struct WorkerStreamBody {
-    receiver: mpsc::UnboundedReceiver<Result<Vec<u8>>>,
+    receiver: mpsc::Receiver<Result<Bytes>>,
     cancel_guard: Option<InvokeCancelGuard>,
 }
 
@@ -198,7 +209,7 @@ impl std::fmt::Debug for WorkerStreamBody {
 }
 
 impl WorkerStreamBody {
-    pub(super) fn new(receiver: mpsc::UnboundedReceiver<Result<Vec<u8>>>) -> Self {
+    pub(super) fn new(receiver: mpsc::Receiver<Result<Bytes>>) -> Self {
         Self {
             receiver,
             cancel_guard: None,
@@ -209,7 +220,7 @@ impl WorkerStreamBody {
         self.cancel_guard = Some(cancel_guard);
     }
 
-    pub async fn recv(&mut self) -> Option<Result<Vec<u8>>> {
+    pub async fn recv(&mut self) -> Option<Result<Bytes>> {
         let next = self.receiver.recv().await;
         if next.is_none() || matches!(next, Some(Err(_))) {
             self.disarm_cancel_guard();
@@ -246,12 +257,42 @@ pub struct DynamicDeployResult {
     pub env_placeholders: HashMap<String, String>,
 }
 
-pub type InvokeRequestBodyReceiver = mpsc::Receiver<std::result::Result<Vec<u8>, String>>;
+pub struct PublicRouteAssetResolution {
+    pub public_worker: bool,
+    pub asset: Option<AssetResponse>,
+}
+
+pub type InvokeRequestBodyReceiver = mpsc::Receiver<std::result::Result<Bytes, String>>;
+
+fn prepare_worker_deployment(
+    worker_name: String,
+    source: String,
+    config: DeployConfig,
+    assets: Vec<DeployAsset>,
+    asset_headers: Option<String>,
+) -> Result<PreparedWorkerDeployment> {
+    let worker_name = worker_name.trim().to_string();
+    if worker_name.is_empty() {
+        return Err(PlatformError::bad_request("Worker name must not be empty"));
+    }
+    let bindings = extract_bindings(&config)?;
+    let compiled_assets = Arc::new(compile_asset_bundle(&assets, asset_headers.as_deref())?);
+    Ok(PreparedWorkerDeployment {
+        worker_name,
+        source,
+        config,
+        assets,
+        asset_headers,
+        compiled_assets,
+        bindings,
+    })
+}
 
 #[derive(Clone)]
 pub struct RuntimeService {
     sender: mpsc::Sender<RuntimeCommand>,
-    cancel_sender: mpsc::UnboundedSender<RuntimeCommand>,
+    cancel_sender: mpsc::Sender<RuntimeCommand>,
+    asset_catalog: AssetCatalog,
     cache_store: CacheStore,
     storage: RuntimeStorageConfig,
 }
@@ -321,11 +362,13 @@ impl RuntimeService {
         )
         .await?;
         let (sender, receiver) = mpsc::channel(256);
-        let (cancel_sender, cancel_receiver) = mpsc::unbounded_channel();
+        let (cancel_sender, cancel_receiver) = mpsc::channel(RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY);
+        let asset_catalog = AssetCatalog::default();
         spawn_runtime_thread(
             receiver,
             cancel_receiver,
             cancel_sender.clone(),
+            asset_catalog.clone(),
             bootstrap_snapshot,
             kv_store,
             memory_store,
@@ -336,6 +379,7 @@ impl RuntimeService {
         let service = Self {
             sender,
             cancel_sender,
+            asset_catalog,
             cache_store,
             storage,
         };
@@ -561,14 +605,12 @@ impl RuntimeService {
         expires_at_ms: Option<i64>,
         enforce_temporary_transition: bool,
     ) -> Result<String> {
+        let prepared =
+            prepare_worker_deployment(worker_name, source, config, assets, asset_headers)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::Deploy {
-                worker_name,
-                source,
-                config,
-                assets,
-                asset_headers,
+                prepared,
                 persist,
                 temporary,
                 expires_at_ms,
@@ -748,8 +790,8 @@ impl RuntimeService {
         &self,
         worker_name: String,
         request: WorkerInvocation,
-        stream_sender: mpsc::UnboundedSender<Vec<u8>>,
-        datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+        stream_sender: mpsc::Sender<Vec<u8>>,
+        datagram_sender: mpsc::Sender<Vec<u8>>,
     ) -> Result<TransportOpen> {
         let session_id = Uuid::new_v4().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -960,30 +1002,92 @@ impl RuntimeService {
         reply_rx.await.ok().flatten()
     }
 
-    pub async fn resolve_asset(
+    pub fn worker_is_public(&self, worker_name: &str) -> bool {
+        self.asset_catalog
+            .get(worker_name)
+            .is_some_and(|entry| entry.public)
+    }
+
+    pub fn resolve_asset(
         &self,
-        worker_name: String,
-        method: String,
-        host: Option<String>,
-        path: String,
-        headers: Vec<(String, String)>,
+        worker_name: &str,
+        method: &str,
+        host: Option<&str>,
+        path: &str,
+        headers: &[(String, String)],
     ) -> Result<Option<AssetResponse>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::ResolveAsset {
-                worker_name,
+        self.resolve_asset_from_catalog(worker_name, method, host, path, headers, false)
+    }
+
+    pub fn resolve_public_asset(
+        &self,
+        worker_name: &str,
+        method: &str,
+        host: Option<&str>,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Result<Option<AssetResponse>> {
+        self.resolve_asset_from_catalog(worker_name, method, host, path, headers, true)
+    }
+
+    pub fn resolve_public_route_asset(
+        &self,
+        worker_name: &str,
+        method: &str,
+        host: Option<&str>,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Result<PublicRouteAssetResolution> {
+        let Some(entry) = self.asset_catalog.get(worker_name) else {
+            return Ok(PublicRouteAssetResolution {
+                public_worker: false,
+                asset: None,
+            });
+        };
+        if !entry.public {
+            return Ok(PublicRouteAssetResolution {
+                public_worker: false,
+                asset: None,
+            });
+        }
+        Ok(PublicRouteAssetResolution {
+            public_worker: true,
+            asset: resolve_asset(
+                &entry.assets,
+                AssetRequest {
+                    method,
+                    host,
+                    path,
+                    headers,
+                },
+            ),
+        })
+    }
+
+    fn resolve_asset_from_catalog(
+        &self,
+        worker_name: &str,
+        method: &str,
+        host: Option<&str>,
+        path: &str,
+        headers: &[(String, String)],
+        public_only: bool,
+    ) -> Result<Option<AssetResponse>> {
+        let Some(entry) = self.asset_catalog.get(worker_name) else {
+            return Ok(None);
+        };
+        if public_only && !entry.public {
+            return Ok(None);
+        }
+        Ok(resolve_asset(
+            &entry.assets,
+            AssetRequest {
                 method,
                 host,
                 path,
                 headers,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime asset channel closed"))?
+            },
+        ))
     }
 
     pub async fn debug_dump(&self, worker_name: String) -> Option<WorkerDebugDump> {

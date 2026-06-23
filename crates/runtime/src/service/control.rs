@@ -1,15 +1,11 @@
 use super::*;
 use tracing::warn;
 #[derive(Clone)]
-pub(crate) struct RuntimeFastCommandSender(pub mpsc::UnboundedSender<RuntimeCommand>);
+pub(crate) struct RuntimeFastCommandSender(pub mpsc::Sender<RuntimeCommand>);
 
 pub(crate) enum RuntimeCommand {
     Deploy {
-        worker_name: String,
-        source: String,
-        config: DeployConfig,
-        assets: Vec<DeployAsset>,
-        asset_headers: Option<String>,
+        prepared: PreparedWorkerDeployment,
         persist: bool,
         temporary: bool,
         expires_at_ms: Option<i64>,
@@ -61,14 +57,6 @@ pub(crate) enum RuntimeCommand {
     Stats {
         worker_name: String,
         reply: oneshot::Sender<Option<WorkerStats>>,
-    },
-    ResolveAsset {
-        worker_name: String,
-        method: String,
-        host: Option<String>,
-        path: String,
-        headers: Vec<(String, String)>,
-        reply: oneshot::Sender<Result<Option<AssetResponse>>>,
     },
     DebugDump {
         worker_name: String,
@@ -123,8 +111,8 @@ pub(crate) enum RuntimeCommand {
         worker_name: String,
         request: WorkerInvocation,
         session_id: String,
-        stream_sender: mpsc::UnboundedSender<Vec<u8>>,
-        datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+        stream_sender: mpsc::Sender<Vec<u8>>,
+        datagram_sender: mpsc::Sender<Vec<u8>>,
         reply: oneshot::Sender<Result<TransportOpen>>,
     },
     PushTransportStream {
@@ -176,12 +164,13 @@ pub(super) enum RuntimeEvent {
         worker_name: String,
         request_id: String,
         completion_token: String,
-        chunk: Vec<u8>,
+        chunk: Bytes,
+        reply: oneshot::Sender<Result<()>>,
     },
     CacheRevalidate {
         worker_name: String,
         generation: u64,
-        payload: String,
+        payload: CacheRevalidatePayload,
     },
     MemoryInvoke(MemoryInvokeEvent),
     MemorySocketSend(crate::ops::MemorySocketSendEvent),
@@ -193,8 +182,6 @@ pub(super) enum RuntimeEvent {
     },
     MemoryTransportSendStream(crate::ops::MemoryTransportSendStreamEvent),
     MemoryTransportSendDatagram(crate::ops::MemoryTransportSendDatagramEvent),
-    MemoryTransportRecvStream(crate::ops::MemoryTransportRecvStreamEvent),
-    MemoryTransportRecvDatagram(crate::ops::MemoryTransportRecvDatagramEvent),
     MemoryTransportClose(crate::ops::MemoryTransportCloseEvent),
     MemoryTransportConsumeClose {
         worker_name: String,
@@ -205,7 +192,6 @@ pub(super) enum RuntimeEvent {
     DynamicWorkerLookup(crate::ops::DynamicWorkerLookupEvent),
     DynamicWorkerList(crate::ops::DynamicWorkerListEvent),
     DynamicWorkerDelete(crate::ops::DynamicWorkerDeleteEvent),
-    DynamicWorkerInvoke(crate::ops::DynamicWorkerInvokeEvent),
     DynamicHostRpcInvoke(crate::ops::DynamicHostRpcInvokeEvent),
     DynamicReplyReady(crate::ops::DynamicPendingReplyDelivery),
     DynamicFetchReplyReady(crate::ops::DynamicPendingReplyDelivery),
@@ -217,6 +203,11 @@ pub(super) enum RuntimeEvent {
         result: Result<String>,
     },
     DynamicTimeoutDiagnostic(DynamicTimeoutDiagnostic),
+    IsolateReady {
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+    },
     IsolateFailed {
         worker_name: String,
         generation: u64,
@@ -232,8 +223,10 @@ impl WorkerManager {
         cache_store: CacheStore,
         config: RuntimeConfig,
         storage: RuntimeStorageConfig,
-        runtime_fast_sender: mpsc::UnboundedSender<RuntimeCommand>,
+        runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+        asset_catalog: AssetCatalog,
     ) -> Self {
+        let next_memory_entity_epoch = memory_store.owner_epoch_floor();
         Self {
             config,
             storage,
@@ -242,7 +235,10 @@ impl WorkerManager {
             kv_store,
             memory_store,
             cache_store,
+            asset_catalog,
             workers: HashMap::new(),
+            queue_counters: RuntimeQueueCounters::default(),
+            next_queue_expiry_at: None,
             pre_canceled: HashMap::new(),
             stream_registrations: HashMap::new(),
             revalidation_keys: HashSet::new(),
@@ -267,13 +263,12 @@ impl WorkerManager {
             host_rpc_providers: HashMap::new(),
             dynamic_profile: crate::ops::DynamicProfile::default(),
             validated_worker_sources: HashSet::new(),
-            dynamic_worker_snapshots: HashMap::new(),
-            dynamic_worker_snapshot_failures: HashSet::new(),
             runtime_batch_depth: 0,
             pending_dispatches: HashSet::new(),
             pending_cleanup_workers: HashSet::new(),
             next_generation: 1,
             next_isolate_id: 1,
+            next_memory_entity_epoch,
         }
     }
 
@@ -281,7 +276,7 @@ impl WorkerManager {
         self.runtime_batch_depth += 1;
     }
 
-    pub(super) fn finish_runtime_batch(&mut self, event_tx: &mpsc::UnboundedSender<RuntimeEvent>) {
+    pub(super) fn finish_runtime_batch(&mut self, event_tx: &RuntimeEventSender) {
         debug_assert!(self.runtime_batch_depth > 0);
         if self.runtime_batch_depth == 0 {
             return;
@@ -310,15 +305,11 @@ impl WorkerManager {
     pub(super) async fn handle_command(
         &mut self,
         command: RuntimeCommand,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) -> bool {
         match command {
             RuntimeCommand::Deploy {
-                worker_name,
-                source,
-                config,
-                assets,
-                asset_headers,
+                prepared,
                 persist,
                 temporary,
                 expires_at_ms,
@@ -327,11 +318,7 @@ impl WorkerManager {
             } => {
                 let result = self
                     .deploy(
-                        worker_name,
-                        source,
-                        config,
-                        assets,
-                        asset_headers,
+                        prepared,
                         persist,
                         temporary,
                         expires_at_ms,
@@ -623,23 +610,6 @@ impl WorkerManager {
                 let _ = reply.send(self.worker_stats(&worker_name));
                 true
             }
-            RuntimeCommand::ResolveAsset {
-                worker_name,
-                method,
-                host,
-                path,
-                headers,
-                reply,
-            } => {
-                let _ = reply.send(self.resolve_asset(
-                    &worker_name,
-                    &method,
-                    host.as_deref(),
-                    &path,
-                    &headers,
-                ));
-                true
-            }
             RuntimeCommand::DebugDump { worker_name, reply } => {
                 let _ = reply.send(self.worker_debug_dump(&worker_name));
                 true
@@ -683,7 +653,7 @@ impl WorkerManager {
     pub(super) async fn handle_event(
         &mut self,
         event: RuntimeEvent,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         match event {
             RuntimeEvent::RequestFinished {
@@ -704,7 +674,8 @@ impl WorkerManager {
                     wait_until_count,
                     result,
                     event_tx,
-                );
+                )
+                .await;
                 self.dispatch_pool(&worker_name, generation, event_tx);
                 self.cleanup_drained_generations_for(&worker_name);
             }
@@ -744,8 +715,17 @@ impl WorkerManager {
                 request_id,
                 completion_token,
                 chunk,
+                reply,
             } => {
-                self.handle_response_chunk(&worker_name, &request_id, &completion_token, chunk);
+                self.handle_response_chunk(
+                    &worker_name,
+                    &request_id,
+                    &completion_token,
+                    chunk,
+                    event_tx,
+                    reply,
+                )
+                .await;
             }
             RuntimeEvent::CacheRevalidate {
                 worker_name,
@@ -776,12 +756,6 @@ impl WorkerManager {
             RuntimeEvent::MemoryTransportSendDatagram(payload) => {
                 self.handle_memory_transport_send_datagram(payload, event_tx);
             }
-            RuntimeEvent::MemoryTransportRecvStream(payload) => {
-                self.handle_memory_transport_recv_stream(payload, event_tx);
-            }
-            RuntimeEvent::MemoryTransportRecvDatagram(payload) => {
-                self.handle_memory_transport_recv_datagram(payload, event_tx);
-            }
             RuntimeEvent::MemoryTransportClose(payload) => {
                 self.handle_memory_transport_close(payload, event_tx);
             }
@@ -803,10 +777,6 @@ impl WorkerManager {
             }
             RuntimeEvent::DynamicWorkerDelete(payload) => {
                 self.handle_dynamic_worker_delete(payload);
-            }
-            RuntimeEvent::DynamicWorkerInvoke(payload) => {
-                let runtime_fast_sender = self.runtime_fast_sender.clone();
-                self.handle_dynamic_worker_invoke(payload, &runtime_fast_sender, event_tx);
             }
             RuntimeEvent::DynamicHostRpcInvoke(payload) => {
                 self.handle_dynamic_host_rpc_invoke(payload, event_tx);
@@ -843,6 +813,14 @@ impl WorkerManager {
             RuntimeEvent::DynamicTimeoutDiagnostic(payload) => {
                 self.log_dynamic_timeout_diagnostic(payload);
             }
+            RuntimeEvent::IsolateReady {
+                worker_name,
+                generation,
+                isolate_id,
+            } => {
+                self.mark_isolate_ready(&worker_name, generation, isolate_id);
+                self.dispatch_pool(&worker_name, generation, event_tx);
+            }
             RuntimeEvent::IsolateFailed {
                 worker_name,
                 generation,
@@ -863,7 +841,7 @@ impl WorkerManager {
         frame: Vec<u8>,
         is_binary: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let Some((session_worker_name, generation, binding, key, handle)) =
             self.websocket_sessions.get(session_id).map(|session| {
@@ -931,7 +909,7 @@ impl WorkerManager {
         session_id: &str,
         close_code: u16,
         close_reason: String,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) -> Result<()> {
         let Some(existing) = self.websocket_sessions.get(session_id) else {
             return Err(PlatformError::not_found("websocket session not found"));
@@ -1152,7 +1130,7 @@ impl WorkerManager {
     fn handle_test_async_reply(
         &mut self,
         payload: crate::ops::TestAsyncReplyEvent,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let result = if payload.ok {
             Ok(payload.value)
@@ -1170,18 +1148,20 @@ impl WorkerManager {
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(payload.delay_ms)).await;
-            let _ = event_tx.send(RuntimeEvent::TestAsyncReplyComplete {
-                reply_id: payload.reply_id,
-                replies: payload.replies,
-                result,
-            });
+            let _ = event_tx
+                .send(RuntimeEvent::TestAsyncReplyComplete {
+                    reply_id: payload.reply_id,
+                    replies: payload.replies,
+                    result,
+                })
+                .await;
         });
     }
 
     fn handle_test_nested_targeted_invoke(
         &mut self,
         payload: crate::ops::TestNestedTargetedInvokeEvent,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let Some(pool) = self.get_pool_mut(&payload.worker_name, payload.generation) else {
             self.complete_test_async_reply(
@@ -1325,7 +1305,7 @@ impl WorkerManager {
         };
         let schedule = inbox.push_reply(payload);
         if schedule {
-            let _ = sender.send(IsolateCommand::DrainDynamicControl);
+            let _ = sender.try_send(IsolateCommand::DrainDynamicControl);
         }
     }
 
@@ -1338,7 +1318,7 @@ impl WorkerManager {
         method_name: String,
         args: Vec<u8>,
         reply: TargetedHostRpcReply,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) -> Result<()> {
         let provider_available = self
             .workers
@@ -1405,7 +1385,9 @@ impl WorkerManager {
                         reply_id,
                         crate::ops::DynamicPendingReplyPayload::HostRpc(result),
                     ) {
-                        let _ = event_tx.send(RuntimeEvent::DynamicReplyReady(delivery));
+                        let _ = event_tx
+                            .send(RuntimeEvent::DynamicReplyReady(delivery))
+                            .await;
                     }
                 }
                 TargetedHostRpcReply::Test {
@@ -1414,40 +1396,17 @@ impl WorkerManager {
                     success_value,
                 } => {
                     let string_result = result.map(|_| success_value);
-                    let _ = event_tx.send(RuntimeEvent::TestAsyncReplyComplete {
-                        reply_id,
-                        replies,
-                        result: string_result,
-                    });
+                    let _ = event_tx
+                        .send(RuntimeEvent::TestAsyncReplyComplete {
+                            reply_id,
+                            replies,
+                            result: string_result,
+                        })
+                        .await;
                 }
             }
         });
         Ok(())
-    }
-
-    fn resolve_asset(
-        &self,
-        worker_name: &str,
-        method: &str,
-        host: Option<&str>,
-        path: &str,
-        headers: &[(String, String)],
-    ) -> Result<Option<AssetResponse>> {
-        let Some(entry) = self.workers.get(worker_name) else {
-            return Ok(None);
-        };
-        let Some(pool) = entry.pools.get(&entry.current_generation) else {
-            return Ok(None);
-        };
-        Ok(resolve_asset(
-            &pool.assets,
-            AssetRequest {
-                method,
-                host,
-                path,
-                headers,
-            },
-        ))
     }
 
     pub(super) fn get_pool_mut(
@@ -1466,10 +1425,19 @@ impl WorkerManager {
             self.reap_owned_sessions(&worker_name, None, None);
         }
         let mut clear_request_ids = Vec::new();
-        for entry in self.workers.values_mut() {
+        let mut queued_pending = Vec::new();
+        let mut dequeued_count = 0usize;
+        let mut dequeued_bytes = 0usize;
+        for (worker_name, entry) in &mut self.workers {
             for pool in entry.pools.values_mut() {
+                while let Some(pending) = pool.queue.pop_front() {
+                    dequeued_count = dequeued_count.saturating_add(1);
+                    dequeued_bytes = dequeued_bytes.saturating_add(pending.queued_bytes);
+                    queued_pending.push((worker_name.clone(), pending));
+                }
+                pool.clear_isolate_indices();
                 for isolate in pool.isolates.drain(..) {
-                    let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                    let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending
@@ -1479,6 +1447,14 @@ impl WorkerManager {
                 }
             }
         }
+        self.account_dequeued_many(dequeued_count, dequeued_bytes);
+        for (worker_name, pending) in queued_pending {
+            self.reject_pending_invoke(
+                &worker_name,
+                pending,
+                PlatformError::internal("runtime shutting down"),
+            );
+        }
         for request_id in clear_request_ids {
             self.clear_revalidation_for_request(&request_id);
         }
@@ -1487,7 +1463,7 @@ impl WorkerManager {
             if let Some(ready) = registration.ready.take() {
                 let _ = ready.send(Err(error.clone()));
             } else {
-                let _ = registration.body_sender.send(Err(error));
+                let _ = registration.body_sender.try_send(Err(error));
             }
         }
         for (_, waiter) in std::mem::take(&mut self.websocket_open_waiters) {

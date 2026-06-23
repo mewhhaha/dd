@@ -342,6 +342,21 @@ function activeRuntimeRequestId() {
     : "";
 }
 
+function activeRuntimeRequestContextHandle() {
+  return typeof globalThis.__dd_get_runtime_request_context_handle === "function"
+    ? Math.max(
+      0,
+      Math.trunc(Number(globalThis.__dd_get_runtime_request_context_handle() ?? 0) || 0),
+    )
+    : 0;
+}
+
+function activeCacheBypassStale() {
+  return typeof globalThis.__dd_get_cache_bypass_stale === "function"
+    ? Boolean(globalThis.__dd_get_cache_bypass_stale())
+    : false;
+}
+
 class Cache {
   constructor(name = "default") {
     this.name = String(name || "default");
@@ -351,16 +366,18 @@ class Cache {
     const _ = options;
     const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
     const requestHeaders = Array.from(normalizedRequest.headers.entries());
+    const requestHeadersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      requestHeaders,
+    );
     const result = await runtimeOp(
       "op_cache_match",
-      JSON.stringify({
-        request_id: activeRuntimeRequestId(),
-        cache_name: this.name,
-        method: normalizedRequest.method,
-        url: normalizedRequest.url,
-        headers: requestHeaders,
-        bypass_stale: Boolean(globalThis.__dd_cache_bypass_stale),
-      }),
+      activeRuntimeRequestContextHandle(),
+      this.name,
+      normalizedRequest.method,
+      normalizedRequest.url,
+      Number(requestHeadersHandle ?? 0),
+      activeCacheBypassStale(),
     );
     await syncFrozenTimeBoundary();
 
@@ -372,21 +389,31 @@ class Cache {
     }
 
     if (result.should_revalidate === true) {
+      const revalidateHeadersHandle = runtimeOp(
+        "op_http_store_prepared_headers",
+        requestHeaders,
+      );
       runtimeOp(
         "op_emit_cache_revalidate",
-        JSON.stringify({
-          cache_name: this.name,
-          method: normalizedRequest.method,
-          url: normalizedRequest.url,
-          headers: requestHeaders,
-        }),
+        this.name,
+        normalizedRequest.method,
+        normalizedRequest.url,
+        Number(revalidateHeadersHandle ?? 0),
       );
       await syncFrozenTimeBoundary();
     }
 
-    return new ResponseCtor(new Uint8Array(result.body ?? []), {
+    const body = runtimeOp(
+      "op_http_take_prepared_body",
+      Number(result.body_handle ?? 0),
+    );
+    const headers = runtimeOp(
+      "op_http_take_prepared_headers",
+      Number(result.headers_handle ?? 0),
+    );
+    return new ResponseCtor(body, {
       status: Number(result.status ?? 200),
-      headers: Array.isArray(result.headers) ? result.headers : [],
+      headers: Array.isArray(headers) ? headers : [],
     });
   }
 
@@ -395,19 +422,28 @@ class Cache {
     if (!(response instanceof ResponseCtor) && typeof response?.arrayBuffer !== "function") {
       throw new TypeError("cache.put expects a Response");
     }
-    const body = Array.from(new Uint8Array(await response.arrayBuffer()));
+    const bodyHandle = runtimeOp(
+      "op_http_store_prepared_body",
+      new Uint8Array(await response.arrayBuffer()),
+    );
+    const requestHeadersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      Array.from(normalizedRequest.headers.entries()),
+    );
+    const responseHeadersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      Array.from(response.headers.entries()),
+    );
     const result = await runtimeOp(
       "op_cache_put",
-      JSON.stringify({
-        request_id: activeRuntimeRequestId(),
-        cache_name: this.name,
-        method: normalizedRequest.method,
-        url: normalizedRequest.url,
-        request_headers: Array.from(normalizedRequest.headers.entries()),
-        response_status: response.status,
-        response_headers: Array.from(response.headers.entries()),
-        response_body: body,
-      }),
+      activeRuntimeRequestContextHandle(),
+      this.name,
+      normalizedRequest.method,
+      normalizedRequest.url,
+      Number(requestHeadersHandle ?? 0),
+      Number(response.status ?? 200),
+      Number(responseHeadersHandle ?? 0),
+      Number(bodyHandle ?? 0),
     );
     await syncFrozenTimeBoundary();
     if (result && typeof result === "object" && result.ok === false) {
@@ -418,15 +454,17 @@ class Cache {
   async delete(request, options = {}) {
     const _ = options;
     const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
+    const headersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      Array.from(normalizedRequest.headers.entries()),
+    );
     const result = await runtimeOp(
       "op_cache_delete",
-      JSON.stringify({
-        request_id: activeRuntimeRequestId(),
-        cache_name: this.name,
-        method: normalizedRequest.method,
-        url: normalizedRequest.url,
-        headers: Array.from(normalizedRequest.headers.entries()),
-      }),
+      activeRuntimeRequestContextHandle(),
+      this.name,
+      normalizedRequest.method,
+      normalizedRequest.url,
+      Number(headersHandle ?? 0),
     );
     await syncFrozenTimeBoundary();
     if (result && typeof result === "object" && result.ok === false) {

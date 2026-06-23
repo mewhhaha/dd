@@ -77,7 +77,7 @@
         url: String(value.url || ""),
         method: String(value.method || "GET"),
         headers: Array.from(value.headers.entries()),
-        body: Array.from(new Uint8Array(await value.arrayBuffer())),
+        body: new Uint8Array(await value.arrayBuffer()),
       };
     }
     if (value instanceof Response) {
@@ -85,7 +85,7 @@
         __dd_rpc_type: "response",
         status: Number(value.status || 200),
         headers: Array.from(value.headers.entries()),
-        body: Array.from(new Uint8Array(await value.arrayBuffer())),
+        body: new Uint8Array(await value.arrayBuffer()),
       };
     }
     if (Array.isArray(value)) {
@@ -206,19 +206,88 @@
   const INTERNAL_TRANSPORT_KEY_HEADER = "x-dd-transport-memory-key";
   const INTERNAL_TRANSPORT_METHOD_HEADER = "x-dd-transport-method";
 
+  const MEMORY_RUNTIME_EFFECT_VERSION = 1;
+
+  const writeMemoryEffectU16 = (target, offset, value) => {
+    const normalized = Math.max(0, Math.min(0xffff, Math.trunc(Number(value ?? 0) || 0)));
+    target[offset] = (normalized >>> 8) & 0xff;
+    target[offset + 1] = normalized & 0xff;
+    return offset + 2;
+  };
+
+  const writeMemoryEffectU32 = (target, offset, value) => {
+    const normalized = Math.trunc(Number(value ?? 0) || 0);
+    if (!Number.isFinite(normalized) || normalized < 0 || normalized > 0xffffffff) {
+      throw new Error("memory runtime effect field is too large");
+    }
+    target[offset] = (normalized >>> 24) & 0xff;
+    target[offset + 1] = (normalized >>> 16) & 0xff;
+    target[offset + 2] = (normalized >>> 8) & 0xff;
+    target[offset + 3] = normalized & 0xff;
+    return offset + 4;
+  };
+
+  const writeMemoryEffectBytes = (target, offset, value) => {
+    const bytes = toArrayBytes(value);
+    offset = writeMemoryEffectU32(target, offset, bytes.byteLength);
+    target.set(bytes, offset);
+    return offset + bytes.byteLength;
+  };
+
+  const memoryEffectStringBytes = (value) => toUtf8Bytes(String(value ?? ""));
+
+  const encodeMemorySocketSendEffect = (handle, payload) => {
+    const handleBytes = memoryEffectStringBytes(handle);
+    const messageBytes = toArrayBytes(payload.value);
+    const out = new Uint8Array(10 + handleBytes.byteLength + messageBytes.byteLength);
+    let offset = 0;
+    out[offset] = MEMORY_RUNTIME_EFFECT_VERSION;
+    offset += 1;
+    out[offset] = payload.kind === "binary" ? 0 : 1;
+    offset += 1;
+    offset = writeMemoryEffectBytes(out, offset, handleBytes);
+    writeMemoryEffectBytes(out, offset, messageBytes);
+    return out;
+  };
+
+  const encodeMemoryCloseEffect = (handle, code, reason) => {
+    const handleBytes = memoryEffectStringBytes(handle);
+    const reasonBytes = memoryEffectStringBytes(reason);
+    const out = new Uint8Array(11 + handleBytes.byteLength + reasonBytes.byteLength);
+    let offset = 0;
+    out[offset] = MEMORY_RUNTIME_EFFECT_VERSION;
+    offset += 1;
+    offset = writeMemoryEffectU16(out, offset, code);
+    offset = writeMemoryEffectBytes(out, offset, handleBytes);
+    writeMemoryEffectBytes(out, offset, reasonBytes);
+    return out;
+  };
+
+  const encodeMemoryTransportDataEffect = (handle, payload) => {
+    const handleBytes = memoryEffectStringBytes(handle);
+    const bodyBytes = toArrayBytes(payload);
+    const out = new Uint8Array(9 + handleBytes.byteLength + bodyBytes.byteLength);
+    let offset = 0;
+    out[offset] = MEMORY_RUNTIME_EFFECT_VERSION;
+    offset += 1;
+    offset = writeMemoryEffectBytes(out, offset, handleBytes);
+    writeMemoryEffectBytes(out, offset, bodyBytes);
+    return out;
+  };
+
   const encodeSocketSendPayload = (value, kind) => {
     if (kind != null) {
       const normalizedKind = String(kind).toLowerCase();
       if (normalizedKind === "text") {
         return {
           kind: "text",
-          value: Array.from(toUtf8Bytes(String(value))),
+          value: toUtf8Bytes(String(value)),
         };
       }
       if (normalizedKind === "binary") {
         return {
           kind: "binary",
-          value: Array.from(toArrayBytes(value)),
+          value: toArrayBytes(value),
         };
       }
       throw new Error(`WebSocket(handle).send unsupported kind: ${kind}`);
@@ -226,12 +295,12 @@
     if (isBinaryLike(value)) {
       return {
         kind: "binary",
-        value: Array.from(toArrayBytes(value)),
+        value: toArrayBytes(value),
       };
     }
     return {
       kind: "text",
-      value: Array.from(toUtf8Bytes(String(value ?? ""))),
+      value: toUtf8Bytes(String(value ?? "")),
     };
   };
 
@@ -248,12 +317,20 @@
     };
   };
 
+  const takeMemoryBytes = (record) => {
+    const handle = Math.max(0, Math.trunc(Number(record?.value_handle ?? 0) || 0));
+    if (handle > 0) {
+      return callOp("op_memory_bytes_take", activeRequestContextHandle(), handle);
+    }
+    return toArrayBytes(record?.value ?? []);
+  };
+
   const decodeMemoryStorageValue = (record) => {
     if (!record) {
       return null;
     }
     const encoding = String(record.encoding ?? "utf8");
-    const bytes = toArrayBytes(record.value ?? []);
+    const bytes = takeMemoryBytes(record);
     if (encoding === "utf8") {
       return Deno.core.decode(bytes);
     }
@@ -278,11 +355,6 @@
         freshnessCheckedVersion: -1,
         freshnessCheckedAtMs: 0,
         stale: false,
-        pendingMutations: [],
-        flushRunning: false,
-        flushTail: Promise.resolve(),
-        pendingSubmissionCount: 0,
-        pendingSubmissionPromises: [],
         failedError: null,
         outputGate: Promise.resolve(),
       };
@@ -300,59 +372,19 @@
     }
     return {
       key: String(record.key ?? ""),
-      value: toArrayBytes(record.value ?? []),
+      value: takeMemoryBytes(record),
       encoding: String(record.encoding ?? "utf8"),
       version: Number(record.version ?? -1),
       deleted: record.deleted === true,
     };
   };
 
-  const createMemoryTxn = (entry) => ({
+  const createMemoryTxn = (entry, options = undefined) => ({
     entry,
-    reads: new Map(),
-    writes: new Map(),
-    deferred: [],
-    listGateVersion: null,
-    stagedVersionSeed: null,
-    accepted: false,
-    sideEffects: false,
-    committed: false,
-    committedVersion: null,
+    batchHandle: beginMemoryBatch(entry, {
+      commandHandle: Math.max(0, Math.trunc(Number(options?.commandHandle ?? 0) || 0)),
+    }),
   });
-
-  const memoryTxnIsSnapshotOnly = (txn) => !!txn
-    && txn.reads.size === 0
-    && txn.writes.size === 0
-    && txn.deferred.length === 0
-    && txn.listGateVersion == null
-    && txn.accepted !== true
-    && txn.sideEffects !== true;
-
-  const memoryTxnIsReadOnly = (txn) => !!txn
-    && txn.writes.size === 0
-    && txn.deferred.length === 0
-    && txn.accepted !== true
-    && txn.sideEffects !== true;
-
-  const memoryTxnIsBlindWrite = (txn) => !!txn
-    && txn.writes.size > 0
-    && txn.reads.size === 0
-    && txn.deferred.length === 0
-    && txn.listGateVersion == null
-    && txn.accepted !== true
-    && txn.sideEffects !== true;
-
-  class MemoryHydrationNeeded extends Error {
-    constructor(mode, keys = []) {
-      super(mode === "full" ? "memory hydration requires full snapshot" : "memory hydration requires keys");
-      this.name = "MemoryHydrationNeeded";
-      this.__dd_memory_hydration_needed = true;
-      this.mode = mode;
-      this.keys = Array.isArray(keys)
-        ? keys.map((value) => String(value)).filter((value) => value.length > 0)
-        : [];
-    }
-  }
 
   const mergeMemorySnapshotEntries = (storageState, entries, maxVersion, mode, requestedKeys = []) => {
     if (mode === "full") {
@@ -369,7 +401,7 @@
       storageState.loadedKeys.add(key);
       storageState.mirror.set(key, {
         key,
-        value: toArrayBytes(entryValue?.value ?? []),
+        value: takeMemoryBytes(entryValue),
         encoding: String(entryValue?.encoding ?? "utf8"),
         version: Number(entryValue?.version ?? -1),
         deleted: entryValue?.deleted === true,
@@ -441,50 +473,57 @@
 
   const memoryTxnReadRecord = (txn, key) => {
     const normalizedKey = String(key);
-    if (txn?.writes?.has(normalizedKey)) {
-      return txn.writes.get(normalizedKey);
+    const staged = memoryTxnMutation(txn, normalizedKey);
+    if (staged) {
+      return staged;
     }
     const storageState = ensureMemoryStorageState(txn.entry);
     return storageState.mirror.get(normalizedKey) ?? null;
   };
 
-  const memoryTxnTrackRead = (txn, key, record, allowConcurrency) => {
-    if (!txn || allowConcurrency === true) {
-      return;
+  const memoryTxnMutation = (txn, key) => {
+    if (!txn) {
+      return null;
     }
-    const normalizedKey = String(key);
-    if (txn.reads.has(normalizedKey)) {
-      return;
+    const result = callOp("op_memory_batch_get_mutation", txn.batchHandle, String(key));
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory batch mutation lookup failed"));
     }
-    if (txn.writes.has(normalizedKey)) {
-      return;
-    }
-    txn.reads.set(normalizedKey, memoryRecordVersion(record));
+    return result.record == null ? null : cloneMemoryRecord(result.record);
   };
 
-  const memoryTxnNextVersion = (txn) => {
+  const memoryTxnListOverlay = (txn, prefix) => {
     if (!txn) {
-      throw new Error("transaction is required");
+      return {
+        entries: [],
+        mutation_count: 0,
+      };
     }
-    if (!Number.isFinite(Number(txn.stagedVersionSeed))) {
-      const storageState = ensureMemoryStorageState(txn.entry);
-      txn.stagedVersionSeed = Number(storageState.committedVersion ?? -1) + 1;
+    const result = callOp("op_memory_batch_list_overlay", txn.batchHandle, String(prefix ?? ""));
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory batch list overlay failed"));
     }
-    const version = Number(txn.stagedVersionSeed);
-    txn.stagedVersionSeed = version + 1;
-    return version;
+    return {
+      entries: Array.isArray(result.entries)
+        ? result.entries.map((entryValue) => cloneMemoryRecord(entryValue))
+        : [],
+      mutation_count: Math.max(0, Math.trunc(Number(result.mutation_count ?? 0) || 0)),
+    };
   };
 
   const closeMemoryResourcesOnFailure = async (entry, runtimeRequestId) => {
     const socketHandles = Array.from(entry.openSocketHandles ?? []);
     for (const handle of socketHandles) {
       try {
-        const result = await callOp("op_memory_socket_close", {
-          request_id: runtimeRequestId,
+        const result = await callOp(
+          "op_memory_socket_close",
+          memoryScopedScopeHandle(entry),
           handle,
-          code: 1011,
-          reason: "memory storage flush failed",
-        });
+          entry.binding,
+          entry.memoryKey,
+          1011,
+          "memory storage flush failed",
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           console.warn(String(result.error ?? "memory socket close failed"));
@@ -502,12 +541,12 @@
             "op_memory_transport_close",
             "op_memory_transport_terminate",
           ],
-          {
-            request_id: runtimeRequestId,
-            handle,
-            code: 1011,
-          reason: "memory storage flush failed",
-          },
+          memoryScopedScopeHandle(entry),
+          handle,
+          entry.binding,
+          entry.memoryKey,
+          1011,
+          "memory storage flush failed",
         );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
@@ -533,147 +572,12 @@
     throw failure;
   };
 
-  const handleMemoryDirectWriteFailure = (entry, error) => {
-    const storageState = ensureMemoryStorageState(entry);
-    console.warn(String(error?.message ?? error ?? "memory direct write failed"));
-    invalidateMemorySnapshot(entry);
-    storageState.freshnessCheckedRequestId = "";
-  };
-
-  const waitForMemoryDirectSubmission = async (entry, submissionId) => {
-    const storageState = ensureMemoryStorageState(entry);
-    try {
-      let result = null;
-      for (;;) {
-        result = await callOp("op_memory_state_await_submission", {
-          submission_id: Number(submissionId),
-        });
-        await syncFrozenTime();
-        if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "memory direct write submission failed"));
-        }
-        if (result.pending !== true) {
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
-      storageState.committedVersion = Math.max(
-        Number(storageState.committedVersion ?? -1),
-        Number(result.max_version ?? -1),
-      );
-      storageState.nextVersion = Math.max(
-        Number(storageState.nextVersion ?? 0),
-        Number(storageState.committedVersion ?? -1) + 1,
-      );
-      if (storageState.pendingSubmissionCount <= 1) {
-        storageState.freshnessCheckedVersion = Number(storageState.committedVersion ?? -1);
-        storageState.freshnessCheckedAtMs = performance.now();
-        storageState.stale = false;
-      }
-      return Number(result.max_version ?? -1);
-    } catch (error) {
-      handleMemoryDirectWriteFailure(entry, error);
-      throw error;
-    } finally {
-      storageState.pendingSubmissionCount = Math.max(
-        0,
-        Number(storageState.pendingSubmissionCount ?? 0) - 1,
-      );
-    }
-  };
-
-  const flushMemoryStorage = (entry, runtimeRequestId) => {
-    const storageState = ensureMemoryStorageState(entry);
-    if (storageState.flushRunning) {
-      return storageState.flushTail;
-    }
-    storageState.flushRunning = true;
-    storageState.flushTail = (async () => {
-      while (storageState.pendingMutations.length > 0) {
-        const mutations = storageState.pendingMutations.splice(0, storageState.pendingMutations.length);
-        const result = await callOp(
-          "op_memory_state_enqueue_batch",
-          {
-            request_id: runtimeRequestId,
-            binding: entry.binding,
-            key: entry.memoryKey,
-            mutations: mutations.map((mutation) => ({
-              key: mutation.key,
-              value: Array.from(mutation.value),
-              encoding: mutation.encoding,
-              deleted: mutation.deleted,
-            })),
-          },
-        );
-        await syncFrozenTime();
-        if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "memory storage batch flush failed"));
-        }
-        storageState.pendingSubmissionCount += 1;
-        const submission = waitForMemoryDirectSubmission(entry, Number(result.submission_id ?? 0));
-        storageState.pendingSubmissionPromises.push(submission);
-        submission.finally(() => {
-          const index = storageState.pendingSubmissionPromises.indexOf(submission);
-          if (index >= 0) {
-            storageState.pendingSubmissionPromises.splice(index, 1);
-          }
-        }).catch(() => {});
-      }
-    })()
-      .catch((error) => {
-        handleMemoryDirectWriteFailure(entry, error);
-        throw error;
-      })
-      .finally(() => {
-        storageState.flushRunning = false;
-      });
-    return storageState.flushTail;
-  };
-
-  const queueMemoryMutation = (entry, runtimeRequestId, mutation) => {
-    const storageState = ensureMemoryStorageState(entry);
-    if (storageState.failedError) {
-      throw storageState.failedError;
-    }
-    storageState.pendingMutations.push(mutation);
-  };
-
-  const ensureMemoryStorageQueued = async (entry, runtimeRequestId) => {
-    const storageState = ensureMemoryStorageState(entry);
-    if (storageState.failedError) {
-      throw storageState.failedError;
-    }
-    if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
-      await flushMemoryStorage(entry, runtimeRequestId);
-    }
-    if (storageState.pendingSubmissionPromises.length > 0) {
-      await Promise.all(Array.from(storageState.pendingSubmissionPromises));
-    }
-    if (storageState.failedError) {
-      throw storageState.failedError;
-    }
-  };
-
-  const waitForMemoryFlush = async (entry, runtimeRequestId) => {
-    const storageState = ensureMemoryStorageState(entry);
-    if (storageState.failedError) {
-      throw storageState.failedError;
-    }
-    if (storageState.flushRunning || storageState.pendingMutations.length > 0) {
-      await flushMemoryStorage(entry, runtimeRequestId);
-    }
-    if (storageState.pendingSubmissionPromises.length > 0) {
-      await Promise.all(Array.from(storageState.pendingSubmissionPromises));
-    }
-    if (storageState.failedError) {
-      throw storageState.failedError;
-    }
-  };
-
   const gateMemoryOutput = (entry, runtimeRequestId, callback) => {
     const storageState = ensureMemoryStorageState(entry);
     const run = async () => {
-      await waitForMemoryFlush(entry, runtimeRequestId);
+      if (storageState.failedError) {
+        throw storageState.failedError;
+      }
       return await callback();
     };
     const gated = storageState.outputGate.then(run, run);
@@ -695,12 +599,14 @@
       return storageState;
     }
     const started = performance.now();
-    const result = await callOp("op_memory_state_get", {
-      request_id: runtimeRequestId,
-      binding: entry.binding,
-      key: entry.memoryKey,
-      item_key: normalizedKey,
-    });
+    const result = await callOp(
+      "op_memory_state_get",
+      activeRequestContextHandle(),
+      memoryScopedScopeHandle(entry),
+      entry.binding,
+      entry.memoryKey,
+      normalizedKey,
+    );
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory storage point read failed"));
@@ -727,11 +633,14 @@
     if (!storageState.hydrating) {
       storageState.hydrating = (async () => {
         const started = performance.now();
-        const result = await callOp("op_memory_state_snapshot", {
-          request_id: runtimeRequestId,
-          binding: entry.binding,
-          key: entry.memoryKey,
-        });
+        const result = await callOp(
+          "op_memory_state_snapshot",
+          activeRequestContextHandle(),
+          memoryScopedScopeHandle(entry),
+          entry.binding,
+          entry.memoryKey,
+          [],
+        );
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
           throw new Error(String(result?.error ?? "memory storage snapshot failed"));
@@ -775,12 +684,14 @@
       return ensureMemoryStoragePointHydrated(entry, runtimeRequestId, pendingKeys[0], { force });
     }
     const started = performance.now();
-    const result = await callOp("op_memory_state_snapshot", {
-      request_id: runtimeRequestId,
-      binding: entry.binding,
-      key: entry.memoryKey,
-      keys: pendingKeys,
-    });
+    const result = await callOp(
+      "op_memory_state_snapshot",
+      activeRequestContextHandle(),
+      memoryScopedScopeHandle(entry),
+      entry.binding,
+      entry.memoryKey,
+      pendingKeys,
+    );
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory storage point snapshot failed"));
@@ -800,12 +711,23 @@
   };
 
   const stageMemoryTxnWrite = (txn, record) => {
-    txn.writes.set(String(record.key ?? ""), cloneMemoryRecord(record));
+    const staged = addMemoryBatchMutation(txn, record);
+    if (!staged) {
+      throw new Error("memory batch mutation did not return a staged record");
+    }
+    return staged;
   };
 
-  const refreshMemoryEntrySnapshot = async (entry, runtimeRequestId) => {
-    invalidateMemorySnapshot(entry);
-    await ensureMemoryStorageHydrated(entry, runtimeRequestId, { force: true });
+  const stageMemoryTxnEffect = (txn, kind, payload) => {
+    requireMemoryBatchOp(
+      callOp(
+        "op_memory_batch_effect",
+        txn.batchHandle,
+        kind,
+        putMemoryBytes(payload),
+      ),
+      "effect",
+    );
   };
 
   const memorySnapshotTtlExpired = (storageState) => (
@@ -815,20 +737,6 @@
   const ensureMemoryDirectReadReady = async (entry, runtimeRequestId, key) => {
     const normalizedKey = String(key ?? "");
     const storageState = ensureMemoryStorageState(entry);
-    if (
-      (
-        storageState.pendingMutations.length > 0
-        || storageState.flushRunning
-        || Number(storageState.pendingSubmissionCount ?? 0) > 0
-      )
-      && (
-        storageState.fullSnapshotLoaded
-        || storageState.loadedKeys.has(normalizedKey)
-        || storageState.mirror.has(normalizedKey)
-      )
-    ) {
-      return storageState;
-    }
     if (
       (storageState.fullSnapshotLoaded || storageState.loadedKeys.has(normalizedKey))
       && storageState.stale !== true
@@ -848,97 +756,139 @@
     return storageState;
   };
 
-  const commitMemoryTxn = async (txn, runtimeRequestId) => {
+  const beginMemoryCommand = async (entry, idempotencyKey) => {
+    const normalizedKey = String(idempotencyKey ?? "").trim();
+    if (!normalizedKey) {
+      return { handle: 0, hit: false, value: null };
+    }
+    const result = await callOp(
+      "op_memory_command_begin",
+      activeRequestContextHandle(),
+      memoryScopedScopeHandle(entry),
+      entry.binding,
+      entry.memoryKey,
+      normalizedKey,
+    );
+    await syncFrozenTime();
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory command begin failed"));
+    }
+    return {
+      handle: Math.max(0, Math.trunc(Number(result.handle ?? 0) || 0)),
+      hit: result.hit === true,
+      value: result.hit === true ? takeMemoryBytes(result) : null,
+    };
+  };
+
+  const closeMemoryCommand = (handle) => {
+    const normalizedHandle = Math.max(0, Math.trunc(Number(handle ?? 0) || 0));
+    if (normalizedHandle > 0) {
+      callOp("op_memory_command_close", normalizedHandle);
+    }
+  };
+
+  const putMemoryBytes = (value) => {
+    const bytes = toArrayBytes(value);
+    if (bytes.byteLength === 0) {
+      return 0;
+    }
+    const result = callOp("op_memory_bytes_put", activeRequestContextHandle(), bytes);
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory byte handle put failed"));
+    }
+    return Math.max(0, Math.trunc(Number(result.handle ?? 0) || 0));
+  };
+
+  const beginMemoryBatch = (entry, options = undefined) => {
+    const result = callOp(
+      "op_memory_batch_begin",
+      activeRequestContextHandle(),
+      memoryScopedScopeHandle(entry),
+      entry.binding,
+      entry.memoryKey,
+      Math.max(0, Math.trunc(Number(options?.commandHandle ?? 0) || 0)),
+    );
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory batch begin failed"));
+    }
+    return Math.max(0, Math.trunc(Number(result.handle ?? 0) || 0));
+  };
+
+  const closeMemoryBatch = (handle) => {
+    const normalizedHandle = Math.max(0, Math.trunc(Number(handle ?? 0) || 0));
+    if (normalizedHandle > 0) {
+      callOp("op_memory_batch_close", normalizedHandle);
+    }
+  };
+
+  const closeMemoryTxnBatch = (txn) => {
+    if (txn) {
+      closeMemoryBatch(txn.batchHandle);
+    }
+  };
+
+  const requireMemoryBatchOp = (ok, operation) => {
+    if (ok !== true) {
+      throw new Error(`memory batch ${operation} failed`);
+    }
+  };
+
+  const markMemoryBatchAccepted = (txn) => {
+    if (!txn) {
+      return;
+    }
+    requireMemoryBatchOp(callOp("op_memory_batch_accept", txn.batchHandle), "accept");
+  };
+
+  const setMemoryBatchCommandResult = (txn, value) => {
+    if (!txn) {
+      return;
+    }
+    requireMemoryBatchOp(
+      callOp(
+        "op_memory_batch_command_result",
+        txn.batchHandle,
+        putMemoryBytes(value),
+      ),
+      "command result",
+    );
+  };
+
+  const addMemoryBatchMutation = (txn, mutation) => {
+    const result = callOp(
+      "op_memory_batch_mutation",
+      txn.batchHandle,
+      mutation.key,
+      putMemoryBytes(mutation.value),
+      mutation.encoding,
+      mutation.deleted === true,
+    );
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "memory batch mutation failed"));
+    }
+    return result.record == null ? null : cloneMemoryRecord(result.record);
+  };
+
+  const finishMemoryTxn = async (txn, runtimeRequestId) => {
     if (!txn) {
       return;
     }
     const started = performance.now();
     const storageState = ensureMemoryStorageState(txn.entry);
-    const writes = Array.from(txn.writes.values());
-    const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
-      key,
-      version: Number(version ?? -1),
-    }));
-    const result = await callOp("op_memory_state_apply_batch", {
-      request_id: runtimeRequestId,
-      binding: txn.entry.binding,
-      key: txn.entry.memoryKey,
-      transactional: true,
-      expected_base_version: -1,
-      reads,
-      list_gate_version: txn.listGateVersion == null ? -1 : Number(txn.listGateVersion),
-      mutations: writes.map((mutation) => ({
-        key: mutation.key,
-        value: Array.from(mutation.value),
-        encoding: mutation.encoding,
-        version: mutation.version,
-        deleted: mutation.deleted,
-      })),
-    });
+    const result = await callOp("op_memory_batch_apply", txn.batchHandle);
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory transaction commit failed"));
     }
-    if (result.conflict === true) {
-      await refreshMemoryEntrySnapshot(txn.entry, runtimeRequestId);
-      return false;
-    }
-    const committedVersion = Number(result.max_version ?? storageState.committedVersion);
-    for (const mutation of writes) {
-      storageState.loadedKeys.add(mutation.key);
-      storageState.mirror.set(mutation.key, {
-        ...cloneMemoryRecord(mutation),
-        version: committedVersion,
-      });
-    }
-    storageState.committedVersion = committedVersion;
-    storageState.nextVersion = Math.max(
-      Number(storageState.nextVersion ?? 0),
-      Number(storageState.committedVersion ?? -1) + 1,
-    );
-    storageState.snapshotVersion = committedVersion;
-    storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
-    storageState.freshnessCheckedVersion = committedVersion;
-    storageState.freshnessCheckedAtMs = performance.now();
-    storageState.stale = false;
-    txn.committed = true;
-    txn.committedVersion = committedVersion;
-    if (txn.deferred.length > 0 || txn.accepted === true || txn.sideEffects === true) {
-      await gateMemoryOutput(txn.entry, runtimeRequestId, async () => undefined);
-    }
-    recordMemoryProfile("js_txn_commit", performance.now() - started, writes.length + reads.length + 1);
-    return true;
-  };
-
-  const commitMemoryBlindTxn = async (txn, runtimeRequestId) => {
-    if (!txn) {
+    if (result.read_only === true || result.applied !== true) {
+      recordMemoryProfile("js_read_only_total", performance.now() - started, 1);
       return;
     }
-    const started = performance.now();
-    const storageState = ensureMemoryStorageState(txn.entry);
-    const writes = Array.from(txn.writes.values());
-    const result = await callOp("op_memory_state_apply_blind_batch", {
-      request_id: runtimeRequestId,
-      binding: txn.entry.binding,
-      key: txn.entry.memoryKey,
-      mutations: writes.map((mutation) => ({
-        key: mutation.key,
-        value: Array.from(mutation.value),
-        encoding: mutation.encoding,
-        version: mutation.version,
-        deleted: mutation.deleted,
-      })),
-    });
-    await syncFrozenTime();
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory blind transaction commit failed"));
-    }
-    if (result.conflict === true) {
-      await refreshMemoryEntrySnapshot(txn.entry, runtimeRequestId);
-      return false;
-    }
     const committedVersion = Number(result.max_version ?? storageState.committedVersion);
-    for (const mutation of writes) {
+    const mutations = Array.isArray(result.mutations)
+      ? result.mutations.map((mutation) => cloneMemoryRecord(mutation))
+      : [];
+    for (const mutation of mutations) {
       storageState.loadedKeys.add(mutation.key);
       storageState.mirror.set(mutation.key, {
         ...cloneMemoryRecord(mutation),
@@ -955,92 +905,30 @@
     storageState.freshnessCheckedVersion = committedVersion;
     storageState.freshnessCheckedAtMs = performance.now();
     storageState.stale = false;
-    txn.committed = true;
-    txn.committedVersion = committedVersion;
-    recordMemoryProfile("js_txn_blind_commit", performance.now() - started, writes.length + 1);
-    return true;
-  };
-
-  const validateMemoryTxnReads = async (txn, runtimeRequestId) => {
-    if (!txn) {
-      return true;
+    if (result.output_gate_required === true) {
+      await gateMemoryOutput(txn.entry, runtimeRequestId, async () => undefined);
     }
-    const started = performance.now();
-    const storageState = ensureMemoryStorageState(txn.entry);
-    const reads = Array.from(txn.reads.entries()).map(([key, version]) => ({
-      key,
-      version: Number(version ?? -1),
-    }));
-    const result = await callOp("op_memory_state_validate_reads", {
-      request_id: runtimeRequestId,
-      binding: txn.entry.binding,
-      key: txn.entry.memoryKey,
-      reads,
-      list_gate_version: txn.listGateVersion == null ? -1 : Number(txn.listGateVersion),
-    });
-    await syncFrozenTime();
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory transaction validation failed"));
-    }
-    if (result.conflict === true) {
-      await ensureMemoryStorageKeysHydrated(
-        txn.entry,
-        runtimeRequestId,
-        reads.map((entry) => entry.key),
-        { force: true },
-      );
-      if (txn.listGateVersion != null) {
-        await refreshMemoryEntrySnapshot(txn.entry, runtimeRequestId);
-      }
-      return false;
-    }
-    storageState.committedVersion = Math.max(
-      Number(storageState.committedVersion ?? -1),
-      Number(result.max_version ?? storageState.committedVersion ?? -1),
+    recordMemoryProfile(
+      "js_txn_commit",
+      performance.now() - started,
+      mutations.length + 1,
     );
-    storageState.nextVersion = Math.max(
-      Number(storageState.nextVersion ?? 0),
-      Number(storageState.committedVersion ?? -1) + 1,
-    );
-    txn.committed = true;
-    txn.committedVersion = Number(result.max_version ?? storageState.committedVersion);
-    recordMemoryProfile("js_txn_validate", performance.now() - started, reads.length + 1);
-    return true;
-  };
-
-  const ensureMemoryReadTxnFresh = async (txn, runtimeRequestId) => {
-    if (!txn || (txn.reads.size === 0 && txn.listGateVersion == null)) {
-      return true;
-    }
-    const started = performance.now();
-    const storageState = ensureMemoryStorageState(txn.entry);
-    const knownVersion = Number(storageState.committedVersion ?? -1);
-    const result = await callOp("op_memory_state_version_if_newer", {
-      request_id: runtimeRequestId,
-      binding: txn.entry.binding,
-      key: txn.entry.memoryKey,
-      known_version: knownVersion,
-    });
-    await syncFrozenTime();
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory transaction freshness check failed"));
-    }
-    recordMemoryProfile("js_freshness_check", performance.now() - started, txn.reads.size + 1);
-    if (result.stale !== true) {
-      storageState.freshnessCheckedRequestId = String(runtimeRequestId ?? "");
-      storageState.freshnessCheckedVersion = knownVersion;
-      storageState.freshnessCheckedAtMs = performance.now();
-      storageState.stale = false;
-      return true;
-    }
-    storageState.stale = true;
-    return await validateMemoryTxnReads(txn, runtimeRequestId);
   };
 
   const createMemoryStorageBinding = (entry, runtimeRequestId, txn = null) => {
-    const currentStorageRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
+    const rejectStorageOptions = (operation, options) => {
+      if (
+        options
+        && typeof options === "object"
+        && Object.keys(options).length > 0
+      ) {
+        const scope = txn ? "memory atomic" : "memory";
+        throw new Error(`${scope} ${operation} options are unsupported`);
+      }
+    };
     return {
       get(key, options = {}) {
+        rejectStorageOptions("get", options);
         const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
@@ -1048,12 +936,11 @@
         const normalizedKey = String(key);
         if (txn && !storageState.fullSnapshotLoaded && !storageState.loadedKeys.has(normalizedKey)) {
           recordMemoryProfile("memory_cache_miss", 0, 1);
-          throw new MemoryHydrationNeeded("keys", [normalizedKey]);
+          throw new Error("memory transaction storage must be hydrated before execution");
         }
         const record = txn
           ? memoryTxnReadRecord(txn, normalizedKey)
           : storageState.mirror.get(normalizedKey);
-        memoryTxnTrackRead(txn, normalizedKey, record, options?.allowConcurrency === true);
         if (!record || record.deleted) {
           return null;
         }
@@ -1064,92 +951,48 @@
         };
       },
       put(key, value, options = {}) {
+        rejectStorageOptions("set", options);
+        if (!txn) {
+          throw new Error("memory storage writes require stub.atomic(...)");
+        }
         const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
         const normalizedKey = String(key);
-        const expectedInput = options?.expectedVersion;
-        const expectedVersion = Number.isFinite(Number(expectedInput))
-          ? Math.trunc(Number(expectedInput))
-          : -1;
-        const current = txn
-          ? memoryTxnReadRecord(txn, normalizedKey)
-          : storageState.mirror.get(normalizedKey);
-        const currentVersion = current ? Number(current.version ?? -1) : -1;
-        if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
-          return {
-            ok: true,
-            conflict: true,
-            version: currentVersion,
-          };
-        }
         const encoded = encodeMemoryStorageValue(value);
-        const version = txn
-          ? memoryTxnNextVersion(txn)
-          : Number(storageState.committedVersion ?? -1);
         const record = {
           key: normalizedKey,
           value: encoded.value,
           encoding: encoded.encoding,
-          version,
           deleted: false,
         };
-        if (txn) {
-          stageMemoryTxnWrite(txn, record);
-        } else {
-          storageState.loadedKeys.add(normalizedKey);
-          storageState.mirror.set(normalizedKey, record);
-          queueMemoryMutation(entry, currentStorageRequestId(), record);
-        }
+        const staged = stageMemoryTxnWrite(txn, record);
         return {
           ok: true,
-          conflict: false,
-          version,
+          version: Number(staged.version ?? -1),
         };
       },
       delete(key, options = {}) {
+        rejectStorageOptions("delete", options);
+        if (!txn) {
+          throw new Error("memory storage writes require stub.atomic(...)");
+        }
         const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
         }
         const normalizedKey = String(key);
-        const expectedInput = options?.expectedVersion;
-        const expectedVersion = Number.isFinite(Number(expectedInput))
-          ? Math.trunc(Number(expectedInput))
-          : -1;
-        const current = txn
-          ? memoryTxnReadRecord(txn, normalizedKey)
-          : storageState.mirror.get(normalizedKey);
-        const currentVersion = current ? Number(current.version ?? -1) : -1;
-        if (expectedVersion >= 0 && currentVersion !== expectedVersion) {
-          return {
-            ok: true,
-            conflict: true,
-            version: currentVersion,
-          };
-        }
-        const version = txn
-          ? memoryTxnNextVersion(txn)
-          : Number(storageState.committedVersion ?? -1);
         const record = {
           key: normalizedKey,
           value: new Uint8Array(),
           encoding: "utf8",
-          version,
           deleted: true,
         };
-        if (txn) {
-          stageMemoryTxnWrite(txn, record);
-        } else {
-          storageState.loadedKeys.add(normalizedKey);
-          storageState.mirror.set(normalizedKey, record);
-          queueMemoryMutation(entry, currentStorageRequestId(), record);
-        }
+        const staged = stageMemoryTxnWrite(txn, record);
         return {
           ok: true,
-          conflict: false,
-          version,
+          version: Number(staged.version ?? -1),
         };
       },
       list(options = {}) {
@@ -1158,7 +1001,7 @@
           throw storageState.failedError;
         }
         if (txn && !storageState.fullSnapshotLoaded) {
-          throw new MemoryHydrationNeeded("full");
+          throw new Error("memory transaction storage must be hydrated before execution");
         }
         const prefix = String(options?.prefix ?? "");
         const limitInput = Number(options?.limit ?? 100);
@@ -1167,11 +1010,8 @@
           : 100;
         const merged = new Map(storageState.mirror);
         if (txn) {
-          for (const [key, record] of txn.writes.entries()) {
-            merged.set(key, cloneMemoryRecord(record));
-          }
-          if (options?.allowConcurrency !== true) {
-            txn.listGateVersion = Number(storageState.committedVersion ?? -1);
+          for (const record of memoryTxnListOverlay(txn, prefix).entries) {
+            merged.set(record.key, cloneMemoryRecord(record));
           }
         }
         return Array.from(merged.values())

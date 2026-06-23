@@ -6,32 +6,46 @@
     read(key, options) {
       return createMemoryStubVarApi(namespace, memoryKey, key).read(options);
     },
-    async write(key, value) {
-      const runtimeRequestId = activeRequestId();
-      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
-      const state = createMemoryStorageBinding(entry, runtimeRequestId);
-      state.put(String(key ?? ""), value);
-      await ensureMemoryStorageQueued(entry, runtimeRequestId);
-      return value;
+    async write(key, value, options) {
+      rejectMemoryDirectOptions("set", options);
+      return await invokeMemoryExecutable(
+        namespace,
+        memoryKey,
+        MEMORY_ATOMIC_METHOD,
+        (state) => {
+          state.set(String(key ?? ""), value);
+          return value;
+        },
+        [],
+      );
     },
-    async delete(key) {
-      const runtimeRequestId = activeRequestId();
-      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
-      const state = createMemoryStorageBinding(entry, runtimeRequestId);
-      state.delete(String(key ?? ""));
-      await ensureMemoryStorageQueued(entry, runtimeRequestId);
-      return true;
+    async delete(key, options) {
+      rejectMemoryDirectOptions("delete", options);
+      return await invokeMemoryExecutable(
+        namespace,
+        memoryKey,
+        MEMORY_ATOMIC_METHOD,
+        (state) => {
+          state.delete(String(key ?? ""));
+          return true;
+        },
+        [],
+      );
     },
     async writeMany(entries) {
-      const runtimeRequestId = activeRequestId();
-      const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
-      const state = createMemoryStorageBinding(entry, runtimeRequestId);
       const normalizedEntries = normalizeMemoryWriteManyEntries(entries);
-      for (const item of normalizedEntries) {
-        state.put(item.key, item.value);
-      }
-      await ensureMemoryStorageQueued(entry, runtimeRequestId);
-      return normalizedEntries.length;
+      return await invokeMemoryExecutable(
+        namespace,
+        memoryKey,
+        MEMORY_ATOMIC_METHOD,
+        (state) => {
+          for (const item of normalizedEntries) {
+            state.set(item.key, item.value);
+          }
+          return normalizedEntries.length;
+        },
+        [],
+      );
     },
     async list(options = {}) {
       const scope = memoryTxnScopeFor(namespace, memoryKey);
@@ -64,12 +78,12 @@
     tvar(key, defaultValue = null) {
       return createMemoryStubVarApi(namespace, memoryKey, key, defaultValue);
     },
-    defer(callback) {
+    emit(kind, payload = null) {
       const scope = memoryTxnScopeFor(namespace, memoryKey);
       if (!scope) {
-        throw new Error("stub.defer(callback) requires stub.atomic(...)");
+        throw new Error("stub.emit(kind, payload) requires stub.atomic(...)");
       }
-      return scope.state.defer(callback);
+      return scope.state.emit(kind, payload);
     },
     accept(request, options) {
       const scope = memoryTxnScopeFor(namespace, memoryKey);
@@ -78,13 +92,15 @@
       }
       return scope.state.accept(request, options);
     },
-    async atomic(executable, ...args) {
+    async atomic(executableOrOptions, ...rawArgs) {
+      const invocation = normalizeMemoryAtomicInvocation(executableOrOptions, rawArgs);
       return await invokeMemoryExecutable(
         namespace,
         memoryKey,
         MEMORY_ATOMIC_METHOD,
-        executable,
-        args,
+        invocation.executable,
+        invocation.args,
+        { idempotencyKey: invocation.idempotencyKey },
       );
     },
     async apply(effects) {
@@ -139,58 +155,86 @@
     },
   });
 
+  const rejectMemoryDirectOptions = (operation, options) => {
+    if (
+      options
+      && typeof options === "object"
+      && Object.keys(options).length > 0
+    ) {
+      throw new Error(`memory ${operation} options are unsupported`);
+    }
+  };
+
+  const normalizeMemoryAtomicInvocation = (first, args) => {
+    if (
+      first
+      && typeof first === "object"
+      && typeof first !== "function"
+      && !Array.isArray(first)
+    ) {
+      const idempotencyKey = String(
+        first.idempotencyKey ?? first.idempotency_key ?? "",
+      ).trim();
+      if (idempotencyKey.length > 512) {
+        throw new Error("stub.atomic idempotencyKey must be at most 512 characters");
+      }
+      return {
+        executable: args[0],
+        args: args.slice(1),
+        idempotencyKey,
+      };
+    }
+    return {
+      executable: first,
+      args,
+      idempotencyKey: "",
+    };
+  };
+
   const invokeMemoryExecutable = async (
     namespace,
     memoryKey,
     methodName,
     executable,
     args,
+    options = {},
   ) => {
-      const scopedRequestId = activeRequestId();
-      const localRuntimeRequestId = `${scopedRequestId}:memory-run:${nextMemoryInvokeSeq()}`;
-      if (methodName === MEMORY_ATOMIC_METHOD && typeof executable === "function") {
-        const entry = await ensureMemoryEntry(namespace, memoryKey, localRuntimeRequestId, { hydrate: false });
-        return await executeMemoryTransaction(
-          entry,
-          localRuntimeRequestId,
-          executable,
-          args,
-        );
+    const scopedRequestContextHandle = activeRequestContextHandle();
+    const descriptor = extractExecDescriptor(executable);
+    const idempotencyKey = String(options?.idempotencyKey ?? "").trim();
+    if (idempotencyKey) {
+      descriptor.idempotency_key = idempotencyKey;
+    }
+    const payload = [
+      {
+        ...descriptor,
+      },
+      ...args,
+    ];
+    const argsBytes = await encodeRpcArgs(payload);
+    try {
+      const preferCallerIsolate = methodName === MEMORY_ATOMIC_METHOD || !descriptor.export_name;
+      const result = await callOp(
+        "op_memory_invoke_method",
+        scopedRequestContextHandle,
+        workerName,
+        namespace,
+        memoryKey,
+        methodName,
+        preferCallerIsolate,
+        argsBytes,
+      );
+      await syncFrozenTime();
+      if (!result || typeof result !== "object" || result.ok === false) {
+        throw new Error(String(result?.error ?? "memory operation failed"));
       }
-      const descriptor = extractExecDescriptor(executable);
-      const payload = [
-        {
-          ...descriptor,
-        },
-        ...args,
-      ];
-      const argsBytes = await encodeRpcArgs(payload);
-      try {
-        const preferCallerIsolate = !descriptor.export_name;
-        const result = await callOp(
-          "op_memory_invoke_method",
-          {
-            worker_name: workerName,
-            binding: namespace,
-            key: memoryKey,
-            method_name: methodName,
-            prefer_caller_isolate: preferCallerIsolate,
-            args: Array.from(argsBytes),
-            caller_request_id: scopedRequestId,
-            request_id: localRuntimeRequestId,
-          },
-        );
-        await syncFrozenTime();
-        if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "memory operation failed"));
-        }
-        return decodeRpcResult(toArrayBytes(result.value));
-      } finally {
-        if (descriptor.live_token) {
-          liveMemoryExecutables.delete(String(descriptor.live_token));
-        }
+      return decodeRpcResult(takeMemoryBytes(result));
+    } finally {
+      if (descriptor.live_token) {
+        liveMemoryExecutables.delete(String(descriptor.live_token));
       }
-    };
+    }
+  };
 
   const memoryIdKey = (id) => {
     if (typeof id === "string") {

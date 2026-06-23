@@ -6,7 +6,7 @@ pub struct DynamicWorkerCreateEvent {
     pub owner_isolate_id: u64,
     pub binding: String,
     pub id: String,
-    pub source: String,
+    pub source: WorkerSource,
     pub bindings: Vec<common::DeployBinding>,
     pub env: HashMap<String, String>,
     pub timeout: u64,
@@ -14,6 +14,21 @@ pub struct DynamicWorkerCreateEvent {
     pub host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
     pub reply_id: String,
     pub pending_replies: DynamicPendingReplies,
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkerSource {
+    Inline(Arc<str>),
+    DynamicModule {
+        graph_id: String,
+        entrypoint: String,
+    },
+}
+
+impl WorkerSource {
+    pub(crate) fn inline(source: String) -> Self {
+        Self::Inline(Arc::<str>::from(source))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,17 +63,6 @@ pub struct DynamicWorkerDeleteEvent {
     pub owner_isolate_id: u64,
     pub binding: String,
     pub id: String,
-    pub reply_id: String,
-    pub pending_replies: DynamicPendingReplies,
-}
-
-pub struct DynamicWorkerInvokeEvent {
-    pub owner_worker: String,
-    pub owner_generation: u64,
-    pub owner_isolate_id: u64,
-    pub binding: String,
-    pub handle: String,
-    pub request: WorkerInvocation,
     pub reply_id: String,
     pub pending_replies: DynamicPendingReplies,
 }
@@ -189,7 +193,6 @@ pub enum DynamicPendingReplyPayload {
     Lookup(Result<Option<DynamicWorkerCreateReply>>),
     List(Result<Vec<String>>),
     Delete(Result<bool>),
-    Invoke(Result<WorkerOutput>),
     Fetch {
         result: Result<WorkerOutput>,
         stale_handle: bool,
@@ -223,10 +226,9 @@ pub struct DynamicPendingReplyResult {
     pub(crate) worker: String,
     pub(crate) timeout: u64,
     pub(crate) ids: Vec<String>,
-    pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
-    pub(crate) value: Vec<u8>,
+    pub(crate) value_handle: u32,
+    #[serde(skip_serializing)]
+    pub(crate) pending_value: Option<Vec<u8>>,
     pub(crate) error: String,
 }
 
@@ -235,8 +237,10 @@ pub struct DynamicFetchReplyResult {
     pub reply_id: String,
     pub ok: bool,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub headers_handle: u32,
+    pub body_handle: u32,
+    #[serde(skip_serializing)]
+    pub pending_output: Option<WorkerOutput>,
     pub error: String,
     pub stale_handle: bool,
     pub boundary_changed: bool,
@@ -261,8 +265,9 @@ impl DynamicFetchReplyResult {
                 reply_id,
                 ok: true,
                 status: output.status,
-                headers: output.headers,
-                body: output.body,
+                headers_handle: 0,
+                body_handle: 0,
+                pending_output: Some(output),
                 error: String::new(),
                 stale_handle,
                 boundary_changed,
@@ -273,8 +278,9 @@ impl DynamicFetchReplyResult {
                 reply_id,
                 ok: false,
                 status: 0,
-                headers: Vec::new(),
-                body: Vec::new(),
+                headers_handle: 0,
+                body_handle: 0,
+                pending_output: None,
                 error: error.to_string(),
                 stale_handle,
                 boundary_changed,
@@ -347,10 +353,8 @@ impl Default for DynamicPendingReplyResult {
             worker: String::new(),
             timeout: 0,
             ids: Vec::new(),
-            status: 0,
-            headers: Vec::new(),
-            body: Vec::new(),
-            value: Vec::new(),
+            value_handle: 0,
+            pending_value: None,
             error: String::new(),
         }
     }
@@ -487,18 +491,6 @@ impl DynamicPendingReplyPayload {
                     ..DynamicPendingReplyResult::ready(reply_id, "delete", false)
                 }),
             },
-            Self::Invoke(result) => match result {
-                Ok(output) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    status: output.status,
-                    headers: output.headers,
-                    body: output.body,
-                    ..DynamicPendingReplyResult::ready(reply_id, "invoke", true)
-                }),
-                Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    error: error.to_string(),
-                    ..DynamicPendingReplyResult::ready(reply_id, "invoke", false)
-                }),
-            },
             Self::Fetch {
                 result,
                 stale_handle,
@@ -511,7 +503,7 @@ impl DynamicPendingReplyPayload {
             )),
             Self::HostRpc(result) => match result {
                 Ok(value) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
-                    value,
+                    pending_value: Some(value),
                     ..DynamicPendingReplyResult::ready(reply_id, "host-rpc", true)
                 }),
                 Err(error) => DynamicPushedReplyPayload::Dynamic(DynamicPendingReplyResult {
@@ -562,71 +554,6 @@ impl TestAsyncReplies {
 pub struct TestAsyncReplyDelivery {
     pub owner: PendingReplyOwner,
     pub payload: TestAsyncReplyResult,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DynamicWorkerCreatePayload {
-    pub(crate) request_id: String,
-    pub(crate) binding: String,
-    pub(crate) id: String,
-    pub(crate) source: String,
-    #[serde(default)]
-    pub(crate) bindings: Vec<common::DeployBinding>,
-    #[serde(default)]
-    pub(crate) env: HashMap<String, String>,
-    #[serde(default = "default_dynamic_worker_timeout")]
-    pub(crate) timeout: u64,
-    #[serde(default)]
-    pub(crate) policy: DynamicWorkerPolicy,
-    #[serde(default)]
-    pub(crate) host_rpc_bindings: Vec<DynamicHostRpcBindingSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DynamicWorkerLookupPayload {
-    pub(crate) request_id: String,
-    pub(crate) binding: String,
-    pub(crate) id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DynamicWorkerListPayload {
-    pub(crate) request_id: String,
-    pub(crate) binding: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DynamicWorkerDeletePayload {
-    pub(crate) request_id: String,
-    pub(crate) binding: String,
-    pub(crate) id: String,
-}
-
-fn default_dynamic_worker_timeout() -> u64 {
-    5_000
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DynamicWorkerInvokePayload {
-    pub(crate) request_id: String,
-    pub(crate) subrequest_id: String,
-    pub(crate) binding: String,
-    pub(crate) handle: String,
-    pub(crate) method: String,
-    pub(crate) url: String,
-    #[serde(default)]
-    pub(crate) headers: Vec<(String, String)>,
-    #[serde(default)]
-    pub(crate) body: Vec<u8>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DynamicHostRpcInvokePayload {
-    pub(crate) request_id: String,
-    pub(crate) binding: String,
-    pub(crate) method_name: String,
-    #[serde(default)]
-    pub(crate) args: Vec<u8>,
 }
 
 #[derive(Clone, Default)]

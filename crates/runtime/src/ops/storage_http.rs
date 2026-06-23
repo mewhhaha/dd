@@ -3,7 +3,7 @@ use super::*;
 #[derive(Debug, Serialize)]
 pub(crate) struct KvListItem {
     key: String,
-    value: Vec<u8>,
+    value_handle: u32,
     encoding: String,
 }
 
@@ -14,13 +14,6 @@ pub(crate) struct KvGetResult {
     wrong_encoding: bool,
     value: String,
     error: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct KvGetManyPayload {
-    worker_name: String,
-    binding: String,
-    keys: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,44 +37,13 @@ pub(crate) struct KvProfileResult {
     error: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct KvGetValuePayload {
-    worker_name: String,
-    binding: String,
-    key: String,
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct KvGetValueResult {
     ok: bool,
     found: bool,
-    value: Vec<u8>,
+    value_handle: u32,
     encoding: String,
     error: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct KvPutValuePayload {
-    worker_name: String,
-    binding: String,
-    key: String,
-    encoding: String,
-    value: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct KvApplyBatchPayload {
-    worker_name: String,
-    binding: String,
-    mutations: Vec<KvApplyBatchMutationPayload>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct KvApplyBatchMutationPayload {
-    key: String,
-    encoding: String,
-    value: Vec<u8>,
-    deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,31 +61,6 @@ pub(crate) struct KvListResult {
     error: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct CacheRequestPayload {
-    #[serde(default)]
-    request_id: String,
-    cache_name: String,
-    method: String,
-    url: String,
-    headers: Vec<(String, String)>,
-    #[serde(default)]
-    bypass_stale: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CachePutPayload {
-    #[serde(default)]
-    request_id: String,
-    cache_name: String,
-    method: String,
-    url: String,
-    request_headers: Vec<(String, String)>,
-    response_status: u16,
-    response_headers: Vec<(String, String)>,
-    response_body: Vec<u8>,
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct CacheMatchResult {
     ok: bool,
@@ -131,8 +68,8 @@ pub(crate) struct CacheMatchResult {
     stale: bool,
     should_revalidate: bool,
     status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    headers_handle: u32,
+    body_handle: u32,
     error: String,
 }
 
@@ -143,37 +80,26 @@ pub(crate) struct CacheDeleteResult {
     error: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct HttpFetchPayload {
-    request_id: String,
-    method: String,
-    url: String,
-    #[serde(default)]
-    headers: Vec<(String, String)>,
-    #[serde(default)]
-    body: Vec<u8>,
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct HttpPrepareResult {
     ok: bool,
     method: String,
     url: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    headers_handle: u32,
+    body_handle: u32,
     error: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct HttpUrlCheckPayload {
-    request_id: String,
-    url: String,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct HttpUrlCheckResult {
     ok: bool,
     url: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponseChunkEmitResult {
+    ok: bool,
     error: String,
 }
 
@@ -229,25 +155,14 @@ pub(crate) async fn op_kv_get(
 #[serde]
 pub(crate) async fn op_kv_get_many_utf8(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    #[string] worker_name: String,
+    #[string] binding: String,
+    #[serde] keys: Vec<String>,
 ) -> KvGetManyResult {
     let started = Instant::now();
-    let payload: KvGetManyPayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return KvGetManyResult {
-                ok: false,
-                values: Vec::new(),
-                error: format!("invalid kv get many payload: {error}"),
-            };
-        }
-    };
     let store = state.borrow().borrow::<KvStore>().clone();
-    let item_count = payload.keys.len() as u64;
-    let result = match store
-        .get_utf8_many(&payload.worker_name, &payload.binding, &payload.keys)
-        .await
-    {
+    let item_count = keys.len() as u64;
+    let result = match store.get_utf8_many(&worker_name, &binding, &keys).await {
         Ok(values) => KvGetManyResult {
             ok: true,
             values: values
@@ -290,44 +205,37 @@ pub(crate) async fn op_kv_get_many_utf8(
 #[serde]
 pub(crate) async fn op_kv_get_value(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    #[string] worker_name: String,
+    #[string] binding: String,
+    #[string] key: String,
 ) -> KvGetValueResult {
     let started = Instant::now();
-    let payload: KvGetValuePayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return KvGetValueResult {
-                ok: false,
-                found: false,
-                value: Vec::new(),
-                encoding: "utf8".to_string(),
-                error: format!("invalid kv get payload: {error}"),
-            };
-        }
-    };
     let store = state.borrow().borrow::<KvStore>().clone();
-    let result = match store
-        .get(&payload.worker_name, &payload.binding, &payload.key)
-        .await
-    {
-        Ok(Some(value)) => KvGetValueResult {
-            ok: true,
-            found: true,
-            value: value.value,
-            encoding: value.encoding,
-            error: String::new(),
-        },
+    let result = match store.get(&worker_name, &binding, &key).await {
+        Ok(Some(value)) => {
+            let value_handle = state
+                .borrow_mut()
+                .borrow_mut::<HttpPreparedBodies>()
+                .insert(Bytes::from(value.value));
+            KvGetValueResult {
+                ok: true,
+                found: true,
+                value_handle,
+                encoding: value.encoding,
+                error: String::new(),
+            }
+        }
         Ok(None) => KvGetValueResult {
             ok: true,
             found: false,
-            value: Vec::new(),
+            value_handle: 0,
             encoding: "utf8".to_string(),
             error: String::new(),
         },
         Err(error) => KvGetValueResult {
             ok: false,
             found: false,
-            value: Vec::new(),
+            value_handle: 0,
             encoding: "utf8".to_string(),
             error: error.to_string(),
         },
@@ -395,10 +303,10 @@ pub(crate) async fn op_kv_put(
 ) -> KvOpResult {
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.put(&worker_name, &binding, &key, &value).await {
-        Ok(()) => KvOpResult {
+        Ok(version) => KvOpResult {
             ok: true,
             error: String::new(),
-            version: None,
+            version: Some(version),
         },
         Err(error) => KvOpResult {
             ok: false,
@@ -410,35 +318,24 @@ pub(crate) async fn op_kv_put(
 
 #[deno_core::op2]
 #[serde]
-pub(crate) async fn op_kv_put_value(
+pub(crate) async fn op_kv_put_value_bytes(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    #[string] worker_name: String,
+    #[string] binding: String,
+    #[string] key: String,
+    #[string] encoding: String,
+    #[buffer] value: JsBuffer,
 ) -> KvOpResult {
-    let payload: KvPutValuePayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return KvOpResult {
-                ok: false,
-                error: format!("invalid kv put payload: {error}"),
-                version: None,
-            };
-        }
-    };
+    let value = Bytes::copy_from_slice(value.as_ref());
     let store = state.borrow().borrow::<KvStore>().clone();
     match store
-        .put_value(
-            &payload.worker_name,
-            &payload.binding,
-            &payload.key,
-            &payload.value,
-            &payload.encoding,
-        )
+        .put_value(&worker_name, &binding, &key, value.as_ref(), &encoding)
         .await
     {
-        Ok(()) => KvOpResult {
+        Ok(version) => KvOpResult {
             ok: true,
             error: String::new(),
-            version: None,
+            version: Some(version),
         },
         Err(error) => KvOpResult {
             ok: false,
@@ -458,10 +355,10 @@ pub(crate) async fn op_kv_delete(
 ) -> KvOpResult {
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.delete(&worker_name, &binding, &key).await {
-        Ok(()) => KvOpResult {
+        Ok(version) => KvOpResult {
             ok: true,
             error: String::new(),
-            version: None,
+            version: Some(version),
         },
         Err(error) => KvOpResult {
             ok: false,
@@ -506,28 +403,23 @@ pub(crate) fn op_kv_enqueue_put(
 
 #[deno_core::op2]
 #[serde]
-pub(crate) fn op_kv_enqueue_put_value(
+pub(crate) fn op_kv_enqueue_put_value_bytes(
     state: &mut OpState,
-    #[string] payload: String,
+    #[string] worker_name: String,
+    #[string] binding: String,
+    #[string] key: String,
+    #[string] encoding: String,
+    #[buffer] value: JsBuffer,
 ) -> KvOpResult {
-    let payload: KvPutValuePayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return KvOpResult {
-                ok: false,
-                error: format!("invalid kv enqueue payload: {error}"),
-                version: None,
-            };
-        }
-    };
+    let value = Bytes::copy_from_slice(value.as_ref());
     let store = state.borrow::<KvStore>().clone();
     match store.enqueue_batch_versions(
-        &payload.worker_name,
-        &payload.binding,
+        &worker_name,
+        &binding,
         &[KvBatchMutation {
-            key: payload.key,
-            value: payload.value,
-            encoding: payload.encoding,
+            key,
+            value: value.to_vec(),
+            encoding,
             deleted: false,
         }],
     ) {
@@ -578,44 +470,6 @@ pub(crate) fn op_kv_enqueue_delete(
 
 #[deno_core::op2]
 #[serde]
-pub(crate) fn op_kv_apply_batch(state: &mut OpState, #[string] payload: String) -> KvOpResult {
-    let payload: KvApplyBatchPayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return KvOpResult {
-                ok: false,
-                error: format!("invalid kv apply batch payload: {error}"),
-                version: None,
-            };
-        }
-    };
-    let store = state.borrow::<KvStore>().clone();
-    let mutations = payload
-        .mutations
-        .into_iter()
-        .map(|mutation| KvBatchMutation {
-            key: mutation.key,
-            value: mutation.value,
-            encoding: mutation.encoding,
-            deleted: mutation.deleted,
-        })
-        .collect::<Vec<_>>();
-    match store.apply_batch(&payload.worker_name, &payload.binding, &mutations) {
-        Ok(()) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: None,
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_list(
     state: Rc<RefCell<OpState>>,
     #[string] worker_name: String,
@@ -629,11 +483,21 @@ pub(crate) async fn op_kv_list(
         .list(&worker_name, &binding, &prefix, clamped_limit)
         .await
     {
-        Ok(values) => KvListResult {
-            ok: true,
-            entries: values.into_iter().map(to_list_item).collect(),
-            error: String::new(),
-        },
+        Ok(values) => {
+            let entries = {
+                let mut op_state = state.borrow_mut();
+                let bodies = op_state.borrow_mut::<HttpPreparedBodies>();
+                values
+                    .into_iter()
+                    .map(|entry| to_list_item(entry, bodies))
+                    .collect()
+            };
+            KvListResult {
+                ok: true,
+                entries,
+                error: String::new(),
+            }
+        }
         Err(error) => KvListResult {
             ok: false,
             entries: Vec::new(),
@@ -646,75 +510,54 @@ pub(crate) async fn op_kv_list(
 #[serde]
 pub(crate) async fn op_cache_match(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    request_context_handle: u32,
+    #[string] cache_name: String,
+    #[string] method: String,
+    #[string] url: String,
+    headers_handle: u32,
+    bypass_stale: bool,
 ) -> CacheMatchResult {
-    let (request, request_id) = match decode_cache_request_payload(payload) {
-        Ok(request) => request,
-        Err(error) => {
-            return CacheMatchResult {
-                ok: false,
-                found: false,
-                stale: false,
-                should_revalidate: false,
-                status: 0,
-                headers: Vec::new(),
-                body: Vec::new(),
-                error: error.to_string(),
-            };
-        }
+    let headers = state
+        .borrow_mut()
+        .borrow_mut::<HttpPreparedHeaders>()
+        .take(headers_handle)
+        .unwrap_or_default();
+    let request = CacheRequest {
+        cache_name,
+        method,
+        url,
+        headers,
+        bypass_stale,
     };
-    if let Err(error) = ensure_cache_allowed(&state, &request_id) {
+    if let Err(error) = ensure_cache_allowed(&state, request_context_handle) {
         return CacheMatchResult {
             ok: false,
             found: false,
             stale: false,
             should_revalidate: false,
             status: 0,
-            headers: Vec::new(),
-            body: Vec::new(),
+            headers_handle: 0,
+            body_handle: 0,
             error,
         };
     }
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.get(&request).await {
-        Ok(CacheLookup::Fresh(response)) => CacheMatchResult {
-            ok: true,
-            found: true,
-            stale: false,
-            should_revalidate: false,
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
-            error: String::new(),
-        },
-        Ok(CacheLookup::StaleWhileRevalidate(response)) => CacheMatchResult {
-            ok: true,
-            found: true,
-            stale: true,
-            should_revalidate: true,
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
-            error: String::new(),
-        },
-        Ok(CacheLookup::StaleIfError(response)) => CacheMatchResult {
-            ok: true,
-            found: true,
-            stale: true,
-            should_revalidate: false,
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
-            error: String::new(),
-        },
+        Ok(CacheLookup::Fresh(response)) => cache_match_hit_result(&state, response, false, false),
+        Ok(CacheLookup::StaleWhileRevalidate(response)) => {
+            cache_match_hit_result(&state, response, true, true)
+        }
+        Ok(CacheLookup::StaleIfError(response)) => {
+            cache_match_hit_result(&state, response, true, false)
+        }
         Ok(CacheLookup::Miss) => CacheMatchResult {
             ok: true,
             found: false,
             stale: false,
             should_revalidate: false,
             status: 0,
-            headers: Vec::new(),
-            body: Vec::new(),
+            headers_handle: 0,
+            body_handle: 0,
             error: String::new(),
         },
         Err(error) => CacheMatchResult {
@@ -723,10 +566,38 @@ pub(crate) async fn op_cache_match(
             stale: false,
             should_revalidate: false,
             status: 0,
-            headers: Vec::new(),
-            body: Vec::new(),
+            headers_handle: 0,
+            body_handle: 0,
             error: error.to_string(),
         },
+    }
+}
+
+fn cache_match_hit_result(
+    state: &Rc<RefCell<OpState>>,
+    response: CacheResponse,
+    stale: bool,
+    should_revalidate: bool,
+) -> CacheMatchResult {
+    let (headers_handle, body_handle) = {
+        let mut op_state = state.borrow_mut();
+        let headers_handle = op_state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .insert(response.headers);
+        let body_handle = op_state
+            .borrow_mut::<HttpPreparedBodies>()
+            .insert(response.body);
+        (headers_handle, body_handle)
+    };
+    CacheMatchResult {
+        ok: true,
+        found: true,
+        stale,
+        should_revalidate,
+        status: response.status,
+        headers_handle,
+        body_handle,
+        error: String::new(),
     }
 }
 
@@ -734,25 +605,50 @@ pub(crate) async fn op_cache_match(
 #[serde]
 pub(crate) async fn op_cache_put(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    request_context_handle: u32,
+    #[string] cache_name: String,
+    #[string] method: String,
+    #[string] url: String,
+    request_headers_handle: u32,
+    response_status: u16,
+    response_headers_handle: u32,
+    response_body_handle: u32,
 ) -> KvOpResult {
-    let ((request, response), request_id) = match decode_cache_put_payload(payload) {
-        Ok(values) => values,
-        Err(error) => {
-            return KvOpResult {
-                ok: false,
-                error: error.to_string(),
-                version: None,
-            };
-        }
-    };
-    if let Err(error) = ensure_cache_allowed(&state, &request_id) {
+    if let Err(error) = ensure_cache_allowed(&state, request_context_handle) {
         return KvOpResult {
             ok: false,
             error,
             version: None,
         };
     }
+    let (request_headers, response_headers, body) = {
+        let mut op_state = state.borrow_mut();
+        let request_headers = op_state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .take(request_headers_handle)
+            .unwrap_or_default();
+        let response_headers = op_state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .take(response_headers_handle)
+            .unwrap_or_default();
+        let body = op_state
+            .borrow_mut::<HttpPreparedBodies>()
+            .take(response_body_handle)
+            .unwrap_or_default();
+        (request_headers, response_headers, body)
+    };
+    let request = CacheRequest {
+        cache_name,
+        method,
+        url,
+        headers: request_headers,
+        bypass_stale: false,
+    };
+    let response = CacheResponse {
+        status: response_status,
+        headers: response_headers,
+        body: body.to_vec(),
+    };
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.put(&request, response).await {
         Ok(_) => KvOpResult {
@@ -772,19 +668,25 @@ pub(crate) async fn op_cache_put(
 #[serde]
 pub(crate) async fn op_cache_delete(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    request_context_handle: u32,
+    #[string] cache_name: String,
+    #[string] method: String,
+    #[string] url: String,
+    headers_handle: u32,
 ) -> CacheDeleteResult {
-    let (request, request_id) = match decode_cache_request_payload(payload) {
-        Ok(request) => request,
-        Err(error) => {
-            return CacheDeleteResult {
-                ok: false,
-                deleted: false,
-                error: error.to_string(),
-            };
-        }
+    let headers = state
+        .borrow_mut()
+        .borrow_mut::<HttpPreparedHeaders>()
+        .take(headers_handle)
+        .unwrap_or_default();
+    let request = CacheRequest {
+        cache_name,
+        method,
+        url,
+        headers,
+        bypass_stale: false,
     };
-    if let Err(error) = ensure_cache_allowed(&state, &request_id) {
+    if let Err(error) = ensure_cache_allowed(&state, request_context_handle) {
         return CacheDeleteResult {
             ok: false,
             deleted: false,
@@ -809,18 +711,16 @@ pub(crate) async fn op_cache_delete(
 
 fn ensure_cache_allowed(
     state: &Rc<RefCell<OpState>>,
-    request_id: &str,
+    request_context_handle: u32,
 ) -> std::result::Result<(), String> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
+    if request_context_handle == 0 {
         return Ok(());
     }
     let allowed = {
         let state_ref = state.borrow();
         state_ref
             .borrow::<RequestSecretContexts>()
-            .contexts
-            .get(request_id)
+            .get(request_context_handle)
             .map(|context| context.execution.allow_cache)
             .unwrap_or(true)
     };
@@ -832,7 +732,11 @@ fn ensure_cache_allowed(
 
 pub(crate) fn prepare_http_fetch_request(
     state: &Rc<RefCell<OpState>>,
-    payload: HttpFetchPayload,
+    request_context_handle: u32,
+    method: &str,
+    url: &str,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 ) -> std::result::Result<
     (
         reqwest::Method,
@@ -844,17 +748,17 @@ pub(crate) fn prepare_http_fetch_request(
     ),
     String,
 > {
-    let (execution, canceled, canceled_notify) = http_fetch_context(state, &payload.request_id)?;
+    let (execution, canceled, canceled_notify) = http_fetch_context(state, request_context_handle)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
     }
 
-    let method_raw = replace_placeholders_text(&payload.method, execution.replacements.as_ref());
+    let method_raw = replace_placeholders_text(method, execution.replacements.as_ref());
     let method = reqwest::Method::from_bytes(method_raw.trim().to_ascii_uppercase().as_bytes())
         .map_err(|error| format!("invalid host fetch method: {error}"))?;
 
-    let url = replace_placeholders_text(&payload.url, execution.replacements.as_ref());
+    let url = replace_placeholders_text(url, execution.replacements.as_ref());
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, execution.egress_allow_hosts.as_ref()) {
@@ -891,18 +795,18 @@ pub(crate) fn prepare_http_fetch_request(
                 .borrow()
                 .borrow::<crate::service::RuntimeFastCommandSender>()
                 .clone();
-            let _ = command_sender
-                .0
-                .send(crate::service::RuntimeCommand::RetireDynamicWorker {
-                    worker_name: execution.worker_name.as_ref().to_string(),
-                    reason: "dynamic child exceeded max_outbound_requests".to_string(),
-                });
+            let _ =
+                command_sender
+                    .0
+                    .try_send(crate::service::RuntimeCommand::RetireDynamicWorker {
+                        worker_name: execution.worker_name.as_ref().to_string(),
+                        reason: "dynamic child exceeded max_outbound_requests".to_string(),
+                    });
             return Err("dynamic child exceeded max_outbound_requests".to_string());
         }
     }
 
-    let headers = payload
-        .headers
+    let headers = headers
         .into_iter()
         .filter_map(|(name, value)| {
             let normalized_name = replace_placeholders_text(&name, execution.replacements.as_ref());
@@ -917,21 +821,22 @@ pub(crate) fn prepare_http_fetch_request(
             Some((trimmed, normalized_value))
         })
         .collect::<Vec<_>>();
-    let body = replace_placeholders_in_body(payload.body, execution.replacements.as_ref());
+    let body = replace_placeholders_in_body(body, execution.replacements.as_ref());
 
     Ok((method, parsed_url, headers, body, canceled, canceled_notify))
 }
 
 pub(crate) fn check_http_fetch_url(
     state: &Rc<RefCell<OpState>>,
-    payload: HttpUrlCheckPayload,
+    request_context_handle: u32,
+    url: &str,
 ) -> std::result::Result<String, String> {
-    let (execution, canceled, canceled_notify) = http_fetch_context(state, &payload.request_id)?;
+    let (execution, canceled, canceled_notify) = http_fetch_context(state, request_context_handle)?;
     if canceled.load(Ordering::SeqCst) {
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
     }
-    let url = replace_placeholders_text(&payload.url, execution.replacements.as_ref());
+    let url = replace_placeholders_text(url, execution.replacements.as_ref());
     let parsed_url =
         reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, execution.egress_allow_hosts.as_ref()) {
@@ -954,18 +859,16 @@ pub(crate) fn check_http_fetch_url(
 
 pub(crate) fn http_fetch_context(
     state: &Rc<RefCell<OpState>>,
-    request_id: &str,
+    request_context_handle: u32,
 ) -> std::result::Result<(RequestExecutionContext, Arc<AtomicBool>, Arc<Notify>), String> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
-        return Err("host fetch request_id must not be empty".to_string());
+    if request_context_handle == 0 {
+        return Err("host fetch request context handle must not be empty".to_string());
     }
     let context = {
         let state_ref = state.borrow();
         state_ref
             .borrow::<RequestSecretContexts>()
-            .contexts
-            .get(request_id)
+            .get(request_context_handle)
             .map(|context| {
                 (
                     context.execution.clone(),
@@ -979,62 +882,106 @@ pub(crate) fn http_fetch_context(
 
 #[deno_core::op2]
 #[serde]
-pub(crate) async fn op_http_prepare(
+pub(crate) fn op_http_prepare(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    request_context_handle: u32,
+    #[string] method: String,
+    #[string] url: String,
+    headers_handle: u32,
+    body_handle: u32,
 ) -> HttpPrepareResult {
-    let payload: HttpFetchPayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return HttpPrepareResult {
-                ok: false,
-                method: String::new(),
-                url: String::new(),
-                headers: Vec::new(),
-                body: Vec::new(),
-                error: format!("invalid host fetch payload: {error}"),
-            };
-        }
+    let (headers, body) = {
+        let mut op_state = state.borrow_mut();
+        let headers = op_state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .take(headers_handle)
+            .unwrap_or_default();
+        let body = op_state
+            .borrow_mut::<HttpPreparedBodies>()
+            .take(body_handle)
+            .unwrap_or_default();
+        (headers, body)
     };
-
-    match prepare_http_fetch_request(&state, payload) {
-        Ok((method, url, headers, body, _, _)) => HttpPrepareResult {
-            ok: true,
-            method: method.as_str().to_string(),
-            url: url.to_string(),
-            headers,
-            body,
-            error: String::new(),
-        },
+    match prepare_http_fetch_request(
+        &state,
+        request_context_handle,
+        &method,
+        &url,
+        headers,
+        body.to_vec(),
+    ) {
+        Ok((method, url, headers, body, _, _)) => {
+            let (headers_handle, body_handle) = {
+                let mut op_state = state.borrow_mut();
+                let headers_handle = op_state.borrow_mut::<HttpPreparedHeaders>().insert(headers);
+                let body_handle = op_state.borrow_mut::<HttpPreparedBodies>().insert(body);
+                (headers_handle, body_handle)
+            };
+            HttpPrepareResult {
+                ok: true,
+                method: method.as_str().to_string(),
+                url: url.to_string(),
+                headers_handle,
+                body_handle,
+                error: String::new(),
+            }
+        }
         Err(error) => HttpPrepareResult {
             ok: false,
             method: String::new(),
             url: String::new(),
-            headers: Vec::new(),
-            body: Vec::new(),
+            headers_handle: 0,
+            body_handle: 0,
             error,
         },
     }
 }
 
 #[deno_core::op2]
+#[buffer]
+pub(crate) fn op_http_take_prepared_body(state: &mut OpState, body_handle: u32) -> Vec<u8> {
+    state
+        .borrow_mut::<HttpPreparedBodies>()
+        .take(body_handle)
+        .map(|body| body.to_vec())
+        .unwrap_or_default()
+}
+
+#[deno_core::op2]
+pub(crate) fn op_http_store_prepared_body(state: &mut OpState, #[buffer] body: JsBuffer) -> u32 {
+    state
+        .borrow_mut::<HttpPreparedBodies>()
+        .insert(Bytes::copy_from_slice(body.as_ref()))
+}
+
+#[deno_core::op2]
+pub(crate) fn op_http_store_prepared_headers(
+    state: &mut OpState,
+    #[serde] headers: Vec<(String, String)>,
+) -> u32 {
+    state.borrow_mut::<HttpPreparedHeaders>().insert(headers)
+}
+
+#[deno_core::op2]
+#[serde]
+pub(crate) fn op_http_take_prepared_headers(
+    state: &mut OpState,
+    headers_handle: u32,
+) -> Vec<(String, String)> {
+    state
+        .borrow_mut::<HttpPreparedHeaders>()
+        .take(headers_handle)
+        .unwrap_or_default()
+}
+
+#[deno_core::op2]
 #[serde]
 pub(crate) fn op_http_check_url(
     state: Rc<RefCell<OpState>>,
-    #[string] payload: String,
+    request_context_handle: u32,
+    #[string] url: String,
 ) -> HttpUrlCheckResult {
-    let payload: HttpUrlCheckPayload = match crate::json::from_string(payload) {
-        Ok(value) => value,
-        Err(error) => {
-            return HttpUrlCheckResult {
-                ok: false,
-                url: String::new(),
-                error: format!("invalid host fetch URL check payload: {error}"),
-            };
-        }
-    };
-
-    match check_http_fetch_url(&state, payload) {
+    match check_http_fetch_url(&state, request_context_handle, &url) {
         Ok(url) => HttpUrlCheckResult {
             ok: true,
             url,
@@ -1049,40 +996,207 @@ pub(crate) fn op_http_check_url(
 }
 
 #[deno_core::op2(fast)]
-pub(crate) fn op_emit_completion(state: &mut OpState, #[string] payload: String) {
-    if let Some(meta) = completion_meta(&payload) {
-        let request_id = meta.request_id;
-        clear_request_body_stream(state, &request_id);
-        if meta.wait_until_count == 0 {
-            clear_memory_request_scope(state, &request_id);
-            clear_request_secret_context(state, &request_id);
-        }
+pub(crate) fn op_emit_completion_ok(
+    state: &mut OpState,
+    completion_handle: u32,
+    status: u16,
+    headers_handle: u32,
+    body_handle: u32,
+) {
+    let Some(context) = active_request_context_for_completion(state, completion_handle) else {
+        return;
+    };
+    let headers = state
+        .borrow_mut::<HttpPreparedHeaders>()
+        .take(headers_handle)
+        .unwrap_or_default();
+    let body = state
+        .borrow_mut::<HttpPreparedBodies>()
+        .take(body_handle)
+        .unwrap_or_default();
+    emit_completion_result(
+        state,
+        context.request_id,
+        context.completion_token,
+        context.request_context_handle,
+        context.wait_until_count,
+        Ok(WorkerOutput {
+            status,
+            headers,
+            body: body.to_vec(),
+        }),
+    );
+}
+
+#[deno_core::op2(fast)]
+pub(crate) fn op_emit_completion_error(
+    state: &mut OpState,
+    completion_handle: u32,
+    #[string] error: String,
+) {
+    let Some(context) = active_request_context_for_completion(state, completion_handle) else {
+        return;
+    };
+    let message = if error.is_empty() {
+        "worker execution failed".to_string()
+    } else {
+        error
+    };
+    emit_completion_result(
+        state,
+        context.request_id,
+        context.completion_token,
+        context.request_context_handle,
+        context.wait_until_count,
+        Err(PlatformError::runtime(message)),
+    );
+}
+
+fn emit_completion_result(
+    state: &mut OpState,
+    request_id: String,
+    completion_token: String,
+    request_context_handle: u32,
+    wait_until_count: usize,
+    result: Result<WorkerOutput>,
+) {
+    if wait_until_count == 0 && request_context_handle > 0 {
+        clear_memory_command_handles(state, request_context_handle);
+        clear_memory_byte_handles(state, request_context_handle);
+        clear_memory_batch_handles(state, request_context_handle);
     }
-    let _ = emit_isolate_event(state, IsolateEventPayload::Completion(payload));
+    let _ = emit_isolate_event(
+        state,
+        IsolateEventPayload::Completion {
+            request_id,
+            completion_token,
+            wait_until_count,
+            result,
+        },
+    );
 }
 
 #[deno_core::op2(fast)]
-pub(crate) fn op_emit_wait_until_done(state: &mut OpState, #[string] payload: String) {
-    if let Some(request_id) = wait_until_request_id(&payload) {
-        clear_memory_request_scope(state, &request_id);
-        clear_request_secret_context(state, &request_id);
+pub(crate) fn op_emit_wait_until_done(state: &mut OpState, completion_handle: u32) -> bool {
+    let Some(context) = state
+        .borrow_mut::<ActiveRequestContextHandles>()
+        .mark_wait_until_done(completion_handle)
+    else {
+        return false;
+    };
+    let request_context_handle = context.request_context_handle;
+    if request_context_handle > 0 {
+        clear_memory_command_handles(state, request_context_handle);
+        clear_memory_byte_handles(state, request_context_handle);
+        clear_memory_batch_handles(state, request_context_handle);
     }
-    let _ = emit_isolate_event(state, IsolateEventPayload::WaitUntilDone(payload));
+    let _ = emit_isolate_event(
+        state,
+        IsolateEventPayload::WaitUntilDone {
+            request_id: context.request_id,
+            completion_token: context.completion_token,
+        },
+    );
+    true
 }
 
 #[deno_core::op2(fast)]
-pub(crate) fn op_emit_response_start(state: &mut OpState, #[string] payload: String) {
-    let _ = emit_isolate_event(state, IsolateEventPayload::ResponseStart(payload));
+pub(crate) fn op_emit_response_start(
+    state: &mut OpState,
+    completion_handle: u32,
+    status: u16,
+    headers_handle: u32,
+) {
+    let Some(context) = active_request_context_for_completion(state, completion_handle) else {
+        return;
+    };
+    let headers = state
+        .borrow_mut::<HttpPreparedHeaders>()
+        .take(headers_handle)
+        .unwrap_or_default();
+    let _ = emit_isolate_event(
+        state,
+        IsolateEventPayload::ResponseStart {
+            request_id: context.request_id,
+            completion_token: context.completion_token,
+            status,
+            headers,
+        },
+    );
+}
+
+#[deno_core::op2]
+#[serde]
+pub(crate) async fn op_emit_response_chunk(
+    state: Rc<RefCell<OpState>>,
+    completion_handle: u32,
+    #[buffer] chunk: JsBuffer,
+) -> ResponseChunkEmitResult {
+    let context = {
+        let op_state = state.borrow();
+        active_request_context_for_completion(&op_state, completion_handle)
+    };
+    let Some(context) = context else {
+        return ResponseChunkEmitResult {
+            ok: false,
+            error: "request context handle is unavailable".to_string(),
+        };
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if emit_isolate_event_from_rc(
+        &state,
+        IsolateEventPayload::ResponseChunk {
+            request_id: context.request_id,
+            completion_token: context.completion_token,
+            chunk: Bytes::copy_from_slice(chunk.as_ref()),
+            reply: reply_tx,
+        },
+    )
+    .is_err()
+    {
+        return ResponseChunkEmitResult {
+            ok: false,
+            error: "runtime response stream is unavailable".to_string(),
+        };
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => ResponseChunkEmitResult {
+            ok: true,
+            error: String::new(),
+        },
+        Ok(Err(error)) => ResponseChunkEmitResult {
+            ok: false,
+            error: error.to_string(),
+        },
+        Err(_) => ResponseChunkEmitResult {
+            ok: false,
+            error: "response stream acknowledgment channel closed".to_string(),
+        },
+    }
 }
 
 #[deno_core::op2(fast)]
-pub(crate) fn op_emit_response_chunk(state: &mut OpState, #[string] payload: String) {
-    let _ = emit_isolate_event(state, IsolateEventPayload::ResponseChunk(payload));
-}
-
-#[deno_core::op2(fast)]
-pub(crate) fn op_emit_cache_revalidate(state: &mut OpState, #[string] payload: String) {
-    let _ = emit_isolate_event(state, IsolateEventPayload::CacheRevalidate(payload));
+pub(crate) fn op_emit_cache_revalidate(
+    state: &mut OpState,
+    #[string] cache_name: String,
+    #[string] method: String,
+    #[string] url: String,
+    headers_handle: u32,
+) {
+    let headers = state
+        .borrow_mut::<HttpPreparedHeaders>()
+        .take(headers_handle)
+        .unwrap_or_default();
+    let _ = emit_isolate_event(
+        state,
+        IsolateEventPayload::CacheRevalidate(CacheRevalidatePayload {
+            cache_name,
+            method,
+            url,
+            headers,
+        }),
+    );
 }
 
 pub(crate) fn replace_placeholders_text(
@@ -1146,53 +1260,10 @@ pub(crate) fn default_port_for_scheme(scheme: &str) -> Option<u16> {
     }
 }
 
-pub(crate) fn to_list_item(entry: KvEntry) -> KvListItem {
+pub(crate) fn to_list_item(entry: KvEntry, bodies: &mut HttpPreparedBodies) -> KvListItem {
     KvListItem {
         key: entry.key,
-        value: entry.value,
+        value_handle: bodies.insert(Bytes::from(entry.value)),
         encoding: entry.encoding,
     }
-}
-
-pub(crate) fn decode_cache_request_payload(
-    payload: String,
-) -> common::Result<(CacheRequest, String)> {
-    let payload: CacheRequestPayload = crate::json::from_string(payload).map_err(|error| {
-        common::PlatformError::runtime(format!("invalid cache payload: {error}"))
-    })?;
-    Ok((
-        CacheRequest {
-            cache_name: payload.cache_name,
-            method: payload.method,
-            url: payload.url,
-            headers: payload.headers,
-            bypass_stale: payload.bypass_stale,
-        },
-        payload.request_id,
-    ))
-}
-
-pub(crate) fn decode_cache_put_payload(
-    payload: String,
-) -> common::Result<((CacheRequest, CacheResponse), String)> {
-    let payload: CachePutPayload = crate::json::from_string(payload).map_err(|error| {
-        common::PlatformError::runtime(format!("invalid cache put payload: {error}"))
-    })?;
-    Ok((
-        (
-            CacheRequest {
-                cache_name: payload.cache_name,
-                method: payload.method,
-                url: payload.url,
-                headers: payload.request_headers,
-                bypass_stale: false,
-            },
-            CacheResponse {
-                status: payload.response_status,
-                headers: payload.response_headers,
-                body: payload.response_body,
-            },
-        ),
-        payload.request_id,
-    ))
 }

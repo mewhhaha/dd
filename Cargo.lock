@@ -4805,6 +4805,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
  "capnp",
  "common",
  "deno_core",

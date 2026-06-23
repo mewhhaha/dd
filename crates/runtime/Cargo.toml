@@ -16,12 +16,13 @@ serde_json.workspace = true
 simd-json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-opentelemetry.workspace = true
-opentelemetry.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
 uuid.workspace = true
 reqwest.workspace = true
 getrandom = "0.3"
 base64.workspace = true
+bytes = "1"
 sha2 = "0.10"
 mime_guess = "2"
 regex = "1"
@@ -32,6 +33,10 @@ deno_crypto = "0.255.0"
 deno_permissions = "0.100.0"
 rustls = "0.23.28"
 sys_traits = { version = "0.1.25", features = ["real", "libc"] }
+
+[features]
+default = []
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry"]
 
 [dev-dependencies]
 serial_test = "3"

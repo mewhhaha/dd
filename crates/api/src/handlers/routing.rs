@@ -21,6 +21,7 @@ where
     respond(route_public_request(state, request).await)
 }
 
+#[cfg(feature = "http3")]
 pub async fn handle_public_h3_request(
     state: AppState,
     request: Request<()>,
@@ -120,6 +121,7 @@ where
     invoke_worker_public(state, request, ws_upgrade).await
 }
 
+#[cfg(feature = "http3")]
 async fn route_public_h3_request(
     state: AppState,
     request: Request<()>,

@@ -122,38 +122,53 @@ pub(super) fn validate_internal_config(
     Ok(())
 }
 pub(super) fn set_span_parent_from_http_headers(span: &Span, headers: &HeaderMap) {
+    #[cfg(feature = "otel")]
     global::get_text_map_propagator(|propagator| {
         let parent = propagator.extract(&HttpHeaderExtractor(headers));
         if parent.span().span_context().is_valid() {
             span.set_parent(parent);
         }
     });
+    #[cfg(not(feature = "otel"))]
+    let _ = (span, headers);
 }
 
 pub(crate) fn inject_current_trace_context(headers: &mut Vec<(String, String)>) {
-    let context = Span::current().context();
-    global::get_text_map_propagator(|propagator| {
-        let mut injector = InvocationHeaderInjector(headers);
-        propagator.inject_context(&context, &mut injector);
-    });
+    #[cfg(feature = "otel")]
+    {
+        let context = Span::current().context();
+        global::get_text_map_propagator(|propagator| {
+            let mut injector = InvocationHeaderInjector(headers);
+            propagator.inject_context(&context, &mut injector);
+        });
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = headers;
 }
 
 pub(crate) fn annotate_response_with_trace_id(response: &mut Response<ResponseBody>) {
-    let context = Span::current().context();
-    let span = context.span();
-    let span_context = span.span_context();
-    if !span_context.is_valid() {
-        return;
+    #[cfg(feature = "otel")]
+    {
+        let context = Span::current().context();
+        let span = context.span();
+        let span_context = span.span_context();
+        if !span_context.is_valid() {
+            return;
+        }
+        if let Ok(value) = HeaderValue::from_str(&span_context.trace_id().to_string()) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static(HEADER_TRACE_ID), value);
+        }
     }
-    if let Ok(value) = HeaderValue::from_str(&span_context.trace_id().to_string()) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static(HEADER_TRACE_ID), value);
-    }
+    #[cfg(not(feature = "otel"))]
+    let _ = response;
 }
 
+#[cfg(feature = "otel")]
 struct HttpHeaderExtractor<'a>(&'a HeaderMap);
 
+#[cfg(feature = "otel")]
 impl Extractor for HttpHeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).and_then(|value| value.to_str().ok())
@@ -164,8 +179,10 @@ impl Extractor for HttpHeaderExtractor<'_> {
     }
 }
 
+#[cfg(feature = "otel")]
 struct InvocationHeaderInjector<'a>(&'a mut Vec<(String, String)>);
 
+#[cfg(feature = "otel")]
 impl Injector for InvocationHeaderInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
         if let Some(existing) = self
@@ -218,14 +235,15 @@ pub(super) fn respond(result: ApiResult<Response<ResponseBody>>) -> Response<Res
     }
 }
 
+#[cfg(feature = "websocket")]
 pub(crate) fn empty_body() -> ResponseBody {
     Empty::<Bytes>::new()
         .map_err(infallible_to_box_error)
         .boxed()
 }
 
-pub(crate) fn full_body(body: Vec<u8>) -> ResponseBody {
-    Full::new(Bytes::from(body))
+pub(crate) fn full_body(body: impl Into<Bytes>) -> ResponseBody {
+    Full::new(body.into())
         .map_err(infallible_to_box_error)
         .boxed()
 }

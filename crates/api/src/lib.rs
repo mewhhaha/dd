@@ -3,6 +3,7 @@ mod deploy_tokens;
 mod handlers;
 #[cfg(test)]
 mod handlers_runtime_tests;
+#[cfg(feature = "http3")]
 mod public_quic;
 mod state;
 

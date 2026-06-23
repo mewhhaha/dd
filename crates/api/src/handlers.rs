@@ -1,6 +1,10 @@
 mod invocation;
 mod routing;
 mod util;
+#[cfg(feature = "websocket")]
+mod websocket;
+#[cfg(not(feature = "websocket"))]
+#[path = "handlers/websocket_disabled.rs"]
 mod websocket;
 
 use crate::state::AppState;
@@ -11,28 +15,41 @@ use common::{
     DeployTokenMintResponse, DynamicDeployRequest, DynamicDeployResponse, ErrorBody, ErrorKind,
     PlatformError, WorkerInvocation, WorkerOutput,
 };
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::StreamExt;
+#[cfg(feature = "websocket")]
+use futures_util::{stream::SplitSink, SinkExt};
 use http::header::{
     HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, HOST, WWW_AUTHENTICATE,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body::Body as HttpBody;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full, StreamBody};
+#[cfg(feature = "websocket")]
+use http_body_util::Empty;
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
+#[cfg(feature = "websocket")]
 use hyper::upgrade::OnUpgrade;
+#[cfg(feature = "websocket")]
 use hyper_util::rt::TokioIo;
+#[cfg(feature = "otel")]
 use opentelemetry::global;
+#[cfg(feature = "otel")]
 use opentelemetry::propagation::{Extractor, Injector};
+#[cfg(feature = "otel")]
 use opentelemetry::trace::TraceContextExt;
 use runtime::{CacheLookup, CacheRequest, CacheResponse};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::handshake::server::create_response as create_ws_response;
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::WebSocketStream;
 use tracing::Span;
+#[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
@@ -47,30 +64,47 @@ const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
 const HEADER_CACHE: &str = "x-dd-cache";
 const HEADER_CACHE_FALLBACK: &str = "x-dd-cache-fallback";
 const HEADER_CACHE_BYPASS_STALE: &str = "x-dd-cache-bypass-stale";
+#[cfg(feature = "otel")]
 const HEADER_TRACE_ID: &str = "x-dd-trace-id";
+#[cfg(feature = "websocket")]
 const HEADER_WS_INTERNAL_PREFIX: &str = "x-dd-";
+#[cfg(feature = "websocket")]
 const HEADER_WS_SESSION: &str = "x-dd-ws-session";
+#[cfg(feature = "websocket")]
 const HEADER_WS_BINARY: &str = "x-dd-ws-binary";
+#[cfg(feature = "websocket")]
 const HEADER_WS_CLOSE_CODE: &str = "x-dd-ws-close-code";
+#[cfg(feature = "websocket")]
 const HEADER_WS_CLOSE_REASON: &str = "x-dd-ws-close-reason";
 
+#[cfg(all(test, not(feature = "websocket")))]
+use self::invocation::build_public_request_url;
+#[cfg(feature = "http3")]
+pub use self::invocation::invoke_worker_public_h3;
+#[cfg(any(feature = "websocket", test))]
 use self::invocation::parse_invoke_request_uri;
 #[cfg(test)]
 use self::invocation::parse_worker_from_host;
+#[cfg(feature = "websocket")]
 pub(crate) use self::invocation::{
     build_public_request_url, ensure_public_worker, parse_public_worker_name_from_request,
 };
-pub use self::invocation::{invoke_worker_private, invoke_worker_public, invoke_worker_public_h3};
+pub use self::invocation::{invoke_worker_private, invoke_worker_public};
 #[cfg(test)]
 pub(crate) use self::routing::deploy_worker;
-pub use self::routing::{handle_private_request, handle_public_h3_request, handle_public_request};
+#[cfg(feature = "http3")]
+pub use self::routing::handle_public_h3_request;
+pub use self::routing::{handle_private_request, handle_public_request};
+#[cfg(feature = "websocket")]
+use self::util::empty_body;
+use self::util::inject_current_trace_context;
 pub(crate) use self::util::{annotate_response_with_trace_id, full_body};
 use self::util::{
     bearer_token_from_headers, json_response, private_auth_response, private_request_is_authorized,
     private_route_requires_auth, public_route_is_reserved, read_json_body, respond,
     set_span_parent_from_http_headers, validate_deploy_bindings, validate_internal_config,
 };
-use self::util::{empty_body, inject_current_trace_context};
+#[cfg(feature = "websocket")]
 pub(crate) use self::websocket::{
     handle_websocket_session, open_transport_session_from_parts, open_websocket_session_from_parts,
     sanitize_websocket_handshake_headers,

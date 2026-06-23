@@ -1,6 +1,7 @@
 use super::{
     BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
 };
+use bytes::Bytes;
 use common::{
     DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination,
     ErrorKind, WorkerInvocation, WorkerOutput,
@@ -41,6 +42,128 @@ async fn service_starts_with_deno_runtime_bootstrap() {
         ..RuntimeConfig::default()
     })
     .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn isolate_starts_with_configured_heap_limit() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        max_isolate_heap_bytes: 64 * 1024 * 1024,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "heap-limited".to_string();
+    service
+        .deploy(
+            worker.clone(),
+            r#"
+export default {
+  fetch() {
+    const values = Array.from({ length: 1024 }, (_, idx) => idx);
+    return new Response(String(values.length));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = timeout(
+        Duration::from_secs(2),
+        service.invoke(worker, test_invocation()),
+    )
+    .await
+    .expect("invoke should not hang")
+    .expect("request should succeed");
+    assert_eq!(output.status, 200);
+    assert_eq!(
+        String::from_utf8(output.body).expect("body should be utf8"),
+        "1024"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn isolate_startup_does_not_block_manager_commands() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 4,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "slow-startup".to_string();
+    service
+        .deploy(
+            worker.clone(),
+            r#"
+await Deno.core.ops.op_sleep(800);
+
+export default {
+  async fetch() {
+    return new Response("ready");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let invoke_service = service.clone();
+    let invoke_worker = worker.clone();
+    let invoke = tokio::spawn(async move {
+        invoke_service
+            .invoke(
+                invoke_worker,
+                test_invocation_with_path("/", "slow-startup-invoke"),
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let stats = service.stats(worker.clone()).await.expect("stats");
+            if stats.queued == 1 && stats.isolates_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("request should wait while the isolate starts");
+
+    let stats_started = Instant::now();
+    let stats = timeout(Duration::from_millis(250), service.stats(worker.clone()))
+        .await
+        .expect("stats should not wait for isolate startup")
+        .expect("stats");
+    assert_eq!(stats.queued, 1);
+    assert_eq!(stats.inflight_total, 0);
+    assert!(
+        stats_started.elapsed() < Duration::from_millis(250),
+        "stats was delayed by isolate startup: {:?}",
+        stats_started.elapsed(),
+    );
+
+    let output = timeout(Duration::from_secs(2), invoke)
+        .await
+        .expect("invoke join should not hang")
+        .expect("invoke task should complete")
+        .expect("invoke should succeed");
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "ready");
+    let stats = service.stats(worker).await.expect("stats");
+    assert_eq!(stats.spawn_count, 1);
 }
 
 #[tokio::test]
@@ -124,6 +247,141 @@ export default {
     )
     .await;
     assert_eq!(String::from_utf8(output.body).expect("utf8"), "22");
+}
+
+#[tokio::test]
+#[serial]
+async fn host_fetch_is_single_permanent_request_scoped_wrapper() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "fetch-wrapper".to_string(),
+            r#"
+let firstFetch;
+let firstInstaller;
+let firstRequestIdGetter;
+let firstRequestContextHandleGetter;
+let firstSyncBoundary;
+let firstCacheBypassGetter;
+
+export default {
+  async fetch() {
+    const current = globalThis.fetch;
+    const installer = globalThis.__dd_install_host_fetch;
+    const requestIdGetter = globalThis.__dd_get_runtime_request_id;
+    const requestContextHandleGetter = globalThis.__dd_get_runtime_request_context_handle;
+    const syncBoundary = globalThis.__dd_sync_time_boundary;
+    const cacheBypassGetter = globalThis.__dd_get_cache_bypass_stale;
+    const first = firstFetch === undefined;
+    if (first) {
+      firstFetch = current;
+      firstInstaller = installer;
+      firstRequestIdGetter = requestIdGetter;
+      firstRequestContextHandleGetter = requestContextHandleGetter;
+      firstSyncBoundary = syncBoundary;
+      firstCacheBypassGetter = cacheBypassGetter;
+    }
+    return Response.json({
+      first,
+      sameAsFirst: current === firstFetch,
+      installerAvailable: typeof installer === "function",
+      installerSameAsFirst: installer === firstInstaller,
+      requestIdGetterSameAsFirst: requestIdGetter === firstRequestIdGetter,
+      requestContextHandleGetterSameAsFirst: requestContextHandleGetter === firstRequestContextHandleGetter,
+      syncBoundarySameAsFirst: syncBoundary === firstSyncBoundary,
+      cacheBypassGetterSameAsFirst: cacheBypassGetter === firstCacheBypassGetter,
+      cacheBypassGetterAvailable: typeof cacheBypassGetter === "function",
+      cacheBypassValue: Boolean(cacheBypassGetter?.()),
+      rawAvailable: typeof globalThis.__dd_raw_host_fetch === "function",
+      rawInstalled: current === globalThis.__dd_raw_host_fetch,
+      wrapperInstalled: current.__dd_host_fetch === true,
+    });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke(
+            "fetch-wrapper".to_string(),
+            test_invocation_with_path("/", "fetch-wrapper-first"),
+        )
+        .await
+        .expect("first invoke should succeed");
+    let second = service
+        .invoke(
+            "fetch-wrapper".to_string(),
+            test_invocation_with_path("/", "fetch-wrapper-second"),
+        )
+        .await
+        .expect("second invoke should succeed");
+
+    let first: Value = serde_json::from_slice(&first.body).expect("first body should be json");
+    let second: Value = serde_json::from_slice(&second.body).expect("second body should be json");
+
+    assert_eq!(first["first"], true);
+    assert_eq!(first["sameAsFirst"], true);
+    assert_eq!(first["installerAvailable"], true);
+    assert_eq!(first["installerSameAsFirst"], true);
+    assert_eq!(first["requestIdGetterSameAsFirst"], true);
+    assert_eq!(first["requestContextHandleGetterSameAsFirst"], true);
+    assert_eq!(first["syncBoundarySameAsFirst"], true);
+    assert_eq!(first["cacheBypassGetterSameAsFirst"], true);
+    assert_eq!(first["cacheBypassGetterAvailable"], true);
+    assert_eq!(first["cacheBypassValue"], false);
+    assert_eq!(first["rawAvailable"], true);
+    assert_eq!(first["rawInstalled"], false);
+    assert_eq!(first["wrapperInstalled"], true);
+    assert_eq!(second["first"], false);
+    assert_eq!(second["sameAsFirst"], true);
+    assert_eq!(second["installerAvailable"], true);
+    assert_eq!(second["installerSameAsFirst"], true);
+    assert_eq!(second["requestIdGetterSameAsFirst"], true);
+    assert_eq!(second["requestContextHandleGetterSameAsFirst"], true);
+    assert_eq!(second["syncBoundarySameAsFirst"], true);
+    assert_eq!(second["cacheBypassGetterSameAsFirst"], true);
+    assert_eq!(second["cacheBypassGetterAvailable"], true);
+    assert_eq!(second["cacheBypassValue"], false);
+    assert_eq!(second["rawAvailable"], true);
+    assert_eq!(second["rawInstalled"], false);
+    assert_eq!(second["wrapperInstalled"], true);
+
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    assert!(worker_runtime_source.contains("__dd_install_host_fetch"));
+    assert!(worker_runtime_source.contains("value: function installHostFetch()"));
+    assert!(worker_runtime_source
+        .contains("const installHostFetch = globalThis.__dd_install_host_fetch"));
+    assert!(!worker_runtime_source.contains("const installHostFetch = () =>"));
+    assert!(worker_runtime_source.contains("__dd_get_cache_bypass_stale"));
+    assert!(worker_runtime_source.contains("cacheBypassStale,"));
+    assert!(!worker_runtime_source.contains("globalThis.__dd_get_runtime_request_id ="));
+    assert!(!worker_runtime_source.contains("globalThis.__dd_get_runtime_request_context_handle ="));
+    assert!(!worker_runtime_source.contains("globalThis.__dd_sync_time_boundary ="));
+    assert!(!worker_runtime_source.contains("globalThis.__dd_cache_bypass_stale ="));
+    let bootstrap_source = include_str!("../../js/bootstrap.js");
+    assert!(bootstrap_source.contains("function activeCacheBypassStale()"));
+    assert!(bootstrap_source.contains("activeCacheBypassStale(),"));
+    assert!(!bootstrap_source.contains("__dd_cache_bypass_stale"));
+    assert_eq!(
+        worker_runtime_source
+            .matches("globalThis.fetch = scopedFetch")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -227,6 +485,145 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn worker_queue_rejects_when_global_limit_is_full_across_workers() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        max_queued_requests_per_worker: 8,
+        max_global_queued_requests: 1,
+        max_global_queued_bytes: 1024 * 1024,
+        max_queue_wait: Duration::from_secs(5),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker_a = "global-queue-a".to_string();
+    let worker_b = "global-queue-b".to_string();
+    let source = r#"
+export default {
+  async fetch(request) {
+    await Deno.core.ops.op_sleep(300);
+    return new Response(new URL(request.url).pathname);
+  },
+};
+"#
+    .to_string();
+    service
+        .deploy(worker_a.clone(), source.clone())
+        .await
+        .expect("worker a deploy should succeed");
+    service
+        .deploy(worker_b.clone(), source)
+        .await
+        .expect("worker b deploy should succeed");
+
+    let first_a_service = service.clone();
+    let first_a_worker = worker_a.clone();
+    let first_a = tokio::spawn(async move {
+        first_a_service
+            .invoke(
+                first_a_worker,
+                test_invocation_with_path("/one", "global-a-one"),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service
+                .stats(worker_a.clone())
+                .await
+                .expect("worker a stats");
+            if stats.inflight_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker a first request should dispatch");
+
+    let first_b_service = service.clone();
+    let first_b_worker = worker_b.clone();
+    let first_b = tokio::spawn(async move {
+        first_b_service
+            .invoke(
+                first_b_worker,
+                test_invocation_with_path("/one", "global-b-one"),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service
+                .stats(worker_b.clone())
+                .await
+                .expect("worker b stats");
+            if stats.inflight_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker b first request should dispatch");
+
+    let queued_a_service = service.clone();
+    let queued_a_worker = worker_a.clone();
+    let queued_a = tokio::spawn(async move {
+        queued_a_service
+            .invoke(
+                queued_a_worker,
+                test_invocation_with_path("/two", "global-a-two"),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service
+                .stats(worker_a.clone())
+                .await
+                .expect("worker a stats");
+            if stats.queued == 1 && stats.inflight_total == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("worker a second request should occupy the only global queue slot");
+
+    let error = service
+        .invoke(
+            worker_b.clone(),
+            test_invocation_with_path("/two", "global-b-two"),
+        )
+        .await
+        .expect_err("worker b queued request should hit the global queue limit");
+    assert_eq!(error.kind(), ErrorKind::Overloaded);
+    assert!(error.to_string().contains("runtime queue is full"));
+
+    timeout(Duration::from_secs(3), first_a)
+        .await
+        .expect("worker a first join")
+        .expect("worker a first request should complete")
+        .expect("worker a first request should succeed");
+    timeout(Duration::from_secs(3), queued_a)
+        .await
+        .expect("worker a queued join")
+        .expect("worker a queued request should complete")
+        .expect("worker a queued request should succeed");
+    timeout(Duration::from_secs(3), first_b)
+        .await
+        .expect("worker b first join")
+        .expect("worker b first request should complete")
+        .expect("worker b first request should succeed");
+}
+
+#[tokio::test]
+#[serial]
 async fn worker_queue_expires_requests_after_queue_wait_limit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
@@ -310,6 +707,290 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn worker_request_wall_timeout_retires_cooperative_isolate() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        request_wall_timeout: Duration::from_millis(50),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(10),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "cooperative-wall-timeout".to_string();
+    service
+        .deploy(
+            worker.clone(),
+            r#"
+export default {
+  async fetch() {
+    await Deno.core.ops.op_sleep(500);
+    return new Response("late");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let error = timeout(
+        Duration::from_secs(2),
+        service.invoke(worker.clone(), test_invocation()),
+    )
+    .await
+    .expect("invoke should not hang")
+    .expect_err("request should exceed wall timeout");
+    assert!(
+        error.to_string().contains("wall-time limit"),
+        "unexpected error: {error}"
+    );
+
+    wait_for_isolate_total(&service, &worker, 0).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn worker_request_wall_timeout_interrupts_cpu_bound_isolate() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        request_wall_timeout: Duration::from_millis(50),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(10),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "cpu-wall-timeout".to_string();
+    service
+        .deploy(
+            worker.clone(),
+            r#"
+export default {
+  fetch() {
+    while (true) {}
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let started_at = Instant::now();
+    let error = timeout(
+        Duration::from_secs(2),
+        service.invoke(worker.clone(), test_invocation()),
+    )
+    .await
+    .expect("invoke should not hang")
+    .expect_err("request should exceed wall timeout");
+    assert!(
+        error.to_string().contains("wall-time limit"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "cpu-bound request took too long to interrupt"
+    );
+
+    wait_for_isolate_total(&service, &worker, 0).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn buffered_request_body_limit_rejects_before_dispatch() {
+    let service = test_service(RuntimeConfig {
+        max_request_body_bytes: 3,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "request-limit".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    return new Response(await request.text());
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut request = test_invocation();
+    request.method = "POST".to_string();
+    request.body = b"four".to_vec();
+    let error = service
+        .invoke("request-limit".to_string(), request)
+        .await
+        .expect_err("oversized request should fail");
+    assert!(
+        error.to_string().contains("max_request_body_bytes"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn streamed_request_body_limit_fails_during_read() {
+    let service = test_service(RuntimeConfig {
+        max_request_body_bytes: 3,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "streamed-request-limit".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    return new Response(await request.text());
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let (tx, rx) = mpsc::channel(4);
+    tx.send(Ok(Bytes::from_static(b"ab")))
+        .await
+        .expect("send first chunk");
+    tx.send(Ok(Bytes::from_static(b"cd")))
+        .await
+        .expect("send second chunk");
+    drop(tx);
+
+    let mut request = test_invocation();
+    request.method = "POST".to_string();
+    let error = service
+        .invoke_with_request_body("streamed-request-limit".to_string(), request, Some(rx))
+        .await
+        .expect_err("oversized streamed request should fail");
+    assert!(
+        error.to_string().contains("max_request_body_bytes"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn buffered_response_body_limit_rejects_completion() {
+    let service = test_service(RuntimeConfig {
+        max_response_body_bytes: 4,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "response-limit".to_string(),
+            r#"
+export default {
+  fetch() {
+    return new Response("hello");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let error = service
+        .invoke("response-limit".to_string(), test_invocation())
+        .await
+        .expect_err("oversized response should fail");
+    assert!(
+        error.to_string().contains("max_response_body_bytes"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn streamed_response_body_limit_fails_stream_and_retires_isolate() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        max_response_body_bytes: 5,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(10),
+        queue_warn_thresholds: vec![1],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "streamed-response-limit".to_string(),
+            r#"
+export default {
+  fetch(request) {
+    if (new URL(request.url).pathname === "/ok") {
+      return new Response("ok");
+    }
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue("abc");
+        controller.enqueue("def");
+        controller.close();
+      }
+    }));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream(
+            "streamed-response-limit".to_string(),
+            test_invocation_with_path("/stream", "stream-limit"),
+        )
+        .await
+        .expect("stream should start");
+    let first = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("first chunk should arrive")
+        .expect("body should still be open")
+        .expect("first chunk should be ok");
+    assert_eq!(String::from_utf8(first.to_vec()).expect("utf8"), "abc");
+
+    let error = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("limit error should arrive")
+        .expect("body should report limit error")
+        .expect_err("second chunk should exceed response limit");
+    assert!(
+        error.to_string().contains("max_response_body_bytes"),
+        "unexpected error: {error}"
+    );
+
+    let followup = timeout(
+        Duration::from_secs(3),
+        service.invoke(
+            "streamed-response-limit".to_string(),
+            test_invocation_with_path("/ok", "stream-limit-followup"),
+        ),
+    )
+    .await
+    .expect("stream limit should retire the isolate and allow a followup")
+    .expect("followup invoke should succeed");
+    assert_eq!(String::from_utf8(followup.body).expect("utf8"), "ok");
+}
+
+#[tokio::test]
+#[serial]
 async fn deployed_assets_resolve_with_headers_and_head_support() {
     let service = test_service(RuntimeConfig::default()).await;
     service
@@ -323,19 +1004,17 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
         .await
         .expect("deploy should succeed");
 
+    let private_public_lookup = service
+        .resolve_public_asset("assets", "GET", Some("foo.example.com"), "/a.js", &[])
+        .expect("public asset lookup should succeed");
+    assert!(private_public_lookup.is_none());
+
     let asset = service
-        .resolve_asset(
-            "assets".to_string(),
-            "GET".to_string(),
-            Some("foo.example.com:443".to_string()),
-            "/a.js".to_string(),
-            Vec::new(),
-        )
-        .await
+        .resolve_asset("assets", "GET", Some("foo.example.com:443"), "/a.js", &[])
         .expect("asset lookup should succeed")
         .expect("asset should exist");
     assert_eq!(asset.status, 200);
-    assert_eq!(asset.body, b"asset-body");
+    assert_eq!(asset.body.as_ref(), b"asset-body");
     assert!(asset.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("cache-control") && value == "public, max-age=60"
     }));
@@ -353,13 +1032,12 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
 
     let head = service
         .resolve_asset(
-            "assets".to_string(),
-            "HEAD".to_string(),
-            Some("foo.example.com".to_string()),
-            "/nested/b.css".to_string(),
-            Vec::new(),
+            "assets",
+            "HEAD",
+            Some("foo.example.com"),
+            "/nested/b.css",
+            &[],
         )
-        .await
         .expect("head lookup should succeed")
         .expect("asset should exist");
     assert_eq!(head.status, 200);
@@ -371,13 +1049,12 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
 
     let not_modified = service
         .resolve_asset(
-            "assets".to_string(),
-            "GET".to_string(),
-            Some("foo.example.com".to_string()),
-            "/a.js".to_string(),
-            vec![("if-none-match".to_string(), etag)],
+            "assets",
+            "GET",
+            Some("foo.example.com"),
+            "/a.js",
+            &[("if-none-match".to_string(), etag)],
         )
-        .await
         .expect("etag lookup should succeed")
         .expect("asset should exist");
     assert_eq!(not_modified.status, 304);
@@ -413,17 +1090,10 @@ async fn deployed_assets_restore_from_worker_store() {
     let restored =
         test_service_with_paths(RuntimeConfig::default(), root.clone(), database_url, true).await;
     let asset = restored
-        .resolve_asset(
-            "assets".to_string(),
-            "GET".to_string(),
-            Some("foo.example.com".to_string()),
-            "/a.js".to_string(),
-            Vec::new(),
-        )
-        .await
+        .resolve_asset("assets", "GET", Some("foo.example.com"), "/a.js", &[])
         .expect("asset lookup should succeed")
         .expect("asset should exist after restore");
-    assert_eq!(asset.body, b"asset-body");
+    assert_eq!(asset.body.as_ref(), b"asset-body");
 
     let _ = tokio::fs::remove_dir_all(root).await;
 }
@@ -581,11 +1251,15 @@ async fn temporary_worker_expires_while_runtime_is_running() {
             "preview-live".to_string(),
             versioned_worker("temp", 0),
             DeployConfig::default(),
-            Vec::new(),
+            test_assets(),
             None,
         )
         .await
         .expect("temporary deploy should succeed");
+    assert!(service
+        .resolve_asset("preview-live", "GET", None, "/a.js", &[],)
+        .expect("asset lookup before expiry should succeed")
+        .is_some());
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -597,6 +1271,10 @@ async fn temporary_worker_expires_while_runtime_is_running() {
     })
     .await
     .expect("temporary worker should expire");
+    assert!(service
+        .resolve_asset("preview-live", "GET", None, "/a.js", &[],)
+        .expect("asset lookup after expiry should succeed")
+        .is_none());
 }
 
 #[tokio::test]
@@ -950,6 +1628,28 @@ async fn lazy_kv_get_batching_decodes_mixed_values_and_rejects_whole_batch_on_fa
         ]
     );
 
+    let listed = service
+        .invoke(
+            worker_name.clone(),
+            test_invocation_with_path("/list-object", "kv-list-object-request"),
+        )
+        .await
+        .expect("list object read should succeed");
+    let listed_values: Vec<Value> =
+        crate::json::from_string(String::from_utf8(listed.body).expect("list body should be utf8"))
+            .expect("list response should parse");
+    assert_eq!(listed_values.len(), 1);
+    assert_eq!(
+        listed_values[0]["key"],
+        Value::String("obj-list".to_string())
+    );
+    assert_eq!(
+        listed_values[0]["encoding"],
+        Value::String("v8sc".to_string())
+    );
+    assert_eq!(listed_values[0]["value"]["ok"], Value::Bool(true));
+    assert_eq!(listed_values[0]["value"]["n"], Value::from(17));
+
     let rejected = service
         .invoke(
             worker_name,
@@ -1187,6 +1887,160 @@ async fn kv_write_overlay_makes_same_request_reads_predictable() {
         String::from_utf8(output.body).expect("body should be utf8"),
         "9"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn kv_queued_durability_returns_explicit_version_ack() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 8,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    let worker_name = "kv-queued-durability".to_string();
+    service
+        .deploy_with_config(
+            worker_name.clone(),
+            kv_write_worker(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Kv {
+                    binding: "MY_KV".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+    service
+        .invoke(
+            worker_name.clone(),
+            test_invocation_with_path("/seed", "kv-queued-durability-seed"),
+        )
+        .await
+        .expect("seed should succeed");
+
+    let put = service
+        .invoke(
+            worker_name.clone(),
+            test_invocation_with_path("/put-queued-version-read", "kv-queued-durability-put"),
+        )
+        .await
+        .expect("queued put should succeed");
+    let put_body: Value =
+        serde_json::from_slice(&put.body).expect("queued put response should be json");
+    assert_eq!(put_body["queued"], Value::Bool(true));
+    assert_eq!(put_body["durability"], Value::String("queued".to_string()));
+    assert!(put_body["version"].as_i64().expect("queued put version") > 0);
+    assert_eq!(put_body["value"], Value::String("13".to_string()));
+
+    let delete = service
+        .invoke(
+            worker_name,
+            test_invocation_with_path("/delete-queued-version-read", "kv-queued-durability-delete"),
+        )
+        .await
+        .expect("queued delete should succeed");
+    let delete_body: Value =
+        serde_json::from_slice(&delete.body).expect("queued delete response should be json");
+    assert_eq!(delete_body["queued"], Value::Bool(true));
+    assert_eq!(
+        delete_body["durability"],
+        Value::String("queued".to_string())
+    );
+    assert!(
+        delete_body["version"]
+            .as_i64()
+            .expect("queued delete version")
+            > 0
+    );
+    assert_eq!(delete_body["value"], Value::Null);
+}
+
+#[tokio::test]
+#[serial]
+async fn kv_committed_durability_awaits_canonical_write() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 8,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    let worker_name = "kv-committed-durability".to_string();
+    service
+        .deploy_with_config(
+            worker_name.clone(),
+            kv_write_worker(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Kv {
+                    binding: "MY_KV".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+    service
+        .invoke(
+            worker_name.clone(),
+            test_invocation_with_path("/seed", "kv-committed-durability-seed"),
+        )
+        .await
+        .expect("seed should succeed");
+
+    let put = service
+        .invoke(
+            worker_name.clone(),
+            test_invocation_with_path("/put-committed-read", "kv-committed-durability-put"),
+        )
+        .await
+        .expect("committed put should succeed");
+    let put_body = String::from_utf8(put.body).expect("put body should be utf8");
+    let (put_version, put_value) = put_body
+        .split_once(':')
+        .expect("committed put should return version and value");
+    assert!(put_version.parse::<i64>().expect("put version") > 0);
+    assert_eq!(put_value, "12");
+
+    let put_object = service
+        .invoke(
+            worker_name.clone(),
+            test_invocation_with_path(
+                "/put-committed-object-read",
+                "kv-committed-durability-put-object",
+            ),
+        )
+        .await
+        .expect("committed object put should succeed");
+    let object_body: Value =
+        serde_json::from_slice(&put_object.body).expect("object response should be json");
+    assert!(object_body["version"].as_i64().expect("object version") > 0);
+    assert_eq!(object_body["value"]["ok"], Value::Bool(true));
+    assert_eq!(object_body["value"]["n"], Value::from(12));
+
+    let delete = service
+        .invoke(
+            worker_name,
+            test_invocation_with_path("/delete-committed-read", "kv-committed-durability-delete"),
+        )
+        .await
+        .expect("committed delete should succeed");
+    let delete_body = String::from_utf8(delete.body).expect("delete body should be utf8");
+    let (delete_version, delete_value) = delete_body
+        .split_once(':')
+        .expect("committed delete should return version and value");
+    assert!(delete_version.parse::<i64>().expect("delete version") > 0);
+    assert_eq!(delete_value, "missing");
 }
 
 #[tokio::test]
@@ -2346,9 +3200,57 @@ export default {
 
     let mut body = Vec::new();
     while let Some(chunk) = output.body.recv().await {
-        body.extend(chunk.expect("chunk should be ok"));
+        body.extend_from_slice(&chunk.expect("chunk should be ok"));
     }
     assert_eq!(String::from_utf8(body).expect("utf8"), "hello");
+}
+
+#[tokio::test]
+#[serial]
+async fn invoke_stream_delivers_binary_response_chunks() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "binary-streaming".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([0, 255, 1]));
+        controller.enqueue(new Uint8Array([2, 128, 3]));
+        controller.close();
+      }
+    }), { status: 206, headers: [["content-type", "application/octet-stream"]] });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream("binary-streaming".to_string(), test_invocation())
+        .await
+        .expect("invoke stream should succeed");
+    assert_eq!(output.status, 206);
+
+    let mut body = Vec::new();
+    while let Some(chunk) = output.body.recv().await {
+        body.extend_from_slice(&chunk.expect("chunk should be ok"));
+    }
+    assert_eq!(body, vec![0, 255, 1, 2, 128, 3]);
 }
 
 #[tokio::test]
@@ -2401,7 +3303,7 @@ export default {
         .expect("first chunk should arrive")
         .expect("body should still be open")
         .expect("first chunk should be ok");
-    assert_eq!(String::from_utf8(first).expect("utf8"), "first");
+    assert_eq!(String::from_utf8(first.to_vec()).expect("utf8"), "first");
 
     drop(output);
 
@@ -2454,10 +3356,10 @@ async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
         })
     };
 
-    tx.send(Ok(b"hel".to_vec()))
+    tx.send(Ok(Bytes::from_static(b"hel")))
         .await
         .expect("first body chunk should send");
-    tx.send(Ok(b"lo".to_vec()))
+    tx.send(Ok(Bytes::from_static(b"lo")))
         .await
         .expect("second body chunk should send");
     drop(tx);
@@ -2788,6 +3690,649 @@ fn dynamic_host_rpc_fake_wake_path_is_removed_from_runtime_sources() {
     assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/sockets_transport.js"));
     assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/memory.js"));
     assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/dynamic.js"));
+}
+
+#[test]
+fn dynamic_module_workers_do_not_generate_js_import_wrappers() {
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let dynamic_modules_source = include_str!("../dynamic_modules.rs");
+    let dynamic_ops_source = include_str!("../ops/dynamic.rs");
+
+    assert!(!worker_runtime_source.contains("buildSourceFromModules"));
+    assert!(!worker_runtime_source.contains("normalizeModulePath"));
+    assert!(!worker_runtime_source.contains("dynamicSourceCacheKey"));
+    assert!(!worker_runtime_source.contains("dynamic worker missing entrypoint module"));
+    assert!(!worker_runtime_source.contains("__dd_dynamic_graph"));
+    assert!(!worker_runtime_source.contains("await import(\"dd-dynamic://graph/\""));
+    assert!(worker_runtime_source.contains("op_dynamic_module_graph_register"));
+    assert!(worker_runtime_source.contains("result.entrypoint"));
+    assert!(worker_runtime_source.contains("module_graph_id"));
+    assert!(worker_runtime_source.contains("module_entrypoint"));
+    assert!(dynamic_ops_source.contains("#[string] entrypoint: String"));
+    assert!(dynamic_modules_source.contains("register_dynamic_module_graph("));
+    assert!(dynamic_modules_source.contains("normalize_dynamic_module_path(entrypoint)"));
+    assert!(dynamic_modules_source.contains("dynamic module graph missing entrypoint module"));
+    assert!(dynamic_modules_source.contains("duplicate normalized path"));
+}
+
+#[test]
+fn worker_invocation_uses_typed_request_handle_runtime_entrypoint() {
+    let engine_source = include_str!("../engine.rs");
+    let ops_source = include_str!("../ops.rs");
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let api_invocation_source = include_str!("../../../api/src/handlers/invocation.rs");
+    let request_types_source = include_str!("../ops/request_types.rs");
+    let request_ops_source = include_str!("../ops/request.rs");
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+
+    assert!(!engine_source.contains("<dd:invoke>"));
+    assert!(!engine_source.contains("execute_script(\"<dd:invoke>\""));
+    assert!(engine_source.contains("__dd_execute_worker_handle"));
+    assert!(worker_runtime_source.contains("__dd_execute_worker_handle = (requestHandle)"));
+    assert!(worker_runtime_source.contains("op_http_take_prepared_headers"));
+    assert!(worker_runtime_source.contains("op_http_take_prepared_body(requestBodyHandle)"));
+    assert!(worker_runtime_source.contains("op_http_take_prepared_body\", bodyHandle"));
+    assert!(engine_source.contains("request_headers_handle"));
+    assert!(engine_source.contains("request_body_handle"));
+    assert!(engine_source.contains("HttpPreparedHeaders"));
+    assert!(engine_source.contains("HttpPreparedBodies"));
+    assert!(api_invocation_source.contains("tx.send(Ok(chunk))"));
+    assert!(!api_invocation_source.contains("tx.send(Ok(chunk.to_vec()))"));
+    assert!(request_types_source
+        .contains("pub type RequestBodyChunk = std::result::Result<Bytes, String>"));
+    assert!(request_types_source.contains("bodies: HashMap<u32, Bytes>"));
+    assert!(request_ops_source.contains(".insert(bytes)"));
+    assert!(storage_http_source.contains("#[buffer] body: JsBuffer"));
+    assert!(storage_http_source.contains("Bytes::copy_from_slice(body.as_ref())"));
+    assert!(storage_http_source.contains("pub(crate) struct KvGetValueResult"));
+    assert!(storage_http_source.contains("pub(crate) struct KvListItem"));
+    assert!(storage_http_source.contains("value_handle: u32"));
+    assert!(storage_http_source.contains(".insert(Bytes::from(value.value))"));
+    assert!(storage_http_source.contains("to_list_item(entry, bodies)"));
+    assert!(worker_runtime_source.contains("result.value_handle"));
+    assert!(worker_runtime_source.contains("entry?.value_handle"));
+    assert!(!storage_http_source.contains("#[buffer(copy)] body: Vec<u8>"));
+    assert!(!storage_http_source.contains("value: Vec<u8>,\n    encoding: String,\n}\n\n#[derive(Debug, Serialize)]\npub(crate) struct KvGetValueResult"));
+    assert!(!storage_http_source.contains(
+        "pub(crate) struct KvGetValueResult {\n    ok: bool,\n    found: bool,\n    value: Vec<u8>"
+    ));
+    assert!(!worker_runtime_source.contains("new Uint8Array(Array.isArray(rawValue)"));
+    assert!(!worker_runtime_source.contains("entry?.value, \"kv list\""));
+    assert!(request_types_source.contains("take_descriptor"));
+    assert!(!ops_source.contains("std::mem::take(&mut payload.request.headers)"));
+    assert!(!worker_runtime_source.contains("op_take_request_invocation_body"));
+    assert!(!worker_runtime_source.contains("op_take_request_body_chunk"));
+    assert!(!worker_runtime_source.contains("descriptor.headers"));
+    assert!(!worker_runtime_source.contains("payload?.request ??"));
+    assert!(!worker_runtime_source.contains("request: {\n      method: String(descriptor.method"));
+    assert!(worker_runtime_source.contains("const input = {"));
+    assert!(worker_runtime_source.contains("input_request_id: String(descriptor.input_request_id"));
+    assert!(request_types_source.contains("request_headers_handle"));
+    assert!(request_types_source.contains("request_body_handle"));
+    assert!(request_types_source.contains("input_request_id: String"));
+    assert!(!request_types_source.contains("request: WorkerInvocation"));
+    assert!(!request_types_source.contains("payload.request."));
+    assert!(engine_source.contains("method: mem::take(&mut request.method)"));
+    assert!(engine_source.contains("url: mem::take(&mut request.url)"));
+    assert!(engine_source.contains("input_request_id: mem::take(&mut request.request_id)"));
+    assert!(request_types_source.contains("body_handle: u32"));
+    assert!(!request_types_source.contains("pub(crate) headers: Vec<(String, String)>,"));
+    assert!(!request_types_source.contains("fn take_body("));
+    assert!(!request_types_source.contains("RequestBodyChunkHandles"));
+}
+
+#[test]
+fn memory_rpc_nested_request_ids_are_host_generated() {
+    let memory_ops_source = include_str!("../ops/memory.rs");
+    let dynamic_ops_source = include_str!("../ops/dynamic.rs");
+    let dynamic_types_source = include_str!("../ops/dynamic_types.rs");
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let pending_reply_start = dynamic_types_source
+        .find("pub struct DynamicPendingReplyResult")
+        .expect("dynamic pending reply result should exist");
+    let pending_reply_end = dynamic_types_source[pending_reply_start..]
+        .find("pub struct DynamicFetchReplyResult")
+        .map(|offset| pending_reply_start + offset)
+        .expect("dynamic fetch reply result should follow pending reply result");
+    let pending_reply_source = &dynamic_types_source[pending_reply_start..pending_reply_end];
+
+    assert!(memory_ops_source.contains("MEMORY_INVOKE_REQUEST_SEQ"));
+    assert!(memory_ops_source.contains(":memory-run:"));
+    assert!(worker_runtime_source.contains("op_memory_invoke_method"));
+    assert!(memory_ops_source.contains("#[buffer] args: JsBuffer"));
+    assert!(!memory_ops_source.contains("#[buffer(copy)] args: Vec<u8>"));
+    assert!(!worker_runtime_source.contains(":memory-run:"));
+    assert!(dynamic_ops_source.contains("DYNAMIC_FETCH_REQUEST_SEQ"));
+    assert!(dynamic_ops_source.contains(":dynamic:"));
+    assert!(worker_runtime_source.contains("op_dynamic_worker_fetch_start"));
+    assert_eq!(
+        dynamic_ops_source
+            .matches("#[buffer] args: JsBuffer")
+            .count(),
+        2
+    );
+    assert!(!dynamic_ops_source.contains("#[buffer(copy)] args: Vec<u8>"));
+    assert!(!worker_runtime_source.contains(":dynamic:"));
+    assert!(dynamic_ops_source.contains("headers_handle: u32"));
+    assert!(dynamic_ops_source.contains("body_handle: u32"));
+    assert!(!dynamic_ops_source.contains("#[serde] headers: Vec<(String, String)>"));
+    assert!(!dynamic_ops_source.contains("#[buffer(copy)] body: Vec<u8>"));
+    assert!(!pending_reply_source.contains("status: u16"));
+    assert!(!pending_reply_source.contains("Vec<(String, String)>"));
+    assert!(!pending_reply_source.contains("body: Vec<u8>"));
+    assert!(pending_reply_source.contains("value_handle: u32"));
+    assert!(pending_reply_source.contains("pending_value: Option<Vec<u8>>"));
+    assert!(!pending_reply_source.contains("value: Vec<u8>"));
+    assert!(!dynamic_types_source.contains("pub headers: Vec<(String, String)>"));
+    assert!(!dynamic_types_source.contains("pub body: Vec<u8>"));
+    assert!(dynamic_types_source.contains("pub pending_output: Option<WorkerOutput>"));
+    assert!(dynamic_ops_source.contains("reply.headers_handle"));
+    assert!(dynamic_ops_source.contains("reply.body_handle"));
+    assert!(dynamic_ops_source.contains("reply.value_handle"));
+    assert!(dynamic_types_source.contains("pub headers_handle: u32"));
+    assert!(dynamic_types_source.contains("pub body_handle: u32"));
+    assert!(dynamic_ops_source.contains("pending_output.take()"));
+    assert!(dynamic_ops_source.contains("pending_value.take()"));
+    assert!(worker_runtime_source.contains("result.headers_handle"));
+    assert!(worker_runtime_source.contains("result.body_handle"));
+    assert!(worker_runtime_source.contains("result.value_handle"));
+    assert!(worker_runtime_source.contains("op_http_take_prepared_body\", valueHandle"));
+    assert!(worker_runtime_source.contains("const discardDynamicReplyHandles = (payload) =>"));
+    assert!(worker_runtime_source.contains("payload?.value_handle"));
+    assert!(worker_runtime_source.contains("discardDynamicReplyHandles(payload)"));
+    assert!(worker_runtime_source.contains("discardDynamicReplyHandles(readyPayload)"));
+    assert!(!worker_runtime_source.contains("toArrayBytes(result.body)"));
+    assert!(!worker_runtime_source.contains("toArrayBytes(result.value)"));
+    assert!(!worker_runtime_source.contains("Array.isArray(result.headers) ? result.headers : []"));
+}
+
+#[test]
+fn response_streaming_uses_binary_chunk_ops_not_json_number_arrays() {
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+    let ops_source = include_str!("../ops.rs");
+    let facade_source = include_str!("facade.rs");
+    let lifecycle_source = include_str!("lifecycle.rs");
+    let complete_start = lifecycle_source
+        .find("pub(crate) async fn complete_stream_registration")
+        .expect("complete_stream_registration should be async");
+    let complete_end = lifecycle_source[complete_start..]
+        .find("pub(crate) fn fail_all_streams_for_worker")
+        .map(|offset| complete_start + offset)
+        .expect("fail_all_streams_for_worker should follow complete_stream_registration");
+    let complete_source = &lifecycle_source[complete_start..complete_end];
+
+    assert!(worker_runtime_source.contains("op_emit_response_chunk"));
+    assert!(storage_http_source.contains("#[buffer] chunk: JsBuffer"));
+    assert!(storage_http_source.contains("Bytes::copy_from_slice(chunk.as_ref())"));
+    assert!(ops_source.contains("chunk: Bytes"));
+    assert!(facade_source.contains("mpsc::Receiver<Result<Bytes>>"));
+    assert!(complete_source.contains(".body_sender.send("));
+    assert!(!complete_source.contains(".body_sender.try_send("));
+    assert!(!worker_runtime_source.contains("Array.from(bytes)"));
+    assert!(!worker_runtime_source.contains("bodyBytes.push"));
+    assert!(!worker_runtime_source.contains("JSON.stringify({ request_id"));
+}
+
+#[test]
+fn memory_realtime_ops_use_borrowed_buffer_inputs() {
+    let memory_ops_source = include_str!("../ops/memory.rs");
+    let memory_types_source = include_str!("../ops/memory_types.rs");
+    let ops_source = include_str!("../ops.rs");
+    let control_source = include_str!("control.rs");
+    let runtime_source = include_str!("runtime.rs");
+    let sessions_source = include_str!("sessions.rs");
+
+    assert!(memory_ops_source.contains("#[buffer] message: JsBuffer"));
+    assert!(memory_ops_source.contains("#[buffer] chunk: JsBuffer"));
+    assert!(memory_ops_source.contains("#[buffer] datagram: JsBuffer"));
+    assert!(!memory_ops_source.contains("#[buffer(copy)] message: Vec<u8>"));
+    assert!(!memory_ops_source.contains("#[buffer(copy)] chunk: Vec<u8>"));
+    assert!(!memory_ops_source.contains("#[buffer(copy)] datagram: Vec<u8>"));
+    assert!(!ops_source.contains("op_memory_transport_recv_stream"));
+    assert!(!ops_source.contains("op_memory_transport_recv_datagram"));
+    assert!(!memory_ops_source.contains("op_memory_transport_recv_stream"));
+    assert!(!memory_ops_source.contains("op_memory_transport_recv_datagram"));
+    assert!(!memory_types_source.contains("MemoryTransportRecvResult"));
+    assert!(!memory_types_source.contains("MemoryTransportRecvStreamEvent"));
+    assert!(!memory_types_source.contains("MemoryTransportRecvDatagramEvent"));
+    assert!(!memory_types_source.contains("TransportRecvEvent"));
+    assert!(!control_source.contains("MemoryTransportRecvStream"));
+    assert!(!control_source.contains("MemoryTransportRecvDatagram"));
+    assert!(!runtime_source.contains("MemoryTransportRecvStream"));
+    assert!(!runtime_source.contains("MemoryTransportRecvDatagram"));
+    assert!(!sessions_source.contains("handle_memory_transport_recv_stream"));
+    assert!(!sessions_source.contains("handle_memory_transport_recv_datagram"));
+    assert!(!sessions_source.contains("inbound_streams"));
+    assert!(!sessions_source.contains("inbound_stream_closed"));
+    assert!(!sessions_source.contains("inbound_datagrams"));
+}
+
+#[test]
+fn response_headers_are_prepared_handles_for_lifecycle_ops() {
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let request_types_source = include_str!("../ops/request_types.rs");
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+    let completion_start = storage_http_source
+        .find("pub(crate) fn op_emit_completion_ok")
+        .expect("op_emit_completion_ok should exist");
+    let completion_end = storage_http_source[completion_start..]
+        .find("pub(crate) fn op_emit_completion_error")
+        .map(|offset| completion_start + offset)
+        .expect("op_emit_completion_error should follow op_emit_completion_ok");
+    let completion_source = &storage_http_source[completion_start..completion_end];
+
+    assert!(worker_runtime_source.contains("op_http_store_prepared_headers"));
+    assert!(worker_runtime_source
+        .contains("headersHandle: streamResponse ? 0 : storeResponseHeaders(headers)"));
+    assert!(worker_runtime_source
+        .contains("Math.max(0, Math.trunc(Number(result.headersHandle ?? 0) || 0))"));
+    assert!(worker_runtime_source.contains("bodyHandle: 0"));
+    assert!(worker_runtime_source.contains("result.bodyHandle = callOp("));
+    assert!(worker_runtime_source
+        .contains("Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0))"));
+    assert!(!worker_runtime_source.contains("result.body = concatByteChunks"));
+    assert!(!worker_runtime_source.contains("result.body == null"));
+    assert!(request_types_source.contains("pub struct HttpPreparedHeaders"));
+    assert!(completion_source.contains("headers_handle: u32"));
+    assert!(completion_source.contains("body_handle: u32"));
+    assert!(completion_source.contains("borrow_mut::<HttpPreparedHeaders>()"));
+    assert!(completion_source.contains("borrow_mut::<HttpPreparedBodies>()"));
+    assert!(!completion_source.contains("#[buffer(copy)] body: Vec<u8>"));
+}
+
+#[test]
+fn host_fetch_prepare_uses_prepared_header_and_body_handles() {
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+    let prepare_start = storage_http_source
+        .find("pub(crate) fn op_http_prepare")
+        .expect("op_http_prepare should exist");
+    let prepare_end = storage_http_source[prepare_start..]
+        .find("pub(crate) fn op_http_take_prepared_body")
+        .map(|offset| prepare_start + offset)
+        .expect("op_http_take_prepared_body should follow op_http_prepare");
+    let prepare_source = &storage_http_source[prepare_start..prepare_end];
+
+    assert!(worker_runtime_source.contains("normalizedHeadersHandle"));
+    assert!(worker_runtime_source.contains("normalizedBodyHandle"));
+    assert!(worker_runtime_source.contains("prepared.headers_handle"));
+    assert!(prepare_source.contains("headers_handle: u32"));
+    assert!(prepare_source.contains("body_handle: u32"));
+    assert!(!prepare_source.contains("#[serde] headers: Vec<(String, String)>"));
+    assert!(!prepare_source.contains("#[buffer(copy)] body: Vec<u8>"));
+}
+
+#[test]
+fn cache_ops_use_prepared_header_and_body_handles() {
+    let bootstrap_source = include_str!("../../js/bootstrap.js");
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+    let op_source = |name: &str, next: &str| {
+        let start = storage_http_source
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} should exist"));
+        let end = storage_http_source[start..]
+            .find(next)
+            .map(|offset| start + offset)
+            .unwrap_or(storage_http_source.len());
+        &storage_http_source[start..end]
+    };
+    let match_source = op_source(
+        "pub(crate) async fn op_cache_match",
+        "pub(crate) async fn op_cache_put",
+    );
+    let put_source = op_source(
+        "pub(crate) async fn op_cache_put",
+        "pub(crate) async fn op_cache_delete",
+    );
+    let delete_source = op_source(
+        "pub(crate) async fn op_cache_delete",
+        "fn ensure_cache_allowed",
+    );
+    let revalidate_source = op_source(
+        "pub(crate) fn op_emit_cache_revalidate",
+        "pub(crate) fn replace_placeholders_text",
+    );
+
+    assert!(bootstrap_source.contains("op_http_store_prepared_headers"));
+    assert!(bootstrap_source.contains("result.body_handle"));
+    assert!(bootstrap_source.contains("result.headers_handle"));
+    assert!(!bootstrap_source.contains("new Uint8Array(result.body ?? [])"));
+    assert!(!bootstrap_source.contains("Array.isArray(result.headers) ? result.headers : []"));
+    assert!(match_source.contains("headers_handle: u32"));
+    assert!(match_source.contains("body_handle"));
+    assert!(!match_source.contains("#[serde] headers: Vec<(String, String)>"));
+    assert!(put_source.contains("request_headers_handle: u32"));
+    assert!(put_source.contains("response_headers_handle: u32"));
+    assert!(!put_source.contains("#[serde] request_headers: Vec<(String, String)>"));
+    assert!(!put_source.contains("#[serde] response_headers: Vec<(String, String)>"));
+    assert!(delete_source.contains("headers_handle: u32"));
+    assert!(!delete_source.contains("#[serde] headers: Vec<(String, String)>"));
+    assert!(revalidate_source.contains("headers_handle: u32"));
+    assert!(!revalidate_source.contains("#[serde] headers: Vec<(String, String)>"));
+}
+
+#[test]
+fn kv_committed_writes_use_writer_actor_reply_lane() {
+    let kv_source = include_str!("../kv.rs");
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+    let source_range = |start_marker: &str, end_marker: &str| {
+        let start = kv_source
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("{start_marker} should exist"));
+        let end = kv_source[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or(kv_source.len());
+        &kv_source[start..end]
+    };
+    let put_source = source_range("pub async fn put(", "pub async fn put_value(");
+    let put_value_source = source_range("pub async fn put_value(", "pub async fn delete(");
+    let delete_source = source_range("pub async fn delete(", "async fn commit_single_version(");
+
+    assert!(kv_source.contains("committed: VecDeque<KvCommittedBatch>"));
+    assert!(kv_source.contains("committed_mutations: usize"));
+    assert!(kv_source.contains("committed_bytes: usize"));
+    assert!(kv_source.contains("committed_backlog_accepts"));
+    assert!(kv_source.contains("state.push_committed"));
+    assert!(kv_source.contains("state.pop_committed"));
+    assert!(kv_source.contains("kv committed write queue overloaded: enqueue rejected"));
+    assert!(kv_source.contains("struct KvCommittedBatch"));
+    assert!(kv_source.contains("async fn commit_batch("));
+    assert!(kv_source.contains("KvWriterWork::Committed"));
+    assert!(put_source.contains("commit_single_version"));
+    assert!(put_value_source.contains("commit_single_version"));
+    assert!(delete_source.contains("commit_single_version"));
+    assert!(!put_source.contains("conn.execute("));
+    assert!(!put_value_source.contains("conn.execute("));
+    assert!(!delete_source.contains("conn.execute("));
+    assert!(!kv_source.contains("KV_VERSION_RETRIES"));
+    assert!(!kv_source.contains("execute_with_retry"));
+    assert!(storage_http_source.contains("pub(crate) async fn op_kv_put_value_bytes"));
+    assert!(storage_http_source.contains("pub(crate) fn op_kv_enqueue_put_value_bytes"));
+    assert!(storage_http_source.contains("#[buffer] value: JsBuffer"));
+    assert!(!storage_http_source.contains("#[buffer(copy)] value: Vec<u8>"));
+}
+
+#[test]
+fn wait_until_lifecycle_count_is_owned_by_request_context_handle() {
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let request_ops_source = include_str!("../ops/request.rs");
+    let request_types_source = include_str!("../ops/request_types.rs");
+    let storage_http_source = include_str!("../ops/storage_http.rs");
+
+    assert!(worker_runtime_source.contains("op_request_wait_until_register"));
+    assert!(!worker_runtime_source.contains("waitUntilDoneSent"));
+    assert!(request_ops_source.contains("op_request_wait_until_register"));
+    assert!(request_types_source.contains("increment_wait_until"));
+    assert!(request_types_source.contains("mark_wait_until_done"));
+    assert!(storage_http_source.contains("context.wait_until_count"));
+    assert!(!storage_http_source.contains("wait_until_count: u32"));
+}
+
+#[test]
+fn isolate_runtime_loop_uses_thread_local_event_queue_without_poll_sleep() {
+    let runtime_source = include_str!("runtime.rs");
+    let ops_source = include_str!("../ops.rs");
+
+    assert!(runtime_source.contains("pending_events: &Rc<RefCell<VecDeque<RuntimeEvent>>>,"));
+    assert!(runtime_source.contains("Rc::new(RefCell::new(VecDeque::<RuntimeEvent>::new()))"));
+    assert!(runtime_source.contains("event_loop_notify.notified()"));
+    assert!(runtime_source.contains("pump_event_loop_once"));
+    assert!(ops_source.contains("pub struct IsolateEventSender(pub Rc<dyn Fn"));
+    assert!(!runtime_source.contains("Arc<StdMutex<VecDeque<RuntimeEvent>>>"));
+    assert!(!runtime_source.contains("isolate event queue mutex poisoned"));
+    assert!(!runtime_source.contains("Duration::from_millis(1)"));
+    assert!(!runtime_source.contains("recv_timeout"));
+}
+
+#[test]
+fn vite_dev_websocket_bridge_waits_for_runtime_frames_without_interval_polling() {
+    let vite_source = include_str!("../../../../packages/dd-vite/src/vite.js");
+    let runtime_client_source = include_str!("../../../../packages/dd-vite/src/runtime.js");
+    let dev_runtime_source = include_str!("../bin/dd_dev_runtime.rs");
+
+    assert!(vite_source.contains("runRuntimeFrameLoop"));
+    assert!(vite_source.contains("drainRuntimeFrames"));
+    assert!(vite_source.contains("waitWebSocketFrame"));
+    assert!(!vite_source.contains("pollRuntimeFrames"));
+    assert!(!vite_source.contains("pollTimer"));
+    assert!(!vite_source.contains("setInterval(() => {\n      void this.pollRuntimeFrames();"));
+    assert!(runtime_client_source.contains("op: \"wait_websocket_frame\""));
+    assert!(runtime_client_source.contains("}, { timeoutMs: 0 })"));
+    assert!(dev_runtime_source.contains("WaitWebsocketFrame"));
+    assert!(dev_runtime_source.contains("websocket_wait_frame"));
+    assert!(dev_runtime_source.contains("mpsc::channel::<ResponseEnvelope<CommandResult>>"));
+    assert!(dev_runtime_source
+        .contains("matches!(&request.command, DevCommand::WaitWebsocketFrame { .. })"));
+    assert!(dev_runtime_source.contains("tokio::spawn(async move"));
+}
+
+#[test]
+fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
+    let model_source = include_str!("model.rs");
+    let lifecycle_source = include_str!("lifecycle.rs");
+    let dispatch_source = include_str!("dispatch.rs");
+    let remove_isolate_start = lifecycle_source
+        .find("pub(crate) fn remove_isolate(")
+        .expect("remove_isolate should exist");
+    let remove_isolate_end = lifecycle_source[remove_isolate_start..]
+        .find("pub(crate) fn remove_isolate_by_id(")
+        .map(|offset| remove_isolate_start + offset)
+        .expect("remove_isolate_by_id should follow remove_isolate");
+    let remove_isolate_source = &lifecycle_source[remove_isolate_start..remove_isolate_end];
+    let expire_queue_start = dispatch_source
+        .find("pub(crate) fn expire_queued_requests(")
+        .expect("expire_queued_requests should exist");
+    let expire_queue_end = dispatch_source[expire_queue_start..]
+        .find("pub(crate) fn expire_inflight_requests(")
+        .map(|offset| expire_queue_start + offset)
+        .expect("expire_inflight_requests should follow expire_queued_requests");
+    let expire_queue_source = &dispatch_source[expire_queue_start..expire_queue_end];
+
+    assert!(model_source.contains("by_runtime_request_id: HashMap<String, PendingQueueKey>"));
+    assert!(model_source.contains("by_target_isolate_id: HashMap<u64, HashSet<PendingQueueKey>>"));
+    assert!(model_source.contains("by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>"));
+    assert!(model_source.contains("by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>"));
+    assert!(model_source.contains("targeted: BTreeMap<u64, PendingInvoke>"));
+    assert!(model_source.contains("pub(super) fn drain_target_isolate_id("));
+    assert!(model_source.contains("pub(super) fn drain_expired("));
+    assert!(model_source.contains("pub(super) fn next_expiry_at("));
+    assert!(!model_source.contains("VecDeque<QueuedPendingInvoke>"));
+    assert!(!model_source.contains("lane.remove(index)"));
+    assert!(dispatch_source.contains("remove_by_runtime_request_id(&runtime_request_id)"));
+    assert!(remove_isolate_source.contains("pool.queue.drain_target_isolate_id(isolate.id)"));
+    assert!(remove_isolate_source
+        .contains("self.account_dequeued_many(stale_targeted_count, stale_targeted_bytes)"));
+    assert!(
+        remove_isolate_source.contains("PlatformError::runtime(\"target isolate is unavailable\")")
+    );
+    assert!(expire_queue_source.contains("pool.queue.drain_expired(now, max_queue_wait)"));
+    assert!(expire_queue_source.contains("pool.queue.next_expiry_at(max_queue_wait)"));
+    assert!(!expire_queue_source.contains("duration_since(pending.enqueued_at)"));
+    assert!(!expire_queue_source.contains("for pending in pool.queue.iter()"));
+}
+
+#[test]
+fn memory_direct_writes_route_through_actor_invocation() {
+    let memory_source = include_str!("../../js/execute_worker/memory.js");
+    let fetch_cache_source = include_str!("../../js/execute_worker/fetch_cache.js");
+    let worker_runtime_source =
+        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+    let memory_ops_source = include_str!("../ops/memory.rs");
+    let memory_types_source = include_str!("../ops/memory_types.rs");
+    let memory_store_source = include_str!("../memory.rs");
+    let add_mutation_start = worker_runtime_source
+        .find("const addMemoryBatchMutation = (txn, mutation) =>")
+        .expect("addMemoryBatchMutation should exist");
+    let add_mutation_end = worker_runtime_source[add_mutation_start..]
+        .find("const finishMemoryTxn")
+        .map(|offset| add_mutation_start + offset)
+        .expect("finishMemoryTxn should follow addMemoryBatchMutation");
+    let add_mutation_source = &worker_runtime_source[add_mutation_start..add_mutation_end];
+    let batch_mutation_start = memory_store_source
+        .find("pub struct MemoryBatchMutation")
+        .expect("MemoryBatchMutation should exist");
+    let batch_mutation_end = memory_store_source[batch_mutation_start..]
+        .find("pub struct MemoryCommandResultWrite")
+        .map(|offset| batch_mutation_start + offset)
+        .expect("MemoryCommandResultWrite should follow MemoryBatchMutation");
+    let batch_mutation_source = &memory_store_source[batch_mutation_start..batch_mutation_end];
+    let memory_state_entry_start = memory_types_source
+        .find("pub(crate) struct MemoryStateGetEntry")
+        .expect("MemoryStateGetEntry should exist");
+    let memory_state_entry_end = memory_types_source[memory_state_entry_start..]
+        .find("pub(crate) struct MemoryProfileResult")
+        .map(|offset| memory_state_entry_start + offset)
+        .expect("MemoryProfileResult should follow memory state entries");
+    let memory_state_entry_source =
+        &memory_types_source[memory_state_entry_start..memory_state_entry_end];
+    let memory_command_begin_start = memory_types_source
+        .find("pub(crate) struct MemoryCommandBeginResult")
+        .expect("MemoryCommandBeginResult should exist");
+    let memory_command_begin_end = memory_types_source[memory_command_begin_start..]
+        .find("pub(crate) struct MemorySocketSendResult")
+        .map(|offset| memory_command_begin_start + offset)
+        .unwrap_or(memory_types_source.len());
+    let memory_command_begin_source =
+        &memory_types_source[memory_command_begin_start..memory_command_begin_end];
+    let memory_invoke_method_start = memory_types_source
+        .find("pub(crate) struct MemoryInvokeMethodResult")
+        .expect("MemoryInvokeMethodResult should exist");
+    let memory_invoke_method_end = memory_types_source[memory_invoke_method_start..]
+        .find("pub(crate) struct MemorySocketSendResult")
+        .map(|offset| memory_invoke_method_start + offset)
+        .expect("MemorySocketSendResult should follow MemoryInvokeMethodResult");
+    let memory_invoke_method_source =
+        &memory_types_source[memory_invoke_method_start..memory_invoke_method_end];
+
+    assert!(memory_source.contains("async write(key, value, options)"));
+    assert!(memory_source.contains("rejectMemoryDirectOptions(\"set\", options)"));
+    assert!(memory_source.contains("return await invokeMemoryExecutable("));
+    assert!(memory_source.contains("MEMORY_ATOMIC_METHOD"));
+    assert!(memory_source.contains("state.set(String(key ?? \"\"), value)"));
+    assert!(memory_source.contains("async delete(key, options)"));
+    assert!(memory_source.contains("rejectMemoryDirectOptions(\"delete\", options)"));
+    assert!(memory_source.contains("state.delete(String(key ?? \"\"))"));
+    assert!(memory_source.contains("async writeMany(entries)"));
+    assert!(memory_source.contains("state.set(item.key, item.value)"));
+    assert!(!memory_source.contains("ensureMemoryStorageCommitted(entry, runtimeRequestId)"));
+    assert!(!memory_source.contains("createMemoryStorageBinding(entry, runtimeRequestId);"));
+    assert!(worker_runtime_source.contains("op_memory_batch_apply"));
+    assert!(!worker_runtime_source.contains("op_memory_batch_next_version"));
+    assert!(!memory_ops_source.contains("op_memory_batch_next_version"));
+    assert!(!memory_types_source.contains("MemoryBatchNextVersionResult"));
+    assert!(!worker_runtime_source.contains("memoryTxnNextVersion"));
+    assert!(memory_ops_source.contains("MemoryBatchMutationResult"));
+    assert!(memory_ops_source.contains("#[buffer] value: JsBuffer"));
+    assert!(memory_ops_source.contains("op_memory_bytes_take"));
+    assert!(memory_ops_source.contains("memory_output_bytes_insert"));
+    assert!(memory_ops_source.contains("value_handle: memory_output_bytes_insert"));
+    assert!(memory_ops_source.contains("Bytes::copy_from_slice(value.as_ref())"));
+    assert!(!memory_ops_source.contains("#[buffer(copy)] value: Vec<u8>"));
+    assert!(memory_state_entry_source.contains("value_handle: u32"));
+    assert!(!memory_state_entry_source.contains("value: Vec<u8>"));
+    assert!(memory_command_begin_source.contains("value_handle: u32"));
+    assert!(!memory_command_begin_source.contains("value: Vec<u8>"));
+    assert!(memory_invoke_method_source.contains("value_handle: u32"));
+    assert!(!memory_invoke_method_source.contains("value: Vec<u8>"));
+    assert!(memory_ops_source.contains("Ok(MemoryInvokeResponse::Method { value })"));
+    assert!(
+        memory_ops_source.contains("caller_request_context_handle,\n                    value,")
+    );
+    assert!(memory_source.contains("return decodeRpcResult(takeMemoryBytes(result))"));
+    assert!(!memory_source.contains("decodeRpcResult(toArrayBytes(result.value))"));
+    assert!(fetch_cache_source.contains("const takeMemoryBytes = (record) =>"));
+    assert!(fetch_cache_source.contains("op_memory_bytes_take"));
+    assert!(fetch_cache_source.contains("activeRequestContextHandle(), handle"));
+    assert!(fetch_cache_source.contains("value: takeMemoryBytes(record)"));
+    assert!(fetch_cache_source.contains("value: takeMemoryBytes(entryValue)"));
+    assert!(
+        fetch_cache_source.contains("value: result.hit === true ? takeMemoryBytes(result) : null")
+    );
+    assert!(!fetch_cache_source.contains("toArrayBytes(entryValue?.value"));
+    assert!(
+        !fetch_cache_source.contains("result.value == null ? null : toArrayBytes(result.value)")
+    );
+    assert!(memory_types_source.contains("value: Bytes"));
+    assert!(!add_mutation_source.contains("committedVersion"));
+    assert!(!memory_ops_source.contains("committed_version: f64"));
+    assert!(!memory_types_source.contains("next_version: Option<i64>"));
+    assert!(!batch_mutation_source.contains("version: i64"));
+    assert!(worker_runtime_source.contains("memory batch mutation did not return a staged record"));
+    assert!(memory_ops_source.contains("close_memory_command_for_committed_batch"));
+    assert!(memory_ops_source.contains("memory_batch_commit_owner_epoch"));
+    assert!(memory_ops_source.contains("memory batch commit requires actor owner epoch"));
+    assert!(memory_ops_source.contains("Some(owner_epoch)"));
+    assert!(memory_ops_source.contains(".get(batch.command_handle)"));
+    assert!(!memory_ops_source.contains(".remove(batch.command_handle)\n        .ok_or_else"));
+    assert!(worker_runtime_source.contains("memory transaction commit failed"));
+    assert!(worker_runtime_source.contains("finishMemoryTxn"));
+    assert!(worker_runtime_source.contains("memory storage writes require stub.atomic(...)"));
+    assert!(!worker_runtime_source.contains("memory storage batch commit failed"));
+    assert!(!worker_runtime_source.contains("queueMemoryMutation"));
+    assert!(!worker_runtime_source.contains("ensureMemoryStorageCommitted"));
+    assert!(!worker_runtime_source.contains("pendingBatches"));
+    assert!(!worker_runtime_source.contains("flushRunning"));
+    assert!(!worker_runtime_source.contains("flushTail"));
+    assert!(!worker_runtime_source.contains("commitMemoryTxn"));
+    assert!(!worker_runtime_source.contains("requires_commit"));
+    assert!(!worker_runtime_source.contains("batchSnapshot"));
+    assert!(!worker_runtime_source.contains("op_memory_batch_snapshot"));
+    assert!(!memory_ops_source.contains("op_memory_batch_snapshot"));
+    assert!(!memory_types_source.contains("MemoryBatchSnapshotResult"));
+    assert!(worker_runtime_source.contains("op_memory_batch_list_overlay"));
+    assert!(memory_ops_source.contains("op_memory_batch_list_overlay"));
+    assert!(!worker_runtime_source.contains("op_memory_batch_enqueue"));
+    assert!(!worker_runtime_source.contains("op_memory_state_await_submission"));
+    assert!(!worker_runtime_source.contains("op_memory_batch_configure"));
+    assert!(!worker_runtime_source.contains("configureMemoryBatch"));
+    assert!(!worker_runtime_source.contains("blind_apply_allowed"));
+    assert!(!worker_runtime_source.contains("blind_applied"));
+    assert!(!worker_runtime_source.contains("js_txn_blind_commit"));
+    assert!(!memory_ops_source.contains("apply_blind_batch"));
+    assert!(!memory_ops_source.contains("memory_batch_blind_apply_allowed"));
+    assert!(!memory_ops_source.contains("js_txn_blind_commit"));
+    assert!(!worker_runtime_source.contains("pendingSubmissionPromises"));
+    assert!(!worker_runtime_source.contains("result.conflict"));
+    assert!(!worker_runtime_source.contains("expectedVersion"));
+    assert!(!worker_runtime_source.contains("optimisticWriteVersion"));
+    assert!(!worker_runtime_source.contains("conflict: true"));
+    assert!(!worker_runtime_source.contains("conflict: false"));
+    assert!(!memory_types_source.contains("pub(crate) conflict: bool"));
+    assert!(!memory_types_source.contains("requires_commit"));
+    assert!(!memory_types_source.contains("blind_apply_allowed"));
+    assert!(!memory_types_source.contains("blind_applied"));
+    assert!(!memory_ops_source.contains("MemoryBatchKind"));
+    assert!(!worker_runtime_source.contains("defer(callback)"));
+    assert!(!worker_runtime_source.contains("txn.deferred"));
+    assert!(!worker_runtime_source.contains("memory transaction conflicted"));
+}
+
+#[test]
+fn static_asset_lookup_uses_catalog_without_runtime_manager_command() {
+    let control_source = include_str!("control.rs");
+    let facade_source = include_str!("facade.rs");
+    let lifecycle_source = include_str!("lifecycle.rs");
+
+    assert!(!control_source.contains("ResolveAsset"));
+    assert!(facade_source.contains("pub fn resolve_asset("));
+    assert!(facade_source.contains("pub fn resolve_public_asset("));
+    assert!(facade_source.contains("pub fn resolve_public_route_asset("));
+    assert!(facade_source.contains("pub struct PublicRouteAssetResolution"));
+    assert!(facade_source.contains("fn resolve_asset_from_catalog("));
+    assert!(facade_source.contains("self.asset_catalog.get(worker_name)"));
+    assert!(control_source.contains("prepared: PreparedWorkerDeployment"));
+    assert!(facade_source.contains("fn prepare_worker_deployment("));
+    assert!(!lifecycle_source.contains("compile_asset_bundle("));
+    assert!(!lifecycle_source.contains("extract_bindings(&config)"));
 }
 
 #[test]

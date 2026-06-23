@@ -61,21 +61,31 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ## Distribution Builds
 
 Shipped server artifacts use the `dist` Cargo profile rather than the ordinary
-developer release profile:
+developer release profile. The full server includes HTTP/3, WebSocket, and OTEL
+support. The lean server disables those optional server features.
 
 ```bash
-cargo build --locked --profile dist -p dd_server -p cli
+just server-full
+just server-lean
 ```
 
-Generate a reproducible size report for `dd_server` with:
+Those commands write stable artifacts at `target/dist/dd_server-full` and
+`target/dist/dd_server-lean`. To only run Cargo directly:
 
 ```bash
-just size-report
+cargo build --locked --profile dist -p dd_server --no-default-features --features http3,websocket,otel
+cargo build --locked --profile dist -p dd_server --no-default-features
 ```
 
-Reports are written to `target/size-report/<git-sha>/<profile>/` and include
-exact unstripped/stripped bytes, section sizes, dependency trees, and optional
-`cargo bloat`/`bloaty` output when those tools are installed.
+Generate reproducible size reports for both server variants with:
+
+```bash
+just size-report-all
+```
+
+Reports are written to `target/size-report/<git-sha>/<profile>/<variant>/` and
+include exact unstripped/stripped bytes, section sizes, dependency trees, and
+optional `cargo bloat`/`bloaty` output when those tools are installed.
 
 ## Vite and Vitest worker development
 

@@ -4,11 +4,17 @@ use common::{
     DEFAULT_PUBLIC_BIND_ADDR,
 };
 use dd_server::ServerConfig;
+#[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider as _;
+#[cfg(feature = "otel")]
 use opentelemetry::{global, KeyValue};
+#[cfg(feature = "otel")]
 use opentelemetry_otlp::{Protocol, WithExportConfig};
+#[cfg(feature = "otel")]
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+#[cfg(feature = "otel")]
 use opentelemetry_sdk::trace::TracerProvider as OTelTracerProvider;
+#[cfg(feature = "otel")]
 use opentelemetry_sdk::Resource;
 use std::env;
 use std::net::SocketAddr;
@@ -94,12 +100,11 @@ async fn main() -> Result<()> {
     })
     .await;
 
-    if let Some(provider) = otel_provider {
-        let _ = provider.shutdown();
-    }
+    shutdown_tracing(otel_provider);
     result
 }
 
+#[cfg(feature = "otel")]
 fn init_tracing() -> Result<Option<OTelTracerProvider>> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
@@ -136,6 +141,28 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
     Ok(Some(provider))
 }
 
+#[cfg(not(feature = "otel"))]
+fn init_tracing() -> Result<Option<()>> {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let fmt_layer = tracing_subscriber::fmt::layer();
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .init();
+    Ok(None)
+}
+
+#[cfg(feature = "otel")]
+fn shutdown_tracing(provider: Option<OTelTracerProvider>) {
+    if let Some(provider) = provider {
+        let _ = provider.shutdown();
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+fn shutdown_tracing(_provider: Option<()>) {}
+
+#[cfg(feature = "otel")]
 fn configured_otlp_http_traces_endpoint() -> Option<String> {
     env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .ok()
@@ -155,6 +182,7 @@ fn configured_otlp_http_traces_endpoint() -> Option<String> {
         })
 }
 
+#[cfg(feature = "otel")]
 fn otlp_http_traces_endpoint(endpoint: &str) -> String {
     let trimmed = endpoint.trim().trim_end_matches('/');
     if trimmed.ends_with("/v1/traces") {
@@ -166,6 +194,7 @@ fn otlp_http_traces_endpoint(endpoint: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "otel")]
     use super::otlp_http_traces_endpoint;
     use common::first_non_empty_trimmed;
 
@@ -187,6 +216,7 @@ mod tests {
         assert!(token.is_none());
     }
 
+    #[cfg(feature = "otel")]
     #[test]
     fn otlp_http_endpoint_appends_trace_path_to_base_endpoint() {
         assert_eq!(
@@ -203,6 +233,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "otel")]
     #[test]
     fn otlp_http_endpoint_keeps_explicit_trace_path() {
         assert_eq!(

@@ -296,6 +296,26 @@ function testReplyFailure(error) {
   };
 }
 
+function startTestAsyncReply(runtimeRequestId, options = {}) {
+  return Deno.core.ops.op_test_async_reply_start(
+    Math.max(0, Math.trunc(Number(globalThis.__dd_get_runtime_request_context_handle?.() ?? 0) || 0)),
+    Math.max(0, Math.trunc(Number(options.delay_ms ?? options.delayMs ?? 0) || 0)),
+    options.ok == null ? true : Boolean(options.ok),
+    String(options.value ?? ""),
+    String(options.error ?? ""),
+  );
+}
+
+function startTestNestedTargetedInvoke(runtimeRequestId, targetMode, targetId, methodName, args) {
+  return Deno.core.ops.op_test_nested_targeted_invoke_start(
+    Math.max(0, Math.trunc(Number(globalThis.__dd_get_runtime_request_context_handle?.() ?? 0) || 0)),
+    String(targetMode ?? ""),
+    String(targetId ?? ""),
+    String(methodName ?? ""),
+    args,
+  );
+}
+
 async function waitTestReply(runtimeRequestId, started, timeoutMs) {
   const waitReply = globalThis.__dd_await_dynamic_reply;
   if (typeof waitReply !== "function") {
@@ -305,8 +325,7 @@ async function waitTestReply(runtimeRequestId, started, timeoutMs) {
   if (!actualReplyId) {
     return testReplyFailure(started?.error ?? "test reply failed to start");
   }
-  const timeoutStarted = Deno.core.ops.op_test_async_reply_start({
-    request_id: runtimeRequestId,
+  const timeoutStarted = startTestAsyncReply(runtimeRequestId, {
     delay_ms: timeoutMs,
     ok: false,
     error: `test async reply timed out after ${timeoutMs}ms`,
@@ -360,8 +379,7 @@ export default {
     if (url.pathname === "/async/immediate") {
       const result = await waitTestReply(
         runtimeRequestId,
-        Deno.core.ops.op_test_async_reply_start({
-          request_id: runtimeRequestId,
+        startTestAsyncReply(runtimeRequestId, {
           value: "immediate",
         }),
         250,
@@ -372,8 +390,7 @@ export default {
     if (url.pathname === "/async/delayed") {
       const result = await waitTestReply(
         runtimeRequestId,
-        Deno.core.ops.op_test_async_reply_start({
-          request_id: runtimeRequestId,
+        startTestAsyncReply(runtimeRequestId, {
           delay_ms: 25,
           value: "delayed",
         }),
@@ -385,8 +402,7 @@ export default {
     if (url.pathname === "/async/timeout") {
       const result = await waitTestReply(
         runtimeRequestId,
-        Deno.core.ops.op_test_async_reply_start({
-          request_id: runtimeRequestId,
+        startTestAsyncReply(runtimeRequestId, {
           delay_ms: 200,
           value: "late",
         }),
@@ -401,8 +417,7 @@ export default {
       if (holdMs > 0) {
         const hold = await waitTestReply(
           runtimeRequestId,
-          Deno.core.ops.op_test_async_reply_start({
-            request_id: runtimeRequestId,
+          startTestAsyncReply(runtimeRequestId, {
             delay_ms: holdMs,
             value: "warm",
           }),
@@ -417,15 +432,16 @@ export default {
 
     if (url.pathname === "/nested/same" || url.pathname === "/nested/other") {
       const targetId = ensureProvider();
+      const args = new Uint8Array(await globalThis.__dd_encode_rpc_args([]));
       const result = await waitTestReply(
         runtimeRequestId,
-        Deno.core.ops.op_test_nested_targeted_invoke_start({
-          request_id: runtimeRequestId,
-          target_mode: url.pathname.endsWith("/other") ? "other" : "same",
-          target_id: targetId,
-          method_name: "ping",
-          args: Array.from(new Uint8Array(await globalThis.__dd_encode_rpc_args([]))),
-        }),
+        startTestNestedTargetedInvoke(
+          runtimeRequestId,
+          url.pathname.endsWith("/other") ? "other" : "same",
+          targetId,
+          "ping",
+          args,
+        ),
         1_000,
       );
       return testReplyResponse(result);
@@ -524,9 +540,16 @@ function childConfig() {
   };
 }
 
+function metricsResponse() {
+  return Response.json(globalThis.__dd_dynamic_metrics ?? {});
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/__dynamic_metrics") {
+      return metricsResponse();
+    }
     const id = url.searchParams.get("id") ?? "one";
     const child = await env.SANDBOX.get(`snap:${id}`, async () => childConfig());
     return child.fetch("http://worker/");
@@ -1319,13 +1342,13 @@ export default {{
       await env.MY_KV.put("obj", {{ ok: true, n: 7 }});
       await env.MY_KV.put("left", "L");
       await env.MY_KV.put("right", "R");
-      const bad = await Deno.core.ops.op_kv_put_value(JSON.stringify({{
-        worker_name: "{worker_name}",
-        binding: "MY_KV",
-        key: "broken",
-        encoding: "v8sc",
-        value: [1, 2, 3],
-      }}));
+      const bad = await Deno.core.ops.op_kv_put_value_bytes(
+        "{worker_name}",
+        "MY_KV",
+        "broken",
+        "v8sc",
+        new Uint8Array([1, 2, 3]),
+      );
       if (bad && bad.ok === false) {{
         throw new Error(String(bad.error ?? "seed broken failed"));
       }}
@@ -1357,6 +1380,11 @@ export default {{
         env.MY_KV.get("obj"),
       ]);
       return Response.json(values);
+    }}
+
+    if (url.pathname === "/list-object") {{
+      await env.MY_KV.put("obj-list", {{ ok: true, n: 17 }}, {{ durability: "committed" }});
+      return Response.json(await env.MY_KV.list({{ prefix: "obj-list", limit: 10 }}));
     }}
 
     if (url.pathname === "/scoped") {{
@@ -1502,9 +1530,47 @@ export default {
       return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
     }
 
+    if (url.pathname === "/put-queued-version-read") {
+      const result = env.MY_KV.put("hot", "13");
+      return new Response(JSON.stringify({
+        queued: result?.queued ?? false,
+        durability: result?.durability ?? null,
+        version: result?.version ?? null,
+        value: await env.MY_KV.get("hot"),
+      }), { headers: [["content-type", "application/json"]] });
+    }
+
+    if (url.pathname === "/put-committed-read") {
+      const result = await env.MY_KV.put("hot", "12", { durability: "committed" });
+      return new Response(String(result?.version ?? "none") + ":" + String((await env.MY_KV.get("hot")) ?? "missing"));
+    }
+
+    if (url.pathname === "/put-committed-object-read") {
+      const result = await env.MY_KV.put("obj2", { ok: true, n: 12 }, { durability: "committed" });
+      return new Response(JSON.stringify({
+        version: result?.version ?? null,
+        value: await env.MY_KV.get("obj2"),
+      }), { headers: [["content-type", "application/json"]] });
+    }
+
     if (url.pathname === "/delete-read") {
       await env.MY_KV.delete("hot");
       return new Response(String((await env.MY_KV.get("hot")) ?? "missing"));
+    }
+
+    if (url.pathname === "/delete-queued-version-read") {
+      const result = env.MY_KV.delete("hot");
+      return new Response(JSON.stringify({
+        queued: result?.queued ?? false,
+        durability: result?.durability ?? null,
+        version: result?.version ?? null,
+        value: await env.MY_KV.get("hot"),
+      }), { headers: [["content-type", "application/json"]] });
+    }
+
+    if (url.pathname === "/delete-committed-read") {
+      const result = await env.MY_KV.delete("hot", { durability: "committed" });
+      return new Response(String(result?.version ?? "none") + ":" + String((await env.MY_KV.get("hot")) ?? "missing"));
     }
 
     if (url.pathname === "/write-wait-until") {
@@ -1623,14 +1689,20 @@ export default {
   async fetch(_request, _env, ctx) {
     counter += 1;
 
-    Deno.core.ops.op_emit_completion("{");
-    Deno.core.ops.op_emit_completion(
-      JSON.stringify({
-        request_id: ctx.requestId,
-        completion_token: "forged-token",
-        ok: true,
-        result: { status: 200, headers: [], body: [102, 97, 107, 101] },
-      }),
+    const bodyHandle = Deno.core.ops.op_http_store_prepared_body(
+      new Uint8Array([102, 97, 107, 101]),
+    );
+    Deno.core.ops.op_emit_completion_ok(
+      0,
+      200,
+      0,
+      bodyHandle,
+    );
+    Deno.core.ops.op_emit_completion_ok(
+      0,
+      200,
+      0,
+      bodyHandle,
     );
 
     return new Response(String(counter));
@@ -1696,6 +1768,7 @@ pub(crate) fn memory_worker() -> String {
 globalThis.__dd_memory_runtime = globalThis.__dd_memory_runtime ?? {
   active: new Map(),
   max: new Map(),
+  attempts: new Map(),
 };
 
 function busyWait(ms) {
@@ -1765,6 +1838,7 @@ export default {
     }
 
     if (url.pathname === "/run") {
+      const spin = asNumber(queryParam(url.search, "spin") ?? "100", 100);
       await memory.atomic((state) => {
         const slot = String(state.id);
         const runtime = globalThis.__dd_memory_runtime;
@@ -1772,7 +1846,7 @@ export default {
         runtime.active.set(slot, active);
         const max = Math.max(runtime.max.get(slot) ?? 0, active);
         runtime.max.set(slot, max);
-        busyWait(100);
+        busyWait(spin);
         runtime.active.set(slot, Math.max(0, (runtime.active.get(slot) ?? 1) - 1));
         return null;
       });
@@ -1784,6 +1858,93 @@ export default {
         const runtime = globalThis.__dd_memory_runtime;
         return runtime.max.get(String(state.id)) ?? 0;
       })));
+    }
+
+    if (url.pathname === "/single-execution-read") {
+      const result = await memory.atomic((state) => {
+        const slot = String(state.id);
+        const runtime = globalThis.__dd_memory_runtime;
+        runtime.attempts.set(slot, (runtime.attempts.get(slot) ?? 0) + 1);
+        return state.get("cold") ?? "missing";
+      });
+      const attempts = globalThis.__dd_memory_runtime.attempts.get(String(id)) ?? 0;
+      return new Response(`${result}:${attempts}`);
+    }
+
+    if (url.pathname === "/atomic-unsupported-option") {
+      const operation = queryParam(url.search, "operation") ?? "get";
+      try {
+        await memory.atomic((state) => {
+          if (operation === "set") {
+            state.set("count", "1", { expectedVersion: 0 });
+            return null;
+          }
+          if (operation === "delete") {
+            state.delete("count", { expectedVersion: 0 });
+            return null;
+          }
+          return state.get("count", { mode: "legacy" });
+        });
+        return new Response("not rejected", { status: 500 });
+      } catch (error) {
+        return new Response(String(error?.message ?? error), { status: 418 });
+      }
+    }
+
+    if (url.pathname === "/direct-unsupported-option") {
+      const operation = queryParam(url.search, "operation") ?? "get";
+      try {
+        if (operation === "set") {
+          await memory.write("count", "1", { expectedVersion: 0 });
+        } else if (operation === "delete") {
+          await memory.delete("count", { expectedVersion: 0 });
+        } else {
+          await memory.read("count", { mode: "legacy" });
+        }
+        return new Response("not rejected", { status: 500 });
+      } catch (error) {
+        return new Response(String(error?.message ?? error), { status: 418 });
+      }
+    }
+
+    if (url.pathname === "/idempotent-inc") {
+      const idempotencyKey = queryParam(url.search, "command") ?? "";
+      const amount = asNumber(queryParam(url.search, "amount") ?? "1", 1);
+      const result = await memory.atomic({ idempotencyKey }, (state, delta) => {
+        const slot = String(state.id);
+        const runtime = globalThis.__dd_memory_runtime;
+        const attempts = (runtime.attempts.get(slot) ?? 0) + 1;
+        runtime.attempts.set(slot, attempts);
+        const current = asNumber(state.get("count"), 0);
+        const next = current + delta;
+        state.set("count", String(next));
+        return { next, attempts };
+      }, amount);
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/idempotent-read") {
+      const idempotencyKey = queryParam(url.search, "command") ?? "";
+      const result = await memory.atomic({ idempotencyKey }, (state) => {
+        const slot = String(state.id);
+        const runtime = globalThis.__dd_memory_runtime;
+        const attempts = (runtime.attempts.get(slot) ?? 0) + 1;
+        runtime.attempts.set(slot, attempts);
+        return { current: asNumber(state.get("count"), 0), attempts };
+      });
+      return Response.json(result);
+    }
+
+    if (url.pathname === "/emit-effect") {
+      const result = await memory.atomic((state) => {
+        const current = asNumber(state.get("count"), 0);
+        const next = current + 1;
+        state.set("count", String(next));
+        state.emit("audit.increment", { key, next });
+        memory.emit("audit.stub", { key, next });
+        return { next };
+      });
+      return Response.json(result);
     }
 
     if (url.pathname === "/seed") {
@@ -1847,12 +2008,23 @@ export default {
       return new Response(ok ? "ok" : "bad", { status: ok ? 200 : 500 });
     }
 
+    if (url.pathname === "/multi-write-versions") {
+      const result = await memory.atomic((state) => {
+        state.set("alpha", "1");
+        state.set("beta", "2");
+        const entries = state.list({ prefix: "" })
+          .filter((entry) => entry.key === "alpha" || entry.key === "beta");
+        return entries.map((entry) => `${entry.key}:${entry.value}:${entry.version}`).join(",");
+      });
+      return new Response(String(result));
+    }
+
     if (url.pathname === "/inc-cas") {
       await memory.atomic(incrementStrict);
       return new Response("ok");
     }
 
-    if (url.pathname === "/stm-blind-write") {
+    if (url.pathname === "/actor-set-write") {
       const value = String(url.searchParams.get("value") ?? "1");
       const committed = await memory.atomic((state) => {
         state.set("count", value);
@@ -1861,7 +2033,7 @@ export default {
       return new Response(String(committed));
     }
 
-    if (url.pathname === "/stm-read-write") {
+    if (url.pathname === "/actor-read-write") {
       const value = String(url.searchParams.get("value") ?? "1");
       const committed = await memory.atomic((state) => {
         const previous = String(state.get("count") ?? "0");
@@ -2005,7 +2177,7 @@ export default {
       return new Response(String(total));
     }
 
-    if (url.pathname === "/stm-sum") {
+    if (url.pathname === "/actor-sum") {
       let total = 0;
       for (let i = 0; i < keys; i++) {
         const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(`bench-${i}`));
@@ -2063,7 +2235,7 @@ export function writeA(state, value) {
 }
 
 export function readOnce(state) {
-  const a = String(state.get("a", { allowConcurrency: true }) ?? "missing");
+  const a = String(state.get("a") ?? "missing");
   busyWait(5);
   return a;
 }
@@ -2076,9 +2248,9 @@ export function readPairStrict(state) {
 }
 
 export function readPairSnapshot(state) {
-  const a = String(state.get("a", { allowConcurrency: true }) ?? "missing");
+  const a = String(state.get("a") ?? "missing");
   busyWait(5);
-  const b = String(state.get("b", { allowConcurrency: true }) ?? "missing");
+  const b = String(state.get("b") ?? "missing");
   return `${a}:${b}`;
 }
 
@@ -2135,18 +2307,18 @@ export default {
       return new Response(String(await memory.atomic(() => `ok-${suffix}`)));
     }
 
-    if (url.pathname === "/stm/seed") {
+    if (url.pathname === "/actor/seed") {
       await memory.atomic(seedStm);
       return new Response("ok");
     }
 
-    if (url.pathname === "/stm/write-a") {
+    if (url.pathname === "/actor/write-a") {
       const value = String(url.searchParams.get("value") ?? "1");
       await memory.atomic(writeA, value);
       return new Response("ok");
     }
 
-    if (url.pathname === "/stm/read-once") {
+    if (url.pathname === "/actor/read-once") {
       return new Response(String(await memory.atomic(readOnce)));
     }
 
@@ -2154,24 +2326,24 @@ export default {
       return new Response(String(await memory.read("a") ?? "missing"));
     }
 
-    if (url.pathname === "/stm/read-pair") {
+    if (url.pathname === "/actor/read-pair") {
       return new Response(String(await memory.atomic(readPairStrict)));
     }
 
-    if (url.pathname === "/stm/read-pair-snapshot") {
+    if (url.pathname === "/actor/read-pair-snapshot") {
       return new Response(String(await memory.atomic(readPairSnapshot)));
     }
 
-    if (url.pathname === "/stm/tvar-default/read") {
+    if (url.pathname === "/actor/tvar-default/read") {
       const count = memory.tvar("count", 7);
       return new Response(String(await memory.atomic(() => count.read())));
     }
 
-    if (url.pathname === "/stm/tvar-default/raw") {
+    if (url.pathname === "/actor/tvar-default/raw") {
       return new Response(String(await memory.atomic((state) => state.get("count") ?? "missing")));
     }
 
-    if (url.pathname === "/stm/tvar-default/write") {
+    if (url.pathname === "/actor/tvar-default/write") {
       const count = memory.tvar("count", 7);
       return new Response(String(await memory.atomic(() => {
         const next = Number(count.read()) + 1;

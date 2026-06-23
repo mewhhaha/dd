@@ -1,16 +1,35 @@
 globalThis.__dd_execute_worker = (payload) => {
   const requestId = String(payload?.request_id ?? "");
-  const completionToken = String(payload?.completion_token ?? "");
-  const workerName = String(payload?.worker_name ?? "");
-  const kvBindingsConfig = payload?.kv_bindings ?? [];
-  const kvReadCacheConfigInput = payload?.kv_read_cache_config ?? null;
-  const memoryBindingsConfig = payload?.memory_bindings ?? [];
-  const dynamicBindingsConfig = payload?.dynamic_bindings ?? [];
-  const dynamicRpcBindingsConfig = payload?.dynamic_rpc_bindings ?? [];
-  const dynamicEnvConfig = payload?.dynamic_env ?? [];
+  const deploymentConfig = globalThis.__dd_worker_deployment ?? null;
+  if (!deploymentConfig || typeof deploymentConfig !== "object") {
+    throw new Error("Worker deployment config is not installed");
+  }
+  const workerName = String(deploymentConfig?.worker_name ?? "");
+  const kvBindingsConfig = deploymentConfig?.kv_bindings ?? [];
+  const kvReadCacheConfig = deploymentConfig?.kv_read_cache_config;
+  const memoryBindingsConfig = deploymentConfig?.memory_bindings ?? [];
+  const dynamicBindingsConfig = deploymentConfig?.dynamic_bindings ?? [];
+  const dynamicRpcBindingsConfig = deploymentConfig?.dynamic_rpc_bindings ?? [];
+  const dynamicEnvConfig = deploymentConfig?.dynamic_env ?? [];
   const memoryCallConfig = payload?.memory_call ?? null;
   const hostRpcCallConfig = payload?.host_rpc_call ?? null;
-  const hasRequestBodyStream = payload?.has_request_body_stream === true;
+  const requestBodyStreamHandle = Math.max(
+    0,
+    Math.trunc(Number(payload?.request_body_stream_handle ?? 0) || 0),
+  );
+  const requestContextHandle = Math.max(
+    0,
+    Math.trunc(Number(payload?.request_context_handle ?? 0) || 0),
+  );
+  const completionHandle = Math.max(
+    0,
+    Math.trunc(Number(payload?.completion_handle ?? 0) || 0),
+  );
+  const memoryRequestScopeHandle = Math.max(
+    0,
+    Math.trunc(Number(payload?.memory_request_scope_handle ?? 0) || 0),
+  );
+  const hasRequestBodyStream = requestBodyStreamHandle > 0;
   const streamResponse = payload?.stream_response === true;
   const worker = globalThis.__dd_worker;
 
@@ -24,40 +43,33 @@ globalThis.__dd_execute_worker = (payload) => {
   if (globalThis.RpcTarget !== RpcTarget) {
     globalThis.RpcTarget = RpcTarget;
   }
-  const input = payload?.request ?? null;
+  const input = {
+    method: String(payload?.method ?? "GET"),
+    url: String(payload?.url ?? ""),
+    headers: Array.isArray(payload?.headers) ? payload.headers : [],
+    body: payload?.body instanceof Uint8Array ? payload.body : new Uint8Array(),
+    request_id: String(payload?.input_request_id ?? ""),
+  };
+  const cacheBypassStale = Array.isArray(input?.headers)
+    && input.headers.some(([name, value]) => {
+      const key = String(name || "").toLowerCase();
+      if (key !== "x-dd-cache-bypass-stale") {
+        return false;
+      }
+      const normalized = String(value || "").toLowerCase();
+      return normalized === "1" || normalized === "true" || normalized === "yes";
+    });
   const controller = new AbortController();
   const asyncContext = globalThis.__dd_async_context;
-  const kvReadCacheConfig = (() => {
-    const maxEntries = Math.max(
-      1,
-      Math.trunc(Number(kvReadCacheConfigInput?.max_entries ?? 16384) || 16384),
-    );
-    const maxBytes = Math.max(
-      1024,
-      Math.trunc(Number(kvReadCacheConfigInput?.max_bytes ?? 16 * 1024 * 1024) || (16 * 1024 * 1024)),
-    );
-    const hitTtlMs = Math.max(
-      1,
-      Math.trunc(Number(kvReadCacheConfigInput?.hit_ttl_ms ?? 300_000) || 300_000),
-    );
-    const missTtlMs = Math.max(
-      1,
-      Math.trunc(Number(kvReadCacheConfigInput?.miss_ttl_ms ?? 30_000) || 30_000),
-    );
-    return Object.freeze({
-      maxEntries,
-      maxBytes,
-      hitTtlMs,
-      missTtlMs,
-    });
-  })();
   const memoryReadSnapshotFreshTtlMs = 1_000;
   const requestContext = {
     requestId,
     controller,
     waitUntilPromises: [],
-    waitUntilDoneSent: false,
-    memoryInvokeSeq: 0,
+    requestContextHandle,
+    completionHandle,
+    memoryRequestScopeHandle,
+    requestBodyStreamHandle,
     memoryEntry: null,
     memoryRequestId: null,
     memoryTxnScope: null,
@@ -66,6 +78,7 @@ globalThis.__dd_execute_worker = (payload) => {
     kvGetBatches: new Map(),
     kvGetResults: new Map(),
     kvWriteOverlay: new Map(),
+    cacheBypassStale,
   };
 
   const currentRequestContext = (required = true) => {
@@ -74,12 +87,6 @@ globalThis.__dd_execute_worker = (payload) => {
       throw new Error("request scope is unavailable");
     }
     return current;
-  };
-
-  const nextMemoryInvokeSeq = () => {
-    const current = currentRequestContext();
-    current.memoryInvokeSeq = Number(current.memoryInvokeSeq ?? 0) + 1;
-    return current.memoryInvokeSeq;
   };
 
   if (!globalThis.__dd_handle_websocket_wrapped) {
@@ -114,7 +121,12 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   }
 
-  inflightRequests.set(requestId, controller);
+  inflightRequests.set(requestId, {
+    controller,
+    requestContextHandle,
+    memoryRequestScopeHandle,
+    requestBodyStreamHandle,
+  });
 
   const callOp = (name, ...args) => {
     const op = Deno?.core?.ops?.[name];
@@ -165,7 +177,43 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     return scoped;
   };
-  globalThis.__dd_get_runtime_request_id = activeRequestId;
+  if (typeof globalThis.__dd_get_runtime_request_id !== "function") {
+    Object.defineProperty(globalThis, "__dd_get_runtime_request_id", {
+      value: activeRequestId,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  const activeRequestContextHandle = () => {
+    const handle = Math.max(
+      0,
+      Math.trunc(Number(currentRequestContext().requestContextHandle ?? 0) || 0),
+    );
+    if (handle <= 0) {
+      throw new Error("request context handle is unavailable");
+    }
+    return handle;
+  };
+  if (typeof globalThis.__dd_get_runtime_request_context_handle !== "function") {
+    Object.defineProperty(globalThis, "__dd_get_runtime_request_context_handle", {
+      value: activeRequestContextHandle,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  const activeCacheBypassStale = () => Boolean(
+    currentRequestContext(false)?.cacheBypassStale,
+  );
+  if (typeof globalThis.__dd_get_cache_bypass_stale !== "function") {
+    Object.defineProperty(globalThis, "__dd_get_cache_bypass_stale", {
+      value: activeCacheBypassStale,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
 
   const memoryScopedRequestId = (entry, runtimeRequestId) => {
     const current = currentRequestContext(false);
@@ -180,6 +228,16 @@ globalThis.__dd_execute_worker = (payload) => {
       return fallback;
     }
     return activeRequestId();
+  };
+  const memoryScopedScopeHandle = (entry) => {
+    const current = currentRequestContext(false);
+    if (current?.memoryEntry === entry) {
+      return Math.max(
+        0,
+        Math.trunc(Number(current.memoryRequestScopeHandle ?? 0) || 0),
+      );
+    }
+    return 0;
   };
 
   const withMemoryTxnScope = (scope, callback) => {
@@ -274,16 +332,14 @@ globalThis.__dd_execute_worker = (payload) => {
       globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
     }
   };
-  globalThis.__dd_sync_time_boundary = syncFrozenTime;
-  globalThis.__dd_cache_bypass_stale = Array.isArray(input.headers)
-    && input.headers.some(([name, value]) => {
-      const key = String(name || "").toLowerCase();
-      if (key !== "x-dd-cache-bypass-stale") {
-        return false;
-      }
-      const normalized = String(value || "").toLowerCase();
-      return normalized === "1" || normalized === "true" || normalized === "yes";
+  if (typeof globalThis.__dd_sync_time_boundary !== "function") {
+    Object.defineProperty(globalThis, "__dd_sync_time_boundary", {
+      value: syncFrozenTime,
+      enumerable: false,
+      configurable: true,
+      writable: true,
     });
+  }
 
   const toUtf8Bytes = (value) => {
     if (value == null) {
@@ -301,10 +357,36 @@ globalThis.__dd_execute_worker = (payload) => {
     return new TextEncoder().encode(String(value));
   };
 
-  const appendBytes = (target, bytes) => {
-    for (let i = 0; i < bytes.length; i += 1) {
-      target.push(bytes[i]);
+  const toByteChunk = (value) => {
+    if (value == null) {
+      return new Uint8Array();
     }
+    if (value instanceof Uint8Array) {
+      return value;
+    }
+    if (value instanceof ArrayBuffer) {
+      return new Uint8Array(value);
+    }
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+    }
+    return toUtf8Bytes(value);
+  };
+
+  const concatByteChunks = (chunks, totalLength) => {
+    if (!Array.isArray(chunks) || chunks.length === 0 || totalLength <= 0) {
+      return new Uint8Array();
+    }
+    if (chunks.length === 1 && chunks[0].byteLength === totalLength) {
+      return chunks[0];
+    }
+    const output = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return output;
   };
 
   const createRequestBodyStream = () => {
@@ -319,7 +401,7 @@ globalThis.__dd_execute_worker = (payload) => {
         return { value: undefined, done: true };
       }
 
-      const payload = await callOp("op_request_body_read", requestId);
+      const payload = await callOp("op_request_body_read", requestBodyStreamHandle);
       await syncFrozenTime();
       if (!payload || typeof payload !== "object") {
         done = true;
@@ -333,8 +415,9 @@ globalThis.__dd_execute_worker = (payload) => {
         done = true;
         return { value: undefined, done: true };
       }
+      const bodyHandle = Math.max(0, Math.trunc(Number(payload.body_handle ?? 0) || 0));
       return {
-        value: new Uint8Array(Array.isArray(payload.chunk) ? payload.chunk : []),
+        value: callOp("op_http_take_prepared_body", bodyHandle),
         done: false,
       };
     };
@@ -348,7 +431,7 @@ globalThis.__dd_execute_worker = (payload) => {
           },
           async cancel() {
             done = true;
-            await callOp("op_request_body_cancel", requestId);
+            await callOp("op_request_body_cancel", requestBodyStreamHandle);
             await syncFrozenTime();
             return undefined;
           },
@@ -372,8 +455,9 @@ globalThis.__dd_execute_worker = (payload) => {
     });
   };
 
-  const decodeStoredValue = (encoding, rawValue, context) => {
-    const bytes = new Uint8Array(Array.isArray(rawValue) ? rawValue : []);
+  const decodeStoredValue = (encoding, valueHandle, context) => {
+    const handle = Math.max(0, Math.trunc(Number(valueHandle ?? 0) || 0));
+    const bytes = callOp("op_http_take_prepared_body", handle);
     if (encoding === "utf8") {
       return Deno.core.decode(bytes);
     }
@@ -437,7 +521,7 @@ globalThis.__dd_execute_worker = (payload) => {
       normalizedKey,
       value,
       encoding,
-      optimisticWriteVersion = null,
+      pendingWriteVersion = null,
     ) => {
       const existing = persistentReadCache.entries.get(normalizedKey);
       if (existing) {
@@ -454,7 +538,7 @@ globalThis.__dd_execute_worker = (payload) => {
         value,
         missing,
         encoding,
-        optimisticWriteVersion,
+        pendingWriteVersion,
         expiresAtMs,
         sizeBytes,
       });
@@ -469,10 +553,10 @@ globalThis.__dd_execute_worker = (payload) => {
         recordKvProfile("kv_cache_miss", 0, 1);
         return { found: false, value: null };
       }
-      if (cached.optimisticWriteVersion != null) {
+      if (cached.pendingWriteVersion != null) {
         const failed = callOp(
           "op_kv_take_failed_write_version",
-          BigInt(cached.optimisticWriteVersion),
+          BigInt(cached.pendingWriteVersion),
         );
         if (failed === true) {
           deletePersistentCacheEntry(normalizedKey);
@@ -528,14 +612,12 @@ globalThis.__dd_execute_worker = (payload) => {
             Deno.core.decode(mutation.value),
           )
           : callOp(
-            "op_kv_enqueue_put_value",
-            JSON.stringify({
-              worker_name: workerName,
-              binding: bindingName,
-              key: mutation.key,
-              encoding: mutation.encoding,
-              value: Array.from(mutation.value),
-            }),
+            "op_kv_enqueue_put_value_bytes",
+            workerName,
+            bindingName,
+            mutation.key,
+            mutation.encoding,
+            mutation.value,
           );
       syncFrozenTimeNow();
       if (result && typeof result === "object" && result.ok === false) {
@@ -548,6 +630,63 @@ globalThis.__dd_execute_worker = (payload) => {
         mutation.encoding,
         Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
       );
+      return {
+        ok: true,
+        durability: "queued",
+        queued: true,
+        version: Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
+      };
+    };
+
+    const kvWriteDurability = (options) => {
+      const durability = String(
+        options?.durability ?? options?.consistency ?? "queued",
+      ).trim().toLowerCase();
+      if (!durability || durability === "queued" || durability === "enqueue" || durability === "enqueued") {
+        return "queued";
+      }
+      if (durability === "committed" || durability === "commit") {
+        return "committed";
+      }
+      throw new Error(`unsupported kv durability: ${durability}`);
+    };
+
+    const commitKvWrite = async (mutation) => {
+      const result = mutation.deleted === true
+        ? await callOp("op_kv_delete", workerName, bindingName, mutation.key)
+        : mutation.encoding === "utf8"
+          ? await callOp(
+            "op_kv_put",
+            workerName,
+            bindingName,
+            mutation.key,
+            Deno.core.decode(mutation.value),
+          )
+          : await callOp(
+            "op_kv_put_value_bytes",
+            workerName,
+            bindingName,
+            mutation.key,
+            mutation.encoding,
+            mutation.value,
+          );
+      await syncFrozenTime();
+      if (result && typeof result === "object" && result.ok === false) {
+        clearKvOverlayValue(mutation.key);
+        throw new Error(String(result.error ?? "kv committed write failed"));
+      }
+      setPersistentCacheEntry(
+        mutation.key,
+        mutation.deleted === true ? null : mutation.resolvedValue,
+        mutation.encoding,
+        null,
+      );
+      return {
+        ok: true,
+        durability: "committed",
+        committed: true,
+        version: Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
+      };
     };
 
     const loadKvValues = async (normalizedKeys, contextLabel) => {
@@ -580,28 +719,24 @@ globalThis.__dd_execute_worker = (payload) => {
         }
         const result = await callOp(
           "op_kv_get_value",
-          JSON.stringify({
-            worker_name: workerName,
-            binding: bindingName,
-            key: uniqueKeys[0],
-          }),
+          workerName,
+          bindingName,
+          uniqueKeys[0],
         );
         syncFrozenTimeNow();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? `${contextLabel} failed`));
         }
         const value = result?.found === true
-          ? decodeStoredValue(String(result.encoding ?? "utf8"), result.value, contextLabel)
+          ? decodeStoredValue(String(result.encoding ?? "utf8"), result.value_handle, contextLabel)
           : null;
         return normalizedToUnique.map(() => value);
       }
       const utf8Result = await callOp(
         "op_kv_get_many_utf8",
-        JSON.stringify({
-          worker_name: workerName,
-          binding: bindingName,
-          keys: uniqueKeys,
-        }),
+        workerName,
+        bindingName,
+        uniqueKeys,
       );
       syncFrozenTimeNow();
       if (!utf8Result || typeof utf8Result !== "object" || utf8Result.ok === false) {
@@ -628,11 +763,9 @@ globalThis.__dd_execute_worker = (payload) => {
       const fallbackValues = await Promise.all(fallbackIndexes.map(async (index) => {
         const result = await callOp(
           "op_kv_get_value",
-          JSON.stringify({
-            worker_name: workerName,
-            binding: bindingName,
-            key: uniqueKeys[index],
-          }),
+          workerName,
+          bindingName,
+          uniqueKeys[index],
         );
         syncFrozenTimeNow();
         if (result && typeof result === "object" && result.ok === false) {
@@ -641,7 +774,7 @@ globalThis.__dd_execute_worker = (payload) => {
         if (result?.found !== true) {
           return null;
         }
-        return decodeStoredValue(String(result.encoding ?? "utf8"), result.value, contextLabel);
+        return decodeStoredValue(String(result.encoding ?? "utf8"), result.value_handle, contextLabel);
       }));
       for (let index = 0; index < fallbackIndexes.length; index += 1) {
         uniqueValues[fallbackIndexes[index]] = fallbackValues[index];
@@ -738,7 +871,6 @@ globalThis.__dd_execute_worker = (payload) => {
         return await queueKvGet(normalizedKey);
       },
       put(key, value, options = {}) {
-        const _ = options;
         const normalizedKey = String(key);
         let mutation;
         let resolvedValue = value;
@@ -769,22 +901,28 @@ globalThis.__dd_execute_worker = (payload) => {
           deleted: false,
           resolvedValue,
         });
-        enqueueKvWrite(mutation);
+        if (kvWriteDurability(options) === "committed") {
+          return commitKvWrite(mutation);
+        }
+        return enqueueKvWrite(mutation);
       },
       delete(key, options = {}) {
-        const _ = options;
         const normalizedKey = String(key);
-        setKvOverlayValue(normalizedKey, {
-          deleted: true,
-          resolvedValue: null,
-        });
-        enqueueKvWrite({
+        const mutation = {
           key: normalizedKey,
           encoding: "utf8",
           value: new Uint8Array(),
           deleted: true,
           resolvedValue: null,
+        };
+        setKvOverlayValue(normalizedKey, {
+          deleted: true,
+          resolvedValue: null,
         });
+        if (kvWriteDurability(options) === "committed") {
+          return commitKvWrite(mutation);
+        }
+        return enqueueKvWrite(mutation);
       },
       async list(options = {}) {
         const prefix = String(options?.prefix ?? "");
@@ -808,7 +946,7 @@ globalThis.__dd_execute_worker = (payload) => {
           const encoding = String(entry?.encoding ?? "utf8");
           return {
             key: String(entry?.key ?? ""),
-            value: decodeStoredValue(encoding, entry?.value, "kv list"),
+            value: decodeStoredValue(encoding, entry?.value_handle, "kv list"),
             encoding,
           };
         });
@@ -913,13 +1051,11 @@ globalThis.__dd_execute_worker = (payload) => {
       && lower !== "transfer-encoding";
   });
 
-  const checkHostFetchUrl = async (requestId, url) => {
+  const checkHostFetchUrl = async (requestContextHandle, url) => {
     const checked = await callOp(
       "op_http_check_url",
-      JSON.stringify({
-        request_id: requestId,
-        url,
-      }),
+      requestContextHandle,
+      url,
     );
     await syncFrozenTime();
     if (!checked || typeof checked !== "object" || checked.ok === false) {
@@ -1003,96 +1139,125 @@ globalThis.__dd_execute_worker = (payload) => {
     });
   };
 
-  const installHostFetch = () => {
-    const previousFetch = globalThis.fetch;
-    if (typeof previousFetch !== "function") {
-      throw new TypeError("fetch is not available in this runtime");
-    }
-    Object.defineProperty(globalThis, "__dd_raw_host_fetch", {
-      value: previousFetch,
+  if (typeof globalThis.__dd_install_host_fetch !== "function") {
+    Object.defineProperty(globalThis, "__dd_install_host_fetch", {
+      value: function installHostFetch() {
+        if (typeof globalThis.__dd_host_fetch === "function") {
+          return;
+        }
+        const rawFetch = globalThis.__dd_raw_host_fetch ?? globalThis.fetch;
+        if (typeof rawFetch !== "function") {
+          throw new TypeError("fetch is not available in this runtime");
+        }
+        Object.defineProperty(globalThis, "__dd_raw_host_fetch", {
+          value: rawFetch,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+        const scopedFetch = async (inputValue, initValue = undefined) => {
+          const run = async () => {
+            const current = currentRequestContext();
+            const normalized = await normalizeHostFetchInput(inputValue, initValue);
+            const normalizedHeadersHandle = callOp(
+              "op_http_store_prepared_headers",
+              normalized.headers,
+            );
+            const normalizedBodyHandle = callOp(
+              "op_http_store_prepared_body",
+              normalized.body,
+            );
+            const prepared = await callOp(
+              "op_http_prepare",
+              current.requestContextHandle,
+              normalized.method,
+              normalized.url,
+              Math.max(0, Math.trunc(Number(normalizedHeadersHandle ?? 0) || 0)),
+              Math.max(0, Math.trunc(Number(normalizedBodyHandle ?? 0) || 0)),
+            );
+            await syncFrozenTime();
+            if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
+              throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
+            }
+            const signal = composeAbortSignal([current.controller.signal, normalized.signal]);
+            let method = String(prepared.method || "GET");
+            let url = String(prepared.url || normalized.url);
+            let headers = callOp(
+              "op_http_take_prepared_headers",
+              Math.max(0, Math.trunc(Number(prepared.headers_handle ?? 0) || 0)),
+            );
+            if (!Array.isArray(headers)) {
+              headers = [];
+            }
+            const preparedBodyHandle = Number(prepared.body_handle ?? 0);
+            let body = preparedBodyHandle > 0
+              ? callOp("op_http_take_prepared_body", preparedBodyHandle)
+              : undefined;
+            if (body && body.byteLength === 0) {
+              body = undefined;
+            }
+            const redirectMode = normalized.redirect === "error"
+              || normalized.redirect === "manual"
+              ? normalized.redirect
+              : "follow";
+            let redirectsRemaining = HOST_FETCH_MAX_REDIRECTS;
+            for (;;) {
+              const response = await raceAbortSignal(
+                rawFetch(new Request(url, {
+                  method,
+                  headers,
+                  body,
+                  signal,
+                  redirect: "manual",
+                })),
+                signal,
+              );
+              if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(response.status)) {
+                return response;
+              }
+              const location = response.headers.get("location");
+              if (!location) {
+                return response;
+              }
+              if (redirectMode === "error") {
+                throw new TypeError(`host fetch redirect blocked: ${response.status}`);
+              }
+              if (redirectsRemaining <= 0) {
+                throw new TypeError("host fetch exceeded redirect limit");
+              }
+              const nextUrl = new URL(location, response.url || url).toString();
+              await response.body?.cancel?.();
+              url = await checkHostFetchUrl(current.requestContextHandle, nextUrl);
+              const nextMethod = rewriteMethodForRedirect(response.status, method);
+              if (nextMethod !== method) {
+                headers = stripRedirectBodyHeaders(headers);
+                body = undefined;
+              }
+              method = nextMethod;
+              redirectsRemaining -= 1;
+            }
+          };
+          const current = currentRequestContext(false);
+          if (current?.memoryEntry) {
+            return gateMemoryOutput(current.memoryEntry, current.memoryRequestId || current.requestId, run);
+          }
+          return run();
+        };
+        Object.defineProperty(scopedFetch, "__dd_host_fetch", { value: true });
+        Object.defineProperty(globalThis, "__dd_host_fetch", {
+          value: scopedFetch,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+        globalThis.fetch = scopedFetch;
+      },
       enumerable: false,
       configurable: true,
       writable: true,
     });
-    const scopedFetch = async (inputValue, initValue = undefined) => {
-      const run = async () => {
-        const current = currentRequestContext();
-        const normalized = await normalizeHostFetchInput(inputValue, initValue);
-        const prepared = await callOp(
-          "op_http_prepare",
-          JSON.stringify({
-            request_id: current.requestId,
-            method: normalized.method,
-            url: normalized.url,
-            headers: normalized.headers,
-            body: Array.from(normalized.body),
-          }),
-        );
-        await syncFrozenTime();
-        if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
-          throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
-        }
-        const signal = composeAbortSignal([current.controller.signal, normalized.signal]);
-        let method = String(prepared.method || "GET");
-        let url = String(prepared.url || normalized.url);
-        let headers = Array.isArray(prepared.headers) ? prepared.headers : [];
-        let body = Array.isArray(prepared.body) && prepared.body.length > 0
-          ? toArrayBytes(prepared.body)
-          : undefined;
-        const redirectMode = normalized.redirect === "error"
-          || normalized.redirect === "manual"
-          ? normalized.redirect
-          : "follow";
-        let redirectsRemaining = HOST_FETCH_MAX_REDIRECTS;
-        for (;;) {
-          const response = await raceAbortSignal(
-            previousFetch(new Request(url, {
-              method,
-              headers,
-              body,
-              signal,
-              redirect: "manual",
-            })),
-            signal,
-          );
-          if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(response.status)) {
-            return response;
-          }
-          const location = response.headers.get("location");
-          if (!location) {
-            return response;
-          }
-          if (redirectMode === "error") {
-            throw new TypeError(`host fetch redirect blocked: ${response.status}`);
-          }
-          if (redirectsRemaining <= 0) {
-            throw new TypeError("host fetch exceeded redirect limit");
-          }
-          const nextUrl = new URL(location, response.url || url).toString();
-          await response.body?.cancel?.();
-          url = await checkHostFetchUrl(current.requestId, nextUrl);
-          const nextMethod = rewriteMethodForRedirect(response.status, method);
-          if (nextMethod !== method) {
-            headers = stripRedirectBodyHeaders(headers);
-            body = undefined;
-          }
-          method = nextMethod;
-          redirectsRemaining -= 1;
-        }
-      };
-      const current = currentRequestContext(false);
-      if (current?.memoryEntry) {
-        return gateMemoryOutput(current.memoryEntry, current.memoryRequestId || current.requestId, run);
-      }
-      return run();
-    };
-    globalThis.fetch = scopedFetch;
-    return () => {
-      if (globalThis.fetch === scopedFetch) {
-        globalThis.fetch = previousFetch;
-      }
-    };
-  };
+  }
+  const installHostFetch = globalThis.__dd_install_host_fetch;
 
   const normalizeSocketMessageForJs = (value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) {

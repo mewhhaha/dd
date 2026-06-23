@@ -29,8 +29,8 @@ async fn transport_open_works_with_deno_request_compatibility() {
         .await
         .expect("deploy should succeed");
 
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
-    let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+    let (stream_tx, mut stream_rx) = mpsc::channel(16);
+    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
     let opened = service
         .open_transport(
             "transport-runtime".to_string(),
@@ -99,8 +99,8 @@ async fn transport_open_preserves_connect_shape_for_memory_namespace_code() {
         .await
         .expect("deploy should succeed");
 
-    let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
-    let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+    let (stream_tx, _stream_rx) = mpsc::channel(16);
+    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
     let opened = service
         .open_transport(
             "transport-shape".to_string(),
@@ -143,8 +143,8 @@ async fn transport_wake_can_list_transport_handles_without_deadlock() {
         .await
         .expect("deploy should succeed");
 
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
-    let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+    let (stream_tx, mut stream_rx) = mpsc::channel(16);
+    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
     let opened = tokio::time::timeout(
         Duration::from_secs(5),
         service.open_transport(
@@ -218,8 +218,8 @@ async fn transport_session_survives_idle_ttl_and_scales_down_after_close() {
         .await
         .expect("deploy should succeed");
 
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
-    let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+    let (stream_tx, mut stream_rx) = mpsc::channel(16);
+    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
     let opened = service
         .open_transport(
             "transport-idle".to_string(),
@@ -292,8 +292,8 @@ async fn transport_session_reaped_when_owner_isolate_fails() {
         .await
         .expect("deploy should succeed");
 
-    let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
-    let (datagram_tx, _datagram_rx) = mpsc::unbounded_channel();
+    let (stream_tx, _stream_rx) = mpsc::channel(16);
+    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
     let opened = service
         .open_transport(
             "transport-reap".to_string(),

@@ -490,12 +490,12 @@ async fn public_host_invoke_ignores_spoofed_forwarded_request_url() {
 
 #[tokio::test]
 #[serial]
-async fn public_host_invoke_rejects_private_worker() {
+async fn public_host_invoke_rejects_private_worker_assets() {
     let state = TestState::new("example.com").await;
     state
         .app()
         .runtime
-        .deploy_with_config(
+        .deploy_with_bundle_config(
             "private-worker".to_string(),
             "export default { async fetch() { return new Response('private-ok'); } }".to_string(),
             DeployConfig {
@@ -503,13 +503,15 @@ async fn public_host_invoke_rejects_private_worker() {
                 bindings: vec![],
                 ..Default::default()
             },
+            test_assets(),
+            None,
         )
         .await
         .expect("deploy");
 
     let request = Request::builder()
         .method("GET")
-        .uri("/")
+        .uri("/a.js")
         .header("host", "private-worker.example.com")
         .body(Empty::<Bytes>::new())
         .expect("request");
@@ -625,6 +627,14 @@ async fn public_host_invoke_serves_assets_for_public_workers() {
             .and_then(|value| value.to_str().ok()),
         Some("10")
     );
+    let stats = state
+        .app()
+        .runtime
+        .stats("assets".to_string())
+        .await
+        .expect("stats");
+    assert_eq!(stats.spawn_count, 0);
+    assert_eq!(stats.isolates_total, 0);
     state.shutdown().await;
 }
 

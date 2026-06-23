@@ -444,208 +444,6 @@ impl WorkerManager {
         );
     }
 
-    pub(super) fn handle_dynamic_worker_invoke(
-        &mut self,
-        payload: crate::ops::DynamicWorkerInvokeEvent,
-        command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        let crate::ops::DynamicWorkerInvokeEvent {
-            owner_worker,
-            owner_generation,
-            owner_isolate_id: _owner_isolate_id,
-            binding,
-            handle,
-            request,
-            reply_id,
-            pending_replies,
-        } = payload;
-        let dispatch_target = match self.dynamic_dispatch_target(
-            &handle,
-            &owner_worker,
-            owner_generation,
-            &binding,
-        ) {
-            Ok(target) => target,
-            Err(error) => {
-                self.finish_dynamic_reply(
-                    pending_replies,
-                    reply_id,
-                    crate::ops::DynamicPendingReplyPayload::Invoke(Err(error)),
-                );
-                return;
-            }
-        };
-        if request.body.len() > dispatch_target.policy.max_request_bytes {
-            dispatch_target
-                .quota_state
-                .total_request_bytes
-                .fetch_add(request.body.len() as u64, Ordering::Relaxed);
-            dispatch_target
-                .quota_state
-                .quota_kill_count
-                .fetch_add(1, Ordering::Relaxed);
-            self.dynamic_profile.record_quota_kill();
-            self.retire_dynamic_worker_handle(
-                &handle,
-                "dynamic child exceeded max_request_bytes",
-                true,
-            );
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::runtime(
-                    format!(
-                        "dynamic child request exceeds max_request_bytes ({})",
-                        dispatch_target.policy.max_request_bytes
-                    ),
-                ))),
-            );
-            return;
-        }
-        if !self.try_acquire_dynamic_inflight(
-            &dispatch_target.quota_state,
-            dispatch_target.policy.max_concurrency,
-        ) {
-            self.dynamic_profile.record_quota_kill();
-            self.retire_dynamic_worker_handle(
-                &handle,
-                "dynamic child exceeded max_concurrency",
-                true,
-            );
-            self.finish_dynamic_reply(
-                pending_replies,
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(Err(PlatformError::runtime(
-                    format!(
-                        "dynamic child exceeded max_concurrency ({})",
-                        dispatch_target.policy.max_concurrency
-                    ),
-                ))),
-            );
-            return;
-        }
-        dispatch_target
-            .quota_state
-            .total_request_bytes
-            .fetch_add(request.body.len() as u64, Ordering::Relaxed);
-
-        let target_generation = Some(dispatch_target.worker_generation);
-        let mut target_isolate_id = dispatch_target.preferred_isolate_id;
-        if let Some(preferred_id) = target_isolate_id {
-            let preferred_alive = self
-                .workers
-                .get(&dispatch_target.worker_name)
-                .and_then(|entry| entry.pools.get(&dispatch_target.worker_generation))
-                .map(|pool| {
-                    pool.isolates
-                        .iter()
-                        .any(|isolate| isolate.id == preferred_id)
-                })
-                .unwrap_or(false);
-            if preferred_alive {
-                self.dynamic_profile.record_warm_isolate_hit();
-            } else {
-                target_isolate_id = None;
-                if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
-                    entry.preferred_isolate_id = None;
-                }
-                self.dynamic_profile.record_fallback_dispatch();
-            }
-        } else {
-            self.dynamic_profile.record_fallback_dispatch();
-        }
-
-        let runtime_request_id = next_runtime_token("dyn");
-        let timeout = dispatch_target.timeout;
-        let timeout_diagnostic = DynamicTimeoutDiagnostic {
-            stage: "invoke-reply",
-            owner_worker: owner_worker.clone(),
-            owner_generation,
-            binding: binding.clone(),
-            handle: handle.clone(),
-            target_worker: dispatch_target.worker_name.clone(),
-            target_isolate_id,
-            target_generation,
-            provider_id: None,
-            provider_owner_isolate_id: None,
-            provider_target_id: None,
-            timeout_ms: timeout,
-        };
-        let (inner_reply_tx, inner_reply_rx) = oneshot::channel();
-        self.enqueue_invoke(
-            dispatch_target.worker_name,
-            runtime_request_id,
-            request,
-            None,
-            None,
-            None,
-            None,
-            target_isolate_id,
-            target_generation,
-            true,
-            inner_reply_tx,
-            PendingReplyKind::DynamicInvoke {
-                handle: handle.clone(),
-            },
-            event_tx,
-        );
-        let event_tx = event_tx.clone();
-        let command_tx = command_tx.clone();
-        let profile = self.dynamic_profile.clone();
-        let handle_for_task = handle.clone();
-        let policy = dispatch_target.policy;
-        let quota_state = dispatch_target.quota_state;
-        tokio::spawn(async move {
-            let result =
-                match tokio::time::timeout(Duration::from_millis(timeout), inner_reply_rx).await {
-                    Ok(Ok(output)) => output,
-                    Ok(Err(_)) => Err(PlatformError::internal(
-                        "dynamic worker invoke response channel closed",
-                    )),
-                    Err(_) => {
-                        let _ = event_tx
-                            .send(RuntimeEvent::DynamicTimeoutDiagnostic(timeout_diagnostic));
-                        Err(PlatformError::runtime(format!(
-                            "dynamic worker invoke timed out after {timeout}ms"
-                        )))
-                    }
-                };
-            quota_state.inflight.fetch_sub(1, Ordering::Relaxed);
-            let result = match result {
-                Ok(output) if output.body.len() > policy.max_response_bytes => {
-                    quota_state
-                        .total_response_bytes
-                        .fetch_add(output.body.len() as u64, Ordering::Relaxed);
-                    quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
-                    profile.record_quota_kill();
-                    let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
-                        handle: handle_for_task.clone(),
-                        reason: "dynamic child exceeded max_response_bytes".to_string(),
-                    });
-                    Err(PlatformError::runtime(format!(
-                        "dynamic child response exceeds max_response_bytes ({})",
-                        policy.max_response_bytes
-                    )))
-                }
-                Ok(output) => {
-                    quota_state
-                        .total_response_bytes
-                        .fetch_add(output.body.len() as u64, Ordering::Relaxed);
-                    Ok(output)
-                }
-                Err(error) => Err(error),
-            };
-            profile.record_async_reply_completion();
-            if let Some(delivery) = pending_replies.finish(
-                reply_id,
-                crate::ops::DynamicPendingReplyPayload::Invoke(result),
-            ) {
-                let _ = event_tx.send(RuntimeEvent::DynamicReplyReady(delivery));
-            }
-        });
-    }
-
     pub(super) fn start_dynamic_worker_fetch(
         &mut self,
         owner_worker: String,
@@ -655,8 +453,8 @@ impl WorkerManager {
         request: WorkerInvocation,
         reply_id: String,
         pending_replies: crate::ops::DynamicPendingReplies,
-        command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        command_tx: &mpsc::Sender<RuntimeCommand>,
+        event_tx: &RuntimeEventSender,
     ) {
         let dispatch_target = match self.dynamic_dispatch_target(
             &handle,
@@ -866,7 +664,8 @@ impl WorkerManager {
                     )),
                     Err(_) => {
                         let _ = event_tx
-                            .send(RuntimeEvent::DynamicTimeoutDiagnostic(timeout_diagnostic));
+                            .send(RuntimeEvent::DynamicTimeoutDiagnostic(timeout_diagnostic))
+                            .await;
                         Err(PlatformError::runtime(format!(
                             "dynamic worker invoke timed out after {timeout}ms"
                         )))
@@ -881,7 +680,7 @@ impl WorkerManager {
                     if output.body.len() > policy.max_response_bytes {
                         quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
                         profile.record_quota_kill();
-                        let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                        let _ = command_tx.try_send(RuntimeCommand::RetireDynamicWorkerHandle {
                             handle: handle_for_task.clone(),
                             reason: "dynamic child exceeded max_response_bytes".to_string(),
                         });
@@ -897,7 +696,7 @@ impl WorkerManager {
                             .upgrade_deny_count
                             .fetch_add(1, Ordering::Relaxed);
                         profile.record_upgrade_deny();
-                        let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                        let _ = command_tx.try_send(RuntimeCommand::RetireDynamicWorkerHandle {
                             handle: handle_for_task.clone(),
                             reason: "dynamic child attempted websocket upgrade without permission"
                                 .to_string(),
@@ -913,7 +712,7 @@ impl WorkerManager {
                             .upgrade_deny_count
                             .fetch_add(1, Ordering::Relaxed);
                         profile.record_upgrade_deny();
-                        let _ = command_tx.send(RuntimeCommand::RetireDynamicWorkerHandle {
+                        let _ = command_tx.try_send(RuntimeCommand::RetireDynamicWorkerHandle {
                             handle: handle_for_task.clone(),
                             reason: "dynamic child attempted transport upgrade without permission"
                                 .to_string(),
@@ -938,7 +737,9 @@ impl WorkerManager {
                     boundary: Some(crate::ops::current_time_boundary()),
                 },
             ) {
-                let _ = event_tx.send(RuntimeEvent::DynamicFetchReplyReady(delivery));
+                let _ = event_tx
+                    .send(RuntimeEvent::DynamicFetchReplyReady(delivery))
+                    .await;
             }
         });
     }
@@ -946,7 +747,7 @@ impl WorkerManager {
     pub(super) fn handle_dynamic_host_rpc_invoke(
         &mut self,
         payload: crate::ops::DynamicHostRpcInvokeEvent,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let crate::ops::DynamicHostRpcInvokeEvent {
             caller_worker,
@@ -1123,18 +924,32 @@ impl WorkerManager {
         }
     }
 
-    pub(super) async fn validate_worker_cached(&mut self, source: &str) -> Result<()> {
+    pub(super) async fn validate_worker_cached(
+        &mut self,
+        source: &crate::ops::WorkerSource,
+    ) -> Result<()> {
         let source_hash =
             hash_source_with_code_generation(source, self.config.debug_code_generation);
         if self.validated_worker_sources.contains(&source_hash) {
             return Ok(());
         }
-        validate_worker(
-            self.bootstrap_snapshot,
-            source,
-            self.config.debug_code_generation,
-        )
-        .await?;
+        match source {
+            crate::ops::WorkerSource::Inline(source) => {
+                validate_worker(
+                    self.bootstrap_snapshot,
+                    source.as_ref(),
+                    self.config.debug_code_generation,
+                )
+                .await?;
+            }
+            crate::ops::WorkerSource::DynamicModule { .. } => {
+                let mut runtime = new_runtime_from_snapshot(
+                    self.bootstrap_snapshot,
+                    self.config.debug_code_generation,
+                )?;
+                crate::engine::load_worker_source(&mut runtime, source).await?;
+            }
+        }
         self.validated_worker_sources.insert(source_hash);
         Ok(())
     }
@@ -1266,9 +1081,26 @@ impl WorkerManager {
     }
 }
 
-fn hash_source_with_code_generation(source: &str, allow_code_generation: bool) -> [u8; 32] {
+fn hash_source_with_code_generation(
+    source: &crate::ops::WorkerSource,
+    allow_code_generation: bool,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update([u8::from(allow_code_generation)]);
-    hasher.update(source.as_bytes());
+    match source {
+        crate::ops::WorkerSource::Inline(source) => {
+            hasher.update([0]);
+            hasher.update(source.as_bytes());
+        }
+        crate::ops::WorkerSource::DynamicModule {
+            graph_id,
+            entrypoint,
+        } => {
+            hasher.update([1]);
+            hasher.update(graph_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(entrypoint.as_bytes());
+        }
+    }
     hasher.finalize().into()
 }

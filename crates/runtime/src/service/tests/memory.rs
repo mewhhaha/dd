@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 #[serial]
-async fn memory_same_key_allows_overlap_by_default() {
+async fn memory_same_key_atomic_commands_are_serialized() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 3,
@@ -29,6 +29,26 @@ async fn memory_same_key_allows_overlap_by_default() {
         .await
         .expect("deploy should succeed");
 
+    let warmup = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/run?key=user-1&spin=2000", "memory-run-warmup"),
+        )
+        .await
+        .expect("warmup invoke should succeed");
+    assert_eq!(warmup.status, 200);
+
+    let single_started = Instant::now();
+    let measured = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/run?key=user-1&spin=2000", "memory-run-measured"),
+        )
+        .await
+        .expect("measured invoke should succeed");
+    assert_eq!(measured.status, 200);
+    let minimum_serial_elapsed = single_started.elapsed().saturating_mul(3);
+
     let started = Instant::now();
     let mut tasks = Vec::new();
     for idx in 0..8 {
@@ -36,7 +56,10 @@ async fn memory_same_key_allows_overlap_by_default() {
         tasks.push(tokio::spawn(async move {
             svc.invoke(
                 "memory".to_string(),
-                test_invocation_with_path("/run?key=user-1", &format!("memory-run-{idx}")),
+                test_invocation_with_path(
+                    "/run?key=user-1&spin=2000",
+                    &format!("memory-run-{idx}"),
+                ),
             )
             .await
         }));
@@ -47,8 +70,8 @@ async fn memory_same_key_allows_overlap_by_default() {
     }
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_millis(650),
-        "expected overlap for same memory key by default, elapsed={elapsed:?}"
+        elapsed >= minimum_serial_elapsed,
+        "expected same-key memory atomic commands to serialize, elapsed={elapsed:?}, single={minimum_serial_elapsed:?}"
     );
 }
 
@@ -118,6 +141,566 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
         String::from_utf8(current.body).expect("utf8"),
         increments.to_string()
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_callback_executes_once_for_cold_read() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/single-execution-read?key=user-cold-single",
+                "single-execution-read",
+            ),
+        )
+        .await
+        .expect("invoke should succeed");
+    assert_eq!(output.status, 200);
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "missing:1");
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_rejects_unsupported_storage_options() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    for operation in ["get", "set", "delete"] {
+        let output = service
+            .invoke(
+                "memory".to_string(),
+                test_invocation_with_path(
+                    &format!(
+                        "/atomic-unsupported-option?key=user-option-{operation}&operation={operation}"
+                    ),
+                    &format!("atomic-unsupported-option-{operation}"),
+                ),
+            )
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(output.status, 418);
+        let body = String::from_utf8(output.body).expect("body should be utf8");
+        assert!(
+            body.contains(&format!(
+                "memory atomic {operation} options are unsupported"
+            )),
+            "body was {body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_direct_operations_reject_unsupported_storage_options() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    for operation in ["get", "set", "delete"] {
+        let output = service
+            .invoke(
+                "memory".to_string(),
+                test_invocation_with_path(
+                    &format!(
+                        "/direct-unsupported-option?key=user-direct-option-{operation}&operation={operation}"
+                    ),
+                    &format!("direct-unsupported-option-{operation}"),
+                ),
+            )
+            .await
+            .expect("invoke should succeed");
+        assert_eq!(output.status, 418);
+        let body = String::from_utf8(output.body).expect("body should be utf8");
+        assert!(
+            body.contains(&format!("memory {operation} options are unsupported")),
+            "body was {body}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/multi-write-versions?key=user-staged-versions",
+                "multi-write-versions",
+            ),
+        )
+        .await
+        .expect("invoke should succeed");
+    assert_eq!(output.status, 200);
+    assert_eq!(
+        String::from_utf8(output.body).expect("body should be utf8"),
+        "alpha:1:-1,beta:2:-1"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_idempotency_key_replays_committed_result() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 2,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-inc?key=user-idempotent&command=cmd-1&amount=1",
+                "idempotent-first",
+            ),
+        )
+        .await
+        .expect("first invoke should succeed");
+    let second = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-inc?key=user-idempotent&command=cmd-1&amount=10",
+                "idempotent-second",
+            ),
+        )
+        .await
+        .expect("second invoke should succeed");
+    assert_eq!(first.status, 200);
+    assert_eq!(second.status, 200);
+    assert_eq!(first.body, second.body);
+
+    let payload: Value = crate::json::from_string(
+        String::from_utf8(second.body).expect("idempotent body should be utf8"),
+    )
+    .expect("idempotent response should parse");
+    assert_eq!(payload["next"].as_i64(), Some(1));
+    assert_eq!(payload["attempts"].as_i64(), Some(1));
+
+    let current = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/get?key=user-idempotent", "idempotent-current"),
+        )
+        .await
+        .expect("get should succeed");
+    assert_eq!(String::from_utf8(current.body).expect("utf8"), "1");
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 2,
+        max_isolates: 3,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut tasks = Vec::new();
+    for idx in 0..12 {
+        let svc = service.clone();
+        tasks.push(tokio::spawn(async move {
+            svc.invoke(
+                "memory".to_string(),
+                test_invocation_with_path(
+                    &format!(
+                        "/idempotent-inc?key=user-idempotent-race&command=cmd-race&amount={}",
+                        idx + 1
+                    ),
+                    &format!("idempotent-race-{idx}"),
+                ),
+            )
+            .await
+        }));
+    }
+
+    let mut bodies = Vec::new();
+    for task in tasks {
+        let output = task.await.expect("join").expect("invoke should succeed");
+        assert_eq!(output.status, 200);
+        bodies.push(output.body);
+    }
+    let first = bodies.first().expect("at least one response").clone();
+    assert!(
+        bodies.iter().all(|body| body == &first),
+        "all duplicate command responses should replay the first committed result"
+    );
+
+    let payload: Value = crate::json::from_string(
+        String::from_utf8(first).expect("idempotent race body should be utf8"),
+    )
+    .expect("idempotent race response should parse");
+    let committed_next = payload["next"]
+        .as_i64()
+        .expect("committed next value should be numeric");
+    assert!((1..=12).contains(&committed_next));
+    assert_eq!(payload["attempts"].as_i64(), Some(1));
+
+    let current = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/get?key=user-idempotent-race", "idempotent-race-current"),
+        )
+        .await
+        .expect("get should succeed");
+    assert_eq!(
+        String::from_utf8(current.body).expect("utf8"),
+        committed_next.to_string()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_idempotency_key_replays_read_only_result() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 2,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-read?key=user-idempotent-read&command=read-1",
+                "idempotent-read-first",
+            ),
+        )
+        .await
+        .expect("first read invoke should succeed");
+
+    service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-inc?key=user-idempotent-read&command=write-1&amount=5",
+                "idempotent-read-mutator",
+            ),
+        )
+        .await
+        .expect("mutating invoke should succeed");
+
+    let second = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-read?key=user-idempotent-read&command=read-1",
+                "idempotent-read-second",
+            ),
+        )
+        .await
+        .expect("second read invoke should succeed");
+    assert_eq!(first.status, 200);
+    assert_eq!(second.status, 200);
+    assert_eq!(first.body, second.body);
+
+    let payload: Value = crate::json::from_string(
+        String::from_utf8(second.body).expect("idempotent read body should be utf8"),
+    )
+    .expect("idempotent read response should parse");
+    assert_eq!(payload["current"].as_i64(), Some(0));
+    assert_eq!(payload["attempts"].as_i64(), Some(1));
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_atomic_can_emit_durable_effect_records() {
+    let root = PathBuf::from(format!("/tmp/dd-memory-outbox-{}", Uuid::new_v4()));
+    let db_path = root.join("dd-test.db");
+    let database_url = format!("file:{}", db_path.display());
+    let service = test_service_with_paths(
+        RuntimeConfig {
+            min_isolates: 1,
+            max_isolates: 2,
+            max_inflight_per_isolate: 4,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_millis(50),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        },
+        root.clone(),
+        database_url,
+        false,
+    )
+    .await;
+
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/emit-effect?key=user-effect", "emit-effect"),
+        )
+        .await
+        .expect("emit invoke should succeed");
+    assert_eq!(output.status, 200);
+    let payload: Value =
+        crate::json::from_string(String::from_utf8(output.body).expect("emit body should be utf8"))
+            .expect("emit response should parse");
+    assert_eq!(payload["next"].as_i64(), Some(1));
+
+    let current = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/get?key=user-effect", "emit-current"),
+        )
+        .await
+        .expect("get should succeed");
+    assert_eq!(String::from_utf8(current.body).expect("utf8"), "1");
+
+    let memory_store =
+        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
+            .await
+            .expect("memory store should open");
+    let outbox = memory_store
+        .outbox_records("MY_MEMORY", "user-effect")
+        .await
+        .expect("outbox records should load");
+    assert_eq!(outbox.len(), 2);
+    assert!(outbox.iter().all(|record| record.status == "delivered"));
+    assert!(outbox
+        .iter()
+        .all(|record| record.kind.starts_with("audit.")));
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_outbox_pending_effects_drain_after_service_start() {
+    let root = PathBuf::from(format!("/tmp/dd-memory-outbox-startup-{}", Uuid::new_v4()));
+    let db_path = root.join("dd-test.db");
+    let database_url = format!("file:{}", db_path.display());
+    let seed_store =
+        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
+            .await
+            .expect("memory store should open");
+    let effects = (0..70)
+        .map(|index| crate::memory::MemoryOutboxEffectWrite {
+            kind: "audit.startup".to_string(),
+            payload: format!(r#"{{"phase":"startup","index":{index}}}"#).into_bytes(),
+        })
+        .collect::<Vec<_>>();
+    seed_store
+        .apply_batch("MY_MEMORY", "startup-effect", &[], None, &effects, None)
+        .await
+        .expect("outbox seed should commit");
+    let seeded = seed_store
+        .outbox_records("MY_MEMORY", "startup-effect")
+        .await
+        .expect("seeded outbox should load");
+    assert_eq!(seeded.len(), effects.len());
+    assert!(seeded.iter().all(|record| record.status == "pending"));
+    drop(seed_store);
+
+    let service = test_service_with_paths(
+        RuntimeConfig {
+            min_isolates: 0,
+            max_isolates: 1,
+            max_inflight_per_isolate: 1,
+            idle_ttl: Duration::from_secs(5),
+            scale_tick: Duration::from_secs(60),
+            queue_warn_thresholds: vec![10],
+            ..RuntimeConfig::default()
+        },
+        root.clone(),
+        database_url,
+        false,
+    )
+    .await;
+
+    let check_store =
+        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
+            .await
+            .expect("memory store should reopen");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let records = check_store
+                .outbox_records("MY_MEMORY", "startup-effect")
+                .await
+                .expect("outbox should load");
+            if records.iter().all(|record| record.status == "delivered") {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pending outbox should drain after service start");
+
+    service.shutdown().await.expect("service should shutdown");
+    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
@@ -407,7 +990,7 @@ async fn memory_direct_writes_preserve_distinct_memory_updates() {
 
 #[tokio::test]
 #[serial]
-async fn memory_blind_stm_write_uses_blind_apply_path() {
+async fn memory_actor_set_write_uses_owner_validated_batch_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -438,7 +1021,7 @@ async fn memory_blind_stm_write_uses_blind_apply_path() {
     service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/__profile_reset", "memory-blind-profile-reset"),
+            test_invocation_with_path("/__profile_reset", "memory-set-profile-reset"),
         )
         .await
         .expect("profile reset should succeed");
@@ -447,19 +1030,19 @@ async fn memory_blind_stm_write_uses_blind_apply_path() {
         .invoke(
             "memory".to_string(),
             test_invocation_with_path(
-                "/stm-blind-write?key=user-blind-stm&value=7",
-                "memory-blind-write",
+                "/actor-set-write?key=user-set-actor&value=7",
+                "memory-set-write",
             ),
         )
         .await
-        .expect("blind stm write should succeed");
+        .expect("actor set write should succeed");
     assert_eq!(write.status, 200);
     assert_eq!(String::from_utf8(write.body).expect("utf8"), "7");
 
     let output = service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/__profile", "memory-blind-profile"),
+            test_invocation_with_path("/__profile", "memory-set-profile"),
         )
         .await
         .expect("profile should succeed");
@@ -468,19 +1051,14 @@ async fn memory_blind_stm_write_uses_blind_apply_path() {
     )
     .expect("profile should parse");
     assert!(
-        profile["snapshot"]["op_apply_blind_batch"]["calls"]
+        profile["snapshot"]["op_apply_batch"]["calls"]
             .as_u64()
             .unwrap_or(0)
             >= 1
     );
-    assert_eq!(
-        profile["snapshot"]["op_apply_batch"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
+    assert!(profile["snapshot"].get("op_apply_blind_batch").is_none());
     assert!(
-        profile["snapshot"]["js_txn_blind_commit"]["calls"]
+        profile["snapshot"]["js_txn_commit"]["calls"]
             .as_u64()
             .unwrap_or(0)
             >= 1
@@ -489,7 +1067,7 @@ async fn memory_blind_stm_write_uses_blind_apply_path() {
 
 #[tokio::test]
 #[serial]
-async fn memory_mixed_stm_write_stays_on_full_apply_path() {
+async fn memory_actor_read_write_uses_owner_validated_batch_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -520,7 +1098,7 @@ async fn memory_mixed_stm_write_stays_on_full_apply_path() {
     service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/seed?key=user-mixed-stm", "memory-mixed-seed"),
+            test_invocation_with_path("/seed?key=user-mixed-actor", "memory-mixed-seed"),
         )
         .await
         .expect("seed should succeed");
@@ -537,12 +1115,12 @@ async fn memory_mixed_stm_write_stays_on_full_apply_path() {
         .invoke(
             "memory".to_string(),
             test_invocation_with_path(
-                "/stm-read-write?key=user-mixed-stm&value=9",
+                "/actor-read-write?key=user-mixed-actor&value=9",
                 "memory-mixed-write",
             ),
         )
         .await
-        .expect("mixed stm write should succeed");
+        .expect("actor read/write should succeed");
     assert_eq!(write.status, 200);
     assert_eq!(String::from_utf8(write.body).expect("utf8"), "0->9");
 
@@ -563,18 +1141,89 @@ async fn memory_mixed_stm_write_stays_on_full_apply_path() {
             .unwrap_or(0)
             >= 1
     );
-    assert_eq!(
-        profile["snapshot"]["op_apply_blind_batch"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
+    assert!(profile["snapshot"].get("op_apply_blind_batch").is_none());
     assert!(
         profile["snapshot"]["js_txn_commit"]["calls"]
             .as_u64()
             .unwrap_or(0)
             >= 1
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_actor_owner_epoch_survives_runtime_restart() {
+    let root = PathBuf::from(format!("/tmp/dd-memory-owner-epoch-{}", Uuid::new_v4()));
+    let db_path = root.join("dd-test.db");
+    let database_url = format!("file:{}", db_path.display());
+    let config = RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    };
+
+    let service =
+        test_service_with_paths(config.clone(), root.clone(), database_url.clone(), true).await;
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/actor-set-write?key=user-owner-restart&value=7",
+                "memory-owner-first",
+            ),
+        )
+        .await
+        .expect("first actor write should succeed");
+    assert_eq!(first.status, 200);
+    assert_eq!(String::from_utf8(first.body).expect("utf8"), "7");
+    service.shutdown().await.expect("service should shut down");
+
+    let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
+    let second = restored
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/actor-set-write?key=user-owner-restart&value=8",
+                "memory-owner-second",
+            ),
+        )
+        .await
+        .expect("second actor write after restart should succeed");
+    assert_eq!(second.status, 200);
+    assert_eq!(String::from_utf8(second.body).expect("utf8"), "8");
+
+    let current = restored
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path("/get?key=user-owner-restart", "memory-owner-current"),
+        )
+        .await
+        .expect("current value should load");
+    assert_eq!(String::from_utf8(current.body).expect("utf8"), "8");
+    restored
+        .shutdown()
+        .await
+        .expect("restored should shut down");
+    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
@@ -661,7 +1310,7 @@ async fn memory_direct_read_uses_point_read_lane() {
 
 #[tokio::test]
 #[serial]
-async fn memory_read_only_atomic_avoids_stm_commit_path() {
+async fn memory_read_only_atomic_uses_actor_snapshot_without_commit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -718,26 +1367,14 @@ async fn memory_read_only_atomic_avoids_stm_commit_path() {
         String::from_utf8(output.body).expect("profile body should be utf8"),
     )
     .expect("profile should parse");
-    assert_eq!(
+    assert!(
         profile["snapshot"]["op_snapshot"]["calls"]
             .as_u64()
-            .unwrap_or(0),
-        0
-    );
-    assert_eq!(
-        profile["snapshot"]["op_validate_reads"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
+            .unwrap_or(0)
+            >= 1
     );
     assert_eq!(
         profile["snapshot"]["op_apply_batch"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
-    assert_eq!(
-        profile["snapshot"]["js_txn_validate"]["calls"]
             .as_u64()
             .unwrap_or(0),
         0
@@ -748,6 +1385,8 @@ async fn memory_read_only_atomic_avoids_stm_commit_path() {
             .unwrap_or(0),
         0
     );
+    assert!(profile["snapshot"].get("op_validate_reads").is_none());
+    assert!(profile["snapshot"].get("js_txn_validate").is_none());
 }
 
 #[tokio::test]
@@ -878,7 +1517,7 @@ async fn memory_multikey_direct_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn memory_multikey_stm_reads_complete_after_warmup() {
+async fn memory_multikey_actor_reads_complete_after_warmup() {
     let service = test_service(RuntimeConfig {
         min_isolates: 4,
         max_isolates: 4,
@@ -908,7 +1547,7 @@ async fn memory_multikey_stm_reads_complete_after_warmup() {
     service
         .invoke(
             "memory-multi-key".to_string(),
-            test_invocation_with_path("/seed-all?keys=8", "multi-key-stm-seed"),
+            test_invocation_with_path("/seed-all?keys=8", "multi-key-actor-seed"),
         )
         .await
         .expect("seed should succeed");
@@ -916,10 +1555,10 @@ async fn memory_multikey_stm_reads_complete_after_warmup() {
     let warmed = service
         .invoke(
             "memory-multi-key".to_string(),
-            test_invocation_with_path("/stm-sum?keys=8", "multi-key-stm-warm"),
+            test_invocation_with_path("/actor-sum?keys=8", "multi-key-actor-warm"),
         )
         .await
-        .expect("warm stm sum should succeed");
+        .expect("warm actor sum should succeed");
     assert_eq!(String::from_utf8(warmed.body).expect("utf8"), "8");
 
     let mut tasks = Vec::new();
@@ -930,7 +1569,10 @@ async fn memory_multikey_stm_reads_complete_after_warmup() {
                 Duration::from_secs(2),
                 service.invoke(
                     "memory-multi-key".to_string(),
-                    test_invocation_with_path("/stm-sum?keys=8", &format!("multi-key-stm-{idx}")),
+                    test_invocation_with_path(
+                        "/actor-sum?keys=8",
+                        &format!("multi-key-actor-{idx}"),
+                    ),
                 ),
             )
             .await
@@ -940,8 +1582,8 @@ async fn memory_multikey_stm_reads_complete_after_warmup() {
         let output = task
             .await
             .expect("join")
-            .expect("stm sum should not hang")
-            .expect("stm sum invoke should succeed");
+            .expect("actor sum should not hang")
+            .expect("actor sum invoke should succeed");
         assert_eq!(output.status, 200);
         assert_eq!(String::from_utf8(output.body).expect("utf8"), "8");
     }
@@ -949,7 +1591,7 @@ async fn memory_multikey_stm_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn memory_stm_benchmark_worker_returns_correct_total() {
+async fn memory_actor_benchmark_worker_returns_correct_total() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 2,
@@ -1369,7 +2011,7 @@ async fn hosted_memory_allows_inline_closures() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_stm_single_read_is_point_in_time_only() {
+async fn hosted_memory_actor_single_read_is_point_in_time_only() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -1399,7 +2041,7 @@ async fn hosted_memory_stm_single_read_is_point_in_time_only() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/stm/seed?key=user-stm-once", "stm-seed-once"),
+            test_invocation_with_path("/actor/seed?key=user-actor-once", "actor-seed-once"),
         )
         .await
         .expect("seed should succeed");
@@ -1410,7 +2052,10 @@ async fn hosted_memory_stm_single_read_is_point_in_time_only() {
             service
                 .invoke(
                     "hosted-memory".to_string(),
-                    test_invocation_with_path("/stm/read-once?key=user-stm-once", "stm-read-once"),
+                    test_invocation_with_path(
+                        "/actor/read-once?key=user-actor-once",
+                        "actor-read-once",
+                    ),
                 )
                 .await
         })
@@ -1421,7 +2066,10 @@ async fn hosted_memory_stm_single_read_is_point_in_time_only() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/stm/write-a?key=user-stm-once&value=1", "stm-write-once"),
+            test_invocation_with_path(
+                "/actor/write-a?key=user-actor-once&value=1",
+                "actor-write-once",
+            ),
         )
         .await
         .expect("write should succeed");
@@ -1435,7 +2083,7 @@ async fn hosted_memory_stm_single_read_is_point_in_time_only() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
+async fn hosted_memory_actor_read_command_does_not_replay_when_prior_read_goes_stale() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -1465,7 +2113,7 @@ async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/stm/seed?key=user-stm-pair", "stm-seed-pair"),
+            test_invocation_with_path("/actor/seed?key=user-actor-pair", "actor-seed-pair"),
         )
         .await
         .expect("seed should succeed");
@@ -1476,7 +2124,10 @@ async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
             service
                 .invoke(
                     "hosted-memory".to_string(),
-                    test_invocation_with_path("/stm/read-pair?key=user-stm-pair", "stm-read-pair"),
+                    test_invocation_with_path(
+                        "/actor/read-pair?key=user-actor-pair",
+                        "actor-read-pair",
+                    ),
                 )
                 .await
         })
@@ -1496,8 +2147,8 @@ async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
                     .invoke(
                         "hosted-memory".to_string(),
                         test_invocation_with_path(
-                            "/stm/write-a?key=user-stm-pair&value=1",
-                            "stm-write-pair",
+                            "/actor/write-a?key=user-actor-pair&value=1",
+                            "actor-write-pair",
                         ),
                     )
                     .await
@@ -1511,12 +2162,12 @@ async fn hosted_memory_stm_retries_when_prior_read_goes_stale() {
         .expect("join")
         .expect("invoke should succeed");
     writer_thread.join().expect("writer join");
-    assert_eq!(String::from_utf8(pair.body).expect("utf8"), "1:0");
+    assert_eq!(String::from_utf8(pair.body).expect("utf8"), "0:0");
 }
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_stm_snapshot_read_skips_retry_for_that_read() {
+async fn hosted_memory_actor_snapshot_read_executes_once() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 3,
@@ -1546,7 +2197,7 @@ async fn hosted_memory_stm_snapshot_read_skips_retry_for_that_read() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/stm/seed?key=user-stm-allow", "stm-seed-allow"),
+            test_invocation_with_path("/actor/seed?key=user-actor-allow", "actor-seed-allow"),
         )
         .await
         .expect("seed should succeed");
@@ -1558,8 +2209,8 @@ async fn hosted_memory_stm_snapshot_read_skips_retry_for_that_read() {
                 .invoke(
                     "hosted-memory".to_string(),
                     test_invocation_with_path(
-                        "/stm/read-pair-snapshot?key=user-stm-allow",
-                        "stm-read-allow",
+                        "/actor/read-pair-snapshot?key=user-actor-allow",
+                        "actor-read-allow",
                     ),
                 )
                 .await
@@ -1571,7 +2222,10 @@ async fn hosted_memory_stm_snapshot_read_skips_retry_for_that_read() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/stm/write-a?key=user-stm-allow&value=1", "stm-write-allow"),
+            test_invocation_with_path(
+                "/actor/write-a?key=user-actor-allow&value=1",
+                "actor-write-allow",
+            ),
         )
         .await
         .expect("write should succeed");
@@ -1616,7 +2270,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/stm/tvar-default/read?key=user-1",
+                "/actor/tvar-default/read?key=user-1",
                 "hosted-memory-tvar-default-read",
             ),
         )
@@ -1628,7 +2282,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/stm/tvar-default/raw?key=user-1",
+                "/actor/tvar-default/raw?key=user-1",
                 "hosted-memory-tvar-default-raw-before-write",
             ),
         )
@@ -1643,7 +2297,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/stm/tvar-default/write?key=user-1",
+                "/actor/tvar-default/write?key=user-1",
                 "hosted-memory-tvar-default-write",
             ),
         )
@@ -1655,7 +2309,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/stm/tvar-default/raw?key=user-1",
+                "/actor/tvar-default/raw?key=user-1",
                 "hosted-memory-tvar-default-raw-after-write",
             ),
         )

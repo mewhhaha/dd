@@ -1,6 +1,7 @@
 mod assets;
 mod blob;
 mod cache;
+mod dynamic_modules;
 mod engine;
 mod json;
 mod kv;
@@ -16,7 +17,8 @@ pub use blob::{BlobBackendConfig, BlobStoreConfig};
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use kv::{KvStore, KvUtf8Lookup};
 pub use service::{
-    DynamicDeployResult, InvokeRequestBodyReceiver, RuntimeConfig, RuntimeService,
-    RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump,
-    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    DynamicDeployResult, InvokeRequestBodyReceiver, PublicRouteAssetResolution, RuntimeConfig,
+    RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen,
+    WorkerDebugDump, WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody,
+    WorkerStreamOutput,
 };

@@ -14,7 +14,7 @@ where
     let (parts, body) = request.into_parts();
     let (worker_name, url) =
         parse_invoke_request_uri(parts.uri.path(), parts.uri.path_and_query())?;
-    invoke_worker_with_target(state, parts, body, worker_name, url).await
+    invoke_worker_with_target(state, parts, body, worker_name, url, false).await
 }
 
 pub async fn invoke_worker_public<B>(
@@ -32,16 +32,17 @@ where
         &parts.uri,
         &state.public_base_domain,
     )?;
-    ensure_public_worker(&state, &worker_name).await?;
     let url = build_public_request_url(&parts.headers, &parts.uri)?;
     let request = Request::from_parts(parts, body);
     if ws_upgrade.is_some() {
+        ensure_public_worker(&state, &worker_name)?;
         return invoke_worker_websocket_public(state, request, ws_upgrade).await;
     }
     let (parts, body) = request.into_parts();
-    invoke_worker_with_target(state, parts, body, worker_name, url).await
+    invoke_worker_with_target(state, parts, body, worker_name, url, true).await
 }
 
+#[cfg(feature = "http3")]
 pub async fn invoke_worker_public_h3(
     state: AppState,
     request: Request<()>,
@@ -53,9 +54,8 @@ pub async fn invoke_worker_public_h3(
         &parts.uri,
         &state.public_base_domain,
     )?;
-    ensure_public_worker(&state, &worker_name).await?;
     let url = build_public_request_url(&parts.headers, &parts.uri)?;
-    invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url).await
+    invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url, true).await
 }
 
 async fn invoke_worker_with_target<B>(
@@ -64,6 +64,7 @@ async fn invoke_worker_with_target<B>(
     body: B,
     worker_name: String,
     url: String,
+    require_public_worker: bool,
 ) -> ApiResult<Response<ResponseBody>>
 where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
@@ -81,7 +82,15 @@ where
     } else {
         None
     };
-    invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url).await
+    invoke_worker_from_body_stream(
+        state,
+        parts,
+        request_body_stream,
+        worker_name,
+        url,
+        require_public_worker,
+    )
+    .await
 }
 
 async fn invoke_worker_from_body_stream(
@@ -90,6 +99,7 @@ async fn invoke_worker_from_body_stream(
     request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
     worker_name: String,
     url: String,
+    require_public_worker: bool,
 ) -> ApiResult<Response<ResponseBody>> {
     let method = parts.method.as_str().to_string();
     let invoke_span = tracing::info_span!(
@@ -108,17 +118,20 @@ async fn invoke_worker_from_body_stream(
         })?;
         headers.push((name.as_str().to_string(), value.to_string()));
     }
-    if let Some(asset_response) = try_serve_static_asset(
+    let static_asset = try_serve_static_asset(
         &state,
         &worker_name,
         &method,
         request_host_for_matching(&parts.headers, &parts.uri),
-        worker_asset_path(&url)?,
-        headers.clone(),
-    )
-    .await?
-    {
+        &worker_asset_path(&url)?,
+        &headers,
+        require_public_worker,
+    )?;
+    if let Some(asset_response) = static_asset.response {
         return Ok(asset_response);
+    }
+    if require_public_worker && !static_asset.public_worker {
+        return Err(PlatformError::not_found("not found").into());
     }
     inject_current_trace_context(&mut headers);
     let request_id = Uuid::new_v4().to_string();
@@ -236,14 +249,11 @@ pub(crate) fn parse_public_worker_name_from_request(
     parse_worker_from_host(host, public_base_domain)
 }
 
-pub(crate) async fn ensure_public_worker(
+pub(crate) fn ensure_public_worker(
     state: &AppState,
     worker_name: &str,
 ) -> Result<(), PlatformError> {
-    let Some(stats) = state.runtime.stats(worker_name.to_string()).await else {
-        return Err(PlatformError::not_found("not found"));
-    };
-    if !stats.public {
+    if !state.runtime.worker_is_public(worker_name) {
         return Err(PlatformError::not_found("not found"));
     }
     Ok(())
@@ -345,32 +355,51 @@ pub(super) fn request_host_for_matching(headers: &HeaderMap, uri: &http::Uri) ->
         })
 }
 
-async fn try_serve_static_asset(
+struct StaticAssetLookup {
+    response: Option<Response<ResponseBody>>,
+    public_worker: bool,
+}
+
+fn try_serve_static_asset(
     state: &AppState,
     worker_name: &str,
     method: &str,
     host: Option<String>,
-    path: String,
-    headers: Vec<(String, String)>,
-) -> Result<Option<Response<ResponseBody>>, PlatformError> {
-    let Some(asset) = state
-        .runtime
-        .resolve_asset(
-            worker_name.to_string(),
-            method.to_string(),
-            host,
+    path: &str,
+    headers: &[(String, String)],
+    public_only: bool,
+) -> Result<StaticAssetLookup, PlatformError> {
+    let (asset, public_worker) = if public_only {
+        let resolution = state.runtime.resolve_public_route_asset(
+            worker_name,
+            method,
+            host.as_deref(),
             path,
             headers,
+        )?;
+        (resolution.asset, resolution.public_worker)
+    } else {
+        (
+            state
+                .runtime
+                .resolve_asset(worker_name, method, host.as_deref(), path, headers)?,
+            false,
         )
-        .await?
-    else {
-        return Ok(None);
+    };
+    let Some(asset) = asset else {
+        return Ok(StaticAssetLookup {
+            response: None,
+            public_worker,
+        });
     };
 
-    Ok(Some(
-        build_direct_buffered_response(asset.status, asset.headers, asset.body)
-            .map_err(|error| error.0)?,
-    ))
+    Ok(StaticAssetLookup {
+        response: Some(
+            build_direct_buffered_response(asset.status, asset.headers, asset.body)
+                .map_err(|error| error.0)?,
+        ),
+        public_worker,
+    })
 }
 
 pub(super) fn parse_worker_from_host(
@@ -455,7 +484,7 @@ where
                     .await;
                 return;
             }
-            if tx.send(Ok(chunk.to_vec())).await.is_err() {
+            if tx.send(Ok(chunk)).await.is_err() {
                 return;
             }
         }
@@ -482,7 +511,6 @@ fn build_worker_stream_response(
     })
     .map(|chunk| {
         chunk
-            .map(Bytes::from)
             .map(Frame::data)
             .map_err(|error| -> BoxError { std::io::Error::other(error.to_string()).into() })
     });
@@ -555,7 +583,7 @@ fn build_worker_buffered_response(
 fn build_direct_buffered_response(
     status: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> ApiResult<Response<ResponseBody>> {
     let mut response = Response::builder()
         .status(status)

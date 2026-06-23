@@ -1,8 +1,15 @@
 use crate::assets::{
-    abort_worker_js, execute_worker_js, install_worker_js, BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER,
-    INSTALL_SPECIFIER, WORKER_SPECIFIER,
+    install_worker_js, BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER,
 };
-use crate::ops::runtime_extension;
+use crate::dynamic_modules::{
+    dynamic_module_source, normalize_dynamic_module_path, resolve_dynamic_module_path,
+};
+use crate::ops::{
+    clear_request_invocation, clear_worker_deployment_config, register_request_invocation,
+    register_worker_deployment_config, runtime_extension, WorkerDeploymentPayload,
+    WorkerRequestPayload, WorkerSource,
+};
+use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
 use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
     resolve_import, v8, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot,
@@ -14,6 +21,7 @@ use deno_error::JsErrorBox;
 use deno_fetch::Options as DenoFetchOptions;
 use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use std::borrow::Cow;
+use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -26,7 +34,7 @@ static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: runtime_extensions(),
-        module_loader: Some(Rc::new(DataUrlModuleLoader)),
+        module_loader: Some(Rc::new(RuntimeModuleLoader)),
         ..Default::default()
     });
     runtime
@@ -74,7 +82,7 @@ pub async fn validate_worker(
     source: &str,
     allow_code_generation: bool,
 ) -> Result<()> {
-    let mut runtime = new_runtime(bootstrap_snapshot, allow_code_generation)?;
+    let mut runtime = new_runtime(bootstrap_snapshot, allow_code_generation, 0)?;
     load_worker(&mut runtime, source).await
 }
 
@@ -83,10 +91,10 @@ pub async fn build_worker_snapshot(
     _bootstrap_snapshot: &'static [u8],
     source: &str,
     allow_code_generation: bool,
-) -> Result<&'static [u8]> {
+) -> Result<Box<[u8]>> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: runtime_extensions(),
-        module_loader: Some(Rc::new(DataUrlModuleLoader)),
+        module_loader: Some(Rc::new(RuntimeModuleLoader)),
         ..Default::default()
     });
     runtime
@@ -96,15 +104,15 @@ pub async fn build_worker_snapshot(
     evaluate_snapshot_module(&mut runtime, WORKER_SPECIFIER, source, false).await?;
     let install_code = install_worker_js();
     evaluate_snapshot_module(&mut runtime, INSTALL_SPECIFIER, &install_code, true).await?;
-    let snapshot = runtime.snapshot();
-    Ok(Box::leak(snapshot))
+    Ok(runtime.snapshot())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_loaded_worker_runtime(
     startup_snapshot: &'static [u8],
     allow_code_generation: bool,
 ) -> Result<()> {
-    let mut runtime = new_runtime(startup_snapshot, allow_code_generation)?;
+    let mut runtime = new_runtime(startup_snapshot, allow_code_generation, 0)?;
     runtime
         .execute_script(
             "<dd:worker-snapshot-validate>",
@@ -132,7 +140,15 @@ pub fn new_runtime_from_snapshot(
     startup_snapshot: &'static [u8],
     allow_code_generation: bool,
 ) -> Result<JsRuntime> {
-    new_runtime(startup_snapshot, allow_code_generation)
+    new_runtime(startup_snapshot, allow_code_generation, 0)
+}
+
+pub fn new_runtime_from_snapshot_with_heap_limit(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+    max_heap_bytes: usize,
+) -> Result<JsRuntime> {
+    new_runtime(startup_snapshot, allow_code_generation, max_heap_bytes)
 }
 
 pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
@@ -141,67 +157,144 @@ pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
     evaluate_module(runtime, INSTALL_SPECIFIER, &install_code, true).await
 }
 
-pub fn dispatch_worker_request<MemoryCall, HostRpcCall>(
+pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) -> Result<()> {
+    let source = worker_source_text(source)?;
+    load_worker(runtime, source.as_ref()).await
+}
+
+struct RuntimeEntrypoints {
+    install_worker_deployment_handle: Rc<v8::Global<v8::Function>>,
+    execute_worker_handle: Rc<v8::Global<v8::Function>>,
+    abort_worker_request: Rc<v8::Global<v8::Function>>,
+    drain_dynamic_control_queue: Rc<v8::Global<v8::Function>>,
+}
+
+pub fn install_worker_deployment_config(
     runtime: &mut JsRuntime,
-    request_id: &str,
-    completion_token: &str,
-    worker_name_json: &str,
-    kv_bindings_json: &str,
-    kv_read_cache_config_json: &str,
-    memory_bindings_json: &str,
-    dynamic_bindings_json: &str,
-    dynamic_rpc_bindings_json: &str,
-    dynamic_env_json: &str,
-    has_request_body_stream: bool,
-    stream_response: bool,
-    memory_call: Option<&MemoryCall>,
-    host_rpc_call: Option<&HostRpcCall>,
-    request: WorkerInvocation,
-) -> Result<()>
-where
-    MemoryCall: serde::Serialize,
-    HostRpcCall: serde::Serialize,
-{
-    let request_json = crate::json::to_string(&request)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let memory_call_json = crate::json::to_string(&memory_call)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let host_rpc_call_json = crate::json::to_string(&host_rpc_call)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let request_id_json = crate::json::to_string(request_id)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let completion_token_json = crate::json::to_string(completion_token)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let entry_code = execute_worker_js(
-        worker_name_json,
-        kv_bindings_json,
-        kv_read_cache_config_json,
-        memory_bindings_json,
-        dynamic_bindings_json,
-        dynamic_rpc_bindings_json,
-        dynamic_env_json,
-        &memory_call_json,
-        &host_rpc_call_json,
-        &request_id_json,
-        &completion_token_json,
-        has_request_body_stream,
-        stream_response,
-        &request_json,
-    );
-    runtime
-        .execute_script("<dd:invoke>", entry_code)
-        .map_err(runtime_error)?;
+    payload: WorkerDeploymentPayload,
+) -> Result<()> {
+    let deployment_handle = {
+        let op_state = runtime.op_state();
+        let mut op_state = op_state.borrow_mut();
+        register_worker_deployment_config(&mut op_state, payload)
+    };
+
+    match call_cached_u32_function(
+        runtime,
+        "__dd_install_worker_deployment_handle",
+        deployment_handle,
+        |entrypoints| Rc::clone(&entrypoints.install_worker_deployment_handle),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let op_state = runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            clear_worker_deployment_config(&mut op_state, deployment_handle);
+            Err(error)
+        }
+    }
+}
+
+pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
+    let entrypoints = {
+        let context = runtime.main_context();
+        deno_core::scope!(scope, runtime);
+        let context = v8::Local::new(scope, context);
+        let global = context.global(scope);
+        let install_worker_deployment_handle =
+            global_function(scope, global, "__dd_install_worker_deployment_handle")?;
+        let execute_worker_handle = global_function(scope, global, "__dd_execute_worker_handle")?;
+        let abort_worker_request = global_function(scope, global, "__dd_abort_worker_request")?;
+        let drain_dynamic_control_queue =
+            global_function(scope, global, "__dd_drain_dynamic_control_queue_handle")?;
+        RuntimeEntrypoints {
+            install_worker_deployment_handle: Rc::new(v8::Global::new(
+                scope,
+                install_worker_deployment_handle,
+            )),
+            execute_worker_handle: Rc::new(v8::Global::new(scope, execute_worker_handle)),
+            abort_worker_request: Rc::new(v8::Global::new(scope, abort_worker_request)),
+            drain_dynamic_control_queue: Rc::new(v8::Global::new(
+                scope,
+                drain_dynamic_control_queue,
+            )),
+        }
+    };
+    let op_state = runtime.op_state();
+    op_state.borrow_mut().put(entrypoints);
     Ok(())
 }
 
+pub fn dispatch_worker_request(
+    runtime: &mut JsRuntime,
+    request_id: &str,
+    request_context_handle: u32,
+    completion_handle: u32,
+    memory_request_scope_handle: u32,
+    request_body_stream_handle: u32,
+    stream_response: bool,
+    memory_call: Option<&MemoryExecutionCall>,
+    host_rpc_call: Option<&HostRpcExecutionCall>,
+    mut request: WorkerInvocation,
+) -> Result<()> {
+    let request_handle = {
+        let op_state = runtime.op_state();
+        let mut op_state = op_state.borrow_mut();
+        let request_headers_handle = op_state
+            .borrow_mut::<crate::ops::HttpPreparedHeaders>()
+            .insert(mem::take(&mut request.headers));
+        let request_body_handle = op_state
+            .borrow_mut::<crate::ops::HttpPreparedBodies>()
+            .insert(mem::take(&mut request.body));
+        let payload = WorkerRequestPayload {
+            request_id: request_id.to_string(),
+            request_context_handle,
+            completion_handle,
+            memory_request_scope_handle,
+            memory_call: memory_call.cloned(),
+            host_rpc_call: host_rpc_call.cloned(),
+            request_body_stream_handle,
+            request_headers_handle,
+            request_body_handle,
+            stream_response,
+            method: mem::take(&mut request.method),
+            url: mem::take(&mut request.url),
+            input_request_id: mem::take(&mut request.request_id),
+        };
+        register_request_invocation(&mut op_state, payload)
+    };
+
+    match call_cached_u32_function(
+        runtime,
+        "__dd_execute_worker_handle",
+        request_handle,
+        |entrypoints| Rc::clone(&entrypoints.execute_worker_handle),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let op_state = runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            clear_request_invocation(&mut op_state, request_handle);
+            Err(error)
+        }
+    }
+}
+
 pub fn abort_worker_request(runtime: &mut JsRuntime, request_id: &str) -> Result<()> {
-    let request_id_json = crate::json::to_string(request_id)
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-    let entry_code = abort_worker_js(&request_id_json);
-    runtime
-        .execute_script("<dd:abort>", entry_code)
-        .map_err(runtime_error)?;
-    Ok(())
+    call_cached_string_function(
+        runtime,
+        "__dd_abort_worker_request",
+        request_id,
+        |entrypoints| Rc::clone(&entrypoints.abort_worker_request),
+    )
+}
+
+pub fn drain_dynamic_control_queue(runtime: &mut JsRuntime) -> Result<()> {
+    call_cached_noarg_function(
+        runtime,
+        "__dd_drain_dynamic_control_queue_handle",
+        |entrypoints| Rc::clone(&entrypoints.drain_dynamic_control_queue),
+    )
 }
 
 pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()> {
@@ -212,11 +305,18 @@ pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()
     }
 }
 
-fn new_runtime(startup_snapshot: &'static [u8], allow_code_generation: bool) -> Result<JsRuntime> {
+fn new_runtime(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+    max_heap_bytes: usize,
+) -> Result<JsRuntime> {
+    let create_params =
+        (max_heap_bytes > 0).then(|| v8::CreateParams::default().heap_limits(0, max_heap_bytes));
     let mut runtime = JsRuntime::try_new(RuntimeOptions {
         extensions: runtime_extensions(),
-        module_loader: Some(Rc::new(DataUrlModuleLoader)),
+        module_loader: Some(Rc::new(RuntimeModuleLoader)),
         startup_snapshot: Some(startup_snapshot),
+        create_params,
         ..Default::default()
     })
     .map_err(runtime_error)?;
@@ -236,6 +336,90 @@ fn set_snapshot_code_generation_from_strings(runtime: &mut JsRuntimeForSnapshot,
     deno_core::scope!(scope, runtime);
     let context = v8::Local::new(scope, context);
     context.set_allow_generation_from_strings(allow);
+}
+
+fn call_cached_u32_function(
+    runtime: &mut JsRuntime,
+    name: &str,
+    arg: u32,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Result<()> {
+    let function = cached_entrypoint(runtime, select);
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    let global = context.global(scope);
+    let function = v8::Local::new(scope, function.as_ref());
+    let arg = v8::Integer::new_from_unsigned(scope, arg).into();
+    function
+        .call(scope, global.into(), &[arg])
+        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+    Ok(())
+}
+
+fn call_cached_string_function(
+    runtime: &mut JsRuntime,
+    name: &str,
+    arg: &str,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Result<()> {
+    let function = cached_entrypoint(runtime, select);
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    let global = context.global(scope);
+    let function = v8::Local::new(scope, function.as_ref());
+    let arg = v8::String::new(scope, arg)
+        .ok_or_else(|| PlatformError::runtime("failed to allocate V8 string argument"))?
+        .into();
+    function
+        .call(scope, global.into(), &[arg])
+        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+    Ok(())
+}
+
+fn call_cached_noarg_function(
+    runtime: &mut JsRuntime,
+    name: &str,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Result<()> {
+    let function = cached_entrypoint(runtime, select);
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    let global = context.global(scope);
+    let function = v8::Local::new(scope, function.as_ref());
+    function
+        .call(scope, global.into(), &[])
+        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+    Ok(())
+}
+
+fn cached_entrypoint(
+    runtime: &mut JsRuntime,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Rc<v8::Global<v8::Function>> {
+    let op_state = runtime.op_state();
+    let op_state = op_state.borrow();
+    select(op_state.borrow::<RuntimeEntrypoints>())
+}
+
+fn global_function<'scope>(
+    scope: &mut v8::PinScope<'scope, '_>,
+    global: v8::Local<'scope, v8::Object>,
+    name: &str,
+) -> Result<v8::Local<'scope, v8::Function>> {
+    let name_value = v8::String::new(scope, name)
+        .ok_or_else(|| PlatformError::runtime("failed to allocate V8 function name"))?;
+    let value = global.get(scope, name_value.into()).ok_or_else(|| {
+        PlatformError::runtime(format!("global runtime entrypoint {name} is unavailable"))
+    })?;
+    let function = v8::Local::<v8::Function>::try_from(value).map_err(|_| {
+        PlatformError::runtime(format!(
+            "global runtime entrypoint {name} is not a function"
+        ))
+    })?;
+    Ok(function)
 }
 
 fn runtime_extensions() -> Vec<Extension> {
@@ -263,15 +447,21 @@ fn without_esm(extension: Extension) -> Extension {
     }
 }
 
-struct DataUrlModuleLoader;
+struct RuntimeModuleLoader;
 
-impl ModuleLoader for DataUrlModuleLoader {
+impl ModuleLoader for RuntimeModuleLoader {
     fn resolve(
         &self,
         specifier: &str,
         referrer: &str,
         _kind: ResolutionKind,
     ) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
+        if referrer.starts_with("dd-dynamic:")
+            && !specifier.starts_with("//")
+            && !has_url_scheme(specifier)
+        {
+            return resolve_dd_dynamic_import(specifier, referrer);
+        }
         resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
     }
 
@@ -283,59 +473,165 @@ impl ModuleLoader for DataUrlModuleLoader {
     ) -> ModuleLoadResponse {
         if options.requested_module_type != RequestedModuleType::None {
             return ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
-                "unsupported requested module type for dynamic data URL: {}",
+                "unsupported requested module type for dynamic module: {}",
                 options.requested_module_type
             ))));
         }
 
-        ModuleLoadResponse::Sync(load_data_url_module(module_specifier))
+        ModuleLoadResponse::Sync(match module_specifier.scheme() {
+            "dd-dynamic" => load_dd_dynamic_module(module_specifier),
+            _ => Err(JsErrorBox::generic(format!(
+                "dynamic module loader only supports dd-dynamic: URLs, got {module_specifier}"
+            ))),
+        })
     }
 }
 
-fn load_data_url_module(
+fn resolve_dd_dynamic_import(
+    specifier: &str,
+    referrer: &str,
+) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
+    let referrer = ModuleSpecifier::parse(referrer).map_err(JsErrorBox::from_err)?;
+    let (graph_id, referrer_path) = dd_dynamic_module_parts(&referrer)?;
+    let module_path =
+        resolve_dynamic_module_path(&referrer_path, specifier).map_err(JsErrorBox::generic)?;
+    let encoded_path = module_path
+        .split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    ModuleSpecifier::parse(&format!("dd-dynamic://graph/{graph_id}/{encoded_path}"))
+        .map_err(JsErrorBox::from_err)
+}
+
+fn load_dd_dynamic_module(
     module_specifier: &ModuleSpecifier,
 ) -> std::result::Result<ModuleSource, JsErrorBox> {
-    let source = decode_data_url_module_source(module_specifier)?;
+    let (graph_id, module_path) = dd_dynamic_module_parts(module_specifier)?;
+    let source = dynamic_module_source(&graph_id, &module_path).ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "dynamic module graph {graph_id} does not contain module: {module_path}"
+        ))
+    })?;
     Ok(ModuleSource::new(
         ModuleType::JavaScript,
-        ModuleSourceCode::String(source.into()),
+        ModuleSourceCode::String(source.clone().into()),
         module_specifier,
         None,
     ))
 }
 
-fn decode_data_url_module_source(
+fn dd_dynamic_module_parts(
     module_specifier: &ModuleSpecifier,
-) -> std::result::Result<String, JsErrorBox> {
-    if module_specifier.scheme() != "data" {
+) -> std::result::Result<(String, String), JsErrorBox> {
+    if module_specifier.scheme() != "dd-dynamic" {
         return Err(JsErrorBox::generic(format!(
-            "dynamic module loader only supports data: URLs, got {module_specifier}"
+            "expected dd-dynamic module URL, got {module_specifier}"
         )));
     }
-
-    let raw = module_specifier.as_str();
-    let Some(rest) = raw.strip_prefix("data:") else {
+    if module_specifier.host_str() != Some("graph") {
         return Err(JsErrorBox::generic(format!(
-            "invalid data URL: {module_specifier}"
+            "expected dd-dynamic://graph module URL, got {module_specifier}"
         )));
-    };
-    let Some((meta, body)) = rest.split_once(',') else {
-        return Err(JsErrorBox::generic(format!(
-            "invalid data URL payload: {module_specifier}"
-        )));
-    };
-    if meta
-        .split(';')
-        .any(|part| part.eq_ignore_ascii_case("base64"))
+    }
+    let path = module_specifier.path().trim_start_matches('/');
+    let (graph_id, module_path) = path.split_once('/').ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "dd-dynamic module URL is missing graph id or module path: {module_specifier}"
+        ))
+    })?;
+    let graph_id = graph_id.trim();
+    if graph_id.is_empty()
+        || graph_id.len() > 128
+        || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(JsErrorBox::generic(
-            "base64 data URLs are not supported in dynamic modules",
+        return Err(JsErrorBox::generic(format!(
+            "invalid dd-dynamic graph id in module URL: {module_specifier}"
+        )));
+    }
+    let bytes = percent_decode(module_path).map_err(JsErrorBox::generic)?;
+    let path = String::from_utf8(bytes).map_err(|error| {
+        JsErrorBox::generic(format!("invalid UTF-8 in dd-dynamic module path: {error}"))
+    })?;
+    normalize_dynamic_module_path(&path)
+        .map(|path| (graph_id.to_string(), path))
+        .map_err(JsErrorBox::generic)
+}
+
+fn has_url_scheme(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    for ch in chars {
+        if ch == ':' {
+            return true;
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.') {
+            return false;
+        }
+    }
+    false
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn worker_source_text(source: &WorkerSource) -> Result<Cow<'_, str>> {
+    match source {
+        WorkerSource::Inline(source) => Ok(Cow::Borrowed(source.as_ref())),
+        WorkerSource::DynamicModule {
+            graph_id,
+            entrypoint,
+        } => {
+            let specifier = dynamic_module_entrypoint_specifier(graph_id, entrypoint)?;
+            Ok(Cow::Owned(format!(
+                "export {{ default }} from {specifier:?};\n"
+            )))
+        }
+    }
+}
+
+fn dynamic_module_entrypoint_specifier(graph_id: &str, entrypoint: &str) -> Result<String> {
+    let graph_id = graph_id.trim();
+    if graph_id.is_empty()
+        || graph_id.len() > 128
+        || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(PlatformError::bad_request(
+            "dynamic module graph id is invalid",
         ));
     }
-
-    let bytes = percent_decode(body).map_err(JsErrorBox::generic)?;
-    String::from_utf8(bytes)
-        .map_err(|error| JsErrorBox::generic(format!("invalid UTF-8 in data URL module: {error}")))
+    let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
+        PlatformError::bad_request(format!("invalid dynamic module entrypoint: {error}"))
+    })?;
+    if dynamic_module_source(graph_id, &entrypoint).is_none() {
+        return Err(PlatformError::bad_request(format!(
+            "dynamic module graph {graph_id} does not contain entrypoint: {entrypoint}"
+        )));
+    }
+    let encoded_path = entrypoint
+        .split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(format!("dd-dynamic://graph/{graph_id}/{encoded_path}"))
 }
 
 fn percent_decode(value: &str) -> std::result::Result<Vec<u8>, String> {
@@ -346,7 +642,7 @@ fn percent_decode(value: &str) -> std::result::Result<Vec<u8>, String> {
         match bytes[idx] {
             b'%' => {
                 if idx + 2 >= bytes.len() {
-                    return Err("truncated percent-escape in data URL".to_string());
+                    return Err("truncated percent-escape in module URL".to_string());
                 }
                 let hi = decode_hex_digit(bytes[idx + 1])?;
                 let lo = decode_hex_digit(bytes[idx + 2])?;
@@ -368,7 +664,7 @@ fn decode_hex_digit(value: u8) -> std::result::Result<u8, String> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(format!(
-            "invalid hex digit in data URL escape: {}",
+            "invalid hex digit in module URL escape: {}",
             value as char
         )),
     }
@@ -496,6 +792,7 @@ mod tests {
         let worker_snapshot = build_worker_snapshot(snapshot, simple_worker_source(), false)
             .await
             .expect("worker snapshot should build");
+        let worker_snapshot = Box::leak(worker_snapshot);
         validate_loaded_worker_runtime(worker_snapshot, false)
             .expect("worker snapshot should validate");
     }

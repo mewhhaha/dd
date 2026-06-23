@@ -153,16 +153,13 @@ pub(crate) async fn run_and_print(
     };
     if let Some(verify_path) = verify_path {
         set_watchdog_phase(&watchdog_state, started_at, BenchPhase::Verify);
-        let expected =
-            if verify_path == "/sum" || verify_path == "/sum-read" || verify_path == "/sum-blind" {
-                distinct_memory_keys(requests, key_space).len().to_string()
-            } else if verify_path == "/read" || verify_path == "/get-strong" {
-                "1".to_string()
-            } else if verify_path == "/get-blind" {
-                "1".to_string()
-            } else {
-                requests.to_string()
-            };
+        let expected = if verify_path == "/sum" || verify_path == "/sum-read" {
+            distinct_memory_keys(requests, key_space).len().to_string()
+        } else if verify_path == "/read" || verify_path == "/get-strong" {
+            "1".to_string()
+        } else {
+            requests.to_string()
+        };
         let verify_started = Instant::now();
         let observed = timeout(
             options.verify_timeout,
@@ -313,44 +310,35 @@ async fn verify_expected_value(
 ) -> Result<String, String> {
     let deadline = TokioInstant::now() + Duration::from_secs(2);
     loop {
-        let observed =
-            if verify_path == "/sum" || verify_path == "/sum-read" || verify_path == "/sum-blind" {
-                verify_distinct_memory_sum(
-                    service,
-                    worker_name,
-                    requests,
-                    key_space,
-                    verify_path,
-                    request_timeout,
+        let observed = if verify_path == "/sum" || verify_path == "/sum-read" {
+            verify_distinct_memory_sum(
+                service,
+                worker_name,
+                requests,
+                key_space,
+                verify_path,
+                request_timeout,
+            )
+            .await?
+        } else {
+            let verify = timeout(
+                request_timeout,
+                service.invoke(
+                    worker_name.to_string(),
+                    invocation(verify_path, requests + 1, 1),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "verification invoke timed out after {}ms on {}",
+                    request_timeout.as_millis(),
+                    verify_path
                 )
-                .await?
-            } else {
-                let verify = timeout(
-                    request_timeout,
-                    service.invoke(
-                        worker_name.to_string(),
-                        invocation(
-                            if verify_path == "/get-blind" {
-                                "/get"
-                            } else {
-                                verify_path
-                            },
-                            requests + 1,
-                            1,
-                        ),
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "verification invoke timed out after {}ms on {}",
-                        request_timeout.as_millis(),
-                        verify_path
-                    )
-                })?
-                .map_err(|error| error.to_string())?;
-                String::from_utf8(verify.body).map_err(|error| error.to_string())?
-            };
+            })?
+            .map_err(|error| error.to_string())?;
+            String::from_utf8(verify.body).map_err(|error| error.to_string())?
+        };
         if observed.trim() == expected {
             return Ok(observed);
         }

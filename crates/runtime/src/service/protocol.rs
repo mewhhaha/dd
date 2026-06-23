@@ -1,82 +1,5 @@
 use super::*;
 
-pub(super) fn decode_completion_payload(
-    payload: String,
-) -> Result<(String, String, usize, Result<WorkerOutput>)> {
-    let completion: CompletionPayload = crate::json::from_string(payload)
-        .map_err(|error| PlatformError::runtime(format!("invalid completion payload: {error}")))?;
-    if completion.ok {
-        let output = completion
-            .result
-            .ok_or_else(|| PlatformError::runtime("completion is missing result"))?;
-        Ok((
-            completion.request_id,
-            completion.completion_token,
-            completion.wait_until_count,
-            Ok(output),
-        ))
-    } else {
-        let message = completion
-            .error
-            .unwrap_or_else(|| "worker execution failed".to_string());
-        Ok((
-            completion.request_id,
-            completion.completion_token,
-            completion.wait_until_count,
-            Err(PlatformError::runtime(message)),
-        ))
-    }
-}
-
-pub(super) fn decode_wait_until_payload(payload: String) -> Result<(String, String)> {
-    let done: WaitUntilPayload = crate::json::from_string(payload)
-        .map_err(|error| PlatformError::runtime(format!("invalid waitUntil payload: {error}")))?;
-    Ok((done.request_id, done.completion_token))
-}
-
-pub(super) fn decode_response_start_payload(
-    payload: String,
-) -> Result<(String, String, u16, Vec<(String, String)>)> {
-    let start: ResponseStartPayload = crate::json::from_string(payload).map_err(|error| {
-        PlatformError::runtime(format!("invalid response start payload: {error}"))
-    })?;
-    Ok((
-        start.request_id,
-        start.completion_token,
-        start.status,
-        start.headers,
-    ))
-}
-
-pub(super) fn decode_response_chunk_payload(payload: String) -> Result<(String, String, Vec<u8>)> {
-    let chunk: ResponseChunkPayload = crate::json::from_string(payload).map_err(|error| {
-        PlatformError::runtime(format!("invalid response chunk payload: {error}"))
-    })?;
-    Ok((chunk.request_id, chunk.completion_token, chunk.chunk))
-}
-
-pub(super) fn decode_cache_revalidate_payload(payload: String) -> Result<CacheRevalidatePayload> {
-    let request: CacheRevalidatePayload = crate::json::from_string(payload).map_err(|error| {
-        PlatformError::runtime(format!("invalid cache revalidate payload: {error}"))
-    })?;
-    if request.cache_name.trim().is_empty() {
-        return Err(PlatformError::runtime(
-            "cache revalidate payload is missing cache_name",
-        ));
-    }
-    if request.method.trim().is_empty() {
-        return Err(PlatformError::runtime(
-            "cache revalidate payload is missing method",
-        ));
-    }
-    if request.url.trim().is_empty() {
-        return Err(PlatformError::runtime(
-            "cache revalidate payload is missing url",
-        ));
-    }
-    Ok(request)
-}
-
 pub(super) fn cache_revalidation_key(
     worker_name: &str,
     generation: u64,
@@ -269,6 +192,7 @@ pub(super) fn traceparent_from_headers(headers: &[(String, String)]) -> Option<&
         .map(|(_, value)| value.as_str())
 }
 
+#[cfg(feature = "otel")]
 pub(super) fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent: Option<&str>) {
     let Some(traceparent) = traceparent.filter(|value| !value.trim().is_empty()) else {
         return;
@@ -282,8 +206,13 @@ pub(super) fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent
     });
 }
 
+#[cfg(not(feature = "otel"))]
+pub(super) fn set_span_parent_from_traceparent(_span: &tracing::Span, _traceparent: Option<&str>) {}
+
+#[cfg(feature = "otel")]
 pub(super) struct TraceparentExtractor<'a>(&'a str);
 
+#[cfg(feature = "otel")]
 impl Extractor for TraceparentExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         if key.eq_ignore_ascii_case("traceparent") {

@@ -7,6 +7,7 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +56,10 @@ enum DevCommand {
         binary: bool,
     },
     DrainWebsocketFrame {
+        name: String,
+        session_id: String,
+    },
+    WaitWebsocketFrame {
         name: String,
         session_id: String,
     },
@@ -114,6 +119,7 @@ enum CommandResult {
     WebsocketDrainFrame {
         frame: Option<WorkerOutputEnvelope>,
     },
+    WebsocketWaitFrame,
     WebsocketClose,
     Stats {
         stats: Option<WorkerStatsEnvelope>,
@@ -192,40 +198,71 @@ async fn main() -> Result<(), String> {
 async fn run_stdio(service: RuntimeService) -> Result<(), String> {
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
-    let mut stdout = io::stdout();
+    let (response_tx, mut response_rx) = mpsc::channel::<ResponseEnvelope<CommandResult>>(128);
+    let writer = tokio::spawn(async move {
+        let mut stdout = io::stdout();
+        while let Some(response) = response_rx.recv().await {
+            let is_shutdown = matches!(response.result, Some(CommandResult::Shutdown));
+            let line = serde_json::to_string(&response).map_err(|error| error.to_string())?;
+            stdout
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout
+                .write_all(b"\n")
+                .await
+                .map_err(|error| error.to_string())?;
+            stdout.flush().await.map_err(|error| error.to_string())?;
+            if is_shutdown {
+                break;
+            }
+        }
+        Ok::<(), String>(())
+    });
 
     while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<RequestEnvelope>(&line) {
-            Ok(request) => handle_command(&service, request).await,
-            Err(error) => ResponseEnvelope {
-                id: String::new(),
-                ok: false,
-                result: None,
-                error: Some(ErrorEnvelope {
-                    kind: "bad_request",
-                    message: format!("invalid command JSON: {error}"),
-                }),
-            },
-        };
-        let line = serde_json::to_string(&response).map_err(|error| error.to_string())?;
-        stdout
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        stdout
-            .write_all(b"\n")
-            .await
-            .map_err(|error| error.to_string())?;
-        stdout.flush().await.map_err(|error| error.to_string())?;
-        if matches!(response.result, Some(CommandResult::Shutdown)) {
-            break;
+        match serde_json::from_str::<RequestEnvelope>(&line) {
+            Ok(request) => {
+                let stop_reading = matches!(&request.command, DevCommand::Shutdown);
+                if matches!(&request.command, DevCommand::WaitWebsocketFrame { .. }) {
+                    let response_tx = response_tx.clone();
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        let response = handle_command(&service, request).await;
+                        let _ = response_tx.send(response).await;
+                    });
+                } else {
+                    let response = handle_command(&service, request).await;
+                    if response_tx.send(response).await.is_err() {
+                        break;
+                    }
+                }
+                if stop_reading {
+                    break;
+                }
+            }
+            Err(error) => {
+                let response = ResponseEnvelope {
+                    id: String::new(),
+                    ok: false,
+                    result: None,
+                    error: Some(ErrorEnvelope {
+                        kind: "bad_request",
+                        message: format!("invalid command JSON: {error}"),
+                    }),
+                };
+                if response_tx.send(response).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
-    Ok(())
+    drop(response_tx);
+    writer.await.map_err(|error| error.to_string())?
 }
 
 async fn handle_command(
@@ -296,6 +333,10 @@ async fn handle_command(
             .map(|frame| CommandResult::WebsocketDrainFrame {
                 frame: frame.map(WorkerOutputEnvelope::from),
             }),
+        DevCommand::WaitWebsocketFrame { name, session_id } => service
+            .websocket_wait_frame(name, session_id)
+            .await
+            .map(|()| CommandResult::WebsocketWaitFrame),
         DevCommand::CloseWebsocket {
             name,
             session_id,

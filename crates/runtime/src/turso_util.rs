@@ -45,6 +45,8 @@ pub(crate) fn is_retryable_turso_error(error: &impl std::fmt::Display) -> bool {
     message.contains("database is locked")
         || message.contains("database table is locked")
         || message.contains("database is busy")
+        || message.contains("database schema has changed")
+        || message.contains("schema changed")
         || message.contains("busy")
         || message.contains("conflict")
 }
@@ -71,5 +73,29 @@ impl VersionFloor {
             return;
         }
         Self::set_floor(counter, version as u64 + 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct DisplayError(&'static str);
+
+    impl std::fmt::Display for DisplayError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    #[test]
+    fn schema_change_errors_are_retryable() {
+        assert!(is_retryable_turso_error(&DisplayError(
+            "Database schema changed"
+        )));
+        assert!(is_retryable_turso_error(&DisplayError(
+            "database schema has changed"
+        )));
     }
 }

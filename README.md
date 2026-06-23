@@ -2,7 +2,7 @@
 
 `dd` is single-node worker runtime in Rust with Deno-backed isolates. It is inspired by Cloudflare Workers and Durable Objects, but aimed at "run Cloudflare-like workers on one machine with disk-backed storage" rather than "managed global edge platform."
 
-Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. State lives on disk. For coordination, `dd` does not use Durable Objects as public model. It uses keyed memory namespaces with STM-like `atomic(...)` callbacks, so you shard state by key and treat each shard like transactional memory backed by durable storage.
+Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. State lives on disk. For coordination, `dd` does not use Durable Objects as the public model. It uses keyed memory namespaces as durable single-writer actors: shard state by key, run `atomic(...)` commands once for that key, and commit state plus effects through durable storage.
 
 Worker shape stays familiar: `fetch(request, env, ctx)` plus worker bindings. KV handles simple persistence, Cache API handles response reuse, and memory namespaces handle shardable coordination.
 
@@ -54,7 +54,7 @@ local private default.
 
 ## Memory namespaces
 
-Memory namespace is main coordination primitive. You pick key, get shard, run synchronous `atomic(...)` callback against that shard.
+Memory namespace is the main coordination primitive. You pick a key, get the actor for that key, and run a synchronous `atomic(...)` command against it. Commands for one key are ordered, the callback runs once, and state plus emitted effects commit together.
 
 Deploy with memory binding:
 
@@ -88,7 +88,7 @@ export default {
 };
 ```
 
-This is closest thing to Durable Objects, but model is different. You are not instantiating long-lived object class with special lifecycle. You are reading and writing shard of transactional memory selected by key.
+This is the closest thing to Durable Objects, but the model is different. You are not instantiating a long-lived object class with a special lifecycle. You are sending ordered commands to a durable keyed actor.
 
 ## KV
 
@@ -225,7 +225,7 @@ See [docs/development.md](docs/development.md#vite-and-vitest-worker-development
 
 If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.
 
-If you want "Durable Objects, but expressed as disk-backed STM-like shards instead of object instances," memory namespaces are that shape.
+If you want "Durable Objects, but expressed as disk-backed keyed actors instead of object instances," memory namespaces are that shape.
 
 If you want one app process you can deploy to Fly or another VM and then load with named workers, `dd_server` is that shape.
 
@@ -283,12 +283,18 @@ Project shape:
 | total tracked lines | 106,694 |
 | Rust test attributes | 224 |
 
-Distribution artifacts use the `dist` Cargo profile:
+Distribution artifacts use the `dist` Cargo profile. The full server includes
+HTTP/3, WebSocket, and OTEL support; the lean server disables those optional
+server features:
 
 ```bash
-cargo build --locked --profile dist -p dd_server -p cli
-just size-report
+just server-full
+just server-lean
+just size-report-all
 ```
+
+Those commands write `target/dist/dd_server-full`, `target/dist/dd_server-lean`,
+and matching reports under `target/size-report/<git-sha>/dist/<variant>/`.
 
 Historical release artifacts from `cargo build --release -p dd_server -p cli`:
 

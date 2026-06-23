@@ -1,5 +1,18 @@
 use super::*;
 
+const MEMORY_OUTBOX_DRAIN_LIMIT: usize = 64;
+const MEMORY_OUTBOX_MAX_DRAIN_BATCHES: usize = 64;
+const MEMORY_OUTBOX_LEASE: Duration = Duration::from_secs(30);
+const MEMORY_OUTBOX_EFFECT_KINDS: &[&str] = &[
+    "audit.*",
+    "socket.send",
+    "socket.close",
+    "trace.*",
+    "transport.stream",
+    "transport.datagram",
+    "transport.close",
+];
+
 impl WorkerManager {
     fn increment_websocket_session_count(
         &mut self,
@@ -278,8 +291,8 @@ impl WorkerManager {
         binding: &str,
         key: &str,
         handle: &str,
-        stream_sender: mpsc::UnboundedSender<Vec<u8>>,
-        datagram_sender: mpsc::UnboundedSender<Vec<u8>>,
+        stream_sender: mpsc::Sender<Vec<u8>>,
+        datagram_sender: mpsc::Sender<Vec<u8>>,
     ) -> Result<()> {
         if self.transport_sessions.contains_key(session_id) {
             let _ = self.unregister_transport_session(session_id);
@@ -295,9 +308,6 @@ impl WorkerManager {
             handle: handle.to_string(),
             stream_sender,
             datagram_sender,
-            inbound_streams: VecDeque::new(),
-            inbound_stream_closed: false,
-            inbound_datagrams: VecDeque::new(),
         };
         self.transport_handle_index.insert(
             memory_handle_key(&session.binding, &session.key, &session.handle),
@@ -464,7 +474,7 @@ impl WorkerManager {
     pub(super) fn handle_memory_socket_send(
         &mut self,
         payload: crate::ops::MemorySocketSendEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let crate::ops::MemorySocketSendEvent {
             reply,
@@ -474,28 +484,14 @@ impl WorkerManager {
             is_text,
             message,
         } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
-        let result = match self.websocket_handle_index.get(&index_key).cloned() {
-            Some(session_id) => {
-                self.websocket_outbound_frames
-                    .entry(session_id.clone())
-                    .or_default()
-                    .push_back(WebSocketOutboundFrame {
-                        is_binary: !is_text,
-                        payload: message,
-                    });
-                self.notify_websocket_frame_waiters(&session_id);
-                Ok(())
-            }
-            None => Err(PlatformError::not_found("websocket session not found")),
-        };
+        let result = self.send_memory_socket(&binding, &key, &handle, is_text, message);
         let _ = reply.send(result);
     }
 
     pub(super) fn handle_memory_socket_close(
         &mut self,
         payload: crate::ops::MemorySocketCloseEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let crate::ops::MemorySocketCloseEvent {
             reply,
@@ -505,17 +501,53 @@ impl WorkerManager {
             code,
             reason,
         } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
-        let result = match self.websocket_handle_index.get(&index_key).cloned() {
-            Some(session_id) => {
-                self.websocket_close_signals
-                    .insert(session_id.clone(), SocketCloseEvent { code, reason });
-                self.notify_websocket_frame_waiters(&session_id);
-                Ok(())
-            }
-            None => Err(PlatformError::not_found("websocket session not found")),
-        };
+        let result = self.close_memory_socket(&binding, &key, &handle, code, reason);
         let _ = reply.send(result);
+    }
+
+    fn send_memory_socket(
+        &mut self,
+        binding: &str,
+        key: &str,
+        handle: &str,
+        is_text: bool,
+        message: Vec<u8>,
+    ) -> Result<()> {
+        let index_key = memory_handle_key(binding, key, handle);
+        let session_id = self
+            .websocket_handle_index
+            .get(&index_key)
+            .cloned()
+            .ok_or_else(|| PlatformError::not_found("websocket session not found"))?;
+        self.websocket_outbound_frames
+            .entry(session_id.clone())
+            .or_default()
+            .push_back(WebSocketOutboundFrame {
+                is_binary: !is_text,
+                payload: message,
+            });
+        self.notify_websocket_frame_waiters(&session_id);
+        Ok(())
+    }
+
+    fn close_memory_socket(
+        &mut self,
+        binding: &str,
+        key: &str,
+        handle: &str,
+        code: u16,
+        reason: String,
+    ) -> Result<()> {
+        let index_key = memory_handle_key(binding, key, handle);
+        let session_id = self
+            .websocket_handle_index
+            .get(&index_key)
+            .cloned()
+            .ok_or_else(|| PlatformError::not_found("websocket session not found"))?;
+        self.websocket_close_signals
+            .insert(session_id.clone(), SocketCloseEvent { code, reason });
+        self.notify_websocket_frame_waiters(&session_id);
+        Ok(())
     }
 
     pub(super) fn websocket_handles_snapshot(
@@ -544,7 +576,7 @@ impl WorkerManager {
     pub(super) fn handle_memory_socket_consume_close(
         &mut self,
         payload: crate::ops::MemorySocketConsumeCloseEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let owner_key = memory_owner_key(&payload.binding, &payload.key);
         let events = self
@@ -576,7 +608,7 @@ impl WorkerManager {
         session_id: &str,
         chunk: Vec<u8>,
         done: bool,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) -> Result<()> {
         let _ = done;
         let Some((session_worker_name, generation, binding, key, handle)) =
@@ -655,7 +687,7 @@ impl WorkerManager {
         worker_name: &str,
         session_id: &str,
         datagram: Vec<u8>,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) -> Result<()> {
         let Some((session_worker_name, generation, binding, key, handle)) =
             self.transport_sessions.get(session_id).map(|session| {
@@ -734,7 +766,7 @@ impl WorkerManager {
         session_id: &str,
         close_code: u16,
         close_reason: String,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) -> Result<()> {
         let Some(existing) = self.transport_sessions.get(session_id) else {
             return Err(PlatformError::not_found("transport session not found"));
@@ -805,7 +837,7 @@ impl WorkerManager {
     pub(super) fn handle_memory_transport_send_stream(
         &mut self,
         payload: crate::ops::MemoryTransportSendStreamEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let crate::ops::MemoryTransportSendStreamEvent {
             reply,
@@ -814,25 +846,14 @@ impl WorkerManager {
             key,
             chunk,
         } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
-        let session_id = self.transport_handle_index.get(&index_key).cloned();
-        let result = match session_id.as_deref() {
-            Some(session_id) => match self.transport_sessions.get(session_id) {
-                Some(session) => session
-                    .stream_sender
-                    .send(chunk)
-                    .map_err(|_| PlatformError::internal("transport stream channel closed")),
-                None => Err(PlatformError::not_found("transport session not found")),
-            },
-            None => Err(PlatformError::not_found("transport session not found")),
-        };
+        let result = self.send_memory_transport_stream(&binding, &key, &handle, chunk);
         let _ = reply.send(result);
     }
 
     pub(super) fn handle_memory_transport_send_datagram(
         &mut self,
         payload: crate::ops::MemoryTransportSendDatagramEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let crate::ops::MemoryTransportSendDatagramEvent {
             reply,
@@ -841,78 +862,14 @@ impl WorkerManager {
             key,
             datagram,
         } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
-        let session_id = self.transport_handle_index.get(&index_key).cloned();
-        let result = match session_id.as_deref() {
-            Some(session_id) => match self.transport_sessions.get(session_id) {
-                Some(session) => session
-                    .datagram_sender
-                    .send(datagram)
-                    .map_err(|_| PlatformError::internal("transport datagram channel closed")),
-                None => Err(PlatformError::not_found("transport session not found")),
-            },
-            None => Err(PlatformError::not_found("transport session not found")),
-        };
-        let _ = reply.send(result);
-    }
-
-    pub(super) fn handle_memory_transport_recv_stream(
-        &mut self,
-        payload: crate::ops::MemoryTransportRecvStreamEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        let crate::ops::MemoryTransportRecvStreamEvent {
-            reply,
-            handle,
-            binding,
-            key,
-        } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
-        let session_id = self.transport_handle_index.get(&index_key).cloned();
-        let result = match session_id.as_deref() {
-            Some(session_id) => match self.transport_sessions.get_mut(session_id) {
-                Some(session) => {
-                    let chunk = session.inbound_streams.pop_front().unwrap_or_default();
-                    let done = chunk.is_empty() && session.inbound_stream_closed;
-                    Ok(crate::ops::TransportRecvEvent { done, chunk })
-                }
-                None => Err(PlatformError::not_found("transport session not found")),
-            },
-            None => Err(PlatformError::not_found("transport session not found")),
-        };
-        let _ = reply.send(result);
-    }
-
-    pub(super) fn handle_memory_transport_recv_datagram(
-        &mut self,
-        payload: crate::ops::MemoryTransportRecvDatagramEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    ) {
-        let crate::ops::MemoryTransportRecvDatagramEvent {
-            reply,
-            handle,
-            binding,
-            key,
-        } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
-        let session_id = self.transport_handle_index.get(&index_key).cloned();
-        let result = match session_id.as_deref() {
-            Some(session_id) => match self.transport_sessions.get_mut(session_id) {
-                Some(session) => {
-                    let chunk = session.inbound_datagrams.pop_front().unwrap_or_default();
-                    Ok(crate::ops::TransportRecvEvent { done: false, chunk })
-                }
-                None => Err(PlatformError::not_found("transport session not found")),
-            },
-            None => Err(PlatformError::not_found("transport session not found")),
-        };
+        let result = self.send_memory_transport_datagram(&binding, &key, &handle, datagram);
         let _ = reply.send(result);
     }
 
     pub(super) fn handle_memory_transport_close(
         &mut self,
         payload: crate::ops::MemoryTransportCloseEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let crate::ops::MemoryTransportCloseEvent {
             reply,
@@ -922,9 +879,81 @@ impl WorkerManager {
             code,
             reason,
         } = payload;
-        let index_key = memory_handle_key(&binding, &key, &handle);
+        let result = self.close_memory_transport(&binding, &key, &handle, code, reason);
+        let _ = reply.send(result);
+    }
+
+    fn send_memory_transport_stream(
+        &mut self,
+        binding: &str,
+        key: &str,
+        handle: &str,
+        chunk: Vec<u8>,
+    ) -> Result<()> {
+        let index_key = memory_handle_key(binding, key, handle);
         let session_id = self.transport_handle_index.get(&index_key).cloned();
-        let result = match session_id.as_deref() {
+        match session_id.as_deref() {
+            Some(session_id) => match self.transport_sessions.get(session_id) {
+                Some(session) => {
+                    session
+                        .stream_sender
+                        .try_send(chunk)
+                        .map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                PlatformError::overloaded("transport stream channel is full")
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                PlatformError::internal("transport stream channel closed")
+                            }
+                        })
+                }
+                None => Err(PlatformError::not_found("transport session not found")),
+            },
+            None => Err(PlatformError::not_found("transport session not found")),
+        }
+    }
+
+    fn send_memory_transport_datagram(
+        &mut self,
+        binding: &str,
+        key: &str,
+        handle: &str,
+        datagram: Vec<u8>,
+    ) -> Result<()> {
+        let index_key = memory_handle_key(binding, key, handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        match session_id.as_deref() {
+            Some(session_id) => match self.transport_sessions.get(session_id) {
+                Some(session) => {
+                    session
+                        .datagram_sender
+                        .try_send(datagram)
+                        .map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => {
+                                PlatformError::overloaded("transport datagram channel is full")
+                            }
+                            mpsc::error::TrySendError::Closed(_) => {
+                                PlatformError::internal("transport datagram channel closed")
+                            }
+                        })
+                }
+                None => Err(PlatformError::not_found("transport session not found")),
+            },
+            None => Err(PlatformError::not_found("transport session not found")),
+        }
+    }
+
+    fn close_memory_transport(
+        &mut self,
+        binding: &str,
+        key: &str,
+        handle: &str,
+        code: u16,
+        reason: String,
+    ) -> Result<()> {
+        let index_key = memory_handle_key(binding, key, handle);
+        let session_id = self.transport_handle_index.get(&index_key).cloned();
+        match session_id.as_deref() {
             Some(session_id) => {
                 if let Some(session) = self.unregister_transport_session(session_id) {
                     self.queue_transport_close_replay(&session, code, reason);
@@ -934,8 +963,7 @@ impl WorkerManager {
                 }
             }
             None => Err(PlatformError::not_found("transport session not found")),
-        };
-        let _ = reply.send(result);
+        }
     }
 
     pub(super) fn transport_handles_snapshot(
@@ -964,7 +992,7 @@ impl WorkerManager {
     pub(super) fn handle_memory_transport_consume_close(
         &mut self,
         payload: crate::ops::MemoryTransportConsumeCloseEvent,
-        _event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        _event_tx: &RuntimeEventSender,
     ) {
         let owner_key = memory_owner_key(&payload.binding, &payload.key);
         let events = self
@@ -989,4 +1017,295 @@ impl WorkerManager {
             .collect();
         let _ = payload.reply.send(Ok(replay));
     }
+
+    pub(super) async fn drain_memory_outbox(&mut self) -> usize {
+        let mut processed = 0usize;
+        for _ in 0..MEMORY_OUTBOX_MAX_DRAIN_BATCHES {
+            let claims = match self
+                .memory_store
+                .claim_due_outbox_records(
+                    MEMORY_OUTBOX_DRAIN_LIMIT,
+                    MEMORY_OUTBOX_LEASE,
+                    MEMORY_OUTBOX_EFFECT_KINDS,
+                )
+                .await
+            {
+                Ok(claims) => claims,
+                Err(error) => {
+                    warn!(error = %error, "memory outbox claim failed");
+                    return processed;
+                }
+            };
+            let claimed = claims.len();
+            if claimed == 0 {
+                break;
+            }
+            processed = processed.saturating_add(claimed);
+            for claim in claims {
+                let effect_id = claim.record.effect_id.clone();
+                let namespace = claim.namespace.clone();
+                let memory_key = claim.memory_key.clone();
+                let delivery = self.deliver_memory_outbox_claim(&claim);
+                let store_result = match delivery {
+                    Ok(()) => {
+                        self.memory_store
+                            .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
+                            .await
+                    }
+                    Err(error) if is_terminal_memory_outbox_delivery_error(&error) => {
+                        warn!(
+                            namespace = %namespace,
+                            memory_key = %memory_key,
+                            effect_id = %effect_id,
+                            kind = %claim.record.kind,
+                            error = %error,
+                            "memory outbox effect dropped"
+                        );
+                        self.memory_store
+                            .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
+                            .await
+                    }
+                    Err(error) => {
+                        let retry_after = memory_outbox_retry_after(claim.record.attempt_count);
+                        warn!(
+                            namespace = %namespace,
+                            memory_key = %memory_key,
+                            effect_id = %effect_id,
+                            kind = %claim.record.kind,
+                            error = %error,
+                            "memory outbox delivery failed"
+                        );
+                        self.memory_store
+                            .retry_outbox_record(&namespace, &memory_key, &effect_id, retry_after)
+                            .await
+                    }
+                };
+                if let Err(error) = store_result {
+                    warn!(
+                        namespace = %namespace,
+                        memory_key = %memory_key,
+                        effect_id = %effect_id,
+                        error = %error,
+                        "memory outbox state update failed"
+                    );
+                }
+            }
+            if claimed < MEMORY_OUTBOX_DRAIN_LIMIT {
+                break;
+            }
+        }
+        processed
+    }
+
+    fn deliver_memory_outbox_claim(&mut self, claim: &MemoryOutboxClaim) -> Result<()> {
+        if claim.record.kind.starts_with("audit.") {
+            info!(
+                namespace = %claim.namespace,
+                memory_key = %claim.memory_key,
+                effect_id = %claim.record.effect_id,
+                revision = claim.record.revision,
+                kind = %claim.record.kind,
+                payload_bytes = claim.record.payload.len(),
+                payload_utf8 = std::str::from_utf8(&claim.record.payload).ok(),
+                "memory audit outbox effect delivered"
+            );
+            return Ok(());
+        }
+        if claim.record.kind.starts_with("trace.") {
+            info!(
+                namespace = %claim.namespace,
+                memory_key = %claim.memory_key,
+                effect_id = %claim.record.effect_id,
+                revision = claim.record.revision,
+                kind = %claim.record.kind,
+                payload_bytes = claim.record.payload.len(),
+                payload_utf8 = std::str::from_utf8(&claim.record.payload).ok(),
+                "memory trace outbox effect delivered"
+            );
+            return Ok(());
+        }
+        match claim.record.kind.as_str() {
+            "socket.send" => {
+                let (handle, is_text, message) =
+                    parse_memory_socket_send_effect(&claim.record.payload)?;
+                self.send_memory_socket(
+                    &claim.namespace,
+                    &claim.memory_key,
+                    &handle,
+                    is_text,
+                    message,
+                )
+            }
+            "socket.close" => {
+                let (handle, code, reason) = parse_memory_close_effect(&claim.record.payload)?;
+                self.close_memory_socket(&claim.namespace, &claim.memory_key, &handle, code, reason)
+            }
+            "transport.stream" => {
+                let (handle, chunk) = parse_memory_transport_data_effect(&claim.record.payload)?;
+                self.send_memory_transport_stream(
+                    &claim.namespace,
+                    &claim.memory_key,
+                    &handle,
+                    chunk,
+                )
+            }
+            "transport.datagram" => {
+                let (handle, datagram) = parse_memory_transport_data_effect(&claim.record.payload)?;
+                self.send_memory_transport_datagram(
+                    &claim.namespace,
+                    &claim.memory_key,
+                    &handle,
+                    datagram,
+                )
+            }
+            "transport.close" => {
+                let (handle, code, reason) = parse_memory_close_effect(&claim.record.payload)?;
+                self.close_memory_transport(
+                    &claim.namespace,
+                    &claim.memory_key,
+                    &handle,
+                    code,
+                    reason,
+                )
+            }
+            kind => Err(PlatformError::bad_request(format!(
+                "unsupported memory outbox effect: {kind}"
+            ))),
+        }
+    }
+}
+
+const MEMORY_RUNTIME_EFFECT_VERSION: u8 = 1;
+
+fn parse_memory_socket_send_effect(payload: &[u8]) -> Result<(String, bool, Vec<u8>)> {
+    let mut offset = 0;
+    read_memory_effect_version(payload, &mut offset)?;
+    let is_text = match read_memory_effect_u8(payload, &mut offset, "message kind")? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(PlatformError::bad_request(
+                "memory outbox socket message kind is invalid",
+            ));
+        }
+    };
+    let handle = read_memory_effect_string(payload, &mut offset, "handle")?;
+    let message = read_memory_effect_bytes(payload, &mut offset, "message")?;
+    require_memory_effect_end(payload, offset)?;
+    Ok((handle, is_text, message))
+}
+
+fn parse_memory_transport_data_effect(payload: &[u8]) -> Result<(String, Vec<u8>)> {
+    let mut offset = 0;
+    read_memory_effect_version(payload, &mut offset)?;
+    let handle = read_memory_effect_string(payload, &mut offset, "handle")?;
+    let body = read_memory_effect_bytes(payload, &mut offset, "payload")?;
+    require_memory_effect_end(payload, offset)?;
+    Ok((handle, body))
+}
+
+fn parse_memory_close_effect(payload: &[u8]) -> Result<(String, u16, String)> {
+    let mut offset = 0;
+    read_memory_effect_version(payload, &mut offset)?;
+    let code = read_memory_effect_u16(payload, &mut offset, "code")?;
+    let handle = read_memory_effect_string(payload, &mut offset, "handle")?;
+    let reason = read_memory_effect_string(payload, &mut offset, "reason")?;
+    require_memory_effect_end(payload, offset)?;
+    Ok((handle, code, reason))
+}
+
+fn read_memory_effect_version(payload: &[u8], offset: &mut usize) -> Result<()> {
+    let version = read_memory_effect_u8(payload, offset, "version")?;
+    if version != MEMORY_RUNTIME_EFFECT_VERSION {
+        return Err(PlatformError::bad_request(format!(
+            "memory outbox runtime effect version is unsupported: {version}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_memory_effect_u8(payload: &[u8], offset: &mut usize, field: &str) -> Result<u8> {
+    let Some(value) = payload.get(*offset).copied() else {
+        return Err(PlatformError::bad_request(format!(
+            "memory outbox runtime effect {field} is missing"
+        )));
+    };
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_memory_effect_u16(payload: &[u8], offset: &mut usize, field: &str) -> Result<u16> {
+    if payload.len().saturating_sub(*offset) < 2 {
+        return Err(PlatformError::bad_request(format!(
+            "memory outbox runtime effect {field} is truncated"
+        )));
+    }
+    let value = u16::from_be_bytes([payload[*offset], payload[*offset + 1]]);
+    *offset += 2;
+    Ok(value)
+}
+
+fn read_memory_effect_u32(payload: &[u8], offset: &mut usize, field: &str) -> Result<usize> {
+    if payload.len().saturating_sub(*offset) < 4 {
+        return Err(PlatformError::bad_request(format!(
+            "memory outbox runtime effect {field} length is truncated"
+        )));
+    }
+    let value = u32::from_be_bytes([
+        payload[*offset],
+        payload[*offset + 1],
+        payload[*offset + 2],
+        payload[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value as usize)
+}
+
+fn read_memory_effect_bytes(payload: &[u8], offset: &mut usize, field: &str) -> Result<Vec<u8>> {
+    let len = read_memory_effect_u32(payload, offset, field)?;
+    if payload.len().saturating_sub(*offset) < len {
+        return Err(PlatformError::bad_request(format!(
+            "memory outbox runtime effect {field} is truncated"
+        )));
+    }
+    let bytes = payload[*offset..*offset + len].to_vec();
+    *offset += len;
+    Ok(bytes)
+}
+
+fn read_memory_effect_string(payload: &[u8], offset: &mut usize, field: &str) -> Result<String> {
+    let bytes = read_memory_effect_bytes(payload, offset, field)?;
+    let value = String::from_utf8(bytes).map_err(|error| {
+        PlatformError::bad_request(format!(
+            "memory outbox runtime effect {field} is invalid utf8: {error}"
+        ))
+    })?;
+    if field == "handle" && value.trim().is_empty() {
+        return Err(PlatformError::bad_request(
+            "memory outbox runtime effect handle is required",
+        ));
+    }
+    Ok(if field == "handle" {
+        value.trim().to_string()
+    } else {
+        value
+    })
+}
+
+fn require_memory_effect_end(payload: &[u8], offset: usize) -> Result<()> {
+    if offset == payload.len() {
+        return Ok(());
+    }
+    Err(PlatformError::bad_request(
+        "memory outbox runtime effect has trailing bytes",
+    ))
+}
+
+fn is_terminal_memory_outbox_delivery_error(error: &PlatformError) -> bool {
+    matches!(error.kind(), ErrorKind::BadRequest | ErrorKind::NotFound)
+}
+
+fn memory_outbox_retry_after(attempt_count: i64) -> Duration {
+    let shift = attempt_count.clamp(0, 6) as u32;
+    Duration::from_millis(250u64.saturating_mul(1u64 << shift))
 }

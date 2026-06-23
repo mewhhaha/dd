@@ -5,17 +5,19 @@
       entry.openSocketHandlesInitialized = true;
     };
     const currentSocketRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
+    const currentSocketScopeHandle = () => memoryScopedScopeHandle(entry);
 
     const sendSocketFrame = async (requestIdForOp, normalizedHandle, payload, gated = true) => {
       const perform = async () => {
-        const result = await callOp("op_memory_socket_send", {
-          request_id: requestIdForOp,
-          binding: entry.binding,
-          key: entry.memoryKey,
-          handle: normalizedHandle,
-          message_kind: payload.kind,
-          message: payload.value,
-        });
+        const result = await callOp(
+          "op_memory_socket_send",
+          currentSocketScopeHandle(),
+          normalizedHandle,
+          entry.binding,
+          entry.memoryKey,
+          payload.kind,
+          payload.value,
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "socket send failed"));
@@ -30,14 +32,15 @@
 
     const closeSocketFrame = async (requestIdForOp, normalizedHandle, code, reason, gated = true) => {
       const perform = async () => {
-        const result = await callOp("op_memory_socket_close", {
-          request_id: requestIdForOp,
-          binding: entry.binding,
-          key: entry.memoryKey,
-          handle: normalizedHandle,
+        const result = await callOp(
+          "op_memory_socket_close",
+          currentSocketScopeHandle(),
+          normalizedHandle,
+          entry.binding,
+          entry.memoryKey,
           code,
           reason,
-        });
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "socket close failed"));
@@ -51,12 +54,13 @@
     };
 
     const consumeCloseEvents = async (target) => {
-      const result = await callOp("op_memory_socket_consume_close", {
-        request_id: currentSocketRequestId(),
-        binding: entry.binding,
-        key: entry.memoryKey,
-        handle: target.__dd_handle,
-      });
+      const result = await callOp(
+        "op_memory_socket_consume_close",
+        currentSocketScopeHandle(),
+        target.__dd_handle,
+        entry.binding,
+        entry.memoryKey,
+      );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String(result.error ?? "socket consumeClose failed"));
@@ -149,7 +153,13 @@
             }
           };
           if (scope) {
-            scope.state.defer(perform);
+            if (this.readyState !== 1) {
+              return;
+            }
+            scope.state.__dd_emitRuntimeEffect(
+              "socket.send",
+              encodeMemorySocketSendEffect(normalizedHandle, payload),
+            );
             return;
           }
           await perform();
@@ -176,7 +186,17 @@
           };
           const scope = memoryTxnScopeFor(entry.binding, entry.memoryKey);
           if (scope) {
-            scope.state.defer(perform);
+            if (this.readyState !== 1) {
+              return;
+            }
+            scope.state.__dd_emitRuntimeEffect(
+              "socket.close",
+              encodeMemoryCloseEffect(
+                normalizedHandle,
+                normalizedCode,
+                reason == null ? "" : String(reason),
+              ),
+            );
             return;
           }
           await perform();
@@ -347,11 +367,12 @@
         );
       },
       async refreshOpenHandles() {
-        const result = await callOp("op_memory_socket_list", {
-          request_id: currentSocketRequestId(),
-          binding: entry.binding,
-          key: entry.memoryKey,
-        });
+        const result = await callOp(
+          "op_memory_socket_list",
+          currentSocketScopeHandle(),
+          entry.binding,
+          entry.memoryKey,
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "socket values failed"));
@@ -425,14 +446,16 @@
       entry.openTransportHandlesInitialized = true;
     };
     const currentTransportRequestId = () => memoryScopedRequestId(entry, runtimeRequestId);
+    const currentTransportScopeHandle = () => memoryScopedScopeHandle(entry);
 
     const consumeCloseEvents = async (target) => {
-      const result = await callOp("op_memory_transport_consume_close", {
-        request_id: currentTransportRequestId(),
-        binding: entry.binding,
-        key: entry.memoryKey,
-        handle: target.__dd_handle,
-      });
+      const result = await callOp(
+        "op_memory_transport_consume_close",
+        currentTransportScopeHandle(),
+        target.__dd_handle,
+        entry.binding,
+        entry.memoryKey,
+      );
       await syncFrozenTime();
       if (result && typeof result === "object" && result.ok === false) {
         throw new Error(String(result.error ?? "transport consumeClose failed"));
@@ -484,31 +507,30 @@
 
       const sendTransportPayload = async (kind, value) => {
         const bytes = isBinaryLike(value) ? toArrayBytes(value) : toUtf8Bytes(value);
-        const payload = Array.from(bytes);
-        const body = kind === "datagram"
-          ? {
-            request_id: boundRequestId,
-            handle: normalizedHandle,
-            binding: entry.binding,
-            key: entry.memoryKey,
-            datagram: payload,
-          }
-          : {
-            request_id: boundRequestId,
-            handle: normalizedHandle,
-            binding: entry.binding,
-            key: entry.memoryKey,
-            chunk: payload,
-          };
+        const payload = bytes;
+        const scope = memoryTxnScopeFor(entry.binding, entry.memoryKey);
+        if (scope) {
+          scope.state.__dd_emitRuntimeEffect(
+            kind === "datagram" ? "transport.datagram" : "transport.stream",
+            encodeMemoryTransportDataEffect(normalizedHandle, payload),
+          );
+          return;
+        }
+        const body = [
+          currentTransportScopeHandle(),
+          normalizedHandle,
+          entry.binding,
+          entry.memoryKey,
+          payload,
+        ];
         await gateMemoryOutput(entry, currentTransportRequestId(), async () => {
           const result = await callOpAny(
             [
               kind === "datagram"
                 ? "op_memory_transport_send_datagram"
                 : "op_memory_transport_send_stream",
-              "op_memory_transport_send",
             ],
-            body,
+            ...body,
           );
           await syncFrozenTime();
           if (result && typeof result === "object" && result.ok === false) {
@@ -562,20 +584,31 @@
           const normalizedCode = Number.isFinite(Number(code))
             ? Math.trunc(Number(code))
             : 0;
+          const scope = memoryTxnScopeFor(entry.binding, entry.memoryKey);
+          if (scope) {
+            scope.state.__dd_emitRuntimeEffect(
+              "transport.close",
+              encodeMemoryCloseEffect(
+                normalizedHandle,
+                normalizedCode,
+                reason == null ? "" : String(reason),
+              ),
+            );
+            finishClosed();
+            return;
+          }
           await gateMemoryOutput(entry, currentTransportRequestId(), async () => {
             const result = await callOpAny(
               [
                 "op_memory_transport_close",
                 "op_memory_transport_terminate",
               ],
-              {
-                request_id: currentTransportRequestId(),
-                handle: normalizedHandle,
-                binding: entry.binding,
-                key: entry.memoryKey,
-                code: normalizedCode,
-                reason: reason == null ? "" : String(reason),
-              },
+              currentTransportScopeHandle(),
+              normalizedHandle,
+              entry.binding,
+              entry.memoryKey,
+              normalizedCode,
+              reason == null ? "" : String(reason),
             );
             await syncFrozenTime();
             if (result && typeof result === "object" && result.ok === false) {
@@ -684,14 +717,15 @@
       WebTransportSession: WebTransportSessionForMemory,
       ensureTransport,
       async refreshOpenHandles() {
-        const result = await callOpAny([
-          "op_memory_transport_list",
-          "op_memory_transport_handles",
-        ], {
-          request_id: currentTransportRequestId(),
-          binding: entry.binding,
-          key: entry.memoryKey,
-        });
+        const result = await callOpAny(
+          [
+            "op_memory_transport_list",
+            "op_memory_transport_handles",
+          ],
+          currentTransportScopeHandle(),
+          entry.binding,
+          entry.memoryKey,
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "transport values failed"));
@@ -852,8 +886,8 @@
       get(key, options) {
         return runtimeState.storage.get(key, options)?.value ?? null;
       },
-      set(key, value) {
-        runtimeState.storage.put(key, value);
+      set(key, value, options) {
+        runtimeState.storage.put(key, value, options);
         return value;
       },
       put(key, updater) {
@@ -865,8 +899,8 @@
         runtimeState.storage.put(key, next);
         return next;
       },
-      delete(key) {
-        return runtimeState.storage.delete(key);
+      delete(key, options) {
+        return runtimeState.storage.delete(key, options);
       },
       list(options) {
         return runtimeState.storage.list(options).map((entryValue) => ({
@@ -881,19 +915,35 @@
       tvar(key, defaultValue = null) {
         return createTxnVar(key, defaultValue);
       },
-      defer(callback) {
+      emit(kind, payload = null) {
         if (!txn) {
-          throw new Error("state.defer(callback) requires an active transaction");
+          throw new Error("state.emit(kind, payload) requires an active transaction");
         }
-        if (typeof callback !== "function") {
-          throw new Error("state.defer(callback) requires a function");
+        const normalizedKind = String(kind ?? "").trim();
+        if (!normalizedKind) {
+          throw new Error("state.emit(kind, payload) requires a non-empty kind");
         }
-        txn.deferred.push(callback);
-        return callback;
+        stageMemoryTxnEffect(
+          txn,
+          normalizedKind,
+          toUtf8Bytes(JSON.stringify(payload ?? null)),
+        );
+        return payload;
+      },
+      __dd_emitRuntimeEffect(kind, payload) {
+        if (!txn) {
+          throw new Error("runtime memory effect requires an active transaction");
+        }
+        const normalizedKind = String(kind ?? "").trim();
+        if (!normalizedKind) {
+          throw new Error("runtime memory effect kind is required");
+        }
+        stageMemoryTxnEffect(txn, normalizedKind, toArrayBytes(payload));
+        return payload;
       },
       accept(request, options = {}) {
         if (txn) {
-          txn.accepted = true;
+          markMemoryBatchAccepted(txn);
         }
         if (isTransportRequest(request)) {
           const accepted = runtimeState.transports.accept(request, options);
@@ -949,6 +999,9 @@
       },
       list(...args) {
         return stateRef.current.list(...args);
+      },
+      emit(...args) {
+        return stateRef.current.emit(...args);
       },
       sockets: {
         accept(...args) {
@@ -1050,17 +1103,19 @@
         const argsBytes = await encodeRpcArgs(args);
         const result = await awaitDynamicReply(
           `dynamic host rpc invoke (${bindingName}.${methodName})`,
-          () => callOp("op_dynamic_host_rpc_invoke", {
-            request_id: activeRequestId(),
-            binding: bindingName,
-            method_name: methodName,
-            args: Array.from(argsBytes),
-          }),
+          () => callOp(
+            "op_dynamic_host_rpc_invoke",
+            activeRequestContextHandle(),
+            bindingName,
+            methodName,
+            argsBytes,
+          ),
         );
         if (!result || typeof result !== "object" || result.ok === false) {
           throw new Error(formatDynamicFailure(`dynamic host rpc invoke failed: ${methodName}`, result));
         }
-        return decodeRpcResult(toArrayBytes(result.value));
+        const valueHandle = Math.max(0, Math.trunc(Number(result.value_handle ?? 0) || 0));
+        return decodeRpcResult(callOp("op_http_take_prepared_body", valueHandle));
       };
     },
     set() {
@@ -1148,11 +1203,12 @@
         return localRuntime.listOpenHandles();
       }
       return (async () => {
-        const result = await callOp("op_memory_socket_list", {
-          request_id: activeRequestId(),
-          binding: bindingName,
-          key: memoryKey,
-        });
+        const result = await callOp(
+          "op_memory_socket_list",
+          0,
+          bindingName,
+          memoryKey,
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "socket values failed"));
@@ -1171,14 +1227,15 @@
         return localRuntime.listOpenHandles();
       }
       return (async () => {
-        const result = await callOpAny([
-          "op_memory_transport_list",
-          "op_memory_transport_handles",
-        ], {
-          request_id: activeRequestId(),
-          binding: bindingName,
-          key: memoryKey,
-        });
+        const result = await callOpAny(
+          [
+            "op_memory_transport_list",
+            "op_memory_transport_handles",
+          ],
+          0,
+          bindingName,
+          memoryKey,
+        );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
           throw new Error(String(result.error ?? "transport values failed"));
@@ -1216,6 +1273,12 @@
           return record ? record.value : defaultValue;
         }
         return (async () => {
+          if (options && typeof options === "object") {
+            const unsupported = Object.keys(options).filter((keyValue) => keyValue !== "withVersion");
+            if (unsupported.length > 0) {
+              throw new Error("memory get options are unsupported");
+            }
+          }
           const runtimeRequestId = activeRequestId();
           const entry = await ensureMemoryEntry(bindingName, memoryKey, runtimeRequestId, { hydrate: false });
           const storageState = await ensureMemoryDirectReadReady(entry, runtimeRequestId, normalizedKey);
@@ -1266,4 +1329,3 @@
       throw new Error("stub.writeMany entries must be [key, value] or { key, value }");
     });
   };
-

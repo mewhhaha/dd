@@ -2,6 +2,7 @@ use super::*;
 
 const PRE_CANCELED_TTL: Duration = Duration::from_secs(60);
 const MAX_PRE_CANCELED_REQUESTS_PER_WORKER: usize = 1024;
+const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 16;
 
 fn take_pre_canceled_request(
     pre_canceled: &mut HashMap<String, HashMap<String, Instant>>,
@@ -43,13 +44,43 @@ fn remember_pre_canceled_request(
 }
 
 impl WorkerManager {
+    pub(super) fn account_queued_pending(&mut self, queued_bytes: usize) {
+        self.queue_counters.requests = self.queue_counters.requests.saturating_add(1);
+        self.queue_counters.bytes = self.queue_counters.bytes.saturating_add(queued_bytes);
+    }
+
+    pub(super) fn account_dequeued_pending(&mut self, pending: &PendingInvoke) {
+        self.queue_counters.requests = self.queue_counters.requests.saturating_sub(1);
+        self.queue_counters.bytes = self
+            .queue_counters
+            .bytes
+            .saturating_sub(pending.queued_bytes);
+    }
+
+    pub(super) fn account_dequeued_many(&mut self, count: usize, bytes: usize) {
+        self.queue_counters.requests = self.queue_counters.requests.saturating_sub(count);
+        self.queue_counters.bytes = self.queue_counters.bytes.saturating_sub(bytes);
+    }
+
+    pub(super) fn account_removed_pool_queue(&mut self, pool: &WorkerPool) {
+        self.account_dequeued_many(pool.queue.len(), pool.queue.queued_bytes());
+    }
+
+    fn note_queue_expiry_candidate(&mut self, enqueued_at: Instant) {
+        let expires_at = enqueued_at + self.config.max_queue_wait;
+        self.next_queue_expiry_at = Some(match self.next_queue_expiry_at {
+            Some(current) => current.min(expires_at),
+            None => expires_at,
+        });
+    }
+
     pub(crate) fn register_stream(
         &mut self,
         worker_name: String,
         runtime_request_id: String,
         ready: oneshot::Sender<Result<WorkerStreamOutput>>,
     ) {
-        let (body_sender, body_receiver) = mpsc::unbounded_channel();
+        let (body_sender, body_receiver) = mpsc::channel(RESPONSE_STREAM_CHANNEL_CAPACITY);
         self.stream_registrations.insert(
             runtime_request_id,
             StreamRegistration {
@@ -59,6 +90,8 @@ impl WorkerManager {
                 body_sender,
                 body_receiver: Some(body_receiver),
                 started: false,
+                bytes_sent: 0,
+                max_bytes: self.config.max_response_body_bytes,
             },
         );
     }
@@ -77,7 +110,7 @@ impl WorkerManager {
         internal_origin: bool,
         reply: oneshot::Sender<Result<WorkerOutput>>,
         reply_kind: PendingReplyKind,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let worker_name = worker_name.trim().to_string();
         if take_pre_canceled_request(
@@ -95,6 +128,15 @@ impl WorkerManager {
             return;
         }
         let warn_thresholds = self.config.queue_warn_thresholds.clone();
+        if request.body.len() > self.config.max_request_body_bytes {
+            let error = PlatformError::bad_request(format!(
+                "request body exceeded max_request_body_bytes ({} bytes)",
+                self.config.max_request_body_bytes
+            ));
+            let _ = reply.send(Err(error.clone()));
+            self.fail_stream_registration(&worker_name, &runtime_request_id, error);
+            return;
+        }
         let queued_bytes = estimate_pending_invoke_bytes(&request, request_body.is_some());
         let Some(entry) = self.workers.get(&worker_name) else {
             let error = PlatformError::not_found("Worker not found");
@@ -141,6 +183,7 @@ impl WorkerManager {
                     return;
                 }
             }
+            let enqueued_at = Instant::now();
             pool.queue.push_back(PendingInvoke {
                 runtime_request_id,
                 request,
@@ -152,10 +195,12 @@ impl WorkerManager {
                 internal_origin,
                 reply,
                 reply_kind,
-                enqueued_at: Instant::now(),
+                enqueued_at,
                 queued_bytes,
             });
             pool.update_queue_warning(&warn_thresholds);
+            self.account_queued_pending(queued_bytes);
+            self.note_queue_expiry_candidate(enqueued_at);
         } else {
             let error = PlatformError::not_found("Worker not found");
             let _ = reply.send(Err(error.clone()));
@@ -190,15 +235,15 @@ impl WorkerManager {
             } else {
                 0
             };
-        let total_queued = self.total_queued_requests();
-        if total_queued >= global_limit {
+        if self.queue_counters.requests >= global_limit {
             return Some(PlatformError::overloaded(format!(
                 "runtime queue is full (max {global_limit} queued requests)"
             )));
         }
 
-        let total_bytes = self.total_queued_bytes();
-        if total_bytes.saturating_add(queued_bytes) > self.config.max_global_queued_bytes {
+        if self.queue_counters.bytes.saturating_add(queued_bytes)
+            > self.config.max_global_queued_bytes
+        {
             return Some(PlatformError::overloaded(format!(
                 "runtime queue byte budget is full (max {} bytes)",
                 self.config.max_global_queued_bytes
@@ -206,23 +251,6 @@ impl WorkerManager {
         }
 
         None
-    }
-
-    fn total_queued_requests(&self) -> usize {
-        self.workers
-            .values()
-            .flat_map(|entry| entry.pools.values())
-            .map(|pool| pool.queue.len())
-            .sum()
-    }
-
-    fn total_queued_bytes(&self) -> usize {
-        self.workers
-            .values()
-            .flat_map(|entry| entry.pools.values())
-            .flat_map(|pool| pool.queue.iter())
-            .map(|pending| pending.queued_bytes)
-            .sum()
     }
 
     fn reject_not_queued_invoke(
@@ -247,7 +275,6 @@ impl WorkerManager {
             }
             PendingReplyKind::Normal
             | PendingReplyKind::Stream
-            | PendingReplyKind::DynamicInvoke { .. }
             | PendingReplyKind::DynamicFetch { .. }
             | PendingReplyKind::WebsocketFrame { .. } => {}
         }
@@ -256,23 +283,40 @@ impl WorkerManager {
     }
 
     pub(crate) fn expire_queued_requests(&mut self) {
+        if self.queue_counters.requests == 0 {
+            self.next_queue_expiry_at = None;
+            return;
+        }
         let max_queue_wait = self.config.max_queue_wait;
         let now = Instant::now();
+        if self
+            .next_queue_expiry_at
+            .is_some_and(|next_expiry_at| now < next_expiry_at)
+        {
+            return;
+        }
         let mut expired = Vec::new();
+        let mut expired_count = 0usize;
+        let mut expired_bytes = 0usize;
+        let mut next_queue_expiry_at: Option<Instant> = None;
 
         for (worker_name, entry) in &mut self.workers {
             for pool in entry.pools.values_mut() {
-                let mut retained = VecDeque::with_capacity(pool.queue.len());
-                while let Some(pending) = pool.queue.pop_front() {
-                    if now.duration_since(pending.enqueued_at) >= max_queue_wait {
-                        expired.push((worker_name.clone(), pending));
-                    } else {
-                        retained.push_back(pending);
-                    }
+                for pending in pool.queue.drain_expired(now, max_queue_wait) {
+                    expired_count = expired_count.saturating_add(1);
+                    expired_bytes = expired_bytes.saturating_add(pending.queued_bytes);
+                    expired.push((worker_name.clone(), pending));
                 }
-                pool.queue = retained;
+                if let Some(expires_at) = pool.queue.next_expiry_at(max_queue_wait) {
+                    next_queue_expiry_at = Some(match next_queue_expiry_at {
+                        Some(current) => current.min(expires_at),
+                        None => expires_at,
+                    });
+                }
             }
         }
+        self.next_queue_expiry_at = next_queue_expiry_at;
+        self.account_dequeued_many(expired_count, expired_bytes);
 
         for (worker_name, pending) in expired {
             let runtime_request_id = pending.runtime_request_id.clone();
@@ -290,7 +334,121 @@ impl WorkerManager {
         }
     }
 
-    fn reject_pending_invoke(
+    pub(crate) fn expire_inflight_requests(&mut self, event_tx: &RuntimeEventSender) {
+        let request_wall_timeout = self.config.request_wall_timeout;
+        let now = Instant::now();
+        let mut expired_isolates = Vec::new();
+
+        for (worker_name, entry) in &self.workers {
+            for (generation, pool) in &entry.pools {
+                for isolate in &pool.isolates {
+                    let expired_request_ids = isolate
+                        .pending_replies
+                        .iter()
+                        .filter_map(|(request_id, pending)| {
+                            (now.duration_since(pending.dispatched_at) >= request_wall_timeout)
+                                .then(|| request_id.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    if expired_request_ids.is_empty() {
+                        continue;
+                    }
+                    let v8_handle = isolate
+                        .v8_handle
+                        .lock()
+                        .expect("v8 handle mutex poisoned")
+                        .clone();
+                    expired_isolates.push((
+                        worker_name.clone(),
+                        *generation,
+                        isolate.id,
+                        expired_request_ids,
+                        v8_handle,
+                    ));
+                }
+            }
+        }
+
+        for (worker_name, generation, isolate_id, expired_request_ids, v8_handle) in
+            expired_isolates
+        {
+            let timeout_ms = request_wall_timeout.as_millis() as u64;
+            warn!(
+                worker = %worker_name,
+                generation,
+                isolate_id,
+                request_wall_timeout_ms = timeout_ms,
+                expired_requests = %expired_request_ids.join(","),
+                "terminating isolate after request wall-time limit"
+            );
+            if let Some(v8_handle) = v8_handle {
+                let _ = v8_handle.terminate_execution();
+            }
+            self.fail_isolate(
+                &worker_name,
+                generation,
+                isolate_id,
+                PlatformError::runtime(format!(
+                    "request exceeded wall-time limit of {timeout_ms}ms; isolate retired"
+                )),
+            );
+            self.dispatch_pool(&worker_name, generation, event_tx);
+            self.cleanup_drained_generations_for(&worker_name);
+        }
+    }
+
+    pub(crate) fn expire_starting_isolates(&mut self, event_tx: &RuntimeEventSender) {
+        let startup_timeout = self.config.isolate_startup_timeout;
+        let now = Instant::now();
+        let mut expired_isolates = Vec::new();
+
+        for (worker_name, entry) in &self.workers {
+            for (generation, pool) in &entry.pools {
+                for isolate in &pool.isolates {
+                    if !isolate.startup.timed_out(now, startup_timeout) {
+                        continue;
+                    }
+                    let v8_handle = isolate
+                        .v8_handle
+                        .lock()
+                        .expect("v8 handle mutex poisoned")
+                        .clone();
+                    expired_isolates.push((
+                        worker_name.clone(),
+                        *generation,
+                        isolate.id,
+                        v8_handle,
+                    ));
+                }
+            }
+        }
+
+        for (worker_name, generation, isolate_id, v8_handle) in expired_isolates {
+            let timeout_ms = startup_timeout.as_millis() as u64;
+            warn!(
+                worker = %worker_name,
+                generation,
+                isolate_id,
+                isolate_startup_timeout_ms = timeout_ms,
+                "terminating isolate after startup timeout"
+            );
+            if let Some(v8_handle) = v8_handle {
+                let _ = v8_handle.terminate_execution();
+            }
+            self.fail_isolate(
+                &worker_name,
+                generation,
+                isolate_id,
+                PlatformError::runtime(format!(
+                    "isolate exceeded startup timeout of {timeout_ms}ms; isolate retired"
+                )),
+            );
+            self.dispatch_pool(&worker_name, generation, event_tx);
+            self.cleanup_drained_generations_for(&worker_name);
+        }
+    }
+
+    pub(super) fn reject_pending_invoke(
         &mut self,
         worker_name: &str,
         pending: PendingInvoke,
@@ -316,6 +474,13 @@ impl WorkerManager {
         reply: oneshot::Sender<Result<WorkerOutput>>,
         handle: String,
     ) -> DirectDynamicFetchDispatch {
+        if request.body.len() > self.config.max_request_body_bytes {
+            let _ = reply.send(Err(PlatformError::bad_request(format!(
+                "request body exceeded max_request_body_bytes ({} bytes)",
+                self.config.max_request_body_bytes
+            ))));
+            return DirectDynamicFetchDispatch::Dispatched;
+        }
         let config_max_inflight = self.config.max_inflight_per_isolate;
         let dispatch_result = {
             let Some(pool) = self.get_pool_mut(worker_name, generation) else {
@@ -329,11 +494,7 @@ impl WorkerManager {
             } else {
                 config_max_inflight
             };
-            let Some(isolate_idx) = pool
-                .isolates
-                .iter()
-                .position(|isolate| isolate.id == target_isolate_id)
-            else {
+            let Some(isolate_idx) = pool.isolate_idx(target_isolate_id) else {
                 return DirectDynamicFetchDispatch::Fallback {
                     reply,
                     clear_preferred: true,
@@ -381,6 +542,7 @@ impl WorkerManager {
                     completion_token,
                     canceled: false,
                     memory_key: None,
+                    active_memory_lease: None,
                     internal_origin: true,
                     reply,
                     completion_meta,
@@ -389,7 +551,7 @@ impl WorkerManager {
                 },
             );
 
-            if isolate.sender.send(command).is_ok() {
+            if isolate.sender.try_send(command).is_ok() {
                 return DirectDynamicFetchDispatch::Dispatched;
             }
 
@@ -407,7 +569,7 @@ impl WorkerManager {
         };
         let (isolate_idx, restored_reply) = dispatch_result;
         let failed = self.remove_isolate(worker_name, generation, isolate_idx);
-        for (request_id, reply) in failed {
+        for (request_id, reply) in failed.replies {
             if request_id != runtime_request_id {
                 let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
             }
@@ -421,7 +583,7 @@ impl WorkerManager {
     pub(crate) fn enqueue_memory_invoke(
         &mut self,
         payload: MemoryInvokeEvent,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let decoded = match decode_memory_invoke_request(&payload.request_frame) {
             Ok(decoded) => decoded,
@@ -531,7 +693,7 @@ impl WorkerManager {
         &mut self,
         worker_name: String,
         runtime_request_id: String,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let worker_name = worker_name.trim().to_string();
         if worker_name.is_empty() {
@@ -544,27 +706,26 @@ impl WorkerManager {
         let mut matched = false;
         let mut cleared_request_ids = Vec::new();
         let mut websocket_waiters_to_abort = Vec::new();
+        let mut dequeued_count = 0usize;
+        let mut dequeued_bytes = 0usize;
 
         if let Some(entry) = self.workers.get_mut(&worker_name) {
             for (generation, pool) in &mut entry.pools {
                 let mut generation_touched = false;
 
-                if let Some(idx) = pool
-                    .queue
-                    .iter()
-                    .position(|pending| pending.runtime_request_id == runtime_request_id)
+                if let Some(pending) = pool.queue.remove_by_runtime_request_id(&runtime_request_id)
                 {
-                    if let Some(pending) = pool.queue.remove(idx) {
-                        if let PendingReplyKind::WebsocketOpen { session_id } = pending.reply_kind {
-                            websocket_waiters_to_abort.push(session_id);
-                        }
-                        cleared_request_ids.push(pending.runtime_request_id.clone());
-                        let _ = pending
-                            .reply
-                            .send(Err(PlatformError::runtime("request was aborted")));
-                        generation_touched = true;
-                        matched = true;
+                    dequeued_count = dequeued_count.saturating_add(1);
+                    dequeued_bytes = dequeued_bytes.saturating_add(pending.queued_bytes);
+                    if let PendingReplyKind::WebsocketOpen { session_id } = pending.reply_kind {
+                        websocket_waiters_to_abort.push(session_id);
                     }
+                    cleared_request_ids.push(pending.runtime_request_id.clone());
+                    let _ = pending
+                        .reply
+                        .send(Err(PlatformError::runtime("request was aborted")));
+                    generation_touched = true;
+                    matched = true;
                 }
 
                 for isolate in &mut pool.isolates {
@@ -602,6 +763,7 @@ impl WorkerManager {
                 }
             }
         }
+        self.account_dequeued_many(dequeued_count, dequeued_bytes);
 
         for request_id in cleared_request_ids {
             self.clear_revalidation_for_request(&request_id);
@@ -617,13 +779,13 @@ impl WorkerManager {
 
         for (generation, isolate_id, sender) in abort_commands {
             if sender
-                .send(IsolateCommand::Abort {
+                .try_send(IsolateCommand::Abort {
                     runtime_request_id: runtime_request_id.clone(),
                 })
                 .is_err()
             {
                 let failed = self.remove_isolate_by_id(&worker_name, generation, isolate_id);
-                for (request_id, reply) in failed {
+                for (request_id, reply) in failed.replies {
                     self.clear_revalidation_for_request(&request_id);
                     let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
                 }
@@ -639,7 +801,7 @@ impl WorkerManager {
                 );
             }
             let failed = self.remove_isolate_by_id(&worker_name, generation, isolate_id);
-            for (request_id, reply) in failed {
+            for (request_id, reply) in failed.replies {
                 self.clear_revalidation_for_request(&request_id);
                 let _ = reply.send(Err(PlatformError::runtime(
                     "streaming request was aborted; isolate retired",
@@ -672,7 +834,7 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         generation: u64,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         if self.runtime_batch_depth > 0 {
             self.pending_dispatches
@@ -699,16 +861,19 @@ impl WorkerManager {
                     select_dispatch_candidate(pool, max_inflight, pool.strict_request_isolation);
                 let spawn_needed = selection.is_none()
                     && !pool.has_dispatch_capacity(max_inflight)
+                    && !pool.has_starting_isolate()
                     && pool.isolates.len() < max_isolates;
                 (selection, spawn_needed)
             };
 
             if spawn_needed {
                 if let Err(error) = self.spawn_isolate(worker_name, generation, event_tx.clone()) {
-                    if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-                        if let Some(pending) = pool.queue.pop_front() {
-                            let _ = pending.reply.send(Err(error));
-                        }
+                    let pending = self
+                        .get_pool_mut(worker_name, generation)
+                        .and_then(|pool| pool.queue.pop_front());
+                    if let Some(pending) = pending {
+                        self.account_dequeued_pending(&pending);
+                        let _ = pending.reply.send(Err(error));
                     }
                     return;
                 }
@@ -720,13 +885,15 @@ impl WorkerManager {
             };
             let candidate = match selection {
                 DispatchSelection::Dispatch(candidate) => candidate,
-                DispatchSelection::DropStaleTarget { queue_idx } => {
-                    if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-                        if let Some(stale) = pool.queue.remove(queue_idx) {
-                            let _ = stale
-                                .reply
-                                .send(Err(PlatformError::runtime("target isolate is unavailable")));
-                        }
+                DispatchSelection::DropStaleTarget { queue_key } => {
+                    let stale = self
+                        .get_pool_mut(worker_name, generation)
+                        .and_then(|pool| pool.queue.remove(queue_key));
+                    if let Some(stale) = stale {
+                        self.account_dequeued_pending(&stale);
+                        let _ = stale
+                            .reply
+                            .send(Err(PlatformError::runtime("target isolate is unavailable")));
                     }
                     continue;
                 }
@@ -734,10 +901,11 @@ impl WorkerManager {
             let isolate_idx = candidate.isolate_idx;
             let Some(pending_invoke) = self
                 .get_pool_mut(worker_name, generation)
-                .and_then(|pool| pool.queue.remove(candidate.queue_idx))
+                .and_then(|pool| pool.queue.remove(candidate.queue_key))
             else {
                 return;
             };
+            self.account_dequeued_pending(&pending_invoke);
 
             let runtime_request_id = pending_invoke.runtime_request_id.clone();
             let internal_origin = pending_invoke.internal_origin;
@@ -745,6 +913,12 @@ impl WorkerManager {
                 .memory_route
                 .as_ref()
                 .map(|route| route.owner_key.clone());
+            let active_memory_entity = pending_memory_key.as_ref().filter(|_| {
+                matches!(
+                    pending_invoke.memory_call.as_ref(),
+                    Some(MemoryExecutionCall::Method { name, .. }) if name == MEMORY_ATOMIC_METHOD
+                )
+            });
             let info_tracing_enabled = tracing::enabled!(Level::INFO);
             let needs_completion_meta = info_tracing_enabled
                 || self
@@ -783,6 +957,13 @@ impl WorkerManager {
             }
             let stream_response = self.stream_registrations.contains_key(&runtime_request_id);
             let mut send_failed = false;
+            let active_memory_epoch = if active_memory_entity.is_some() {
+                self.next_memory_entity_epoch =
+                    self.next_memory_entity_epoch.saturating_add(1).max(1);
+                Some(self.next_memory_entity_epoch)
+            } else {
+                None
+            };
             if let Some(pool) = self.get_pool_mut(worker_name, generation) {
                 if isolate_idx >= pool.isolates.len() {
                     continue;
@@ -799,6 +980,21 @@ impl WorkerManager {
                     traceparent: traceparent.clone(),
                     user_request_id: pending_invoke.request.request_id.clone(),
                 });
+                let active_memory_lease = active_memory_entity.as_ref().map(|owner_key| {
+                    let owner_isolate_id = pool.isolates[isolate_idx].id;
+                    pool.acquire_memory_entity_lease(
+                        (*owner_key).clone(),
+                        owner_isolate_id,
+                        active_memory_epoch.expect("memory epoch must be allocated"),
+                    )
+                });
+                let active_memory_route_epoch = active_memory_lease
+                    .as_ref()
+                    .map(|lease| i64::try_from(lease.epoch).unwrap_or(i64::MAX));
+                let memory_route = match (pending_invoke.memory_route, active_memory_route_epoch) {
+                    (Some(route), Some(epoch)) => Some(route.with_owner_epoch(epoch)),
+                    (route, _) => route,
+                };
                 let command = pool.build_execute_command(
                     runtime_request_id.clone(),
                     completion_token.clone(),
@@ -807,7 +1003,7 @@ impl WorkerManager {
                     stream_response,
                     pending_invoke.memory_call,
                     pending_invoke.host_rpc_call,
-                    pending_invoke.memory_route,
+                    memory_route,
                 );
                 let isolate = &mut pool.isolates[isolate_idx];
                 isolate.served_requests += 1;
@@ -818,6 +1014,7 @@ impl WorkerManager {
                         completion_token,
                         canceled: false,
                         memory_key: pending_memory_key,
+                        active_memory_lease: active_memory_lease.clone(),
                         internal_origin,
                         reply: pending_reply
                             .take()
@@ -827,12 +1024,15 @@ impl WorkerManager {
                         dispatched_at: Instant::now(),
                     },
                 );
-                if isolate.sender.send(command).is_err() {
+                if isolate.sender.try_send(command).is_err() {
                     isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
                     pending_reply = isolate
                         .pending_replies
                         .remove(&runtime_request_id)
                         .map(|pending| pending.reply);
+                    if let Some(lease) = &active_memory_lease {
+                        pool.release_memory_entity_lease(lease);
+                    }
                     send_failed = true;
                 }
             }
@@ -843,7 +1043,7 @@ impl WorkerManager {
                 if let Some(reply) = pending_reply.take() {
                     let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
                 }
-                for (request_id, reply) in failed {
+                for (request_id, reply) in failed.replies {
                     self.clear_revalidation_for_request(&request_id);
                     let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
                 }
@@ -861,13 +1061,20 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         generation: u64,
-        event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: RuntimeEventSender,
     ) -> Result<()> {
-        let (snapshot, snapshot_preloaded, source) = self
+        let (snapshot, snapshot_preloaded, source, deployment_config) = self
             .workers
             .get(worker_name)
             .and_then(|entry| entry.pools.get(&generation))
-            .map(|pool| (pool.snapshot, pool.snapshot_preloaded, pool.source.clone()))
+            .map(|pool| {
+                (
+                    pool.snapshot,
+                    pool.snapshot_preloaded,
+                    pool.source.clone(),
+                    Arc::clone(&pool.deployment_config),
+                )
+            })
             .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
         let allow_code_generation = self.config.debug_code_generation;
         let isolate_id = self.next_isolate_id;
@@ -877,16 +1084,22 @@ impl WorkerManager {
         let cache_store = self.cache_store.clone();
         let dynamic_profile = self.dynamic_profile.clone();
         let open_handle_registry = self.open_handle_registry.clone();
+        let execution_limits = crate::ops::RuntimeExecutionLimits {
+            max_request_body_bytes: self.config.max_request_body_bytes,
+            max_isolate_heap_bytes: self.config.max_isolate_heap_bytes,
+        };
         let isolate = spawn_isolate_thread(
             snapshot,
             snapshot_preloaded,
             source,
+            deployment_config,
             allow_code_generation,
             kv_store,
             memory_store,
             cache_store,
             open_handle_registry,
             dynamic_profile,
+            execution_limits,
             self.runtime_fast_sender.clone(),
             worker_name.to_string(),
             generation,
@@ -895,7 +1108,7 @@ impl WorkerManager {
         )?;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             pool.stats.spawn_count += 1;
-            pool.isolates.push(isolate);
+            pool.push_isolate(isolate);
             pool.log_stats("spawn");
             Ok(())
         } else {
@@ -903,7 +1116,7 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) fn finish_request(
+    pub(crate) async fn finish_request(
         &mut self,
         worker_name: &str,
         generation: u64,
@@ -912,7 +1125,7 @@ impl WorkerManager {
         completion_token: &str,
         wait_until_count: usize,
         mut result: Result<WorkerOutput>,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let mut reply = None;
         let mut canceled = false;
@@ -924,6 +1137,7 @@ impl WorkerManager {
         let mut execution_ms: Option<u64> = None;
         let mut internal_origin = false;
         let mut pending_kind = PendingReplyKind::Normal;
+        let mut should_drain_memory_outbox = false;
         let trace_destination = self
             .get_pool_mut(worker_name, generation)
             .and_then(|pool| pool.internal_trace.clone());
@@ -960,9 +1174,11 @@ impl WorkerManager {
                 if isolate.inflight_count == 0 {
                     isolate.last_used_at = Instant::now();
                 }
+                let mut active_memory_lease = None;
                 if let Some(pending) = isolate.pending_replies.remove(request_id) {
                     canceled = pending.canceled;
                     internal_origin = pending.internal_origin;
+                    active_memory_lease = pending.active_memory_lease.clone();
                     if let Some(meta) = pending.completion_meta {
                         request_method = meta.method;
                         request_url = meta.url;
@@ -983,11 +1199,25 @@ impl WorkerManager {
                     pending_kind = pending.kind;
                     reply = Some(pending.reply);
                 }
+                if let Some(active_memory_lease) = active_memory_lease {
+                    should_drain_memory_outbox = true;
+                    pool.release_memory_entity_lease(&active_memory_lease);
+                }
             }
             pool.log_stats("complete");
         }
         if clear_revalidation {
             self.clear_revalidation_for_request(request_id);
+        }
+        if !stream_registered {
+            if let Ok(output) = &result {
+                if output.body.len() > self.config.max_response_body_bytes {
+                    result = Err(PlatformError::runtime(format!(
+                        "response body exceeded max_response_body_bytes ({} bytes)",
+                        self.config.max_response_body_bytes
+                    )));
+                }
+            }
         }
         let complete_span = if info_tracing_enabled {
             let result_status = match &result {
@@ -1036,6 +1266,10 @@ impl WorkerManager {
             None
         };
 
+        if should_drain_memory_outbox {
+            self.drain_memory_outbox().await;
+        }
+
         if stream_consumes_result {
             stream_result = Some(result);
             if canceled {
@@ -1058,8 +1292,7 @@ impl WorkerManager {
                         let _ = reply.send(result);
                     }
                 }
-                PendingReplyKind::DynamicInvoke { handle }
-                | PendingReplyKind::DynamicFetch { handle } => {
+                PendingReplyKind::DynamicFetch { handle } => {
                     if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
                         match &result {
                             Ok(_) => {
@@ -1133,7 +1366,8 @@ impl WorkerManager {
                 request_id,
                 completion_token,
                 stream_result,
-            );
+            )
+            .await;
         }
     }
 
@@ -1150,7 +1384,7 @@ impl WorkerManager {
         wait_until_count: usize,
         internal_origin: bool,
         trace_destination: Option<InternalTraceDestination>,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        event_tx: &RuntimeEventSender,
     ) {
         let Some(trace_destination) = trace_destination else {
             return;

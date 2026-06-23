@@ -3,13 +3,6 @@ pub(super) enum IsolateCommand {
     Execute {
         runtime_request_id: String,
         completion_token: String,
-        worker_name_json: Arc<str>,
-        kv_bindings_json: Arc<str>,
-        kv_read_cache_config_json: Arc<str>,
-        memory_bindings_json: Arc<str>,
-        dynamic_bindings_json: Arc<str>,
-        dynamic_rpc_bindings_json: Arc<str>,
-        dynamic_env_json: Arc<str>,
         request_context: RequestExecutionContext,
         request: WorkerInvocation,
         request_body: Option<InvokeRequestBodyReceiver>,
@@ -22,27 +15,26 @@ pub(super) enum IsolateCommand {
         runtime_request_id: String,
     },
     DrainDynamicControl,
-    PollEventLoop,
     Shutdown,
 }
 
 pub(super) struct IsolateEventLoopWaker {
-    pub(super) sender: std_mpsc::Sender<IsolateCommand>,
+    pub(super) notify: Arc<Notify>,
 }
 
 impl Wake for IsolateEventLoopWaker {
     fn wake(self: Arc<Self>) {
-        let _ = self.sender.send(IsolateCommand::PollEventLoop);
+        self.notify.notify_one();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let _ = self.sender.send(IsolateCommand::PollEventLoop);
+        self.notify.notify_one();
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub(super) enum MemoryExecutionCall {
+pub(crate) enum MemoryExecutionCall {
     Method {
         binding: String,
         key: String,
@@ -107,8 +99,8 @@ pub(super) enum MemoryExecutionCall {
     },
 }
 
-#[derive(serde::Serialize)]
-pub(super) struct HostRpcExecutionCall {
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct HostRpcExecutionCall {
     pub(super) target_id: String,
     pub(super) method: String,
     pub(super) args: Vec<u8>,
@@ -116,7 +108,7 @@ pub(super) struct HostRpcExecutionCall {
 
 #[derive(Clone)]
 pub(super) struct InvokeCancelGuard {
-    pub(super) cancel_sender: mpsc::UnboundedSender<RuntimeCommand>,
+    pub(super) cancel_sender: mpsc::Sender<RuntimeCommand>,
     pub(super) worker_name: String,
     pub(super) runtime_request_id: String,
     pub(super) armed: bool,
@@ -124,7 +116,7 @@ pub(super) struct InvokeCancelGuard {
 
 impl InvokeCancelGuard {
     pub(super) fn new(
-        cancel_sender: mpsc::UnboundedSender<RuntimeCommand>,
+        cancel_sender: mpsc::Sender<RuntimeCommand>,
         worker_name: String,
         runtime_request_id: String,
     ) -> Self {
@@ -147,7 +139,7 @@ impl Drop for InvokeCancelGuard {
             return;
         }
 
-        let _ = self.cancel_sender.send(RuntimeCommand::Cancel {
+        let _ = self.cancel_sender.try_send(RuntimeCommand::Cancel {
             worker_name: self.worker_name.clone(),
             runtime_request_id: self.runtime_request_id.clone(),
         });

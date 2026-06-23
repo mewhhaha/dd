@@ -1,4 +1,5 @@
 use base64::Engine;
+use bytes::Bytes;
 use common::{DeployAsset, PlatformError, Result};
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -12,7 +13,7 @@ pub struct AssetBundle {
 
 #[derive(Clone, Debug)]
 struct StaticAsset {
-    body: Vec<u8>,
+    body: Bytes,
     etag: String,
     content_type: String,
 }
@@ -51,7 +52,7 @@ pub struct AssetRequest<'a> {
 pub struct AssetResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 pub fn compile_asset_bundle(
@@ -88,7 +89,7 @@ pub fn compile_asset_bundle(
         compiled_assets.insert(
             normalized_path,
             StaticAsset {
-                body,
+                body: Bytes::from(body),
                 etag,
                 content_type,
             },
@@ -169,12 +170,12 @@ pub fn resolve_asset(bundle: &AssetBundle, request: AssetRequest<'_>) -> Option<
         return Some(AssetResponse {
             status: 304,
             headers: headers.into_iter().map(into_pair).collect(),
-            body: Vec::new(),
+            body: Bytes::new(),
         });
     }
 
     let body = if request.method.eq_ignore_ascii_case("HEAD") {
-        Vec::new()
+        Bytes::new()
     } else {
         asset.body.clone()
     };
@@ -583,7 +584,7 @@ mod tests {
         )
         .expect("asset should match");
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"console.log('a');");
+        assert_eq!(response.body.as_ref(), b"console.log('a');");
         assert!(response
             .headers
             .iter()

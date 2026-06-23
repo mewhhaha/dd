@@ -69,9 +69,22 @@ check:
   cargo check --workspace --all-targets --all-features
   cargo test --workspace
 
-# Build dd_server with the selected distribution profile and write a size report.
-size-report profile="dist":
-  ./scripts/measure-binary-size.sh {{profile}}
+# Build the full dd_server artifact and write a size report.
+server-full profile="dist":
+  ./scripts/measure-binary-size.sh {{profile}} full
+
+# Build the lean dd_server artifact and write a size report.
+server-lean profile="dist":
+  ./scripts/measure-binary-size.sh {{profile}} lean
+
+# Build dd_server with the selected distribution profile, variant, and size report.
+size-report profile="dist" variant="full":
+  ./scripts/measure-binary-size.sh {{profile}} {{variant}}
+
+# Build full and lean dd_server artifacts with comparable size reports.
+size-report-all profile="dist":
+  ./scripts/measure-binary-size.sh {{profile}} full
+  ./scripts/measure-binary-size.sh {{profile}} lean
 
 # Syntax-check source-only JS integration package.
 check-js:

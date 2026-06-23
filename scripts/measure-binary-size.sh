@@ -2,26 +2,52 @@
 set -euo pipefail
 
 profile="${1:-dist}"
+variant="${2:-full}"
 package="dd_server"
 binary_name="dd_server"
+
+case "$variant" in
+  full)
+    feature_args=(--no-default-features --features http3,websocket,otel)
+    ;;
+  lean)
+    feature_args=(--no-default-features)
+    ;;
+  *)
+    echo "usage: $0 [profile] [full|lean]" >&2
+    exit 1
+    ;;
+esac
+
+case "$profile" in
+  dev)
+    target_profile_dir="debug"
+    ;;
+  *)
+    target_profile_dir="$profile"
+    ;;
+esac
 
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
 git_sha="$(git rev-parse HEAD)"
-report_dir="target/size-report/$git_sha/$profile"
+report_dir="target/size-report/$git_sha/$profile/$variant"
 mkdir -p "$report_dir"
 
-cargo build --locked --profile "$profile" -p "$package"
+cargo build --locked --profile "$profile" -p "$package" "${feature_args[@]}"
 
-binary="target/$profile/$binary_name"
+binary="target/$target_profile_dir/$binary_name"
 if [ ! -f "$binary" ]; then
   echo "built binary not found: $binary" >&2
   exit 1
 fi
 
-copy="$report_dir/$binary_name"
-cp "$binary" "$copy"
+artifact="target/$target_profile_dir/$binary_name-$variant"
+cp "$binary" "$artifact"
+
+copy="$report_dir/$binary_name-$variant"
+cp "$artifact" "$copy"
 unstripped_bytes="$(stat -c %s "$copy")"
 
 if command -v llvm-strip >/dev/null 2>&1; then
@@ -37,9 +63,11 @@ sha256="$(sha256sum "$copy" | awk '{print $1}')"
   printf '{\n'
   printf '  "git_sha": "%s",\n' "$git_sha"
   printf '  "profile": "%s",\n' "$profile"
+  printf '  "variant": "%s",\n' "$variant"
+  printf '  "features": "%s",\n' "${feature_args[*]}"
   printf '  "target": "%s",\n' "$(rustc -Vv | awk -F': ' '/^host:/ {print $2}')"
   printf '  "rustc": "%s",\n' "$(rustc -V)"
-  printf '  "binary": "%s",\n' "$binary"
+  printf '  "binary": "%s",\n' "$artifact"
   printf '  "strip_tool": "%s",\n' "$strip_tool"
   printf '  "unstripped_bytes": %s,\n' "$unstripped_bytes"
   printf '  "stripped_bytes": %s,\n' "$stripped_bytes"
@@ -51,9 +79,11 @@ sha256="$(sha256sum "$copy" | awk '{print $1}')"
   printf '# Binary Size Report\n\n'
   printf -- '- Git SHA: `%s`\n' "$git_sha"
   printf -- '- Profile: `%s`\n' "$profile"
+  printf -- '- Variant: `%s`\n' "$variant"
+  printf -- '- Feature args: `%s`\n' "${feature_args[*]}"
   printf -- '- Target: `%s`\n' "$(rustc -Vv | awk -F': ' '/^host:/ {print $2}')"
   printf -- '- Rustc: `%s`\n' "$(rustc -V)"
-  printf -- '- Binary: `%s`\n' "$binary"
+  printf -- '- Binary: `%s`\n' "$artifact"
   printf -- '- Strip tool: `%s`\n' "$strip_tool"
   printf -- '- Unstripped bytes: `%s`\n' "$unstripped_bytes"
   printf -- '- Stripped bytes: `%s`\n' "$stripped_bytes"
@@ -84,8 +114,8 @@ run_optional() {
 }
 
 if command -v cargo-bloat >/dev/null 2>&1; then
-  run_optional cargo-bloat-crates cargo bloat --profile "$profile" -p "$package" --crates
-  run_optional cargo-bloat-symbols cargo bloat --profile "$profile" -p "$package" -n 100
+  run_optional cargo-bloat-crates cargo bloat --profile "$profile" -p "$package" "${feature_args[@]}" --crates
+  run_optional cargo-bloat-symbols cargo bloat --profile "$profile" -p "$package" "${feature_args[@]}" -n 100
 else
   printf 'cargo-bloat not installed\n' > "$report_dir/cargo-bloat-crates.txt"
   printf 'cargo-bloat not installed\n' > "$report_dir/cargo-bloat-symbols.txt"
@@ -99,12 +129,12 @@ else
   printf 'bloaty not installed\n' > "$report_dir/bloaty-symbols.txt"
 fi
 
-run_optional cargo-tree-duplicates cargo tree -p "$package" -d
-run_optional cargo-tree-features cargo tree -p "$package" -e features
+run_optional cargo-tree-duplicates cargo tree -p "$package" "${feature_args[@]}" -d
+run_optional cargo-tree-features cargo tree -p "$package" "${feature_args[@]}" -e features
 
-for crate in ring aws-lc-rs openssl boring quinn tonic tonic@0.12.3 tonic@0.14.5 prost@0.13.5 prost@0.14.3 opentelemetry opentelemetry-otlp native-tls hyper-tls reqwest; do
+for crate in ring aws-lc-rs openssl boring quinn tonic tonic@0.12.3 tonic@0.14.5 prost@0.13.5 prost@0.14.3 opentelemetry@0.27.1 opentelemetry@0.31.0 opentelemetry-otlp@0.27.0 native-tls hyper-tls reqwest; do
   safe_name="${crate//[^A-Za-z0-9_]/_}"
-  run_optional "cargo-tree-inverse-$safe_name" cargo tree -p "$package" -i "$crate"
+  run_optional "cargo-tree-inverse-$safe_name" cargo tree -p "$package" "${feature_args[@]}" -i "$crate"
 done
 
-printf 'Wrote %s\n' "$report_dir"
+printf 'Wrote %s and %s\n' "$report_dir" "$artifact"

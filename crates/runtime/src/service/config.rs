@@ -4,6 +4,7 @@ use common::{DeployBinding, DeployConfig, PlatformError, Result};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+#[derive(Clone, Debug)]
 pub(super) struct DeployBindings {
     pub(super) kv: Vec<String>,
     pub(super) memory: Vec<String>,
@@ -315,6 +316,26 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
     if config.max_queue_wait.is_zero() {
         return Err(PlatformError::internal(
             "max_queue_wait must be greater than 0",
+        ));
+    }
+    if config.request_wall_timeout.is_zero() {
+        return Err(PlatformError::internal(
+            "request_wall_timeout must be greater than 0",
+        ));
+    }
+    if config.max_request_body_bytes == 0 {
+        return Err(PlatformError::internal(
+            "max_request_body_bytes must be greater than 0",
+        ));
+    }
+    if config.max_response_body_bytes == 0 {
+        return Err(PlatformError::internal(
+            "max_response_body_bytes must be greater than 0",
+        ));
+    }
+    if config.isolate_startup_timeout.is_zero() {
+        return Err(PlatformError::internal(
+            "isolate_startup_timeout must be greater than 0",
         ));
     }
     if config.min_isolates > config.max_isolates {

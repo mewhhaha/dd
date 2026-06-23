@@ -4,20 +4,21 @@ use super::*;
 impl WorkerManager {
     pub(crate) async fn deploy(
         &mut self,
-        worker_name: String,
-        source: String,
-        config: DeployConfig,
-        assets: Vec<DeployAsset>,
-        asset_headers: Option<String>,
+        prepared: PreparedWorkerDeployment,
         persist: bool,
         temporary: bool,
         expires_at_ms: Option<i64>,
         enforce_temporary_transition: bool,
     ) -> Result<String> {
-        let worker_name = worker_name.trim().to_string();
-        if worker_name.is_empty() {
-            return Err(PlatformError::bad_request("Worker name must not be empty"));
-        }
+        let PreparedWorkerDeployment {
+            worker_name,
+            source,
+            config,
+            assets,
+            asset_headers,
+            compiled_assets,
+            bindings,
+        } = prepared;
         if temporary
             && enforce_temporary_transition
             && self.current_worker_is_permanent(&worker_name)
@@ -31,39 +32,28 @@ impl WorkerManager {
         } else {
             None
         };
-        let bindings = extract_bindings(&config)?;
-        let compiled_assets = compile_asset_bundle(&assets, asset_headers.as_deref())?;
-        self.validate_worker_cached(&source).await?;
+        self.validate_worker_cached(&crate::ops::WorkerSource::inline(source.clone()))
+            .await?;
         // Keep deployed workers on the bootstrap snapshot. Distinct user-code snapshots
         // can abort V8 when multiple complex workers are instantiated in one process.
         let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
         let generation = self.next_generation;
         self.next_generation += 1;
         let deployment_id = Uuid::new_v4().to_string();
-        let worker_name_json = Arc::<str>::from(
-            crate::json::to_string(&worker_name)
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
-        let kv_bindings_json = Arc::<str>::from(
-            crate::json::to_string(&bindings.kv)
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
-        let memory_bindings_json = Arc::<str>::from(
-            crate::json::to_string(&bindings.memory)
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
-        let dynamic_bindings_json = Arc::<str>::from(
-            crate::json::to_string(&bindings.dynamic)
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
-        let dynamic_rpc_bindings_json = Arc::<str>::from(
-            crate::json::to_string(&Vec::<String>::new())
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
-        let dynamic_env_json = Arc::<str>::from(
-            crate::json::to_string(&Vec::<(String, String)>::new())
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
+        let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
+            worker_name: worker_name.clone(),
+            kv_bindings: bindings.kv.clone(),
+            kv_read_cache_config: crate::ops::WorkerKvReadCacheConfigPayload {
+                max_entries: self.config.kv_read_cache_max_entries,
+                max_bytes: self.config.kv_read_cache_max_bytes,
+                hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
+                miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
+            },
+            memory_bindings: bindings.memory.clone(),
+            dynamic_bindings: bindings.dynamic.clone(),
+            dynamic_rpc_bindings: Vec::new(),
+            dynamic_env: Vec::new(),
+        });
         let request_context = RequestExecutionContext::new(
             worker_name.clone(),
             generation,
@@ -74,15 +64,6 @@ impl WorkerManager {
             true,
             None,
             None,
-        );
-        let kv_read_cache_config_json = Arc::<str>::from(
-            crate::json::to_string(&KvReadCacheConfigPayload {
-                max_entries: self.config.kv_read_cache_max_entries,
-                max_bytes: self.config.kv_read_cache_max_bytes,
-                hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
-                miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
-            })
-            .map_err(|error| PlatformError::internal(error.to_string()))?,
         );
         if persist {
             persist_worker_deployment(
@@ -97,10 +78,13 @@ impl WorkerManager {
             )
             .await?;
         }
+        let asset_catalog_entry = AssetCatalogEntry {
+            assets: compiled_assets.clone(),
+            public: config.public,
+        };
         let pool =
             WorkerPool {
                 worker_name: worker_name.clone(),
-                worker_name_json,
                 generation,
                 deployment_id: deployment_id.clone(),
                 internal_trace: config.internal.trace.as_ref().map(|trace| {
@@ -113,22 +97,18 @@ impl WorkerManager {
                 expires_at_ms,
                 snapshot,
                 snapshot_preloaded,
-                source: Arc::<str>::from(source.clone()),
-                kv_bindings_json,
-                kv_read_cache_config_json,
+                source: crate::ops::WorkerSource::inline(source.clone()),
                 memory_bindings: bindings.memory,
-                memory_bindings_json,
-                dynamic_bindings_json,
                 dynamic_rpc_bindings: Vec::new(),
-                dynamic_rpc_bindings_json,
-                dynamic_env_json,
+                deployment_config,
                 request_context,
                 dynamic_child_policy: None,
                 dynamic_quota_state: None,
-                assets: compiled_assets,
                 strict_request_isolation: false,
-                queue: VecDeque::new(),
+                memory_entity_leases: HashMap::new(),
+                queue: PendingInvokeQueue::new(),
                 isolates: Vec::new(),
+                isolate_indices: HashMap::new(),
                 stats: PoolStats::default(),
                 queue_warn_level: 0,
             };
@@ -142,6 +122,8 @@ impl WorkerManager {
             });
         entry.current_generation = generation;
         entry.pools.insert(generation, pool);
+        self.asset_catalog
+            .insert(worker_name.clone(), asset_catalog_entry);
         self.cleanup_drained_generations_for(&worker_name);
         info!(
             worker = %worker_name,
@@ -212,7 +194,7 @@ impl WorkerManager {
         dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     ) -> Result<DynamicDeployResult> {
         self.deploy_dynamic_internal(
-            source,
+            crate::ops::WorkerSource::inline(source),
             env,
             Vec::new(),
             full_dynamic_internal_policy(egress_allow_hosts),
@@ -224,7 +206,7 @@ impl WorkerManager {
 
     pub(crate) async fn deploy_dynamic_internal(
         &mut self,
-        source: String,
+        source: crate::ops::WorkerSource,
         env: HashMap<String, String>,
         bindings: Vec<DeployBinding>,
         policy: ValidatedDynamicWorkerPolicy,
@@ -259,10 +241,6 @@ impl WorkerManager {
             .iter()
             .map(|binding| binding.binding.clone())
             .collect::<Vec<_>>();
-        let dynamic_rpc_bindings_json = Arc::<str>::from(
-            crate::json::to_string(&dynamic_rpc_binding_names)
-                .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
         let dynamic_quota_state = Arc::new(DynamicQuotaState::default());
         let request_context = RequestExecutionContext::new(
             worker_name.clone(),
@@ -276,22 +254,23 @@ impl WorkerManager {
             Some(Arc::clone(&dynamic_quota_state)),
         );
         let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
-        let kv_read_cache_config_json = Arc::<str>::from(
-            crate::json::to_string(&KvReadCacheConfigPayload {
+        let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
+            worker_name: worker_name.clone(),
+            kv_bindings: dynamic_config.bindings.kv.clone(),
+            kv_read_cache_config: crate::ops::WorkerKvReadCacheConfigPayload {
                 max_entries: self.config.kv_read_cache_max_entries,
                 max_bytes: self.config.kv_read_cache_max_bytes,
                 hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
                 miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
-            })
-            .map_err(|error| PlatformError::internal(error.to_string()))?,
-        );
+            },
+            memory_bindings: dynamic_config.bindings.memory.clone(),
+            dynamic_bindings: dynamic_config.bindings.dynamic.clone(),
+            dynamic_rpc_bindings: dynamic_rpc_binding_names,
+            dynamic_env: dynamic_config.dynamic_env.clone(),
+        });
 
         let pool = WorkerPool {
             worker_name: worker_name.clone(),
-            worker_name_json: Arc::<str>::from(
-                crate::json::to_string(&worker_name)
-                    .map_err(|error| PlatformError::internal(error.to_string()))?,
-            ),
             generation,
             deployment_id: deployment_id.clone(),
             internal_trace: None,
@@ -299,34 +278,18 @@ impl WorkerManager {
             expires_at_ms: None,
             snapshot,
             snapshot_preloaded,
-            source: Arc::<str>::from(source),
-            kv_bindings_json: Arc::<str>::from(
-                crate::json::to_string(&dynamic_config.bindings.kv)
-                    .map_err(|error| PlatformError::internal(error.to_string()))?,
-            ),
-            kv_read_cache_config_json,
+            source,
             memory_bindings: dynamic_config.bindings.memory.clone(),
-            memory_bindings_json: Arc::<str>::from(
-                crate::json::to_string(&dynamic_config.bindings.memory)
-                    .map_err(|error| PlatformError::internal(error.to_string()))?,
-            ),
-            dynamic_bindings_json: Arc::<str>::from(
-                crate::json::to_string(&dynamic_config.bindings.dynamic)
-                    .map_err(|error| PlatformError::internal(error.to_string()))?,
-            ),
             dynamic_rpc_bindings: dynamic_config.dynamic_rpc_bindings.clone(),
-            dynamic_rpc_bindings_json,
-            dynamic_env_json: Arc::<str>::from(
-                crate::json::to_string(&dynamic_config.dynamic_env)
-                    .map_err(|error| PlatformError::internal(error.to_string()))?,
-            ),
+            deployment_config,
             request_context,
             dynamic_child_policy: Some(dynamic_config.policy.clone()),
             dynamic_quota_state: Some(dynamic_quota_state),
-            assets: AssetBundle::default(),
             strict_request_isolation: false,
-            queue: VecDeque::new(),
+            memory_entity_leases: HashMap::new(),
+            queue: PendingInvokeQueue::new(),
             isolates: Vec::new(),
+            isolate_indices: HashMap::new(),
             stats: PoolStats::default(),
             queue_warn_level: 0,
         };
@@ -363,11 +326,39 @@ impl WorkerManager {
         error: PlatformError,
     ) {
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
-        for (request_id, reply) in failed {
+        for (request_id, reply) in failed.replies {
             self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
         }
+        if failed.was_starting {
+            self.reject_queued_dynamic_invokes_for_generation(
+                worker_name,
+                generation,
+                error.clone(),
+            );
+        }
         self.fail_all_streams_for_worker(worker_name, error);
+    }
+
+    pub(crate) fn mark_isolate_ready(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) {
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return;
+        };
+        let Some(isolate) = pool
+            .isolates
+            .iter_mut()
+            .find(|isolate| isolate.id == isolate_id)
+        else {
+            return;
+        };
+        isolate.startup = IsolateStartup::Ready;
+        isolate.last_used_at = Instant::now();
+        pool.log_stats("ready");
     }
 
     pub(crate) fn finish_wait_until(
@@ -428,31 +419,75 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) fn handle_response_chunk(
+    pub(crate) async fn handle_response_chunk(
         &mut self,
         worker_name: &str,
         request_id: &str,
         completion_token: &str,
-        chunk: Vec<u8>,
+        chunk: Bytes,
+        event_tx: &RuntimeEventSender,
+        reply: oneshot::Sender<Result<()>>,
     ) {
-        let Some(registration) = self.stream_registrations.get(request_id) else {
-            return;
+        let send = {
+            let Some(registration) = self.stream_registrations.get_mut(request_id) else {
+                let _ = reply.send(Err(PlatformError::internal(
+                    "stream registration is unavailable",
+                )));
+                return;
+            };
+            if registration.worker_name != worker_name {
+                let _ = reply.send(Err(PlatformError::internal(
+                    "stream registration worker mismatch",
+                )));
+                return;
+            }
+            if registration.completion_token.as_deref() != Some(completion_token) {
+                let _ = reply.send(Err(PlatformError::internal(
+                    "stream registration completion token mismatch",
+                )));
+                return;
+            }
+            let next_bytes = registration.bytes_sent.saturating_add(chunk.len());
+            if next_bytes > registration.max_bytes {
+                Err(PlatformError::runtime(format!(
+                    "response body exceeded max_response_body_bytes ({} bytes)",
+                    registration.max_bytes
+                )))
+            } else {
+                registration.bytes_sent = next_bytes;
+                Ok(registration.body_sender.clone())
+            }
         };
-        if registration.worker_name != worker_name {
-            return;
+
+        let sender = match send {
+            Ok(sender) => sender,
+            Err(error) => {
+                self.fail_stream_registration(worker_name, request_id, error.clone());
+                self.cancel_invoke(worker_name.to_string(), request_id.to_string(), event_tx);
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+
+        match sender.send(Ok(chunk)).await {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+            }
+            Err(_) => {
+                let error = PlatformError::internal("stream response receiver closed");
+                self.fail_stream_registration(worker_name, request_id, error.clone());
+                self.cancel_invoke(worker_name.to_string(), request_id.to_string(), event_tx);
+                let _ = reply.send(Err(error));
+            }
         }
-        if registration.completion_token.as_deref() != Some(completion_token) {
-            return;
-        }
-        let _ = registration.body_sender.send(Ok(chunk));
     }
 
     pub(crate) fn schedule_cache_revalidate(
         &mut self,
         worker_name: &str,
         generation: u64,
-        payload: String,
-        event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
+        request: CacheRevalidatePayload,
+        event_tx: &RuntimeEventSender,
     ) {
         let Some(entry) = self.workers.get(worker_name) else {
             return;
@@ -461,18 +496,17 @@ impl WorkerManager {
             return;
         }
 
-        let request = match decode_cache_revalidate_payload(payload) {
-            Ok(request) => request,
-            Err(error) => {
-                warn!(
-                    worker = %worker_name,
-                    generation,
-                    error = %error,
-                    "ignoring invalid cache revalidate payload"
-                );
-                return;
-            }
-        };
+        if request.cache_name.trim().is_empty()
+            || request.method.trim().is_empty()
+            || request.url.trim().is_empty()
+        {
+            warn!(
+                worker = %worker_name,
+                generation,
+                "ignoring invalid cache revalidate payload"
+            );
+            return;
+        }
 
         let method = request.method.trim().to_ascii_uppercase();
         if method != "GET" {
@@ -549,6 +583,7 @@ impl WorkerManager {
                 queued_bytes,
             });
             pool.update_queue_warning(&warn_thresholds);
+            self.account_queued_pending(queued_bytes);
             self.revalidation_requests.insert(runtime_request_id, key);
             self.dispatch_pool(worker_name, generation, event_tx);
             tracing::info!("scheduled background cache revalidation");
@@ -581,10 +616,10 @@ impl WorkerManager {
             let _ = ready.send(Err(error));
             return;
         }
-        let _ = registration.body_sender.send(Err(error));
+        let _ = registration.body_sender.try_send(Err(error));
     }
 
-    pub(crate) fn complete_stream_registration(
+    pub(crate) async fn complete_stream_registration(
         &mut self,
         worker_name: &str,
         request_id: &str,
@@ -626,7 +661,21 @@ impl WorkerManager {
                         }
                     }
                     if !output_body.is_empty() {
-                        let _ = registration.body_sender.send(Ok(output_body));
+                        let next_bytes = registration.bytes_sent.saturating_add(output_body.len());
+                        if next_bytes > registration.max_bytes {
+                            let _ = registration
+                                .body_sender
+                                .send(Err(PlatformError::runtime(format!(
+                                    "response body exceeded max_response_body_bytes ({} bytes)",
+                                    registration.max_bytes
+                                ))))
+                                .await;
+                        } else {
+                            let _ = registration
+                                .body_sender
+                                .send(Ok(Bytes::from(output_body)))
+                                .await;
+                        }
                     }
                 }
             }
@@ -634,7 +683,7 @@ impl WorkerManager {
                 if let Some(ready) = registration.ready.take() {
                     let _ = ready.send(Err(error));
                 } else {
-                    let _ = registration.body_sender.send(Err(error));
+                    let _ = registration.body_sender.send(Err(error)).await;
                 }
             }
         }
@@ -665,12 +714,17 @@ impl WorkerManager {
         worker_name: &str,
         error: PlatformError,
     ) {
+        self.asset_catalog.remove(worker_name);
         let mut clear_request_ids = Vec::new();
         self.reap_owned_sessions(worker_name, None, None);
         if let Some(mut entry) = self.workers.remove(worker_name) {
-            for (_, pool) in entry.pools.drain() {
+            for (_, mut pool) in entry.pools.drain() {
+                self.account_removed_pool_queue(&pool);
+                while let Some(pending) = pool.queue.pop_front() {
+                    self.reject_pending_invoke(worker_name, pending, error.clone());
+                }
                 for isolate in pool.isolates {
-                    let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                    let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending.reply.send(Err(error.clone()));
@@ -699,19 +753,32 @@ impl WorkerManager {
         worker_name: &str,
         generation: u64,
         isolate_idx: usize,
-    ) -> Vec<(String, oneshot::Sender<Result<WorkerOutput>>)> {
+    ) -> RemovedIsolate {
         let mut websocket_open_session_ids = Vec::new();
         let mut transport_open_session_ids = Vec::new();
         let mut replies = Vec::new();
+        let mut was_starting = false;
         let mut removed_isolate_id = None;
+        let mut stale_targeted_pending = Vec::new();
+        let mut stale_targeted_count = 0usize;
+        let mut stale_targeted_bytes = 0usize;
         let mut removed = false;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-            if isolate_idx < pool.isolates.len() {
-                let isolate = pool.isolates.swap_remove(isolate_idx);
-                let _ = isolate.sender.send(IsolateCommand::Shutdown);
+            if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
+                was_starting = isolate.startup.is_starting();
+                let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                 removed_isolate_id = Some(isolate.id);
+                stale_targeted_pending = pool.queue.drain_target_isolate_id(isolate.id);
+                stale_targeted_count = stale_targeted_pending.len();
+                stale_targeted_bytes = stale_targeted_pending
+                    .iter()
+                    .map(|pending| pending.queued_bytes)
+                    .sum::<usize>();
                 replies = Vec::with_capacity(isolate.pending_replies.len());
                 for (request_id, pending) in isolate.pending_replies {
+                    if let Some(active_memory_lease) = pending.active_memory_lease.as_ref() {
+                        pool.release_memory_entity_lease(active_memory_lease);
+                    }
                     match &pending.kind {
                         PendingReplyKind::WebsocketOpen { session_id } => {
                             websocket_open_session_ids.push(session_id.clone());
@@ -721,7 +788,6 @@ impl WorkerManager {
                         }
                         PendingReplyKind::Normal
                         | PendingReplyKind::Stream
-                        | PendingReplyKind::DynamicInvoke { .. }
                         | PendingReplyKind::DynamicFetch { .. }
                         | PendingReplyKind::WebsocketFrame { .. } => {}
                     }
@@ -732,6 +798,14 @@ impl WorkerManager {
         }
         if let Some(isolate_id) = removed_isolate_id {
             self.reap_owned_sessions(worker_name, Some(generation), Some(isolate_id));
+        }
+        self.account_dequeued_many(stale_targeted_count, stale_targeted_bytes);
+        for pending in stale_targeted_pending {
+            self.reject_pending_invoke(
+                worker_name,
+                pending,
+                PlatformError::runtime("target isolate is unavailable"),
+            );
         }
         for session_id in websocket_open_session_ids {
             if let Some(waiter) = self.websocket_open_waiters.remove(&session_id) {
@@ -745,9 +819,12 @@ impl WorkerManager {
             self.transport_open_channels.remove(&session_id);
         }
         if removed {
-            replies
+            RemovedIsolate {
+                replies,
+                was_starting,
+            }
         } else {
-            Vec::new()
+            RemovedIsolate::default()
         }
     }
 
@@ -756,20 +833,43 @@ impl WorkerManager {
         worker_name: &str,
         generation: u64,
         isolate_id: u64,
-    ) -> Vec<(String, oneshot::Sender<Result<WorkerOutput>>)> {
+    ) -> RemovedIsolate {
         let isolate_idx = self
             .workers
             .get(worker_name)
             .and_then(|entry| entry.pools.get(&generation))
-            .and_then(|pool| {
-                pool.isolates
-                    .iter()
-                    .position(|isolate| isolate.id == isolate_id)
-            });
+            .and_then(|pool| pool.isolate_idx(isolate_id));
         if let Some(idx) = isolate_idx {
             return self.remove_isolate(worker_name, generation, idx);
         }
-        Vec::new()
+        RemovedIsolate::default()
+    }
+
+    pub(crate) fn reject_queued_dynamic_invokes_for_generation(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        error: PlatformError,
+    ) {
+        let mut rejected = Vec::new();
+        let mut rejected_count = 0usize;
+        let mut rejected_bytes = 0usize;
+        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
+            for pending in pool.queue.drain_matching(|pending| {
+                matches!(pending.reply_kind, PendingReplyKind::DynamicFetch { .. })
+            }) {
+                rejected_count = rejected_count.saturating_add(1);
+                rejected_bytes = rejected_bytes.saturating_add(pending.queued_bytes);
+                rejected.push(pending);
+            }
+        }
+        if rejected.is_empty() {
+            return;
+        }
+        self.account_dequeued_many(rejected_count, rejected_bytes);
+        for pending in rejected {
+            self.reject_pending_invoke(worker_name, pending, error.clone());
+        }
     }
 
     pub(crate) fn scale_down_idle(&mut self) {
@@ -811,7 +911,9 @@ impl WorkerManager {
                 let Some((idx, _)) = candidate else {
                     break;
                 };
-                let isolate = pool.isolates.swap_remove(idx);
+                let isolate = pool
+                    .swap_remove_isolate(idx)
+                    .expect("selected isolate index must be present");
                 pool.stats.scale_down_count += 1;
                 removed.push(isolate);
             }
@@ -822,7 +924,7 @@ impl WorkerManager {
         }
 
         for isolate in removed {
-            let _ = isolate.sender.send(IsolateCommand::Shutdown);
+            let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
             for (request_id, pending) in isolate.pending_replies {
                 self.clear_revalidation_for_request(&request_id);
                 let _ = pending
@@ -875,9 +977,10 @@ impl WorkerManager {
                 .get_mut(worker_name)
                 .and_then(|entry| entry.pools.remove(&generation))
             {
+                self.account_removed_pool_queue(&pool);
                 retired_generations.insert(generation);
                 for isolate in pool.isolates {
-                    let _ = isolate.sender.send(IsolateCommand::Shutdown);
+                    let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending
@@ -969,12 +1072,7 @@ impl WorkerManager {
             .collect::<Vec<_>>();
         providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
 
-        DynamicRuntimeDebugDump {
-            handles,
-            providers,
-            snapshot_cache_entries: self.dynamic_worker_snapshots.len(),
-            snapshot_cache_failures: self.dynamic_worker_snapshot_failures.len(),
-        }
+        DynamicRuntimeDebugDump { handles, providers }
     }
 
     pub(crate) fn log_dynamic_timeout_diagnostic(&self, diagnostic: DynamicTimeoutDiagnostic) {
