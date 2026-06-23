@@ -15,7 +15,7 @@ mod storage;
 use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
-    abort_worker_request, build_bootstrap_snapshot, cache_runtime_entrypoints,
+    abort_worker_request_handle, build_bootstrap_snapshot, cache_runtime_entrypoints,
     dispatch_worker_request, drain_dynamic_control_queue, ensure_v8_flags,
     install_worker_deployment_config, new_runtime_from_snapshot,
     new_runtime_from_snapshot_with_heap_limit, pump_event_loop_once, validate_worker,
@@ -113,6 +113,8 @@ impl AssetCatalog {
 
 #[derive(Clone, Debug)]
 struct AssetCatalogEntry {
+    worker_name: String,
+    generation: u64,
     assets: Arc<AssetBundle>,
     public: bool,
 }

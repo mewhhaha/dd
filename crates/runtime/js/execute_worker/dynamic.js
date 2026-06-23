@@ -28,6 +28,7 @@
     metrics,
     metricPrefix,
     estimateEntryBytes,
+    onRemove,
   }) => {
     const entries = new Map();
     let totalBytes = 0;
@@ -45,6 +46,10 @@
       }
       entries.delete(key);
       totalBytes = Math.max(0, totalBytes - entry.bytes);
+      try {
+        onRemove?.(entry.value, key);
+      } catch {
+      }
       return true;
     };
     const evictOldest = () => {
@@ -100,6 +105,12 @@
         return removed;
       },
       clear() {
+        for (const entry of entries.values()) {
+          try {
+            onRemove?.(entry.value, "");
+          } catch {
+          }
+        }
         entries.clear();
         totalBytes = 0;
         publish();
@@ -841,6 +852,12 @@
           estimateDynamicStringBytes(key)
           + estimateDynamicWorkerSourceBytes(source)
         ),
+        onRemove: (source) => {
+          const graphId = String(source?.module_graph_id ?? "").trim();
+          if (graphId) {
+            Deno.core.ops.op_dynamic_module_graph_release(graphId);
+          }
+        },
       }),
       enumerable: false,
       configurable: false,
@@ -1436,6 +1453,11 @@
         }
       }
       inflightRequests.delete(requestId);
+      if (requestContextHandle > 0) {
+        globalThis.__dd_inflight_requests_by_context_handle?.delete(
+          requestContextHandle,
+        );
+      }
     }
   })())
     .then(async (result) => {
@@ -1585,9 +1607,16 @@ globalThis.__dd_drain_dynamic_control_queue_handle = () => {
   void Promise.resolve(drain()).catch(() => undefined);
 };
 
-globalThis.__dd_abort_worker_request = (requestId) => {
-  const inflightRequests = globalThis.__dd_inflight_requests;
-  const inflight = inflightRequests?.get(String(requestId));
+globalThis.__dd_abort_worker_request_handle = (requestContextHandle) => {
+  const handle = Math.max(0, Math.trunc(Number(requestContextHandle ?? 0) || 0));
+  if (handle === 0) {
+    return false;
+  }
+  const inflightRequests = globalThis.__dd_inflight_requests_by_context_handle;
+  const inflight = inflightRequests?.get(handle);
+  if (!inflight) {
+    return false;
+  }
   if (inflight?.requestBodyStreamHandle > 0) {
     try {
       Deno.core.ops.op_request_body_cancel(inflight.requestBodyStreamHandle);
@@ -1609,4 +1638,5 @@ globalThis.__dd_abort_worker_request = (requestId) => {
   if (inflight?.controller) {
     inflight.controller.abort(new Error("Request aborted by caller"));
   }
+  return true;
 };

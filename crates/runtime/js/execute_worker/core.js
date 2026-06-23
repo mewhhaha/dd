@@ -38,6 +38,8 @@ globalThis.__dd_execute_worker = (payload) => {
   }
 
   const inflightRequests = globalThis.__dd_inflight_requests ??= new Map();
+  const inflightRequestsByContextHandle =
+    globalThis.__dd_inflight_requests_by_context_handle ??= new Map();
   const hostRpcTargets = globalThis.__dd_host_rpc_targets ??= new Map();
   const RpcTarget = globalThis.RpcTarget ?? class RpcTarget {};
   if (globalThis.RpcTarget !== RpcTarget) {
@@ -121,12 +123,16 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   }
 
-  inflightRequests.set(requestId, {
+  const inflightRequest = {
     controller,
     requestContextHandle,
     memoryRequestScopeHandle,
     requestBodyStreamHandle,
-  });
+  };
+  inflightRequests.set(requestId, inflightRequest);
+  if (requestContextHandle > 0) {
+    inflightRequestsByContextHandle.set(requestContextHandle, inflightRequest);
+  }
 
   const callOp = (name, ...args) => {
     const op = Deno?.core?.ops?.[name];

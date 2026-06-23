@@ -259,6 +259,7 @@ pub struct DynamicDeployResult {
 
 pub struct PublicRouteAssetResolution {
     pub public_worker: bool,
+    pub generation: Option<u64>,
     pub asset: Option<AssetResponse>,
 }
 
@@ -1005,7 +1006,7 @@ impl RuntimeService {
     pub fn worker_is_public(&self, worker_name: &str) -> bool {
         self.asset_catalog
             .get(worker_name)
-            .is_some_and(|entry| entry.public)
+            .is_some_and(|entry| entry.worker_name == worker_name && entry.public)
     }
 
     pub fn resolve_asset(
@@ -1041,17 +1042,27 @@ impl RuntimeService {
         let Some(entry) = self.asset_catalog.get(worker_name) else {
             return Ok(PublicRouteAssetResolution {
                 public_worker: false,
+                generation: None,
                 asset: None,
             });
         };
+        if entry.worker_name != worker_name {
+            return Ok(PublicRouteAssetResolution {
+                public_worker: false,
+                generation: None,
+                asset: None,
+            });
+        }
         if !entry.public {
             return Ok(PublicRouteAssetResolution {
                 public_worker: false,
+                generation: Some(entry.generation),
                 asset: None,
             });
         }
         Ok(PublicRouteAssetResolution {
             public_worker: true,
+            generation: Some(entry.generation),
             asset: resolve_asset(
                 &entry.assets,
                 AssetRequest {
@@ -1076,6 +1087,9 @@ impl RuntimeService {
         let Some(entry) = self.asset_catalog.get(worker_name) else {
             return Ok(None);
         };
+        if entry.worker_name != worker_name {
+            return Ok(None);
+        }
         if public_only && !entry.public {
             return Ok(None);
         }

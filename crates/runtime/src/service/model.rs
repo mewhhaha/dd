@@ -75,6 +75,7 @@ pub(super) struct DynamicWorkerHandle {
     pub(super) binding: String,
     pub(super) worker_name: String,
     pub(super) worker_generation: u64,
+    pub(super) module_graph_id: Option<String>,
     pub(super) timeout: u64,
     pub(super) policy: ValidatedDynamicWorkerPolicy,
     pub(super) host_rpc_provider_ids: Vec<String>,
@@ -817,6 +818,8 @@ pub(super) struct IsolateHandle {
 pub(super) enum IsolateStartup {
     Starting { started_at: Instant },
     Ready,
+    Retiring,
+    Failed,
 }
 
 impl IsolateStartup {
@@ -831,7 +834,7 @@ impl IsolateStartup {
     pub(super) fn timed_out(&self, now: Instant, timeout: Duration) -> bool {
         match self {
             Self::Starting { started_at } => now.duration_since(*started_at) >= timeout,
-            Self::Ready => false,
+            Self::Ready | Self::Retiring | Self::Failed => false,
         }
     }
 }

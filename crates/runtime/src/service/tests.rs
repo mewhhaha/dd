@@ -386,6 +386,90 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn overlapping_requests_keep_independent_request_context_handles() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 2,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "overlap-context".to_string(),
+            r#"
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const label = url.searchParams.get("label");
+    const before = {
+      id: globalThis.__dd_get_runtime_request_id?.(),
+      handle: globalThis.__dd_get_runtime_request_context_handle?.(),
+    };
+    await ctx.sleep(Number(url.searchParams.get("delay") ?? "0"));
+    const after = {
+      id: globalThis.__dd_get_runtime_request_id?.(),
+      handle: globalThis.__dd_get_runtime_request_context_handle?.(),
+    };
+    return Response.json({ label, before, after });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let slow = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .invoke(
+                    "overlap-context".to_string(),
+                    test_invocation_with_path("/?label=slow&delay=50", "overlap-slow"),
+                )
+                .await
+        })
+    };
+    let fast = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .invoke(
+                    "overlap-context".to_string(),
+                    test_invocation_with_path("/?label=fast&delay=1", "overlap-fast"),
+                )
+                .await
+        })
+    };
+
+    let slow = slow
+        .await
+        .expect("slow task should join")
+        .expect("slow request should succeed");
+    let fast = fast
+        .await
+        .expect("fast task should join")
+        .expect("fast request should succeed");
+    let slow: Value = serde_json::from_slice(&slow.body).expect("slow response should be json");
+    let fast: Value = serde_json::from_slice(&fast.body).expect("fast response should be json");
+
+    assert_eq!(slow["label"], "slow");
+    assert_eq!(fast["label"], "fast");
+    assert_eq!(slow["before"]["id"], slow["after"]["id"]);
+    assert_eq!(fast["before"]["id"], fast["after"]["id"]);
+    assert_eq!(slow["before"]["handle"], slow["after"]["handle"]);
+    assert_eq!(fast["before"]["handle"], fast["after"]["handle"]);
+    assert_ne!(slow["before"]["id"], fast["before"]["id"]);
+    assert_ne!(slow["before"]["handle"], fast["before"]["handle"]);
+}
+
+#[tokio::test]
+#[serial]
 async fn worker_queue_rejects_when_per_worker_limit_is_full() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
@@ -3322,6 +3406,67 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn invoke_stream_propagates_response_body_error() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "error-stream".to_string(),
+            r#"
+export default {
+  async fetch() {
+    let count = 0;
+    return new Response(new ReadableStream({
+      pull(controller) {
+        if (count === 0) {
+          count++;
+          controller.enqueue("first");
+          return;
+        }
+        controller.error(new Error("stream failed"));
+      }
+    }));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream("error-stream".to_string(), test_invocation())
+        .await
+        .expect("stream should start");
+    let first = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("first chunk should arrive")
+        .expect("body should still be open")
+        .expect("first chunk should be ok");
+    assert_eq!(String::from_utf8(first.to_vec()).expect("utf8"), "first");
+
+    let error = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("stream error should arrive")
+        .expect("body should deliver an error")
+        .expect_err("second body item should be an error");
+    assert!(
+        error.to_string().contains("stream failed"),
+        "stream error should include original message: {error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -3706,14 +3851,20 @@ fn dynamic_module_workers_do_not_generate_js_import_wrappers() {
     assert!(!worker_runtime_source.contains("__dd_dynamic_graph"));
     assert!(!worker_runtime_source.contains("await import(\"dd-dynamic://graph/\""));
     assert!(worker_runtime_source.contains("op_dynamic_module_graph_register"));
+    assert!(worker_runtime_source.contains("op_dynamic_module_graph_release"));
+    assert!(worker_runtime_source.contains("onRemove: (source) =>"));
     assert!(worker_runtime_source.contains("result.entrypoint"));
     assert!(worker_runtime_source.contains("module_graph_id"));
     assert!(worker_runtime_source.contains("module_entrypoint"));
     assert!(dynamic_ops_source.contains("#[string] entrypoint: String"));
     assert!(dynamic_modules_source.contains("register_dynamic_module_graph("));
+    assert!(dynamic_modules_source.contains("retain_dynamic_module_graph("));
+    assert!(dynamic_modules_source.contains("release_dynamic_module_graph("));
+    assert!(dynamic_modules_source.contains("ref_count: usize"));
     assert!(dynamic_modules_source.contains("normalize_dynamic_module_path(entrypoint)"));
     assert!(dynamic_modules_source.contains("dynamic module graph missing entrypoint module"));
     assert!(dynamic_modules_source.contains("duplicate normalized path"));
+    assert!(dynamic_modules_source.contains("dynamic module URL imports are unsupported"));
 }
 
 #[test]
@@ -3730,7 +3881,17 @@ fn worker_invocation_uses_typed_request_handle_runtime_entrypoint() {
     assert!(!engine_source.contains("<dd:invoke>"));
     assert!(!engine_source.contains("execute_script(\"<dd:invoke>\""));
     assert!(engine_source.contains("__dd_execute_worker_handle"));
+    assert!(engine_source.contains("__dd_abort_worker_request_handle"));
+    assert!(engine_source.contains("pub fn abort_worker_request_handle("));
+    assert!(engine_source.contains("call_cached_u32_function("));
+    assert!(!engine_source.contains("call_cached_string_function"));
+    assert!(!engine_source.contains("__dd_abort_worker_request\","));
     assert!(worker_runtime_source.contains("__dd_execute_worker_handle = (requestHandle)"));
+    assert!(
+        worker_runtime_source.contains("__dd_abort_worker_request_handle = (requestContextHandle)")
+    );
+    assert!(worker_runtime_source.contains("__dd_inflight_requests_by_context_handle"));
+    assert!(!worker_runtime_source.contains("__dd_abort_worker_request = (requestId)"));
     assert!(worker_runtime_source.contains("op_http_take_prepared_headers"));
     assert!(worker_runtime_source.contains("op_http_take_prepared_body(requestBodyHandle)"));
     assert!(worker_runtime_source.contains("op_http_take_prepared_body\", bodyHandle"));
@@ -4080,12 +4241,21 @@ fn wait_until_lifecycle_count_is_owned_by_request_context_handle() {
 #[test]
 fn isolate_runtime_loop_uses_thread_local_event_queue_without_poll_sleep() {
     let runtime_source = include_str!("runtime.rs");
+    let model_source = include_str!("model.rs");
+    let lifecycle_source = include_str!("lifecycle.rs");
     let ops_source = include_str!("../ops.rs");
 
     assert!(runtime_source.contains("pending_events: &Rc<RefCell<VecDeque<RuntimeEvent>>>,"));
     assert!(runtime_source.contains("Rc::new(RefCell::new(VecDeque::<RuntimeEvent>::new()))"));
     assert!(runtime_source.contains("event_loop_notify.notified()"));
     assert!(runtime_source.contains("pump_event_loop_once"));
+    assert!(model_source.contains("Starting { started_at: Instant }"));
+    assert!(model_source.contains("Ready"));
+    assert!(model_source.contains("Retiring"));
+    assert!(model_source.contains("Failed"));
+    assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Ready"));
+    assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Retiring"));
+    assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Failed"));
     assert!(ops_source.contains("pub struct IsolateEventSender(pub Rc<dyn Fn"));
     assert!(!runtime_source.contains("Arc<StdMutex<VecDeque<RuntimeEvent>>>"));
     assert!(!runtime_source.contains("isolate event queue mutex poisoned"));
@@ -4331,6 +4501,14 @@ fn static_asset_lookup_uses_catalog_without_runtime_manager_command() {
     assert!(facade_source.contains("self.asset_catalog.get(worker_name)"));
     assert!(control_source.contains("prepared: PreparedWorkerDeployment"));
     assert!(facade_source.contains("fn prepare_worker_deployment("));
+    assert!(lifecycle_source.contains("AssetCatalogEntry {"));
+    assert!(lifecycle_source.contains("worker_name: worker_name.clone()"));
+    assert!(lifecycle_source.contains("generation,"));
+    assert!(facade_source.contains("entry.worker_name != worker_name"));
+    assert!(lifecycle_source.contains(
+        "self.asset_catalog\n            .insert(worker_name.clone(), asset_catalog_entry)"
+    ));
+    assert!(lifecycle_source.contains("self.asset_catalog.remove(worker_name)"));
     assert!(!lifecycle_source.contains("compile_asset_bundle("));
     assert!(!lifecycle_source.contains("extract_bindings(&config)"));
 }

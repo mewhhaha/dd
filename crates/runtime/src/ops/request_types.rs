@@ -515,6 +515,36 @@ mod tests {
         assert!(handles.remove(handle).is_none());
         assert!(handles.take_descriptor(handle).is_none());
     }
+
+    #[test]
+    fn active_request_context_rejects_removed_or_stale_handles() {
+        let mut handles = ActiveRequestContextHandles::default();
+        let completion = handles.insert(ActiveRequestContext {
+            request_context_handle: 42,
+            completion_handle: 0,
+            request_id: "runtime-1".to_string(),
+            completion_token: "token-1".to_string(),
+            wait_until_count: 0,
+            wait_until_done_sent: false,
+        });
+        assert_ne!(completion, 0);
+        assert_eq!(handles.get_request("runtime-1"), Some(42));
+        assert_eq!(
+            handles
+                .get_completion(completion)
+                .map(|context| context.request_context_handle),
+            Some(42)
+        );
+
+        let removed = handles
+            .remove_handle(42)
+            .expect("active request context should remove");
+        assert_eq!(removed.request_id, "runtime-1");
+        assert_eq!(handles.get_request("runtime-1"), None);
+        assert!(handles.get_handle(42).is_none());
+        assert!(handles.get_completion(completion).is_none());
+        assert!(handles.mark_wait_until_done(completion).is_none());
+    }
 }
 
 impl RequestExecutionContext {

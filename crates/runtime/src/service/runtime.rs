@@ -928,21 +928,23 @@ pub(super) async fn handle_isolate_command(
             Ok(true)
         }
         IsolateCommand::Abort { runtime_request_id } => {
-            {
+            let request_context_handle = {
                 let op_state = js_runtime.op_state();
                 let mut op_state = op_state.borrow_mut();
-                if let Some(request_context_handle) =
-                    crate::ops::active_request_context_handle_for_request(
-                        &op_state,
-                        &runtime_request_id,
-                    )
-                {
+                let request_context_handle = crate::ops::active_request_context_handle_for_request(
+                    &op_state,
+                    &runtime_request_id,
+                );
+                if let Some(request_context_handle) = request_context_handle {
                     crate::ops::clear_memory_command_handles(&mut op_state, request_context_handle);
                     crate::ops::clear_memory_byte_handles(&mut op_state, request_context_handle);
                     crate::ops::clear_memory_batch_handles(&mut op_state, request_context_handle);
                 }
+                request_context_handle
+            };
+            if let Some(request_context_handle) = request_context_handle {
+                abort_worker_request_handle(js_runtime, request_context_handle)?;
             }
-            abort_worker_request(js_runtime, &runtime_request_id)?;
             Ok(true)
         }
         IsolateCommand::DrainDynamicControl => {

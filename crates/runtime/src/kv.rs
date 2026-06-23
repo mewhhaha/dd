@@ -1585,12 +1585,20 @@ mod tests {
     async fn version_counter_is_restored_from_disk() -> Result<()> {
         let path = temp_db_path("version-restore");
         let store = test_store(&path).await?;
-        store.put("worker-a", "MY_KV", "k", "v1").await?;
-        store.put("worker-a", "MY_KV", "k", "v2").await?;
+        let first_version = store.put("worker-a", "MY_KV", "k", "v1").await?;
+        let second_version = store.put("worker-a", "MY_KV", "k", "v2").await?;
+        assert!(
+            second_version > first_version,
+            "versions should be monotonic before restart"
+        );
         drop(store);
 
         let restored = test_store(&path).await?;
-        restored.put("worker-a", "MY_KV", "k", "v3").await?;
+        let restored_version = restored.put("worker-a", "MY_KV", "k", "v3").await?;
+        assert!(
+            restored_version > second_version,
+            "version floor should be restored before accepting post-restart writes"
+        );
         let value = restored.get("worker-a", "MY_KV", "k").await?;
         assert_eq!(value.map(decode_utf8), Some("v3".to_string()));
         Ok(())

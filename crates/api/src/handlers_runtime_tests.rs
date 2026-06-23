@@ -640,6 +640,153 @@ async fn public_host_invoke_serves_assets_for_public_workers() {
 
 #[tokio::test]
 #[serial]
+async fn public_host_asset_miss_falls_back_to_worker() {
+    let state = TestState::new("example.com").await;
+    state
+        .app()
+        .runtime
+        .deploy_with_bundle_config(
+            "assets".to_string(),
+            "export default { async fetch(request) { return new Response(new URL(request.url).pathname); } }"
+                .to_string(),
+            DeployConfig {
+                public: true,
+                ..DeployConfig::default()
+            },
+            test_assets(),
+            None,
+        )
+        .await
+        .expect("deploy");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/missing")
+        .header("host", "assets.example.com")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = invoke_worker_public(state.app(), request, None)
+        .await
+        .expect("invoke");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+
+    assert_eq!(body.as_ref(), b"/missing");
+    let stats = state
+        .app()
+        .runtime
+        .stats("assets".to_string())
+        .await
+        .expect("stats");
+    assert_eq!(stats.spawn_count, 1);
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn public_host_asset_catalog_swaps_on_redeploy_without_isolate_work() {
+    let state = TestState::new("example.com").await;
+    state
+        .app()
+        .runtime
+        .deploy_with_bundle_config(
+            "assets".to_string(),
+            "export default { async fetch() { return new Response('old-worker'); } }".to_string(),
+            DeployConfig {
+                public: true,
+                ..DeployConfig::default()
+            },
+            vec![DeployAsset {
+                path: "/a.js".to_string(),
+                content_base64: "b2xkLWFzc2V0".to_string(),
+            }],
+            None,
+        )
+        .await
+        .expect("first deploy");
+    let first_resolution = state
+        .app()
+        .runtime
+        .resolve_public_route_asset("assets", "GET", Some("assets.example.com"), "/a.js", &[])
+        .expect("first catalog resolution should succeed");
+    assert_eq!(first_resolution.generation, Some(1));
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/a.js")
+        .header("host", "assets.example.com")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = invoke_worker_public(state.app(), request, None)
+        .await
+        .expect("first invoke");
+    let first_body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(first_body.as_ref(), b"old-asset");
+
+    state
+        .app()
+        .runtime
+        .deploy_with_bundle_config(
+            "assets".to_string(),
+            "export default { async fetch() { return new Response('new-worker'); } }".to_string(),
+            DeployConfig {
+                public: true,
+                ..DeployConfig::default()
+            },
+            vec![DeployAsset {
+                path: "/a.js".to_string(),
+                content_base64: "bmV3LWFzc2V0".to_string(),
+            }],
+            None,
+        )
+        .await
+        .expect("second deploy");
+    let second_resolution = state
+        .app()
+        .runtime
+        .resolve_public_route_asset("assets", "GET", Some("assets.example.com"), "/a.js", &[])
+        .expect("second catalog resolution should succeed");
+    assert_eq!(second_resolution.generation, Some(2));
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/a.js")
+        .header("host", "assets.example.com")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let response = invoke_worker_public(state.app(), request, None)
+        .await
+        .expect("second invoke");
+    let second_body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(second_body.as_ref(), b"new-asset");
+
+    let stats = state
+        .app()
+        .runtime
+        .stats("assets".to_string())
+        .await
+        .expect("stats");
+    assert_eq!(stats.spawn_count, 0);
+    assert_eq!(stats.isolates_total, 0);
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn private_websocket_route_rejects_non_memory_upgrade() {
     let state = TestState::new("example.com").await;
     state

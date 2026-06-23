@@ -282,6 +282,7 @@ deno_core::extension!(
         op_dynamic_profile_take,
         op_dynamic_profile_reset,
         op_dynamic_module_graph_register,
+        op_dynamic_module_graph_release,
         op_http_prepare,
         op_http_check_url,
         op_dynamic_cancel_reply,

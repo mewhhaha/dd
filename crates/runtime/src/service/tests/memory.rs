@@ -408,6 +408,91 @@ async fn memory_atomic_idempotency_key_replays_committed_result() {
 
 #[tokio::test]
 #[serial]
+async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
+    let root = PathBuf::from(format!("/tmp/dd-memory-idempotent-{}", Uuid::new_v4()));
+    let db_path = root.join("dd-test.db");
+    let database_url = format!("file:{}", db_path.display());
+    let config = RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 2,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    };
+
+    let service =
+        test_service_with_paths(config.clone(), root.clone(), database_url.clone(), true).await;
+    service
+        .deploy_with_config(
+            "memory".to_string(),
+            memory_worker(),
+            DeployConfig {
+                public: false,
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "MY_MEMORY".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-inc?key=user-idempotent-restart&command=cmd-restart&amount=1",
+                "idempotent-restart-first",
+            ),
+        )
+        .await
+        .expect("first invoke should succeed");
+    assert_eq!(first.status, 200);
+    service.shutdown().await.expect("service should shut down");
+
+    let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
+    let replay = restored
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/idempotent-inc?key=user-idempotent-restart&command=cmd-restart&amount=10",
+                "idempotent-restart-replay",
+            ),
+        )
+        .await
+        .expect("replay invoke should succeed");
+    assert_eq!(replay.status, 200);
+    assert_eq!(first.body, replay.body);
+
+    let payload: Value = crate::json::from_string(
+        String::from_utf8(replay.body).expect("idempotent restart body should be utf8"),
+    )
+    .expect("idempotent restart response should parse");
+    assert_eq!(payload["next"].as_i64(), Some(1));
+    assert_eq!(payload["attempts"].as_i64(), Some(1));
+
+    let current = restored
+        .invoke(
+            "memory".to_string(),
+            test_invocation_with_path(
+                "/get?key=user-idempotent-restart",
+                "idempotent-restart-current",
+            ),
+        )
+        .await
+        .expect("get should succeed");
+    assert_eq!(String::from_utf8(current.body).expect("utf8"), "1");
+    restored
+        .shutdown()
+        .await
+        .expect("restored should shut down");
+    let _ = tokio::fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+#[serial]
 async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,

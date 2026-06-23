@@ -49,6 +49,11 @@ pub(super) fn op_dynamic_module_graph_register(
     }
 }
 
+#[deno_core::op2(fast)]
+pub(super) fn op_dynamic_module_graph_release(#[string] graph_id: String) {
+    crate::dynamic_modules::release_dynamic_module_graph(graph_id.trim());
+}
+
 pub(super) fn dynamic_worker_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_context_handle: u32,

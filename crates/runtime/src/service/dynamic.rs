@@ -89,6 +89,10 @@ impl WorkerManager {
                 by_id.remove(&normalized_id);
             }
         }
+        let module_graph_id = match &source {
+            crate::ops::WorkerSource::DynamicModule { graph_id, .. } => Some(graph_id.clone()),
+            crate::ops::WorkerSource::Inline(_) => None,
+        };
         let mut dynamic_rpc_bindings = Vec::new();
         let mut created_provider_ids = Vec::new();
         let mut seen_binding_names = HashSet::new();
@@ -210,7 +214,7 @@ impl WorkerManager {
         };
         let result = self
             .deploy_dynamic_internal(
-                source,
+                source.clone(),
                 env,
                 bindings,
                 validated_policy.clone(),
@@ -220,6 +224,9 @@ impl WorkerManager {
             .await;
         let owner_worker_for_handle = owner_worker.clone();
         let result = result.map(|deployed| {
+            if let Some(graph_id) = &module_graph_id {
+                crate::dynamic_modules::retain_dynamic_module_graph(graph_id);
+            }
             let handle = format!("dynh-{}", Uuid::new_v4().simple());
             let worker_name = deployed.worker;
             let worker_generation = self
@@ -242,6 +249,7 @@ impl WorkerManager {
                     binding,
                     worker_name: worker_name.clone(),
                     worker_generation,
+                    module_graph_id: module_graph_id.clone(),
                     timeout,
                     policy: validated_policy.clone(),
                     host_rpc_provider_ids: created_provider_ids.clone(),
@@ -1020,6 +1028,9 @@ impl WorkerManager {
         let Some(entry) = self.dynamic_worker_handles.remove(handle) else {
             return;
         };
+        if let Some(graph_id) = &entry.module_graph_id {
+            crate::dynamic_modules::release_dynamic_module_graph(graph_id);
+        }
         for provider_id in &entry.host_rpc_provider_ids {
             self.host_rpc_providers.remove(provider_id);
         }

@@ -79,6 +79,8 @@ impl WorkerManager {
             .await?;
         }
         let asset_catalog_entry = AssetCatalogEntry {
+            worker_name: worker_name.clone(),
+            generation,
             assets: compiled_assets.clone(),
             public: config.public,
         };
@@ -325,12 +327,23 @@ impl WorkerManager {
         isolate_id: u64,
         error: PlatformError,
     ) {
+        let mut was_starting_before_failure = false;
+        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
+            if let Some(isolate) = pool
+                .isolates
+                .iter_mut()
+                .find(|isolate| isolate.id == isolate_id)
+            {
+                was_starting_before_failure = isolate.startup.is_starting();
+                isolate.startup = IsolateStartup::Failed;
+            }
+        }
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
         for (request_id, reply) in failed.replies {
             self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
         }
-        if failed.was_starting {
+        if failed.was_starting || was_starting_before_failure {
             self.reject_queued_dynamic_invokes_for_generation(
                 worker_name,
                 generation,
@@ -764,8 +777,13 @@ impl WorkerManager {
         let mut stale_targeted_bytes = 0usize;
         let mut removed = false;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-            if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
+            if let Some(isolate) = pool.isolates.get_mut(isolate_idx) {
                 was_starting = isolate.startup.is_starting();
+                if !matches!(isolate.startup, IsolateStartup::Failed) {
+                    isolate.startup = IsolateStartup::Retiring;
+                }
+            }
+            if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
                 let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                 removed_isolate_id = Some(isolate.id);
                 stale_targeted_pending = pool.queue.drain_target_isolate_id(isolate.id);

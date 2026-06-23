@@ -165,7 +165,7 @@ pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) 
 struct RuntimeEntrypoints {
     install_worker_deployment_handle: Rc<v8::Global<v8::Function>>,
     execute_worker_handle: Rc<v8::Global<v8::Function>>,
-    abort_worker_request: Rc<v8::Global<v8::Function>>,
+    abort_worker_request_handle: Rc<v8::Global<v8::Function>>,
     drain_dynamic_control_queue: Rc<v8::Global<v8::Function>>,
 }
 
@@ -204,7 +204,8 @@ pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
         let install_worker_deployment_handle =
             global_function(scope, global, "__dd_install_worker_deployment_handle")?;
         let execute_worker_handle = global_function(scope, global, "__dd_execute_worker_handle")?;
-        let abort_worker_request = global_function(scope, global, "__dd_abort_worker_request")?;
+        let abort_worker_request_handle =
+            global_function(scope, global, "__dd_abort_worker_request_handle")?;
         let drain_dynamic_control_queue =
             global_function(scope, global, "__dd_drain_dynamic_control_queue_handle")?;
         RuntimeEntrypoints {
@@ -213,7 +214,10 @@ pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
                 install_worker_deployment_handle,
             )),
             execute_worker_handle: Rc::new(v8::Global::new(scope, execute_worker_handle)),
-            abort_worker_request: Rc::new(v8::Global::new(scope, abort_worker_request)),
+            abort_worker_request_handle: Rc::new(v8::Global::new(
+                scope,
+                abort_worker_request_handle,
+            )),
             drain_dynamic_control_queue: Rc::new(v8::Global::new(
                 scope,
                 drain_dynamic_control_queue,
@@ -280,12 +284,15 @@ pub fn dispatch_worker_request(
     }
 }
 
-pub fn abort_worker_request(runtime: &mut JsRuntime, request_id: &str) -> Result<()> {
-    call_cached_string_function(
+pub fn abort_worker_request_handle(
+    runtime: &mut JsRuntime,
+    request_context_handle: u32,
+) -> Result<()> {
+    call_cached_u32_function(
         runtime,
-        "__dd_abort_worker_request",
-        request_id,
-        |entrypoints| Rc::clone(&entrypoints.abort_worker_request),
+        "__dd_abort_worker_request_handle",
+        request_context_handle,
+        |entrypoints| Rc::clone(&entrypoints.abort_worker_request_handle),
     )
 }
 
@@ -351,27 +358,6 @@ fn call_cached_u32_function(
     let global = context.global(scope);
     let function = v8::Local::new(scope, function.as_ref());
     let arg = v8::Integer::new_from_unsigned(scope, arg).into();
-    function
-        .call(scope, global.into(), &[arg])
-        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
-    Ok(())
-}
-
-fn call_cached_string_function(
-    runtime: &mut JsRuntime,
-    name: &str,
-    arg: &str,
-    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
-) -> Result<()> {
-    let function = cached_entrypoint(runtime, select);
-    let context = runtime.main_context();
-    deno_core::scope!(scope, runtime);
-    let context = v8::Local::new(scope, context);
-    let global = context.global(scope);
-    let function = v8::Local::new(scope, function.as_ref());
-    let arg = v8::String::new(scope, arg)
-        .ok_or_else(|| PlatformError::runtime("failed to allocate V8 string argument"))?
-        .into();
     function
         .call(scope, global.into(), &[arg])
         .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;

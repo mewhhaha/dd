@@ -151,4 +151,17 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    #[test]
+    fn lean_server_features_keep_heavy_dependencies_optional() {
+        let manifest = include_str!("../Cargo.toml");
+
+        assert!(manifest.contains("default = [\"http3\", \"websocket\", \"otel\"]"));
+        assert!(manifest.contains("http3 = [\"dep:tokio-quiche\", \"websocket\"]"));
+        assert!(manifest.contains("websocket = [\"dep:tokio-tungstenite\"]"));
+        assert!(manifest.contains("\"dep:opentelemetry-otlp\""));
+        assert!(manifest.contains("tokio-quiche = { version = \"0.16.1\", optional = true }"));
+        assert!(manifest.contains("tokio-tungstenite = { version = \"0.28\", optional = true }"));
+        assert!(manifest.contains("opentelemetry-otlp = { workspace = true, optional = true }"));
+    }
 }
