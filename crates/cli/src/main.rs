@@ -2,10 +2,11 @@ use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use common::{
     first_non_empty_trimmed, DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig,
-    DeployRequest, DeployResponse, DeployTokenCapabilities, DeployTokenDeleteResponse,
-    DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
-    DeployTokenMintResponse, DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse,
-    ErrorBody, DEFAULT_PRIVATE_SERVER_URL,
+    DeployRequest, DeployResponse, DeployServerModule, DeployServerModuleKind,
+    DeployTokenCapabilities, DeployTokenDeleteResponse, DeployTokenGetResponse,
+    DeployTokenListResponse, DeployTokenMintRequest, DeployTokenMintResponse,
+    DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
+    DEFAULT_PRIVATE_SERVER_URL,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -82,6 +83,9 @@ struct DeployCmd {
 
     #[arg(long = "assets-dir")]
     assets_dir: Option<String>,
+
+    #[arg(long = "server-module", value_name = "TYPE:MODULE_PATH[=FILE]")]
+    server_modules: Vec<String>,
 
     #[arg(long = "kv-binding")]
     kv_bindings: Vec<String>,
@@ -189,7 +193,18 @@ struct DeployFileConfig {
     #[serde(default)]
     asset_excludes: Vec<String>,
     #[serde(default)]
+    server_modules: Vec<DeployFileServerModule>,
+    #[serde(default)]
     config: DeployConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployFileServerModule {
+    path: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(rename = "type", alias = "kind")]
+    kind: DeployServerModuleKind,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -501,6 +516,8 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
         .await
         .map_err(|error| format!("failed to read {}: {error}", command.file))?;
     let (assets, asset_headers) = package_assets_dir(command.assets_dir.as_deref())?;
+    let server_modules =
+        package_server_module_specs(&command.server_modules, Path::new("."), true)?;
     let mut bindings: Vec<DeployBinding> = command
         .kv_bindings
         .into_iter()
@@ -543,6 +560,7 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
         source,
         config,
         assets,
+        server_modules,
         asset_headers,
         temporary: command.temporary,
     })
@@ -575,6 +593,20 @@ async fn build_deploy_request_from_config_file(
         .map_err(|error| format!("failed to read {}: {error}", entry_path.display()))?;
 
     let mut asset_excludes = deploy_file.asset_excludes;
+    let server_module_file_paths = deploy_file
+        .server_modules
+        .iter()
+        .enumerate()
+        .map(|(index, module)| {
+            let file = module.file.as_deref().unwrap_or(&module.path);
+            resolve_config_file_path(
+                base_dir,
+                file,
+                command.allow_outside_config_root,
+                &format!("server_modules[{index}].file"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let (assets, asset_headers) = if let Some(assets_dir) = deploy_file.assets_dir.as_deref() {
         let assets_path = resolve_config_file_path(
             base_dir,
@@ -584,16 +616,25 @@ async fn build_deploy_request_from_config_file(
         )?;
         push_asset_exclude_if_within(&mut asset_excludes, &assets_path, &entry_path)?;
         push_asset_exclude_if_within(&mut asset_excludes, &assets_path, &config_path)?;
+        for module_path in &server_module_file_paths {
+            push_asset_exclude_if_within(&mut asset_excludes, &assets_path, module_path)?;
+        }
         package_assets_dir_with_excludes(Some(&path_to_string(&assets_path)?), &asset_excludes)?
     } else {
         (Vec::new(), None)
     };
+    let server_modules = package_deploy_file_server_modules(
+        base_dir,
+        deploy_file.server_modules,
+        command.allow_outside_config_root,
+    )?;
 
     Ok(DeployRequest {
         name: deploy_file.name,
         source,
         config: deploy_file.config,
         assets,
+        server_modules,
         asset_headers,
         temporary: command.temporary || deploy_file.temporary,
     })
@@ -955,6 +996,181 @@ fn package_assets_dir(dir: Option<&str>) -> Result<(Vec<DeployAsset>, Option<Str
     package_assets_dir_with_excludes(dir, &[])
 }
 
+fn package_server_module_specs(
+    specs: &[String],
+    base_dir: &Path,
+    allow_outside_config_root: bool,
+) -> Result<Vec<DeployServerModule>, String> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let (kind, path, file) = parse_server_module_spec(spec)
+                .map_err(|error| format!("server module {index}: {error}"))?;
+            package_server_module(
+                kind,
+                &path,
+                file.as_deref(),
+                base_dir,
+                allow_outside_config_root,
+                &format!("server_modules[{index}].file"),
+            )
+        })
+        .collect()
+}
+
+fn package_deploy_file_server_modules(
+    base_dir: &Path,
+    modules: Vec<DeployFileServerModule>,
+    allow_outside_config_root: bool,
+) -> Result<Vec<DeployServerModule>, String> {
+    modules
+        .into_iter()
+        .enumerate()
+        .map(|(index, module)| {
+            let file = module.file.as_deref();
+            package_server_module(
+                module.kind,
+                &module.path,
+                file,
+                base_dir,
+                allow_outside_config_root,
+                &format!("server_modules[{index}].file"),
+            )
+        })
+        .collect()
+}
+
+fn parse_server_module_spec(
+    spec: &str,
+) -> Result<(DeployServerModuleKind, String, Option<String>), String> {
+    let (kind, rest) = spec
+        .split_once(':')
+        .ok_or_else(|| "expected TYPE:MODULE_PATH[=FILE]".to_string())?;
+    let kind = parse_server_module_kind(kind)?;
+    let (path, file) = match rest.split_once('=') {
+        Some((path, file)) => (path.trim(), Some(file.trim().to_string())),
+        None => (rest.trim(), None),
+    };
+    if path.is_empty() {
+        return Err("module path must not be empty".to_string());
+    }
+    Ok((
+        kind,
+        path.to_string(),
+        file.filter(|value| !value.is_empty()),
+    ))
+}
+
+fn parse_server_module_kind(value: &str) -> Result<DeployServerModuleKind, String> {
+    let normalized = value
+        .trim()
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_' && !ch.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match normalized.as_str() {
+        "esmodule" | "esm" | "javascript" | "module" => Ok(DeployServerModuleKind::EsModule),
+        "compiledwasm" | "wasm" => Ok(DeployServerModuleKind::CompiledWasm),
+        "text" => Ok(DeployServerModuleKind::Text),
+        "data" | "bytes" => Ok(DeployServerModuleKind::Data),
+        "json" => Ok(DeployServerModuleKind::Json),
+        _ => Err(format!("unsupported server module type: {value}")),
+    }
+}
+
+fn package_server_module(
+    kind: DeployServerModuleKind,
+    module_path: &str,
+    file: Option<&str>,
+    base_dir: &Path,
+    allow_outside_config_root: bool,
+    field: &str,
+) -> Result<DeployServerModule, String> {
+    let path = normalize_server_module_path(module_path)?;
+    let file = file.unwrap_or(module_path).trim();
+    if file.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    let file_path = resolve_config_file_path(base_dir, file, allow_outside_config_root, field)?;
+    let metadata = fs::symlink_metadata(&file_path).map_err(|error| {
+        format!(
+            "failed to stat server module {}: {error}",
+            file_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "server module symlinks are not supported: {}",
+            file_path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "server module is not a file: {}",
+            file_path.display()
+        ));
+    }
+    let bytes = fs::read(&file_path).map_err(|error| {
+        format!(
+            "failed to read server module {}: {error}",
+            file_path.display()
+        )
+    })?;
+    Ok(DeployServerModule {
+        path,
+        kind,
+        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+fn normalize_server_module_path(value: &str) -> Result<String, String> {
+    let value = value.trim().replace('\\', "/");
+    if value.is_empty() {
+        return Err("server module path must not be empty".to_string());
+    }
+    if has_url_scheme(&value) {
+        return Err(format!("server module URL paths are unsupported: {value}"));
+    }
+    let mut segments = Vec::new();
+    for segment in value.trim_start_matches('/').split('/') {
+        let segment = segment.trim();
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            if segments.pop().is_none() {
+                return Err("server module path must not escape module root".to_string());
+            }
+            continue;
+        }
+        segments.push(segment.to_string());
+    }
+    if segments.is_empty() {
+        return Err("server module path must not be empty".to_string());
+    }
+    Ok(segments.join("/"))
+}
+
+fn has_url_scheme(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    for ch in chars {
+        if ch == ':' {
+            return true;
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.') {
+            return false;
+        }
+    }
+    false
+}
+
 fn package_assets_dir_with_excludes(
     dir: Option<&str>,
     excludes: &[String],
@@ -1166,12 +1382,14 @@ mod tests {
     use super::{
         build_deploy_request_from_config_file, build_deploy_token_mint_request, keyring_account,
         load_workspace_cli_config_from, normalize_asset_relative_path, package_assets_dir,
-        resolve_server_from, Cli, CliConfig, Command, DeployConfigFileCmd, MintDeployTokenCmd,
-        DEFAULT_PRIVATE_SERVER_URL,
+        package_server_module_specs, resolve_server_from, Cli, CliConfig, Command,
+        DeployConfigFileCmd, MintDeployTokenCmd, DEFAULT_PRIVATE_SERVER_URL,
     };
+    use base64::Engine;
     use clap::Parser;
+    use common::DeployServerModuleKind;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1207,6 +1425,8 @@ mod tests {
         fs::create_dir_all(root.join("assets")).expect("create assets");
         fs::write(root.join("worker.js"), "export default { fetch() {} };").expect("write worker");
         fs::write(root.join("index.html"), "<div id=\"root\"></div>").expect("write html");
+        fs::create_dir_all(root.join("data")).expect("create data");
+        fs::write(root.join("data").join("config.json"), r#"{"answer":42}"#).expect("write config");
         fs::write(root.join("assets").join("app.js"), "console.log('asset');")
             .expect("write asset");
         fs::write(
@@ -1217,6 +1437,9 @@ mod tests {
               "assets_dir": ".",
               "temporary": true,
               "asset_excludes": ["worker.js", "dd.deploy.json"],
+              "server_modules": [
+                { "type": "Json", "path": "./data/config.json", "file": "data/config.json" }
+              ],
               "config": {
                 "public": true,
                 "bindings": [{ "type": "memory", "binding": "ROOM" }]
@@ -1244,7 +1467,38 @@ mod tests {
             .map(|asset| asset.path.as_str())
             .collect::<Vec<_>>();
         assert_eq!(asset_paths, vec!["/assets/app.js", "/index.html"]);
+        assert_eq!(request.server_modules.len(), 1);
+        assert_eq!(request.server_modules[0].path, "data/config.json");
+        assert_eq!(request.server_modules[0].kind, DeployServerModuleKind::Json);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(request.server_modules[0].content_base64.as_bytes())
+            .expect("server module should decode");
+        assert_eq!(decoded, br#"{"answer":42}"#);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_server_module_specs_accepts_file_aliases() {
+        let root = temp_dir("server-modules");
+        fs::create_dir_all(root.join("files")).expect("create files");
+        let source = root.join("files").join("message.txt");
+        fs::write(&source, "hello").expect("write module");
+
+        let modules = package_server_module_specs(
+            &[format!("Text:./modules/message.txt={}", source.display())],
+            Path::new("."),
+            true,
+        )
+        .expect("package server module");
+
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].path, "modules/message.txt");
+        assert_eq!(modules[0].kind, DeployServerModuleKind::Text);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(modules[0].content_base64.as_bytes())
+            .expect("server module should decode");
+        assert_eq!(decoded, b"hello");
         let _ = fs::remove_dir_all(root);
     }
 

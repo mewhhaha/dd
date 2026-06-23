@@ -409,12 +409,16 @@ fn enforce_capabilities(
         }
     }
     if let Some(max_assets) = capabilities.max_assets {
-        if request.assets.len() as u64 > max_assets {
+        let asset_count = request
+            .assets
+            .len()
+            .saturating_add(request.server_modules.len()) as u64;
+        if asset_count > max_assets {
             return Err(PlatformError::forbidden("token asset count limit exceeded"));
         }
     }
     if let Some(max_asset_bytes) = capabilities.max_asset_bytes {
-        let asset_bytes = total_asset_bytes(&request.assets)?;
+        let asset_bytes = total_upload_asset_bytes(request)?;
         if asset_bytes > max_asset_bytes {
             return Err(PlatformError::forbidden("token asset byte limit exceeded"));
         }
@@ -435,15 +439,28 @@ fn enforce_capabilities(
     Ok(())
 }
 
-fn total_asset_bytes(assets: &[common::DeployAsset]) -> Result<u64> {
+fn total_upload_asset_bytes(request: &DeployRequest) -> Result<u64> {
     let mut total = 0u64;
-    for asset in assets {
+    for asset in &request.assets {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(asset.content_base64.as_bytes())
             .map_err(|error| {
                 PlatformError::bad_request(format!(
                     "asset {} has invalid base64 content: {error}",
                     asset.path
+                ))
+            })?;
+        total = total
+            .checked_add(decoded.len() as u64)
+            .ok_or_else(|| PlatformError::bad_request("asset payload is too large"))?;
+    }
+    for module in &request.server_modules {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(module.content_base64.as_bytes())
+            .map_err(|error| {
+                PlatformError::bad_request(format!(
+                    "server module {} has invalid base64 content: {error}",
+                    module.path
                 ))
             })?;
         total = total
@@ -549,7 +566,8 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{DeployAsset, DeployConfig};
+    use base64::Engine;
+    use common::{DeployAsset, DeployConfig, DeployServerModule, DeployServerModuleKind};
 
     fn caps_for_worker(worker: &str) -> DeployTokenCapabilities {
         DeployTokenCapabilities {
@@ -581,10 +599,52 @@ mod tests {
                 path: "/a.txt".to_string(),
                 content_base64: "b2s=".to_string(),
             }],
+            server_modules: Vec::new(),
             asset_headers: None,
             temporary: false,
         };
         enforce_capabilities(&caps_for_worker("chat"), &request).expect("allowed");
+    }
+
+    #[test]
+    fn capabilities_count_server_modules_as_assets() {
+        let mut request = DeployRequest {
+            name: "chat".to_string(),
+            source: "export default {}".to_string(),
+            config: DeployConfig {
+                public: true,
+                ..DeployConfig::default()
+            },
+            assets: Vec::new(),
+            server_modules: vec![DeployServerModule {
+                path: "config.json".to_string(),
+                kind: DeployServerModuleKind::Json,
+                content_base64: "e30=".to_string(),
+            }],
+            asset_headers: None,
+            temporary: false,
+        };
+        let caps = DeployTokenCapabilities {
+            workers: vec!["chat".to_string()],
+            allow_public: true,
+            max_assets: Some(1),
+            max_asset_bytes: Some(16),
+            ..DeployTokenCapabilities::default()
+        };
+        enforce_capabilities(&caps, &request).expect("single server module should fit limits");
+
+        request.assets.push(DeployAsset {
+            path: "/public.txt".to_string(),
+            content_base64: "b2s=".to_string(),
+        });
+        let error = enforce_capabilities(&caps, &request).expect_err("asset count should fail");
+        assert_eq!(error.kind(), common::ErrorKind::Forbidden);
+
+        request.assets.clear();
+        request.server_modules[0].content_base64 =
+            base64::engine::general_purpose::STANDARD.encode([0u8; 17]);
+        let error = enforce_capabilities(&caps, &request).expect_err("asset bytes should fail");
+        assert_eq!(error.kind(), common::ErrorKind::Forbidden);
     }
 
     #[test]
@@ -610,6 +670,7 @@ mod tests {
                 ..DeployConfig::default()
             },
             assets: Vec::new(),
+            server_modules: Vec::new(),
             asset_headers: None,
             temporary: false,
         };
@@ -639,6 +700,7 @@ mod tests {
                 ..DeployConfig::default()
             },
             assets: Vec::new(),
+            server_modules: Vec::new(),
             asset_headers: None,
             temporary: false,
         };

@@ -8,6 +8,7 @@ struct DeployWithConfigRequest {
     source: String,
     config: DeployConfig,
     assets: Vec<DeployAsset>,
+    server_modules: Vec<DeployServerModule>,
     asset_headers: Option<String>,
     persist: bool,
     temporary: bool,
@@ -282,6 +283,7 @@ fn prepare_worker_deployment(
     source: String,
     config: DeployConfig,
     assets: Vec<DeployAsset>,
+    server_modules: Vec<DeployServerModule>,
     asset_headers: Option<String>,
 ) -> Result<PreparedWorkerDeployment> {
     let worker_name = worker_name.trim().to_string();
@@ -295,6 +297,7 @@ fn prepare_worker_deployment(
         source,
         config,
         assets,
+        server_modules,
         asset_headers,
         compiled_assets,
         bindings,
@@ -491,6 +494,7 @@ impl RuntimeService {
                     source: stored.source,
                     config: stored.config,
                     assets: stored.assets,
+                    server_modules: stored.server_modules,
                     asset_headers: stored.asset_headers,
                     persist: false,
                     temporary: stored.expires_at_ms.is_some(),
@@ -592,11 +596,34 @@ impl RuntimeService {
         asset_headers: Option<String>,
         temporary: bool,
     ) -> Result<String> {
+        self.deploy_with_bundle_config_lifecycle_and_server_modules(
+            worker_name,
+            source,
+            config,
+            assets,
+            Vec::new(),
+            asset_headers,
+            temporary,
+        )
+        .await
+    }
+
+    pub async fn deploy_with_bundle_config_lifecycle_and_server_modules(
+        &self,
+        worker_name: String,
+        source: String,
+        config: DeployConfig,
+        assets: Vec<DeployAsset>,
+        server_modules: Vec<DeployServerModule>,
+        asset_headers: Option<String>,
+        temporary: bool,
+    ) -> Result<String> {
         self.deploy_with_config_internal(DeployWithConfigRequest {
             worker_name,
             source,
             config,
             assets,
+            server_modules,
             asset_headers,
             persist: true,
             temporary,
@@ -615,14 +642,21 @@ impl RuntimeService {
             source,
             config,
             assets,
+            server_modules,
             asset_headers,
             persist,
             temporary,
             expires_at_ms,
             enforce_temporary_transition,
         } = request;
-        let prepared =
-            prepare_worker_deployment(worker_name, source, config, assets, asset_headers)?;
+        let prepared = prepare_worker_deployment(
+            worker_name,
+            source,
+            config,
+            assets,
+            server_modules,
+            asset_headers,
+        )?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::Deploy {

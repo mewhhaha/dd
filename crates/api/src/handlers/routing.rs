@@ -148,11 +148,12 @@ pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult
     let _guard = span.enter();
     let deployment_id = state
         .runtime
-        .deploy_with_bundle_config_lifecycle(
+        .deploy_with_bundle_config_lifecycle_and_server_modules(
             name.clone(),
             payload.source,
             payload.config,
             payload.assets,
+            payload.server_modules,
             payload.asset_headers,
             payload.temporary,
         )

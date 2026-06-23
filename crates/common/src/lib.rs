@@ -113,6 +113,8 @@ pub struct DeployRequest {
     #[serde(default)]
     pub assets: Vec<DeployAsset>,
     #[serde(default)]
+    pub server_modules: Vec<DeployServerModule>,
+    #[serde(default)]
     pub asset_headers: Option<String>,
     #[serde(default)]
     pub temporary: bool,
@@ -122,6 +124,39 @@ pub struct DeployRequest {
 pub struct DeployAsset {
     pub path: String,
     pub content_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployServerModule {
+    pub path: String,
+    #[serde(rename = "type", alias = "kind")]
+    pub kind: DeployServerModuleKind,
+    pub content_base64: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeployServerModuleKind {
+    #[serde(
+        rename = "ESModule",
+        alias = "esmodule",
+        alias = "esm",
+        alias = "javascript",
+        alias = "module"
+    )]
+    EsModule,
+    #[serde(
+        rename = "CompiledWasm",
+        alias = "compiledwasm",
+        alias = "wasm",
+        alias = "wasm_module"
+    )]
+    CompiledWasm,
+    #[serde(rename = "Text", alias = "text")]
+    Text,
+    #[serde(rename = "Data", alias = "data", alias = "bytes")]
+    Data,
+    #[serde(rename = "Json", alias = "JSON", alias = "json")]
+    Json,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

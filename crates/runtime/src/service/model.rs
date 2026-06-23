@@ -60,6 +60,7 @@ pub(crate) struct PreparedWorkerDeployment {
     pub(super) source: String,
     pub(super) config: DeployConfig,
     pub(super) assets: Vec<DeployAsset>,
+    pub(super) server_modules: Vec<DeployServerModule>,
     pub(super) asset_headers: Option<String>,
     pub(super) compiled_assets: Arc<AssetBundle>,
     pub(super) bindings: DeployBindings,
@@ -1020,6 +1021,8 @@ pub(super) struct StoredWorkerDeployment {
     pub(super) config: DeployConfig,
     #[serde(default)]
     pub(super) assets: Vec<DeployAsset>,
+    #[serde(default)]
+    pub(super) server_modules: Vec<DeployServerModule>,
     #[serde(default)]
     pub(super) asset_headers: Option<String>,
     pub(super) deployment_id: String,

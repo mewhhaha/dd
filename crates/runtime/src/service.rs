@@ -38,8 +38,8 @@ use crate::static_assets::{
 };
 use bytes::Bytes;
 use common::{
-    DeployAsset, DeployBinding, DeployConfig, ErrorKind, PlatformError, Result, WorkerInvocation,
-    WorkerOutput,
+    DeployAsset, DeployBinding, DeployConfig, DeployServerModule, ErrorKind, PlatformError, Result,
+    WorkerInvocation, WorkerOutput,
 };
 #[cfg(feature = "otel")]
 use opentelemetry::global;

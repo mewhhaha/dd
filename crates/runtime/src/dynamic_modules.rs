@@ -1,16 +1,34 @@
-use common::{PlatformError, Result};
+use base64::Engine;
+use common::{DeployServerModule, DeployServerModuleKind, PlatformError, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const MAX_DYNAMIC_MODULE_COUNT: usize = 256;
 const MAX_DYNAMIC_GRAPH_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SERVER_MODULE_COUNT: usize = 512;
+const MAX_SERVER_MODULE_GRAPH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DYNAMIC_REGISTERED_GRAPHS: usize = 1024;
 
 #[derive(Clone)]
 struct DynamicModuleGraph {
-    modules: Arc<HashMap<String, String>>,
+    modules: Arc<HashMap<String, RuntimeModule>>,
     ref_count: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeModule {
+    pub(crate) kind: RuntimeModuleKind,
+    pub(crate) code: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RuntimeModuleKind {
+    JavaScript,
+    Wasm,
+    Json,
+    Text,
+    Bytes,
 }
 
 static DYNAMIC_MODULE_GRAPHS: OnceLock<Mutex<HashMap<String, DynamicModuleGraph>>> =
@@ -36,12 +54,12 @@ pub(crate) fn register_dynamic_module_graph(
     for (path, source) in modules {
         let path = normalize_dynamic_module_path(&path)
             .map_err(|error| PlatformError::bad_request(format!("invalid module path: {error}")))?;
-        let source = source.to_string();
         if source.trim().is_empty() {
             return Err(PlatformError::bad_request(format!(
                 "dynamic module must not be empty: {path}"
             )));
         }
+        let source = source.into_bytes();
         total_bytes = total_bytes
             .saturating_add(path.len())
             .saturating_add(source.len());
@@ -50,18 +68,112 @@ pub(crate) fn register_dynamic_module_graph(
                 "dynamic module graph exceeds {MAX_DYNAMIC_GRAPH_BYTES} bytes"
             )));
         }
-        if normalized.insert(path.clone(), source).is_some() {
+        if normalized
+            .insert(
+                path.clone(),
+                RuntimeModule {
+                    kind: RuntimeModuleKind::JavaScript,
+                    code: Arc::from(source.into_boxed_slice()),
+                },
+            )
+            .is_some()
+        {
             return Err(PlatformError::bad_request(format!(
                 "dynamic module graph contains duplicate normalized path: {path}"
             )));
         }
     }
+    register_dynamic_module_graph_normalized(
+        entrypoint,
+        normalized,
+        MAX_DYNAMIC_REGISTERED_GRAPHS,
+        "dynamic module",
+    )
+}
+
+pub(crate) fn register_server_module_graph(
+    entrypoint: &str,
+    source: String,
+    server_modules: Vec<DeployServerModule>,
+) -> Result<(String, String)> {
+    let module_count = server_modules.len().saturating_add(1);
+    if module_count > MAX_SERVER_MODULE_COUNT {
+        return Err(PlatformError::bad_request(format!(
+            "server module graph exceeds {MAX_SERVER_MODULE_COUNT} modules"
+        )));
+    }
+
+    let mut modules = HashMap::with_capacity(module_count);
+    let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
+        PlatformError::bad_request(format!("invalid server module entrypoint: {error}"))
+    })?;
+    modules.insert(
+        entrypoint.clone(),
+        RuntimeModule {
+            kind: RuntimeModuleKind::JavaScript,
+            code: Arc::from(source.into_bytes().into_boxed_slice()),
+        },
+    );
+
+    let mut total_bytes = modules
+        .iter()
+        .map(|(path, module)| path.len().saturating_add(module.code.len()))
+        .sum::<usize>();
+    for module in server_modules {
+        let path = normalize_dynamic_module_path(&module.path).map_err(|error| {
+            PlatformError::bad_request(format!("invalid server module path: {error}"))
+        })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(module.content_base64.as_bytes())
+            .map_err(|error| {
+                PlatformError::bad_request(format!(
+                    "invalid server module base64 for {path}: {error}"
+                ))
+            })?;
+        total_bytes = total_bytes
+            .saturating_add(path.len())
+            .saturating_add(bytes.len());
+        if total_bytes > MAX_SERVER_MODULE_GRAPH_BYTES {
+            return Err(PlatformError::bad_request(format!(
+                "server module graph exceeds {MAX_SERVER_MODULE_GRAPH_BYTES} bytes"
+            )));
+        }
+        if modules
+            .insert(
+                path.clone(),
+                RuntimeModule {
+                    kind: server_module_kind(module.kind),
+                    code: Arc::from(bytes.into_boxed_slice()),
+                },
+            )
+            .is_some()
+        {
+            return Err(PlatformError::bad_request(format!(
+                "server module graph contains duplicate normalized path: {path}"
+            )));
+        }
+    }
+
+    register_dynamic_module_graph_normalized(
+        &entrypoint,
+        modules,
+        MAX_DYNAMIC_REGISTERED_GRAPHS,
+        "server module",
+    )
+}
+
+fn register_dynamic_module_graph_normalized(
+    entrypoint: &str,
+    normalized: HashMap<String, RuntimeModule>,
+    max_registered_graphs: usize,
+    graph_label: &str,
+) -> Result<(String, String)> {
     let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
         PlatformError::bad_request(format!("invalid module entrypoint: {error}"))
     })?;
     if !normalized.contains_key(&entrypoint) {
         return Err(PlatformError::bad_request(format!(
-            "dynamic module graph missing entrypoint module: {entrypoint}"
+            "{graph_label} graph missing entrypoint module: {entrypoint}"
         )));
     }
 
@@ -74,9 +186,9 @@ pub(crate) fn register_dynamic_module_graph(
         graph.ref_count = graph.ref_count.saturating_add(1);
         return Ok((graph_id, entrypoint));
     }
-    if graphs.len() >= MAX_DYNAMIC_REGISTERED_GRAPHS {
+    if graphs.len() >= max_registered_graphs {
         return Err(PlatformError::bad_request(format!(
-            "dynamic module graph registry exceeds {MAX_DYNAMIC_REGISTERED_GRAPHS} graphs"
+            "dynamic module graph registry exceeds {max_registered_graphs} graphs"
         )));
     }
     graphs.insert(
@@ -87,6 +199,16 @@ pub(crate) fn register_dynamic_module_graph(
         },
     );
     Ok((graph_id, entrypoint))
+}
+
+fn server_module_kind(kind: DeployServerModuleKind) -> RuntimeModuleKind {
+    match kind {
+        DeployServerModuleKind::EsModule => RuntimeModuleKind::JavaScript,
+        DeployServerModuleKind::CompiledWasm => RuntimeModuleKind::Wasm,
+        DeployServerModuleKind::Text => RuntimeModuleKind::Text,
+        DeployServerModuleKind::Data => RuntimeModuleKind::Bytes,
+        DeployServerModuleKind::Json => RuntimeModuleKind::Json,
+    }
 }
 
 pub(crate) fn retain_dynamic_module_graph(graph_id: &str) -> bool {
@@ -116,6 +238,14 @@ pub(crate) fn release_dynamic_module_graph(graph_id: &str) {
 }
 
 pub(crate) fn dynamic_module_source(graph_id: &str, module_path: &str) -> Option<String> {
+    dynamic_module(graph_id, module_path).and_then(|module| {
+        (module.kind == RuntimeModuleKind::JavaScript)
+            .then(|| String::from_utf8(module.code.as_ref().to_vec()).ok())
+            .flatten()
+    })
+}
+
+pub(crate) fn dynamic_module(graph_id: &str, module_path: &str) -> Option<RuntimeModule> {
     let graphs = DYNAMIC_MODULE_GRAPHS.get_or_init(|| Mutex::new(HashMap::new()));
     let graphs = graphs
         .lock()
@@ -210,7 +340,7 @@ fn has_url_scheme(value: &str) -> bool {
     false
 }
 
-fn dynamic_module_graph_id(modules: &HashMap<String, String>) -> String {
+fn dynamic_module_graph_id(modules: &HashMap<String, RuntimeModule>) -> String {
     let mut hasher = Sha256::new();
     let mut keys = modules.keys().collect::<Vec<_>>();
     keys.sort();
@@ -218,12 +348,23 @@ fn dynamic_module_graph_id(modules: &HashMap<String, String>) -> String {
         hasher.update((key.len() as u64).to_le_bytes());
         hasher.update(key.as_bytes());
         hasher.update([0]);
-        let source = modules.get(key).expect("key came from modules map");
-        hasher.update((source.len() as u64).to_le_bytes());
-        hasher.update(source.as_bytes());
+        let module = modules.get(key).expect("key came from modules map");
+        hasher.update([module_kind_tag(module.kind)]);
+        hasher.update((module.code.len() as u64).to_le_bytes());
+        hasher.update(module.code.as_ref());
         hasher.update([0xff]);
     }
     hex_encode(&hasher.finalize())
+}
+
+fn module_kind_tag(kind: RuntimeModuleKind) -> u8 {
+    match kind {
+        RuntimeModuleKind::JavaScript => 0,
+        RuntimeModuleKind::Wasm => 1,
+        RuntimeModuleKind::Json => 2,
+        RuntimeModuleKind::Text => 3,
+        RuntimeModuleKind::Bytes => 4,
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

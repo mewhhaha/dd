@@ -482,6 +482,7 @@ impl ServerHarness {
                 source: source.to_string(),
                 config,
                 assets: Vec::new(),
+                server_modules: Vec::new(),
                 asset_headers: None,
                 temporary: false,
             },

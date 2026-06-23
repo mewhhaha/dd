@@ -154,6 +154,55 @@ export default {
 };
 "#;
 
+pub(super) const MEMORY_ATOMIC_WRITE_WORKER_SOURCE: &str = r#"
+export function readPayload(state) {
+  return String(state.get("payload") ?? "0");
+}
+
+export function readWritePayload(state) {
+  state.get("payload");
+  state.set("payload", "1");
+  return "1";
+}
+
+export function writePayloadAndEffect(state) {
+  state.set("payload", "1");
+  state.emit("audit.bench.write", { payload: "1" });
+  return "1";
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
+    const memory = env.BENCH_MEMORY.get(id);
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_memory_profile_reset?.();
+      return new Response("ok");
+    }
+    if (url.pathname === "/seed") {
+      await memory.atomic(readWritePayload);
+      return new Response("ok");
+    }
+    if (url.pathname === "/get") {
+      return new Response(String(await memory.atomic(readPayload)));
+    }
+    if (url.pathname === "/readwrite") {
+      return new Response(String(await memory.atomic(readWritePayload)));
+    }
+    if (url.pathname === "/write-effect") {
+      return new Response(String(await memory.atomic(writePayloadAndEffect)));
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
 pub(super) const MEMORY_ACTOR_INCREMENT_WORKER_SOURCE: &str = r#"
 export function seed(state) {
   state.set("count", "0");

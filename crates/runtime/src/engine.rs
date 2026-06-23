@@ -2,7 +2,8 @@ use crate::assets::{
     install_worker_js, BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER,
 };
 use crate::dynamic_modules::{
-    dynamic_module_source, normalize_dynamic_module_path, resolve_dynamic_module_path,
+    dynamic_module, dynamic_module_source, normalize_dynamic_module_path,
+    resolve_dynamic_module_path, RuntimeModuleKind,
 };
 use crate::ops::{
     clear_request_invocation, clear_worker_deployment_config, register_request_invocation,
@@ -10,9 +11,10 @@ use crate::ops::{
     WorkerRequestPayload, WorkerSource,
 };
 use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
+use base64::Engine;
 use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
-    resolve_import, v8, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot,
+    resolve_import, v8, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot, ModuleCodeBytes,
     ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
     PollEventLoopOptions, RequestedModuleType, ResolutionKind, RuntimeOptions,
 };
@@ -472,15 +474,8 @@ impl ModuleLoader for RuntimeModuleLoader {
         _maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
         options: deno_core::ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        if options.requested_module_type != RequestedModuleType::None {
-            return ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
-                "unsupported requested module type for dynamic module: {}",
-                options.requested_module_type
-            ))));
-        }
-
         ModuleLoadResponse::Sync(match module_specifier.scheme() {
-            "dd-dynamic" => load_dd_dynamic_module(module_specifier),
+            "dd-dynamic" => load_dd_dynamic_module(module_specifier, options.requested_module_type),
             _ => Err(JsErrorBox::generic(format!(
                 "dynamic module loader only supports dd-dynamic: URLs, got {module_specifier}"
             ))),
@@ -507,19 +502,71 @@ fn resolve_dd_dynamic_import(
 
 fn load_dd_dynamic_module(
     module_specifier: &ModuleSpecifier,
+    requested_module_type: RequestedModuleType,
 ) -> std::result::Result<ModuleSource, JsErrorBox> {
     let (graph_id, module_path) = dd_dynamic_module_parts(module_specifier)?;
-    let source = dynamic_module_source(&graph_id, &module_path).ok_or_else(|| {
+    let module = dynamic_module(&graph_id, &module_path).ok_or_else(|| {
         JsErrorBox::generic(format!(
             "dynamic module graph {graph_id} does not contain module: {module_path}"
         ))
     })?;
-    Ok(ModuleSource::new(
-        ModuleType::JavaScript,
-        ModuleSourceCode::String(source.clone().into()),
-        module_specifier,
-        None,
-    ))
+    let module_type = deno_module_type(module.kind);
+    if requested_module_type != RequestedModuleType::from(module_type.clone()) {
+        return Err(JsErrorBox::generic(format!(
+            "requested module type {requested_module_type} does not match {module_type} module: {module_path}"
+        )));
+    }
+    let code = match module.kind {
+        RuntimeModuleKind::JavaScript => ModuleSourceCode::String(
+            String::from_utf8(module.code.as_ref().to_vec())
+                .map_err(|error| {
+                    JsErrorBox::generic(format!(
+                        "dynamic JavaScript module is not valid UTF-8: {module_path}: {error}"
+                    ))
+                })?
+                .into(),
+        ),
+        RuntimeModuleKind::Wasm => {
+            ModuleSourceCode::String(compiled_wasm_module_source(module.code.as_ref()))
+        }
+        RuntimeModuleKind::Json | RuntimeModuleKind::Text => ModuleSourceCode::String(
+            String::from_utf8(module.code.as_ref().to_vec())
+                .map_err(|error| {
+                    JsErrorBox::generic(format!(
+                        "dynamic text module is not valid UTF-8: {module_path}: {error}"
+                    ))
+                })?
+                .into(),
+        ),
+        RuntimeModuleKind::Bytes => ModuleSourceCode::Bytes(ModuleCodeBytes::Arc(module.code)),
+    };
+    Ok(ModuleSource::new(module_type, code, module_specifier, None))
+}
+
+fn deno_module_type(kind: RuntimeModuleKind) -> ModuleType {
+    match kind {
+        RuntimeModuleKind::JavaScript => ModuleType::JavaScript,
+        RuntimeModuleKind::Wasm => ModuleType::JavaScript,
+        RuntimeModuleKind::Json => ModuleType::Json,
+        RuntimeModuleKind::Text => ModuleType::Text,
+        RuntimeModuleKind::Bytes => ModuleType::Bytes,
+    }
+}
+
+fn compiled_wasm_module_source(bytes: &[u8]) -> deno_core::ModuleCodeString {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!(
+        r#"
+const encoded = {encoded:?};
+const binary = atob(encoded);
+const bytes = new Uint8Array(binary.length);
+for (let index = 0; index < binary.length; index += 1) {{
+  bytes[index] = binary.charCodeAt(index);
+}}
+export default new WebAssembly.Module(bytes);
+"#
+    )
+    .into()
 }
 
 fn dd_dynamic_module_parts(

@@ -736,6 +736,7 @@ export function ddVitePlugin(options = {}) {
         assetsDir: clientAssetsRel === false ? false : relativeDeploymentAssetsDir(worker.outputName, clientAssetsRel),
         assetExcludes: deploymentConfig.assetExcludes,
         extraAssetExcludes: [],
+        serverModules: deploymentConfig.serverModules ?? deploymentConfig.server_modules,
         staticRoutes: deploymentConfig.staticRoutes,
       });
     }
@@ -3116,6 +3117,7 @@ async function buildGeneratedDeploymentConfig({
   assetsDir,
   assetExcludes,
   extraAssetExcludes = [],
+  serverModules,
   staticRoutes,
 }) {
   const deployment = {};
@@ -3149,6 +3151,14 @@ async function buildGeneratedDeploymentConfig({
     workerFile,
     configFile,
   ]);
+  const serverModuleConfig = [
+    ...arrayOfObjects(base.server_modules),
+    ...arrayOfObjects(base.serverModules),
+    ...arrayOfObjects(serverModules),
+  ];
+  if (serverModuleConfig.length > 0) {
+    deployment.server_modules = serverModuleConfig;
+  }
   deployment.config = runtimeConfig;
   return deployment;
 }
@@ -3256,6 +3266,15 @@ function arrayOfStrings(value) {
     return [];
   }
   return value.map((entry) => String(entry));
+}
+
+function arrayOfObjects(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((entry) => entry && typeof entry === "object")
+    .map((entry) => cloneJson(entry));
 }
 
 function uniqueStrings(values) {

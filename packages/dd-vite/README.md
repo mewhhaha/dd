@@ -122,6 +122,12 @@ environment name, output directory, and deploy config path. The plugin also
 writes `_headers` with an immutable cache policy for Vite's fingerprinted build
 assets, such as `/assets/*`.
 
+Set `server_modules` in `dd.json` or `deploymentConfig.serverModules` when a
+worker needs private files outside the public asset bundle. Supported types are
+`ESModule`, `Json`, `Text`, `Data`, and `CompiledWasm`; JSON/text/data imports
+use import attributes, while `CompiledWasm` default-exports a
+`WebAssembly.Module`.
+
 ```js
 export default defineConfig({
   plugins: [

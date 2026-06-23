@@ -1,10 +1,11 @@
 use super::{
     BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
 };
+use base64::Engine;
 use bytes::Bytes;
 use common::{
-    DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployTraceDestination,
-    ErrorKind, WorkerInvocation, WorkerOutput,
+    DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig, DeployServerModule,
+    DeployServerModuleKind, DeployTraceDestination, ErrorKind, WorkerInvocation, WorkerOutput,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -87,6 +88,106 @@ export default {
         String::from_utf8(output.body).expect("body should be utf8"),
         "1024"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn deployed_worker_imports_server_module_assets() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "server-modules".to_string();
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    service
+        .deploy_with_bundle_config_lifecycle_and_server_modules(
+            worker.clone(),
+            r#"
+import config from "./config.json" with { type: "json" };
+import message from "./message.txt" with { type: "text" };
+import payload from "./payload.bin" with { type: "bytes" };
+import wasmModule from "./empty.wasm";
+
+function byteValues(value) {
+  if (value instanceof Uint8Array) {
+    return Array.from(value);
+  }
+  if (value instanceof ArrayBuffer) {
+    return Array.from(new Uint8Array(value));
+  }
+  return Array.from(new Uint8Array(value.buffer));
+}
+
+export default {
+  async fetch() {
+    const dynamic = await import("./dynamic.json", { with: { type: "json" } });
+    return Response.json({
+      config,
+      message,
+      payload: byteValues(payload),
+      dynamic: dynamic.default,
+      wasm: wasmModule instanceof WebAssembly.Module,
+    });
+  },
+};
+"#
+            .to_string(),
+            DeployConfig::default(),
+            Vec::new(),
+            vec![
+                DeployServerModule {
+                    path: "config.json".to_string(),
+                    kind: DeployServerModuleKind::Json,
+                    content_base64: encode(br#"{"answer":42}"#),
+                },
+                DeployServerModule {
+                    path: "message.txt".to_string(),
+                    kind: DeployServerModuleKind::Text,
+                    content_base64: encode(b"hello"),
+                },
+                DeployServerModule {
+                    path: "payload.bin".to_string(),
+                    kind: DeployServerModuleKind::Data,
+                    content_base64: encode(&[1, 2, 3, 4]),
+                },
+                DeployServerModule {
+                    path: "dynamic.json".to_string(),
+                    kind: DeployServerModuleKind::Json,
+                    content_base64: encode(br#"{"loaded":true}"#),
+                },
+                DeployServerModule {
+                    path: "empty.wasm".to_string(),
+                    kind: DeployServerModuleKind::CompiledWasm,
+                    content_base64: encode(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+                },
+            ],
+            None,
+            false,
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = timeout(
+        Duration::from_secs(2),
+        service.invoke(worker, test_invocation()),
+    )
+    .await
+    .expect("invoke should not hang")
+    .expect("request should succeed");
+    assert_eq!(output.status, 200);
+    let body: Value = serde_json::from_slice(&output.body).expect("body should be json");
+    assert_eq!(body["config"]["answer"], 42);
+    assert_eq!(body["message"], "hello");
+    assert_eq!(body["payload"], serde_json::json!([1, 2, 3, 4]));
+    assert_eq!(body["dynamic"]["loaded"], true);
+    assert_eq!(body["wasm"], true);
 }
 
 #[tokio::test]

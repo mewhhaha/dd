@@ -143,6 +143,7 @@ async fn private_admin_mints_scoped_deploy_token_for_public_deploy() {
             ..DeployConfig::default()
         },
         assets: Vec::new(),
+        server_modules: Vec::new(),
         asset_headers: None,
         temporary: false,
     };
@@ -209,6 +210,7 @@ async fn public_deploy_token_rejects_unscoped_binding() {
             ..DeployConfig::default()
         },
         assets: Vec::new(),
+        server_modules: Vec::new(),
         asset_headers: None,
         temporary: false,
     };
@@ -310,6 +312,7 @@ async fn private_admin_lists_reads_and_deletes_tokens() {
             ..DeployConfig::default()
         },
         assets: Vec::new(),
+        server_modules: Vec::new(),
         asset_headers: None,
         temporary: false,
     };
@@ -341,6 +344,7 @@ async fn private_deploy_and_invoke_succeeds() {
             ..Default::default()
         },
         assets: Vec::new(),
+        server_modules: Vec::new(),
         asset_headers: None,
         temporary: false,
     };

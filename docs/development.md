@@ -197,6 +197,25 @@ source-only config keys are not copied into `dist/dd.deploy.json`. The plugin
 also writes `dist/_headers` with an immutable cache policy for Vite's
 fingerprinted build assets, such as `/assets/*`.
 
+Server-only module assets can be listed in `server_modules`. These files are
+uploaded with the worker, are not served as public static assets, and can be
+imported from the worker module graph:
+
+```json
+{
+  "server_modules": [
+    { "type": "Json", "path": "./data/config.json", "file": "./data/config.json" },
+    { "type": "Text", "path": "./sql/query.sql", "file": "./sql/query.sql" },
+    { "type": "Data", "path": "./fixtures/blob.bin", "file": "./fixtures/blob.bin" },
+    { "type": "CompiledWasm", "path": "./wasm/filter.wasm", "file": "./wasm/filter.wasm" }
+  ]
+}
+```
+
+Use import attributes for JSON, text, and bytes modules, for example
+`import config from "./data/config.json" with { type: "json" }`. `CompiledWasm`
+imports default-export a `WebAssembly.Module`.
+
 ```js
 dd({
   // Optional: override the root dd.json or provide the config inline.

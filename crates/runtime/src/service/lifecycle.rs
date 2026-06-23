@@ -15,6 +15,7 @@ impl WorkerManager {
             source,
             config,
             assets,
+            server_modules,
             asset_headers,
             compiled_assets,
             bindings,
@@ -32,8 +33,11 @@ impl WorkerManager {
         } else {
             None
         };
-        self.validate_worker_cached(&crate::ops::WorkerSource::inline(source.clone()))
-            .await?;
+        let worker_source = deployed_worker_source(&source, &server_modules)?;
+        if let Err(error) = self.validate_worker_cached(&worker_source).await {
+            release_worker_source_modules(&worker_source);
+            return Err(error);
+        }
         // Keep deployed workers on the bootstrap snapshot. Distinct user-code snapshots
         // can abort V8 when multiple complex workers are instantiated in one process.
         let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
@@ -76,17 +80,22 @@ impl WorkerManager {
             dynamic_quota_state: None,
         });
         if persist {
-            persist_worker_deployment(PersistWorkerDeployment {
+            if let Err(error) = persist_worker_deployment(PersistWorkerDeployment {
                 storage: &self.storage,
                 worker_name: &worker_name,
                 source: &source,
                 config: &config,
                 assets: &assets,
+                server_modules: &server_modules,
                 asset_headers: asset_headers.as_deref(),
                 deployment_id: &deployment_id,
                 expires_at_ms,
             })
-            .await?;
+            .await
+            {
+                release_worker_source_modules(&worker_source);
+                return Err(error);
+            }
         }
         let asset_catalog_entry = AssetCatalogEntry {
             worker_name: worker_name.clone(),
@@ -109,7 +118,7 @@ impl WorkerManager {
                 expires_at_ms,
                 snapshot,
                 snapshot_preloaded,
-                source: crate::ops::WorkerSource::inline(source.clone()),
+                source: worker_source,
                 memory_bindings: bindings.memory,
                 dynamic_rpc_bindings: Vec::new(),
                 deployment_config,
@@ -753,6 +762,7 @@ impl WorkerManager {
         self.reap_owned_sessions(worker_name, None, None);
         if let Some(mut entry) = self.workers.remove(worker_name) {
             for (_, mut pool) in entry.pools.drain() {
+                release_worker_source_modules(&pool.source);
                 self.account_removed_pool_queue(&pool);
                 while let Some(pending) = pool.queue.pop_front() {
                     self.reject_pending_invoke(worker_name, pending, error.clone());
@@ -1016,6 +1026,7 @@ impl WorkerManager {
                 .get_mut(worker_name)
                 .and_then(|entry| entry.pools.remove(&generation))
             {
+                release_worker_source_modules(&pool.source);
                 self.account_removed_pool_queue(&pool);
                 retired_generations.insert(generation);
                 for isolate in pool.isolates {
@@ -1167,5 +1178,29 @@ impl WorkerManager {
             target_dump = ?target_dump,
             "dynamic invoke timeout diagnostic"
         );
+    }
+}
+
+fn deployed_worker_source(
+    source: &str,
+    server_modules: &[DeployServerModule],
+) -> Result<crate::ops::WorkerSource> {
+    if server_modules.is_empty() {
+        return Ok(crate::ops::WorkerSource::inline(source.to_string()));
+    }
+    let (graph_id, entrypoint) = crate::dynamic_modules::register_server_module_graph(
+        "worker.js",
+        source.to_string(),
+        server_modules.to_vec(),
+    )?;
+    Ok(crate::ops::WorkerSource::DynamicModule {
+        graph_id,
+        entrypoint,
+    })
+}
+
+fn release_worker_source_modules(source: &crate::ops::WorkerSource) {
+    if let crate::ops::WorkerSource::DynamicModule { graph_id, .. } = source {
+        crate::dynamic_modules::release_dynamic_module_graph(graph_id);
     }
 }
