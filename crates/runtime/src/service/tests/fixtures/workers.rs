@@ -2024,7 +2024,7 @@ export default {
       return new Response("ok");
     }
 
-    if (url.pathname === "/actor-set-write") {
+    if (url.pathname === "/atomic-set-write") {
       const value = String(url.searchParams.get("value") ?? "1");
       const committed = await memory.atomic((state) => {
         state.set("count", value);
@@ -2033,7 +2033,7 @@ export default {
       return new Response(String(committed));
     }
 
-    if (url.pathname === "/actor-read-write") {
+    if (url.pathname === "/atomic-read-write") {
       const value = String(url.searchParams.get("value") ?? "1");
       const committed = await memory.atomic((state) => {
         const previous = String(state.get("count") ?? "0");
@@ -2177,7 +2177,7 @@ export default {
       return new Response(String(total));
     }
 
-    if (url.pathname === "/actor-sum") {
+    if (url.pathname === "/atomic-sum") {
       let total = 0;
       for (let i = 0; i < keys; i++) {
         const memory = env.MY_MEMORY.get(env.MY_MEMORY.idFromName(`bench-${i}`));
@@ -2307,18 +2307,18 @@ export default {
       return new Response(String(await memory.atomic(() => `ok-${suffix}`)));
     }
 
-    if (url.pathname === "/actor/seed") {
+    if (url.pathname === "/atomic/seed") {
       await memory.atomic(seedStm);
       return new Response("ok");
     }
 
-    if (url.pathname === "/actor/write-a") {
+    if (url.pathname === "/atomic/write-a") {
       const value = String(url.searchParams.get("value") ?? "1");
       await memory.atomic(writeA, value);
       return new Response("ok");
     }
 
-    if (url.pathname === "/actor/read-once") {
+    if (url.pathname === "/atomic/read-once") {
       return new Response(String(await memory.atomic(readOnce)));
     }
 
@@ -2326,24 +2326,24 @@ export default {
       return new Response(String(await memory.read("a") ?? "missing"));
     }
 
-    if (url.pathname === "/actor/read-pair") {
+    if (url.pathname === "/atomic/read-pair") {
       return new Response(String(await memory.atomic(readPairStrict)));
     }
 
-    if (url.pathname === "/actor/read-pair-snapshot") {
+    if (url.pathname === "/atomic/read-pair-snapshot") {
       return new Response(String(await memory.atomic(readPairSnapshot)));
     }
 
-    if (url.pathname === "/actor/tvar-default/read") {
+    if (url.pathname === "/atomic/tvar-default/read") {
       const count = memory.tvar("count", 7);
       return new Response(String(await memory.atomic(() => count.read())));
     }
 
-    if (url.pathname === "/actor/tvar-default/raw") {
+    if (url.pathname === "/atomic/tvar-default/raw") {
       return new Response(String(await memory.atomic((state) => state.get("count") ?? "missing")));
     }
 
-    if (url.pathname === "/actor/tvar-default/write") {
+    if (url.pathname === "/atomic/tvar-default/write") {
       const count = memory.tvar("count", 7);
       return new Response(String(await memory.atomic(() => {
         const next = Number(count.read()) + 1;

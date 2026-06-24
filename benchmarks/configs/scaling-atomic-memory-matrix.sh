@@ -5,6 +5,7 @@ DD_BENCH_MATRIX_ISOLATES="1 2 4 8 16 32"
 DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="1 2 4 8 16 32 64"
 DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard skewed-hotspot"
 DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide atomic-write-memory-wide"
+DD_BENCH_MATRIX_OPT_IN=1
 
 DD_BENCH_MODE="${DD_BENCH_MODE:-direct-write-memory-wide}"
 DD_BENCH_REQUESTS="${DD_BENCH_REQUESTS:-4096}"

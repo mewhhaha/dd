@@ -144,6 +144,10 @@ async fn main() -> Result<(), String> {
             print_help();
             return Ok(());
         }
+        BenchArgAction::List => {
+            println!("scenario fast-fetch");
+            return Ok(());
+        }
         BenchArgAction::Run => {}
     }
 

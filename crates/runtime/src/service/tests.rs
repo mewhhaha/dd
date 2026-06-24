@@ -4376,7 +4376,7 @@ fn cache_ops_use_prepared_header_and_body_handles() {
 }
 
 #[test]
-fn kv_committed_writes_use_writer_actor_reply_lane() {
+fn kv_committed_writes_use_writer_reply_lane() {
     let kv_source = include_str!("../kv.rs");
     let storage_http_source = include_str!("../ops/storage_http.rs");
     let source_range = |start_marker: &str, end_marker: &str| {
@@ -4508,12 +4508,16 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(model_source.contains("by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>"));
     assert!(model_source.contains("by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>"));
     assert!(model_source.contains("memory_shard_affinity: HashMap<usize, u64>"));
-    assert!(model_source.contains("memory_shards: BTreeMap<usize, BTreeMap<u64, PendingInvoke>>"));
+    assert!(model_source.contains("memory_shards: BTreeMap<usize, MemoryShardQueue>"));
+    assert!(model_source.contains("struct MemoryOwnerQueue"));
+    assert!(model_source.contains("owner_ring: VecDeque<String>"));
     assert!(model_source.contains("memory_next_shard_cursor: Option<usize>"));
     assert!(model_source.contains("memory_shard_index: Option<usize>"));
+    assert!(model_source.contains("memory_owner_key: Option<String>"));
     assert!(model_source.contains("pub(super) fn find_fair_map<T>("));
     assert!(model_source.contains("fn find_memory_round_robin_head_map<T>("));
-    assert!(model_source.contains("memory_shard.first_key_value()"));
+    assert!(model_source.contains("fn find_round_robin_owner_head_map<T>("));
+    assert!(model_source.contains("rejected owner head"));
     assert!(model_source.contains("targeted: BTreeMap<u64, PendingInvoke>"));
     assert!(!model_source.contains("memory: BTreeMap<u64, PendingInvoke>"));
     assert!(model_source.contains("pub(super) fn drain_target_isolate_id("));
@@ -4541,25 +4545,28 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
 fn runtime_source_contains_fair_memory_dispatch() -> bool {
     let runtime_source = include_str!("runtime.rs");
     runtime_source.contains("pool.queue.find_fair_map(")
-        && runtime_source.contains("memory_shard_affinity_isolate_idx(")
+        && runtime_source.contains("memory_shard_affinity_outcome(")
 }
 
 #[test]
 fn memory_outbox_scheduled_drains_are_bounded_and_requeued() {
     let sessions_source = include_str!("sessions.rs");
     let control_source = include_str!("control.rs");
+    let runtime_source = include_str!("runtime.rs");
+    let memory_source = include_str!("../memory.rs");
 
     assert!(sessions_source.contains("MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES: usize = 1"));
-    assert!(sessions_source.contains("MEMORY_OUTBOX_TICK_DRAIN_BATCHES: usize = 4"));
-    assert!(sessions_source.contains("struct MemoryOutboxDrainResult"));
-    assert!(sessions_source.contains(
-        "drain_memory_outbox_shard_budget(shard_index, MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES)"
-    ));
-    assert!(sessions_source.contains("if result.saturated"));
-    assert!(
-        sessions_source.contains("self.schedule_memory_outbox_drain_shard(shard_index, event_tx)")
-    );
-    assert!(control_source.contains("drain_scheduled_memory_outbox_shard(shard_index, event_tx)"));
+    assert!(sessions_source.contains("MEMORY_OUTBOX_WORKER_CHANNEL_CAPACITY"));
+    assert!(sessions_source.contains("run_memory_outbox_worker"));
+    assert!(sessions_source.contains("claim_due_outbox_records_for_shard_index"));
+    assert!(sessions_source.contains("RuntimeEvent::MemoryOutboxDelivery"));
+    assert!(sessions_source.contains("apply_outbox_delivery_outcomes(&outcomes).await"));
+    assert!(sessions_source.contains("retry_pending_memory_outbox_drains"));
+    assert!(control_source.contains("MemoryOutboxDelivery"));
+    assert!(!control_source.contains("drain_scheduled_memory_outbox_shard"));
+    assert!(runtime_source.contains("tokio::spawn(run_memory_outbox_worker"));
+    assert!(runtime_source.contains("schedule_all_memory_outbox_shards(&event_tx)"));
+    assert!(memory_source.contains("pub async fn apply_outbox_delivery_outcomes"));
     assert!(!sessions_source.contains("MEMORY_OUTBOX_MAX_DRAIN_BATCHES"));
 }
 
@@ -4679,7 +4686,7 @@ fn memory_direct_writes_use_direct_apply_fast_path() {
     assert!(worker_runtime_source.contains("memory batch mutation did not return a staged record"));
     assert!(memory_ops_source.contains("close_memory_command_for_committed_batch"));
     assert!(memory_ops_source.contains("memory_batch_commit_owner_epoch"));
-    assert!(memory_ops_source.contains("memory batch commit requires actor owner epoch"));
+    assert!(memory_ops_source.contains("memory batch commit requires memory owner epoch"));
     assert!(memory_ops_source.contains("Some(owner_epoch)"));
     assert!(memory_ops_source.contains(".get(batch.command_handle)"));
     assert!(!memory_ops_source.contains(".remove(batch.command_handle)\n        .ok_or_else"));

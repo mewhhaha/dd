@@ -1400,7 +1400,12 @@ impl WorkerManager {
                     );
                 }
                 PendingReplyKind::WebsocketFrame { session_id } => {
-                    self.complete_websocket_frame(session_id, reply, result);
+                    self.complete_websocket_frame(
+                        session_id,
+                        reply,
+                        result,
+                        memory_outbox_shard.is_some(),
+                    );
                 }
                 PendingReplyKind::TransportOpen { session_id } => {
                     self.complete_transport_open(

@@ -199,6 +199,10 @@ async fn main() -> Result<(), String> {
             print_help();
             return Ok(());
         }
+        BenchArgAction::List => {
+            println!("scenario kv");
+            return Ok(());
+        }
         BenchArgAction::Run => {}
     }
 

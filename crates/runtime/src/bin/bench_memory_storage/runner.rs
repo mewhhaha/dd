@@ -294,6 +294,9 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
         };
         timings.profile += profile_started.elapsed();
         print_profile(&profile);
+        if let Some(stats) = service.stats(worker_name.clone()).await {
+            print_scheduler_stats(&stats);
+        }
     }
     set_watchdog_phase(&watchdog_state, started_at, BenchPhase::Shutdown);
     timings.shutdown = Duration::ZERO;

@@ -194,7 +194,7 @@ struct KvScheduledMutation {
 }
 
 #[derive(Default)]
-struct KvWriteActorState {
+struct KvWriteWorkerState {
     pending: HashMap<KvWriteKey, KvScheduledMutation>,
     committed: VecDeque<KvCommittedBatch>,
     pending_bytes: usize,
@@ -203,7 +203,7 @@ struct KvWriteActorState {
     shutting_down: bool,
 }
 
-impl KvWriteActorState {
+impl KvWriteWorkerState {
     fn committed_backlog_accepts(
         &self,
         mutation_count: usize,
@@ -271,13 +271,13 @@ enum KvWriterWork {
     Committed(KvCommittedBatch),
 }
 
-struct KvWriteActor {
-    state: Mutex<KvWriteActorState>,
+struct KvWriteWorker {
+    state: Mutex<KvWriteWorkerState>,
     wake: Condvar,
 }
 
 struct KvWriterInner {
-    actor: Arc<KvWriteActor>,
+    writer: Arc<KvWriteWorker>,
     handle: Mutex<Option<JoinHandle<()>>>,
     max_pending_keys: usize,
     max_pending_bytes: usize,
@@ -473,12 +473,12 @@ impl KvWriter {
         profile: Arc<KvProfile>,
         failed_versions: Arc<Mutex<HashSet<i64>>>,
     ) -> Self {
-        let actor = Arc::new(KvWriteActor {
-            state: Mutex::new(KvWriteActorState::default()),
+        let writer = Arc::new(KvWriteWorker {
+            state: Mutex::new(KvWriteWorkerState::default()),
             wake: Condvar::new(),
         });
         let inner = Arc::new(KvWriterInner {
-            actor,
+            writer,
             handle: Mutex::new(None),
             max_pending_keys: 4_096,
             max_pending_bytes: 16 * 1024 * 1024,
@@ -488,7 +488,7 @@ impl KvWriter {
             profile,
             failed_versions,
         });
-        inner.spawn_actor();
+        inner.spawn_writer();
         Self { inner }
     }
 
@@ -515,7 +515,7 @@ impl KvWriter {
 
         let mut state = self
             .inner
-            .actor
+            .writer
             .state
             .lock()
             .expect("kv writer lock poisoned");
@@ -556,7 +556,7 @@ impl KvWriter {
         }
         drop(state);
 
-        self.inner.actor.wake.notify_one();
+        self.inner.writer.wake.notify_one();
         self.inner.profile.record(
             KvProfileMetricKind::WriteEnqueue,
             started.elapsed().as_micros() as u64,
@@ -607,7 +607,7 @@ impl KvWriter {
         {
             let mut state = self
                 .inner
-                .actor
+                .writer
                 .state
                 .lock()
                 .expect("kv writer lock poisoned");
@@ -641,23 +641,23 @@ impl KvWriter {
             });
         }
 
-        self.inner.actor.wake.notify_one();
+        self.inner.writer.wake.notify_one();
         match committed.await {
             Ok(Ok(())) => Ok(versions),
             Ok(Err(error)) => Err(error),
-            Err(_) => Err(PlatformError::runtime("kv committed write actor stopped")),
+            Err(_) => Err(PlatformError::runtime("kv committed write worker stopped")),
         }
     }
 }
 
 impl KvWriterInner {
-    fn spawn_actor(self: &Arc<Self>) {
+    fn spawn_writer(self: &Arc<Self>) {
         let mut handle_slot = self
             .handle
             .lock()
             .expect("kv write scheduler handle lock poisoned");
         debug_assert!(handle_slot.is_none());
-        let actor = Arc::clone(&self.actor);
+        let writer = Arc::clone(&self.writer);
         let database = Arc::clone(&self.database);
         let profile = Arc::clone(&self.profile);
         let flush_interval = self.flush_interval;
@@ -672,7 +672,7 @@ impl KvWriterInner {
                     flush_interval,
                     flush_threshold,
                     failed_versions,
-                    actor,
+                    writer,
                 )
             })
             .expect("kv writer thread should start");
@@ -685,7 +685,7 @@ impl KvWriterInner {
         flush_interval: Duration,
         flush_threshold: usize,
         failed_versions: Arc<Mutex<HashSet<i64>>>,
-        actor: Arc<KvWriteActor>,
+        writer: Arc<KvWriteWorker>,
     ) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -694,10 +694,10 @@ impl KvWriterInner {
         let mut writer_conn = None;
         loop {
             let work = {
-                let mut state = actor.state.lock().expect("kv writer lock poisoned");
+                let mut state = writer.state.lock().expect("kv writer lock poisoned");
                 while state.pending.is_empty() && state.committed.is_empty() && !state.shutting_down
                 {
-                    state = actor
+                    state = writer
                         .wake
                         .wait(state)
                         .expect("kv writer condvar wait should succeed");
@@ -707,7 +707,7 @@ impl KvWriterInner {
                 } else if state.shutting_down && state.pending.is_empty() {
                     return;
                 } else if state.pending.len() < flush_threshold && !state.shutting_down {
-                    let (next_state, _) = actor
+                    let (next_state, _) = writer
                         .wake
                         .wait_timeout(state, flush_interval)
                         .expect("kv writer timed wait should succeed");
@@ -889,9 +889,9 @@ impl KvWriterInner {
 
 impl Drop for KvWriterInner {
     fn drop(&mut self) {
-        let mut state = self.actor.state.lock().expect("kv writer lock poisoned");
+        let mut state = self.writer.state.lock().expect("kv writer lock poisoned");
         state.shutting_down = true;
-        self.actor.wake.notify_all();
+        self.writer.wake.notify_all();
         drop(state);
         let handle = self
             .handle
@@ -1470,12 +1470,12 @@ mod tests {
         let committed_newer = scheduled_mutation("newer", "committed-newer", 4);
         let untouched = scheduled_mutation("other", "other", 2);
 
-        let mut state = KvWriteActorState {
+        let mut state = KvWriteWorkerState {
             pending_bytes: older
                 .size_bytes
                 .saturating_add(newer.size_bytes)
                 .saturating_add(untouched.size_bytes),
-            ..KvWriteActorState::default()
+            ..KvWriteWorkerState::default()
         };
         state.pending.insert(older.key.clone(), older.clone());
         state.pending.insert(newer.key.clone(), newer.clone());
@@ -1502,7 +1502,7 @@ mod tests {
         let first = scheduled_mutation("first", "a", 1);
         let second = scheduled_mutation("second", "bb", 2);
         let expected_bytes = kv_scheduled_batch_bytes(&[first.clone(), second.clone()]);
-        let mut state = KvWriteActorState::default();
+        let mut state = KvWriteWorkerState::default();
 
         assert!(state.committed_backlog_accepts(2, expected_bytes, 2, expected_bytes));
         state.push_committed(committed_batch(vec![first.clone(), second.clone()]));
@@ -1524,7 +1524,7 @@ mod tests {
         let second = scheduled_mutation("second", "bb", 2);
         let first_bytes = kv_scheduled_batch_bytes(std::slice::from_ref(&first));
         let second_bytes = kv_scheduled_batch_bytes(std::slice::from_ref(&second));
-        let mut state = KvWriteActorState::default();
+        let mut state = KvWriteWorkerState::default();
         state.push_committed(committed_batch(vec![first]));
 
         assert!(!state.committed_backlog_accepts(1, second_bytes, 1, first_bytes + second_bytes));

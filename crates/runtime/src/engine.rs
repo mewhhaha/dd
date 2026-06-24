@@ -511,7 +511,7 @@ fn load_dd_dynamic_module(
         ))
     })?;
     let module_type = deno_module_type(module.kind);
-    if requested_module_type != RequestedModuleType::from(module_type.clone()) {
+    if requested_module_type != module_type.clone() {
         return Err(JsErrorBox::generic(format!(
             "requested module type {requested_module_type} does not match {module_type} module: {module_path}"
         )));

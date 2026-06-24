@@ -3,6 +3,7 @@ use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorag
 use serde_json::from_slice;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -202,6 +203,27 @@ fn bench_progress(label: &str) {
     }
 }
 
+fn bench_marker(config: &str, section: &str, scenario: &str, phase: &str) {
+    let enabled = std::env::var("DD_BENCH_PROGRESS_MARKERS")
+        .ok()
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+        .unwrap_or(false);
+    if enabled {
+        println!(
+            "bench-marker config={} section={} scenario={} phase={} pid={}",
+            config,
+            section,
+            scenario,
+            phase,
+            std::process::id()
+        );
+        let _ = std::io::stdout().flush();
+    }
+}
+
 fn section_enabled(name: &str) -> bool {
     let raw = std::env::var("DD_BENCH_ONLY").unwrap_or_default();
     if raw.trim().is_empty() {
@@ -224,7 +246,12 @@ fn print_help() {
     println!();
     println!("Core env:");
     println!("  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, dynamic, lifecycle, kv-writes");
+    println!(
+        "  DD_BENCH_CONFIG                comma-separated configs: single-isolate, autoscaling-8"
+    );
+    println!("  DD_BENCH_SCENARIO              comma-separated steady-state scenarios by name");
     println!("  DD_BENCH_VERBOSE_PROGRESS      print dynamic benchmark progress markers");
+    println!("  DD_BENCH_PROGRESS_MARKERS      print machine-parseable lifecycle markers");
     println!("  DD_BENCH_WS_SESSIONS           websocket sessions (default 24)");
     println!("  DD_BENCH_WS_MESSAGES_PER_SESSION websocket messages per session (default 24)");
     println!("  DD_BENCH_DYNAMIC_REQUESTS      dynamic requests per hot scenario (default 500)");
@@ -235,13 +262,7 @@ fn print_help() {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    match bench_arg_action(std::env::args().skip(1))? {
-        BenchArgAction::Help => {
-            print_help();
-            return Ok(());
-        }
-        BenchArgAction::Run => {}
-    }
+    let action = bench_arg_action(std::env::args().skip(1))?;
 
     let configs = [
         BenchConfig {
@@ -371,6 +392,18 @@ export default {
         },
     ];
 
+    match action {
+        BenchArgAction::Help => {
+            print_help();
+            return Ok(());
+        }
+        BenchArgAction::List => {
+            print_benchmark_list(&configs, &scenarios);
+            return Ok(());
+        }
+        BenchArgAction::Run => {}
+    }
+
     println!("# dd runtime benchmark");
     println!(
         "# note: this benchmark measures runtime service behavior directly (no API/HTTP network overhead)."
@@ -379,28 +412,44 @@ export default {
     println!();
 
     for config in configs {
+        if !name_enabled("DD_BENCH_CONFIG", config.name) {
+            continue;
+        }
         if section_enabled("steady-state") {
             println!("== steady-state: {} ==", config.name);
+            bench_marker(config.name, "steady-state", "section", "start");
             let service = start_service(config.name, config.runtime.clone())
                 .await
                 .map_err(|error| error.to_string())?;
             for scenario in scenarios {
+                if !name_enabled("DD_BENCH_SCENARIO", scenario.name) {
+                    continue;
+                }
                 let worker_name = format!("{}-{}", config.name, scenario.name);
+                bench_marker(config.name, "steady-state", scenario.name, "deploy-start");
                 service
                     .deploy(worker_name.clone(), scenario.worker_source.to_string())
                     .await
                     .map_err(|error| error.to_string())?;
+                bench_marker(config.name, "steady-state", scenario.name, "invoke-start");
                 let result = run_scenario(&service, &worker_name, scenario)
                     .await
                     .map_err(|error| error.to_string())?;
+                bench_marker(config.name, "steady-state", scenario.name, "invoke-end");
                 println!("{}", format_scenario_result(scenario.name, &result));
             }
+            service
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
+            bench_marker(config.name, "steady-state", "section", "shutdown-end");
             println!();
         }
 
         if section_enabled("websocket") {
             println!("== websocket: {} ==", config.name);
             let websocket_tag = format!("{}-websocket", config.name);
+            bench_marker(config.name, "websocket", "websocket", "start");
             let websocket_service = start_service(&websocket_tag, config.runtime.clone())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -409,6 +458,11 @@ export default {
                 .map_err(|error| error.to_string())?;
             println!("{}", format_websocket_open_result(&websocket));
             println!("{}", format_websocket_roundtrip_result(&websocket));
+            websocket_service
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
+            bench_marker(config.name, "websocket", "websocket", "shutdown-end");
             println!();
         }
 
@@ -421,6 +475,10 @@ export default {
                 .await
                 .map_err(|error| error.to_string())?;
             let baseline_fetch = run_dynamic_baseline_fetch(&baseline_service)
+                .await
+                .map_err(|error| error.to_string())?;
+            baseline_service
+                .shutdown()
                 .await
                 .map_err(|error| error.to_string())?;
             let dynamic_service = start_service(&dynamic_tag, config.runtime.clone())
@@ -484,6 +542,11 @@ export default {
                 )
             );
             println!("dynamic-final      config={} status=ok", config.name);
+            dynamic_service
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
+            bench_marker(config.name, "dynamic", "dynamic", "shutdown-end");
             println!();
         }
 
@@ -497,6 +560,10 @@ export default {
                 .await
                 .map_err(|error| error.to_string())?;
             println!("{}", format_cold_start_result(cold));
+            cold_service
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
 
             let hot_service = start_service("hot-start", config.runtime.clone())
                 .await
@@ -505,6 +572,10 @@ export default {
                 .await
                 .map_err(|error| error.to_string())?;
             println!("{}", format_distribution_result("hot-start", 500, hot));
+            hot_service
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
 
             let restore = run_restore_from_disk(&config.runtime, 30)
                 .await
@@ -518,6 +589,10 @@ export default {
                 .await
                 .map_err(|error| error.to_string())?;
             println!("{}", format_scale_up_result(scale));
+            scale_service
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string())?;
             println!();
 
             if section_enabled("kv-writes") {
@@ -573,12 +648,46 @@ export default {
                     "{}",
                     format_scenario_result("kv-write-concurrent", &kv_concurrent)
                 );
+                kv_service
+                    .shutdown()
+                    .await
+                    .map_err(|error| error.to_string())?;
                 println!();
             }
         }
     }
 
     Ok(())
+}
+
+fn print_benchmark_list(configs: &[BenchConfig], scenarios: &[Scenario]) {
+    for config in configs {
+        println!("config {}", config.name);
+        println!("section steady-state config={}", config.name);
+        for scenario in scenarios {
+            println!(
+                "scenario steady-state/{} config={} section=steady-state",
+                scenario.name, config.name
+            );
+        }
+        println!("section websocket config={}", config.name);
+        println!("section dynamic config={}", config.name);
+        if config.name == "autoscaling-8" {
+            println!("section lifecycle config={}", config.name);
+            println!("section kv-writes config={}", config.name);
+        }
+    }
+}
+
+fn name_enabled(env_name: &str, name: &str) -> bool {
+    let raw = std::env::var(env_name).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return true;
+    }
+    raw.split(',')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .any(|value| value.eq_ignore_ascii_case(name))
 }
 
 const KV_WRITE_WORKER_SOURCE: &str = r#"
@@ -1009,7 +1118,7 @@ export default {
         let seed =
             start_service_with_paths(runtime.clone(), &paths.db_path, &paths.store_dir).await?;
         seed.deploy(worker_name.clone(), source.to_string()).await?;
-        drop(seed);
+        seed.shutdown().await?;
 
         let startup_started = Instant::now();
         let restored =
@@ -1019,7 +1128,7 @@ export default {
         let invoke_started = Instant::now();
         restored.invoke(worker_name, invocation("/", idx)).await?;
         first_invoke.push(invoke_started.elapsed());
-        drop(restored);
+        restored.shutdown().await?;
 
         let _ = tokio::fs::remove_dir_all(paths.root).await;
     }

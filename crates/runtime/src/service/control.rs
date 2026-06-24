@@ -224,7 +224,13 @@ pub(super) enum RuntimeEvent {
         isolate_id: u64,
         error: PlatformError,
     },
-    MemoryOutboxDrain {
+    MemoryOutboxDelivery {
+        shard_index: usize,
+        claims: Vec<MemoryOutboxClaim>,
+        saturated: bool,
+        reply: oneshot::Sender<Vec<MemoryOutboxDeliveryOutcome>>,
+    },
+    MemoryOutboxAckFailed {
         shard_index: usize,
     },
 }
@@ -234,6 +240,7 @@ impl WorkerManager {
             bootstrap_snapshot,
             kv_store,
             memory_store,
+            memory_outbox_drain_sender,
             cache_store,
             config,
             storage,
@@ -248,6 +255,7 @@ impl WorkerManager {
             runtime_fast_sender,
             kv_store,
             memory_store,
+            memory_outbox_drain_sender,
             cache_store,
             asset_catalog,
             workers: HashMap::new(),
@@ -265,6 +273,7 @@ impl WorkerManager {
             websocket_outbound_frames: HashMap::new(),
             websocket_close_signals: HashMap::new(),
             websocket_frame_waiters: HashMap::new(),
+            websocket_pending_frame_replies: HashMap::new(),
             websocket_open_waiters: HashMap::new(),
             transport_sessions: HashMap::new(),
             transport_handle_index: HashMap::new(),
@@ -281,6 +290,7 @@ impl WorkerManager {
             pending_dispatches: HashSet::new(),
             pending_cleanup_workers: HashSet::new(),
             pending_memory_outbox_shards: HashSet::new(),
+            stats: RuntimeManagerStats::default(),
             next_generation: 1,
             next_isolate_id: 1,
             next_memory_entity_epoch,
@@ -883,9 +893,16 @@ impl WorkerManager {
                 self.dispatch_pool(&worker_name, generation, event_tx);
                 self.cleanup_drained_generations_for(&worker_name);
             }
-            RuntimeEvent::MemoryOutboxDrain { shard_index } => {
-                self.drain_scheduled_memory_outbox_shard(shard_index, event_tx)
-                    .await;
+            RuntimeEvent::MemoryOutboxDelivery {
+                shard_index,
+                claims,
+                saturated,
+                reply,
+            } => {
+                self.handle_memory_outbox_delivery(shard_index, claims, saturated, reply, event_tx);
+            }
+            RuntimeEvent::MemoryOutboxAckFailed { shard_index } => {
+                self.handle_memory_outbox_ack_failed(shard_index, event_tx);
             }
         }
     }
@@ -1139,6 +1156,7 @@ impl WorkerManager {
         session_id: String,
         reply: Option<oneshot::Sender<Result<WorkerOutput>>>,
         result: Result<WorkerOutput>,
+        wait_for_outbox_frame: bool,
     ) {
         let Some(reply) = reply else {
             return;
@@ -1146,11 +1164,13 @@ impl WorkerManager {
         match result {
             Ok(mut output) => {
                 output.headers = strip_websocket_frame_internal_headers(&output.headers);
+                let mut has_outbox_output = false;
                 if let Some(frame) = self
                     .websocket_outbound_frames
                     .get_mut(&session_id)
                     .and_then(|queue| queue.pop_front())
                 {
+                    has_outbox_output = true;
                     output.body = frame.payload;
                     if frame.is_binary {
                         append_or_update_header(
@@ -1165,6 +1185,7 @@ impl WorkerManager {
                     }
                 }
                 if let Some(close) = self.websocket_close_signals.remove(&session_id) {
+                    has_outbox_output = true;
                     append_or_update_header(
                         &mut output.headers,
                         INTERNAL_WS_CLOSE_CODE_HEADER,
@@ -1176,10 +1197,62 @@ impl WorkerManager {
                         &close.reason,
                     );
                 }
+                if wait_for_outbox_frame && !has_outbox_output {
+                    self.websocket_pending_frame_replies
+                        .entry(session_id)
+                        .or_default()
+                        .push(WebSocketFrameReply { output, reply });
+                    return;
+                }
                 let _ = reply.send(Ok(output));
             }
             Err(error) => {
                 let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    pub(super) fn flush_pending_websocket_frame_replies(&mut self, session_id: &str) {
+        let Some(replies) = self.websocket_pending_frame_replies.remove(session_id) else {
+            return;
+        };
+        for WebSocketFrameReply { mut output, reply } in replies {
+            let mut has_output = false;
+            if let Some(frame) = self
+                .websocket_outbound_frames
+                .get_mut(session_id)
+                .and_then(|queue| queue.pop_front())
+            {
+                has_output = true;
+                output.body = frame.payload;
+                if frame.is_binary {
+                    append_or_update_header(&mut output.headers, INTERNAL_WS_BINARY_HEADER, "1");
+                } else {
+                    output
+                        .headers
+                        .retain(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_BINARY_HEADER));
+                }
+            }
+            if let Some(close) = self.websocket_close_signals.remove(session_id) {
+                has_output = true;
+                append_or_update_header(
+                    &mut output.headers,
+                    INTERNAL_WS_CLOSE_CODE_HEADER,
+                    close.code.to_string().as_str(),
+                );
+                append_or_update_header(
+                    &mut output.headers,
+                    INTERNAL_WS_CLOSE_REASON_HEADER,
+                    &close.reason,
+                );
+            }
+            if has_output {
+                let _ = reply.send(Ok(output));
+            } else {
+                self.websocket_pending_frame_replies
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .push(WebSocketFrameReply { output, reply });
             }
         }
     }

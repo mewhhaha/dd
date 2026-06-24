@@ -2,6 +2,53 @@ use super::*;
 
 impl WorkerPool {
     pub(super) fn debug_dump(&self) -> WorkerDebugDump {
+        let (memory_max_shard_depth, memory_median_shard_depth) =
+            self.queue.memory_shard_depth_summary();
+        let stale_memory_affinity_entries = self
+            .memory_shard_affinity
+            .values()
+            .filter(|isolate_id| !self.isolate_indices.contains_key(isolate_id))
+            .count();
+        let blocked_owner_queues = self
+            .queue
+            .blocked_memory_owner_queues(&self.memory_entity_leases);
+        let memory_scheduler = MemorySchedulerDebug {
+            queued: self.queue.lane_depths().memory,
+            active_leases: self.memory_entity_leases.len(),
+            active_shards: self.queue.active_memory_shards(),
+            max_shard_depth: memory_max_shard_depth,
+            median_shard_depth: memory_median_shard_depth,
+            owner_queues: self.queue.memory_owner_queues(),
+            blocked_owner_queues,
+            affinity_entries: self.memory_shard_affinity.len(),
+            stale_affinity_entries: stale_memory_affinity_entries,
+            oldest_queue_ms: self.queue.oldest_queue_age_ms(Instant::now()),
+            queued_bytes: self.queue.queued_bytes(),
+            max_queued_requests_per_worker: 0,
+            max_global_queued_bytes: 0,
+            top_shards: self.queue.memory_shard_debug(
+                &self.memory_entity_leases,
+                &self.memory_shard_affinity,
+                &self.isolate_indices,
+                8,
+            ),
+            affinity_hit_count: self.stats.memory_affinity_hit_count,
+            affinity_miss_no_mapping_count: self.stats.memory_affinity_miss_no_mapping_count,
+            affinity_miss_stale_count: self.stats.memory_affinity_miss_stale_count,
+            affinity_miss_saturated_count: self.stats.memory_affinity_miss_saturated_count,
+            least_loaded_fallback_count: self.stats.memory_least_loaded_fallback_count,
+            atomic_overflow_dispatch_count: self.stats.memory_atomic_overflow_dispatch_count,
+            candidate_rejected_owner_lease_count: self
+                .stats
+                .memory_candidate_rejected_owner_lease_count,
+            candidate_rejected_isolate_state_count: self
+                .stats
+                .memory_candidate_rejected_isolate_state_count,
+            candidate_heads_inspected_count: self.stats.memory_candidate_heads_inspected_count,
+            dispatch_no_ready_candidate_count: self.stats.memory_dispatch_no_ready_candidate_count,
+            runtime_ready_work_budget_exhausted_count: 0,
+            runtime_max_ready_work_batch_size: 0,
+        };
         let queued_requests = self
             .queue
             .iter()
@@ -71,6 +118,8 @@ impl WorkerPool {
             queued: self.queue.len(),
             isolates,
             queued_requests,
+            memory_scheduler,
+            memory_outbox: MemoryOutboxDebug::default(),
         }
     }
 
@@ -92,6 +141,13 @@ impl WorkerPool {
             spawn_count = snapshot.spawn_count,
             reuse_count = snapshot.reuse_count,
             scale_down_count = snapshot.scale_down_count,
+            memory_lane_queued = snapshot.memory_lane_queued,
+            memory_active_shards = snapshot.memory_active_shards,
+            memory_owner_queues = snapshot.memory_owner_queues,
+            memory_blocked_owner_queues = snapshot.memory_blocked_owner_queues,
+            active_memory_leases = snapshot.active_memory_leases,
+            oldest_queue_ms = snapshot.oldest_queue_ms,
+            queued_bytes = snapshot.queued_bytes,
             event,
             "worker pool stats"
         );

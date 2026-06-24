@@ -1,0 +1,64 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: Samples per benchmark variant
+        default: "3"
+        required: true
+      allow_large_run:
+        description: Allow plans over the default run budget
+        default: "false"
+        required: true
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  memory-smoke:
+    name: Memory smoke regression check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Plan benchmark smoke matrix
+        run: |
+          DD_BENCH_MATRIX_ISOLATES="1 8" \
+          DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
+          DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
+          DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
+          node benchmarks/run.mjs --plan --samples "${{ inputs.samples }}" \
+            --config scaling-atomic-memory-matrix.sh
+      - name: Run benchmark smoke matrix
+        run: |
+          extra_flags=()
+          if [ "${{ inputs.allow_large_run }}" = "true" ]; then
+            extra_flags+=(--allow-large-run)
+          fi
+          DD_BENCH_MATRIX_ISOLATES="1 8" \
+          DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
+          DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
+          DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
+          node benchmarks/run.mjs --samples "${{ inputs.samples }}" \
+            --config scaling-atomic-memory-matrix.sh \
+            --out benchmarks/results/memory-smoke.json \
+            "${extra_flags[@]}"
+      - name: Check structural regression policy
+        run: |
+          set -o pipefail
+          node benchmarks/check-regression.mjs \
+            --results benchmarks/results/memory-smoke.json \
+            --policy benchmarks/baselines/memory-scaling-policy.json \
+            | tee "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: memory-smoke-benchmark
+          path: benchmarks/results/memory-smoke.json
+          if-no-files-found: ignore
+          retention-days: 14

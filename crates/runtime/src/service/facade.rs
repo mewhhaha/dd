@@ -131,6 +131,44 @@ pub struct WorkerStats {
     pub spawn_count: u64,
     pub reuse_count: u64,
     pub scale_down_count: u64,
+    pub targeted_nested_lane_queued: usize,
+    pub targeted_lane_queued: usize,
+    pub memory_lane_queued: usize,
+    pub general_lane_queued: usize,
+    pub memory_active_shards: usize,
+    pub memory_max_shard_depth: usize,
+    pub memory_median_shard_depth: usize,
+    pub memory_owner_queues: usize,
+    pub memory_blocked_owner_queues: usize,
+    pub active_memory_leases: usize,
+    pub oldest_queue_ms: u64,
+    pub queued_bytes: usize,
+    pub max_queued_requests_per_worker: usize,
+    pub max_global_queued_bytes: usize,
+    pub memory_affinity_entries: usize,
+    pub stale_memory_affinity_entries: usize,
+    pub pending_memory_outbox_shards: usize,
+    pub memory_affinity_hit_count: u64,
+    pub memory_affinity_miss_no_mapping_count: u64,
+    pub memory_affinity_miss_stale_count: u64,
+    pub memory_affinity_miss_saturated_count: u64,
+    pub memory_least_loaded_fallback_count: u64,
+    pub memory_atomic_overflow_dispatch_count: u64,
+    pub memory_candidate_rejected_owner_lease_count: u64,
+    pub memory_candidate_rejected_isolate_state_count: u64,
+    pub memory_candidate_heads_inspected_count: u64,
+    pub memory_dispatch_no_ready_candidate_count: u64,
+    pub runtime_ready_work_budget_exhausted_count: u64,
+    pub runtime_max_ready_work_batch_size: usize,
+    pub memory_outbox_claim_batch_count: u64,
+    pub memory_outbox_claim_row_count: u64,
+    pub memory_outbox_saturated_batch_count: u64,
+    pub memory_outbox_delivery_success_count: u64,
+    pub memory_outbox_delivery_retry_count: u64,
+    pub memory_outbox_terminal_drop_count: u64,
+    pub memory_outbox_ack_failure_count: u64,
+    pub memory_outbox_channel_full_count: u64,
+    pub memory_outbox_reschedule_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +177,62 @@ pub struct WorkerDebugDump {
     pub queued: usize,
     pub isolates: Vec<WorkerDebugIsolate>,
     pub queued_requests: Vec<WorkerDebugRequest>,
+    pub memory_scheduler: MemorySchedulerDebug,
+    pub memory_outbox: MemoryOutboxDebug,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemorySchedulerDebug {
+    pub queued: usize,
+    pub active_leases: usize,
+    pub active_shards: usize,
+    pub max_shard_depth: usize,
+    pub median_shard_depth: usize,
+    pub owner_queues: usize,
+    pub blocked_owner_queues: usize,
+    pub affinity_entries: usize,
+    pub stale_affinity_entries: usize,
+    pub oldest_queue_ms: u64,
+    pub queued_bytes: usize,
+    pub max_queued_requests_per_worker: usize,
+    pub max_global_queued_bytes: usize,
+    pub top_shards: Vec<MemoryShardDebug>,
+    pub affinity_hit_count: u64,
+    pub affinity_miss_no_mapping_count: u64,
+    pub affinity_miss_stale_count: u64,
+    pub affinity_miss_saturated_count: u64,
+    pub least_loaded_fallback_count: u64,
+    pub atomic_overflow_dispatch_count: u64,
+    pub candidate_rejected_owner_lease_count: u64,
+    pub candidate_rejected_isolate_state_count: u64,
+    pub candidate_heads_inspected_count: u64,
+    pub dispatch_no_ready_candidate_count: u64,
+    pub runtime_ready_work_budget_exhausted_count: u64,
+    pub runtime_max_ready_work_batch_size: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryShardDebug {
+    pub shard_index: usize,
+    pub queued: usize,
+    pub ready_owners: usize,
+    pub blocked_owners: usize,
+    pub affinity_isolate_id: Option<u64>,
+    pub affinity_stale: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryOutboxDebug {
+    pub pending_scheduled_shards: usize,
+    pub claim_batch_count: u64,
+    pub claim_row_count: u64,
+    pub saturated_batch_count: u64,
+    pub delivery_success_count: u64,
+    pub delivery_retry_count: u64,
+    pub terminal_drop_count: u64,
+    pub ack_failure_count: u64,
+    pub channel_full_count: u64,
+    pub reschedule_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -608,6 +702,7 @@ impl RuntimeService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn deploy_with_bundle_config_lifecycle_and_server_modules(
         &self,
         worker_name: String,

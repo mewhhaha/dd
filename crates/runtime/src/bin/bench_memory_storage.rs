@@ -1,7 +1,7 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
     stable_memory_shard_index, MemoryBatchMutation, MemoryStore, RuntimeConfig, RuntimeService,
-    RuntimeServiceConfig, RuntimeStorageConfig, WorkerDebugDump,
+    RuntimeServiceConfig, RuntimeStorageConfig, WorkerDebugDump, WorkerStats,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -91,6 +91,12 @@ struct MemoryProfileSnapshot {
     store_apply_batch: MemoryProfileMetric,
     store_apply_batch_validate: MemoryProfileMetric,
     store_apply_batch_write: MemoryProfileMetric,
+    store_database_cache_hit: MemoryProfileMetric,
+    store_database_cache_miss: MemoryProfileMetric,
+    store_database_cache_eviction: MemoryProfileMetric,
+    store_snapshot_cache_hit: MemoryProfileMetric,
+    store_snapshot_cache_miss: MemoryProfileMetric,
+    store_snapshot_cache_eviction: MemoryProfileMetric,
     runtime_atomic_invoke_event_wait: MemoryProfileMetric,
     runtime_atomic_queue_wait: MemoryProfileMetric,
     runtime_atomic_dispatch_wait: MemoryProfileMetric,
@@ -313,9 +319,9 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
-        mode: "actor-inc",
-        label: "memory-actor-inc",
-        source: MEMORY_ACTOR_INCREMENT_WORKER_SOURCE,
+        mode: "coordinated-inc",
+        label: "memory-coordinated-inc",
+        source: MEMORY_COORDINATED_INCREMENT_WORKER_SOURCE,
         seed: true,
         path: "/inc",
         key_space: KeySpaceConfig::One,
@@ -323,9 +329,9 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
-        mode: "actor-read",
-        label: "memory-actor-read",
-        source: MEMORY_ACTOR_READ_WRITE_WORKER_SOURCE,
+        mode: "coordinated-read",
+        label: "memory-coordinated-read",
+        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
         seed: true,
         path: "/read",
         key_space: KeySpaceConfig::One,
@@ -333,9 +339,9 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
-        mode: "actor-read-multikey",
-        label: "memory-actor-read-multikey",
-        source: MEMORY_ACTOR_READ_WRITE_WORKER_SOURCE,
+        mode: "coordinated-read-multikey",
+        label: "memory-coordinated-read-multikey",
+        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
         seed: true,
         path: "/read",
         key_space: KeySpaceConfig::Env,
@@ -343,9 +349,9 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
-        mode: "actor-write",
-        label: "memory-actor-write",
-        source: MEMORY_ACTOR_READ_WRITE_WORKER_SOURCE,
+        mode: "coordinated-write",
+        label: "memory-coordinated-write",
+        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
         seed: true,
         path: "/write",
         key_space: KeySpaceConfig::One,
@@ -353,9 +359,9 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
-        mode: "actor-write-throughput",
-        label: "memory-actor-write-throughput",
-        source: MEMORY_ACTOR_READ_WRITE_WORKER_SOURCE,
+        mode: "coordinated-write-throughput",
+        label: "memory-coordinated-write-throughput",
+        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
         seed: true,
         path: "/write",
         key_space: KeySpaceConfig::One,
@@ -363,9 +369,9 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
-        mode: "actor-write-multikey",
-        label: "memory-actor-write-multikey",
-        source: MEMORY_ACTOR_READ_WRITE_WORKER_SOURCE,
+        mode: "coordinated-write-multikey",
+        label: "memory-coordinated-write-multikey",
+        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
         seed: true,
         path: "/write",
         key_space: KeySpaceConfig::Env,
@@ -389,6 +395,12 @@ async fn main() -> Result<(), String> {
     match bench_arg_action(std::env::args().skip(1))? {
         BenchArgAction::Help => {
             print_help();
+            return Ok(());
+        }
+        BenchArgAction::List => {
+            for bench_case in BENCH_CASES {
+                println!("scenario {}", bench_case.mode);
+            }
             return Ok(());
         }
         BenchArgAction::Run => {}

@@ -7,6 +7,7 @@ pub(super) struct WorkerManager {
     pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
     pub(super) kv_store: KvStore,
     pub(super) memory_store: MemoryStore,
+    pub(super) memory_outbox_drain_sender: MemoryOutboxDrainSender,
     pub(super) cache_store: CacheStore,
     pub(super) asset_catalog: AssetCatalog,
     pub(super) workers: HashMap<String, WorkerEntry>,
@@ -24,6 +25,7 @@ pub(super) struct WorkerManager {
     pub(super) websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
     pub(super) websocket_close_signals: HashMap<String, SocketCloseEvent>,
     pub(super) websocket_frame_waiters: HashMap<String, Vec<oneshot::Sender<Result<()>>>>,
+    pub(super) websocket_pending_frame_replies: HashMap<String, Vec<WebSocketFrameReply>>,
     pub(super) websocket_open_waiters: HashMap<String, oneshot::Sender<Result<WebSocketOpen>>>,
     pub(super) transport_sessions: HashMap<String, WorkerTransportSession>,
     pub(super) transport_handle_index: HashMap<String, String>,
@@ -40,6 +42,7 @@ pub(super) struct WorkerManager {
     pub(super) pending_dispatches: HashSet<(String, u64)>,
     pub(super) pending_cleanup_workers: HashSet<String>,
     pub(super) pending_memory_outbox_shards: HashSet<usize>,
+    pub(super) stats: RuntimeManagerStats,
     pub(super) next_generation: u64,
     pub(super) next_isolate_id: u64,
     pub(super) next_memory_entity_epoch: u64,
@@ -49,6 +52,7 @@ pub(super) struct WorkerManagerInit {
     pub(super) bootstrap_snapshot: &'static [u8],
     pub(super) kv_store: KvStore,
     pub(super) memory_store: MemoryStore,
+    pub(super) memory_outbox_drain_sender: MemoryOutboxDrainSender,
     pub(super) cache_store: CacheStore,
     pub(super) config: RuntimeConfig,
     pub(super) storage: RuntimeStorageConfig,
@@ -71,6 +75,21 @@ pub(crate) struct PreparedWorkerDeployment {
 pub(super) struct RuntimeQueueCounters {
     pub(super) requests: usize,
     pub(super) bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RuntimeManagerStats {
+    pub(super) ready_work_budget_exhausted_count: u64,
+    pub(super) max_ready_work_batch_size: usize,
+    pub(super) memory_outbox_claim_batch_count: u64,
+    pub(super) memory_outbox_claim_row_count: u64,
+    pub(super) memory_outbox_saturated_batch_count: u64,
+    pub(super) memory_outbox_delivery_success_count: u64,
+    pub(super) memory_outbox_delivery_retry_count: u64,
+    pub(super) memory_outbox_terminal_drop_count: u64,
+    pub(super) memory_outbox_ack_failure_count: u64,
+    pub(super) memory_outbox_channel_full_count: u64,
+    pub(super) memory_outbox_reschedule_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -163,6 +182,11 @@ pub(super) struct SocketCloseEvent {
 pub(super) struct WebSocketOutboundFrame {
     pub(super) is_binary: bool,
     pub(super) payload: Vec<u8>,
+}
+
+pub(super) struct WebSocketFrameReply {
+    pub(super) output: WorkerOutput,
+    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
 }
 
 pub(super) struct WorkerTransportSession {
@@ -307,11 +331,149 @@ impl PendingQueueLane {
     ];
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct PendingQueueKey {
     lane: PendingQueueLane,
     sequence: u64,
     memory_shard_index: Option<usize>,
+    memory_owner_key: Option<String>,
+}
+
+pub(super) struct MemoryOwnerQueue {
+    pending: BTreeMap<u64, PendingInvoke>,
+}
+
+#[derive(Default)]
+pub(super) struct MemoryShardQueue {
+    owners: BTreeMap<String, MemoryOwnerQueue>,
+    owner_ring: VecDeque<String>,
+}
+
+impl MemoryShardQueue {
+    fn len(&self) -> usize {
+        self.owners
+            .values()
+            .map(|owner| owner.pending.len())
+            .sum::<usize>()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    fn owner_count(&self) -> usize {
+        self.owners.len()
+    }
+
+    fn blocked_owner_count(
+        &self,
+        memory_entity_leases: &HashMap<String, MemoryEntityLease>,
+    ) -> usize {
+        self.owners
+            .keys()
+            .filter(|owner_key| memory_entity_leases.contains_key(*owner_key))
+            .count()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PendingInvoke> {
+        self.owners
+            .values()
+            .flat_map(|owner| owner.pending.values())
+    }
+
+    fn insert(
+        &mut self,
+        owner_key: String,
+        sequence: u64,
+        pending: PendingInvoke,
+    ) -> Option<PendingInvoke> {
+        let owner = self.owners.entry(owner_key.clone()).or_insert_with(|| {
+            self.owner_ring.push_back(owner_key);
+            MemoryOwnerQueue {
+                pending: BTreeMap::new(),
+            }
+        });
+        owner.pending.insert(sequence, pending)
+    }
+
+    fn remove(&mut self, owner_key: &str, sequence: u64) -> Option<PendingInvoke> {
+        let owner = self.owners.get_mut(owner_key)?;
+        let pending = owner.pending.remove(&sequence);
+        if owner.pending.is_empty() {
+            self.owners.remove(owner_key);
+            self.owner_ring.retain(|candidate| candidate != owner_key);
+        }
+        pending
+    }
+
+    fn find_round_robin_owner_head_map<T>(
+        &self,
+        shard_index: usize,
+        map: &mut impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,
+    ) -> Option<(PendingQueueKey, u64, T)> {
+        // Owner fairness is round-robin over owner queue heads within a physical
+        // shard. A rejected owner head, for example due to an active atomic
+        // lease, does not hide later independent owners in the same shard.
+        for owner_key in &self.owner_ring {
+            let Some(owner) = self.owners.get(owner_key) else {
+                continue;
+            };
+            let Some((sequence, pending)) = owner.pending.first_key_value() else {
+                continue;
+            };
+            let key = PendingQueueKey {
+                lane: PendingQueueLane::Memory,
+                sequence: *sequence,
+                memory_shard_index: Some(shard_index),
+                memory_owner_key: Some(owner_key.clone()),
+            };
+            let Some(value) = map(key.clone(), pending) else {
+                continue;
+            };
+            return Some((key, *sequence, value));
+        }
+        None
+    }
+
+    fn advance_owner_cursor(&mut self, owner_key: &str) {
+        let Some(position) = self
+            .owner_ring
+            .iter()
+            .position(|candidate| candidate == owner_key)
+        else {
+            return;
+        };
+        self.owner_ring.rotate_left(position.saturating_add(1));
+    }
+
+    fn drain_matching(
+        &mut self,
+        shard_index: usize,
+        matches: &mut impl FnMut(&PendingInvoke) -> bool,
+        drained: &mut Vec<(PendingQueueKey, PendingInvoke)>,
+    ) {
+        let mut removals = Vec::new();
+        for (owner_key, owner) in &self.owners {
+            for (sequence, pending) in &owner.pending {
+                if matches(pending) {
+                    removals.push((owner_key.clone(), *sequence));
+                }
+            }
+        }
+        for (owner_key, sequence) in removals {
+            if let Some(pending) = self.remove(&owner_key, sequence) {
+                drained.push((
+                    PendingQueueKey {
+                        lane: PendingQueueLane::Memory,
+                        sequence,
+                        memory_shard_index: Some(shard_index),
+                        memory_owner_key: Some(owner_key),
+                    },
+                    pending,
+                ));
+            }
+        }
+    }
 }
 
 pub(super) struct PendingInvokeQueue {
@@ -322,7 +484,7 @@ pub(super) struct PendingInvokeQueue {
     by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>,
     targeted_nested: BTreeMap<u64, PendingInvoke>,
     targeted: BTreeMap<u64, PendingInvoke>,
-    memory_shards: BTreeMap<usize, BTreeMap<u64, PendingInvoke>>,
+    memory_shards: BTreeMap<usize, MemoryShardQueue>,
     memory_next_shard_cursor: Option<usize>,
     general: BTreeMap<u64, PendingInvoke>,
 }
@@ -354,7 +516,7 @@ impl PendingInvokeQueue {
             .saturating_add(
                 self.memory_shards
                     .values()
-                    .map(BTreeMap::len)
+                    .map(MemoryShardQueue::len)
                     .sum::<usize>(),
             )
             .saturating_add(self.general.len())
@@ -366,12 +528,104 @@ impl PendingInvokeQueue {
             .sum::<usize>()
     }
 
+    pub(super) fn lane_depths(&self) -> PendingQueueLaneDepths {
+        PendingQueueLaneDepths {
+            targeted_nested: self.targeted_nested.len(),
+            targeted: self.targeted.len(),
+            memory: self
+                .memory_shards
+                .values()
+                .map(MemoryShardQueue::len)
+                .sum::<usize>(),
+            general: self.general.len(),
+        }
+    }
+
+    pub(super) fn active_memory_shards(&self) -> usize {
+        self.memory_shards.len()
+    }
+
+    pub(super) fn memory_shard_depth_summary(&self) -> (usize, usize) {
+        let mut depths = self
+            .memory_shards
+            .values()
+            .map(MemoryShardQueue::len)
+            .collect::<Vec<_>>();
+        if depths.is_empty() {
+            return (0, 0);
+        }
+        depths.sort_unstable();
+        let max = depths.last().copied().unwrap_or(0);
+        let median = depths[depths.len() / 2];
+        (max, median)
+    }
+
+    pub(super) fn memory_owner_queues(&self) -> usize {
+        self.memory_shards
+            .values()
+            .map(MemoryShardQueue::owner_count)
+            .sum::<usize>()
+    }
+
+    pub(super) fn blocked_memory_owner_queues(
+        &self,
+        memory_entity_leases: &HashMap<String, MemoryEntityLease>,
+    ) -> usize {
+        self.memory_shards
+            .values()
+            .map(|shard| shard.blocked_owner_count(memory_entity_leases))
+            .sum::<usize>()
+    }
+
+    pub(super) fn oldest_queue_age_ms(&self, now: Instant) -> u64 {
+        self.by_enqueued_at
+            .keys()
+            .next()
+            .map(|enqueued_at| duration_millis_u64(now.saturating_duration_since(*enqueued_at)))
+            .unwrap_or(0)
+    }
+
+    pub(super) fn memory_shard_debug(
+        &self,
+        memory_entity_leases: &HashMap<String, MemoryEntityLease>,
+        memory_shard_affinity: &HashMap<usize, u64>,
+        isolate_indices: &HashMap<u64, usize>,
+        limit: usize,
+    ) -> Vec<MemoryShardDebug> {
+        let mut shards = self
+            .memory_shards
+            .iter()
+            .map(|(shard_index, shard)| {
+                let blocked_owners = shard.blocked_owner_count(memory_entity_leases);
+                let affinity_isolate_id = memory_shard_affinity.get(shard_index).copied();
+                MemoryShardDebug {
+                    shard_index: *shard_index,
+                    queued: shard.len(),
+                    ready_owners: shard.owner_count().saturating_sub(blocked_owners),
+                    blocked_owners,
+                    affinity_isolate_id,
+                    affinity_stale: affinity_isolate_id
+                        .map(|isolate_id| !isolate_indices.contains_key(&isolate_id))
+                        .unwrap_or(false),
+                }
+            })
+            .collect::<Vec<_>>();
+        shards.sort_by(|left, right| {
+            right
+                .queued
+                .cmp(&left.queued)
+                .then_with(|| left.shard_index.cmp(&right.shard_index))
+        });
+        shards.truncate(limit);
+        shards
+    }
+
     pub(super) fn push_back(&mut self, pending: PendingInvoke) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
         let lane = Self::lane_for(&pending);
         let key = Self::key_for(lane, sequence, &pending);
-        self.index_pending(key, &pending);
+        self.index_pending(key.clone(), &pending);
         let replaced = self.insert_pending(key, pending);
         debug_assert!(replaced.is_none());
     }
@@ -382,7 +636,7 @@ impl PendingInvokeQueue {
     }
 
     pub(super) fn remove(&mut self, key: PendingQueueKey) -> Option<PendingInvoke> {
-        let pending = self.remove_pending_from_lane(key)?;
+        let pending = self.remove_pending_from_lane(key.clone())?;
         self.unindex_pending(key, &pending);
         Some(pending)
     }
@@ -394,7 +648,7 @@ impl PendingInvokeQueue {
         let key = self
             .by_runtime_request_id
             .get(runtime_request_id)
-            .copied()?;
+            .cloned()?;
         let removed = self.remove(key);
         if removed.is_none() {
             self.by_runtime_request_id.remove(runtime_request_id);
@@ -410,7 +664,7 @@ impl PendingInvokeQueue {
         keys.sort_by_key(|key| key.sequence);
         keys.into_iter()
             .filter_map(|key| {
-                let pending = self.remove_pending_from_lane(key)?;
+                let pending = self.remove_pending_from_lane(key.clone())?;
                 self.unindex_pending(key, &pending);
                 Some(pending)
             })
@@ -439,7 +693,7 @@ impl PendingInvokeQueue {
         keys.sort_by_key(|key| key.sequence);
         keys.into_iter()
             .filter_map(|key| {
-                let pending = self.remove_pending_from_lane(key)?;
+                let pending = self.remove_pending_from_lane(key.clone())?;
                 self.unindex_pending(key, &pending);
                 Some(pending)
             })
@@ -476,13 +730,7 @@ impl PendingInvokeQueue {
         for shard_index in memory_shard_indices {
             let remove_shard = if let Some(memory_shard) = self.memory_shards.get_mut(&shard_index)
             {
-                Self::drain_lane_matching(
-                    PendingQueueLane::Memory,
-                    Some(shard_index),
-                    memory_shard,
-                    &mut matches,
-                    &mut drained,
-                );
+                memory_shard.drain_matching(shard_index, &mut matches, &mut drained);
                 memory_shard.is_empty()
             } else {
                 false
@@ -524,6 +772,7 @@ impl PendingInvokeQueue {
                             lane,
                             sequence: *sequence,
                             memory_shard_index: None,
+                            memory_owner_key: None,
                         };
                         let Some(value) = map(key, pending) else {
                             continue;
@@ -538,22 +787,26 @@ impl PendingInvokeQueue {
                 }
                 PendingQueueLane::Memory => {
                     for (shard_index, memory_shard) in &self.memory_shards {
-                        let Some((sequence, pending)) = memory_shard.first_key_value() else {
-                            continue;
-                        };
-                        let key = PendingQueueKey {
-                            lane,
-                            sequence: *sequence,
-                            memory_shard_index: Some(*shard_index),
-                        };
-                        let Some(value) = map(key, pending) else {
-                            continue;
-                        };
-                        if selected
-                            .as_ref()
-                            .is_none_or(|(selected_sequence, _)| sequence < selected_sequence)
-                        {
-                            selected = Some((*sequence, value));
+                        for (owner_key, owner_queue) in &memory_shard.owners {
+                            let Some((sequence, pending)) = owner_queue.pending.first_key_value()
+                            else {
+                                continue;
+                            };
+                            let key = PendingQueueKey {
+                                lane,
+                                sequence: *sequence,
+                                memory_shard_index: Some(*shard_index),
+                                memory_owner_key: Some(owner_key.clone()),
+                            };
+                            let Some(value) = map(key, pending) else {
+                                continue;
+                            };
+                            if selected
+                                .as_ref()
+                                .is_none_or(|(selected_sequence, _)| sequence < selected_sequence)
+                            {
+                                selected = Some((*sequence, value));
+                            }
                         }
                     }
                 }
@@ -588,19 +841,17 @@ impl PendingInvokeQueue {
             }
         }
         if matches!(
-            selected_key,
+            selected_key.as_ref(),
             Some(PendingQueueKey {
                 lane: PendingQueueLane::Memory,
                 memory_shard_index: Some(_),
                 ..
             })
         ) {
-            self.advance_memory_shard_cursor(
-                selected_key
-                    .expect("selected memory key must exist")
-                    .memory_shard_index
-                    .expect("selected memory key must include shard"),
-            );
+            let selected_key = selected_key
+                .as_ref()
+                .expect("selected memory key must exist");
+            self.advance_memory_cursor(selected_key);
         }
         selected.map(|(_, value)| value)
     }
@@ -609,11 +860,7 @@ impl PendingInvokeQueue {
         self.targeted_nested
             .values()
             .chain(self.targeted.values())
-            .chain(
-                self.memory_shards
-                    .values()
-                    .flat_map(|memory_shard| memory_shard.values()),
-            )
+            .chain(self.memory_shards.values().flat_map(MemoryShardQueue::iter))
             .chain(self.general.values())
     }
 
@@ -644,6 +891,8 @@ impl PendingInvokeQueue {
             sequence,
             memory_shard_index: (lane == PendingQueueLane::Memory)
                 .then(|| Self::memory_shard_index_for(pending)),
+            memory_owner_key: (lane == PendingQueueLane::Memory)
+                .then(|| Self::memory_owner_key_for(pending)),
         }
     }
 
@@ -653,6 +902,14 @@ impl PendingInvokeQueue {
             .as_ref()
             .and_then(|route| route.shard_index)
             .unwrap_or(0)
+    }
+
+    fn memory_owner_key_for(pending: &PendingInvoke) -> String {
+        pending
+            .memory_route
+            .as_ref()
+            .map(|route| route.owner_key.clone())
+            .unwrap_or_default()
     }
 
     fn insert_pending(
@@ -667,7 +924,11 @@ impl PendingInvokeQueue {
                 .memory_shards
                 .entry(key.memory_shard_index.unwrap_or(0))
                 .or_default()
-                .insert(key.sequence, pending),
+                .insert(
+                    key.memory_owner_key.clone().unwrap_or_default(),
+                    key.sequence,
+                    pending,
+                ),
             PendingQueueLane::General => self.general.insert(key.sequence, pending),
         }
     }
@@ -680,7 +941,10 @@ impl PendingInvokeQueue {
                 let shard_index = key.memory_shard_index.unwrap_or(0);
                 let (pending, remove_shard) = {
                     let memory_shard = self.memory_shards.get_mut(&shard_index)?;
-                    let pending = memory_shard.remove(&key.sequence);
+                    let pending = memory_shard.remove(
+                        key.memory_owner_key.as_deref().unwrap_or_default(),
+                        key.sequence,
+                    );
                     (pending, memory_shard.is_empty())
                 };
                 if remove_shard {
@@ -694,18 +958,18 @@ impl PendingInvokeQueue {
 
     fn index_pending(&mut self, key: PendingQueueKey, pending: &PendingInvoke) {
         self.by_runtime_request_id
-            .insert(pending.runtime_request_id.clone(), key);
+            .insert(pending.runtime_request_id.clone(), key.clone());
         if let Some(target_isolate_id) = pending.target_isolate_id {
             self.by_target_isolate_id
                 .entry(target_isolate_id)
                 .or_default()
-                .insert(key);
+                .insert(key.clone());
         }
         if let Some(memory_route) = pending.memory_route.as_ref() {
             self.by_memory_owner_key
                 .entry(memory_route.owner_key.clone())
                 .or_default()
-                .insert(key);
+                .insert(key.clone());
         }
         self.by_enqueued_at
             .entry(pending.enqueued_at)
@@ -798,8 +1062,9 @@ impl PendingInvokeQueue {
                 lane,
                 sequence: *sequence,
                 memory_shard_index: None,
+                memory_owner_key: None,
             };
-            let Some(value) = map(key, pending) else {
+            let Some(value) = map(key.clone(), pending) else {
                 continue;
             };
             selected = Some((key, *sequence, value));
@@ -809,7 +1074,7 @@ impl PendingInvokeQueue {
     }
 
     fn find_memory_round_robin_head_map<T>(
-        &self,
+        &mut self,
         map: &mut impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,
     ) -> Option<(PendingQueueKey, u64, T)> {
         if self.memory_shards.is_empty() {
@@ -822,23 +1087,25 @@ impl PendingInvokeQueue {
             .range(cursor..)
             .chain(self.memory_shards.range(..cursor))
         {
-            let Some((sequence, pending)) = memory_shard.first_key_value() else {
+            let Some(candidate) = memory_shard.find_round_robin_owner_head_map(*shard_index, map)
+            else {
                 continue;
             };
-            let key = PendingQueueKey {
-                lane: PendingQueueLane::Memory,
-                sequence: *sequence,
-                memory_shard_index: Some(*shard_index),
-            };
-            let Some(value) = map(key, pending) else {
-                continue;
-            };
-            return Some((key, *sequence, value));
+            return Some(candidate);
         }
         None
     }
 
-    fn advance_memory_shard_cursor(&mut self, shard_index: usize) {
+    fn advance_memory_cursor(&mut self, key: &PendingQueueKey) {
+        let Some(shard_index) = key.memory_shard_index else {
+            return;
+        };
+        if let (Some(memory_shard), Some(owner_key)) = (
+            self.memory_shards.get_mut(&shard_index),
+            key.memory_owner_key.as_deref(),
+        ) {
+            memory_shard.advance_owner_cursor(owner_key);
+        }
         self.memory_next_shard_cursor = self
             .memory_shards
             .range((shard_index.saturating_add(1))..)
@@ -865,12 +1132,25 @@ impl PendingInvokeQueue {
                         lane: lane_key,
                         sequence,
                         memory_shard_index,
+                        memory_owner_key: None,
                     },
                     pending,
                 ));
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PendingQueueLaneDepths {
+    pub(super) targeted_nested: usize,
+    pub(super) targeted: usize,
+    pub(super) memory: usize,
+    pub(super) general: usize,
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone)]
@@ -884,6 +1164,65 @@ pub(super) struct PoolStats {
     pub(super) spawn_count: u64,
     pub(super) reuse_count: u64,
     pub(super) scale_down_count: u64,
+    pub(super) memory_affinity_hit_count: u64,
+    pub(super) memory_affinity_miss_no_mapping_count: u64,
+    pub(super) memory_affinity_miss_stale_count: u64,
+    pub(super) memory_affinity_miss_saturated_count: u64,
+    pub(super) memory_least_loaded_fallback_count: u64,
+    pub(super) memory_atomic_overflow_dispatch_count: u64,
+    pub(super) memory_candidate_rejected_owner_lease_count: u64,
+    pub(super) memory_candidate_rejected_isolate_state_count: u64,
+    pub(super) memory_candidate_heads_inspected_count: u64,
+    pub(super) memory_dispatch_no_ready_candidate_count: u64,
+}
+
+impl PoolStats {
+    pub(super) fn record_dispatch_attempt(&mut self, stats: DispatchAttemptStats) {
+        self.memory_affinity_hit_count = self
+            .memory_affinity_hit_count
+            .saturating_add(stats.memory_affinity_hit_count);
+        self.memory_affinity_miss_no_mapping_count = self
+            .memory_affinity_miss_no_mapping_count
+            .saturating_add(stats.memory_affinity_miss_no_mapping_count);
+        self.memory_affinity_miss_stale_count = self
+            .memory_affinity_miss_stale_count
+            .saturating_add(stats.memory_affinity_miss_stale_count);
+        self.memory_affinity_miss_saturated_count = self
+            .memory_affinity_miss_saturated_count
+            .saturating_add(stats.memory_affinity_miss_saturated_count);
+        self.memory_least_loaded_fallback_count = self
+            .memory_least_loaded_fallback_count
+            .saturating_add(stats.memory_least_loaded_fallback_count);
+        self.memory_atomic_overflow_dispatch_count = self
+            .memory_atomic_overflow_dispatch_count
+            .saturating_add(stats.memory_atomic_overflow_dispatch_count);
+        self.memory_candidate_rejected_owner_lease_count = self
+            .memory_candidate_rejected_owner_lease_count
+            .saturating_add(stats.memory_candidate_rejected_owner_lease_count);
+        self.memory_candidate_rejected_isolate_state_count = self
+            .memory_candidate_rejected_isolate_state_count
+            .saturating_add(stats.memory_candidate_rejected_isolate_state_count);
+        self.memory_candidate_heads_inspected_count = self
+            .memory_candidate_heads_inspected_count
+            .saturating_add(stats.memory_candidate_heads_inspected_count);
+        self.memory_dispatch_no_ready_candidate_count = self
+            .memory_dispatch_no_ready_candidate_count
+            .saturating_add(stats.memory_dispatch_no_ready_candidate_count);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct DispatchAttemptStats {
+    pub(super) memory_affinity_hit_count: u64,
+    pub(super) memory_affinity_miss_no_mapping_count: u64,
+    pub(super) memory_affinity_miss_stale_count: u64,
+    pub(super) memory_affinity_miss_saturated_count: u64,
+    pub(super) memory_least_loaded_fallback_count: u64,
+    pub(super) memory_atomic_overflow_dispatch_count: u64,
+    pub(super) memory_candidate_rejected_owner_lease_count: u64,
+    pub(super) memory_candidate_rejected_isolate_state_count: u64,
+    pub(super) memory_candidate_heads_inspected_count: u64,
+    pub(super) memory_dispatch_no_ready_candidate_count: u64,
 }
 
 pub(super) struct PendingInvoke {
@@ -1308,7 +1647,7 @@ mod tests {
             queue
                 .memory_shards
                 .get(&0)
-                .map(BTreeMap::len)
+                .map(MemoryShardQueue::len)
                 .unwrap_or_default(),
             1
         );
@@ -1378,7 +1717,7 @@ mod tests {
             queue
                 .memory_shards
                 .get(&7)
-                .map(BTreeMap::len)
+                .map(MemoryShardQueue::len)
                 .unwrap_or_default(),
             1
         );
@@ -1386,7 +1725,7 @@ mod tests {
             queue
                 .memory_shards
                 .get(&3)
-                .map(BTreeMap::len)
+                .map(MemoryShardQueue::len)
                 .unwrap_or_default(),
             1
         );
@@ -1416,16 +1755,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_invoke_queue_memory_lookup_only_considers_shard_heads() {
+    fn pending_invoke_queue_memory_lookup_can_bypass_blocked_owner_in_same_shard() {
         let mut queue = PendingInvokeQueue::new();
         queue.push_back(pending_invoke(
-            "memory-shard-3-head",
+            "owner-a-head",
             None,
             Some(memory_route_on_shard("room-a", 3)),
             None,
         ));
         queue.push_back(pending_invoke(
-            "memory-shard-3-tail",
+            "owner-a-tail",
+            None,
+            Some(memory_route_on_shard("room-a", 3)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "owner-b-head",
             None,
             Some(memory_route_on_shard("room-b", 3)),
             None,
@@ -1437,21 +1782,86 @@ mod tests {
             None,
         ));
 
-        let hidden_tail = queue.find_oldest_map([PendingQueueLane::Memory], |key, pending| {
-            (pending.runtime_request_id == "memory-shard-3-tail").then_some(key)
+        let owner_b = queue
+            .find_oldest_map([PendingQueueLane::Memory], |key, pending| {
+                (pending.runtime_request_id == "owner-b-head").then_some(key)
+            })
+            .expect("independent owner behind blocked owner should be selectable");
+        assert_eq!(owner_b.memory_shard_index, Some(3));
+        assert_eq!(
+            queue
+                .remove(owner_b)
+                .map(|pending| pending.runtime_request_id),
+            Some("owner-b-head".to_string())
+        );
+
+        let owner_a_tail = queue.find_oldest_map([PendingQueueLane::Memory], |key, pending| {
+            (pending.runtime_request_id == "owner-a-tail").then_some(key)
         });
-        assert!(hidden_tail.is_none());
+        assert!(
+            owner_a_tail.is_none(),
+            "later same-owner work must not overtake its owner head"
+        );
 
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
-            Some("memory-shard-3-head".to_string())
+            Some("owner-a-head".to_string())
         );
         let exposed_tail = queue
             .find_oldest_map([PendingQueueLane::Memory], |key, pending| {
-                (pending.runtime_request_id == "memory-shard-3-tail").then_some(key)
+                (pending.runtime_request_id == "owner-a-tail").then_some(key)
             })
             .expect("tail becomes selectable after the shard head is removed");
         assert_eq!(exposed_tail.memory_shard_index, Some(3));
+    }
+
+    #[test]
+    fn pending_invoke_queue_fair_memory_lookup_rotates_between_owners_in_one_shard() {
+        let mut queue = PendingInvokeQueue::new();
+        queue.push_back(pending_invoke(
+            "owner-a-1",
+            None,
+            Some(memory_route_on_shard("room-a", 3)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "owner-a-2",
+            None,
+            Some(memory_route_on_shard("room-a", 3)),
+            None,
+        ));
+        queue.push_back(pending_invoke(
+            "owner-b-1",
+            None,
+            Some(memory_route_on_shard("room-b", 3)),
+            None,
+        ));
+
+        let first = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
+            .expect("first owner should be selectable");
+        assert_eq!(
+            queue
+                .remove(first)
+                .map(|pending| pending.runtime_request_id),
+            Some("owner-a-1".to_string())
+        );
+
+        let second = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
+            .expect("second owner should rotate ahead of hot owner backlog");
+        assert_eq!(
+            queue
+                .remove(second)
+                .map(|pending| pending.runtime_request_id),
+            Some("owner-b-1".to_string())
+        );
+
+        assert_eq!(
+            queue.pop_front().map(|pending| pending.runtime_request_id),
+            Some("owner-a-2".to_string())
+        );
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -1624,6 +2034,53 @@ mod tests {
         assert_eq!(queue.indexed_target_count(7), 0);
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 0);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn pending_invoke_queue_reports_bounded_memory_scheduler_debug_without_owner_keys() {
+        let mut queue = PendingInvokeQueue::new();
+        let mut hot_route = MemoryRoute::new("MEM".to_string(), "hot".to_string());
+        hot_route.shard_index = Some(2);
+        let mut cold_route = MemoryRoute::new("MEM".to_string(), "cold".to_string());
+        cold_route.shard_index = Some(3);
+        let hot_owner_key = hot_route.owner_key.clone();
+        queue.push_back(pending_invoke("general", None, None, None));
+        queue.push_back(pending_invoke("hot-a", None, Some(hot_route.clone()), None));
+        queue.push_back(pending_invoke("hot-b", None, Some(hot_route), None));
+        queue.push_back(pending_invoke("cold", None, Some(cold_route), None));
+
+        let lane_depths = queue.lane_depths();
+        assert_eq!(lane_depths.general, 1);
+        assert_eq!(lane_depths.memory, 3);
+        assert_eq!(queue.active_memory_shards(), 2);
+        assert_eq!(queue.memory_shard_depth_summary(), (2, 2));
+        assert_eq!(queue.memory_owner_queues(), 2);
+
+        let mut leases = HashMap::new();
+        leases.insert(
+            hot_owner_key.clone(),
+            MemoryEntityLease {
+                owner_key: hot_owner_key.clone(),
+                epoch: 1,
+                owner_isolate_id: 10,
+            },
+        );
+        assert_eq!(queue.blocked_memory_owner_queues(&leases), 1);
+
+        let mut affinity = HashMap::new();
+        affinity.insert(2, 10);
+        affinity.insert(3, 99);
+        let isolate_indices = HashMap::from([(10, 0)]);
+        let shards = queue.memory_shard_debug(&leases, &affinity, &isolate_indices, 1);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].shard_index, 2);
+        assert_eq!(shards[0].queued, 2);
+        assert_eq!(shards[0].blocked_owners, 1);
+        assert_eq!(shards[0].ready_owners, 0);
+        assert_eq!(shards[0].affinity_isolate_id, Some(10));
+        assert!(!shards[0].affinity_stale);
+        assert!(format!("{:?}", shards).contains("shard_index"));
+        assert!(!format!("{:?}", shards).contains(&hot_owner_key));
     }
 
     #[test]

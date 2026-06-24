@@ -2,8 +2,8 @@ use super::*;
 
 const MEMORY_OUTBOX_DRAIN_LIMIT: usize = 64;
 const MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES: usize = 1;
-const MEMORY_OUTBOX_TICK_DRAIN_BATCHES: usize = 4;
 const MEMORY_OUTBOX_LEASE: Duration = Duration::from_secs(30);
+const MEMORY_OUTBOX_WORKER_CHANNEL_CAPACITY: usize = 1024;
 const MEMORY_OUTBOX_EFFECT_KINDS: &[&str] = &[
     "audit.*",
     "socket.send",
@@ -14,9 +14,134 @@ const MEMORY_OUTBOX_EFFECT_KINDS: &[&str] = &[
     "transport.close",
 ];
 
-struct MemoryOutboxDrainResult {
-    processed: usize,
-    saturated: bool,
+pub(super) type MemoryOutboxDrainSender = mpsc::Sender<MemoryOutboxWorkerCommand>;
+pub(super) type MemoryOutboxDrainReceiver = mpsc::Receiver<MemoryOutboxWorkerCommand>;
+
+#[derive(Debug)]
+pub(super) enum MemoryOutboxWorkerCommand {
+    DrainShard { shard_index: usize },
+}
+
+pub(super) fn memory_outbox_worker_channel() -> (MemoryOutboxDrainSender, MemoryOutboxDrainReceiver)
+{
+    mpsc::channel(MEMORY_OUTBOX_WORKER_CHANNEL_CAPACITY)
+}
+
+pub(super) async fn run_memory_outbox_worker(
+    memory_store: MemoryStore,
+    event_tx: RuntimeEventSender,
+    mut receiver: MemoryOutboxDrainReceiver,
+) {
+    while let Some(command) = receiver.recv().await {
+        match command {
+            MemoryOutboxWorkerCommand::DrainShard { shard_index } => {
+                drain_memory_outbox_shard_in_background(
+                    &memory_store,
+                    &event_tx,
+                    shard_index,
+                    MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn drain_memory_outbox_shard_in_background(
+    memory_store: &MemoryStore,
+    event_tx: &RuntimeEventSender,
+    shard_index: usize,
+    max_batches: usize,
+) {
+    for _ in 0..max_batches {
+        let started_at = Instant::now();
+        let claims = match memory_store
+            .claim_due_outbox_records_for_shard_index(
+                shard_index,
+                MEMORY_OUTBOX_DRAIN_LIMIT,
+                MEMORY_OUTBOX_LEASE,
+                MEMORY_OUTBOX_EFFECT_KINDS,
+            )
+            .await
+        {
+            Ok(claims) => claims,
+            Err(error) => {
+                warn!(shard_index, error = %error, "memory outbox shard claim failed");
+                return;
+            }
+        };
+        let claimed = claims.len();
+        let saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
+        memory_store.record_profile(
+            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
+            duration_us(started_at.elapsed()),
+            claimed as u64,
+        );
+
+        if claimed == 0 {
+            let (reply, _reply_rx) = oneshot::channel();
+            let _ = event_tx
+                .send(RuntimeEvent::MemoryOutboxDelivery {
+                    shard_index,
+                    claims,
+                    saturated: false,
+                    reply,
+                })
+                .await;
+            return;
+        }
+
+        let (reply, reply_rx) = oneshot::channel();
+        if let Err(error) = event_tx
+            .send(RuntimeEvent::MemoryOutboxDelivery {
+                shard_index,
+                claims,
+                saturated,
+                reply,
+            })
+            .await
+        {
+            warn!(
+                shard_index,
+                error = %error,
+                "memory outbox delivery event could not be sent"
+            );
+            return;
+        }
+
+        let outcomes = match reply_rx.await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                warn!(
+                    shard_index,
+                    error = %error,
+                    "memory outbox delivery response dropped"
+                );
+                return;
+            }
+        };
+        let ack_started_at = Instant::now();
+        if let Err(error) = memory_store.apply_outbox_delivery_outcomes(&outcomes).await {
+            warn!(
+                shard_index,
+                error = %error,
+                "memory outbox state update failed"
+            );
+            let _ = event_tx
+                .send(RuntimeEvent::MemoryOutboxAckFailed { shard_index })
+                .await;
+            return;
+        }
+        memory_store.record_profile(
+            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
+            duration_us(ack_started_at.elapsed()),
+            outcomes.len() as u64,
+        );
+
+        if !saturated {
+            return;
+        }
+    }
 }
 
 impl WorkerManager {
@@ -30,28 +155,64 @@ impl WorkerManager {
         if !self.pending_memory_outbox_shards.insert(shard_index) {
             return;
         }
-        if let Err(error) = event_tx.try_send(RuntimeEvent::MemoryOutboxDrain { shard_index }) {
+        if let Err(error) = self
+            .memory_outbox_drain_sender
+            .try_send(MemoryOutboxWorkerCommand::DrainShard { shard_index })
+        {
+            self.stats.memory_outbox_channel_full_count = self
+                .stats
+                .memory_outbox_channel_full_count
+                .saturating_add(1);
             warn!(
                 shard_index,
                 error = %error,
-                "memory outbox drain request queued for later retry"
+                "memory outbox worker channel full; drain request queued for later retry"
             );
+        }
+        let _ = event_tx;
+    }
+
+    pub(super) fn schedule_all_memory_outbox_shards(&mut self, event_tx: &RuntimeEventSender) {
+        for shard_index in 0..self.memory_store.namespace_shards().max(1) {
+            self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
         }
     }
 
-    pub(super) async fn drain_scheduled_memory_outbox_shard(
+    pub(super) fn retry_pending_memory_outbox_drains(&mut self) {
+        let pending = self
+            .pending_memory_outbox_shards
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for shard_index in pending {
+            if let Err(error) = self
+                .memory_outbox_drain_sender
+                .try_send(MemoryOutboxWorkerCommand::DrainShard { shard_index })
+            {
+                self.stats.memory_outbox_channel_full_count = self
+                    .stats
+                    .memory_outbox_channel_full_count
+                    .saturating_add(1);
+                warn!(
+                    shard_index,
+                    error = %error,
+                    "memory outbox pending drain retry deferred"
+                );
+            } else {
+                self.stats.memory_outbox_reschedule_count =
+                    self.stats.memory_outbox_reschedule_count.saturating_add(1);
+            }
+        }
+    }
+
+    pub(super) fn handle_memory_outbox_ack_failed(
         &mut self,
         shard_index: usize,
         event_tx: &RuntimeEventSender,
-    ) -> usize {
-        self.pending_memory_outbox_shards.remove(&shard_index);
-        let result = self
-            .drain_memory_outbox_shard_budget(shard_index, MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES)
-            .await;
-        if result.saturated {
-            self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
-        }
-        result.processed
+    ) {
+        self.stats.memory_outbox_ack_failure_count =
+            self.stats.memory_outbox_ack_failure_count.saturating_add(1);
+        self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
     }
 
     fn increment_websocket_session_count(
@@ -301,6 +462,11 @@ impl WorkerManager {
         );
         self.websocket_outbound_frames.remove(session_id);
         self.websocket_close_signals.remove(session_id);
+        if let Some(replies) = self.websocket_pending_frame_replies.remove(session_id) {
+            for WebSocketFrameReply { reply, .. } in replies {
+                let _ = reply.send(Err(PlatformError::not_found("websocket session not found")));
+            }
+        }
 
         let owner_key = memory_owner_key(&session.binding, &session.key);
         let remove_owner_key =
@@ -576,6 +742,7 @@ impl WorkerManager {
                 is_binary: !is_text,
                 payload: message,
             });
+        self.flush_pending_websocket_frame_replies(&session_id);
         self.notify_websocket_frame_waiters(&session_id);
         Ok(())
     }
@@ -596,6 +763,7 @@ impl WorkerManager {
             .ok_or_else(|| PlatformError::not_found("websocket session not found"))?;
         self.websocket_close_signals
             .insert(session_id.clone(), SocketCloseEvent { code, reason });
+        self.flush_pending_websocket_frame_replies(&session_id);
         self.notify_websocket_frame_waiters(&session_id);
         Ok(())
     }
@@ -1074,118 +1242,68 @@ impl WorkerManager {
         let _ = payload.reply.send(Ok(replay));
     }
 
-    pub(super) async fn drain_memory_outbox(&mut self) -> usize {
-        self.drain_memory_outbox_budget(MEMORY_OUTBOX_TICK_DRAIN_BATCHES)
-            .await
-            .processed
-    }
-
-    async fn drain_memory_outbox_budget(&mut self, max_batches: usize) -> MemoryOutboxDrainResult {
-        let started_at = Instant::now();
-        let mut processed = 0usize;
-        let mut saturated = false;
-        for _ in 0..max_batches {
-            let claims = match self
-                .memory_store
-                .claim_due_outbox_records(
-                    MEMORY_OUTBOX_DRAIN_LIMIT,
-                    MEMORY_OUTBOX_LEASE,
-                    MEMORY_OUTBOX_EFFECT_KINDS,
-                )
-                .await
-            {
-                Ok(claims) => claims,
-                Err(error) => {
-                    warn!(error = %error, "memory outbox claim failed");
-                    return MemoryOutboxDrainResult {
-                        processed,
-                        saturated: false,
-                    };
-                }
-            };
-            let claimed = claims.len();
-            if claimed == 0 {
-                saturated = false;
-                break;
-            }
-            processed = processed.saturating_add(claimed);
-            self.deliver_memory_outbox_claims(claims).await;
-            saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
-            if !saturated {
-                break;
-            }
-        }
-        self.memory_store.record_profile(
-            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
-            duration_us(started_at.elapsed()),
-            processed as u64,
-        );
-        MemoryOutboxDrainResult {
-            processed,
-            saturated,
-        }
-    }
-
-    async fn drain_memory_outbox_shard_budget(
+    pub(super) fn handle_memory_outbox_delivery(
         &mut self,
         shard_index: usize,
-        max_batches: usize,
-    ) -> MemoryOutboxDrainResult {
-        let started_at = Instant::now();
-        let mut processed = 0usize;
-        let mut saturated = false;
-        for _ in 0..max_batches {
-            let claims = match self
-                .memory_store
-                .claim_due_outbox_records_for_shard_index(
-                    shard_index,
-                    MEMORY_OUTBOX_DRAIN_LIMIT,
-                    MEMORY_OUTBOX_LEASE,
-                    MEMORY_OUTBOX_EFFECT_KINDS,
-                )
-                .await
-            {
-                Ok(claims) => claims,
-                Err(error) => {
-                    warn!(shard_index, error = %error, "memory outbox shard claim failed");
-                    break;
+        claims: Vec<MemoryOutboxClaim>,
+        saturated: bool,
+        reply: oneshot::Sender<Vec<MemoryOutboxDeliveryOutcome>>,
+        event_tx: &RuntimeEventSender,
+    ) {
+        self.pending_memory_outbox_shards.remove(&shard_index);
+        self.stats.memory_outbox_claim_batch_count =
+            self.stats.memory_outbox_claim_batch_count.saturating_add(1);
+        self.stats.memory_outbox_claim_row_count = self
+            .stats
+            .memory_outbox_claim_row_count
+            .saturating_add(claims.len() as u64);
+        if saturated {
+            self.stats.memory_outbox_saturated_batch_count = self
+                .stats
+                .memory_outbox_saturated_batch_count
+                .saturating_add(1);
+        }
+        let outcomes = self.deliver_memory_outbox_claims(claims);
+        for outcome in &outcomes {
+            match outcome.action {
+                MemoryOutboxDeliveryAction::Delivered => {
+                    self.stats.memory_outbox_delivery_success_count = self
+                        .stats
+                        .memory_outbox_delivery_success_count
+                        .saturating_add(1);
                 }
-            };
-            let claimed = claims.len();
-            if claimed == 0 {
-                saturated = false;
-                break;
-            }
-            processed = processed.saturating_add(claimed);
-            self.deliver_memory_outbox_claims(claims).await;
-            saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
-            if !saturated {
-                break;
+                MemoryOutboxDeliveryAction::DroppedTerminal => {
+                    self.stats.memory_outbox_terminal_drop_count = self
+                        .stats
+                        .memory_outbox_terminal_drop_count
+                        .saturating_add(1);
+                }
+                MemoryOutboxDeliveryAction::Retry { .. } => {
+                    self.stats.memory_outbox_delivery_retry_count = self
+                        .stats
+                        .memory_outbox_delivery_retry_count
+                        .saturating_add(1);
+                }
             }
         }
-        self.memory_store.record_profile(
-            MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
-            duration_us(started_at.elapsed()),
-            processed as u64,
-        );
-        MemoryOutboxDrainResult {
-            processed,
-            saturated,
+        let _ = reply.send(outcomes);
+        if saturated {
+            self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
         }
     }
 
-    async fn deliver_memory_outbox_claims(&mut self, claims: Vec<MemoryOutboxClaim>) {
+    fn deliver_memory_outbox_claims(
+        &mut self,
+        claims: Vec<MemoryOutboxClaim>,
+    ) -> Vec<MemoryOutboxDeliveryOutcome> {
+        let mut outcomes = Vec::with_capacity(claims.len());
         for claim in claims {
             let effect_id = claim.record.effect_id.clone();
             let namespace = claim.namespace.clone();
             let memory_key = claim.memory_key.clone();
             let delivery = self.deliver_memory_outbox_claim(&claim);
-            let store_result = match delivery {
-                Ok(()) => {
-                    self.memory_store
-                        .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
-                        .await
-                }
+            let action = match delivery {
+                Ok(()) => MemoryOutboxDeliveryAction::Delivered,
                 Err(error) if is_terminal_memory_outbox_delivery_error(&error) => {
                     warn!(
                         namespace = %namespace,
@@ -1195,9 +1313,7 @@ impl WorkerManager {
                         error = %error,
                         "memory outbox effect dropped"
                     );
-                    self.memory_store
-                        .mark_outbox_delivered(&namespace, &memory_key, &effect_id)
-                        .await
+                    MemoryOutboxDeliveryAction::DroppedTerminal
                 }
                 Err(error) => {
                     let retry_after = memory_outbox_retry_after(claim.record.attempt_count);
@@ -1209,21 +1325,17 @@ impl WorkerManager {
                         error = %error,
                         "memory outbox delivery failed"
                     );
-                    self.memory_store
-                        .retry_outbox_record(&namespace, &memory_key, &effect_id, retry_after)
-                        .await
+                    MemoryOutboxDeliveryAction::Retry { retry_after }
                 }
             };
-            if let Err(error) = store_result {
-                warn!(
-                    namespace = %namespace,
-                    memory_key = %memory_key,
-                    effect_id = %effect_id,
-                    error = %error,
-                    "memory outbox state update failed"
-                );
-            }
+            outcomes.push(MemoryOutboxDeliveryOutcome {
+                namespace,
+                memory_key,
+                effect_id,
+                action,
+            });
         }
+        outcomes
     }
 
     fn deliver_memory_outbox_claim(&mut self, claim: &MemoryOutboxClaim) -> Result<()> {

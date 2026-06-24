@@ -78,7 +78,7 @@ export default {
 
 ## Memory namespaces
 
-Memory namespace is the main coordination primitive. You pick a key, get the actor for that key, and run a synchronous `atomic(...)` command against it. Commands for one key are ordered, the callback runs once, and state plus emitted effects commit together.
+Memory namespace is the main coordination primitive. You pick a key, get the coordinator for that key, and run a synchronous `atomic(...)` command against it. Commands for one key are ordered, the callback runs once, and state plus emitted effects commit together.
 
 Deploy with memory binding:
 
@@ -112,7 +112,7 @@ export default {
 };
 ```
 
-This is the closest thing to Durable Objects, but the model is different. You are not instantiating a long-lived object class with a special lifecycle. You are sending ordered commands to a durable keyed actor.
+This is the closest thing to Durable Objects, but the model is different. You are not instantiating a long-lived object class with a special lifecycle. You are sending ordered commands to a durable keyed coordinator.
 
 ## KV
 

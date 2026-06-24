@@ -23,7 +23,8 @@ use crate::engine::{
 };
 use crate::kv::KvStore;
 use crate::memory::{
-    stable_memory_shard_index, MemoryOutboxClaim, MemoryProfileMetricKind, MemoryStore,
+    stable_memory_shard_index, MemoryOutboxClaim, MemoryOutboxDeliveryAction,
+    MemoryOutboxDeliveryOutcome, MemoryProfileMetricKind, MemoryStore,
 };
 use crate::memory_rpc::{
     decode_memory_invoke_request, decode_memory_invoke_response, encode_memory_invoke_request,
@@ -72,15 +73,19 @@ use self::config::{
     MAX_DYNAMIC_HOST_RPC_ARG_BYTES, MAX_DYNAMIC_HOST_RPC_METHODS, MAX_DYNAMIC_HOST_RPC_REPLY_BYTES,
 };
 use self::control::RuntimeEvent;
+use self::sessions::{
+    memory_outbox_worker_channel, run_memory_outbox_worker, MemoryOutboxDrainSender,
+};
 type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
 type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
 type AssetCatalogSnapshot = Arc<StdMutex<Arc<HashMap<String, Arc<AssetCatalogEntry>>>>>;
 pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
     DynamicDeployResult, DynamicHandleDebug, DynamicRuntimeDebugDump, HostRpcProviderDebug,
-    InvokeRequestBodyReceiver, PublicRouteAssetResolution, RuntimeConfig, RuntimeService,
-    RuntimeServiceConfig, RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump,
-    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug, MemoryShardDebug,
+    PublicRouteAssetResolution, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
+    RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
+    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };
 
 #[derive(Clone, Default)]

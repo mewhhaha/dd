@@ -1263,7 +1263,7 @@ async fn memory_direct_writes_preserve_distinct_memory_updates() {
 
 #[tokio::test]
 #[serial]
-async fn memory_actor_set_write_uses_owner_validated_batch_path() {
+async fn memory_coordinated_set_write_uses_owner_validated_batch_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1303,12 +1303,12 @@ async fn memory_actor_set_write_uses_owner_validated_batch_path() {
         .invoke(
             "memory".to_string(),
             test_invocation_with_path(
-                "/actor-set-write?key=user-set-actor&value=7",
+                "/atomic-set-write?key=user-set-memory&value=7",
                 "memory-set-write",
             ),
         )
         .await
-        .expect("actor set write should succeed");
+        .expect("memory set write should succeed");
     assert_eq!(write.status, 200);
     assert_eq!(String::from_utf8(write.body).expect("utf8"), "7");
 
@@ -1340,7 +1340,7 @@ async fn memory_actor_set_write_uses_owner_validated_batch_path() {
 
 #[tokio::test]
 #[serial]
-async fn memory_actor_read_write_uses_owner_validated_batch_path() {
+async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1371,7 +1371,7 @@ async fn memory_actor_read_write_uses_owner_validated_batch_path() {
     service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/seed?key=user-mixed-actor", "memory-mixed-seed"),
+            test_invocation_with_path("/seed?key=user-mixed-memory", "memory-mixed-seed"),
         )
         .await
         .expect("seed should succeed");
@@ -1388,12 +1388,12 @@ async fn memory_actor_read_write_uses_owner_validated_batch_path() {
         .invoke(
             "memory".to_string(),
             test_invocation_with_path(
-                "/actor-read-write?key=user-mixed-actor&value=9",
+                "/atomic-read-write?key=user-mixed-memory&value=9",
                 "memory-mixed-write",
             ),
         )
         .await
-        .expect("actor read/write should succeed");
+        .expect("memory read/write should succeed");
     assert_eq!(write.status, 200);
     assert_eq!(String::from_utf8(write.body).expect("utf8"), "0->9");
 
@@ -1425,7 +1425,7 @@ async fn memory_actor_read_write_uses_owner_validated_batch_path() {
 
 #[tokio::test]
 #[serial]
-async fn memory_actor_owner_epoch_survives_runtime_restart() {
+async fn memory_owner_epoch_survives_runtime_restart() {
     let root = PathBuf::from(format!("/tmp/dd-memory-owner-epoch-{}", Uuid::new_v4()));
     let db_path = root.join("dd-test.db");
     let database_url = format!("file:{}", db_path.display());
@@ -1460,12 +1460,12 @@ async fn memory_actor_owner_epoch_survives_runtime_restart() {
         .invoke(
             "memory".to_string(),
             test_invocation_with_path(
-                "/actor-set-write?key=user-owner-restart&value=7",
+                "/atomic-set-write?key=user-owner-restart&value=7",
                 "memory-owner-first",
             ),
         )
         .await
-        .expect("first actor write should succeed");
+        .expect("first memory write should succeed");
     assert_eq!(first.status, 200);
     assert_eq!(String::from_utf8(first.body).expect("utf8"), "7");
     service.shutdown().await.expect("service should shut down");
@@ -1475,12 +1475,12 @@ async fn memory_actor_owner_epoch_survives_runtime_restart() {
         .invoke(
             "memory".to_string(),
             test_invocation_with_path(
-                "/actor-set-write?key=user-owner-restart&value=8",
+                "/atomic-set-write?key=user-owner-restart&value=8",
                 "memory-owner-second",
             ),
         )
         .await
-        .expect("second actor write after restart should succeed");
+        .expect("second memory write after restart should succeed");
     assert_eq!(second.status, 200);
     assert_eq!(String::from_utf8(second.body).expect("utf8"), "8");
 
@@ -1583,7 +1583,7 @@ async fn memory_direct_read_uses_point_read_lane() {
 
 #[tokio::test]
 #[serial]
-async fn memory_read_only_atomic_uses_actor_snapshot_without_commit() {
+async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1790,7 +1790,7 @@ async fn memory_multikey_direct_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn memory_multikey_actor_reads_complete_after_warmup() {
+async fn memory_multikey_coordinated_reads_complete_after_warmup() {
     let service = test_service(RuntimeConfig {
         min_isolates: 4,
         max_isolates: 4,
@@ -1820,7 +1820,7 @@ async fn memory_multikey_actor_reads_complete_after_warmup() {
     service
         .invoke(
             "memory-multi-key".to_string(),
-            test_invocation_with_path("/seed-all?keys=8", "multi-key-actor-seed"),
+            test_invocation_with_path("/seed-all?keys=8", "multi-key-coordinated-seed"),
         )
         .await
         .expect("seed should succeed");
@@ -1828,10 +1828,10 @@ async fn memory_multikey_actor_reads_complete_after_warmup() {
     let warmed = service
         .invoke(
             "memory-multi-key".to_string(),
-            test_invocation_with_path("/actor-sum?keys=8", "multi-key-actor-warm"),
+            test_invocation_with_path("/atomic-sum?keys=8", "multi-key-coordinated-warm"),
         )
         .await
-        .expect("warm actor sum should succeed");
+        .expect("warm memory sum should succeed");
     assert_eq!(String::from_utf8(warmed.body).expect("utf8"), "8");
 
     let mut tasks = Vec::new();
@@ -1843,8 +1843,8 @@ async fn memory_multikey_actor_reads_complete_after_warmup() {
                 service.invoke(
                     "memory-multi-key".to_string(),
                     test_invocation_with_path(
-                        "/actor-sum?keys=8",
-                        &format!("multi-key-actor-{idx}"),
+                        "/atomic-sum?keys=8",
+                        &format!("multi-key-coordinated-{idx}"),
                     ),
                 ),
             )
@@ -1855,8 +1855,8 @@ async fn memory_multikey_actor_reads_complete_after_warmup() {
         let output = task
             .await
             .expect("join")
-            .expect("actor sum should not hang")
-            .expect("actor sum invoke should succeed");
+            .expect("memory sum should not hang")
+            .expect("memory sum invoke should succeed");
         assert_eq!(output.status, 200);
         assert_eq!(String::from_utf8(output.body).expect("utf8"), "8");
     }
@@ -1864,7 +1864,7 @@ async fn memory_multikey_actor_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn memory_actor_benchmark_worker_returns_correct_total() {
+async fn memory_coordinated_benchmark_worker_returns_correct_total() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 2,
@@ -2064,6 +2064,27 @@ async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
     .expect("atomic write total should succeed");
     assert_eq!(total.status, 200);
     assert_eq!(String::from_utf8(total.body).expect("utf8"), "65");
+
+    let stats = service
+        .stats("memory-atomic-write-threshold".to_string())
+        .await
+        .expect("stats should exist");
+    assert!(stats.memory_candidate_heads_inspected_count >= 64);
+    let dispatch_route_count = stats
+        .memory_affinity_hit_count
+        .saturating_add(stats.memory_least_loaded_fallback_count)
+        .saturating_add(stats.memory_atomic_overflow_dispatch_count);
+    assert!(dispatch_route_count > 0);
+    assert!(stats.memory_affinity_hit_count > 0 || stats.memory_affinity_miss_no_mapping_count > 0);
+    let dump = service
+        .debug_dump("memory-atomic-write-threshold".to_string())
+        .await
+        .expect("debug dump should exist");
+    assert_eq!(
+        dump.memory_scheduler.candidate_heads_inspected_count,
+        stats.memory_candidate_heads_inspected_count
+    );
+    assert!(!format!("{:?}", dump.memory_scheduler).contains("bench-0"));
 }
 
 #[tokio::test]
@@ -2284,7 +2305,7 @@ async fn hosted_memory_allows_inline_closures() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_actor_single_read_is_point_in_time_only() {
+async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -2314,7 +2335,7 @@ async fn hosted_memory_actor_single_read_is_point_in_time_only() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/actor/seed?key=user-actor-once", "actor-seed-once"),
+            test_invocation_with_path("/atomic/seed?key=user-memory-once", "atomic-seed-once"),
         )
         .await
         .expect("seed should succeed");
@@ -2326,8 +2347,8 @@ async fn hosted_memory_actor_single_read_is_point_in_time_only() {
                 .invoke(
                     "hosted-memory".to_string(),
                     test_invocation_with_path(
-                        "/actor/read-once?key=user-actor-once",
-                        "actor-read-once",
+                        "/atomic/read-once?key=user-memory-once",
+                        "atomic-read-once",
                     ),
                 )
                 .await
@@ -2340,8 +2361,8 @@ async fn hosted_memory_actor_single_read_is_point_in_time_only() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/actor/write-a?key=user-actor-once&value=1",
-                "actor-write-once",
+                "/atomic/write-a?key=user-memory-once&value=1",
+                "atomic-write-once",
             ),
         )
         .await
@@ -2356,7 +2377,7 @@ async fn hosted_memory_actor_single_read_is_point_in_time_only() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_actor_read_command_does_not_replay_when_prior_read_goes_stale() {
+async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_goes_stale() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 3,
@@ -2386,7 +2407,7 @@ async fn hosted_memory_actor_read_command_does_not_replay_when_prior_read_goes_s
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/actor/seed?key=user-actor-pair", "actor-seed-pair"),
+            test_invocation_with_path("/atomic/seed?key=user-memory-pair", "atomic-seed-pair"),
         )
         .await
         .expect("seed should succeed");
@@ -2398,8 +2419,8 @@ async fn hosted_memory_actor_read_command_does_not_replay_when_prior_read_goes_s
                 .invoke(
                     "hosted-memory".to_string(),
                     test_invocation_with_path(
-                        "/actor/read-pair?key=user-actor-pair",
-                        "actor-read-pair",
+                        "/atomic/read-pair?key=user-memory-pair",
+                        "atomic-read-pair",
                     ),
                 )
                 .await
@@ -2420,8 +2441,8 @@ async fn hosted_memory_actor_read_command_does_not_replay_when_prior_read_goes_s
                     .invoke(
                         "hosted-memory".to_string(),
                         test_invocation_with_path(
-                            "/actor/write-a?key=user-actor-pair&value=1",
-                            "actor-write-pair",
+                            "/atomic/write-a?key=user-memory-pair&value=1",
+                            "atomic-write-pair",
                         ),
                     )
                     .await
@@ -2440,7 +2461,7 @@ async fn hosted_memory_actor_read_command_does_not_replay_when_prior_read_goes_s
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_actor_snapshot_read_executes_once() {
+async fn hosted_memory_coordinated_snapshot_read_executes_once() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 3,
@@ -2470,7 +2491,7 @@ async fn hosted_memory_actor_snapshot_read_executes_once() {
     service
         .invoke(
             "hosted-memory".to_string(),
-            test_invocation_with_path("/actor/seed?key=user-actor-allow", "actor-seed-allow"),
+            test_invocation_with_path("/atomic/seed?key=user-memory-allow", "atomic-seed-allow"),
         )
         .await
         .expect("seed should succeed");
@@ -2482,8 +2503,8 @@ async fn hosted_memory_actor_snapshot_read_executes_once() {
                 .invoke(
                     "hosted-memory".to_string(),
                     test_invocation_with_path(
-                        "/actor/read-pair-snapshot?key=user-actor-allow",
-                        "actor-read-allow",
+                        "/atomic/read-pair-snapshot?key=user-memory-allow",
+                        "atomic-read-allow",
                     ),
                 )
                 .await
@@ -2496,8 +2517,8 @@ async fn hosted_memory_actor_snapshot_read_executes_once() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/actor/write-a?key=user-actor-allow&value=1",
-                "actor-write-allow",
+                "/atomic/write-a?key=user-memory-allow&value=1",
+                "atomic-write-allow",
             ),
         )
         .await
@@ -2543,7 +2564,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/actor/tvar-default/read?key=user-1",
+                "/atomic/tvar-default/read?key=user-1",
                 "hosted-memory-tvar-default-read",
             ),
         )
@@ -2555,7 +2576,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/actor/tvar-default/raw?key=user-1",
+                "/atomic/tvar-default/raw?key=user-1",
                 "hosted-memory-tvar-default-raw-before-write",
             ),
         )
@@ -2570,7 +2591,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/actor/tvar-default/write?key=user-1",
+                "/atomic/tvar-default/write?key=user-1",
                 "hosted-memory-tvar-default-write",
             ),
         )
@@ -2582,7 +2603,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/actor/tvar-default/raw?key=user-1",
+                "/atomic/tvar-default/raw?key=user-1",
                 "hosted-memory-tvar-default-raw-after-write",
             ),
         )

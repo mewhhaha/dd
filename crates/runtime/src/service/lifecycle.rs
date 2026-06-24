@@ -1075,13 +1075,49 @@ impl WorkerManager {
     pub(crate) fn worker_stats(&self, worker_name: &str) -> Option<WorkerStats> {
         let entry = self.workers.get(worker_name)?;
         let pool = entry.pools.get(&entry.current_generation)?;
-        Some(pool.stats_snapshot())
+        let mut stats = pool.stats_snapshot();
+        stats.pending_memory_outbox_shards = self.pending_memory_outbox_shards.len();
+        stats.max_queued_requests_per_worker = self.config.max_queued_requests_per_worker;
+        stats.max_global_queued_bytes = self.config.max_global_queued_bytes;
+        stats.runtime_ready_work_budget_exhausted_count =
+            self.stats.ready_work_budget_exhausted_count;
+        stats.runtime_max_ready_work_batch_size = self.stats.max_ready_work_batch_size;
+        stats.memory_outbox_claim_batch_count = self.stats.memory_outbox_claim_batch_count;
+        stats.memory_outbox_claim_row_count = self.stats.memory_outbox_claim_row_count;
+        stats.memory_outbox_saturated_batch_count = self.stats.memory_outbox_saturated_batch_count;
+        stats.memory_outbox_delivery_success_count =
+            self.stats.memory_outbox_delivery_success_count;
+        stats.memory_outbox_delivery_retry_count = self.stats.memory_outbox_delivery_retry_count;
+        stats.memory_outbox_terminal_drop_count = self.stats.memory_outbox_terminal_drop_count;
+        stats.memory_outbox_ack_failure_count = self.stats.memory_outbox_ack_failure_count;
+        stats.memory_outbox_channel_full_count = self.stats.memory_outbox_channel_full_count;
+        stats.memory_outbox_reschedule_count = self.stats.memory_outbox_reschedule_count;
+        Some(stats)
     }
 
     pub(crate) fn worker_debug_dump(&self, worker_name: &str) -> Option<WorkerDebugDump> {
         let entry = self.workers.get(worker_name)?;
         let pool = entry.pools.get(&entry.current_generation)?;
-        Some(pool.debug_dump())
+        let mut dump = pool.debug_dump();
+        dump.memory_scheduler.max_queued_requests_per_worker =
+            self.config.max_queued_requests_per_worker;
+        dump.memory_scheduler.max_global_queued_bytes = self.config.max_global_queued_bytes;
+        dump.memory_scheduler
+            .runtime_ready_work_budget_exhausted_count =
+            self.stats.ready_work_budget_exhausted_count;
+        dump.memory_scheduler.runtime_max_ready_work_batch_size =
+            self.stats.max_ready_work_batch_size;
+        dump.memory_outbox.pending_scheduled_shards = self.pending_memory_outbox_shards.len();
+        dump.memory_outbox.claim_batch_count = self.stats.memory_outbox_claim_batch_count;
+        dump.memory_outbox.claim_row_count = self.stats.memory_outbox_claim_row_count;
+        dump.memory_outbox.saturated_batch_count = self.stats.memory_outbox_saturated_batch_count;
+        dump.memory_outbox.delivery_success_count = self.stats.memory_outbox_delivery_success_count;
+        dump.memory_outbox.delivery_retry_count = self.stats.memory_outbox_delivery_retry_count;
+        dump.memory_outbox.terminal_drop_count = self.stats.memory_outbox_terminal_drop_count;
+        dump.memory_outbox.ack_failure_count = self.stats.memory_outbox_ack_failure_count;
+        dump.memory_outbox.channel_full_count = self.stats.memory_outbox_channel_full_count;
+        dump.memory_outbox.reschedule_count = self.stats.memory_outbox_reschedule_count;
+        Some(dump)
     }
 
     pub(crate) fn dynamic_debug_dump(&self) -> DynamicRuntimeDebugDump {

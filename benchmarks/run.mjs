@@ -1,33 +1,63 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { cpus } from "node:os";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
-
-const repoRoot = resolve(new URL("..", import.meta.url).pathname);
-const configsDir = join(repoRoot, "benchmarks", "configs");
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import {
+  discoverConfigs,
+  expandConfigs,
+  parseArgs,
+  parseConfigEnv,
+  planRun,
+  renderPlan,
+  repoRoot,
+  validateRunBudget,
+} from "./lib/runner-config.mjs";
 
 const options = parseArgs(process.argv.slice(2));
-const configs = await expandConfigs(await discoverConfigs(options.configs));
+if (options.help) {
+  printHelp();
+  process.exit(0);
+}
+const discovered = await discoverConfigs(options.configs, { configsDirectory: options.configsDir });
+const configs = await expandConfigs(discovered.configs);
 
 if (options.list) {
   for (const config of configs) {
     console.log(config.name);
   }
+  if (discovered.skippedOptIn.length > 0) {
+    console.error(`[bench] skipped opt-in configs: ${discovered.skippedOptIn.join(", ")}`);
+  }
   process.exit(0);
 }
 
 const startedAt = new Date().toISOString();
+const outputPath = options.output
+  ? resolve(repoRoot, options.output)
+  : join(repoRoot, "benchmarks", "results", `${startedAt.replace(/[:.]/g, "-")}.json`);
+const plan = planRun(configs, options, relativePath(outputPath));
+if (options.plan) {
+  process.stdout.write(renderPlan(plan, discovered.skippedOptIn));
+  process.exit(0);
+}
+if (discovered.skippedOptIn.length > 0) {
+  console.error(`[bench] skipped opt-in configs: ${discovered.skippedOptIn.join(", ")}`);
+}
+validateRunBudget(plan, options);
+
 const run = {
   schema_version: 1,
   started_at: startedAt,
   metadata: collectMetadata(),
   sample_count: options.samples,
+  complete: true,
+  failures: [],
   configs: [],
 };
 
 for (const config of configs) {
-  const script = config.script ?? (await readFile(config.path, "utf8"));
+  const script = config.script;
   const env = { ...parseConfigEnv(script), ...(config.envOverrides ?? {}) };
   const configRun = {
     name: config.name,
@@ -42,50 +72,42 @@ for (const config of configs) {
     console.error(`[bench] ${config.name} sample ${index}/${options.samples}`);
     const sample = await runConfig(config.path, index, config.envOverrides ?? {});
     configRun.samples.push(sample);
+    if (sample.status !== 0 || sample.signal) {
+      run.complete = false;
+      const failure = {
+        config: config.name,
+        sample: index,
+        status: sample.status,
+        signal: sample.signal,
+      };
+      run.failure ??= failure;
+      run.failures.push(failure);
+      if (options.keepGoing) {
+        continue;
+      }
+      await writeRun(outputPath, run);
+      console.error(
+        `[bench] failed ${config.name} sample ${index}: status=${sample.status} signal=${sample.signal}; partial output written to ${relativePath(outputPath)}`,
+      );
+      throw new Error(
+        `benchmark failed: ${config.name} sample ${index} status=${sample.status} signal=${sample.signal}`,
+      );
+    }
   }
 
   configRun.summaries = summarizeSamples(configRun.samples, env);
 }
 
-const outputPath = options.output
-  ? resolve(repoRoot, options.output)
-  : join(repoRoot, "benchmarks", "results", `${startedAt.replace(/[:.]/g, "-")}.json`);
-await mkdir(dirname(outputPath), { recursive: true });
-await writeFile(outputPath, `${JSON.stringify(run, null, 2)}\n`);
+await writeRun(outputPath, run);
 console.log(relativePath(outputPath));
 
-function parseArgs(args) {
-  const parsed = {
-    samples: Number(process.env.BENCH_SAMPLES ?? 3),
-    output: null,
-    configs: [],
-    list: false,
-  };
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (arg === "--samples") {
-      parsed.samples = Number(args[++index]);
-    } else if (arg === "--out") {
-      parsed.output = args[++index];
-    } else if (arg === "--config") {
-      parsed.configs.push(args[++index]);
-    } else if (arg === "--list") {
-      parsed.list = true;
-    } else if (arg === "--help" || arg === "-h") {
-      printHelp();
-      process.exit(0);
-    } else {
-      throw new Error(`unknown argument: ${arg}`);
-    }
-  }
-  if (!Number.isInteger(parsed.samples) || parsed.samples < 1) {
-    throw new Error("--samples must be a positive integer");
-  }
-  return parsed;
+async function writeRun(outputPath, run) {
+  await mkdir(dirname(outputPath), { recursive: true });
+  await writeFile(outputPath, `${JSON.stringify(run, null, 2)}\n`);
 }
 
 function printHelp() {
-  console.log(`Usage: node benchmarks/run.mjs [--samples N] [--config NAME] [--out PATH]
+  console.log(`Usage: node benchmarks/run.mjs [--samples N] [--config NAME] [--out PATH] [--plan] [--max-runs N] [--allow-large-run]
 
 Runs benchmark config scripts, captures raw output, parses standard result rows,
 computes medians, and writes JSON. Pass --config more than once to select a
@@ -93,118 +115,9 @@ subset; values may be script names or paths under benchmarks/configs.
 
 Configs may define DD_BENCH_MATRIX_* variables. The runner expands those into
 one sampled config per matrix combination and passes selected values as
-environment overrides to the config script.`);
-}
-
-async function discoverConfigs(selected) {
-  const entries = await readdir(configsDir);
-  const all = entries
-    .filter((entry) => entry.endsWith(".sh"))
-    .sort()
-    .map((entry) => ({
-      name: entry,
-      path: join(configsDir, entry),
-    }));
-  if (selected.length === 0) {
-    return all;
-  }
-  const selectedNames = new Set(selected.map((value) => basename(value)));
-  return all.filter((config) => selectedNames.has(config.name));
-}
-
-async function expandConfigs(configs) {
-  const expanded = [];
-  for (const config of configs) {
-    const script = await readFile(config.path, "utf8");
-    const env = parseConfigEnv(script);
-    for (const variant of expandMatrixVariants(env)) {
-      expanded.push({
-        ...config,
-        script,
-        name:
-          variant.labels.length === 0
-            ? config.name
-            : `${config.name}::${variant.labels.join(",")}`,
-        envOverrides: variant.envOverrides,
-      });
-    }
-  }
-  return expanded;
-}
-
-function expandMatrixVariants(env) {
-  const dimensions = [];
-  const isolates = envList(process.env.DD_BENCH_MATRIX_ISOLATES ?? env.DD_BENCH_MATRIX_ISOLATES);
-  if (isolates.length > 0) {
-    dimensions.push(
-      isolates.map((value) => ({
-        label: `isolates=${value}`,
-        env: {
-          DD_BENCH_MIN_ISOLATES: value,
-          DD_BENCH_MAX_ISOLATES: value,
-        },
-      })),
-    );
-  }
-
-  const memoryShards = envList(
-    process.env.DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS ??
-      env.DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS,
-  );
-  if (memoryShards.length > 0) {
-    dimensions.push(
-      memoryShards.map((value) => ({
-        label: `shards=${value}`,
-        env: { DD_BENCH_MEMORY_NAMESPACE_SHARDS: value },
-      })),
-    );
-  }
-
-  const keyModes = envList(process.env.DD_BENCH_MATRIX_KEY_MODES ?? env.DD_BENCH_MATRIX_KEY_MODES);
-  if (keyModes.length > 0) {
-    dimensions.push(
-      keyModes.map((value) => ({
-        label: `keys=${value}`,
-        env: { DD_BENCH_MEMORY_KEY_MODE: value },
-      })),
-    );
-  }
-
-  const modes = envList(process.env.DD_BENCH_MATRIX_MODES ?? env.DD_BENCH_MATRIX_MODES);
-  if (modes.length > 0) {
-    dimensions.push(
-      modes.map((value) => ({
-        label: `mode=${value}`,
-        env: { DD_BENCH_MODE: value },
-      })),
-    );
-  }
-
-  if (dimensions.length === 0) {
-    return [{ labels: [], envOverrides: {} }];
-  }
-
-  let variants = [{ labels: [], envOverrides: {} }];
-  for (const dimension of dimensions) {
-    const next = [];
-    for (const variant of variants) {
-      for (const entry of dimension) {
-        next.push({
-          labels: [...variant.labels, entry.label],
-          envOverrides: { ...variant.envOverrides, ...entry.env },
-        });
-      }
-    }
-    variants = next;
-  }
-  return variants;
-}
-
-function envList(value) {
-  return (value ?? "")
-    .split(/[,\s]+/)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+environment overrides to the config script. Matrix configs marked
+DD_BENCH_MATRIX_OPT_IN=1 are skipped unless explicitly selected. Use --plan to
+inspect variants without spawning child processes.`);
 }
 
 function collectMetadata() {
@@ -237,33 +150,12 @@ function commandStatus(command, args) {
   return result.status ?? (result.signal ? 128 : 1);
 }
 
-function parseConfigEnv(script) {
-  const env = {};
-  for (const line of script.split(/\r?\n/)) {
-    const trimmed = line.trim().replace(/\\$/, "").trim();
-    const defaultMatch =
-      /^([A-Z][A-Z0-9_]*)=(?:"\$\{[A-Z][A-Z0-9_]*:-([^}]*)\}"|\$\{[A-Z][A-Z0-9_]*:-([^}]*)\})$/.exec(
-        trimmed,
-      );
-    if (defaultMatch) {
-      env[defaultMatch[1]] = defaultMatch[2] ?? defaultMatch[3] ?? "";
-      continue;
-    }
-    const match = /^([A-Z][A-Z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^ \t]+))$/.exec(trimmed);
-    if (!match) {
-      continue;
-    }
-    env[match[1]] = match[2] ?? match[3] ?? match[4];
-  }
-  return env;
-}
-
 async function runConfig(path, sample, envOverrides) {
   const startedAt = new Date().toISOString();
   const started = performance.now();
   const child = spawn("bash", [path], {
     cwd: repoRoot,
-    env: { ...process.env, ...envOverrides },
+    env: { ...process.env, BENCH_SAMPLE: String(sample), ...envOverrides },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";

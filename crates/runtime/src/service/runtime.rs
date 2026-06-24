@@ -17,6 +17,7 @@ pub(super) fn select_dispatch_candidate(
     let isolate_indices = &pool.isolate_indices;
     let memory_entity_leases = &pool.memory_entity_leases;
     let memory_shard_affinity = &pool.memory_shard_affinity;
+    let mut attempt_stats = DispatchAttemptStats::default();
 
     if let Some(selection) =
         pool.queue
@@ -25,6 +26,9 @@ pub(super) fn select_dispatch_candidate(
                     .target_isolate_id
                     .expect("targeted nested queue entries must have a target isolate");
                 if memory_atomic_route_is_active(memory_entity_leases, pending) {
+                    attempt_stats.memory_candidate_rejected_owner_lease_count = attempt_stats
+                        .memory_candidate_rejected_owner_lease_count
+                        .saturating_add(1);
                     return None;
                 }
                 if let Some(isolate_idx) = target_isolate_idx(isolate_indices, target_isolate_id) {
@@ -34,6 +38,9 @@ pub(super) fn select_dispatch_candidate(
                             isolate_idx,
                         }))
                     } else {
+                        attempt_stats.memory_candidate_rejected_isolate_state_count = attempt_stats
+                            .memory_candidate_rejected_isolate_state_count
+                            .saturating_add(1);
                         None
                     }
                 } else {
@@ -41,10 +48,11 @@ pub(super) fn select_dispatch_candidate(
                 }
             })
     {
+        pool.stats.record_dispatch_attempt(attempt_stats);
         return Some(selection);
     }
 
-    pool.queue.find_fair_map(
+    let selection = pool.queue.find_fair_map(
         [
             PendingQueueLane::Targeted,
             PendingQueueLane::Memory,
@@ -66,29 +74,72 @@ pub(super) fn select_dispatch_candidate(
                     });
                 }
 
+                attempt_stats.memory_candidate_heads_inspected_count = attempt_stats
+                    .memory_candidate_heads_inspected_count
+                    .saturating_add(1);
                 if memory_atomic_route_is_active(memory_entity_leases, pending) {
+                    attempt_stats.memory_candidate_rejected_owner_lease_count = attempt_stats
+                        .memory_candidate_rejected_owner_lease_count
+                        .saturating_add(1);
                     return None;
                 }
-                let isolate_idx = memory_route_is_atomic(pending)
-                    .then(|| {
-                        memory_shard_affinity_isolate_idx(
-                            isolates,
-                            isolate_indices,
-                            memory_shard_affinity,
-                            pending,
-                            max_inflight,
-                            require_wait_until_idle,
-                        )
-                    })
-                    .flatten()
-                    .or_else(|| {
-                        least_loaded_isolate_idx(isolates, max_inflight, require_wait_until_idle)
-                    })
-                    .or_else(|| {
-                        (allow_memory_atomic_overflow && memory_route_is_atomic(pending))
-                            .then(|| least_loaded_isolate_any_idx(isolates))
-                            .flatten()
-                    });
+                let mut isolate_idx = None;
+                if memory_route_is_atomic(pending) {
+                    match memory_shard_affinity_outcome(
+                        isolates,
+                        isolate_indices,
+                        memory_shard_affinity,
+                        pending,
+                        max_inflight,
+                        require_wait_until_idle,
+                    ) {
+                        MemoryAffinityOutcome::Hit(idx) => {
+                            attempt_stats.memory_affinity_hit_count =
+                                attempt_stats.memory_affinity_hit_count.saturating_add(1);
+                            isolate_idx = Some(idx);
+                        }
+                        MemoryAffinityOutcome::MissNoMapping => {
+                            attempt_stats.memory_affinity_miss_no_mapping_count = attempt_stats
+                                .memory_affinity_miss_no_mapping_count
+                                .saturating_add(1);
+                        }
+                        MemoryAffinityOutcome::MissStale => {
+                            attempt_stats.memory_affinity_miss_stale_count = attempt_stats
+                                .memory_affinity_miss_stale_count
+                                .saturating_add(1);
+                        }
+                        MemoryAffinityOutcome::MissSaturated => {
+                            attempt_stats.memory_affinity_miss_saturated_count = attempt_stats
+                                .memory_affinity_miss_saturated_count
+                                .saturating_add(1);
+                        }
+                    }
+                }
+                if isolate_idx.is_none() {
+                    isolate_idx =
+                        least_loaded_isolate_idx(isolates, max_inflight, require_wait_until_idle);
+                    if isolate_idx.is_some() && memory_route_is_atomic(pending) {
+                        attempt_stats.memory_least_loaded_fallback_count = attempt_stats
+                            .memory_least_loaded_fallback_count
+                            .saturating_add(1);
+                    }
+                }
+                if isolate_idx.is_none()
+                    && allow_memory_atomic_overflow
+                    && memory_route_is_atomic(pending)
+                {
+                    isolate_idx = least_loaded_isolate_any_idx(isolates);
+                    if isolate_idx.is_some() {
+                        attempt_stats.memory_atomic_overflow_dispatch_count = attempt_stats
+                            .memory_atomic_overflow_dispatch_count
+                            .saturating_add(1);
+                    }
+                }
+                if isolate_idx.is_none() {
+                    attempt_stats.memory_candidate_rejected_isolate_state_count = attempt_stats
+                        .memory_candidate_rejected_isolate_state_count
+                        .saturating_add(1);
+                }
                 return isolate_idx.map(|isolate_idx| {
                     DispatchSelection::Dispatch(DispatchCandidate {
                         queue_key,
@@ -110,13 +161,23 @@ pub(super) fn select_dispatch_candidate(
                         isolate_idx,
                     }))
                 } else {
+                    attempt_stats.memory_candidate_rejected_isolate_state_count = attempt_stats
+                        .memory_candidate_rejected_isolate_state_count
+                        .saturating_add(1);
                     None
                 }
             } else {
                 Some(DispatchSelection::DropStaleTarget { queue_key })
             }
         },
-    )
+    );
+    if selection.is_none() && pool.queue.lane_depths().memory > 0 {
+        attempt_stats.memory_dispatch_no_ready_candidate_count = attempt_stats
+            .memory_dispatch_no_ready_candidate_count
+            .saturating_add(1);
+    }
+    pool.stats.record_dispatch_attempt(attempt_stats);
+    selection
 }
 
 fn memory_atomic_route_is_active(
@@ -139,25 +200,42 @@ fn memory_route_is_atomic(pending: &PendingInvoke) -> bool {
     )
 }
 
-fn memory_shard_affinity_isolate_idx(
+enum MemoryAffinityOutcome {
+    Hit(usize),
+    MissNoMapping,
+    MissStale,
+    MissSaturated,
+}
+
+fn memory_shard_affinity_outcome(
     isolates: &[IsolateHandle],
     isolate_indices: &HashMap<u64, usize>,
     memory_shard_affinity: &HashMap<usize, u64>,
     pending: &PendingInvoke,
     max_inflight: usize,
     require_wait_until_idle: bool,
-) -> Option<usize> {
-    let shard_index = pending.memory_route.as_ref()?.shard_index?;
-    let isolate_id = *memory_shard_affinity.get(&shard_index)?;
-    let isolate_idx = target_isolate_idx(isolate_indices, isolate_id)?;
+) -> MemoryAffinityOutcome {
+    let Some(shard_index) = pending
+        .memory_route
+        .as_ref()
+        .and_then(|route| route.shard_index)
+    else {
+        return MemoryAffinityOutcome::MissNoMapping;
+    };
+    let Some(isolate_id) = memory_shard_affinity.get(&shard_index).copied() else {
+        return MemoryAffinityOutcome::MissNoMapping;
+    };
+    let Some(isolate_idx) = target_isolate_idx(isolate_indices, isolate_id) else {
+        return MemoryAffinityOutcome::MissStale;
+    };
     let isolate = &isolates[isolate_idx];
     if isolate.startup.is_ready()
         && isolate.inflight_count < max_inflight
         && (!require_wait_until_idle || isolate.pending_wait_until.is_empty())
     {
-        Some(isolate_idx)
+        MemoryAffinityOutcome::Hit(isolate_idx)
     } else {
-        None
+        MemoryAffinityOutcome::MissSaturated
     }
 }
 
@@ -267,6 +345,14 @@ impl WorkerPool {
 
     pub(super) fn stats_snapshot(&self) -> WorkerStats {
         let activity = self.activity_snapshot();
+        let lane_depths = self.queue.lane_depths();
+        let (memory_max_shard_depth, memory_median_shard_depth) =
+            self.queue.memory_shard_depth_summary();
+        let stale_memory_affinity_entries = self
+            .memory_shard_affinity
+            .values()
+            .filter(|isolate_id| !self.isolate_indices.contains_key(isolate_id))
+            .count();
         WorkerStats {
             generation: self.generation,
             public: self.is_public,
@@ -280,6 +366,54 @@ impl WorkerPool {
             spawn_count: self.stats.spawn_count,
             reuse_count: self.stats.reuse_count,
             scale_down_count: self.stats.scale_down_count,
+            targeted_nested_lane_queued: lane_depths.targeted_nested,
+            targeted_lane_queued: lane_depths.targeted,
+            memory_lane_queued: lane_depths.memory,
+            general_lane_queued: lane_depths.general,
+            memory_active_shards: self.queue.active_memory_shards(),
+            memory_max_shard_depth,
+            memory_median_shard_depth,
+            memory_owner_queues: self.queue.memory_owner_queues(),
+            memory_blocked_owner_queues: self
+                .queue
+                .blocked_memory_owner_queues(&self.memory_entity_leases),
+            active_memory_leases: self.memory_entity_leases.len(),
+            oldest_queue_ms: self.queue.oldest_queue_age_ms(Instant::now()),
+            queued_bytes: self.queue.queued_bytes(),
+            max_queued_requests_per_worker: 0,
+            max_global_queued_bytes: 0,
+            memory_affinity_entries: self.memory_shard_affinity.len(),
+            stale_memory_affinity_entries,
+            pending_memory_outbox_shards: 0,
+            memory_affinity_hit_count: self.stats.memory_affinity_hit_count,
+            memory_affinity_miss_no_mapping_count: self.stats.memory_affinity_miss_no_mapping_count,
+            memory_affinity_miss_stale_count: self.stats.memory_affinity_miss_stale_count,
+            memory_affinity_miss_saturated_count: self.stats.memory_affinity_miss_saturated_count,
+            memory_least_loaded_fallback_count: self.stats.memory_least_loaded_fallback_count,
+            memory_atomic_overflow_dispatch_count: self.stats.memory_atomic_overflow_dispatch_count,
+            memory_candidate_rejected_owner_lease_count: self
+                .stats
+                .memory_candidate_rejected_owner_lease_count,
+            memory_candidate_rejected_isolate_state_count: self
+                .stats
+                .memory_candidate_rejected_isolate_state_count,
+            memory_candidate_heads_inspected_count: self
+                .stats
+                .memory_candidate_heads_inspected_count,
+            memory_dispatch_no_ready_candidate_count: self
+                .stats
+                .memory_dispatch_no_ready_candidate_count,
+            runtime_ready_work_budget_exhausted_count: 0,
+            runtime_max_ready_work_batch_size: 0,
+            memory_outbox_claim_batch_count: 0,
+            memory_outbox_claim_row_count: 0,
+            memory_outbox_saturated_batch_count: 0,
+            memory_outbox_delivery_success_count: 0,
+            memory_outbox_delivery_retry_count: 0,
+            memory_outbox_terminal_drop_count: 0,
+            memory_outbox_ack_failure_count: 0,
+            memory_outbox_channel_full_count: 0,
+            memory_outbox_reschedule_count: 0,
         }
     }
 
@@ -344,10 +478,18 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
 
             runtime.block_on(async move {
                 let (event_tx, mut event_rx) = mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY);
+                let (memory_outbox_drain_sender, memory_outbox_drain_receiver) =
+                    memory_outbox_worker_channel();
+                tokio::spawn(run_memory_outbox_worker(
+                    memory_store.clone(),
+                    event_tx.clone(),
+                    memory_outbox_drain_receiver,
+                ));
                 let mut manager = WorkerManager::new(WorkerManagerInit {
                     bootstrap_snapshot,
                     kv_store,
                     memory_store,
+                    memory_outbox_drain_sender,
                     cache_store,
                     config: config.clone(),
                     storage,
@@ -356,7 +498,7 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                 });
                 let mut ticker = tokio::time::interval(config.scale_tick);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                manager.drain_memory_outbox().await;
+                manager.schedule_all_memory_outbox_shards(&event_tx);
 
                 loop {
                     tokio::select! {
@@ -414,8 +556,8 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                             manager.expire_queued_requests();
                             manager.expire_starting_isolates(&event_tx);
                             manager.expire_inflight_requests(&event_tx);
-                            manager.drain_memory_outbox().await;
-                            manager.pending_memory_outbox_shards.clear();
+                            manager.schedule_all_memory_outbox_shards(&event_tx);
+                            manager.retry_pending_memory_outbox_drains();
                             manager.scale_down_idle();
                         }
                         else => {
@@ -478,10 +620,18 @@ pub(super) async fn drain_ready_runtime_work(
         }
 
         if processed >= RUNTIME_READY_WORK_BUDGET {
+            manager.stats.ready_work_budget_exhausted_count = manager
+                .stats
+                .ready_work_budget_exhausted_count
+                .saturating_add(1);
+            manager.stats.max_ready_work_batch_size =
+                manager.stats.max_ready_work_batch_size.max(processed);
             return true;
         }
 
         if !made_progress {
+            manager.stats.max_ready_work_batch_size =
+                manager.stats.max_ready_work_batch_size.max(processed);
             return true;
         }
     }

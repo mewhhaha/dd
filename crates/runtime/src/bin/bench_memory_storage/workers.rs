@@ -203,7 +203,7 @@ export default {
 };
 "#;
 
-pub(super) const MEMORY_ACTOR_INCREMENT_WORKER_SOURCE: &str = r#"
+pub(super) const MEMORY_COORDINATED_INCREMENT_WORKER_SOURCE: &str = r#"
 export function seed(state) {
   state.set("count", "0");
   return true;
@@ -247,7 +247,7 @@ export default {
 };
 "#;
 
-pub(super) const MEMORY_ACTOR_READ_WRITE_WORKER_SOURCE: &str = r#"
+pub(super) const MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE: &str = r#"
 export function seed(state) {
   state.set("count", "0");
   return true;

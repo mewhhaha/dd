@@ -218,7 +218,7 @@ fn memory_batch_requires_commit(batch: &MemoryBatchHandle) -> bool {
 fn memory_batch_commit_owner_epoch(batch: &MemoryBatchHandle) -> Result<i64> {
     if batch.owner_epoch <= 0 {
         return Err(PlatformError::bad_request(
-            "memory batch commit requires actor owner epoch",
+            "memory batch commit requires memory owner epoch",
         ));
     }
     Ok(batch.owner_epoch)
@@ -2288,7 +2288,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "memory batch commit requires actor owner epoch"
+            "memory batch commit requires memory owner epoch"
         );
     }
 

@@ -2,6 +2,7 @@
 pub(crate) enum BenchArgAction {
     Run,
     Help,
+    List,
 }
 
 pub(crate) fn bench_arg_action<I, S>(args: I) -> Result<BenchArgAction, String>
@@ -13,6 +14,7 @@ where
         let arg = arg.as_ref();
         match arg {
             "-h" | "--help" => return Ok(BenchArgAction::Help),
+            "--list" => return Ok(BenchArgAction::List),
             value => {
                 return Err(format!(
                     "unsupported argument `{value}`; configure this benchmark with DD_BENCH_* env vars or run with --help"
@@ -44,6 +46,14 @@ mod tests {
         assert_eq!(
             bench_arg_action(std::iter::empty::<&str>()).expect("empty args should parse"),
             BenchArgAction::Run
+        );
+    }
+
+    #[test]
+    fn bench_arg_action_handles_list() {
+        assert_eq!(
+            bench_arg_action(["--list"]).expect("list should parse"),
+            BenchArgAction::List
         );
     }
 

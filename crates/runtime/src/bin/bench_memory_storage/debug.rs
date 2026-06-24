@@ -60,12 +60,11 @@ pub(super) fn print_debug_dump(label: &str, dump: &WorkerDebugDump) {
         .take(8)
         .map(|request| {
             format!(
-                "{}:{}:{}:{} memory={:?} target={:?}",
+                "{}:{}:{}:{} target={:?}",
                 request.runtime_request_id,
                 request.method,
                 request.user_request_id,
                 request.url,
-                request.memory_key,
                 request.target_isolate_id
             )
         })
@@ -77,12 +76,11 @@ pub(super) fn print_debug_dump(label: &str, dump: &WorkerDebugDump) {
         .take(8)
         .map(|request| {
             format!(
-                "{}:{}:{}:{} memory={:?} target={:?}",
+                "{}:{}:{}:{} target={:?}",
                 request.runtime_request_id,
                 request.method,
                 request.user_request_id,
                 request.url,
-                request.memory_key,
                 request.target_isolate_id
             )
         })
@@ -102,12 +100,39 @@ pub(super) fn print_debug_dump(label: &str, dump: &WorkerDebugDump) {
         })
         .collect::<Vec<_>>()
         .join("|");
+    let top_shards = dump
+        .memory_scheduler
+        .top_shards
+        .iter()
+        .map(|shard| {
+            format!(
+                "{}:queued={},ready={},blocked={},affinity={:?},stale={}",
+                shard.shard_index,
+                shard.queued,
+                shard.ready_owners,
+                shard.blocked_owners,
+                shard.affinity_isolate_id,
+                shard.affinity_stale
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
     println!(
-        "bench-dump label={} outcome=ok generation={} queued={} isolates={} queued_requests={} pending_requests={}",
+        "bench-dump label={} outcome=ok generation={} queued={} isolates={} memory_queued={} memory_active_shards={} memory_owner_queues={} memory_blocked_owner_queues={} active_memory_leases={} memory_affinity_entries={} stale_memory_affinity_entries={} oldest_queue_ms={} pending_memory_outbox_shards={} top_memory_shards={} queued_requests={} pending_requests={}",
         label,
         dump.generation,
         dump.queued,
         isolate_summary,
+        dump.memory_scheduler.queued,
+        dump.memory_scheduler.active_shards,
+        dump.memory_scheduler.owner_queues,
+        dump.memory_scheduler.blocked_owner_queues,
+        dump.memory_scheduler.active_leases,
+        dump.memory_scheduler.affinity_entries,
+        dump.memory_scheduler.stale_affinity_entries,
+        dump.memory_scheduler.oldest_queue_ms,
+        dump.memory_outbox.pending_scheduled_shards,
+        top_shards,
         queued_requests,
         pending_requests,
     );

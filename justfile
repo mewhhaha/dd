@@ -90,12 +90,23 @@ size-report-all profile="dist":
 # Syntax-check source-only JS integration package.
 check-js:
   node --check benchmarks/run.mjs
+  node --check benchmarks/summarize.mjs
+  node --check benchmarks/check-regression.mjs
+  node --check benchmarks/lib/runner-config.mjs
+  node --check benchmarks/lib/results.mjs
+  node --test benchmarks/lib/runner-config.test.mjs
+  node --test benchmarks/lib/summarize.test.mjs
+  node --test benchmarks/lib/check-regression.test.mjs
   node --check packages/dd-vite/src/index.js
   node --check packages/dd-runtime/index.cjs
   node --check packages/dd-vite/src/runtime.js
   node --check packages/dd-vite/src/vite.js
   node --check packages/dd-vite/src/vitest.js
   node --check packages/dd-vite/src/vitest-environment.js
+
+# Regenerate the checked-in keyed-memory scaling summary from local ignored JSON.
+benchmark-summary fixed='benchmarks/results/local-atomic-memory-scaling-matrix.json' core='benchmarks/results/local-atomic-memory-scaling-matrix.json':
+  node benchmarks/summarize.mjs --fixed {{fixed}} --core {{core}} --out benchmarks/SCALING.md
 
 # Build the size-optimized dd dev runtime binary into the current host package.
 build-dd-runtime-package package='':
