@@ -2,6 +2,7 @@ use common::{PlatformError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,7 +15,9 @@ use crate::turso_util::{configure_turso_connection, is_retryable_turso_error};
 const MEMORY_SHARD_HASH_DOMAIN: &[u8] = b"dd-memory-shard-v1\0";
 const MEMORY_LAYOUT_MANIFEST_FILE: &str = "memory-layout.json";
 const MEMORY_LAYOUT_FORMAT_VERSION: u32 = 1;
-const MEMORY_SHARD_HASH_VERSION: u32 = 1;
+const LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION: u32 = 0;
+const STABLE_SHA256_MEMORY_SHARD_HASH_VERSION: u32 = 1;
+const MEMORY_SHARD_HASH_VERSION: u32 = STABLE_SHA256_MEMORY_SHARD_HASH_VERSION;
 
 struct MemoryDatabaseEntry {
     slot: Arc<MemoryDatabaseSlot>,
@@ -313,6 +316,7 @@ pub struct MemoryStore {
     db_cache_max_open: usize,
     db_idle_ttl: Duration,
     namespace_shards: usize,
+    shard_hash_version: u32,
     snapshot_cache_max_entries: usize,
     snapshot_cache_max_bytes: usize,
     owner_epoch_floor: Arc<AtomicU64>,
@@ -572,6 +576,7 @@ impl MemoryStore {
             db_cache_max_open,
             db_idle_ttl,
             namespace_shards,
+            shard_hash_version: layout.shard_hash_version,
             snapshot_cache_max_entries: db_cache_max_open.max(64),
             snapshot_cache_max_bytes: db_cache_max_open.max(64).saturating_mul(64 * 1024),
             owner_epoch_floor: Arc::new(AtomicU64::new(floors.owner_epoch_floor.max(1))),
@@ -1895,7 +1900,12 @@ impl MemoryStore {
     }
 
     fn shard_index(&self, memory_key: &str) -> usize {
-        stable_memory_shard_index(memory_key, self.namespace_shards)
+        memory_shard_index_for_hash_version(
+            memory_key,
+            self.namespace_shards,
+            self.shard_hash_version,
+        )
+        .expect("memory store must have a supported shard hash version")
     }
 
     fn shard_for_key(&self, memory_key: &str) -> &MemoryShard {
@@ -2747,8 +2757,7 @@ async fn load_or_adopt_memory_layout(
         return Ok(manifest);
     }
 
-    validate_legacy_memory_layout(root_dir, configured_shards).await?;
-    let manifest = MemoryLayoutManifest::current(configured_shards);
+    let manifest = adopt_legacy_memory_layout(root_dir, configured_shards).await?;
     write_memory_layout_atomic(&manifest_path, &manifest)?;
     Ok(manifest)
 }
@@ -2766,12 +2775,12 @@ fn validate_memory_layout(
             MEMORY_LAYOUT_FORMAT_VERSION
         )));
     }
-    if manifest.shard_hash_version != MEMORY_SHARD_HASH_VERSION {
+    if !is_supported_memory_shard_hash_version(manifest.shard_hash_version) {
         return Err(PlatformError::runtime(format!(
-            "unsupported memory layout shard_hash_version {} at {}; supported shard_hash_version is {} for the dd-memory-shard-v1 hash domain",
+            "unsupported memory layout shard_hash_version {} at {}; supported shard_hash_versions are {}",
             manifest.shard_hash_version,
             memory_layout_manifest_path(root_dir).display(),
-            MEMORY_SHARD_HASH_VERSION
+            supported_memory_shard_hash_versions_label()
         )));
     }
     if manifest.namespace_shards != configured_shards {
@@ -2835,25 +2844,79 @@ fn write_memory_layout_atomic(path: &Path, manifest: &MemoryLayoutManifest) -> R
     Ok(())
 }
 
-async fn validate_legacy_memory_layout(root_dir: &Path, configured_shards: usize) -> Result<()> {
+async fn adopt_legacy_memory_layout(
+    root_dir: &Path,
+    configured_shards: usize,
+) -> Result<MemoryLayoutManifest> {
     let shard_files = discover_legacy_memory_shard_files(root_dir)?;
+    if shard_files.is_empty() {
+        return Ok(MemoryLayoutManifest::current(configured_shards));
+    }
+
+    match validate_legacy_memory_layout(
+        root_dir,
+        configured_shards,
+        STABLE_SHA256_MEMORY_SHARD_HASH_VERSION,
+        &shard_files,
+    )
+    .await
+    {
+        Ok(()) => Ok(MemoryLayoutManifest::current(configured_shards)),
+        Err(stable_error) => {
+            validate_legacy_memory_layout(
+                root_dir,
+                configured_shards,
+                LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
+                &shard_files,
+            )
+            .await
+            .map_err(|legacy_error| {
+                PlatformError::runtime(format!(
+                    "memory legacy layout at {} is incompatible with supported shard hash layouts for configured memory_namespace_shards={}; stable layout error: {}; legacy layout error: {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
+                    root_dir.display(),
+                    configured_shards,
+                    stable_error,
+                    legacy_error
+                ))
+            })?;
+            Ok(MemoryLayoutManifest {
+                format_version: MEMORY_LAYOUT_FORMAT_VERSION,
+                shard_hash_version: LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
+                namespace_shards: configured_shards,
+            })
+        }
+    }
+}
+
+async fn validate_legacy_memory_layout(
+    root_dir: &Path,
+    configured_shards: usize,
+    shard_hash_version: u32,
+    shard_files: &[LegacyMemoryShardFile],
+) -> Result<()> {
     for shard_file in shard_files {
         if shard_file.shard_index >= configured_shards {
             return Err(PlatformError::runtime(format!(
-                "memory legacy layout at {} contains shard index {} outside configured memory_namespace_shards={}; changing the shard count requires an explicit reshard operation before startup",
+                "memory legacy layout at {} contains shard index {} outside configured memory_namespace_shards={} for shard_hash_version={}; changing the shard count requires an explicit reshard operation before startup",
                 root_dir.display(),
                 shard_file.shard_index,
-                configured_shards
+                configured_shards,
+                shard_hash_version
             )));
         }
         let keys = distinct_entity_keys_in_memory_db(&shard_file.path).await?;
         for entity_key in keys {
-            let expected = stable_memory_shard_index(&entity_key, configured_shards);
+            let expected = memory_shard_index_for_hash_version(
+                &entity_key,
+                configured_shards,
+                shard_hash_version,
+            )?;
             if expected != shard_file.shard_index {
                 return Err(PlatformError::runtime(format!(
-                    "memory legacy layout at {} is incompatible with configured memory_namespace_shards={}: entity key in {} belongs to shard {} under the configured layout but is stored in shard {}; changing the shard count requires an explicit reshard operation before startup",
+                    "memory legacy layout at {} is incompatible with configured memory_namespace_shards={} and shard_hash_version={}: entity key in {} belongs to shard {} under the configured layout but is stored in shard {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
                     root_dir.display(),
                     configured_shards,
+                    shard_hash_version,
                     shard_file.path.display(),
                     expected,
                     shard_file.shard_index
@@ -3242,6 +3305,45 @@ pub fn stable_memory_shard_index(memory_key: &str, namespace_shards: usize) -> u
     (u64::from_be_bytes(shard_bytes) as usize) % namespace_shards
 }
 
+fn legacy_default_hasher_memory_shard_index(memory_key: &str, namespace_shards: usize) -> usize {
+    if namespace_shards <= 1 {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    memory_key.hash(&mut hasher);
+    (hasher.finish() as usize) % namespace_shards
+}
+
+fn memory_shard_index_for_hash_version(
+    memory_key: &str,
+    namespace_shards: usize,
+    shard_hash_version: u32,
+) -> Result<usize> {
+    match shard_hash_version {
+        STABLE_SHA256_MEMORY_SHARD_HASH_VERSION => {
+            Ok(stable_memory_shard_index(memory_key, namespace_shards))
+        }
+        LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION => Ok(
+            legacy_default_hasher_memory_shard_index(memory_key, namespace_shards),
+        ),
+        version => Err(PlatformError::runtime(format!(
+            "unsupported memory shard_hash_version {version}; supported shard_hash_versions are {}",
+            supported_memory_shard_hash_versions_label()
+        ))),
+    }
+}
+
+fn is_supported_memory_shard_hash_version(version: u32) -> bool {
+    matches!(
+        version,
+        STABLE_SHA256_MEMORY_SHARD_HASH_VERSION | LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION
+    )
+}
+
+fn supported_memory_shard_hash_versions_label() -> &'static str {
+    "0 (legacy DefaultHasher), 1 (dd-memory-shard-v1)"
+}
+
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
 
@@ -3273,11 +3375,74 @@ mod tests {
             .expect("test should find key with different shard")
     }
 
+    fn key_with_different_hash_layout(shards: usize) -> (String, usize, usize) {
+        (0..10_000)
+            .map(|index| format!("legacy-entity-{index}"))
+            .find_map(|key| {
+                let legacy = legacy_default_hasher_memory_shard_index(&key, shards);
+                let stable = stable_memory_shard_index(&key, shards);
+                (legacy != stable).then_some((key, legacy, stable))
+            })
+            .expect("test should find key with different legacy and stable shards")
+    }
+
     fn key_at_or_above_shard(shards: usize, minimum_shard: usize) -> String {
         (0..10_000)
             .map(|index| format!("entity-{index}"))
             .find(|key| stable_memory_shard_index(key, shards) >= minimum_shard)
             .expect("test should find key at or above requested shard")
+    }
+
+    async fn seed_legacy_default_hasher_memory_state(
+        root: &Path,
+        namespace: &str,
+        memory_key: &str,
+        item_key: &str,
+        value: &str,
+        version: i64,
+        namespace_shards: usize,
+    ) -> Result<usize> {
+        let shard_index = legacy_default_hasher_memory_shard_index(memory_key, namespace_shards);
+        let path = root
+            .join(hex_encode(namespace.as_bytes()))
+            .join(format!("shard-{shard_index:04}.db"));
+        ensure_parent_dir(&path)?;
+        let path_str = path.to_string_lossy().to_string();
+        let database = Builder::new_local(&path_str)
+            .build()
+            .await
+            .map_err(memory_error)?;
+        ensure_schema(&database).await?;
+        let conn = database.connect().map_err(memory_error)?;
+        configure_connection(&conn).await?;
+        conn.execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(memory_error)?;
+        let outcome = async {
+            upsert_memory_state_row(
+                &conn,
+                memory_key,
+                item_key,
+                value.as_bytes(),
+                ENCODING_UTF8,
+                false,
+                version,
+            )
+            .await?;
+            upsert_memory_meta_row(&conn, memory_key, version, None).await?;
+            Ok::<(), PlatformError>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await.map_err(memory_error)?;
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(error);
+            }
+        }
+        Ok(shard_index)
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -3622,6 +3787,37 @@ mod tests {
         assert_eq!(
             read_memory_layout(&memory_layout_manifest_path(&root))?.namespace_shards,
             4
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_layout_adopts_legacy_default_hasher_store() -> Result<()> {
+        let root = temp_root("layout-legacy-default-hasher");
+        let (memory_key, expected_legacy_shard, stable_shard) = key_with_different_hash_layout(16);
+        let written_shard =
+            seed_legacy_default_hasher_memory_state(&root, "ns", &memory_key, "count", "1", 1, 16)
+                .await?;
+        assert_eq!(written_shard, expected_legacy_shard);
+        assert_ne!(expected_legacy_shard, stable_shard);
+
+        let store = MemoryStore::new(root.clone(), 16, 4, Duration::from_secs(60)).await?;
+        let manifest = read_memory_layout(&memory_layout_manifest_path(&root))?;
+        assert_eq!(
+            manifest.shard_hash_version,
+            LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION
+        );
+        assert_eq!(
+            store.shard_index_for_key(&memory_key),
+            expected_legacy_shard
+        );
+        let point = store.point_read("ns", &memory_key, "count").await?;
+        assert_eq!(
+            point
+                .record
+                .expect("legacy state should remain readable")
+                .value,
+            b"1"
         );
         Ok(())
     }

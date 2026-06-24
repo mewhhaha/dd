@@ -23,8 +23,8 @@ use crate::engine::{
 };
 use crate::kv::KvStore;
 use crate::memory::{
-    stable_memory_shard_index, MemoryOutboxClaim, MemoryOutboxDeliveryAction,
-    MemoryOutboxDeliveryOutcome, MemoryProfileMetricKind, MemoryStore,
+    MemoryOutboxClaim, MemoryOutboxDeliveryAction, MemoryOutboxDeliveryOutcome,
+    MemoryProfileMetricKind, MemoryStore,
 };
 use crate::memory_rpc::{
     decode_memory_invoke_request, decode_memory_invoke_response, encode_memory_invoke_request,

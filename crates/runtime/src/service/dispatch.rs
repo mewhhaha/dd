@@ -170,7 +170,11 @@ impl WorkerManager {
             return;
         }
 
-        let memory_namespace_shards = self.storage.memory_namespace_shards;
+        if let Some(route) = memory_route.as_mut() {
+            if route.shard_index.is_none() {
+                route.shard_index = Some(self.memory_store.shard_index_for_key(&route.key));
+            }
+        }
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
             if let Some(route) = &memory_route {
                 if !pool
@@ -185,14 +189,6 @@ impl WorkerManager {
                     let _ = reply.send(Err(error.clone()));
                     self.fail_stream_registration(&worker_name, &runtime_request_id, error);
                     return;
-                }
-            }
-            if let Some(route) = memory_route.as_mut() {
-                if route.shard_index.is_none() {
-                    route.shard_index = Some(stable_memory_shard_index(
-                        &route.key,
-                        memory_namespace_shards,
-                    ));
                 }
             }
             let enqueued_at = Instant::now();
