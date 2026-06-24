@@ -3023,7 +3023,7 @@ async fn collect_physical_memory_key_shard_overrides(
     configured_shards: usize,
     shard_files: &[LegacyMemoryShardFile],
 ) -> Result<BTreeMap<String, usize>> {
-    let mut key_shards = BTreeMap::new();
+    let mut key_shards = BTreeMap::<String, PhysicalMemoryKeyShard>::new();
     for shard_file in shard_files {
         if shard_file.shard_index >= configured_shards {
             return Err(PlatformError::runtime(format!(
@@ -3034,23 +3034,40 @@ async fn collect_physical_memory_key_shard_overrides(
                 configured_shards
             )));
         }
-        let keys = distinct_entity_keys_in_memory_db(&shard_file.path).await?;
-        for entity_key in keys {
-            if let Some(existing) = key_shards.insert(entity_key.clone(), shard_file.shard_index) {
-                if existing != shard_file.shard_index {
-                    return Err(PlatformError::runtime(format!(
-                        "memory legacy layout at {} namespace {} stores entity key {} in multiple shards ({} and {}); changing the shard count or hash layout requires an explicit reshard operation before startup",
-                        root_dir.display(),
-                        shard_file.namespace,
-                        entity_key,
-                        existing,
-                        shard_file.shard_index
-                    )));
+        let key_revisions = entity_key_revisions_in_memory_db(&shard_file.path).await?;
+        for (entity_key, max_revision) in key_revisions {
+            let candidate = PhysicalMemoryKeyShard {
+                shard_index: shard_file.shard_index,
+                max_revision,
+            };
+            match key_shards.get_mut(&entity_key) {
+                Some(current) if current.is_older_than(candidate) => {
+                    *current = candidate;
+                }
+                Some(_) => {}
+                None => {
+                    key_shards.insert(entity_key, candidate);
                 }
             }
         }
     }
-    Ok(key_shards)
+    Ok(key_shards
+        .into_iter()
+        .map(|(key, shard)| (key, shard.shard_index))
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalMemoryKeyShard {
+    shard_index: usize,
+    max_revision: i64,
+}
+
+impl PhysicalMemoryKeyShard {
+    fn is_older_than(self, other: Self) -> bool {
+        self.max_revision < other.max_revision
+            || (self.max_revision == other.max_revision && self.shard_index < other.shard_index)
+    }
 }
 
 struct LegacyMemoryShardFile {
@@ -3143,6 +3160,26 @@ async fn distinct_entity_keys_in_memory_db(path: &Path) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+async fn entity_key_revisions_in_memory_db(path: &Path) -> Result<BTreeMap<String, i64>> {
+    let path_str = path.to_string_lossy().to_string();
+    let database = Builder::new_local(&path_str)
+        .build()
+        .await
+        .map_err(memory_error)?;
+    let conn = database.connect().map_err(memory_error)?;
+    configure_connection(&conn).await?;
+    let mut revisions = BTreeMap::new();
+    for (table, revision_column) in [
+        ("memory_meta", "max_version"),
+        ("memory_state", "version"),
+        ("memory_commands", "revision"),
+        ("memory_outbox", "revision"),
+    ] {
+        read_entity_revisions_from_table(&conn, table, revision_column, &mut revisions).await?;
+    }
+    Ok(revisions)
+}
+
 async fn read_distinct_entity_keys_from_table(
     conn: &Connection,
     table: &str,
@@ -3161,6 +3198,37 @@ async fn read_distinct_entity_keys_from_table(
     };
     while let Some(row) = rows.next().await.map_err(memory_error)? {
         keys.insert(row.get::<String>(0).map_err(memory_error)?);
+    }
+    Ok(())
+}
+
+async fn read_entity_revisions_from_table(
+    conn: &Connection,
+    table: &str,
+    revision_column: &str,
+    revisions: &mut BTreeMap<String, i64>,
+) -> Result<()> {
+    let sql = format!("SELECT entity_key, MAX({revision_column}) FROM {table} GROUP BY entity_key");
+    let mut rows = match conn.query(&sql, ()).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("no such table") || message.contains("no such column") {
+                return Ok(());
+            }
+            return Err(memory_error(error));
+        }
+    };
+    while let Some(row) = rows.next().await.map_err(memory_error)? {
+        let entity_key = row.get::<String>(0).map_err(memory_error)?;
+        let revision = row
+            .get::<Option<i64>>(1)
+            .map_err(memory_error)?
+            .unwrap_or(-1);
+        revisions
+            .entry(entity_key)
+            .and_modify(|current| *current = (*current).max(revision))
+            .or_insert(revision);
     }
     Ok(())
 }
@@ -4116,7 +4184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_layout_rejects_physical_key_duplicate_across_shards() -> Result<()> {
+    async fn memory_layout_adopts_newest_physical_duplicate_key_shard() -> Result<()> {
         let root = temp_root("layout-physical-duplicate");
         let (memory_key, first_shard, stable_shard, legacy_shard) =
             key_with_distinct_physical_shard(16);
@@ -4144,11 +4212,29 @@ mod tests {
         )
         .await?;
 
-        let error =
-            expect_memory_store_new_error(root, 16, "duplicate physical keys must fail startup")
-                .await;
-        assert!(error.to_string().contains("stores entity key"), "{error}");
-        assert!(error.to_string().contains("in multiple shards"), "{error}");
+        let store = MemoryStore::new(root.clone(), 16, 4, Duration::from_secs(60)).await?;
+        let manifest = read_memory_layout(&memory_layout_manifest_path(&root))?;
+        assert_eq!(
+            manifest
+                .namespace_key_shard_overrides
+                .get("EXAMPLE_MEMORY")
+                .and_then(|keys| keys.get(&memory_key))
+                .copied(),
+            Some(second_shard)
+        );
+        assert_eq!(
+            store.shard_index_for_key("EXAMPLE_MEMORY", &memory_key),
+            second_shard
+        );
+        assert_eq!(
+            store
+                .point_read("EXAMPLE_MEMORY", &memory_key, "count")
+                .await?
+                .record
+                .expect("newest duplicate physical shard should remain readable")
+                .value,
+            b"two"
+        );
         Ok(())
     }
 
