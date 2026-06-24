@@ -260,6 +260,8 @@ struct MemoryLayoutManifest {
     format_version: u32,
     shard_hash_version: u32,
     namespace_shards: usize,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    namespace_shard_hash_versions: BTreeMap<String, u32>,
 }
 
 impl MemoryLayoutManifest {
@@ -268,6 +270,7 @@ impl MemoryLayoutManifest {
             format_version: MEMORY_LAYOUT_FORMAT_VERSION,
             shard_hash_version: MEMORY_SHARD_HASH_VERSION,
             namespace_shards,
+            namespace_shard_hash_versions: BTreeMap::new(),
         }
     }
 }
@@ -317,6 +320,7 @@ pub struct MemoryStore {
     db_idle_ttl: Duration,
     namespace_shards: usize,
     shard_hash_version: u32,
+    namespace_shard_hash_versions: Arc<BTreeMap<String, u32>>,
     snapshot_cache_max_entries: usize,
     snapshot_cache_max_bytes: usize,
     owner_epoch_floor: Arc<AtomicU64>,
@@ -577,6 +581,7 @@ impl MemoryStore {
             db_idle_ttl,
             namespace_shards,
             shard_hash_version: layout.shard_hash_version,
+            namespace_shard_hash_versions: Arc::new(layout.namespace_shard_hash_versions),
             snapshot_cache_max_entries: db_cache_max_open.max(64),
             snapshot_cache_max_bytes: db_cache_max_open.max(64).saturating_mul(64 * 1024),
             owner_epoch_floor: Arc::new(AtomicU64::new(floors.owner_epoch_floor.max(1))),
@@ -609,14 +614,14 @@ impl MemoryStore {
         self.namespace_shards
     }
 
-    pub fn shard_index_for_key(&self, memory_key: &str) -> usize {
-        self.shard_index(memory_key)
+    pub fn shard_index_for_key(&self, namespace: &str, memory_key: &str) -> usize {
+        self.shard_index(namespace, memory_key)
     }
 
     pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<MemorySnapshot> {
         let started = Instant::now();
         if let Some(snapshot) = self.cached_full_snapshot(namespace, memory_key).await {
-            self.observe_version(memory_key, snapshot.max_version);
+            self.observe_version(namespace, memory_key, snapshot.max_version);
             self.observe_memory_version(namespace, memory_key, snapshot.max_version)
                 .await;
             self.record_profile(
@@ -657,7 +662,7 @@ impl MemoryStore {
                 deleted: deleted != 0,
             });
         }
-        self.observe_version(memory_key, max_version);
+        self.observe_version(namespace, memory_key, max_version);
         self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         let snapshot = MemorySnapshot {
@@ -689,7 +694,7 @@ impl MemoryStore {
             .cached_point_read(namespace, memory_key, item_key)
             .await
         {
-            self.observe_version(memory_key, point.max_version);
+            self.observe_version(namespace, memory_key, point.max_version);
             self.observe_memory_version(namespace, memory_key, point.max_version)
                 .await;
             self.record_profile(
@@ -706,7 +711,7 @@ impl MemoryStore {
             .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
-        self.observe_version(memory_key, max_version);
+        self.observe_version(namespace, memory_key, max_version);
         self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         self.put_partial_snapshot(
@@ -750,7 +755,7 @@ impl MemoryStore {
                 .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
-            self.observe_version(memory_key, max_version);
+            self.observe_version(namespace, memory_key, max_version);
             return Ok(MemorySnapshot {
                 entries: Vec::new(),
                 max_version,
@@ -807,7 +812,7 @@ impl MemoryStore {
             .max_version_for_memory(&conn, memory_key)
             .await?
             .unwrap_or(-1);
-        self.observe_version(memory_key, max_version);
+        self.observe_version(namespace, memory_key, max_version);
         self.observe_memory_version(namespace, memory_key, max_version)
             .await;
         self.put_partial_snapshot(
@@ -843,7 +848,7 @@ impl MemoryStore {
         }
         let version_key = Self::memory_version_key(namespace, memory_key);
         if let Some(current) = self
-            .shard_for_key(memory_key)
+            .shard_for_key(namespace, memory_key)
             .memory_versions
             .lock()
             .await
@@ -888,7 +893,7 @@ impl MemoryStore {
                 .max_version_for_memory(&conn, memory_key)
                 .await?
                 .unwrap_or(-1);
-            self.observe_version(memory_key, max_version);
+            self.observe_version(namespace, memory_key, max_version);
             self.record_profile(
                 MemoryProfileMetricKind::StoreApplyBatch,
                 started.elapsed().as_micros() as u64,
@@ -962,7 +967,7 @@ impl MemoryStore {
 
                 let write_started = Instant::now();
                 let commit_version = if !mutations.is_empty() || !outbox_effects.is_empty() {
-                    Some(self.reserve_version_after(memory_key, current))
+                    Some(self.reserve_version_after(namespace, memory_key, current))
                 } else {
                     None
                 };
@@ -1041,7 +1046,7 @@ impl MemoryStore {
                             return Err(memory_error(error));
                         }
                     }
-                    self.observe_version(memory_key, result.max_version);
+                    self.observe_version(namespace, memory_key, result.max_version);
                     self.observe_memory_version(namespace, memory_key, result.max_version)
                         .await;
                     if !outcome.cache_mutations.is_empty() {
@@ -1641,9 +1646,9 @@ impl MemoryStore {
         }
     }
 
-    fn reserve_version_after(&self, memory_key: &str, floor: i64) -> i64 {
+    fn reserve_version_after(&self, namespace: &str, memory_key: &str, floor: i64) -> i64 {
         let minimum = floor.saturating_add(1).max(1) as u64;
-        let shard = self.shard_for_key(memory_key);
+        let shard = self.shard_for_key(namespace, memory_key);
         let mut current = shard.version.load(Ordering::Relaxed);
         loop {
             let next = current.max(minimum);
@@ -1669,7 +1674,7 @@ impl MemoryStore {
             return Err(PlatformError::runtime("memory key must not be empty"));
         }
 
-        self.connect_shard(namespace, self.shard_index(memory_key))
+        self.connect_shard(namespace, self.shard_index(namespace, memory_key))
             .await
     }
 
@@ -1899,32 +1904,40 @@ impl MemoryStore {
             .join(format!("shard-{shard_index:04}.db"))
     }
 
-    fn shard_index(&self, memory_key: &str) -> usize {
+    fn shard_hash_version_for_namespace(&self, namespace: &str) -> u32 {
+        self.namespace_shard_hash_versions
+            .get(namespace)
+            .copied()
+            .unwrap_or(self.shard_hash_version)
+    }
+
+    fn shard_index(&self, namespace: &str, memory_key: &str) -> usize {
         memory_shard_index_for_hash_version(
             memory_key,
             self.namespace_shards,
-            self.shard_hash_version,
+            self.shard_hash_version_for_namespace(namespace),
         )
         .expect("memory store must have a supported shard hash version")
     }
 
-    fn shard_for_key(&self, memory_key: &str) -> &MemoryShard {
-        self.shard_for_index(self.shard_index(memory_key))
+    fn shard_for_key(&self, namespace: &str, memory_key: &str) -> &MemoryShard {
+        self.shard_for_index(self.shard_index(namespace, memory_key))
     }
 
     fn shard_for_index(&self, shard_index: usize) -> &MemoryShard {
         &self.shards[shard_index % self.shards.len()]
     }
 
-    fn observe_version(&self, memory_key: &str, version: i64) {
-        self.shard_for_key(memory_key).observe_version(version);
+    fn observe_version(&self, namespace: &str, memory_key: &str, version: i64) {
+        self.shard_for_key(namespace, memory_key)
+            .observe_version(version);
     }
 
     async fn observe_memory_version(&self, namespace: &str, memory_key: &str, version: i64) {
         if version < 0 {
             return;
         }
-        self.shard_for_key(memory_key)
+        self.shard_for_key(namespace, memory_key)
             .memory_versions
             .lock()
             .await
@@ -1994,14 +2007,14 @@ impl MemoryStore {
     ) -> Option<MemorySharedSnapshotEntry> {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let current_version = self
-            .shard_for_key(memory_key)
+            .shard_for_key(namespace, memory_key)
             .memory_versions
             .lock()
             .await
             .get(&Self::memory_version_key(namespace, memory_key))
             .copied();
         let now = Instant::now();
-        let shard_index = self.shard_index(memory_key);
+        let shard_index = self.shard_index(namespace, memory_key);
         let mut snapshots = self
             .shard_for_index(shard_index)
             .shared_snapshots
@@ -2051,7 +2064,7 @@ impl MemoryStore {
     {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
-        let shard_index = self.shard_index(memory_key);
+        let shard_index = self.shard_index(namespace, memory_key);
         let mut snapshots = self
             .shard_for_index(shard_index)
             .shared_snapshots
@@ -2150,7 +2163,7 @@ impl MemoryStore {
     ) {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
-        let shard_index = self.shard_index(memory_key);
+        let shard_index = self.shard_index(namespace, memory_key);
         let mut snapshots = self
             .shard_for_index(shard_index)
             .shared_snapshots
@@ -2783,6 +2796,17 @@ fn validate_memory_layout(
             supported_memory_shard_hash_versions_label()
         )));
     }
+    for (namespace, version) in &manifest.namespace_shard_hash_versions {
+        if !is_supported_memory_shard_hash_version(*version) {
+            return Err(PlatformError::runtime(format!(
+                "unsupported memory layout shard_hash_version {} for namespace {} at {}; supported shard_hash_versions are {}",
+                version,
+                namespace,
+                memory_layout_manifest_path(root_dir).display(),
+                supported_memory_shard_hash_versions_label()
+            )));
+        }
+    }
     if manifest.namespace_shards != configured_shards {
         return Err(memory_layout_mismatch_error(
             root_dir,
@@ -2853,39 +2877,57 @@ async fn adopt_legacy_memory_layout(
         return Ok(MemoryLayoutManifest::current(configured_shards));
     }
 
-    match validate_legacy_memory_layout(
-        root_dir,
-        configured_shards,
-        STABLE_SHA256_MEMORY_SHARD_HASH_VERSION,
-        &shard_files,
-    )
-    .await
-    {
-        Ok(()) => Ok(MemoryLayoutManifest::current(configured_shards)),
-        Err(stable_error) => {
-            validate_legacy_memory_layout(
-                root_dir,
-                configured_shards,
-                LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
-                &shard_files,
-            )
-            .await
-            .map_err(|legacy_error| {
-                PlatformError::runtime(format!(
-                    "memory legacy layout at {} is incompatible with supported shard hash layouts for configured memory_namespace_shards={}; stable layout error: {}; legacy layout error: {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
-                    root_dir.display(),
+    let mut files_by_namespace = BTreeMap::<String, Vec<LegacyMemoryShardFile>>::new();
+    for shard_file in shard_files {
+        files_by_namespace
+            .entry(shard_file.namespace.clone())
+            .or_default()
+            .push(shard_file);
+    }
+
+    let mut namespace_shard_hash_versions = BTreeMap::new();
+    for (namespace, namespace_files) in &files_by_namespace {
+        match validate_legacy_memory_layout(
+            root_dir,
+            configured_shards,
+            STABLE_SHA256_MEMORY_SHARD_HASH_VERSION,
+            namespace_files,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(stable_error) => {
+                validate_legacy_memory_layout(
+                    root_dir,
                     configured_shards,
-                    stable_error,
-                    legacy_error
-                ))
-            })?;
-            Ok(MemoryLayoutManifest {
-                format_version: MEMORY_LAYOUT_FORMAT_VERSION,
-                shard_hash_version: LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
-                namespace_shards: configured_shards,
-            })
+                    LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
+                    namespace_files,
+                )
+                .await
+                .map_err(|legacy_error| {
+                    PlatformError::runtime(format!(
+                        "memory legacy layout at {} is incompatible with supported shard hash layouts for namespace {} and configured memory_namespace_shards={}; stable layout error: {}; legacy layout error: {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
+                        root_dir.display(),
+                        namespace,
+                        configured_shards,
+                        stable_error,
+                        legacy_error
+                    ))
+                })?;
+                namespace_shard_hash_versions.insert(
+                    namespace.clone(),
+                    LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
+                );
+            }
         }
     }
+
+    Ok(MemoryLayoutManifest {
+        format_version: MEMORY_LAYOUT_FORMAT_VERSION,
+        shard_hash_version: STABLE_SHA256_MEMORY_SHARD_HASH_VERSION,
+        namespace_shards: configured_shards,
+        namespace_shard_hash_versions,
+    })
 }
 
 async fn validate_legacy_memory_layout(
@@ -2897,8 +2939,9 @@ async fn validate_legacy_memory_layout(
     for shard_file in shard_files {
         if shard_file.shard_index >= configured_shards {
             return Err(PlatformError::runtime(format!(
-                "memory legacy layout at {} contains shard index {} outside configured memory_namespace_shards={} for shard_hash_version={}; changing the shard count requires an explicit reshard operation before startup",
+                "memory legacy layout at {} namespace {} contains shard index {} outside configured memory_namespace_shards={} for shard_hash_version={}; changing the shard count requires an explicit reshard operation before startup",
                 root_dir.display(),
+                shard_file.namespace,
                 shard_file.shard_index,
                 configured_shards,
                 shard_hash_version
@@ -2913,8 +2956,9 @@ async fn validate_legacy_memory_layout(
             )?;
             if expected != shard_file.shard_index {
                 return Err(PlatformError::runtime(format!(
-                    "memory legacy layout at {} is incompatible with configured memory_namespace_shards={} and shard_hash_version={}: entity key in {} belongs to shard {} under the configured layout but is stored in shard {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
+                    "memory legacy layout at {} namespace {} is incompatible with configured memory_namespace_shards={} and shard_hash_version={}: entity key in {} belongs to shard {} under the configured layout but is stored in shard {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
                     root_dir.display(),
+                    shard_file.namespace,
                     configured_shards,
                     shard_hash_version,
                     shard_file.path.display(),
@@ -2931,6 +2975,7 @@ async fn validate_legacy_memory_layout(
 }
 
 struct LegacyMemoryShardFile {
+    namespace: String,
     path: PathBuf,
     shard_index: usize,
 }
@@ -2951,9 +2996,9 @@ fn discover_legacy_memory_shard_files(root_dir: &Path) -> Result<Vec<LegacyMemor
         let Some(raw_namespace) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if hex_decode_to_utf8(&raw_namespace).is_none() {
+        let Some(namespace) = hex_decode_to_utf8(&raw_namespace) else {
             continue;
-        }
+        };
         let shard_entries = std::fs::read_dir(&namespace_path).map_err(memory_error)?;
         for shard_entry in shard_entries {
             let shard_entry = shard_entry.map_err(memory_error)?;
@@ -2967,7 +3012,11 @@ fn discover_legacy_memory_shard_files(root_dir: &Path) -> Result<Vec<LegacyMemor
             let Some(shard_index) = parse_managed_memory_shard_file_name(file_name)? else {
                 continue;
             };
-            files.push(LegacyMemoryShardFile { path, shard_index });
+            files.push(LegacyMemoryShardFile {
+                namespace: namespace.clone(),
+                path,
+                shard_index,
+            });
         }
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -3475,7 +3524,7 @@ mod tests {
     #[tokio::test]
     async fn memory_db_paths_are_stable_per_namespace() -> Result<()> {
         let store = MemoryStore::new(temp_root("paths"), 16, 4, Duration::from_secs(60)).await?;
-        let shard = store.shard_index("memory-a");
+        let shard = store.shard_index("ns", "memory-a");
         let ns_a = store.db_path("ns", shard);
         let ns_a_again = store.db_path("ns", shard);
         let ns_b = store.db_path("other", shard);
@@ -3547,7 +3596,7 @@ mod tests {
             task.await
                 .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
         }
-        let shard = store.shard_for_key("memory-a");
+        let shard = store.shard_for_key("ns", "memory-a");
         assert_eq!(shard.databases.lock().await.len(), 1);
         Ok(())
     }
@@ -3608,7 +3657,7 @@ mod tests {
         store.snapshot("ns", "memory-b").await?;
 
         let snapshots = store
-            .shard_for_key("memory-a")
+            .shard_for_key("ns", "memory-a")
             .shared_snapshots
             .lock()
             .await;
@@ -3645,7 +3694,7 @@ mod tests {
             .await?;
         store.snapshot("ns", "memory-a").await?;
         let snapshots = store
-            .shard_for_key("memory-a")
+            .shard_for_key("ns", "memory-a")
             .shared_snapshots
             .lock()
             .await;
@@ -3719,6 +3768,7 @@ mod tests {
                 format_version: 2,
                 shard_hash_version: MEMORY_SHARD_HASH_VERSION,
                 namespace_shards: 16,
+                namespace_shard_hash_versions: BTreeMap::new(),
             },
         )?;
 
@@ -3747,6 +3797,7 @@ mod tests {
                 format_version: MEMORY_LAYOUT_FORMAT_VERSION,
                 shard_hash_version: 2,
                 namespace_shards: 16,
+                namespace_shard_hash_versions: BTreeMap::new(),
             },
         )?;
 
@@ -3805,10 +3856,14 @@ mod tests {
         let manifest = read_memory_layout(&memory_layout_manifest_path(&root))?;
         assert_eq!(
             manifest.shard_hash_version,
-            LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION
+            STABLE_SHA256_MEMORY_SHARD_HASH_VERSION
         );
         assert_eq!(
-            store.shard_index_for_key(&memory_key),
+            manifest.namespace_shard_hash_versions.get("ns").copied(),
+            Some(LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION)
+        );
+        assert_eq!(
+            store.shard_index_for_key("ns", &memory_key),
             expected_legacy_shard
         );
         let point = store.point_read("ns", &memory_key, "count").await?;
@@ -3818,6 +3873,89 @@ mod tests {
                 .expect("legacy state should remain readable")
                 .value,
             b"1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_layout_adopts_mixed_namespace_hash_layouts() -> Result<()> {
+        let root = temp_root("layout-mixed-namespace-hash");
+        let (stable_key, legacy_shard_for_stable_key, stable_shard) =
+            key_with_different_hash_layout(16);
+        let stable_store = MemoryStore::new(root.clone(), 16, 4, Duration::from_secs(60)).await?;
+        stable_store
+            .apply_batch(
+                "AUTH_STATE",
+                &stable_key,
+                &[utf8_mutation("token", "stable")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+        assert_eq!(
+            stable_store.shard_index_for_key("AUTH_STATE", &stable_key),
+            stable_shard
+        );
+        assert_ne!(legacy_shard_for_stable_key, stable_shard);
+        drop(stable_store);
+        std::fs::remove_file(memory_layout_manifest_path(&root)).map_err(memory_error)?;
+
+        let (legacy_key, legacy_shard, stable_shard_for_legacy_key) =
+            key_with_different_hash_layout(16);
+        seed_legacy_default_hasher_memory_state(
+            &root,
+            "CHAT_ROOM",
+            &legacy_key,
+            "count",
+            "legacy",
+            1,
+            16,
+        )
+        .await?;
+        assert_ne!(legacy_shard, stable_shard_for_legacy_key);
+
+        let store = MemoryStore::new(root.clone(), 16, 4, Duration::from_secs(60)).await?;
+        let manifest = read_memory_layout(&memory_layout_manifest_path(&root))?;
+        assert_eq!(
+            manifest.shard_hash_version,
+            STABLE_SHA256_MEMORY_SHARD_HASH_VERSION
+        );
+        assert_eq!(
+            manifest
+                .namespace_shard_hash_versions
+                .get("CHAT_ROOM")
+                .copied(),
+            Some(LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION)
+        );
+        assert!(!manifest
+            .namespace_shard_hash_versions
+            .contains_key("AUTH_STATE"));
+        assert_eq!(
+            store.shard_index_for_key("AUTH_STATE", &stable_key),
+            stable_shard
+        );
+        assert_eq!(
+            store.shard_index_for_key("CHAT_ROOM", &legacy_key),
+            legacy_shard
+        );
+        assert_eq!(
+            store
+                .point_read("AUTH_STATE", &stable_key, "token")
+                .await?
+                .record
+                .expect("stable namespace state should remain readable")
+                .value,
+            b"stable"
+        );
+        assert_eq!(
+            store
+                .point_read("CHAT_ROOM", &legacy_key, "count")
+                .await?
+                .record
+                .expect("legacy namespace state should remain readable")
+                .value,
+            b"legacy"
         );
         Ok(())
     }
@@ -3908,7 +4046,10 @@ mod tests {
     async fn memory_versions_are_shard_local() -> Result<()> {
         let store =
             MemoryStore::new(temp_root("shard-versions"), 4, 4, Duration::from_secs(60)).await?;
-        assert_ne!(store.shard_index("memory-a"), store.shard_index("memory-b"));
+        assert_ne!(
+            store.shard_index("ns", "memory-a"),
+            store.shard_index("ns", "memory-b")
+        );
 
         let first = store
             .apply_batch(
@@ -3963,7 +4104,12 @@ mod tests {
         let warm_snapshot = store.snapshot("ns", "memory-b").await?;
         assert_eq!(warm_snapshot.entries.len(), 1);
         assert_eq!(
-            store.shard_for_key("memory-b").databases.lock().await.len(),
+            store
+                .shard_for_key("ns", "memory-b")
+                .databases
+                .lock()
+                .await
+                .len(),
             1
         );
 
@@ -4058,7 +4204,7 @@ mod tests {
 
         let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
         let snapshots = store
-            .shard_for_key("memory-a")
+            .shard_for_key("ns", "memory-a")
             .shared_snapshots
             .lock()
             .await;
@@ -4646,7 +4792,7 @@ mod tests {
 
         let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
         let snapshots = store
-            .shard_for_key("memory-a")
+            .shard_for_key("ns", "memory-a")
             .shared_snapshots
             .lock()
             .await;
@@ -4704,7 +4850,7 @@ mod tests {
         let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
         {
             let snapshots = store
-                .shard_for_key("memory-a")
+                .shard_for_key("ns", "memory-a")
                 .shared_snapshots
                 .lock()
                 .await;
@@ -4722,7 +4868,7 @@ mod tests {
         assert!(miss.record.is_none());
 
         let snapshots = store
-            .shard_for_key("memory-a")
+            .shard_for_key("ns", "memory-a")
             .shared_snapshots
             .lock()
             .await;

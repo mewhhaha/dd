@@ -172,7 +172,10 @@ impl WorkerManager {
 
         if let Some(route) = memory_route.as_mut() {
             if route.shard_index.is_none() {
-                route.shard_index = Some(self.memory_store.shard_index_for_key(&route.key));
+                route.shard_index = Some(
+                    self.memory_store
+                        .shard_index_for_key(&route.binding, &route.key),
+                );
             }
         }
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
