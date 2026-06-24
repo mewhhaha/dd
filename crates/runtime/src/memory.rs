@@ -262,6 +262,8 @@ struct MemoryLayoutManifest {
     namespace_shards: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     namespace_shard_hash_versions: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    namespace_key_shard_overrides: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 impl MemoryLayoutManifest {
@@ -271,6 +273,7 @@ impl MemoryLayoutManifest {
             shard_hash_version: MEMORY_SHARD_HASH_VERSION,
             namespace_shards,
             namespace_shard_hash_versions: BTreeMap::new(),
+            namespace_key_shard_overrides: BTreeMap::new(),
         }
     }
 }
@@ -321,6 +324,7 @@ pub struct MemoryStore {
     namespace_shards: usize,
     shard_hash_version: u32,
     namespace_shard_hash_versions: Arc<BTreeMap<String, u32>>,
+    namespace_key_shard_overrides: Arc<BTreeMap<String, BTreeMap<String, usize>>>,
     snapshot_cache_max_entries: usize,
     snapshot_cache_max_bytes: usize,
     owner_epoch_floor: Arc<AtomicU64>,
@@ -582,6 +586,7 @@ impl MemoryStore {
             namespace_shards,
             shard_hash_version: layout.shard_hash_version,
             namespace_shard_hash_versions: Arc::new(layout.namespace_shard_hash_versions),
+            namespace_key_shard_overrides: Arc::new(layout.namespace_key_shard_overrides),
             snapshot_cache_max_entries: db_cache_max_open.max(64),
             snapshot_cache_max_bytes: db_cache_max_open.max(64).saturating_mul(64 * 1024),
             owner_epoch_floor: Arc::new(AtomicU64::new(floors.owner_epoch_floor.max(1))),
@@ -1912,6 +1917,13 @@ impl MemoryStore {
     }
 
     fn shard_index(&self, namespace: &str, memory_key: &str) -> usize {
+        if let Some(shard_index) = self
+            .namespace_key_shard_overrides
+            .get(namespace)
+            .and_then(|keys| keys.get(memory_key))
+        {
+            return *shard_index;
+        }
         memory_shard_index_for_hash_version(
             memory_key,
             self.namespace_shards,
@@ -2807,6 +2819,20 @@ fn validate_memory_layout(
             )));
         }
     }
+    for (namespace, key_overrides) in &manifest.namespace_key_shard_overrides {
+        for (memory_key, shard_index) in key_overrides {
+            if *shard_index >= configured_shards {
+                return Err(PlatformError::runtime(format!(
+                    "memory layout key shard override for namespace {} key {} points to shard {} outside configured memory_namespace_shards={} at {}",
+                    namespace,
+                    memory_key,
+                    shard_index,
+                    configured_shards,
+                    memory_layout_manifest_path(root_dir).display()
+                )));
+            }
+        }
+    }
     if manifest.namespace_shards != configured_shards {
         return Err(memory_layout_mismatch_error(
             root_dir,
@@ -2886,6 +2912,7 @@ async fn adopt_legacy_memory_layout(
     }
 
     let mut namespace_shard_hash_versions = BTreeMap::new();
+    let mut namespace_key_shard_overrides = BTreeMap::new();
     for (namespace, namespace_files) in &files_by_namespace {
         match validate_legacy_memory_layout(
             root_dir,
@@ -2897,27 +2924,43 @@ async fn adopt_legacy_memory_layout(
         {
             Ok(()) => {}
             Err(stable_error) => {
-                validate_legacy_memory_layout(
+                match validate_legacy_memory_layout(
                     root_dir,
                     configured_shards,
                     LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
                     namespace_files,
                 )
                 .await
-                .map_err(|legacy_error| {
-                    PlatformError::runtime(format!(
-                        "memory legacy layout at {} is incompatible with supported shard hash layouts for namespace {} and configured memory_namespace_shards={}; stable layout error: {}; legacy layout error: {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
-                        root_dir.display(),
-                        namespace,
-                        configured_shards,
-                        stable_error,
-                        legacy_error
-                    ))
-                })?;
-                namespace_shard_hash_versions.insert(
-                    namespace.clone(),
-                    LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
-                );
+                {
+                    Ok(()) => {
+                        namespace_shard_hash_versions.insert(
+                            namespace.clone(),
+                            LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION,
+                        );
+                    }
+                    Err(legacy_error) => {
+                        let key_overrides = collect_physical_memory_key_shard_overrides(
+                            root_dir,
+                            configured_shards,
+                            namespace_files,
+                        )
+                        .await
+                        .map_err(|physical_error| {
+                            PlatformError::runtime(format!(
+                                "memory legacy layout at {} is incompatible with supported shard layouts for namespace {} and configured memory_namespace_shards={}; stable layout error: {}; legacy layout error: {}; physical layout error: {}; changing the shard count or hash layout requires an explicit reshard operation before startup",
+                                root_dir.display(),
+                                namespace,
+                                configured_shards,
+                                stable_error,
+                                legacy_error,
+                                physical_error
+                            ))
+                        })?;
+                        if !key_overrides.is_empty() {
+                            namespace_key_shard_overrides.insert(namespace.clone(), key_overrides);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2927,6 +2970,7 @@ async fn adopt_legacy_memory_layout(
         shard_hash_version: STABLE_SHA256_MEMORY_SHARD_HASH_VERSION,
         namespace_shards: configured_shards,
         namespace_shard_hash_versions,
+        namespace_key_shard_overrides,
     })
 }
 
@@ -2972,6 +3016,41 @@ async fn validate_legacy_memory_layout(
         // discovered persisted entity keys above are compatible.
     }
     Ok(())
+}
+
+async fn collect_physical_memory_key_shard_overrides(
+    root_dir: &Path,
+    configured_shards: usize,
+    shard_files: &[LegacyMemoryShardFile],
+) -> Result<BTreeMap<String, usize>> {
+    let mut key_shards = BTreeMap::new();
+    for shard_file in shard_files {
+        if shard_file.shard_index >= configured_shards {
+            return Err(PlatformError::runtime(format!(
+                "memory legacy layout at {} namespace {} contains shard index {} outside configured memory_namespace_shards={}; changing the shard count requires an explicit reshard operation before startup",
+                root_dir.display(),
+                shard_file.namespace,
+                shard_file.shard_index,
+                configured_shards
+            )));
+        }
+        let keys = distinct_entity_keys_in_memory_db(&shard_file.path).await?;
+        for entity_key in keys {
+            if let Some(existing) = key_shards.insert(entity_key.clone(), shard_file.shard_index) {
+                if existing != shard_file.shard_index {
+                    return Err(PlatformError::runtime(format!(
+                        "memory legacy layout at {} namespace {} stores entity key {} in multiple shards ({} and {}); changing the shard count or hash layout requires an explicit reshard operation before startup",
+                        root_dir.display(),
+                        shard_file.namespace,
+                        entity_key,
+                        existing,
+                        shard_file.shard_index
+                    )));
+                }
+            }
+        }
+    }
+    Ok(key_shards)
 }
 
 struct LegacyMemoryShardFile {
@@ -3414,16 +3493,6 @@ mod tests {
         }
     }
 
-    fn key_with_different_shard(old_shards: usize, new_shards: usize) -> String {
-        (0..10_000)
-            .map(|index| format!("entity-{index}"))
-            .find(|key| {
-                let old_shard = stable_memory_shard_index(key, old_shards);
-                old_shard < new_shards && old_shard != stable_memory_shard_index(key, new_shards)
-            })
-            .expect("test should find key with different shard")
-    }
-
     fn key_with_different_hash_layout(shards: usize) -> (String, usize, usize) {
         (0..10_000)
             .map(|index| format!("legacy-entity-{index}"))
@@ -3433,6 +3502,18 @@ mod tests {
                 (legacy != stable).then_some((key, legacy, stable))
             })
             .expect("test should find key with different legacy and stable shards")
+    }
+
+    fn key_with_distinct_physical_shard(shards: usize) -> (String, usize, usize, usize) {
+        (0..10_000)
+            .map(|index| format!("physical-entity-{index}"))
+            .find_map(|key| {
+                let stable = stable_memory_shard_index(&key, shards);
+                let legacy = legacy_default_hasher_memory_shard_index(&key, shards);
+                let physical = (0..shards).find(|shard| *shard != stable && *shard != legacy)?;
+                Some((key, physical, stable, legacy))
+            })
+            .expect("test should find key with a distinct physical shard")
     }
 
     fn key_at_or_above_shard(shards: usize, minimum_shard: usize) -> String {
@@ -3452,6 +3533,28 @@ mod tests {
         namespace_shards: usize,
     ) -> Result<usize> {
         let shard_index = legacy_default_hasher_memory_shard_index(memory_key, namespace_shards);
+        seed_memory_state_at_shard(
+            root,
+            namespace,
+            memory_key,
+            item_key,
+            value,
+            version,
+            shard_index,
+        )
+        .await?;
+        Ok(shard_index)
+    }
+
+    async fn seed_memory_state_at_shard(
+        root: &Path,
+        namespace: &str,
+        memory_key: &str,
+        item_key: &str,
+        value: &str,
+        version: i64,
+        shard_index: usize,
+    ) -> Result<()> {
         let path = root
             .join(hex_encode(namespace.as_bytes()))
             .join(format!("shard-{shard_index:04}.db"));
@@ -3491,7 +3594,7 @@ mod tests {
                 return Err(error);
             }
         }
-        Ok(shard_index)
+        Ok(())
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -3769,6 +3872,7 @@ mod tests {
                 shard_hash_version: MEMORY_SHARD_HASH_VERSION,
                 namespace_shards: 16,
                 namespace_shard_hash_versions: BTreeMap::new(),
+                namespace_key_shard_overrides: BTreeMap::new(),
             },
         )?;
 
@@ -3798,6 +3902,7 @@ mod tests {
                 shard_hash_version: 2,
                 namespace_shards: 16,
                 namespace_shard_hash_versions: BTreeMap::new(),
+                namespace_key_shard_overrides: BTreeMap::new(),
             },
         )?;
 
@@ -3961,27 +4066,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_layout_rejects_incompatible_legacy_entity_placement() -> Result<()> {
-        let root = temp_root("layout-legacy-incompatible");
-        let key = key_with_different_shard(6, 4);
-        let store = MemoryStore::new(root.clone(), 6, 4, Duration::from_secs(60)).await?;
-        store
-            .apply_batch("ns", &key, &[utf8_mutation("count", "1")], None, &[], None)
-            .await?;
-        std::fs::remove_file(memory_layout_manifest_path(&root)).map_err(memory_error)?;
-
-        let error = expect_memory_store_new_error(
-            root,
-            4,
-            "incompatible legacy placement must fail startup",
+    async fn memory_layout_adopts_physical_key_shard_overrides() -> Result<()> {
+        let root = temp_root("layout-physical-key-overrides");
+        let (memory_key, physical_shard, stable_shard, legacy_shard) =
+            key_with_distinct_physical_shard(16);
+        seed_memory_state_at_shard(
+            &root,
+            "EXAMPLE_MEMORY",
+            &memory_key,
+            "count",
+            "physical",
+            1,
+            physical_shard,
         )
-        .await;
-        assert!(
-            error
-                .to_string()
-                .contains("is incompatible with configured memory_namespace_shards"),
-            "{error}"
+        .await?;
+        assert_ne!(physical_shard, stable_shard);
+        assert_ne!(physical_shard, legacy_shard);
+
+        let store = MemoryStore::new(root.clone(), 16, 4, Duration::from_secs(60)).await?;
+        let manifest = read_memory_layout(&memory_layout_manifest_path(&root))?;
+        assert_eq!(
+            manifest
+                .namespace_key_shard_overrides
+                .get("EXAMPLE_MEMORY")
+                .and_then(|keys| keys.get(&memory_key))
+                .copied(),
+            Some(physical_shard)
         );
+        assert_eq!(
+            store.shard_index_for_key("EXAMPLE_MEMORY", &memory_key),
+            physical_shard
+        );
+        assert_eq!(
+            store
+                .point_read("EXAMPLE_MEMORY", &memory_key, "count")
+                .await?
+                .record
+                .expect("physically routed state should remain readable")
+                .value,
+            b"physical"
+        );
+
+        let new_key = "new-example-memory-key";
+        assert_eq!(
+            store.shard_index_for_key("EXAMPLE_MEMORY", new_key),
+            stable_memory_shard_index(new_key, 16)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_layout_rejects_physical_key_duplicate_across_shards() -> Result<()> {
+        let root = temp_root("layout-physical-duplicate");
+        let (memory_key, first_shard, stable_shard, legacy_shard) =
+            key_with_distinct_physical_shard(16);
+        let second_shard = (0..16)
+            .find(|shard| *shard != first_shard && *shard != stable_shard && *shard != legacy_shard)
+            .expect("test should find a second non-hash shard");
+        seed_memory_state_at_shard(
+            &root,
+            "EXAMPLE_MEMORY",
+            &memory_key,
+            "count",
+            "one",
+            1,
+            first_shard,
+        )
+        .await?;
+        seed_memory_state_at_shard(
+            &root,
+            "EXAMPLE_MEMORY",
+            &memory_key,
+            "count",
+            "two",
+            2,
+            second_shard,
+        )
+        .await?;
+
+        let error =
+            expect_memory_store_new_error(root, 16, "duplicate physical keys must fail startup")
+                .await;
+        assert!(error.to_string().contains("stores entity key"), "{error}");
+        assert!(error.to_string().contains("in multiple shards"), "{error}");
         Ok(())
     }
 
