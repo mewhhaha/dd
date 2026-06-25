@@ -20,6 +20,7 @@ implementation agent without relying on conversational context.
 | 10 | [Isolate and fix the benchmark signal-139 instability](010-fix-benchmark-signal-139-instability.md) | P2 reliability | Restores the complete runtime benchmark suite as a usable gate. |
 | 11 | [Scale runtime scheduling beyond one manager thread](011-scale-runtime-manager-beyond-one-thread.md) | P2 architecture | Removes the next structural ceiling after shard-local scheduling and outbox improvements are measured. |
 | 12 | [Add an explicit memory resharding tool](012-add-memory-shard-resharding-tool.md) | P2 operations | Provides a safe path to intentionally change shard counts after layout validation exists. |
+| 13 | [Capture and analyze full shard-matrix findings](013-capture-full-shard-matrix-findings.md) | P2 performance analysis | Turns the full shard-count sweep into durable guidance instead of only a 16-shard slice. |
 
 ## Task execution rules
 
