@@ -48,6 +48,12 @@ impl WorkerPool {
             dispatch_no_ready_candidate_count: self.stats.memory_dispatch_no_ready_candidate_count,
             runtime_ready_work_budget_exhausted_count: 0,
             runtime_max_ready_work_batch_size: 0,
+            global_isolate_budget: 0,
+            global_isolates_total: 0,
+            global_isolates_starting: 0,
+            global_isolate_slots_available: 0,
+            scale_up_waiting_pools: 0,
+            scale_up_budget_denied_count: 0,
         };
         let queued_requests = self
             .queue

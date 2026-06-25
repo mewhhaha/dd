@@ -3082,6 +3082,7 @@ async fn preview_dynamic_worker_can_proxy_module_based_children() {
 async fn scales_up_with_backlog() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
+        max_global_isolates: 4,
         max_isolates: 4,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
@@ -3106,9 +3107,13 @@ async fn scales_up_with_backlog() {
         }));
     }
 
-    for task in tasks {
-        task.await.expect("join").expect("invoke should succeed");
-    }
+    timeout(Duration::from_secs(10), async {
+        for task in tasks {
+            task.await.expect("join").expect("invoke should succeed");
+        }
+    })
+    .await
+    .expect("single worker requests should finish");
 
     let stats = service
         .stats("slow".to_string())
@@ -3116,6 +3121,110 @@ async fn scales_up_with_backlog() {
         .expect("stats should exist");
     assert!(stats.spawn_count > 1);
     assert!(stats.isolates_total <= 4);
+    assert_eq!(stats.global_isolate_budget, 4);
+    assert!(stats.global_isolates_total <= 4);
+}
+
+#[tokio::test]
+#[serial]
+async fn single_worker_can_grow_to_global_isolate_budget() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 2,
+        max_isolates: 8,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy("slow".to_string(), slow_worker())
+        .await
+        .expect("deploy should succeed");
+
+    let mut tasks = Vec::new();
+    for idx in 0..12 {
+        let svc = service.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut req = test_invocation();
+            req.request_id = format!("budget-req-{idx}");
+            svc.invoke("slow".to_string(), req).await
+        }));
+    }
+
+    timeout(Duration::from_secs(10), async {
+        for task in tasks {
+            task.await.expect("join").expect("invoke should succeed");
+        }
+    })
+    .await
+    .expect("single worker requests should finish");
+
+    let stats = service
+        .stats("slow".to_string())
+        .await
+        .expect("stats should exist");
+    assert_eq!(stats.global_isolate_budget, 2);
+    assert!(stats.spawn_count > 1);
+    assert!(stats.isolates_total <= 2);
+    assert!(stats.global_isolates_total <= 2);
+    assert_eq!(
+        stats.global_isolate_slots_available,
+        2usize.saturating_sub(stats.global_isolates_total)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn active_workers_share_small_global_isolate_budget() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 2,
+        max_isolates: 4,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy("slow-a".to_string(), slow_worker())
+        .await
+        .expect("deploy a should succeed");
+    service
+        .deploy("slow-b".to_string(), slow_worker())
+        .await
+        .expect("deploy b should succeed");
+
+    let mut tasks = Vec::new();
+    for worker in ["slow-a", "slow-b"] {
+        for idx in 0..4 {
+            let svc = service.clone();
+            let worker = worker.to_string();
+            tasks.push(tokio::spawn(async move {
+                let mut req = test_invocation();
+                req.request_id = format!("{worker}-req-{idx}");
+                svc.invoke(worker, req).await
+            }));
+        }
+    }
+
+    for task in tasks {
+        task.await.expect("join").expect("invoke should succeed");
+    }
+
+    let a = service.stats("slow-a".to_string()).await.expect("stats a");
+    let b = service.stats("slow-b".to_string()).await.expect("stats b");
+    assert!(a.spawn_count >= 1);
+    assert!(b.spawn_count >= 1);
+    assert!(a.isolates_total + b.isolates_total <= 2);
+    assert_eq!(a.global_isolates_total, b.global_isolates_total);
+    assert!(a.global_isolates_total <= 2);
 }
 
 #[tokio::test]
@@ -3123,6 +3232,7 @@ async fn scales_up_with_backlog() {
 async fn scales_down_when_idle() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
+        max_global_isolates: 3,
         max_isolates: 3,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_millis(200),
@@ -3156,6 +3266,8 @@ async fn scales_down_when_idle() {
         loop {
             let stats = service.stats("slow".to_string()).await.expect("stats");
             if stats.isolates_total == 0 {
+                assert_eq!(stats.global_isolates_total, 0);
+                assert_eq!(stats.global_isolate_slots_available, 3);
                 break;
             }
             sleep(Duration::from_millis(50)).await;
@@ -4510,14 +4622,17 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(model_source.contains("memory_shard_affinity: HashMap<usize, u64>"));
     assert!(model_source.contains("memory_shards: BTreeMap<usize, MemoryShardQueue>"));
     assert!(model_source.contains("struct MemoryOwnerQueue"));
-    assert!(model_source.contains("owner_ring: VecDeque<String>"));
+    assert!(model_source.contains("ready: VecDeque<String>"));
+    assert!(model_source.contains("ready_membership: HashSet<String>"));
+    assert!(model_source.contains("blocked: HashSet<String>"));
     assert!(model_source.contains("memory_next_shard_cursor: Option<usize>"));
     assert!(model_source.contains("memory_shard_index: Option<usize>"));
     assert!(model_source.contains("memory_owner_key: Option<String>"));
     assert!(model_source.contains("pub(super) fn find_fair_map<T>("));
     assert!(model_source.contains("fn find_memory_round_robin_head_map<T>("));
     assert!(model_source.contains("fn find_round_robin_owner_head_map<T>("));
-    assert!(model_source.contains("rejected owner head"));
+    assert!(model_source.contains("pub(super) fn mark_memory_owner_blocked("));
+    assert!(model_source.contains("pub(super) fn mark_memory_owner_ready("));
     assert!(model_source.contains("targeted: BTreeMap<u64, PendingInvoke>"));
     assert!(!model_source.contains("memory: BTreeMap<u64, PendingInvoke>"));
     assert!(model_source.contains("pub(super) fn drain_target_isolate_id("));

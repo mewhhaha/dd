@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "dd_server")]
 #[command(about = "Single-node dd worker runtime server")]
 #[command(
-    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT"
+    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS"
 )]
 struct Cli {
     #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = DEFAULT_PUBLIC_BIND_ADDR)]
@@ -63,6 +63,48 @@ struct Cli {
 
     #[arg(long, env = "DD_TOKEN_STORE_PATH")]
     token_store_path: Option<PathBuf>,
+
+    #[arg(
+        long = "runtime-max-global-isolates",
+        env = "DD_RUNTIME_MAX_GLOBAL_ISOLATES"
+    )]
+    runtime_max_global_isolates: Option<usize>,
+
+    #[arg(
+        long = "runtime-max-isolates-per-worker",
+        env = "DD_RUNTIME_MAX_ISOLATES_PER_WORKER"
+    )]
+    runtime_max_isolates_per_worker: Option<usize>,
+
+    #[arg(
+        long = "runtime-max-inflight-per-isolate",
+        env = "DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE"
+    )]
+    runtime_max_inflight_per_isolate: Option<usize>,
+
+    #[arg(
+        long = "runtime-min-isolates-per-worker",
+        env = "DD_RUNTIME_MIN_ISOLATES_PER_WORKER"
+    )]
+    runtime_min_isolates_per_worker: Option<usize>,
+
+    #[arg(
+        long = "memory-outbox-max-concurrent-shards",
+        env = "DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS"
+    )]
+    memory_outbox_max_concurrent_shards: Option<usize>,
+
+    #[arg(
+        long = "memory-db-read-connections-per-database",
+        env = "DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE"
+    )]
+    memory_db_read_connections_per_database: Option<usize>,
+
+    #[arg(
+        long = "memory-db-max-total-connections",
+        env = "DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
+    )]
+    memory_db_max_total_connections: Option<usize>,
 }
 
 #[tokio::main]
@@ -84,8 +126,7 @@ async fn main() -> Result<()> {
     ]);
     let allow_insecure_private_loopback =
         cli.dd_allow_insecure_private_loopback || cli.allow_insecure_private_loopback;
-
-    let result = dd_server::run(ServerConfig {
+    let mut server_config = ServerConfig {
         bind_public_addr: public_addr,
         bind_private_addr: private_addr,
         public_base_domain: cli.public_base_domain,
@@ -97,8 +138,39 @@ async fn main() -> Result<()> {
             .token_store_path
             .or_else(|| env::var_os("DD_DEPLOY_TOKEN_STORE_PATH").map(PathBuf::from)),
         ..ServerConfig::default()
-    })
-    .await;
+    };
+    if let Some(value) = cli.runtime_max_global_isolates {
+        server_config.runtime.runtime.max_global_isolates = value;
+    }
+    if let Some(value) = cli.runtime_max_isolates_per_worker {
+        server_config.runtime.runtime.max_isolates = value;
+    }
+    if let Some(value) = cli.runtime_max_inflight_per_isolate {
+        server_config.runtime.runtime.max_inflight_per_isolate = value;
+    }
+    if let Some(value) = cli.runtime_min_isolates_per_worker {
+        server_config.runtime.runtime.min_isolates = value;
+    }
+    if let Some(value) = cli.memory_outbox_max_concurrent_shards {
+        server_config
+            .runtime
+            .storage
+            .memory_outbox_max_concurrent_shards = value;
+    }
+    if let Some(value) = cli.memory_db_read_connections_per_database {
+        server_config
+            .runtime
+            .storage
+            .memory_db_read_connections_per_database = value;
+    }
+    if let Some(value) = cli.memory_db_max_total_connections {
+        server_config
+            .runtime
+            .storage
+            .memory_db_max_total_connections = value;
+    }
+
+    let result = dd_server::run(server_config).await;
 
     shutdown_tracing(otel_provider);
     result
@@ -196,6 +268,8 @@ fn otlp_http_traces_endpoint(endpoint: &str) -> String {
 mod tests {
     #[cfg(feature = "otel")]
     use super::otlp_http_traces_endpoint;
+    use super::Cli;
+    use clap::Parser;
     use common::first_non_empty_trimmed;
 
     #[test]
@@ -214,6 +288,36 @@ mod tests {
     fn token_selection_returns_none_when_all_tokens_are_empty() {
         let token = first_non_empty_trimmed(["", " "]);
         assert!(token.is_none());
+    }
+
+    #[test]
+    fn runtime_tuning_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "dd_server",
+            "--runtime-max-global-isolates",
+            "12",
+            "--runtime-max-isolates-per-worker",
+            "6",
+            "--runtime-max-inflight-per-isolate",
+            "3",
+            "--runtime-min-isolates-per-worker",
+            "1",
+            "--memory-outbox-max-concurrent-shards",
+            "4",
+            "--memory-db-read-connections-per-database",
+            "2",
+            "--memory-db-max-total-connections",
+            "32",
+        ])
+        .expect("runtime flags should parse");
+
+        assert_eq!(cli.runtime_max_global_isolates, Some(12));
+        assert_eq!(cli.runtime_max_isolates_per_worker, Some(6));
+        assert_eq!(cli.runtime_max_inflight_per_isolate, Some(3));
+        assert_eq!(cli.runtime_min_isolates_per_worker, Some(1));
+        assert_eq!(cli.memory_outbox_max_concurrent_shards, Some(4));
+        assert_eq!(cli.memory_db_read_connections_per_database, Some(2));
+        assert_eq!(cli.memory_db_max_total_connections, Some(32));
     }
 
     #[cfg(feature = "otel")]

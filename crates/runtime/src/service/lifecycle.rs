@@ -391,19 +391,26 @@ impl WorkerManager {
         generation: u64,
         isolate_id: u64,
     ) {
-        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
-            return;
-        };
-        let Some(isolate) = pool
-            .isolates
-            .iter_mut()
-            .find(|isolate| isolate.id == isolate_id)
-        else {
-            return;
-        };
-        isolate.startup = IsolateStartup::Ready;
-        isolate.last_used_at = Instant::now();
-        pool.log_stats("ready");
+        let was_starting;
+        {
+            let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+                return;
+            };
+            let Some(isolate) = pool
+                .isolates
+                .iter_mut()
+                .find(|isolate| isolate.id == isolate_id)
+            else {
+                return;
+            };
+            was_starting = isolate.startup.is_starting();
+            isolate.startup = IsolateStartup::Ready;
+            isolate.last_used_at = Instant::now();
+            pool.log_stats("ready");
+        }
+        if was_starting {
+            self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
+        }
     }
 
     pub(crate) fn finish_wait_until(
@@ -771,6 +778,7 @@ impl WorkerManager {
                 }
                 for isolate in pool.isolates {
                     let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                    self.global_isolate_slot_released(isolate.startup);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending.reply.send(Err(error.clone()));
@@ -809,6 +817,7 @@ impl WorkerManager {
         let mut stale_targeted_count = 0usize;
         let mut stale_targeted_bytes = 0usize;
         let mut removed = false;
+        let mut removed_startup = None;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool.isolates.get_mut(isolate_idx) {
                 was_starting = isolate.startup.is_starting();
@@ -817,6 +826,7 @@ impl WorkerManager {
                 }
             }
             if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
+                removed_startup = Some(isolate.startup);
                 let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                 removed_isolate_id = Some(isolate.id);
                 pool.memory_shard_affinity
@@ -848,6 +858,9 @@ impl WorkerManager {
                 }
                 removed = true;
             }
+        }
+        if let Some(startup) = removed_startup {
+            self.global_isolate_slot_released(startup);
         }
         if let Some(isolate_id) = removed_isolate_id {
             self.reap_owned_sessions(worker_name, Some(generation), Some(isolate_id));
@@ -945,6 +958,7 @@ impl WorkerManager {
         let min_isolates = self.config.min_isolates;
         let idle_ttl = self.config.idle_ttl;
         let mut removed = Vec::new();
+        let mut removed_startups = Vec::new();
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             loop {
                 if pool.isolates.len() <= min_isolates {
@@ -967,6 +981,7 @@ impl WorkerManager {
                 let isolate = pool
                     .swap_remove_isolate(idx)
                     .expect("selected isolate index must be present");
+                removed_startups.push(isolate.startup);
                 pool.stats.scale_down_count += 1;
                 removed.push(isolate);
             }
@@ -974,6 +989,9 @@ impl WorkerManager {
             if !removed.is_empty() {
                 pool.log_stats("scale_down");
             }
+        }
+        for startup in removed_startups {
+            self.global_isolate_slot_released(startup);
         }
 
         for isolate in removed {
@@ -994,6 +1012,7 @@ impl WorkerManager {
         }
         let mut clear_request_ids = Vec::new();
         let mut retired_generations = HashSet::new();
+        let mut released_startups = Vec::new();
         let live_websocket_generations: HashSet<u64> = self
             .websocket_sessions
             .values()
@@ -1035,6 +1054,7 @@ impl WorkerManager {
                 retired_generations.insert(generation);
                 for isolate in pool.isolates {
                     let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                    released_startups.push(isolate.startup);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending
@@ -1047,6 +1067,9 @@ impl WorkerManager {
         }
         for request_id in clear_request_ids {
             self.clear_revalidation_for_request(&request_id);
+        }
+        for startup in released_startups {
+            self.global_isolate_slot_released(startup);
         }
         if retired_generations.is_empty() {
             return;
@@ -1082,6 +1105,15 @@ impl WorkerManager {
         stats.runtime_ready_work_budget_exhausted_count =
             self.stats.ready_work_budget_exhausted_count;
         stats.runtime_max_ready_work_batch_size = self.stats.max_ready_work_batch_size;
+        stats.global_isolate_budget = self.config.max_global_isolates;
+        stats.global_isolates_total = self.global_isolate_slots_used;
+        stats.global_isolates_starting = self.global_isolates_starting;
+        stats.global_isolate_slots_available = self
+            .config
+            .max_global_isolates
+            .saturating_sub(self.global_isolate_slots_used);
+        stats.scale_up_waiting_pools = self.scale_up_request_members.len();
+        stats.scale_up_budget_denied_count = self.stats.scale_up_budget_denied_count;
         stats.memory_outbox_claim_batch_count = self.stats.memory_outbox_claim_batch_count;
         stats.memory_outbox_claim_row_count = self.stats.memory_outbox_claim_row_count;
         stats.memory_outbox_saturated_batch_count = self.stats.memory_outbox_saturated_batch_count;
@@ -1092,6 +1124,17 @@ impl WorkerManager {
         stats.memory_outbox_ack_failure_count = self.stats.memory_outbox_ack_failure_count;
         stats.memory_outbox_channel_full_count = self.stats.memory_outbox_channel_full_count;
         stats.memory_outbox_reschedule_count = self.stats.memory_outbox_reschedule_count;
+        stats.memory_outbox_worker_pending_shards = self.stats.memory_outbox_worker_pending_shards;
+        stats.memory_outbox_worker_in_flight_shards =
+            self.stats.memory_outbox_worker_in_flight_shards;
+        stats.memory_outbox_worker_parallelism_limit =
+            self.stats.memory_outbox_worker_parallelism_limit;
+        stats.memory_outbox_worker_parallelism_peak =
+            self.stats.memory_outbox_worker_parallelism_peak;
+        stats.memory_outbox_duplicate_schedule_coalesced_count =
+            self.stats.memory_outbox_duplicate_schedule_coalesced_count;
+        stats.memory_outbox_task_failure_count = self.stats.memory_outbox_task_failure_count;
+        stats.memory_outbox_shard_requeue_count = self.stats.memory_outbox_shard_requeue_count;
         Some(stats)
     }
 
@@ -1107,6 +1150,16 @@ impl WorkerManager {
             self.stats.ready_work_budget_exhausted_count;
         dump.memory_scheduler.runtime_max_ready_work_batch_size =
             self.stats.max_ready_work_batch_size;
+        dump.memory_scheduler.global_isolate_budget = self.config.max_global_isolates;
+        dump.memory_scheduler.global_isolates_total = self.global_isolate_slots_used;
+        dump.memory_scheduler.global_isolates_starting = self.global_isolates_starting;
+        dump.memory_scheduler.global_isolate_slots_available = self
+            .config
+            .max_global_isolates
+            .saturating_sub(self.global_isolate_slots_used);
+        dump.memory_scheduler.scale_up_waiting_pools = self.scale_up_request_members.len();
+        dump.memory_scheduler.scale_up_budget_denied_count =
+            self.stats.scale_up_budget_denied_count;
         dump.memory_outbox.pending_scheduled_shards = self.pending_memory_outbox_shards.len();
         dump.memory_outbox.claim_batch_count = self.stats.memory_outbox_claim_batch_count;
         dump.memory_outbox.claim_row_count = self.stats.memory_outbox_claim_row_count;
@@ -1117,6 +1170,17 @@ impl WorkerManager {
         dump.memory_outbox.ack_failure_count = self.stats.memory_outbox_ack_failure_count;
         dump.memory_outbox.channel_full_count = self.stats.memory_outbox_channel_full_count;
         dump.memory_outbox.reschedule_count = self.stats.memory_outbox_reschedule_count;
+        dump.memory_outbox.worker_pending_shards = self.stats.memory_outbox_worker_pending_shards;
+        dump.memory_outbox.worker_in_flight_shards =
+            self.stats.memory_outbox_worker_in_flight_shards;
+        dump.memory_outbox.worker_parallelism_limit =
+            self.stats.memory_outbox_worker_parallelism_limit;
+        dump.memory_outbox.worker_parallelism_peak =
+            self.stats.memory_outbox_worker_parallelism_peak;
+        dump.memory_outbox.duplicate_schedule_coalesced_count =
+            self.stats.memory_outbox_duplicate_schedule_coalesced_count;
+        dump.memory_outbox.task_failure_count = self.stats.memory_outbox_task_failure_count;
+        dump.memory_outbox.shard_requeue_count = self.stats.memory_outbox_shard_requeue_count;
         Some(dump)
     }
 

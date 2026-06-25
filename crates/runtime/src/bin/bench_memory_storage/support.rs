@@ -40,7 +40,16 @@ pub(super) fn runtime_service_config(
             store_dir: store_dir.to_path_buf(),
             database_url: format!("file:{}", db_path.display()),
             memory_namespace_shards: env_memory_namespace_shards(),
+            memory_outbox_max_concurrent_shards: env_memory_namespace_shards()
+                .min(
+                    std::thread::available_parallelism()
+                        .map(usize::from)
+                        .unwrap_or(1),
+                )
+                .clamp(1, 8),
             memory_db_cache_max_open: 4096,
+            memory_db_read_connections_per_database: 4,
+            memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
             blob_store: runtime::BlobStoreConfig::local(store_dir.join("blobs")),

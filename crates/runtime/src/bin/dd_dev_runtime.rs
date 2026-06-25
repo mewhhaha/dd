@@ -170,6 +170,7 @@ async fn main() -> Result<(), String> {
     let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
         runtime: RuntimeConfig {
             min_isolates: 0,
+            max_global_isolates: 4,
             max_isolates: 4,
             max_inflight_per_isolate: 4,
             idle_ttl: Duration::from_secs(10),
@@ -181,7 +182,10 @@ async fn main() -> Result<(), String> {
             store_dir: store_dir.clone(),
             database_url,
             memory_namespace_shards: 16,
+            memory_outbox_max_concurrent_shards: 8,
             memory_db_cache_max_open: 256,
+            memory_db_read_connections_per_database: 4,
+            memory_db_max_total_connections: 256usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(30),
             worker_store_enabled: false,
             blob_store: BlobStoreConfig::local(store_dir.join("blobs")),

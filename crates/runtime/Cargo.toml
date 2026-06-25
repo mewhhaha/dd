@@ -23,6 +23,7 @@ reqwest.workspace = true
 getrandom = "0.3"
 base64.workspace = true
 bytes = "1"
+futures-util = "0.3"
 sha2 = "0.10"
 mime_guess = "2"
 regex = "1"

@@ -9,7 +9,10 @@ pub(crate) async fn test_service(config: RuntimeConfig) -> RuntimeService {
             store_dir: PathBuf::from(&store_dir),
             database_url: format!("file:{db_path}"),
             memory_namespace_shards: 16,
+            memory_outbox_max_concurrent_shards: 8,
             memory_db_cache_max_open: 4096,
+            memory_db_read_connections_per_database: 4,
+            memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: false,
             blob_store: BlobStoreConfig::local(PathBuf::from(&store_dir).join("blobs")),
@@ -31,7 +34,10 @@ pub(crate) async fn test_service_with_paths(
             store_dir: store_dir.clone(),
             database_url,
             memory_namespace_shards: 16,
+            memory_outbox_max_concurrent_shards: 8,
             memory_db_cache_max_open: 4096,
+            memory_db_read_connections_per_database: 4,
+            memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled,
             blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
@@ -56,6 +62,7 @@ pub(crate) fn dynamic_single_isolate_config() -> RuntimeConfig {
 pub(crate) fn dynamic_autoscaling_config() -> RuntimeConfig {
     RuntimeConfig {
         min_isolates: 0,
+        max_global_isolates: 128,
         max_isolates: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
@@ -68,6 +75,7 @@ pub(crate) fn dynamic_autoscaling_config() -> RuntimeConfig {
 pub(crate) fn dynamic_bench_autoscaling_config() -> RuntimeConfig {
     RuntimeConfig {
         min_isolates: 0,
+        max_global_isolates: 128,
         max_isolates: 8,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),

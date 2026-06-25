@@ -1,13 +1,14 @@
 use common::{PlatformError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use turso::{Builder, Connection, Database, Value};
 
 use crate::turso_util::{configure_turso_connection, is_retryable_turso_error};
@@ -18,6 +19,7 @@ const MEMORY_LAYOUT_FORMAT_VERSION: u32 = 1;
 const LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION: u32 = 0;
 const STABLE_SHA256_MEMORY_SHARD_HASH_VERSION: u32 = 1;
 const MEMORY_SHARD_HASH_VERSION: u32 = STABLE_SHA256_MEMORY_SHARD_HASH_VERSION;
+const MEMORY_ENTITY_CACHE_STRIPES: usize = 64;
 
 struct MemoryDatabaseEntry {
     slot: Arc<MemoryDatabaseSlot>,
@@ -26,13 +28,117 @@ struct MemoryDatabaseEntry {
 }
 
 struct MemoryDatabaseSlot {
-    database: OnceCell<Arc<Database>>,
+    handle: OnceCell<Arc<MemoryDatabaseHandle>>,
 }
 
 impl MemoryDatabaseSlot {
     fn new() -> Self {
         Self {
-            database: OnceCell::new(),
+            handle: OnceCell::new(),
+        }
+    }
+}
+
+struct MemoryDatabaseHandle {
+    database: Arc<Database>,
+    readers: Arc<MemoryReadPool>,
+    writer: Arc<Mutex<Option<PooledMemoryConnection>>>,
+}
+
+struct MemoryReadPool {
+    idle: StdMutex<Vec<PooledMemoryConnection>>,
+    permits: Arc<Semaphore>,
+    global_permits: Arc<Semaphore>,
+    max_idle: usize,
+}
+
+struct PooledMemoryConnection {
+    conn: Connection,
+    _permit: MemoryConnectionPermit,
+    _pool_permit: Option<OwnedSemaphorePermit>,
+}
+
+struct MemoryConnectionPermit {
+    _permit: OwnedSemaphorePermit,
+    live_connections: Arc<AtomicUsize>,
+}
+
+impl Drop for MemoryConnectionPermit {
+    fn drop(&mut self) {
+        self.live_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct MemoryReadConnection {
+    pool: Arc<MemoryReadPool>,
+    pooled: Option<PooledMemoryConnection>,
+    healthy: bool,
+}
+
+impl std::ops::Deref for MemoryReadConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self
+            .pooled
+            .as_ref()
+            .expect("memory read connection guard must hold a connection")
+            .conn
+    }
+}
+
+impl Drop for MemoryReadConnection {
+    fn drop(&mut self) {
+        let Some(pooled) = self.pooled.take() else {
+            return;
+        };
+        if !self.healthy {
+            return;
+        }
+        let mut idle = self
+            .pool
+            .idle
+            .lock()
+            .expect("memory read pool mutex should not be poisoned");
+        if idle.len() < self.pool.max_idle
+            && self.pool.permits.available_permits() > 0
+            && self.pool.global_permits.available_permits() > 0
+        {
+            idle.push(pooled);
+        }
+    }
+}
+
+struct MemoryWriterConnection {
+    guard: tokio::sync::OwnedMutexGuard<Option<PooledMemoryConnection>>,
+    profile: Arc<MemoryProfile>,
+    healthy: bool,
+}
+
+impl std::ops::Deref for MemoryWriterConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self
+            .guard
+            .as_ref()
+            .expect("memory writer connection guard must hold a connection")
+            .conn
+    }
+}
+
+impl MemoryWriterConnection {
+    fn discard(&mut self) {
+        self.profile
+            .record(MemoryProfileMetricKind::StoreConnectionDiscard, 0, 1);
+        self.healthy = false;
+    }
+}
+
+impl Drop for MemoryWriterConnection {
+    fn drop(&mut self) {
+        if !self.healthy {
+            self.guard.take();
         }
     }
 }
@@ -91,7 +197,7 @@ impl MemoryDatabaseCache {
                 .map(|entry| {
                     entry.recency_id == recency_id
                         && entry.last_used_at == last_used_at
-                        && entry.slot.database.get().is_some()
+                        && entry.slot.handle.get().is_some()
                 })
                 .unwrap_or(false);
             self.recency.remove(&(last_used_at, recency_id));
@@ -115,7 +221,7 @@ impl MemoryDatabaseCache {
                 .map(|entry| {
                     entry.recency_id == recency_id
                         && entry.last_used_at == last_used_at
-                        && entry.slot.database.get().is_some()
+                        && entry.slot.handle.get().is_some()
                 })
                 .unwrap_or(false);
             self.recency.remove(&(last_used_at, recency_id));
@@ -280,17 +386,30 @@ impl MemoryLayoutManifest {
 
 struct MemoryShard {
     databases: Mutex<MemoryDatabaseCache>,
-    memory_versions: Mutex<HashMap<String, i64>>,
-    shared_snapshots: Mutex<MemorySharedSnapshotCache>,
+    cache_stripes: Box<[MemoryEntityCacheStripe]>,
     version: AtomicU64,
+}
+
+struct MemoryEntityCacheStripe {
+    state: Mutex<MemoryEntityCacheState>,
+}
+
+#[derive(Default)]
+struct MemoryEntityCacheState {
+    memory_versions: HashMap<String, i64>,
+    snapshots: MemorySharedSnapshotCache,
 }
 
 impl MemoryShard {
     fn new(version_floor: u64) -> Self {
         Self {
             databases: Mutex::new(MemoryDatabaseCache::default()),
-            memory_versions: Mutex::new(HashMap::new()),
-            shared_snapshots: Mutex::new(MemorySharedSnapshotCache::default()),
+            cache_stripes: (0..MEMORY_ENTITY_CACHE_STRIPES)
+                .map(|_| MemoryEntityCacheStripe {
+                    state: Mutex::new(MemoryEntityCacheState::default()),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             version: AtomicU64::new(version_floor.max(1)),
         }
     }
@@ -321,6 +440,10 @@ pub struct MemoryStore {
     shards: Arc<[MemoryShard]>,
     db_cache_max_open: usize,
     db_idle_ttl: Duration,
+    db_read_connections_per_database: usize,
+    db_connection_permits: Arc<Semaphore>,
+    db_live_connections: Arc<AtomicUsize>,
+    db_peak_connections: Arc<AtomicUsize>,
     namespace_shards: usize,
     shard_hash_version: u32,
     namespace_shard_hash_versions: Arc<BTreeMap<String, u32>>,
@@ -354,9 +477,21 @@ pub enum MemoryProfileMetricKind {
     StoreDatabaseCacheHit,
     StoreDatabaseCacheMiss,
     StoreDatabaseCacheEviction,
+    StoreConnectionCreate,
+    StoreConnectionReuse,
+    StoreReaderPoolWait,
+    StoreWriterLaneWait,
+    StoreWriterBusyRetry,
+    StoreConnectionDiscard,
+    StoreConnectionsLive,
+    StoreConnectionsPeak,
     StoreSnapshotCacheHit,
     StoreSnapshotCacheMiss,
     StoreSnapshotCacheEviction,
+    EntityCacheLockWait,
+    EntityCacheStripeCount,
+    EntityCachePeakEntriesPerStripe,
+    EntityCacheMaxEntriesPerStripe,
     RuntimeAtomicInvokeEventWait,
     RuntimeAtomicQueueWait,
     RuntimeAtomicDispatchWait,
@@ -405,9 +540,21 @@ pub struct MemoryProfileSnapshot {
     pub store_database_cache_hit: MemoryProfileMetricSnapshot,
     pub store_database_cache_miss: MemoryProfileMetricSnapshot,
     pub store_database_cache_eviction: MemoryProfileMetricSnapshot,
+    pub store_connection_create: MemoryProfileMetricSnapshot,
+    pub store_connection_reuse: MemoryProfileMetricSnapshot,
+    pub store_reader_pool_wait: MemoryProfileMetricSnapshot,
+    pub store_writer_lane_wait: MemoryProfileMetricSnapshot,
+    pub store_writer_busy_retry: MemoryProfileMetricSnapshot,
+    pub store_connection_discard: MemoryProfileMetricSnapshot,
+    pub store_connections_live: MemoryProfileMetricSnapshot,
+    pub store_connections_peak: MemoryProfileMetricSnapshot,
     pub store_snapshot_cache_hit: MemoryProfileMetricSnapshot,
     pub store_snapshot_cache_miss: MemoryProfileMetricSnapshot,
     pub store_snapshot_cache_eviction: MemoryProfileMetricSnapshot,
+    pub entity_cache_lock_wait: MemoryProfileMetricSnapshot,
+    pub entity_cache_stripe_count: MemoryProfileMetricSnapshot,
+    pub entity_cache_peak_entries_per_stripe: MemoryProfileMetricSnapshot,
+    pub entity_cache_max_entries_per_stripe: MemoryProfileMetricSnapshot,
     pub runtime_atomic_invoke_event_wait: MemoryProfileMetricSnapshot,
     pub runtime_atomic_queue_wait: MemoryProfileMetricSnapshot,
     pub runtime_atomic_dispatch_wait: MemoryProfileMetricSnapshot,
@@ -440,9 +587,21 @@ pub struct MemoryProfile {
     store_database_cache_hit: MemoryProfileMetric,
     store_database_cache_miss: MemoryProfileMetric,
     store_database_cache_eviction: MemoryProfileMetric,
+    store_connection_create: MemoryProfileMetric,
+    store_connection_reuse: MemoryProfileMetric,
+    store_reader_pool_wait: MemoryProfileMetric,
+    store_writer_lane_wait: MemoryProfileMetric,
+    store_writer_busy_retry: MemoryProfileMetric,
+    store_connection_discard: MemoryProfileMetric,
+    store_connections_live: MemoryProfileMetric,
+    store_connections_peak: MemoryProfileMetric,
     store_snapshot_cache_hit: MemoryProfileMetric,
     store_snapshot_cache_miss: MemoryProfileMetric,
     store_snapshot_cache_eviction: MemoryProfileMetric,
+    entity_cache_lock_wait: MemoryProfileMetric,
+    entity_cache_stripe_count: MemoryProfileMetric,
+    entity_cache_peak_entries_per_stripe: MemoryProfileMetric,
+    entity_cache_max_entries_per_stripe: MemoryProfileMetric,
     runtime_atomic_invoke_event_wait: MemoryProfileMetric,
     runtime_atomic_queue_wait: MemoryProfileMetric,
     runtime_atomic_dispatch_wait: MemoryProfileMetric,
@@ -547,6 +706,25 @@ impl MemoryStore {
         db_cache_max_open: usize,
         db_idle_ttl: Duration,
     ) -> Result<Self> {
+        Self::new_with_connection_limits(
+            root_dir,
+            namespace_shards,
+            db_cache_max_open,
+            db_idle_ttl,
+            4,
+            db_cache_max_open.saturating_mul(5).max(1),
+        )
+        .await
+    }
+
+    pub async fn new_with_connection_limits(
+        root_dir: PathBuf,
+        namespace_shards: usize,
+        db_cache_max_open: usize,
+        db_idle_ttl: Duration,
+        db_read_connections_per_database: usize,
+        db_max_total_connections: usize,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&root_dir).map_err(memory_error)?;
         if namespace_shards == 0 {
             return Err(PlatformError::internal(
@@ -561,6 +739,16 @@ impl MemoryStore {
         if db_idle_ttl.is_zero() {
             return Err(PlatformError::internal(
                 "memory_db_idle_ttl must be greater than 0",
+            ));
+        }
+        if db_read_connections_per_database == 0 {
+            return Err(PlatformError::internal(
+                "memory_db_read_connections_per_database must be greater than 0",
+            ));
+        }
+        if db_max_total_connections == 0 {
+            return Err(PlatformError::internal(
+                "memory_db_max_total_connections must be greater than 0",
             ));
         }
         let layout = load_or_adopt_memory_layout(&root_dir, namespace_shards).await?;
@@ -583,6 +771,10 @@ impl MemoryStore {
             shards: Arc::from(shards),
             db_cache_max_open,
             db_idle_ttl,
+            db_read_connections_per_database,
+            db_connection_permits: Arc::new(Semaphore::new(db_max_total_connections)),
+            db_live_connections: Arc::new(AtomicUsize::new(0)),
+            db_peak_connections: Arc::new(AtomicUsize::new(0)),
             namespace_shards,
             shard_hash_version: layout.shard_hash_version,
             namespace_shard_hash_versions: Arc::new(layout.namespace_shard_hash_versions),
@@ -852,14 +1044,11 @@ impl MemoryStore {
             return Err(PlatformError::runtime("memory key must not be empty"));
         }
         let version_key = Self::memory_version_key(namespace, memory_key);
-        if let Some(current) = self
-            .shard_for_key(namespace, memory_key)
-            .memory_versions
-            .lock()
-            .await
-            .get(&version_key)
-            .copied()
-        {
+        let cached_version = {
+            let (_, state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
+            state.memory_versions.get(&version_key).copied()
+        };
+        if let Some(current) = cached_version {
             self.record_profile(
                 MemoryProfileMetricKind::StoreVersionIfNewer,
                 started.elapsed().as_micros() as u64,
@@ -892,8 +1081,8 @@ impl MemoryStore {
         owner_epoch: Option<i64>,
     ) -> Result<MemoryBatchApplyResult> {
         let started = Instant::now();
-        let conn = self.connect(namespace, memory_key).await?;
         if mutations.is_empty() && command_result.is_none() && outbox_effects.is_empty() {
+            let conn = self.connect(namespace, memory_key).await?;
             let max_version = self
                 .max_version_for_memory(&conn, memory_key)
                 .await?
@@ -944,16 +1133,21 @@ impl MemoryStore {
             }
         }
 
+        let mut conn = self.writer_connection(namespace, memory_key).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
             match conn.execute("BEGIN IMMEDIATE", ()).await {
                 Ok(_) => {}
                 Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
+                    self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(memory_error(error)),
+                Err(error) => {
+                    conn.discard();
+                    return Err(memory_error(error));
+                }
             }
 
             let outcome = async {
@@ -1040,6 +1234,11 @@ impl MemoryStore {
                         Ok(_) => {}
                         Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                             let _ = conn.execute("ROLLBACK", ()).await;
+                            self.record_profile(
+                                MemoryProfileMetricKind::StoreWriterBusyRetry,
+                                0,
+                                1,
+                            );
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 5 * attempt as u64,
                             ))
@@ -1048,6 +1247,7 @@ impl MemoryStore {
                         }
                         Err(error) => {
                             let _ = conn.execute("ROLLBACK", ()).await;
+                            conn.discard();
                             return Err(memory_error(error));
                         }
                     }
@@ -1073,10 +1273,12 @@ impl MemoryStore {
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
                     if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
                         continue;
                     }
+                    conn.discard();
                     return Err(error);
                 }
             }
@@ -1159,17 +1361,21 @@ impl MemoryStore {
         let now_ms = epoch_ms_i64()?;
         let lease_until_ms = now_ms.saturating_add(duration_ms_i64(lease_for)?);
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let conn = self.connect(namespace, memory_key).await?;
+        let mut conn = self.writer_connection(namespace, memory_key).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
             match conn.execute("BEGIN IMMEDIATE", ()).await {
                 Ok(_) => {}
                 Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
+                    self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(memory_error(error)),
+                Err(error) => {
+                    conn.discard();
+                    return Err(memory_error(error));
+                }
             }
 
             let outcome = async {
@@ -1229,22 +1435,26 @@ impl MemoryStore {
                     Ok(_) => return Ok(records),
                     Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                         let _ = conn.execute("ROLLBACK", ()).await;
+                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
                         continue;
                     }
                     Err(error) => {
                         let _ = conn.execute("ROLLBACK", ()).await;
+                        conn.discard();
                         return Err(memory_error(error));
                     }
                 },
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
                     if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
                         continue;
                     }
+                    conn.discard();
                     return Err(error);
                 }
             }
@@ -1322,7 +1532,7 @@ impl MemoryStore {
             ));
         }
         let now_ms = epoch_ms_i64()?;
-        let conn = self.connect(namespace, memory_key).await?;
+        let conn = self.writer_connection(namespace, memory_key).await?;
         conn.execute(
             "UPDATE memory_outbox
              SET status = 'delivered',
@@ -1352,7 +1562,7 @@ impl MemoryStore {
         }
         let now_ms = epoch_ms_i64()?;
         let next_attempt_at_ms = now_ms.saturating_add(duration_ms_i64(retry_after)?);
-        let conn = self.connect(namespace, memory_key).await?;
+        let conn = self.writer_connection(namespace, memory_key).await?;
         conn.execute(
             "UPDATE memory_outbox
              SET status = 'pending',
@@ -1389,18 +1599,22 @@ impl MemoryStore {
         }
 
         for ((namespace, memory_key), entity_outcomes) in grouped {
-            let conn = self.connect(&namespace, &memory_key).await?;
+            let mut conn = self.writer_connection(&namespace, &memory_key).await?;
             let mut attempt = 0usize;
             loop {
                 attempt += 1;
                 match conn.execute("BEGIN IMMEDIATE", ()).await {
                     Ok(_) => {}
                     Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
+                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
                         continue;
                     }
-                    Err(error) => return Err(memory_error(error)),
+                    Err(error) => {
+                        conn.discard();
+                        return Err(memory_error(error));
+                    }
                 }
 
                 let outcome = async {
@@ -1451,6 +1665,11 @@ impl MemoryStore {
                         Ok(_) => break,
                         Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                             let _ = conn.execute("ROLLBACK", ()).await;
+                            self.record_profile(
+                                MemoryProfileMetricKind::StoreWriterBusyRetry,
+                                0,
+                                1,
+                            );
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 5 * attempt as u64,
                             ))
@@ -1459,18 +1678,25 @@ impl MemoryStore {
                         }
                         Err(error) => {
                             let _ = conn.execute("ROLLBACK", ()).await;
+                            conn.discard();
                             return Err(memory_error(error));
                         }
                     },
                     Err(error) => {
                         let _ = conn.execute("ROLLBACK", ()).await;
                         if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                            self.record_profile(
+                                MemoryProfileMetricKind::StoreWriterBusyRetry,
+                                0,
+                                1,
+                            );
                             tokio::time::sleep(std::time::Duration::from_millis(
                                 5 * attempt as u64,
                             ))
                             .await;
                             continue;
                         }
+                        conn.discard();
                         return Err(error);
                     }
                 }
@@ -1558,17 +1784,21 @@ impl MemoryStore {
                 .map(|prefix| Value::Text(format!("{}%", escape_sql_like_prefix(prefix)))),
         );
         select_params.push(Value::Integer(limit));
-        let conn = self.connect_shard(namespace, shard_index).await?;
+        let mut conn = self.writer_connection_shard(namespace, shard_index).await?;
         let mut attempt = 0usize;
         loop {
             attempt += 1;
             match conn.execute("BEGIN IMMEDIATE", ()).await {
                 Ok(_) => {}
                 Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
+                    self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                     tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
                     continue;
                 }
-                Err(error) => return Err(memory_error(error)),
+                Err(error) => {
+                    conn.discard();
+                    return Err(memory_error(error));
+                }
             }
 
             let outcome = async {
@@ -1629,22 +1859,26 @@ impl MemoryStore {
                     Ok(_) => return Ok(claims),
                     Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
                         let _ = conn.execute("ROLLBACK", ()).await;
+                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
                         continue;
                     }
                     Err(error) => {
                         let _ = conn.execute("ROLLBACK", ()).await;
+                        conn.discard();
                         return Err(memory_error(error));
                     }
                 },
                 Err(error) => {
                     let _ = conn.execute("ROLLBACK", ()).await;
                     if is_retryable_platform_memory_error(&error) && attempt < 8 {
+                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
                         tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
                             .await;
                         continue;
                     }
+                    conn.discard();
                     return Err(error);
                 }
             }
@@ -1669,7 +1903,7 @@ impl MemoryStore {
         }
     }
 
-    async fn connect(&self, namespace: &str, memory_key: &str) -> Result<Connection> {
+    async fn connect(&self, namespace: &str, memory_key: &str) -> Result<MemoryReadConnection> {
         let namespace = namespace.trim();
         if namespace.is_empty() {
             return Err(PlatformError::runtime("memory namespace must not be empty"));
@@ -1683,7 +1917,46 @@ impl MemoryStore {
             .await
     }
 
-    async fn connect_shard(&self, namespace: &str, shard_index: usize) -> Result<Connection> {
+    async fn connect_shard(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+    ) -> Result<MemoryReadConnection> {
+        let handle = self.database_handle_shard(namespace, shard_index).await?;
+        self.checkout_reader(handle).await
+    }
+
+    async fn writer_connection(
+        &self,
+        namespace: &str,
+        memory_key: &str,
+    ) -> Result<MemoryWriterConnection> {
+        let namespace = namespace.trim();
+        if namespace.is_empty() {
+            return Err(PlatformError::runtime("memory namespace must not be empty"));
+        }
+        let memory_key = memory_key.trim();
+        if memory_key.is_empty() {
+            return Err(PlatformError::runtime("memory key must not be empty"));
+        }
+        self.writer_connection_shard(namespace, self.shard_index(namespace, memory_key))
+            .await
+    }
+
+    async fn writer_connection_shard(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+    ) -> Result<MemoryWriterConnection> {
+        let handle = self.database_handle_shard(namespace, shard_index).await?;
+        self.checkout_writer(handle).await
+    }
+
+    async fn database_handle_shard(
+        &self,
+        namespace: &str,
+        shard_index: usize,
+    ) -> Result<Arc<MemoryDatabaseHandle>> {
         let shard = self.shard_for_index(shard_index);
         let db_key = self.database_key(namespace, shard_index);
         let now = Instant::now();
@@ -1702,8 +1975,8 @@ impl MemoryStore {
         };
 
         let path = self.db_path(namespace, shard_index);
-        let database = match slot
-            .database
+        let handle = match slot
+            .handle
             .get_or_try_init(|| async {
                 ensure_parent_dir(&path)?;
                 let path_str = path.to_string_lossy().to_string();
@@ -1713,18 +1986,27 @@ impl MemoryStore {
                     .map_err(memory_error)?;
                 let database = Arc::new(database);
                 ensure_schema(&database).await?;
-                Ok::<_, PlatformError>(database)
+                Ok::<_, PlatformError>(Arc::new(MemoryDatabaseHandle {
+                    database,
+                    readers: Arc::new(MemoryReadPool {
+                        idle: StdMutex::new(Vec::new()),
+                        permits: Arc::new(Semaphore::new(self.db_read_connections_per_database)),
+                        global_permits: Arc::clone(&self.db_connection_permits),
+                        max_idle: self.db_read_connections_per_database,
+                    }),
+                    writer: Arc::new(Mutex::new(None)),
+                }))
             })
             .await
         {
-            Ok(database) => Arc::clone(database),
+            Ok(handle) => Arc::clone(handle),
             Err(error) => {
                 let mut databases = shard.databases.lock().await;
                 let remove_failed_slot = databases
                     .entries
                     .get(&db_key)
                     .map(|entry| {
-                        Arc::ptr_eq(&entry.slot, &slot) && entry.slot.database.get().is_none()
+                        Arc::ptr_eq(&entry.slot, &slot) && entry.slot.handle.get().is_none()
                     })
                     .unwrap_or(false);
                 if remove_failed_slot {
@@ -1747,9 +2029,125 @@ impl MemoryStore {
             self.prune_databases_locked(shard_index, &mut databases, Instant::now());
         }
 
+        Ok(handle)
+    }
+
+    async fn open_pooled_connection(
+        &self,
+        database: &Arc<Database>,
+        pool_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<PooledMemoryConnection> {
+        let permit = self
+            .db_connection_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| PlatformError::runtime("memory connection pool is closed"))?;
         let conn = database.connect().map_err(memory_error)?;
         configure_connection(&conn).await?;
-        Ok(conn)
+        let live = self
+            .db_live_connections
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.update_peak_connections(live);
+        self.record_profile(MemoryProfileMetricKind::StoreConnectionCreate, 0, 1);
+        self.record_profile(
+            MemoryProfileMetricKind::StoreConnectionsLive,
+            live as u64,
+            1,
+        );
+        Ok(PooledMemoryConnection {
+            conn,
+            _permit: MemoryConnectionPermit {
+                _permit: permit,
+                live_connections: Arc::clone(&self.db_live_connections),
+            },
+            _pool_permit: pool_permit,
+        })
+    }
+
+    async fn checkout_reader(
+        &self,
+        handle: Arc<MemoryDatabaseHandle>,
+    ) -> Result<MemoryReadConnection> {
+        let started_at = Instant::now();
+        let pooled = {
+            let mut idle = handle
+                .readers
+                .idle
+                .lock()
+                .expect("memory read pool mutex should not be poisoned");
+            idle.pop()
+        };
+        let pooled = if let Some(pooled) = pooled {
+            self.record_profile(MemoryProfileMetricKind::StoreConnectionReuse, 0, 1);
+            pooled
+        } else {
+            let pool_permit = handle
+                .readers
+                .permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| PlatformError::runtime("memory read pool is closed"))?;
+            self.open_pooled_connection(&handle.database, Some(pool_permit))
+                .await?
+        };
+        self.record_profile(
+            MemoryProfileMetricKind::StoreReaderPoolWait,
+            started_at.elapsed().as_micros() as u64,
+            1,
+        );
+        Ok(MemoryReadConnection {
+            pool: Arc::clone(&handle.readers),
+            pooled: Some(pooled),
+            healthy: true,
+        })
+    }
+
+    async fn checkout_writer(
+        &self,
+        handle: Arc<MemoryDatabaseHandle>,
+    ) -> Result<MemoryWriterConnection> {
+        let started_at = Instant::now();
+        let mut guard = handle.writer.clone().lock_owned().await;
+        self.record_profile(
+            MemoryProfileMetricKind::StoreWriterLaneWait,
+            started_at.elapsed().as_micros() as u64,
+            1,
+        );
+        if guard.is_none() {
+            *guard = Some(self.open_pooled_connection(&handle.database, None).await?);
+        } else {
+            self.record_profile(MemoryProfileMetricKind::StoreConnectionReuse, 0, 1);
+        }
+        Ok(MemoryWriterConnection {
+            guard,
+            profile: Arc::clone(&self.profile),
+            healthy: true,
+        })
+    }
+
+    fn update_peak_connections(&self, live: usize) {
+        let mut current = self.db_peak_connections.load(Ordering::Relaxed);
+        while live > current {
+            match self.db_peak_connections.compare_exchange(
+                current,
+                live,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.record_profile(
+                        MemoryProfileMetricKind::StoreConnectionsPeak,
+                        live as u64,
+                        1,
+                    );
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     async fn max_version_for_memory(
@@ -1940,6 +2338,40 @@ impl MemoryStore {
         &self.shards[shard_index % self.shards.len()]
     }
 
+    fn entity_cache_stripe<'a>(
+        &'a self,
+        namespace: &str,
+        memory_key: &str,
+    ) -> (usize, &'a MemoryEntityCacheStripe) {
+        let shard = self.shard_for_key(namespace, memory_key);
+        let stripe_index = Self::entity_cache_stripe_index(namespace, memory_key);
+        (stripe_index, &shard.cache_stripes[stripe_index])
+    }
+
+    fn entity_cache_stripe_index(namespace: &str, memory_key: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        namespace.hash(&mut hasher);
+        0xffu8.hash(&mut hasher);
+        memory_key.hash(&mut hasher);
+        (hasher.finish() as usize) % MEMORY_ENTITY_CACHE_STRIPES
+    }
+
+    async fn lock_entity_cache_stripe<'a>(
+        &'a self,
+        namespace: &str,
+        memory_key: &str,
+    ) -> (usize, tokio::sync::MutexGuard<'a, MemoryEntityCacheState>) {
+        let (stripe_index, stripe) = self.entity_cache_stripe(namespace, memory_key);
+        let started_at = Instant::now();
+        let state = stripe.state.lock().await;
+        self.record_profile(
+            MemoryProfileMetricKind::EntityCacheLockWait,
+            started_at.elapsed().as_micros() as u64,
+            1,
+        );
+        (stripe_index, state)
+    }
+
     fn observe_version(&self, namespace: &str, memory_key: &str, version: i64) {
         self.shard_for_key(namespace, memory_key)
             .observe_version(version);
@@ -1949,10 +2381,9 @@ impl MemoryStore {
         if version < 0 {
             return;
         }
-        self.shard_for_key(namespace, memory_key)
+        let (_, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
+        state
             .memory_versions
-            .lock()
-            .await
             .insert(Self::memory_version_key(namespace, memory_key), version);
     }
 
@@ -2018,27 +2449,20 @@ impl MemoryStore {
         memory_key: &str,
     ) -> Option<MemorySharedSnapshotEntry> {
         let key = Self::memory_snapshot_key(namespace, memory_key);
-        let current_version = self
-            .shard_for_key(namespace, memory_key)
-            .memory_versions
-            .lock()
-            .await
-            .get(&Self::memory_version_key(namespace, memory_key))
-            .copied();
         let now = Instant::now();
         let shard_index = self.shard_index(namespace, memory_key);
-        let mut snapshots = self
-            .shard_for_index(shard_index)
-            .shared_snapshots
-            .lock()
-            .await;
-        self.prune_snapshots_locked(shard_index, &mut snapshots, now);
-        let Some(entry) = snapshots.get_cloned(&key, now) else {
+        let (stripe_index, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
+        let current_version = state
+            .memory_versions
+            .get(&Self::memory_version_key(namespace, memory_key))
+            .copied();
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        let Some(entry) = state.snapshots.get_cloned(&key, now) else {
             self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
             return None;
         };
         if current_version.is_some_and(|current| current > entry.max_version) {
-            snapshots.remove(&key);
+            state.snapshots.remove(&key);
             self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
             return None;
         }
@@ -2077,18 +2501,16 @@ impl MemoryStore {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
         let shard_index = self.shard_index(namespace, memory_key);
-        let mut snapshots = self
-            .shard_for_index(shard_index)
-            .shared_snapshots
-            .lock()
-            .await;
-        self.prune_snapshots_locked(shard_index, &mut snapshots, now);
-        let existing = snapshots.entries.remove(&key);
+        let (stripe_index, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        let existing = state.snapshots.entries.remove(&key);
         let existing = if let Some(existing) = existing {
-            snapshots.approximate_bytes = snapshots
+            state.snapshots.approximate_bytes = state
+                .snapshots
                 .approximate_bytes
                 .saturating_sub(existing.approximate_bytes);
-            snapshots
+            state
+                .snapshots
                 .recency
                 .remove(&(existing.last_used_at, existing.recency_id));
             Some(existing)
@@ -2102,7 +2524,7 @@ impl MemoryStore {
         {
             let mut entry = existing.expect("checked above");
             entry.last_used_at = now;
-            snapshots.insert_or_replace(key, entry);
+            state.snapshots.insert_or_replace(key, entry);
             return;
         }
 
@@ -2148,10 +2570,11 @@ impl MemoryStore {
 
         let approximate_bytes =
             approximate_snapshot_cache_bytes(&key, &next_records, &next_loaded_keys);
-        if approximate_bytes > self.snapshot_cache_byte_budget_for_shard(shard_index) {
+        if approximate_bytes > self.snapshot_cache_byte_budget_for_stripe(shard_index, stripe_index)
+        {
             return;
         }
-        snapshots.insert_or_replace(
+        state.snapshots.insert_or_replace(
             key,
             MemorySharedSnapshotEntry {
                 records: Arc::new(next_records),
@@ -2163,7 +2586,7 @@ impl MemoryStore {
                 approximate_bytes,
             },
         );
-        self.prune_snapshots_locked(shard_index, &mut snapshots, now);
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
     }
 
     async fn update_cached_snapshot_after_commit(
@@ -2176,13 +2599,9 @@ impl MemoryStore {
         let key = Self::memory_snapshot_key(namespace, memory_key);
         let now = Instant::now();
         let shard_index = self.shard_index(namespace, memory_key);
-        let mut snapshots = self
-            .shard_for_index(shard_index)
-            .shared_snapshots
-            .lock()
-            .await;
-        self.prune_snapshots_locked(shard_index, &mut snapshots, now);
-        let Some(entry) = snapshots.remove(&key) else {
+        let (stripe_index, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        let Some(entry) = state.snapshots.remove(&key) else {
             return;
         };
         let mut next_records = entry.records.as_ref().clone();
@@ -2204,10 +2623,11 @@ impl MemoryStore {
         }
         let approximate_bytes =
             approximate_snapshot_cache_bytes(&key, &next_records, &next_loaded_keys);
-        if approximate_bytes > self.snapshot_cache_byte_budget_for_shard(shard_index) {
+        if approximate_bytes > self.snapshot_cache_byte_budget_for_stripe(shard_index, stripe_index)
+        {
             return;
         }
-        snapshots.insert_or_replace(
+        state.snapshots.insert_or_replace(
             key,
             MemorySharedSnapshotEntry {
                 records: Arc::new(next_records),
@@ -2244,14 +2664,15 @@ impl MemoryStore {
     fn prune_snapshots_locked(
         &self,
         shard_index: usize,
+        stripe_index: usize,
         snapshots: &mut MemorySharedSnapshotCache,
         now: Instant,
     ) {
         let evicted = snapshots.prune(
             now,
             self.db_idle_ttl,
-            self.snapshot_cache_entry_budget_for_shard(shard_index),
-            self.snapshot_cache_byte_budget_for_shard(shard_index),
+            self.snapshot_cache_entry_budget_for_stripe(shard_index, stripe_index),
+            self.snapshot_cache_byte_budget_for_stripe(shard_index, stripe_index),
         );
         if evicted > 0 {
             self.record_profile(
@@ -2260,6 +2681,21 @@ impl MemoryStore {
                 evicted as u64,
             );
         }
+        self.record_profile(
+            MemoryProfileMetricKind::EntityCacheStripeCount,
+            0,
+            MEMORY_ENTITY_CACHE_STRIPES as u64,
+        );
+        self.record_profile(
+            MemoryProfileMetricKind::EntityCachePeakEntriesPerStripe,
+            snapshots.entries.len() as u64,
+            1,
+        );
+        self.record_profile(
+            MemoryProfileMetricKind::EntityCacheMaxEntriesPerStripe,
+            self.snapshot_cache_entry_budget_for_stripe(shard_index, stripe_index) as u64,
+            1,
+        );
     }
 
     fn database_cache_budget_for_shard(&self, shard_index: usize) -> usize {
@@ -2281,6 +2717,56 @@ impl MemoryStore {
             shard_index,
         )
     }
+
+    fn snapshot_cache_entry_budget_for_stripe(
+        &self,
+        shard_index: usize,
+        stripe_index: usize,
+    ) -> usize {
+        partitioned_budget(
+            self.snapshot_cache_entry_budget_for_shard(shard_index),
+            MEMORY_ENTITY_CACHE_STRIPES,
+            stripe_index,
+        )
+    }
+
+    fn snapshot_cache_byte_budget_for_stripe(
+        &self,
+        shard_index: usize,
+        stripe_index: usize,
+    ) -> usize {
+        partitioned_budget(
+            self.snapshot_cache_byte_budget_for_shard(shard_index),
+            MEMORY_ENTITY_CACHE_STRIPES,
+            stripe_index,
+        )
+    }
+
+    #[cfg(test)]
+    async fn test_entity_cache_snapshot(
+        &self,
+        namespace: &str,
+        memory_key: &str,
+    ) -> MemoryEntityCacheDebugSnapshot {
+        let (_, state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
+        MemoryEntityCacheDebugSnapshot {
+            snapshot_keys: state.snapshots.entries.keys().cloned().collect(),
+            snapshot_entries: state.snapshots.entries.len(),
+            snapshot_approximate_bytes: state.snapshots.approximate_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_entity_cache_stripe_index(&self, namespace: &str, memory_key: &str) -> usize {
+        Self::entity_cache_stripe_index(namespace, memory_key)
+    }
+}
+
+#[cfg(test)]
+struct MemoryEntityCacheDebugSnapshot {
+    snapshot_keys: HashSet<String>,
+    snapshot_entries: usize,
+    snapshot_approximate_bytes: usize,
 }
 
 async fn upsert_memory_state_row(
@@ -2514,10 +3000,26 @@ impl MemoryProfile {
             MemoryProfileMetricKind::StoreDatabaseCacheEviction => {
                 &self.store_database_cache_eviction
             }
+            MemoryProfileMetricKind::StoreConnectionCreate => &self.store_connection_create,
+            MemoryProfileMetricKind::StoreConnectionReuse => &self.store_connection_reuse,
+            MemoryProfileMetricKind::StoreReaderPoolWait => &self.store_reader_pool_wait,
+            MemoryProfileMetricKind::StoreWriterLaneWait => &self.store_writer_lane_wait,
+            MemoryProfileMetricKind::StoreWriterBusyRetry => &self.store_writer_busy_retry,
+            MemoryProfileMetricKind::StoreConnectionDiscard => &self.store_connection_discard,
+            MemoryProfileMetricKind::StoreConnectionsLive => &self.store_connections_live,
+            MemoryProfileMetricKind::StoreConnectionsPeak => &self.store_connections_peak,
             MemoryProfileMetricKind::StoreSnapshotCacheHit => &self.store_snapshot_cache_hit,
             MemoryProfileMetricKind::StoreSnapshotCacheMiss => &self.store_snapshot_cache_miss,
             MemoryProfileMetricKind::StoreSnapshotCacheEviction => {
                 &self.store_snapshot_cache_eviction
+            }
+            MemoryProfileMetricKind::EntityCacheLockWait => &self.entity_cache_lock_wait,
+            MemoryProfileMetricKind::EntityCacheStripeCount => &self.entity_cache_stripe_count,
+            MemoryProfileMetricKind::EntityCachePeakEntriesPerStripe => {
+                &self.entity_cache_peak_entries_per_stripe
+            }
+            MemoryProfileMetricKind::EntityCacheMaxEntriesPerStripe => {
+                &self.entity_cache_max_entries_per_stripe
             }
             MemoryProfileMetricKind::RuntimeAtomicInvokeEventWait => {
                 &self.runtime_atomic_invoke_event_wait
@@ -2559,9 +3061,25 @@ impl MemoryProfile {
             store_database_cache_hit: self.store_database_cache_hit.snapshot(),
             store_database_cache_miss: self.store_database_cache_miss.snapshot(),
             store_database_cache_eviction: self.store_database_cache_eviction.snapshot(),
+            store_connection_create: self.store_connection_create.snapshot(),
+            store_connection_reuse: self.store_connection_reuse.snapshot(),
+            store_reader_pool_wait: self.store_reader_pool_wait.snapshot(),
+            store_writer_lane_wait: self.store_writer_lane_wait.snapshot(),
+            store_writer_busy_retry: self.store_writer_busy_retry.snapshot(),
+            store_connection_discard: self.store_connection_discard.snapshot(),
+            store_connections_live: self.store_connections_live.snapshot(),
+            store_connections_peak: self.store_connections_peak.snapshot(),
             store_snapshot_cache_hit: self.store_snapshot_cache_hit.snapshot(),
             store_snapshot_cache_miss: self.store_snapshot_cache_miss.snapshot(),
             store_snapshot_cache_eviction: self.store_snapshot_cache_eviction.snapshot(),
+            entity_cache_lock_wait: self.entity_cache_lock_wait.snapshot(),
+            entity_cache_stripe_count: self.entity_cache_stripe_count.snapshot(),
+            entity_cache_peak_entries_per_stripe: self
+                .entity_cache_peak_entries_per_stripe
+                .snapshot(),
+            entity_cache_max_entries_per_stripe: self
+                .entity_cache_max_entries_per_stripe
+                .snapshot(),
             runtime_atomic_invoke_event_wait: self.runtime_atomic_invoke_event_wait.snapshot(),
             runtime_atomic_queue_wait: self.runtime_atomic_queue_wait.snapshot(),
             runtime_atomic_dispatch_wait: self.runtime_atomic_dispatch_wait.snapshot(),
@@ -2595,9 +3113,21 @@ impl MemoryProfile {
         self.store_database_cache_hit.reset();
         self.store_database_cache_miss.reset();
         self.store_database_cache_eviction.reset();
+        self.store_connection_create.reset();
+        self.store_connection_reuse.reset();
+        self.store_reader_pool_wait.reset();
+        self.store_writer_lane_wait.reset();
+        self.store_writer_busy_retry.reset();
+        self.store_connection_discard.reset();
+        self.store_connections_live.reset();
+        self.store_connections_peak.reset();
         self.store_snapshot_cache_hit.reset();
         self.store_snapshot_cache_miss.reset();
         self.store_snapshot_cache_eviction.reset();
+        self.entity_cache_lock_wait.reset();
+        self.entity_cache_stripe_count.reset();
+        self.entity_cache_peak_entries_per_stripe.reset();
+        self.entity_cache_max_entries_per_stripe.reset();
         self.runtime_atomic_invoke_event_wait.reset();
         self.runtime_atomic_queue_wait.reset();
         self.runtime_atomic_dispatch_wait.reset();
@@ -3561,6 +4091,27 @@ mod tests {
         }
     }
 
+    fn same_entity_cache_stripe_key(
+        store: &MemoryStore,
+        namespace: &str,
+        base_key: &str,
+        prefix: &str,
+    ) -> String {
+        let target = store.test_entity_cache_stripe_index(namespace, base_key);
+        (0..100_000)
+            .map(|index| format!("{prefix}-{index}"))
+            .find(|candidate| {
+                candidate != base_key
+                    && store.test_entity_cache_stripe_index(namespace, candidate) == target
+            })
+            .expect("test should find another key in the same entity cache stripe")
+    }
+
+    fn enable_one_snapshot_slot_per_entity_stripe(store: &mut MemoryStore) {
+        store.snapshot_cache_max_entries = store.namespace_shards * MEMORY_ENTITY_CACHE_STRIPES;
+        store.snapshot_cache_max_bytes = usize::MAX / 2;
+    }
+
     fn key_with_different_hash_layout(shards: usize) -> (String, usize, usize) {
         (0..10_000)
             .map(|index| format!("legacy-entity-{index}"))
@@ -3719,6 +4270,7 @@ mod tests {
     #[test]
     fn turso_database_handle_is_shareable_across_threads() {
         assert_send_sync::<Database>();
+        assert_send_sync::<Connection>();
     }
 
     #[test]
@@ -3794,16 +4346,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_snapshot_cache_eviction_keeps_recent_entry() -> Result<()> {
-        let mut store = MemoryStore::new(
-            temp_root("snapshot-lru-budget"),
+    async fn repeated_memory_reads_reuse_configured_connection() -> Result<()> {
+        let store = MemoryStore::new_with_connection_limits(
+            temp_root("read-connection-reuse"),
             1,
             4,
             Duration::from_secs(60),
+            2,
+            4,
         )
         .await?;
-        store.snapshot_cache_max_entries = 1;
-        store.snapshot_cache_max_bytes = usize::MAX / 2;
+        store.set_profile_enabled(true);
+
+        assert!(store
+            .command_result("ns", "memory-a", "missing")
+            .await?
+            .is_none());
+        assert!(store
+            .command_result("ns", "memory-a", "missing")
+            .await?
+            .is_none());
+        let profile = store.take_profile_snapshot_and_reset();
+
+        assert_eq!(profile.store_connection_create.calls, 1);
+        assert_eq!(profile.store_connection_reuse.calls, 1);
+        assert_eq!(profile.store_connections_peak.max_us, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_memory_writes_reuse_single_writer_connection() -> Result<()> {
+        let store = MemoryStore::new_with_connection_limits(
+            temp_root("writer-connection-reuse"),
+            1,
+            4,
+            Duration::from_secs(60),
+            1,
+            4,
+        )
+        .await?;
+        store.set_profile_enabled(true);
+
         store
             .apply_batch(
                 "ns",
@@ -3817,28 +4400,349 @@ mod tests {
         store
             .apply_batch(
                 "ns",
-                "memory-b",
+                "memory-a",
                 &[utf8_mutation("count", "2")],
                 None,
                 &[],
                 None,
             )
             .await?;
-        store.snapshot("ns", "memory-a").await?;
-        store.snapshot("ns", "memory-b").await?;
+        let profile = store.take_profile_snapshot_and_reset();
 
-        let snapshots = store
-            .shard_for_key("ns", "memory-a")
-            .shared_snapshots
-            .lock()
+        assert_eq!(profile.store_connection_create.calls, 1);
+        assert_eq!(profile.store_connection_reuse.calls, 1);
+        assert_eq!(profile.store_writer_busy_retry.calls, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_memory_connection_cap_blocks_new_database_checkout_without_leaking(
+    ) -> Result<()> {
+        let store = Arc::new(
+            MemoryStore::new_with_connection_limits(
+                temp_root("connection-global-cap"),
+                2,
+                4,
+                Duration::from_secs(60),
+                1,
+                1,
+            )
+            .await?,
+        );
+        let held = store.connect("ns", "memory-a").await?;
+        assert_eq!(store.db_live_connections.load(Ordering::Relaxed), 1);
+
+        let waiting_store = Arc::clone(&store);
+        let waiting = tokio::spawn(async move {
+            waiting_store
+                .command_result("ns", "memory-b", "missing")
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished());
+
+        drop(held);
+        waiting
+            .await
+            .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
+        assert_eq!(store.db_live_connections.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_database_writer_lane_serializes_before_begin_immediate() -> Result<()> {
+        let store = Arc::new(
+            MemoryStore::new_with_connection_limits(
+                temp_root("writer-lane-serializes"),
+                1,
+                4,
+                Duration::from_secs(60),
+                1,
+                2,
+            )
+            .await?,
+        );
+        let writer = store.writer_connection("ns", "memory-a").await?;
+        let waiting_store = Arc::clone(&store);
+        let waiting = tokio::spawn(async move {
+            waiting_store
+                .apply_batch(
+                    "ns",
+                    "memory-a",
+                    &[utf8_mutation("count", "1")],
+                    None,
+                    &[],
+                    None,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished());
+
+        drop(writer);
+        waiting
+            .await
+            .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
+        assert_eq!(
+            store
+                .point_read("ns", "memory-a", "count")
+                .await?
+                .record
+                .expect("count should be written")
+                .value,
+            b"1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn different_shard_writer_lanes_can_progress_independently() -> Result<()> {
+        let store = Arc::new(
+            MemoryStore::new_with_connection_limits(
+                temp_root("writer-lane-cross-shard"),
+                2,
+                4,
+                Duration::from_secs(60),
+                1,
+                4,
+            )
+            .await?,
+        );
+        assert_ne!(
+            store.shard_index("ns", "memory-a"),
+            store.shard_index("ns", "memory-b")
+        );
+
+        let writer = store.writer_connection("ns", "memory-a").await?;
+        let other_store = Arc::clone(&store);
+        let other = tokio::spawn(async move {
+            other_store
+                .apply_batch(
+                    "ns",
+                    "memory-b",
+                    &[utf8_mutation("count", "1")],
+                    None,
+                    &[],
+                    None,
+                )
+                .await
+        });
+
+        other
+            .await
+            .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
+        drop(writer);
+        assert_eq!(
+            store
+                .point_read("ns", "memory-b", "count")
+                .await?
+                .record
+                .expect("count should be written")
+                .value,
+            b"1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_database_reader_limit_blocks_second_reader_without_leaking() -> Result<()> {
+        let store = Arc::new(
+            MemoryStore::new_with_connection_limits(
+                temp_root("reader-pool-limit"),
+                1,
+                4,
+                Duration::from_secs(60),
+                1,
+                4,
+            )
+            .await?,
+        );
+        let held = store.connect("ns", "memory-a").await?;
+        let waiting_store = Arc::clone(&store);
+        let waiting = tokio::spawn(async move { waiting_store.connect("ns", "memory-a").await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished());
+
+        drop(held);
+        let second = waiting
+            .await
+            .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
+        drop(second);
+        assert!(store.db_live_connections.load(Ordering::Relaxed) <= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_memory_write_rolls_back_and_discards_writer_before_next_write() -> Result<()> {
+        let store = MemoryStore::new_with_connection_limits(
+            temp_root("writer-rollback-discard"),
+            1,
+            4,
+            Duration::from_secs(60),
+            1,
+            4,
+        )
+        .await?;
+        store.set_profile_enabled(true);
+        let command = MemoryCommandResultWrite {
+            idempotency_key: "command-1".to_string(),
+            result: b"ok".to_vec(),
+        };
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                Some(&command),
+                &[],
+                None,
+            )
+            .await?;
+        let duplicate = store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "duplicate")],
+                Some(&command),
+                &[],
+                None,
+            )
             .await;
-        assert!(!snapshots
-            .entries
-            .contains_key(&MemoryStore::memory_snapshot_key("ns", "memory-a")));
-        assert!(snapshots
-            .entries
-            .contains_key(&MemoryStore::memory_snapshot_key("ns", "memory-b")));
-        assert_eq!(snapshots.entries.len(), 1);
+        assert!(duplicate.is_err());
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "2")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+
+        let point = store
+            .point_read("ns", "memory-a", "count")
+            .await?
+            .record
+            .expect("count should exist");
+        assert_eq!(point.value, b"2");
+        let profile = store.take_profile_snapshot_and_reset();
+        assert_eq!(profile.store_connection_discard.calls, 1);
+        assert!(profile.store_connection_create.calls >= 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn entity_cache_stripe_selection_is_stable_and_uses_namespace() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("entity-stripe-stable"),
+            4,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let first = store.test_entity_cache_stripe_index("ns-a", "memory-a");
+        let second = store.test_entity_cache_stripe_index("ns-a", "memory-a");
+        assert_eq!(first, second);
+
+        let namespace_sensitive = (0..10_000)
+            .map(|index| format!("entity-{index}"))
+            .any(|key| {
+                store.test_entity_cache_stripe_index("ns-a", &key)
+                    != store.test_entity_cache_stripe_index("ns-b", &key)
+            });
+        assert!(namespace_sensitive, "namespace should affect stripe choice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generated_entities_cover_multiple_entity_cache_stripes() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("entity-stripe-coverage"),
+            4,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let stripes = (0..256)
+            .map(|index| store.test_entity_cache_stripe_index("ns", &format!("memory-{index}")))
+            .collect::<HashSet<_>>();
+        assert!(
+            stripes.len() > 8,
+            "generated keys should cover many stripes, got {}",
+            stripes.len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_cache_budget_is_partitioned_across_entity_stripes() -> Result<()> {
+        let mut store = MemoryStore::new(
+            temp_root("entity-stripe-budget"),
+            1,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        store.snapshot_cache_max_entries = MEMORY_ENTITY_CACHE_STRIPES + 7;
+        store.snapshot_cache_max_bytes = MEMORY_ENTITY_CACHE_STRIPES * 10 + 3;
+
+        let total_entry_budget = (0..MEMORY_ENTITY_CACHE_STRIPES)
+            .map(|stripe| store.snapshot_cache_entry_budget_for_stripe(0, stripe))
+            .sum::<usize>();
+        let total_byte_budget = (0..MEMORY_ENTITY_CACHE_STRIPES)
+            .map(|stripe| store.snapshot_cache_byte_budget_for_stripe(0, stripe))
+            .sum::<usize>();
+
+        assert_eq!(total_entry_budget, store.snapshot_cache_max_entries);
+        assert_eq!(total_byte_budget, store.snapshot_cache_max_bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_snapshot_cache_eviction_keeps_recent_entry() -> Result<()> {
+        let mut store = MemoryStore::new(
+            temp_root("snapshot-lru-budget"),
+            1,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        store.snapshot_cache_max_entries = MEMORY_ENTITY_CACHE_STRIPES;
+        store.snapshot_cache_max_bytes = usize::MAX / 2;
+        let memory_a = "memory-a";
+        let memory_b = same_entity_cache_stripe_key(&store, "ns", memory_a, "memory-b");
+        store
+            .apply_batch(
+                "ns",
+                memory_a,
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+        store
+            .apply_batch(
+                "ns",
+                &memory_b,
+                &[utf8_mutation("count", "2")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+        store.snapshot("ns", memory_a).await?;
+        store.snapshot("ns", &memory_b).await?;
+
+        let cache = store.test_entity_cache_snapshot("ns", memory_a).await;
+        assert!(!cache
+            .snapshot_keys
+            .contains(&MemoryStore::memory_snapshot_key("ns", memory_a)));
+        assert!(cache
+            .snapshot_keys
+            .contains(&MemoryStore::memory_snapshot_key("ns", &memory_b)));
+        assert_eq!(cache.snapshot_entries, 1);
         Ok(())
     }
 
@@ -3864,13 +4768,9 @@ mod tests {
             )
             .await?;
         store.snapshot("ns", "memory-a").await?;
-        let snapshots = store
-            .shard_for_key("ns", "memory-a")
-            .shared_snapshots
-            .lock()
-            .await;
-        assert!(snapshots.entries.is_empty());
-        assert_eq!(snapshots.approximate_bytes, 0);
+        let cache = store.test_entity_cache_snapshot("ns", "memory-a").await;
+        assert_eq!(cache.snapshot_entries, 0);
+        assert_eq!(cache.snapshot_approximate_bytes, 0);
         Ok(())
     }
 
@@ -4402,8 +5302,9 @@ mod tests {
 
     #[tokio::test]
     async fn memory_snapshot_cache_updates_after_transactional_commit() -> Result<()> {
-        let store =
+        let mut store =
             MemoryStore::new(temp_root("snapshot-cache"), 16, 4, Duration::from_secs(60)).await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
 
         let initial = store.snapshot("ns", "memory-a").await?;
         assert_eq!(initial.max_version, -1);
@@ -4432,13 +5333,14 @@ mod tests {
 
     #[tokio::test]
     async fn memory_transactional_snapshot_cache_uses_committed_version() -> Result<()> {
-        let store = MemoryStore::new(
+        let mut store = MemoryStore::new(
             temp_root("transactional-cache-version"),
             16,
             4,
             Duration::from_secs(60),
         )
         .await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
 
         let initial = store.snapshot("ns", "memory-a").await?;
         assert_eq!(initial.max_version, -1);
@@ -4455,15 +5357,9 @@ mod tests {
             .await?;
         assert_eq!(result.max_version, 1);
 
-        let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
-        let snapshots = store
-            .shard_for_key("ns", "memory-a")
-            .shared_snapshots
-            .lock()
-            .await;
-        let entry = snapshots
-            .entries
-            .get(&key)
+        let entry = store
+            .cached_snapshot_entry("ns", "memory-a")
+            .await
             .expect("shared cache entry should be updated after commit");
         assert_eq!(entry.max_version, result.max_version);
         assert_eq!(
@@ -5020,13 +5916,14 @@ mod tests {
 
     #[tokio::test]
     async fn memory_commit_snapshot_cache_uses_committed_version() -> Result<()> {
-        let store = MemoryStore::new(
+        let mut store = MemoryStore::new(
             temp_root("coordinator-cache-version"),
             16,
             4,
             Duration::from_secs(60),
         )
         .await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
 
         let initial = store.snapshot("ns", "memory-a").await?;
         assert_eq!(initial.max_version, -1);
@@ -5043,15 +5940,9 @@ mod tests {
             .await?;
         assert_eq!(result.max_version, 1);
 
-        let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
-        let snapshots = store
-            .shard_for_key("ns", "memory-a")
-            .shared_snapshots
-            .lock()
-            .await;
-        let entry = snapshots
-            .entries
-            .get(&key)
+        let entry = store
+            .cached_snapshot_entry("ns", "memory-a")
+            .await
             .expect("shared cache entry should be updated after commit");
         assert_eq!(entry.max_version, result.max_version);
         assert_eq!(
@@ -5067,13 +5958,14 @@ mod tests {
 
     #[tokio::test]
     async fn memory_point_read_populates_partial_shared_cache_and_tracks_misses() -> Result<()> {
-        let store = MemoryStore::new(
+        let mut store = MemoryStore::new(
             temp_root("point-read-cache"),
             16,
             4,
             Duration::from_secs(60),
         )
         .await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
 
         store
             .apply_batch(
@@ -5100,16 +5992,10 @@ mod tests {
             "1"
         );
 
-        let key = MemoryStore::memory_snapshot_key("ns", "memory-a");
         {
-            let snapshots = store
-                .shard_for_key("ns", "memory-a")
-                .shared_snapshots
-                .lock()
-                .await;
-            let entry = snapshots
-                .entries
-                .get(&key)
+            let entry = store
+                .cached_snapshot_entry("ns", "memory-a")
+                .await
                 .expect("shared cache entry should exist");
             assert!(!entry.complete);
             assert!(entry.loaded_keys.contains("count"));
@@ -5120,14 +6006,9 @@ mod tests {
         assert_eq!(miss.max_version, 1);
         assert!(miss.record.is_none());
 
-        let snapshots = store
-            .shard_for_key("ns", "memory-a")
-            .shared_snapshots
-            .lock()
-            .await;
-        let entry = snapshots
-            .entries
-            .get(&key)
+        let entry = store
+            .cached_snapshot_entry("ns", "memory-a")
+            .await
             .expect("shared cache entry should exist");
         assert!(entry.loaded_keys.contains("missing"));
         assert!(!entry.records.contains_key("missing"));
@@ -5136,13 +6017,14 @@ mod tests {
 
     #[tokio::test]
     async fn memory_point_read_cache_updates_after_commit() -> Result<()> {
-        let store = MemoryStore::new(
+        let mut store = MemoryStore::new(
             temp_root("point-read-commit"),
             16,
             4,
             Duration::from_secs(60),
         )
         .await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
 
         store
             .apply_batch(

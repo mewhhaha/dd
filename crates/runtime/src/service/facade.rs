@@ -19,6 +19,7 @@ struct DeployWithConfigRequest {
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub min_isolates: usize,
+    pub max_global_isolates: usize,
     pub max_isolates: usize,
     pub max_inflight_per_isolate: usize,
     pub max_queued_requests_per_worker: usize,
@@ -52,6 +53,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             min_isolates: 0,
+            max_global_isolates: default_global_isolate_budget(),
             max_isolates: 8,
             max_inflight_per_isolate: 4,
             max_queued_requests_per_worker: 1024,
@@ -83,12 +85,22 @@ impl Default for RuntimeConfig {
     }
 }
 
+fn default_global_isolate_budget() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeStorageConfig {
     pub store_dir: PathBuf,
     pub database_url: String,
     pub memory_namespace_shards: usize,
+    pub memory_outbox_max_concurrent_shards: usize,
     pub memory_db_cache_max_open: usize,
+    pub memory_db_read_connections_per_database: usize,
+    pub memory_db_max_total_connections: usize,
     pub memory_db_idle_ttl: Duration,
     pub worker_store_enabled: bool,
     pub blob_store: BlobStoreConfig,
@@ -103,12 +115,23 @@ impl Default for RuntimeStorageConfig {
             store_dir,
             database_url,
             memory_namespace_shards: 16,
+            memory_outbox_max_concurrent_shards: default_memory_outbox_parallelism(16),
             memory_db_cache_max_open: 4096,
+            memory_db_read_connections_per_database: 4,
+            memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: !cfg!(test),
             blob_store: BlobStoreConfig::local(blob_root),
         }
     }
+}
+
+fn default_memory_outbox_parallelism(namespace_shards: usize) -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1);
+    namespace_shards.max(1).min(cpus).clamp(1, 8)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,6 +183,12 @@ pub struct WorkerStats {
     pub memory_dispatch_no_ready_candidate_count: u64,
     pub runtime_ready_work_budget_exhausted_count: u64,
     pub runtime_max_ready_work_batch_size: usize,
+    pub global_isolate_budget: usize,
+    pub global_isolates_total: usize,
+    pub global_isolates_starting: usize,
+    pub global_isolate_slots_available: usize,
+    pub scale_up_waiting_pools: usize,
+    pub scale_up_budget_denied_count: u64,
     pub memory_outbox_claim_batch_count: u64,
     pub memory_outbox_claim_row_count: u64,
     pub memory_outbox_saturated_batch_count: u64,
@@ -169,6 +198,13 @@ pub struct WorkerStats {
     pub memory_outbox_ack_failure_count: u64,
     pub memory_outbox_channel_full_count: u64,
     pub memory_outbox_reschedule_count: u64,
+    pub memory_outbox_worker_pending_shards: usize,
+    pub memory_outbox_worker_in_flight_shards: usize,
+    pub memory_outbox_worker_parallelism_limit: usize,
+    pub memory_outbox_worker_parallelism_peak: usize,
+    pub memory_outbox_duplicate_schedule_coalesced_count: u64,
+    pub memory_outbox_task_failure_count: u64,
+    pub memory_outbox_shard_requeue_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +245,12 @@ pub struct MemorySchedulerDebug {
     pub dispatch_no_ready_candidate_count: u64,
     pub runtime_ready_work_budget_exhausted_count: u64,
     pub runtime_max_ready_work_batch_size: usize,
+    pub global_isolate_budget: usize,
+    pub global_isolates_total: usize,
+    pub global_isolates_starting: usize,
+    pub global_isolate_slots_available: usize,
+    pub scale_up_waiting_pools: usize,
+    pub scale_up_budget_denied_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,6 +275,13 @@ pub struct MemoryOutboxDebug {
     pub ack_failure_count: u64,
     pub channel_full_count: u64,
     pub reschedule_count: u64,
+    pub worker_pending_shards: usize,
+    pub worker_in_flight_shards: usize,
+    pub worker_parallelism_limit: usize,
+    pub worker_parallelism_peak: usize,
+    pub duplicate_schedule_coalesced_count: u64,
+    pub task_failure_count: u64,
+    pub shard_requeue_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -434,6 +483,21 @@ impl RuntimeService {
                 "memory_namespace_shards must be greater than 0",
             ));
         }
+        if storage.memory_outbox_max_concurrent_shards == 0 {
+            return Err(PlatformError::internal(
+                "memory_outbox_max_concurrent_shards must be greater than 0",
+            ));
+        }
+        if storage.memory_db_read_connections_per_database == 0 {
+            return Err(PlatformError::internal(
+                "memory_db_read_connections_per_database must be greater than 0",
+            ));
+        }
+        if storage.memory_db_max_total_connections == 0 {
+            return Err(PlatformError::internal(
+                "memory_db_max_total_connections must be greater than 0",
+            ));
+        }
         if storage.memory_db_idle_ttl.is_zero() {
             return Err(PlatformError::internal(
                 "memory_db_idle_ttl must be greater than 0",
@@ -451,11 +515,13 @@ impl RuntimeService {
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
         let kv_store = KvStore::from_database_url(&storage.database_url).await?;
         kv_store.set_profile_enabled(runtime.kv_profile_enabled);
-        let memory_store = MemoryStore::new(
+        let memory_store = MemoryStore::new_with_connection_limits(
             storage.store_dir.join("memory"),
             storage.memory_namespace_shards,
             storage.memory_db_cache_max_open,
             storage.memory_db_idle_ttl,
+            storage.memory_db_read_connections_per_database,
+            storage.memory_db_max_total_connections,
         )
         .await?;
         memory_store.set_profile_enabled(runtime.memory_profile_enabled);

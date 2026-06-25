@@ -31,19 +31,180 @@ pub(super) async fn run_memory_outbox_worker(
     memory_store: MemoryStore,
     event_tx: RuntimeEventSender,
     mut receiver: MemoryOutboxDrainReceiver,
+    max_concurrent_shards: usize,
 ) {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            MemoryOutboxWorkerCommand::DrainShard { shard_index } => {
-                drain_memory_outbox_shard_in_background(
+    let max_concurrent_shards = max_concurrent_shards.max(1);
+    let mut coordinator = MemoryOutboxDrainCoordinator::new(max_concurrent_shards);
+    let mut tasks = JoinSet::new();
+    let mut accepting = true;
+
+    loop {
+        coordinator.start_ready_drains(&mut tasks, &memory_store, &event_tx);
+        if !accepting && tasks.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            command = receiver.recv(), if accepting => {
+                match command {
+                    Some(MemoryOutboxWorkerCommand::DrainShard { shard_index }) => {
+                        coordinator.schedule(shard_index);
+                        coordinator.send_stats(&event_tx);
+                    }
+                    None => {
+                        accepting = false;
+                        coordinator.clear_pending();
+                        coordinator.send_stats(&event_tx);
+                    }
+                }
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                coordinator.finish_joined(joined);
+                coordinator.send_stats(&event_tx);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MemoryOutboxDrainResult {
+    shard_index: usize,
+    saturated: bool,
+    panicked: bool,
+}
+
+struct MemoryOutboxDrainCoordinator {
+    max_concurrent_shards: usize,
+    pending: VecDeque<usize>,
+    pending_members: HashSet<usize>,
+    in_flight: HashSet<usize>,
+    follow_up: HashSet<usize>,
+    duplicate_schedule_coalesced_count: u64,
+    task_failure_count: u64,
+    shard_requeue_count: u64,
+    parallelism_peak: usize,
+}
+
+impl MemoryOutboxDrainCoordinator {
+    fn new(max_concurrent_shards: usize) -> Self {
+        Self {
+            max_concurrent_shards: max_concurrent_shards.max(1),
+            pending: VecDeque::new(),
+            pending_members: HashSet::new(),
+            in_flight: HashSet::new(),
+            follow_up: HashSet::new(),
+            duplicate_schedule_coalesced_count: 0,
+            task_failure_count: 0,
+            shard_requeue_count: 0,
+            parallelism_peak: 0,
+        }
+    }
+
+    fn schedule(&mut self, shard_index: usize) {
+        if self.in_flight.contains(&shard_index) {
+            if !self.follow_up.insert(shard_index) {
+                self.duplicate_schedule_coalesced_count =
+                    self.duplicate_schedule_coalesced_count.saturating_add(1);
+            }
+            return;
+        }
+        if !self.pending_members.insert(shard_index) {
+            self.duplicate_schedule_coalesced_count =
+                self.duplicate_schedule_coalesced_count.saturating_add(1);
+            return;
+        }
+        self.pending.push_back(shard_index);
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.pending_members.clear();
+        self.follow_up.clear();
+    }
+
+    fn start_ready_drains(
+        &mut self,
+        tasks: &mut JoinSet<MemoryOutboxDrainResult>,
+        memory_store: &MemoryStore,
+        event_tx: &RuntimeEventSender,
+    ) {
+        while self.in_flight.len() < self.max_concurrent_shards {
+            let Some(shard_index) = self.pending.pop_front() else {
+                break;
+            };
+            self.pending_members.remove(&shard_index);
+            if !self.in_flight.insert(shard_index) {
+                self.follow_up.insert(shard_index);
+                continue;
+            }
+            self.parallelism_peak = self.parallelism_peak.max(self.in_flight.len());
+            let memory_store = memory_store.clone();
+            let event_tx = event_tx.clone();
+            tasks.spawn(async move {
+                match AssertUnwindSafe(drain_memory_outbox_shard_in_background(
                     &memory_store,
                     &event_tx,
                     shard_index,
                     MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES,
-                )
-                .await;
-            }
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => MemoryOutboxDrainResult {
+                        shard_index,
+                        saturated: false,
+                        panicked: true,
+                    },
+                }
+            });
         }
+    }
+
+    fn finish_joined(
+        &mut self,
+        joined: Option<std::result::Result<MemoryOutboxDrainResult, tokio::task::JoinError>>,
+    ) {
+        match joined {
+            Some(Ok(result)) => {
+                self.in_flight.remove(&result.shard_index);
+                if result.panicked {
+                    self.task_failure_count = self.task_failure_count.saturating_add(1);
+                    warn!(
+                        shard_index = result.shard_index,
+                        "memory outbox drain task panicked"
+                    );
+                }
+                let follow_up = self.follow_up.remove(&result.shard_index);
+                if result.saturated || follow_up {
+                    self.requeue(result.shard_index);
+                }
+            }
+            Some(Err(error)) => {
+                self.task_failure_count = self.task_failure_count.saturating_add(1);
+                warn!(error = %error, "memory outbox drain task failed");
+            }
+            None => {}
+        }
+    }
+
+    fn requeue(&mut self, shard_index: usize) {
+        if self.pending_members.insert(shard_index) {
+            self.pending.push_back(shard_index);
+            self.shard_requeue_count = self.shard_requeue_count.saturating_add(1);
+        }
+    }
+
+    fn send_stats(&self, event_tx: &RuntimeEventSender) {
+        let _ = event_tx.try_send(RuntimeEvent::MemoryOutboxWorkerStats {
+            pending_shards: self.pending_members.len(),
+            in_flight_shards: self.in_flight.len(),
+            parallelism_limit: self.max_concurrent_shards,
+            parallelism_peak: self.parallelism_peak,
+            duplicate_schedule_coalesced_count: self.duplicate_schedule_coalesced_count,
+            task_failure_count: self.task_failure_count,
+            shard_requeue_count: self.shard_requeue_count,
+        });
     }
 }
 
@@ -52,7 +213,8 @@ async fn drain_memory_outbox_shard_in_background(
     event_tx: &RuntimeEventSender,
     shard_index: usize,
     max_batches: usize,
-) {
+) -> MemoryOutboxDrainResult {
+    let mut saturated_any = false;
     for _ in 0..max_batches {
         let started_at = Instant::now();
         let claims = match memory_store
@@ -67,11 +229,16 @@ async fn drain_memory_outbox_shard_in_background(
             Ok(claims) => claims,
             Err(error) => {
                 warn!(shard_index, error = %error, "memory outbox shard claim failed");
-                return;
+                return MemoryOutboxDrainResult {
+                    shard_index,
+                    saturated: false,
+                    panicked: false,
+                };
             }
         };
         let claimed = claims.len();
         let saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
+        saturated_any |= saturated;
         memory_store.record_profile(
             MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
             duration_us(started_at.elapsed()),
@@ -88,7 +255,11 @@ async fn drain_memory_outbox_shard_in_background(
                     reply,
                 })
                 .await;
-            return;
+            return MemoryOutboxDrainResult {
+                shard_index,
+                saturated: false,
+                panicked: false,
+            };
         }
 
         let (reply, reply_rx) = oneshot::channel();
@@ -106,7 +277,11 @@ async fn drain_memory_outbox_shard_in_background(
                 error = %error,
                 "memory outbox delivery event could not be sent"
             );
-            return;
+            return MemoryOutboxDrainResult {
+                shard_index,
+                saturated: false,
+                panicked: false,
+            };
         }
 
         let outcomes = match reply_rx.await {
@@ -117,7 +292,11 @@ async fn drain_memory_outbox_shard_in_background(
                     error = %error,
                     "memory outbox delivery response dropped"
                 );
-                return;
+                return MemoryOutboxDrainResult {
+                    shard_index,
+                    saturated: false,
+                    panicked: false,
+                };
             }
         };
         let ack_started_at = Instant::now();
@@ -130,7 +309,11 @@ async fn drain_memory_outbox_shard_in_background(
             let _ = event_tx
                 .send(RuntimeEvent::MemoryOutboxAckFailed { shard_index })
                 .await;
-            return;
+            return MemoryOutboxDrainResult {
+                shard_index,
+                saturated: false,
+                panicked: false,
+            };
         }
         memory_store.record_profile(
             MemoryProfileMetricKind::RuntimeAtomicOutboxDrain,
@@ -139,8 +322,17 @@ async fn drain_memory_outbox_shard_in_background(
         );
 
         if !saturated {
-            return;
+            return MemoryOutboxDrainResult {
+                shard_index,
+                saturated: false,
+                panicked: false,
+            };
         }
+    }
+    MemoryOutboxDrainResult {
+        shard_index,
+        saturated: saturated_any,
+        panicked: false,
     }
 }
 
@@ -152,9 +344,7 @@ impl WorkerManager {
     ) {
         let shard_count = self.memory_store.namespace_shards().max(1);
         let shard_index = shard_index % shard_count;
-        if !self.pending_memory_outbox_shards.insert(shard_index) {
-            return;
-        }
+        self.pending_memory_outbox_shards.insert(shard_index);
         if let Err(error) = self
             .memory_outbox_drain_sender
             .try_send(MemoryOutboxWorkerCommand::DrainShard { shard_index })
@@ -1549,4 +1739,83 @@ fn is_terminal_memory_outbox_delivery_error(error: &PlatformError) -> bool {
 fn memory_outbox_retry_after(attempt_count: i64) -> Duration {
     let shift = attempt_count.clamp(0, 6) as u32;
     Duration::from_millis(250u64.saturating_mul(1u64 << shift))
+}
+
+#[cfg(test)]
+mod outbox_coordinator_tests {
+    use super::*;
+
+    #[test]
+    fn coordinator_deduplicates_pending_shards() {
+        let mut coordinator = MemoryOutboxDrainCoordinator::new(2);
+        coordinator.schedule(7);
+        coordinator.schedule(7);
+
+        assert_eq!(coordinator.pending.len(), 1);
+        assert_eq!(coordinator.pending_members.len(), 1);
+        assert_eq!(coordinator.duplicate_schedule_coalesced_count, 1);
+    }
+
+    #[test]
+    fn coordinator_records_follow_up_for_in_flight_shard_once() {
+        let mut coordinator = MemoryOutboxDrainCoordinator::new(2);
+        coordinator.in_flight.insert(3);
+
+        coordinator.schedule(3);
+        coordinator.schedule(3);
+
+        assert!(coordinator.follow_up.contains(&3));
+        assert_eq!(coordinator.pending.len(), 0);
+        assert_eq!(coordinator.duplicate_schedule_coalesced_count, 1);
+
+        coordinator.finish_joined(Some(Ok(MemoryOutboxDrainResult {
+            shard_index: 3,
+            saturated: false,
+            panicked: false,
+        })));
+
+        assert!(!coordinator.in_flight.contains(&3));
+        assert!(!coordinator.follow_up.contains(&3));
+        assert_eq!(coordinator.pending.pop_front(), Some(3));
+        assert_eq!(coordinator.shard_requeue_count, 1);
+    }
+
+    #[test]
+    fn coordinator_requeues_saturated_shard_behind_pending_work() {
+        let mut coordinator = MemoryOutboxDrainCoordinator::new(2);
+        coordinator.in_flight.insert(1);
+        coordinator.schedule(2);
+
+        coordinator.finish_joined(Some(Ok(MemoryOutboxDrainResult {
+            shard_index: 1,
+            saturated: true,
+            panicked: false,
+        })));
+
+        assert_eq!(coordinator.pending.pop_front(), Some(2));
+        assert_eq!(coordinator.pending.pop_front(), Some(1));
+        assert_eq!(coordinator.shard_requeue_count, 1);
+    }
+
+    #[test]
+    fn coordinator_clears_in_flight_after_task_panic_result() {
+        let mut coordinator = MemoryOutboxDrainCoordinator::new(2);
+        coordinator.in_flight.insert(9);
+
+        coordinator.finish_joined(Some(Ok(MemoryOutboxDrainResult {
+            shard_index: 9,
+            saturated: false,
+            panicked: true,
+        })));
+
+        assert!(!coordinator.in_flight.contains(&9));
+        assert_eq!(coordinator.task_failure_count, 1);
+        assert!(!coordinator.pending_members.contains(&9));
+    }
+
+    #[test]
+    fn coordinator_limit_is_clamped_to_one() {
+        let coordinator = MemoryOutboxDrainCoordinator::new(0);
+        assert_eq!(coordinator.max_concurrent_shards, 1);
+    }
 }

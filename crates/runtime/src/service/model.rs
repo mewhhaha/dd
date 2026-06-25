@@ -42,6 +42,10 @@ pub(super) struct WorkerManager {
     pub(super) pending_dispatches: HashSet<(String, u64)>,
     pub(super) pending_cleanup_workers: HashSet<String>,
     pub(super) pending_memory_outbox_shards: HashSet<usize>,
+    pub(super) scale_up_requests: VecDeque<(String, u64)>,
+    pub(super) scale_up_request_members: HashSet<(String, u64)>,
+    pub(super) global_isolate_slots_used: usize,
+    pub(super) global_isolates_starting: usize,
     pub(super) stats: RuntimeManagerStats,
     pub(super) next_generation: u64,
     pub(super) next_isolate_id: u64,
@@ -90,6 +94,14 @@ pub(super) struct RuntimeManagerStats {
     pub(super) memory_outbox_ack_failure_count: u64,
     pub(super) memory_outbox_channel_full_count: u64,
     pub(super) memory_outbox_reschedule_count: u64,
+    pub(super) memory_outbox_worker_pending_shards: usize,
+    pub(super) memory_outbox_worker_in_flight_shards: usize,
+    pub(super) memory_outbox_worker_parallelism_limit: usize,
+    pub(super) memory_outbox_worker_parallelism_peak: usize,
+    pub(super) memory_outbox_duplicate_schedule_coalesced_count: u64,
+    pub(super) memory_outbox_task_failure_count: u64,
+    pub(super) memory_outbox_shard_requeue_count: u64,
+    pub(super) scale_up_budget_denied_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -302,7 +314,7 @@ impl WorkerPool {
         lease
     }
 
-    pub(super) fn release_memory_entity_lease(&mut self, lease: &MemoryEntityLease) {
+    pub(super) fn release_memory_entity_lease(&mut self, lease: &MemoryEntityLease) -> bool {
         let should_release = self
             .memory_entity_leases
             .get(&lease.owner_key)
@@ -310,7 +322,9 @@ impl WorkerPool {
             .unwrap_or(false);
         if should_release {
             self.memory_entity_leases.remove(&lease.owner_key);
+            self.queue.mark_memory_owner_ready(&lease.owner_key);
         }
+        should_release
     }
 }
 
@@ -346,7 +360,9 @@ pub(super) struct MemoryOwnerQueue {
 #[derive(Default)]
 pub(super) struct MemoryShardQueue {
     owners: BTreeMap<String, MemoryOwnerQueue>,
-    owner_ring: VecDeque<String>,
+    ready: VecDeque<String>,
+    ready_membership: HashSet<String>,
+    blocked: HashSet<String>,
 }
 
 impl MemoryShardQueue {
@@ -371,7 +387,9 @@ impl MemoryShardQueue {
     ) -> usize {
         self.owners
             .keys()
-            .filter(|owner_key| memory_entity_leases.contains_key(*owner_key))
+            .filter(|owner_key| {
+                self.blocked.contains(*owner_key) || memory_entity_leases.contains_key(*owner_key)
+            })
             .count()
     }
 
@@ -387,12 +405,19 @@ impl MemoryShardQueue {
         sequence: u64,
         pending: PendingInvoke,
     ) -> Option<PendingInvoke> {
-        let owner = self.owners.entry(owner_key.clone()).or_insert_with(|| {
-            self.owner_ring.push_back(owner_key);
-            MemoryOwnerQueue {
-                pending: BTreeMap::new(),
-            }
-        });
+        if !self.owners.contains_key(&owner_key) {
+            self.owners.insert(
+                owner_key.clone(),
+                MemoryOwnerQueue {
+                    pending: BTreeMap::new(),
+                },
+            );
+            self.ready_owner(owner_key.clone());
+        }
+        let owner = self
+            .owners
+            .get_mut(&owner_key)
+            .expect("owner queue should exist after insertion");
         owner.pending.insert(sequence, pending)
     }
 
@@ -401,24 +426,38 @@ impl MemoryShardQueue {
         let pending = owner.pending.remove(&sequence);
         if owner.pending.is_empty() {
             self.owners.remove(owner_key);
-            self.owner_ring.retain(|candidate| candidate != owner_key);
+            self.ready_membership.remove(owner_key);
+            self.blocked.remove(owner_key);
         }
         pending
     }
 
     fn find_round_robin_owner_head_map<T>(
-        &self,
+        &mut self,
         shard_index: usize,
         map: &mut impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,
     ) -> Option<(PendingQueueKey, u64, T)> {
-        // Owner fairness is round-robin over owner queue heads within a physical
-        // shard. A rejected owner head, for example due to an active atomic
-        // lease, does not hide later independent owners in the same shard.
-        for owner_key in &self.owner_ring {
-            let Some(owner) = self.owners.get(owner_key) else {
+        let mut inspected = 0usize;
+        let ready_len = self.ready.len();
+        while inspected < ready_len {
+            inspected = inspected.saturating_add(1);
+            let owner_key = self.ready.front().cloned()?;
+            if !self.ready_membership.contains(&owner_key)
+                || self.blocked.contains(&owner_key)
+                || !self.owners.contains_key(&owner_key)
+            {
+                self.ready.pop_front();
+                self.ready_membership.remove(&owner_key);
+                continue;
+            }
+            let Some(owner) = self.owners.get(&owner_key) else {
+                self.ready.pop_front();
+                self.ready_membership.remove(&owner_key);
                 continue;
             };
             let Some((sequence, pending)) = owner.pending.first_key_value() else {
+                self.ready.pop_front();
+                self.ready_membership.remove(&owner_key);
                 continue;
             };
             let key = PendingQueueKey {
@@ -436,14 +475,36 @@ impl MemoryShardQueue {
     }
 
     fn advance_owner_cursor(&mut self, owner_key: &str) {
-        let Some(position) = self
-            .owner_ring
-            .iter()
-            .position(|candidate| candidate == owner_key)
-        else {
-            return;
-        };
-        self.owner_ring.rotate_left(position.saturating_add(1));
+        if self
+            .ready
+            .front()
+            .is_some_and(|candidate| candidate == owner_key)
+        {
+            if let Some(owner_key) = self.ready.pop_front() {
+                self.ready.push_back(owner_key);
+            }
+        }
+    }
+
+    fn block_owner(&mut self, owner_key: &str) {
+        if self.owners.contains_key(owner_key) {
+            self.blocked.insert(owner_key.to_string());
+            self.ready_membership.remove(owner_key);
+        }
+    }
+
+    fn ready_owner(&mut self, owner_key: String) -> bool {
+        if !self.owners.contains_key(&owner_key) {
+            self.blocked.remove(&owner_key);
+            self.ready_membership.remove(&owner_key);
+            return false;
+        }
+        self.blocked.remove(&owner_key);
+        if self.ready_membership.insert(owner_key.clone()) {
+            self.ready.push_back(owner_key);
+            return true;
+        }
+        false
     }
 
     fn drain_matching(
@@ -575,6 +636,30 @@ impl PendingInvokeQueue {
             .values()
             .map(|shard| shard.blocked_owner_count(memory_entity_leases))
             .sum::<usize>()
+    }
+
+    pub(super) fn mark_memory_owner_blocked(&mut self, key: &PendingQueueKey) {
+        let (Some(shard_index), Some(owner_key)) =
+            (key.memory_shard_index, key.memory_owner_key.as_deref())
+        else {
+            return;
+        };
+        if let Some(memory_shard) = self.memory_shards.get_mut(&shard_index) {
+            memory_shard.block_owner(owner_key);
+        }
+    }
+
+    pub(super) fn mark_memory_owner_ready(&mut self, owner_key: &str) -> bool {
+        let Some(keys) = self.by_memory_owner_key.get(owner_key) else {
+            return false;
+        };
+        let Some(shard_index) = keys.iter().find_map(|key| key.memory_shard_index) else {
+            return false;
+        };
+        let Some(memory_shard) = self.memory_shards.get_mut(&shard_index) else {
+            return false;
+        };
+        memory_shard.ready_owner(owner_key.to_string())
     }
 
     pub(super) fn oldest_queue_age_ms(&self, now: Instant) -> u64 {
@@ -1082,12 +1167,17 @@ impl PendingInvokeQueue {
         }
 
         let cursor = self.memory_next_shard_cursor.unwrap_or(0);
-        for (shard_index, memory_shard) in self
+        let shard_indices = self
             .memory_shards
             .range(cursor..)
             .chain(self.memory_shards.range(..cursor))
-        {
-            let Some(candidate) = memory_shard.find_round_robin_owner_head_map(*shard_index, map)
+            .map(|(shard_index, _)| *shard_index)
+            .collect::<Vec<_>>();
+        for shard_index in shard_indices {
+            let Some(memory_shard) = self.memory_shards.get_mut(&shard_index) else {
+                continue;
+            };
+            let Some(candidate) = memory_shard.find_round_robin_owner_head_map(shard_index, map)
             else {
                 continue;
             };
@@ -1526,6 +1616,7 @@ pub(super) struct IsolateHandle {
     pub(super) pending_wait_until: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum IsolateStartup {
     Starting { started_at: Instant },
     Ready,
@@ -1862,6 +1953,72 @@ mod tests {
             Some("owner-a-2".to_string())
         );
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn pending_invoke_queue_blocked_memory_owner_is_skipped_until_woken() {
+        let mut queue = PendingInvokeQueue::new();
+        let route_a = memory_route_on_shard("room-a", 3);
+        let owner_a = route_a.owner_key.clone();
+        queue.push_back(pending_invoke("owner-a-1", None, Some(route_a), None));
+        queue.push_back(pending_invoke(
+            "owner-b-1",
+            None,
+            Some(memory_route_on_shard("room-b", 3)),
+            None,
+        ));
+
+        let blocked = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
+            .expect("owner a should be the first memory head");
+        queue.mark_memory_owner_blocked(&blocked);
+
+        let mut inspected = 0usize;
+        let ready = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, pending| {
+                inspected = inspected.saturating_add(1);
+                Some((key, pending.runtime_request_id.clone()))
+            })
+            .expect("owner b should remain dispatchable");
+        assert_eq!(ready.1, "owner-b-1");
+        assert_eq!(inspected, 1);
+        assert_eq!(
+            queue
+                .remove(ready.0)
+                .map(|pending| pending.runtime_request_id),
+            Some("owner-b-1".to_string())
+        );
+
+        assert!(queue.mark_memory_owner_ready(&owner_a));
+        assert!(!queue.mark_memory_owner_ready(&owner_a));
+        let woken = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, pending| {
+                Some((key, pending.runtime_request_id.clone()))
+            })
+            .expect("woken owner should be dispatchable again");
+        assert_eq!(woken.1, "owner-a-1");
+    }
+
+    #[test]
+    fn pending_invoke_queue_final_memory_owner_removal_clears_ready_and_blocked_state() {
+        let mut queue = PendingInvokeQueue::new();
+        let route = memory_route_on_shard("room-a", 3);
+        let owner_key = route.owner_key.clone();
+        queue.push_back(pending_invoke("owner-a-1", None, Some(route), None));
+
+        let key = queue
+            .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
+            .expect("memory owner should be selectable");
+        queue.mark_memory_owner_blocked(&key);
+        assert_eq!(queue.blocked_memory_owner_queues(&HashMap::new()), 1);
+
+        assert_eq!(
+            queue.remove(key).map(|pending| pending.runtime_request_id),
+            Some("owner-a-1".to_string())
+        );
+        assert_eq!(queue.blocked_memory_owner_queues(&HashMap::new()), 0);
+        assert!(!queue.mark_memory_owner_ready(&owner_key));
+        assert!(queue.memory_shards.is_empty());
     }
 
     #[test]

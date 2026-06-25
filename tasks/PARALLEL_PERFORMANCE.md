@@ -1,8 +1,7 @@
 # Parallel performance review
 
-This review targets current `main` at commit `a079003` and focuses on bounded,
-reasonably implementable changes that can improve multi-core throughput without
-rewriting the runtime.
+This review was written against `main` at commit `a079003` and has been updated
+after the bounded parallel-performance backlog was implemented.
 
 ## Current state
 
@@ -21,7 +20,14 @@ The previous major bottlenecks have been addressed:
 - outbox claim and acknowledgement storage I/O run outside the runtime manager;
 - scheduler, affinity, queue, and outbox counters are exposed;
 - benchmark matrices are planned/budgeted, summaries are generated, and
-  structural regression checks exist.
+  structural regression checks exist;
+- isolate allocation is governed by a CPU-aware global budget with explicit
+  production tuning;
+- outbox shard drains run concurrently with bounded per-shard scheduling;
+- memory version and snapshot cache locks are striped by entity;
+- memory owner readiness uses explicit ready/blocked queues;
+- memory database handles reuse configured connections with pooled readers and a
+  single writer lane before SQLite/Turso contention.
 
 The five-sample 16-shard benchmark summary shows useful scaling:
 
@@ -42,59 +48,15 @@ The shape matters more than the absolute values:
 - 32 isolates provide only a modest gain on a 16-logical-CPU host;
 - same-shard controls remain flat, as required by ordered transactional work.
 
-## Remaining practical levers
+## Completed bounded levers
 
-### 1. Allocate isolates globally and expose production tuning
+The bounded levers identified in this review have been implemented:
 
-`RuntimeConfig` still defaults to 8 isolates and 4 inflight requests per isolate,
-while the server CLI does not expose runtime or memory tuning. The isolate limit
-is per worker pool, so multiple busy workers can each reach the cap and
-oversubscribe the host. Conversely, one busy worker on a larger host can be
-artificially limited.
-
-The most useful near-term change is a CPU-aware global isolate budget with fair
-allocation across worker pools, plus explicit server configuration. This should
-improve multi-worker parallelism and prevent thread explosion.
-
-### 2. Drain independent outbox shards concurrently
-
-Outbox database I/O is no longer on the manager, but one background task still
-receives every `DrainShard` command and processes commands serially. Effect-heavy
-work on independent storage shards therefore shares one claim/ack pipeline.
-
-A bounded concurrent shard worker should improve atomic write/effect throughput
-without changing delivery semantics.
-
-### 3. Stripe memory cache/version locks within physical shards
-
-Each physical `MemoryShard` still has one mutex for memory-version metadata and
-one mutex for the shared snapshot cache. Independent entity IDs mapped to the
-same physical shard contend on those locks even though the scheduler now treats
-them independently.
-
-Striping these structures by entity hash is a contained way to extend the
-scheduler’s parallelism into the storage cache layer.
-
-### 4. Make the owner-ready scheduler constant time
-
-The per-shard scheduler uses a `VecDeque<String>` owner ring. Selection can scan
-blocked owners; advancing finds the selected owner linearly and rotates the
-ring; removing an owner retains across the full deque. This is acceptable at the
-current keyspace but becomes manager-thread work proportional to active owners.
-
-Maintaining explicit ready/blocked owner queues and waking an owner when its
-lease is released can reduce single-thread scheduling overhead under large
-keyspaces and hot-key skew.
-
-### 5. Reuse configured database connections
-
-The `Database` handle is cached, but each operation still calls
-`database.connect()` and configures a new connection. At high concurrency this
-adds repeated setup and can amplify SQLite/Turso lock contention.
-
-A small bounded per-database connection pool, or one writer lane plus pooled
-readers, should be evaluated. The implementation must be driven by profiling and
-Turso thread-safety constraints rather than assumed to help.
+1. Global isolate budget and production configuration.
+2. Concurrent outbox shard draining.
+3. Striped memory cache/version locks.
+4. Constant-time owner-ready scheduling.
+5. Connection reuse with pooled readers and serialized writers.
 
 ## What not to do yet
 
@@ -104,17 +66,10 @@ that the manager loop dominates after 8 isolates. Splitting manager ownership
 would affect deployment, cancellation, sessions, dynamic RPC, queue limits, and
 shutdown correctness.
 
-First implement or measure the five bounded levers above. Revisit manager
-partitioning only if manager event wait, budget exhaustion, or dispatch CPU
-remains dominant afterward.
+Revisit manager partitioning only if manager event wait, budget exhaustion, or
+dispatch CPU remains dominant after the completed bounded changes.
 
-## Recommended order
-
-1. Global isolate budget and production configuration.
-2. Concurrent outbox shard draining.
-3. Stripe memory cache/version locks.
-4. Constant-time owner-ready scheduling.
-5. Connection reuse/pooling after profiling.
+## Benchmark discipline
 
 Every performance PR should run the relative regression policy plus the relevant
 real-world workload. Use at least three samples on a clean worktree and record

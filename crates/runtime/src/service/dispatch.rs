@@ -902,17 +902,9 @@ impl WorkerManager {
             };
 
             if spawn_needed {
-                if let Err(error) = self.spawn_isolate(worker_name, generation, event_tx.clone()) {
-                    let pending = self
-                        .get_pool_mut(worker_name, generation)
-                        .and_then(|pool| pool.queue.pop_front());
-                    if let Some(pending) = pending {
-                        self.account_dequeued_pending(&pending);
-                        let _ = pending.reply.send(Err(error));
-                    }
-                    return;
-                }
-                continue;
+                self.request_scale_up(worker_name, generation);
+                self.process_scale_up_requests(event_tx);
+                return;
             }
 
             let Some(selection) = selection else {
@@ -1118,6 +1110,14 @@ impl WorkerManager {
         generation: u64,
         event_tx: RuntimeEventSender,
     ) -> Result<()> {
+        if !self.try_reserve_global_isolate_slot() {
+            self.stats.scale_up_budget_denied_count =
+                self.stats.scale_up_budget_denied_count.saturating_add(1);
+            return Err(PlatformError::overloaded(format!(
+                "runtime isolate budget is exhausted (max {} global isolates)",
+                self.config.max_global_isolates
+            )));
+        }
         let (snapshot, snapshot_preloaded, source, deployment_config) = self
             .workers
             .get(worker_name)
@@ -1143,7 +1143,7 @@ impl WorkerManager {
             max_request_body_bytes: self.config.max_request_body_bytes,
             max_isolate_heap_bytes: self.config.max_isolate_heap_bytes,
         };
-        let isolate = spawn_isolate_thread(IsolateThreadStart {
+        let isolate = match spawn_isolate_thread(IsolateThreadStart {
             snapshot,
             snapshot_preloaded,
             source,
@@ -1160,14 +1160,112 @@ impl WorkerManager {
             generation,
             isolate_id,
             event_tx: event_tx.clone(),
-        })?;
+        }) {
+            Ok(isolate) => isolate,
+            Err(error) => {
+                self.release_global_isolate_slot_for_startup_failure();
+                return Err(error);
+            }
+        };
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             pool.stats.spawn_count += 1;
             pool.push_isolate(isolate);
             pool.log_stats("spawn");
             Ok(())
         } else {
+            self.release_global_isolate_slot_for_startup_failure();
+            let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
             Err(PlatformError::internal("worker pool missing"))
+        }
+    }
+
+    fn request_scale_up(&mut self, worker_name: &str, generation: u64) {
+        let key = (worker_name.to_string(), generation);
+        if self.scale_up_request_members.insert(key.clone()) {
+            self.scale_up_requests.push_back(key);
+        }
+    }
+
+    pub(crate) fn process_scale_up_requests(&mut self, event_tx: &RuntimeEventSender) {
+        let mut remaining = self.scale_up_requests.len();
+        while remaining > 0
+            && self.global_isolate_slots_used < self.config.max_global_isolates
+            && !self.scale_up_requests.is_empty()
+        {
+            remaining -= 1;
+            let Some((worker_name, generation)) = self.scale_up_requests.pop_front() else {
+                break;
+            };
+            self.scale_up_request_members
+                .remove(&(worker_name.clone(), generation));
+            if !self.pool_needs_scale_up(&worker_name, generation) {
+                continue;
+            }
+            match self.spawn_isolate(&worker_name, generation, event_tx.clone()) {
+                Ok(()) => {
+                    self.dispatch_pool(&worker_name, generation, event_tx);
+                    if self.pool_needs_scale_up(&worker_name, generation) {
+                        self.request_scale_up(&worker_name, generation);
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Overloaded => {
+                    self.request_scale_up(&worker_name, generation);
+                    break;
+                }
+                Err(error) => {
+                    let pending = self
+                        .get_pool_mut(&worker_name, generation)
+                        .and_then(|pool| pool.queue.pop_front());
+                    if let Some(pending) = pending {
+                        self.account_dequeued_pending(&pending);
+                        let _ = pending.reply.send(Err(error));
+                    }
+                }
+            }
+        }
+        if !self.scale_up_requests.is_empty()
+            && self.global_isolate_slots_used >= self.config.max_global_isolates
+        {
+            self.stats.scale_up_budget_denied_count =
+                self.stats.scale_up_budget_denied_count.saturating_add(1);
+        }
+    }
+
+    fn pool_needs_scale_up(&mut self, worker_name: &str, generation: u64) -> bool {
+        let max_inflight = self.config.max_inflight_per_isolate;
+        let max_isolates = self.config.max_isolates;
+        let Some(pool) = self.get_pool_mut(worker_name, generation) else {
+            return false;
+        };
+        let max_inflight = if pool.strict_request_isolation {
+            1
+        } else {
+            max_inflight
+        };
+        !pool.queue.is_empty()
+            && !pool.has_dispatch_capacity(max_inflight)
+            && !pool.has_starting_isolate()
+            && pool.isolates.len() < max_isolates
+    }
+
+    fn try_reserve_global_isolate_slot(&mut self) -> bool {
+        if self.global_isolate_slots_used >= self.config.max_global_isolates {
+            return false;
+        }
+        self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_add(1);
+        self.global_isolates_starting = self.global_isolates_starting.saturating_add(1);
+        true
+    }
+
+    fn release_global_isolate_slot_for_startup_failure(&mut self) {
+        self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_sub(1);
+        self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
+    }
+
+    pub(crate) fn global_isolate_slot_released(&mut self, startup: IsolateStartup) {
+        self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_sub(1);
+        if startup.is_starting() {
+            self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
         }
     }
 

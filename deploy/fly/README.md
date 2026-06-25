@@ -51,6 +51,31 @@ export DD_PRIVATE_TOKEN=replace-me-with-long-random-secret
 
 This value in docs is placeholder only. Replace it with fresh random secret.
 
+## Runtime isolate tuning
+
+`dd_server` defaults the process-wide isolate budget to the host logical CPU
+count. Override these values for production capacity planning:
+
+```bash
+flyctl secrets set \
+  DD_RUNTIME_MAX_GLOBAL_ISOLATES=1 \
+  DD_RUNTIME_MAX_ISOLATES_PER_WORKER=8 \
+  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE=4 \
+  DD_RUNTIME_MIN_ISOLATES_PER_WORKER=0 \
+  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS=1 \
+  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE=2 \
+  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS=256 \
+  --app your-dd-app
+```
+
+The global value is shared by all deployed workers in one process. The
+per-worker value is a ceiling; it may be higher than the global value, but one
+worker can only reach it when global slots are available. The memory outbox
+parallelism value bounds how many physical memory shards can claim, deliver, and
+ack durable effects at once. The memory DB connection values bound reusable
+per-database reader connections plus the single writer connection per active
+database slot.
+
 ## 4) Open private tunnel
 
 ```bash

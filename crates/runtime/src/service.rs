@@ -44,6 +44,7 @@ use common::{
     DeployAsset, DeployBinding, DeployConfig, DeployServerModule, ErrorKind, PlatformError, Result,
     WorkerInvocation, WorkerOutput,
 };
+use futures_util::FutureExt;
 #[cfg(feature = "otel")]
 use opentelemetry::global;
 #[cfg(feature = "otel")]
@@ -53,6 +54,7 @@ use opentelemetry::trace::TraceContextExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Once};
@@ -62,6 +64,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::task::JoinSet;
 use tracing::{info, warn, Level};
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;

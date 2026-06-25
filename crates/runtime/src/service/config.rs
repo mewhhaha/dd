@@ -321,6 +321,11 @@ fn is_valid_egress_host(host: &str) -> bool {
 }
 
 pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
+    if config.max_global_isolates == 0 {
+        return Err(PlatformError::internal(
+            "max_global_isolates must be greater than 0",
+        ));
+    }
     if config.max_isolates == 0 {
         return Err(PlatformError::internal(
             "max_isolates must be greater than 0",
@@ -374,6 +379,11 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
     if config.min_isolates > config.max_isolates {
         return Err(PlatformError::internal(
             "min_isolates cannot exceed max_isolates",
+        ));
+    }
+    if config.min_isolates > config.max_global_isolates {
+        return Err(PlatformError::internal(
+            "min_isolates cannot exceed max_global_isolates",
         ));
     }
     if config.cache_max_entries == 0 {

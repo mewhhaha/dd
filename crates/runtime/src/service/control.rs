@@ -233,6 +233,15 @@ pub(super) enum RuntimeEvent {
     MemoryOutboxAckFailed {
         shard_index: usize,
     },
+    MemoryOutboxWorkerStats {
+        pending_shards: usize,
+        in_flight_shards: usize,
+        parallelism_limit: usize,
+        parallelism_peak: usize,
+        duplicate_schedule_coalesced_count: u64,
+        task_failure_count: u64,
+        shard_requeue_count: u64,
+    },
 }
 impl WorkerManager {
     pub(super) fn new(init: WorkerManagerInit) -> Self {
@@ -290,6 +299,10 @@ impl WorkerManager {
             pending_dispatches: HashSet::new(),
             pending_cleanup_workers: HashSet::new(),
             pending_memory_outbox_shards: HashSet::new(),
+            scale_up_requests: VecDeque::new(),
+            scale_up_request_members: HashSet::new(),
+            global_isolate_slots_used: 0,
+            global_isolates_starting: 0,
             stats: RuntimeManagerStats::default(),
             next_generation: 1,
             next_isolate_id: 1,
@@ -321,6 +334,7 @@ impl WorkerManager {
             for (worker_name, generation) in pending_dispatches {
                 self.dispatch_pool(&worker_name, generation, event_tx);
             }
+            self.process_scale_up_requests(event_tx);
             for worker_name in pending_cleanup_workers {
                 self.cleanup_drained_generations_for(&worker_name);
             }
@@ -903,6 +917,27 @@ impl WorkerManager {
             }
             RuntimeEvent::MemoryOutboxAckFailed { shard_index } => {
                 self.handle_memory_outbox_ack_failed(shard_index, event_tx);
+            }
+            RuntimeEvent::MemoryOutboxWorkerStats {
+                pending_shards,
+                in_flight_shards,
+                parallelism_limit,
+                parallelism_peak,
+                duplicate_schedule_coalesced_count,
+                task_failure_count,
+                shard_requeue_count,
+            } => {
+                self.stats.memory_outbox_worker_pending_shards = pending_shards;
+                self.stats.memory_outbox_worker_in_flight_shards = in_flight_shards;
+                self.stats.memory_outbox_worker_parallelism_limit = parallelism_limit;
+                self.stats.memory_outbox_worker_parallelism_peak = self
+                    .stats
+                    .memory_outbox_worker_parallelism_peak
+                    .max(parallelism_peak);
+                self.stats.memory_outbox_duplicate_schedule_coalesced_count =
+                    duplicate_schedule_coalesced_count;
+                self.stats.memory_outbox_task_failure_count = task_failure_count;
+                self.stats.memory_outbox_shard_requeue_count = shard_requeue_count;
             }
         }
     }
@@ -1565,6 +1600,7 @@ impl WorkerManager {
         let mut queued_pending = Vec::new();
         let mut dequeued_count = 0usize;
         let mut dequeued_bytes = 0usize;
+        let mut released_startups = Vec::new();
         for (worker_name, entry) in &mut self.workers {
             for pool in entry.pools.values_mut() {
                 while let Some(pending) = pool.queue.pop_front() {
@@ -1575,6 +1611,7 @@ impl WorkerManager {
                 pool.clear_isolate_indices();
                 for isolate in pool.isolates.drain(..) {
                     let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                    released_startups.push(isolate.startup);
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending
@@ -1583,6 +1620,9 @@ impl WorkerManager {
                     }
                 }
             }
+        }
+        for startup in released_startups {
+            self.global_isolate_slot_released(startup);
         }
         self.account_dequeued_many(dequeued_count, dequeued_bytes);
         for (worker_name, pending) in queued_pending {
