@@ -1,29 +1,54 @@
-# Implementation tasks
+# Parallel performance tasks
 
-These task files describe concrete improvements found during a review of current
-`main`. Each file is written so it can be handed directly to a GPT-5.5-medium
-implementation agent without relying on conversational context.
+This directory is the active implementation backlog for bounded performance
+work on current `main`. Completed task briefs are removed when their behavior is
+present and tested in the repository.
+
+Read [`PARALLEL_PERFORMANCE.md`](PARALLEL_PERFORMANCE.md) for the current-state
+summary, benchmark interpretation, and why larger runtime-manager partitioning
+is deferred.
+
+Each task is written so it can be assigned directly to a GPT-5.5-medium
+implementation model without relying on conversation history.
 
 ## Recommended order
 
-| Order | Task | Priority | Reason |
+| Order | Task | Priority | Main expected benefit |
 | ---: | --- | --- | --- |
-| 1 | [Persist and validate the memory shard layout](001-persist-and-validate-memory-shard-layout.md) | P0 correctness | Prevents a shard-count configuration change from silently making persisted memory appear missing. |
-| 2 | [Remove intra-shard head-of-line blocking](002-remove-intra-shard-head-of-line-blocking.md) | P0 performance | Lets independent entity IDs progress even when they share one physical storage shard. |
-| 3 | [Move outbox storage I/O off the runtime manager](003-move-outbox-io-off-runtime-manager.md) | P1 performance | Prevents durable-effect persistence work from blocking all runtime scheduling. |
-| 4 | [Deduplicate memory database initialization without holding shard locks across I/O](004-deduplicate-memory-database-initialization.md) | P1 performance | Removes cold-open lock convoys and duplicate per-thread database objects where safe. |
-| 5 | [Replace full-map cache pruning with bounded LRU caches](005-use-bounded-lru-memory-caches.md) | P1 performance/memory | Makes cache operations predictable and enforces real process-wide budgets. |
-| 6 | [Make benchmark matrices opt-in and budgeted](006-make-benchmark-matrices-opt-in.md) | P1 tooling | Avoids accidentally launching hundreds or thousands of benchmark processes. |
-| 7 | [Generate the scaling summary from benchmark output](007-generate-scaling-summary.md) | P1 tooling | Prevents checked-in performance documentation from drifting from the measured data. |
-| 8 | [Add memory scheduler observability](008-add-memory-scheduler-observability.md) | P1 operations | Makes queue contention, affinity, leases, and manager-loop saturation diagnosable. |
-| 9 | [Add non-flaky performance regression gates](009-add-performance-regression-gates.md) | P2 quality | Converts the demonstrated sharding invariants into repeatable checks without fragile absolute RPS thresholds. |
-| 10 | [Isolate and fix the benchmark signal-139 instability](010-fix-benchmark-signal-139-instability.md) | P2 reliability | Restores the complete runtime benchmark suite as a usable gate. |
+| 1 | [Add a CPU-aware global isolate budget and production tuning surface](001-global-isolate-budget-and-runtime-tuning.md) | P0 | Uses host parallelism without multiplying a per-worker isolate cap across many workers. |
+| 2 | [Drain independent memory outbox shards concurrently](002-parallelize-memory-outbox-shard-drains.md) | P0 | Removes the remaining single background pipeline for cross-shard durable effects. |
+| 3 | [Stripe memory-store version and snapshot locks by entity](003-stripe-memory-store-hot-locks.md) | P1 | Lets independent IDs in one physical shard avoid shared cache/version mutexes. |
+| 4 | [Make memory-owner readiness and rotation constant time](004-make-memory-owner-ready-queue-constant-time.md) | P1 | Reduces single-manager scheduling work for large keyspaces and hot-owner skew. |
+| 5 | [Reuse memory database connections and serialize writers before SQLite contention](005-reuse-memory-database-connections.md) | P1 | Avoids per-request connection setup and reduces same-database writer lock thrash. |
+
+## Completed work removed from the backlog
+
+Current `main` already contains the major items from the previous task set:
+
+- persisted/validated memory shard layouts with legacy and mixed-layout adoption;
+- per-owner scheduling inside physical memory shards;
+- background outbox storage I/O;
+- deduplicated database initialization outside cache locks;
+- bounded database and snapshot caches;
+- safe benchmark matrix planning and run budgets;
+- generated scaling summaries;
+- memory scheduler/outbox observability;
+- relative performance regression policies;
+- broad benchmark filtering, lifecycle markers, explicit shutdown, and crash
+  reproduction tooling.
 
 ## Task execution rules
 
-- Implement one task per pull request unless a task explicitly lists another as a dependency.
-- Preserve public keyed-memory semantics: atomic calls for the same binding and entity ID must remain ordered and must never execute concurrently.
-- Add focused unit or integration coverage for every behavior change.
-- Run `just check` before requesting review unless the task documents a narrower reason that the full check cannot run.
-- Performance claims must identify the benchmark configuration, sample count, commit, hardware, and whether the worktree was clean.
-- Do not commit raw files under `benchmarks/results/`; update durable summaries instead.
+- Implement one task per pull request unless the task explicitly requires a
+  small prerequisite refactor.
+- Preserve same-owner atomic FIFO and single-writer semantics.
+- Keep concurrency bounded; do not replace one bottleneck with unbounded tasks,
+  threads, connections, or queues.
+- Add focused correctness tests and deterministic concurrency tests.
+- Run the relevant relative regression policy and real-world workload with at
+  least three samples on a clean worktree.
+- Record commit, logical CPU count, requests, concurrency, isolates, shards,
+  throughput, p95, and p99 for performance claims.
+- Run `just check` before requesting review.
+- Do not commit raw files under `benchmarks/results/`; update durable summaries
+  when conclusions materially change.
