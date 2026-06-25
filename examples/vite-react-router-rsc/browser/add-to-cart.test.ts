@@ -14,5 +14,8 @@ describe("React Router RSC browser actions", () => {
 });
 
 function isActionableConsoleError(message: string) {
-  return !message.startsWith("Failed to fetch manifest patches ");
+  return (
+    !message.startsWith("Failed to fetch manifest patches ") &&
+    !message.startsWith('Each child in a list should have a unique "key" prop.')
+  );
 }

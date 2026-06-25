@@ -33,10 +33,8 @@ try {
     throw new Error("RSC shell includes a pre-hydration live socket script");
   }
   const cookie = sessionCookie(appResponse);
-  const addToCartAction = serverActionName(appText, "addToCart");
-
   const cartFormData = new FormData();
-  cartFormData.set(addToCartAction, "");
+  cartFormData.set("intent", "add-to-cart");
   cartFormData.set("slug", "runtime");
   cartFormData.set("quantity", "2");
   const cartResponse = await fetch(`${base}/projects/runtime`, {
@@ -52,9 +50,8 @@ try {
 
   const homeWithCartResponse = await fetch(`${base}/`, { headers: { cookie } });
   const homeWithCartText = await homeWithCartResponse.text();
-  const checkoutAction = serverActionName(homeWithCartText, "checkoutCart");
   const checkoutFormData = new FormData();
-  checkoutFormData.set(checkoutAction, "");
+  checkoutFormData.set("intent", "checkout");
   checkoutFormData.set("email", "smoke@example.test");
   const checkoutResponse = await fetch(`${base}/?index`, {
     method: "POST",
@@ -141,15 +138,6 @@ function sessionCookie(response) {
 
 function stripReactComments(text) {
   return text.replace(/<!--\s*-->/g, "");
-}
-
-function serverActionName(text, exportName) {
-  const escapedExport = exportName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = text.match(new RegExp(`name="(\\$ACTION_ID_[^"]+#${escapedExport})"`));
-  if (!match) {
-    throw new Error(`RSC response did not include a ${exportName} server action form`);
-  }
-  return match[1];
 }
 
 function assertLiveSocket(base, workerName) {

@@ -4,7 +4,6 @@ import {
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
-import { addToCart, checkoutCart } from "../cart-actions";
 import { ddRequestContext } from "../dd-context";
 
 export function meta({ params }: { params: { slug?: string } }) {
@@ -101,7 +100,8 @@ export async function ServerComponent({
             </div>
           </div>
 
-          <form action={addToCart} className="grid gap-3 sm:grid-cols-[7rem_1fr]">
+          <form method="post" className="grid gap-3 sm:grid-cols-[7rem_1fr]">
+            <input name="intent" type="hidden" value="add-to-cart" />
             <input name="slug" type="hidden" value={loaderData.product.slug} />
             <label className="grid gap-1 text-base/7 font-medium text-neutral-950 sm:text-sm/6">
               Quantity
@@ -155,7 +155,8 @@ export async function ServerComponent({
               {loaderData.cart.subtotal}
             </p>
           </div>
-          <form action={checkoutCart} className="grid gap-3">
+          <form method="post" className="grid gap-3">
+            <input name="intent" type="hidden" value="checkout" />
             <input
               aria-label="Email"
               className="rounded-md bg-white px-3 py-2.5 text-base/7 text-neutral-950 ring-1 ring-neutral-950/10 placeholder:text-neutral-400 focus:outline-2 focus:-outline-offset-1 focus:outline-emerald-600 sm:py-2 sm:text-sm/6"

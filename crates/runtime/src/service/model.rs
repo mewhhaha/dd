@@ -1,5 +1,6 @@
 use super::*;
 use serde::{Deserialize, Serialize};
+use std::ops::Bound::{Excluded, Unbounded};
 pub(super) struct WorkerManager {
     pub(super) config: RuntimeConfig,
     pub(super) storage: RuntimeStorageConfig,
@@ -363,18 +364,17 @@ pub(super) struct MemoryShardQueue {
     ready: VecDeque<String>,
     ready_membership: HashSet<String>,
     blocked: HashSet<String>,
+    queued: usize,
+    queued_bytes: usize,
 }
 
 impl MemoryShardQueue {
     fn len(&self) -> usize {
-        self.owners
-            .values()
-            .map(|owner| owner.pending.len())
-            .sum::<usize>()
+        self.queued
     }
 
     fn is_empty(&self) -> bool {
-        self.owners.is_empty()
+        self.queued == 0
     }
 
     fn owner_count(&self) -> usize {
@@ -418,12 +418,25 @@ impl MemoryShardQueue {
             .owners
             .get_mut(&owner_key)
             .expect("owner queue should exist after insertion");
-        owner.pending.insert(sequence, pending)
+        let replaced = owner.pending.insert(sequence, pending);
+        if let Some(replaced) = replaced.as_ref() {
+            self.queued_bytes = self.queued_bytes.saturating_sub(replaced.queued_bytes);
+        } else {
+            self.queued = self.queued.saturating_add(1);
+        }
+        if let Some(inserted) = owner.pending.get(&sequence) {
+            self.queued_bytes = self.queued_bytes.saturating_add(inserted.queued_bytes);
+        }
+        replaced
     }
 
     fn remove(&mut self, owner_key: &str, sequence: u64) -> Option<PendingInvoke> {
         let owner = self.owners.get_mut(owner_key)?;
         let pending = owner.pending.remove(&sequence);
+        if let Some(pending) = pending.as_ref() {
+            self.queued = self.queued.saturating_sub(1);
+            self.queued_bytes = self.queued_bytes.saturating_sub(pending.queued_bytes);
+        }
         if owner.pending.is_empty() {
             self.owners.remove(owner_key);
             self.ready_membership.remove(owner_key);
@@ -512,7 +525,7 @@ impl MemoryShardQueue {
         shard_index: usize,
         matches: &mut impl FnMut(&PendingInvoke) -> bool,
         drained: &mut Vec<(PendingQueueKey, PendingInvoke)>,
-    ) {
+    ) -> (usize, usize) {
         let mut removals = Vec::new();
         for (owner_key, owner) in &self.owners {
             for (sequence, pending) in &owner.pending {
@@ -521,8 +534,12 @@ impl MemoryShardQueue {
                 }
             }
         }
+        let mut removed = 0usize;
+        let mut removed_bytes = 0usize;
         for (owner_key, sequence) in removals {
             if let Some(pending) = self.remove(&owner_key, sequence) {
+                removed = removed.saturating_add(1);
+                removed_bytes = removed_bytes.saturating_add(pending.queued_bytes);
                 drained.push((
                     PendingQueueKey {
                         lane: PendingQueueLane::Memory,
@@ -534,6 +551,7 @@ impl MemoryShardQueue {
                 ));
             }
         }
+        (removed, removed_bytes)
     }
 }
 
@@ -548,6 +566,8 @@ pub(super) struct PendingInvokeQueue {
     memory_shards: BTreeMap<usize, MemoryShardQueue>,
     memory_next_shard_cursor: Option<usize>,
     general: BTreeMap<u64, PendingInvoke>,
+    queued: usize,
+    queued_bytes: usize,
 }
 
 impl PendingInvokeQueue {
@@ -563,30 +583,21 @@ impl PendingInvokeQueue {
             memory_shards: BTreeMap::new(),
             memory_next_shard_cursor: None,
             general: BTreeMap::new(),
+            queued: 0,
+            queued_bytes: 0,
         }
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.queued == 0
     }
 
     pub(super) fn len(&self) -> usize {
-        self.targeted_nested
-            .len()
-            .saturating_add(self.targeted.len())
-            .saturating_add(
-                self.memory_shards
-                    .values()
-                    .map(MemoryShardQueue::len)
-                    .sum::<usize>(),
-            )
-            .saturating_add(self.general.len())
+        self.queued
     }
 
     pub(super) fn queued_bytes(&self) -> usize {
-        self.iter()
-            .map(|pending| pending.queued_bytes)
-            .sum::<usize>()
+        self.queued_bytes
     }
 
     pub(super) fn lane_depths(&self) -> PendingQueueLaneDepths {
@@ -797,25 +808,32 @@ impl PendingInvokeQueue {
         mut matches: impl FnMut(&PendingInvoke) -> bool,
     ) -> Vec<PendingInvoke> {
         let mut drained = Vec::new();
-        Self::drain_lane_matching(
+        let (removed, removed_bytes) = Self::drain_lane_matching(
             PendingQueueLane::TargetedNested,
             None,
             &mut self.targeted_nested,
             &mut matches,
             &mut drained,
         );
-        Self::drain_lane_matching(
+        self.queued = self.queued.saturating_sub(removed);
+        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
+        let (removed, removed_bytes) = Self::drain_lane_matching(
             PendingQueueLane::Targeted,
             None,
             &mut self.targeted,
             &mut matches,
             &mut drained,
         );
+        self.queued = self.queued.saturating_sub(removed);
+        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
         let memory_shard_indices = self.memory_shards.keys().copied().collect::<Vec<_>>();
         for shard_index in memory_shard_indices {
             let remove_shard = if let Some(memory_shard) = self.memory_shards.get_mut(&shard_index)
             {
-                memory_shard.drain_matching(shard_index, &mut matches, &mut drained);
+                let (removed, removed_bytes) =
+                    memory_shard.drain_matching(shard_index, &mut matches, &mut drained);
+                self.queued = self.queued.saturating_sub(removed);
+                self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
                 memory_shard.is_empty()
             } else {
                 false
@@ -824,13 +842,15 @@ impl PendingInvokeQueue {
                 self.memory_shards.remove(&shard_index);
             }
         }
-        Self::drain_lane_matching(
+        let (removed, removed_bytes) = Self::drain_lane_matching(
             PendingQueueLane::General,
             None,
             &mut self.general,
             &mut matches,
             &mut drained,
         );
+        self.queued = self.queued.saturating_sub(removed);
+        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
         drained.sort_by_key(|(key, _)| key.sequence);
         drained
             .into_iter()
@@ -1002,7 +1022,8 @@ impl PendingInvokeQueue {
         key: PendingQueueKey,
         pending: PendingInvoke,
     ) -> Option<PendingInvoke> {
-        match key.lane {
+        let queued_bytes = pending.queued_bytes;
+        let replaced = match key.lane {
             PendingQueueLane::TargetedNested => self.targeted_nested.insert(key.sequence, pending),
             PendingQueueLane::Targeted => self.targeted.insert(key.sequence, pending),
             PendingQueueLane::Memory => self
@@ -1015,11 +1036,18 @@ impl PendingInvokeQueue {
                     pending,
                 ),
             PendingQueueLane::General => self.general.insert(key.sequence, pending),
+        };
+        if let Some(replaced) = replaced.as_ref() {
+            self.queued_bytes = self.queued_bytes.saturating_sub(replaced.queued_bytes);
+        } else {
+            self.queued = self.queued.saturating_add(1);
         }
+        self.queued_bytes = self.queued_bytes.saturating_add(queued_bytes);
+        replaced
     }
 
     fn remove_pending_from_lane(&mut self, key: PendingQueueKey) -> Option<PendingInvoke> {
-        match key.lane {
+        let pending = match key.lane {
             PendingQueueLane::TargetedNested => self.targeted_nested.remove(&key.sequence),
             PendingQueueLane::Targeted => self.targeted.remove(&key.sequence),
             PendingQueueLane::Memory => {
@@ -1038,7 +1066,12 @@ impl PendingInvokeQueue {
                 pending
             }
             PendingQueueLane::General => self.general.remove(&key.sequence),
+        };
+        if let Some(pending) = pending.as_ref() {
+            self.queued = self.queued.saturating_sub(1);
+            self.queued_bytes = self.queued_bytes.saturating_sub(pending.queued_bytes);
         }
+        pending
     }
 
     fn index_pending(&mut self, key: PendingQueueKey, pending: &PendingInvoke) {
@@ -1167,13 +1200,34 @@ impl PendingInvokeQueue {
         }
 
         let cursor = self.memory_next_shard_cursor.unwrap_or(0);
-        let shard_indices = self
-            .memory_shards
-            .range(cursor..)
-            .chain(self.memory_shards.range(..cursor))
-            .map(|(shard_index, _)| *shard_index)
-            .collect::<Vec<_>>();
-        for shard_index in shard_indices {
+        let active_shards = self.memory_shards.len();
+        let mut wrapped = false;
+        let mut last_seen = None;
+        for _ in 0..active_shards {
+            let shard_index = if let Some(last_seen) = last_seen {
+                self.memory_shards
+                    .range((Excluded(last_seen), Unbounded))
+                    .next()
+                    .map(|(shard_index, _)| *shard_index)
+                    .or_else(|| {
+                        if wrapped {
+                            None
+                        } else {
+                            wrapped = true;
+                            self.memory_shards.keys().next().copied()
+                        }
+                    })?
+            } else {
+                self.memory_shards
+                    .range(cursor..)
+                    .next()
+                    .map(|(shard_index, _)| *shard_index)
+                    .or_else(|| {
+                        wrapped = true;
+                        self.memory_shards.keys().next().copied()
+                    })?
+            };
+            last_seen = Some(shard_index);
             let Some(memory_shard) = self.memory_shards.get_mut(&shard_index) else {
                 continue;
             };
@@ -1210,13 +1264,17 @@ impl PendingInvokeQueue {
         lane: &mut BTreeMap<u64, PendingInvoke>,
         matches: &mut impl FnMut(&PendingInvoke) -> bool,
         drained: &mut Vec<(PendingQueueKey, PendingInvoke)>,
-    ) {
+    ) -> (usize, usize) {
         let sequences = lane
             .iter()
             .filter_map(|(sequence, pending)| matches(pending).then_some(*sequence))
             .collect::<Vec<_>>();
+        let mut removed = 0usize;
+        let mut removed_bytes = 0usize;
         for sequence in sequences {
             if let Some(pending) = lane.remove(&sequence) {
+                removed = removed.saturating_add(1);
+                removed_bytes = removed_bytes.saturating_add(pending.queued_bytes);
                 drained.push((
                     PendingQueueKey {
                         lane: lane_key,
@@ -1228,6 +1286,7 @@ impl PendingInvokeQueue {
                 ));
             }
         }
+        (removed, removed_bytes)
     }
 }
 
@@ -1712,6 +1771,31 @@ mod tests {
         route
     }
 
+    fn assert_queue_accounting(queue: &PendingInvokeQueue) {
+        let actual_count = queue.iter().count();
+        let actual_bytes = queue
+            .iter()
+            .map(|pending| pending.queued_bytes)
+            .sum::<usize>();
+        assert_eq!(queue.len(), actual_count);
+        assert_eq!(queue.queued_bytes(), actual_bytes);
+        assert_eq!(
+            queue.is_empty(),
+            actual_count == 0,
+            "is_empty should follow actual queued count"
+        );
+        for shard in queue.memory_shards.values() {
+            let shard_count = shard.iter().count();
+            let shard_bytes = shard
+                .iter()
+                .map(|pending| pending.queued_bytes)
+                .sum::<usize>();
+            assert_eq!(shard.len(), shard_count);
+            assert_eq!(shard.queued_bytes, shard_bytes);
+            assert_eq!(shard.is_empty(), shard_count == 0);
+        }
+    }
+
     #[test]
     fn pending_invoke_queue_lanes_preserve_global_fifo_pop_order() {
         let mut queue = PendingInvokeQueue::new();
@@ -1743,19 +1827,23 @@ mod tests {
             1
         );
         assert_eq!(queue.targeted_nested.len(), 1);
+        assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
             Some("general".to_string())
         );
+        assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
             Some("memory".to_string())
         );
+        assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
             Some("targeted-nested".to_string())
         );
         assert!(queue.is_empty());
+        assert_queue_accounting(&queue);
     }
 
     #[test]
@@ -1779,11 +1867,13 @@ mod tests {
             queue.remove(key).map(|pending| pending.runtime_request_id),
             Some("ready-general".to_string())
         );
+        assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
             Some("blocked-memory".to_string())
         );
         assert!(queue.is_empty());
+        assert_queue_accounting(&queue);
     }
 
     #[test]
@@ -1804,6 +1894,7 @@ mod tests {
         queue.push_back(pending_invoke("general", None, None, None));
 
         assert_eq!(queue.memory_shards.len(), 2);
+        assert_queue_accounting(&queue);
         assert_eq!(
             queue
                 .memory_shards
@@ -1833,6 +1924,7 @@ mod tests {
         );
         assert!(!queue.memory_shards.contains_key(&3));
         assert!(queue.memory_shards.contains_key(&7));
+        assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
             Some("memory-shard-7".to_string())
@@ -1843,6 +1935,7 @@ mod tests {
         );
         assert!(queue.memory_shards.is_empty());
         assert!(queue.is_empty());
+        assert_queue_accounting(&queue);
     }
 
     #[test]
@@ -2188,6 +2281,7 @@ mod tests {
         let drained = queue.drain_matching(|pending| pending.memory_route.is_some());
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].runtime_request_id, "memory");
+        assert_queue_accounting(&queue);
         assert_eq!(queue.indexed_target_count(7), 0);
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 0);
         assert!(queue.is_empty());
@@ -2262,6 +2356,7 @@ mod tests {
             .map(|pending| pending.runtime_request_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(drained_ids, vec!["targeted-a", "targeted-memory"]);
+        assert_queue_accounting(&queue);
         assert_eq!(queue.indexed_target_count(7), 0);
         assert_eq!(queue.indexed_target_count(8), 1);
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 0);
@@ -2278,6 +2373,7 @@ mod tests {
             Some("targeted-b".to_string())
         );
         assert!(queue.is_empty());
+        assert_queue_accounting(&queue);
     }
 
     #[test]
@@ -2314,6 +2410,7 @@ mod tests {
             .map(|pending| pending.runtime_request_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(drained_ids, vec!["old-targeted", "old-general"]);
+        assert_queue_accounting(&queue);
         assert_eq!(queue.indexed_target_count(7), 0);
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 1);
         assert_eq!(queue.indexed_enqueued_count(), 1);
@@ -2329,6 +2426,7 @@ mod tests {
         );
         assert!(queue.is_empty());
         assert_eq!(queue.indexed_enqueued_count(), 0);
+        assert_queue_accounting(&queue);
     }
 
     #[test]

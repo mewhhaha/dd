@@ -1,5 +1,4 @@
 import { Link, redirect, type ActionFunctionArgs, type LoaderFunctionArgs } from "react-router";
-import { addToCart, checkoutCart, clearCart } from "../cart-actions";
 import { ddRequestContext } from "../dd-context";
 
 export function meta() {
@@ -127,7 +126,8 @@ export async function ServerComponent({ loaderData }: { loaderData: LoaderData }
                     <p className="text-base/7 font-medium tabular-nums text-neutral-950 sm:text-sm/6">
                       {product.price}
                     </p>
-                    <form action={addToCart}>
+                    <form method="post">
+                      <input name="intent" type="hidden" value="add-to-cart" />
                       <input name="slug" type="hidden" value={product.slug} />
                       <input name="quantity" type="hidden" value="1" />
                       <button
@@ -193,7 +193,8 @@ export async function ServerComponent({ loaderData }: { loaderData: LoaderData }
             )}
           </div>
 
-          <form action={checkoutCart} className="grid gap-3">
+          <form method="post" className="grid gap-3">
+            <input name="intent" type="hidden" value="checkout" />
             <input
               aria-label="Email"
               className="rounded-md bg-white px-3 py-2.5 text-base/7 text-neutral-950 ring-1 ring-neutral-950/10 placeholder:text-neutral-400 focus:outline-2 focus:-outline-offset-1 focus:outline-emerald-600 sm:py-2 sm:text-sm/6"
@@ -209,7 +210,8 @@ export async function ServerComponent({ loaderData }: { loaderData: LoaderData }
               Checkout
             </button>
           </form>
-          <form action={clearCart}>
+          <form method="post">
+            <input name="intent" type="hidden" value="clear-cart" />
             <button
               className="rounded-md px-3 py-2 text-sm/6 font-medium text-neutral-700 ring-1 ring-neutral-950/10 hover:bg-neutral-950/5 disabled:cursor-not-allowed disabled:text-neutral-400"
               disabled={loaderData.cart.lines.length === 0}
