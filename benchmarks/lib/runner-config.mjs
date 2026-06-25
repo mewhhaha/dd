@@ -21,6 +21,8 @@ const knownModes = new Set([
   "atomic-readwrite-memory-wide",
   "atomic-write-memory-wide",
   "storage-write-memory-wide",
+  "realworld-rate-limiter",
+  "realworld-multiworker-auth",
   "fast-fetch-instant-text",
   "dynamic-namespace",
   "sync-memory",

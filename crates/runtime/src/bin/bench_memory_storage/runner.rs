@@ -4,6 +4,7 @@ pub(crate) struct BenchRun<'a> {
     pub(crate) service: &'a RuntimeService,
     pub(crate) label: &'a str,
     pub(crate) source: &'a str,
+    pub(crate) bindings: Vec<DeployBinding>,
     pub(crate) seed: bool,
     pub(crate) path: &'static str,
     pub(crate) key_space: usize,
@@ -23,6 +24,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
         service,
         label,
         source,
+        bindings,
         seed,
         path,
         key_space,
@@ -58,9 +60,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
             source.to_string(),
             DeployConfig {
                 public: false,
-                bindings: vec![DeployBinding::Memory {
-                    binding: "BENCH_MEMORY".to_string(),
-                }],
+                bindings,
                 ..DeployConfig::default()
             },
         )
@@ -177,6 +177,8 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
                 .distinct_for_requests(requests)
                 .len()
                 .to_string()
+        } else if verify_path == "/sum-requests" {
+            requests.to_string()
         } else if verify_path == "/read" || verify_path == "/get-strong" {
             "1".to_string()
         } else {
@@ -559,7 +561,10 @@ async fn verify_expected_value(
 ) -> Result<String, String> {
     let deadline = TokioInstant::now() + Duration::from_secs(2);
     loop {
-        let observed = if verify_path == "/sum" || verify_path == "/sum-read" {
+        let observed = if verify_path == "/sum"
+            || verify_path == "/sum-read"
+            || verify_path == "/sum-requests"
+        {
             verify_distinct_memory_sum(
                 service,
                 worker_name,

@@ -299,6 +299,26 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
+        mode: "realworld-rate-limiter",
+        label: "realworld-rate-limiter-memory",
+        source: REALWORLD_RATE_LIMITER_WORKER_SOURCE,
+        seed: true,
+        path: "/check",
+        key_space: KeySpaceConfig::Wide,
+        verify_path: Some("/sum-requests"),
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "realworld-multiworker-auth",
+        label: "realworld-multiworker-auth",
+        source: REALWORLD_AUTH_FRONTEND_WORKER_SOURCE,
+        seed: true,
+        path: "/dashboard",
+        key_space: KeySpaceConfig::Wide,
+        verify_path: Some("/sum-requests"),
+        profile: ProfileConfig::Never,
+    },
+    BenchCase {
         mode: "atomic-read-memory",
         label: "memory-atomic-read-memory",
         source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
@@ -457,10 +477,27 @@ async fn main() -> Result<(), String> {
         let Some(service) = service.as_ref() else {
             continue;
         };
+        let bindings = if bench_case.mode == "realworld-multiworker-auth" {
+            let auth_worker_name = deploy_realworld_auth_worker(
+                service,
+                bench_case.label,
+                REALWORLD_AUTH_WORKER_SOURCE,
+            )
+            .await?;
+            vec![DeployBinding::Service {
+                binding: "AUTH".to_string(),
+                service: auth_worker_name,
+            }]
+        } else {
+            vec![DeployBinding::Memory {
+                binding: "BENCH_MEMORY".to_string(),
+            }]
+        };
         run_and_print(BenchRun {
             service,
             label: bench_case.label,
             source: bench_case.source,
+            bindings,
             seed: bench_case.seed,
             path: bench_case.path,
             key_space: bench_case.key_space.resolve(&options),
@@ -476,6 +513,34 @@ async fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+async fn deploy_realworld_auth_worker(
+    service: &RuntimeService,
+    label: &str,
+    source: &str,
+) -> Result<String, String> {
+    let worker_name = format!("{label}-auth-{}", Uuid::new_v4());
+    service
+        .deploy_with_config(
+            worker_name.clone(),
+            source.to_string(),
+            DeployConfig {
+                public: false,
+                bindings: vec![
+                    DeployBinding::Kv {
+                        binding: "AUTH_DB".to_string(),
+                    },
+                    DeployBinding::Memory {
+                        binding: "AUTH_STATE".to_string(),
+                    },
+                ],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(worker_name)
 }
 
 fn env_mode_checked() -> Result<Option<String>, String> {

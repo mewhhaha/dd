@@ -96,6 +96,35 @@ The hot-shard tail is the main remaining risk for skewed production workloads. U
 - Core curve: isolates=1 2 4 8 16 32, shards=16
 <!-- END GENERATED: scaling-summary -->
 
+## Real-world workload snapshot
+
+These rows exercise app-shaped flows on `RuntimeService` directly, still without
+public API or network listener overhead. Both workloads used 16 isolates,
+16 memory shards, 128 client tasks, 16 max inflight requests per isolate, and
+cross-shard memory keys.
+
+| Workload | Requests | Key space | Throughput | Mean | P95 | P99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rate limiter | 4,096 | 1,024 | 8,891 req/s | 13.49 ms | 74.37 ms | 99.22 ms |
+| Multi-worker auth | 2,048 | 512 | 7,521 req/s | 16.76 ms | 50.86 ms | 79.27 ms |
+
+The rate limiter checks a per-client window and atomically writes count/reset
+metadata. The auth workload deploys a frontend worker that calls a private auth
+worker through an `AUTH` service binding; the auth worker reads users from KV
+and updates session state in memory. Both workloads verify that per-key counters
+sum to the total completed request count.
+
+Provenance:
+
+- Input: local-realworld.json
+- Started at: 2026-06-25T06:21:17.324Z
+- Git commit: d931badbb451305bcb5cc3e26a9f86d75ba91a41 (dirty; benchmark changes were uncommitted)
+- Samples: 3
+- Logical CPUs: 16
+- OS: Linux cachyos-x8664 7.0.9-1-cachyos #1 SMP PREEMPT_DYNAMIC Sun, 17 May 2026 16:56:12 +0000 x86_64 GNU/Linux
+- Rust: rustc 1.96.0-nightly (3645249d7 2026-03-16)
+- Cargo: cargo 1.96.0-nightly (cbb9bb8bd 2026-03-13)
+
 ## Regenerating results
 
 Run the full matrix from a clean worktree:

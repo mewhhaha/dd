@@ -35,6 +35,15 @@ node benchmarks/run.mjs --samples 5 \
   --out benchmarks/results/local-write-check.json
 ```
 
+Run the real-world memory workloads:
+
+```bash
+node benchmarks/run.mjs --samples 3 \
+  --config realworld-rate-limiter.sh \
+  --config realworld-multiworker-auth.sh \
+  --out benchmarks/results/local-realworld.json
+```
+
 The runner records git, toolchain, and OS metadata; the parsed benchmark
 environment; raw stdout and stderr for every sample; exit status or signal;
 parsed result rows; and median summaries.
@@ -142,6 +151,12 @@ worktree before treating medians as release or main-branch evidence.
 - Atomic read/write configs read the current value and write `payload = "1"`.
 - Atomic write/effect configs write `payload = "1"` and emit an
   `audit.bench.write` durable effect.
+- Real-world rate limiter checks a memory-backed per-client window, writes the
+  request count/reset metadata atomically, and verifies the summed counters
+  equal total requests.
+- Real-world multi-worker auth deploys a private auth worker with KV-backed
+  users plus memory-backed session state, then benchmarks a frontend worker
+  calling it through an `AUTH` service binding.
 - `DD_BENCH_MEMORY_NAMESPACE_SHARDS` configures both runtime storage sharding
   and the same-shard/cross-shard key generator.
 - Direct and atomic wide-write workloads verify all distinct written keys.
