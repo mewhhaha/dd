@@ -21,6 +21,7 @@ implementation agent without relying on conversational context.
 | 11 | [Scale runtime scheduling beyond one manager thread](011-scale-runtime-manager-beyond-one-thread.md) | P2 architecture | Removes the next structural ceiling after shard-local scheduling and outbox improvements are measured. |
 | 12 | [Add an explicit memory resharding tool](012-add-memory-shard-resharding-tool.md) | P2 operations | Provides a safe path to intentionally change shard counts after layout validation exists. |
 | 13 | [Capture and analyze full shard-matrix findings](013-capture-full-shard-matrix-findings.md) | P2 performance analysis | Turns the full shard-count sweep into durable guidance instead of only a 16-shard slice. |
+| 14 | [Harden explicit runtime service shutdown](014-harden-runtime-service-shutdown.md) | P2 reliability | Makes tests, benchmarks, and embedded usage less dependent on best-effort process teardown. |
 
 ## Task execution rules
 
