@@ -19,6 +19,7 @@ implementation agent without relying on conversational context.
 | 9 | [Add non-flaky performance regression gates](009-add-performance-regression-gates.md) | P2 quality | Converts the demonstrated sharding invariants into repeatable checks without fragile absolute RPS thresholds. |
 | 10 | [Isolate and fix the benchmark signal-139 instability](010-fix-benchmark-signal-139-instability.md) | P2 reliability | Restores the complete runtime benchmark suite as a usable gate. |
 | 11 | [Scale runtime scheduling beyond one manager thread](011-scale-runtime-manager-beyond-one-thread.md) | P2 architecture | Removes the next structural ceiling after shard-local scheduling and outbox improvements are measured. |
+| 12 | [Add an explicit memory resharding tool](012-add-memory-shard-resharding-tool.md) | P2 operations | Provides a safe path to intentionally change shard counts after layout validation exists. |
 
 ## Task execution rules
 
