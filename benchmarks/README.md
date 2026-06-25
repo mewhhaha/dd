@@ -157,6 +157,9 @@ worktree before treating medians as release or main-branch evidence.
 - Real-world multi-worker auth deploys a private auth worker with KV-backed
   users plus memory-backed session state, then benchmarks a frontend worker
   calling it through an `AUTH` service binding.
+- `DD_BENCH_MODE=realworld-auth-worker-direct` is a diagnostic auth mode that
+  hits the auth worker directly with KV and memory bindings, bypassing the
+  frontend and service binding layer.
 - `DD_BENCH_MEMORY_NAMESPACE_SHARDS` configures both runtime storage sharding
   and the same-shard/cross-shard key generator.
 - Direct and atomic wide-write workloads verify all distinct written keys.

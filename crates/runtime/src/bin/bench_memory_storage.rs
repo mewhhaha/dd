@@ -316,7 +316,17 @@ const BENCH_CASES: &[BenchCase] = &[
         path: "/dashboard",
         key_space: KeySpaceConfig::Wide,
         verify_path: Some("/sum-requests"),
-        profile: ProfileConfig::Never,
+        profile: ProfileConfig::Enabled,
+    },
+    BenchCase {
+        mode: "realworld-auth-worker-direct",
+        label: "realworld-auth-worker-direct",
+        source: REALWORLD_AUTH_WORKER_SOURCE,
+        seed: true,
+        path: "/api/session",
+        key_space: KeySpaceConfig::Wide,
+        verify_path: Some("/sum-requests"),
+        profile: ProfileConfig::Enabled,
     },
     BenchCase {
         mode: "atomic-read-memory",
@@ -477,6 +487,7 @@ async fn main() -> Result<(), String> {
         let Some(service) = service.as_ref() else {
             continue;
         };
+        let mut profile_stats_worker = None;
         let bindings = if bench_case.mode == "realworld-multiworker-auth" {
             let auth_worker_name = deploy_realworld_auth_worker(
                 service,
@@ -484,10 +495,20 @@ async fn main() -> Result<(), String> {
                 REALWORLD_AUTH_WORKER_SOURCE,
             )
             .await?;
+            profile_stats_worker = Some(auth_worker_name.clone());
             vec![DeployBinding::Service {
                 binding: "AUTH".to_string(),
                 service: auth_worker_name,
             }]
+        } else if bench_case.mode == "realworld-auth-worker-direct" {
+            vec![
+                DeployBinding::Kv {
+                    binding: "AUTH_DB".to_string(),
+                },
+                DeployBinding::Memory {
+                    binding: "AUTH_STATE".to_string(),
+                },
+            ]
         } else {
             vec![DeployBinding::Memory {
                 binding: "BENCH_MEMORY".to_string(),
@@ -498,6 +519,7 @@ async fn main() -> Result<(), String> {
             label: bench_case.label,
             source: bench_case.source,
             bindings,
+            profile_stats_worker,
             seed: bench_case.seed,
             path: bench_case.path,
             key_space: bench_case.key_space.resolve(&options),

@@ -492,6 +492,15 @@ export default {
     const id = env.AUTH_STATE.idFromName(`session:${key}`);
     const memory = env.AUTH_STATE.get(id);
 
+    if (url.pathname === "/__profile") {
+      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+        headers: [["content-type", "application/json"]],
+      });
+    }
+    if (url.pathname === "/__profile_reset") {
+      Deno.core.ops.op_memory_profile_reset?.();
+      return new Response("ok");
+    }
     if (url.pathname === "/seed") {
       await env.AUTH_DB.put(userKey(key), userPayload(key));
       await memory.atomic(seedSession);
@@ -537,6 +546,9 @@ export default {
     const url = new URL(request.url);
     const key = url.searchParams.get("key") ?? "hot";
 
+    if (url.pathname === "/__profile" || url.pathname === "/__profile_reset") {
+      return env.AUTH.fetch(url.pathname);
+    }
     if (url.pathname === "/seed") {
       return env.AUTH.fetch(authPath("/seed", key));
     }

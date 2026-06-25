@@ -5,6 +5,7 @@ pub(crate) struct BenchRun<'a> {
     pub(crate) label: &'a str,
     pub(crate) source: &'a str,
     pub(crate) bindings: Vec<DeployBinding>,
+    pub(crate) profile_stats_worker: Option<String>,
     pub(crate) seed: bool,
     pub(crate) path: &'static str,
     pub(crate) key_space: usize,
@@ -25,6 +26,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
         label,
         source,
         bindings,
+        profile_stats_worker,
         seed,
         path,
         key_space,
@@ -296,7 +298,8 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
         };
         timings.profile += profile_started.elapsed();
         print_profile(&profile);
-        if let Some(stats) = service.stats(worker_name.clone()).await {
+        let stats_worker_name = profile_stats_worker.as_deref().unwrap_or(&worker_name);
+        if let Some(stats) = service.stats(stats_worker_name.to_string()).await {
             print_scheduler_stats(&stats);
         }
     }
