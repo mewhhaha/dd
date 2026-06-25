@@ -25,6 +25,7 @@ implementation agent without relying on conversational context.
 | 15 | [Audit memory shard hash inputs](015-audit-memory-shard-hash-inputs.md) | P2 correctness | Locks down whether shard routing is by entity key alone or by binding/namespace plus entity key before future migrations. |
 | 16 | [Add a first-class configuration surface for memory storage tuning](016-add-config-surface-for-memory-storage-tuning.md) | P2 operations | Makes shard/cache/profile settings explicit and validated for production deployments. |
 | 17 | [Profile direct-write throughput variance and regression](017-profile-direct-write-regression.md) | P2 performance analysis | Determines whether recent direct-write variance is a real regression, benchmark artifact, or expected trade-off. |
+| 18 | [Add a lifecycle policy for implementation tasks](018-add-task-pruning-policy.md) | P3 repository hygiene | Keeps the task directory from becoming stale as implementation PRs land. |
 
 ## Task execution rules
 
