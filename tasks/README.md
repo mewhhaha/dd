@@ -22,6 +22,7 @@ implementation agent without relying on conversational context.
 | 12 | [Add an explicit memory resharding tool](012-add-memory-shard-resharding-tool.md) | P2 operations | Provides a safe path to intentionally change shard counts after layout validation exists. |
 | 13 | [Capture and analyze full shard-matrix findings](013-capture-full-shard-matrix-findings.md) | P2 performance analysis | Turns the full shard-count sweep into durable guidance instead of only a 16-shard slice. |
 | 14 | [Harden explicit runtime service shutdown](014-harden-runtime-service-shutdown.md) | P2 reliability | Makes tests, benchmarks, and embedded usage less dependent on best-effort process teardown. |
+| 15 | [Audit memory shard hash inputs](015-audit-memory-shard-hash-inputs.md) | P2 correctness | Locks down whether shard routing is by entity key alone or by binding/namespace plus entity key before future migrations. |
 
 ## Task execution rules
 
