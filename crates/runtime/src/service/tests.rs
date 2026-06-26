@@ -3265,7 +3265,7 @@ async fn scales_down_when_idle() {
     timeout(Duration::from_secs(3), async {
         loop {
             let stats = service.stats("slow".to_string()).await.expect("stats");
-            if stats.isolates_total == 0 {
+            if stats.isolates_total == 0 && stats.global_isolates_total == 0 {
                 assert_eq!(stats.global_isolates_total, 0);
                 assert_eq!(stats.global_isolate_slots_available, 3);
                 break;
@@ -4560,10 +4560,10 @@ fn isolate_runtime_loop_uses_thread_local_event_queue_without_poll_sleep() {
     assert!(model_source.contains("Starting { started_at: Instant }"));
     assert!(model_source.contains("Ready"));
     assert!(model_source.contains("Retiring"));
-    assert!(model_source.contains("Failed"));
     assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Ready"));
     assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Retiring"));
-    assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Failed"));
+    assert!(runtime_source.contains("RuntimeEvent::IsolateExited"));
+    assert!(lifecycle_source.contains("track_exiting_isolate_slot"));
     assert!(ops_source.contains("pub struct IsolateEventSender(pub Rc<dyn Fn"));
     assert!(!runtime_source.contains("Arc<StdMutex<VecDeque<RuntimeEvent>>>"));
     assert!(!runtime_source.contains("isolate event queue mutex poisoned"));

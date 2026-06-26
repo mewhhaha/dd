@@ -224,6 +224,11 @@ pub(super) enum RuntimeEvent {
         isolate_id: u64,
         error: PlatformError,
     },
+    IsolateExited {
+        worker_name: String,
+        generation: u64,
+        isolate_id: u64,
+    },
     MemoryOutboxDelivery {
         shard_index: usize,
         claims: Vec<MemoryOutboxClaim>,
@@ -303,6 +308,7 @@ impl WorkerManager {
             scale_up_request_members: HashSet::new(),
             global_isolate_slots_used: 0,
             global_isolates_starting: 0,
+            exiting_isolate_slots: HashMap::new(),
             stats: RuntimeManagerStats::default(),
             next_generation: 1,
             next_isolate_id: 1,
@@ -904,6 +910,15 @@ impl WorkerManager {
                 error,
             } => {
                 self.fail_isolate(&worker_name, generation, isolate_id, error);
+                self.dispatch_pool(&worker_name, generation, event_tx);
+                self.cleanup_drained_generations_for(&worker_name);
+            }
+            RuntimeEvent::IsolateExited {
+                worker_name,
+                generation,
+                isolate_id,
+            } => {
+                self.handle_isolate_exited(&worker_name, generation, isolate_id);
                 self.dispatch_pool(&worker_name, generation, event_tx);
                 self.cleanup_drained_generations_for(&worker_name);
             }
@@ -1600,9 +1615,9 @@ impl WorkerManager {
         let mut queued_pending = Vec::new();
         let mut dequeued_count = 0usize;
         let mut dequeued_bytes = 0usize;
-        let mut released_startups = Vec::new();
+        let mut exiting_slots = Vec::new();
         for (worker_name, entry) in &mut self.workers {
-            for pool in entry.pools.values_mut() {
+            for (generation, pool) in &mut entry.pools {
                 while let Some(pending) = pool.queue.pop_front() {
                     dequeued_count = dequeued_count.saturating_add(1);
                     dequeued_bytes = dequeued_bytes.saturating_add(pending.queued_bytes);
@@ -1611,7 +1626,12 @@ impl WorkerManager {
                 pool.clear_isolate_indices();
                 for isolate in pool.isolates.drain(..) {
                     let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
-                    released_startups.push(isolate.startup);
+                    exiting_slots.push((
+                        worker_name.clone(),
+                        *generation,
+                        isolate.id,
+                        isolate.startup,
+                    ));
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending
@@ -1621,8 +1641,8 @@ impl WorkerManager {
                 }
             }
         }
-        for startup in released_startups {
-            self.global_isolate_slot_released(startup);
+        for (worker_name, generation, isolate_id, startup) in exiting_slots {
+            self.track_exiting_isolate_slot(&worker_name, generation, isolate_id, startup);
         }
         self.account_dequeued_many(dequeued_count, dequeued_bytes);
         for (worker_name, pending) in queued_pending {

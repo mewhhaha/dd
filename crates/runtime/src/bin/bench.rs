@@ -281,6 +281,7 @@ async fn main() -> Result<(), String> {
             name: "autoscaling-8",
             runtime: RuntimeConfig {
                 min_isolates: 0,
+                max_global_isolates: 32,
                 max_isolates: 8,
                 max_inflight_per_isolate: 4,
                 idle_ttl: Duration::from_secs(30),
@@ -1280,43 +1281,64 @@ async fn run_dynamic_bench(
     )
     .await?;
     bench_progress("dynamic plain warm");
-    with_timeout(
-        "dynamic-hot-fetch stage=warm",
-        service.invoke(plain_worker_name.clone(), invocation("/hot", 0)),
-    )
-    .await
-    .map(|_| ())?;
-    reset_dynamic_bench_metrics(service, &plain_worker_name).await?;
-    bench_progress("dynamic plain metrics");
-    with_timeout(
-        "dynamic-hot-fetch stage=metrics",
-        run_scenario(
-            service,
-            &plain_worker_name,
-            Scenario {
-                name: "dynamic-hot-fetch-metrics",
-                worker_source: DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
-                requests: metric_probe_requests,
-                concurrency: metric_probe_concurrency,
-                paths: &["/hot_get"],
-            },
-        ),
+    with_dynamic_diagnostics(service, &plain_worker_name, async {
+        with_timeout(
+            "dynamic-hot-fetch stage=warm",
+            service.invoke(plain_worker_name.clone(), invocation("/hot", 0)),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await?;
+    with_dynamic_diagnostics(
+        service,
+        &plain_worker_name,
+        reset_dynamic_bench_metrics(service, &plain_worker_name),
     )
     .await?;
-    let hot_fetch_metrics = fetch_dynamic_bench_metrics(service, &plain_worker_name).await?;
+    bench_progress("dynamic plain metrics");
+    with_dynamic_diagnostics(service, &plain_worker_name, async {
+        with_timeout(
+            "dynamic-hot-fetch stage=metrics",
+            run_scenario(
+                service,
+                &plain_worker_name,
+                Scenario {
+                    name: "dynamic-hot-fetch-metrics",
+                    worker_source: DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
+                    requests: metric_probe_requests,
+                    concurrency: metric_probe_concurrency,
+                    paths: &["/hot_get"],
+                },
+            ),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await?;
+    let hot_fetch_metrics = with_dynamic_diagnostics(
+        service,
+        &plain_worker_name,
+        fetch_dynamic_bench_metrics(service, &plain_worker_name),
+    )
+    .await?;
     bench_progress("dynamic plain timed");
-    let hot_fetch = with_timeout(
-        "dynamic-hot-fetch stage=timed",
-        run_scenario(
-            service,
-            &plain_worker_name,
-            Scenario {
-                name: "dynamic-hot-fetch",
-                worker_source: DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
-                requests,
-                concurrency,
-                paths: &["/hot"],
-            },
+    let hot_fetch = with_dynamic_diagnostics(
+        service,
+        &plain_worker_name,
+        with_timeout(
+            "dynamic-hot-fetch stage=timed",
+            run_scenario(
+                service,
+                &plain_worker_name,
+                Scenario {
+                    name: "dynamic-hot-fetch",
+                    worker_source: DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
+                    requests,
+                    concurrency,
+                    paths: &["/hot"],
+                },
+            ),
         ),
     )
     .await?;
@@ -1388,7 +1410,12 @@ async fn run_dynamic_bench(
 
     bench_progress("dynamic cold rounds");
     let mut cold_samples = Vec::with_capacity(cold_rounds);
-    reset_dynamic_bench_metrics(service, &plain_worker_name).await?;
+    with_dynamic_diagnostics(
+        service,
+        &plain_worker_name,
+        reset_dynamic_bench_metrics(service, &plain_worker_name),
+    )
+    .await?;
     for idx in 0..cold_rounds {
         let started = Instant::now();
         with_timeout(
@@ -1404,8 +1431,12 @@ async fn run_dynamic_bench(
         .await?;
         cold_samples.push(started.elapsed());
     }
-    let cold_create_invoke_metrics =
-        fetch_dynamic_bench_metrics(service, &plain_worker_name).await?;
+    let cold_create_invoke_metrics = with_dynamic_diagnostics(
+        service,
+        &plain_worker_name,
+        fetch_dynamic_bench_metrics(service, &plain_worker_name),
+    )
+    .await?;
 
     bench_progress("dynamic admin checks");
     run_dynamic_admin_checks(service).await?;

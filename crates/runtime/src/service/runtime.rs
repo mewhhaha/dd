@@ -853,6 +853,8 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
     }));
     let thread_name = format!("dd-isolate-{worker_name}-{generation}-{isolate_id}");
     let thread_event_tx = event_tx.clone();
+    let exit_event_tx = event_tx.clone();
+    let exit_worker_name = worker_name.clone();
 
     thread::Builder::new()
         .name(thread_name)
@@ -865,6 +867,11 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                         generation,
                         isolate_id,
                         error: PlatformError::internal(error.to_string()),
+                    });
+                    let _ = exit_event_tx.blocking_send(RuntimeEvent::IsolateExited {
+                        worker_name: exit_worker_name.clone(),
+                        generation,
+                        isolate_id,
                     });
                     return;
                 }
@@ -1048,6 +1055,11 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                         _ = event_loop_notify.notified() => {}
                     }
                 }
+            });
+            let _ = exit_event_tx.blocking_send(RuntimeEvent::IsolateExited {
+                worker_name: exit_worker_name,
+                generation,
+                isolate_id,
             });
         })
         .map_err(|error| PlatformError::internal(error.to_string()))?;

@@ -359,23 +359,76 @@ impl WorkerManager {
         isolate_id: u64,
         error: PlatformError,
     ) {
-        let mut was_starting_before_failure = false;
-        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-            if let Some(isolate) = pool
-                .isolates
-                .iter_mut()
-                .find(|isolate| isolate.id == isolate_id)
-            {
-                was_starting_before_failure = isolate.startup.is_starting();
-                isolate.startup = IsolateStartup::Failed;
-            }
-        }
         let failed = self.remove_isolate_by_id(worker_name, generation, isolate_id);
+        if !failed.removed {
+            return;
+        }
         for (request_id, reply) in failed.replies {
             self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
         }
-        if failed.was_starting || was_starting_before_failure {
+        if failed.was_starting {
+            self.reject_queued_dynamic_invokes_for_generation(
+                worker_name,
+                generation,
+                error.clone(),
+            );
+        }
+        self.fail_all_streams_for_worker(worker_name, error);
+    }
+
+    pub(crate) fn track_exiting_isolate_slot(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+        startup: IsolateStartup,
+    ) {
+        let key = IsolateSlotKey::new(worker_name, generation, isolate_id);
+        if self.exiting_isolate_slots.insert(key, startup).is_some() {
+            warn!(
+                worker = %worker_name,
+                generation,
+                isolate_id,
+                "duplicate exiting isolate slot accounting"
+            );
+        }
+    }
+
+    pub(crate) fn handle_isolate_exited(
+        &mut self,
+        worker_name: &str,
+        generation: u64,
+        isolate_id: u64,
+    ) {
+        let key = IsolateSlotKey::new(worker_name, generation, isolate_id);
+        let removed = if self.exiting_isolate_slots.contains_key(&key) {
+            RemovedIsolate::default()
+        } else {
+            self.remove_isolate_by_id(worker_name, generation, isolate_id)
+        };
+
+        if let Some(startup) = self.exiting_isolate_slots.remove(&key) {
+            self.global_isolate_slot_released(startup);
+        } else if !removed.removed {
+            warn!(
+                worker = %worker_name,
+                generation,
+                isolate_id,
+                "received exit for untracked isolate"
+            );
+        }
+
+        if !removed.removed {
+            return;
+        }
+
+        let error = PlatformError::internal("isolate exited");
+        for (request_id, reply) in removed.replies {
+            self.clear_revalidation_for_request(&request_id);
+            let _ = reply.send(Err(error.clone()));
+        }
+        if removed.was_starting {
             self.reject_queued_dynamic_invokes_for_generation(
                 worker_name,
                 generation,
@@ -778,7 +831,12 @@ impl WorkerManager {
                 }
                 for isolate in pool.isolates {
                     let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
-                    self.global_isolate_slot_released(isolate.startup);
+                    self.track_exiting_isolate_slot(
+                        worker_name,
+                        pool.generation,
+                        isolate.id,
+                        isolate.startup,
+                    );
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending.reply.send(Err(error.clone()));
@@ -817,16 +875,14 @@ impl WorkerManager {
         let mut stale_targeted_count = 0usize;
         let mut stale_targeted_bytes = 0usize;
         let mut removed = false;
-        let mut removed_startup = None;
+        let mut removed_slot = None;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool.isolates.get_mut(isolate_idx) {
                 was_starting = isolate.startup.is_starting();
-                if !matches!(isolate.startup, IsolateStartup::Failed) {
-                    isolate.startup = IsolateStartup::Retiring;
-                }
+                removed_slot = Some((isolate.id, isolate.startup));
+                isolate.startup = IsolateStartup::Retiring;
             }
             if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
-                removed_startup = Some(isolate.startup);
                 let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
                 removed_isolate_id = Some(isolate.id);
                 pool.memory_shard_affinity
@@ -859,8 +915,10 @@ impl WorkerManager {
                 removed = true;
             }
         }
-        if let Some(startup) = removed_startup {
-            self.global_isolate_slot_released(startup);
+        if removed {
+            if let Some((isolate_id, startup)) = removed_slot {
+                self.track_exiting_isolate_slot(worker_name, generation, isolate_id, startup);
+            }
         }
         if let Some(isolate_id) = removed_isolate_id {
             self.reap_owned_sessions(worker_name, Some(generation), Some(isolate_id));
@@ -886,6 +944,7 @@ impl WorkerManager {
         }
         if removed {
             RemovedIsolate {
+                removed: true,
                 replies,
                 was_starting,
             }
@@ -958,7 +1017,7 @@ impl WorkerManager {
         let min_isolates = self.config.min_isolates;
         let idle_ttl = self.config.idle_ttl;
         let mut removed = Vec::new();
-        let mut removed_startups = Vec::new();
+        let mut removed_slots = Vec::new();
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             loop {
                 if pool.isolates.len() <= min_isolates {
@@ -981,7 +1040,7 @@ impl WorkerManager {
                 let isolate = pool
                     .swap_remove_isolate(idx)
                     .expect("selected isolate index must be present");
-                removed_startups.push(isolate.startup);
+                removed_slots.push((isolate.id, isolate.startup));
                 pool.stats.scale_down_count += 1;
                 removed.push(isolate);
             }
@@ -990,8 +1049,8 @@ impl WorkerManager {
                 pool.log_stats("scale_down");
             }
         }
-        for startup in removed_startups {
-            self.global_isolate_slot_released(startup);
+        for (isolate_id, startup) in removed_slots {
+            self.track_exiting_isolate_slot(worker_name, generation, isolate_id, startup);
         }
 
         for isolate in removed {
@@ -1012,7 +1071,7 @@ impl WorkerManager {
         }
         let mut clear_request_ids = Vec::new();
         let mut retired_generations = HashSet::new();
-        let mut released_startups = Vec::new();
+        let mut exiting_slots = Vec::new();
         let live_websocket_generations: HashSet<u64> = self
             .websocket_sessions
             .values()
@@ -1054,7 +1113,7 @@ impl WorkerManager {
                 retired_generations.insert(generation);
                 for isolate in pool.isolates {
                     let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
-                    released_startups.push(isolate.startup);
+                    exiting_slots.push((generation, isolate.id, isolate.startup));
                     for (request_id, pending) in isolate.pending_replies {
                         clear_request_ids.push(request_id);
                         let _ = pending
@@ -1068,8 +1127,8 @@ impl WorkerManager {
         for request_id in clear_request_ids {
             self.clear_revalidation_for_request(&request_id);
         }
-        for startup in released_startups {
-            self.global_isolate_slot_released(startup);
+        for (generation, isolate_id, startup) in exiting_slots {
+            self.track_exiting_isolate_slot(worker_name, generation, isolate_id, startup);
         }
         if retired_generations.is_empty() {
             return;

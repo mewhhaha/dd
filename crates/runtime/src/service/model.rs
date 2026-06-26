@@ -47,6 +47,7 @@ pub(super) struct WorkerManager {
     pub(super) scale_up_request_members: HashSet<(String, u64)>,
     pub(super) global_isolate_slots_used: usize,
     pub(super) global_isolates_starting: usize,
+    pub(super) exiting_isolate_slots: HashMap<IsolateSlotKey, IsolateStartup>,
     pub(super) stats: RuntimeManagerStats,
     pub(super) next_generation: u64,
     pub(super) next_isolate_id: u64,
@@ -1451,8 +1452,26 @@ pub(super) struct PendingReply {
 
 #[derive(Default)]
 pub(super) struct RemovedIsolate {
+    pub(super) removed: bool,
     pub(super) replies: Vec<(String, oneshot::Sender<Result<WorkerOutput>>)>,
     pub(super) was_starting: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct IsolateSlotKey {
+    pub(super) worker_name: String,
+    pub(super) generation: u64,
+    pub(super) isolate_id: u64,
+}
+
+impl IsolateSlotKey {
+    pub(super) fn new(worker_name: &str, generation: u64, isolate_id: u64) -> Self {
+        Self {
+            worker_name: worker_name.to_string(),
+            generation,
+            isolate_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1680,7 +1699,6 @@ pub(super) enum IsolateStartup {
     Starting { started_at: Instant },
     Ready,
     Retiring,
-    Failed,
 }
 
 impl IsolateStartup {
@@ -1695,7 +1713,7 @@ impl IsolateStartup {
     pub(super) fn timed_out(&self, now: Instant, timeout: Duration) -> bool {
         match self {
             Self::Starting { started_at } => now.duration_since(*started_at) >= timeout,
-            Self::Ready | Self::Retiring | Self::Failed => false,
+            Self::Ready | Self::Retiring => false,
         }
     }
 }

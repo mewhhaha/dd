@@ -1110,14 +1110,6 @@ impl WorkerManager {
         generation: u64,
         event_tx: RuntimeEventSender,
     ) -> Result<()> {
-        if !self.try_reserve_global_isolate_slot() {
-            self.stats.scale_up_budget_denied_count =
-                self.stats.scale_up_budget_denied_count.saturating_add(1);
-            return Err(PlatformError::overloaded(format!(
-                "runtime isolate budget is exhausted (max {} global isolates)",
-                self.config.max_global_isolates
-            )));
-        }
         let (snapshot, snapshot_preloaded, source, deployment_config) = self
             .workers
             .get(worker_name)
@@ -1131,6 +1123,14 @@ impl WorkerManager {
                 )
             })
             .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
+        if !self.try_reserve_global_isolate_slot() {
+            self.stats.scale_up_budget_denied_count =
+                self.stats.scale_up_budget_denied_count.saturating_add(1);
+            return Err(PlatformError::overloaded(format!(
+                "runtime isolate budget is exhausted (max {} global isolates)",
+                self.config.max_global_isolates
+            )));
+        }
         let allow_code_generation = self.config.debug_code_generation;
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
@@ -1173,8 +1173,8 @@ impl WorkerManager {
             pool.log_stats("spawn");
             Ok(())
         } else {
-            self.release_global_isolate_slot_for_startup_failure();
             let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+            self.track_exiting_isolate_slot(worker_name, generation, isolate.id, isolate.startup);
             Err(PlatformError::internal("worker pool missing"))
         }
     }
