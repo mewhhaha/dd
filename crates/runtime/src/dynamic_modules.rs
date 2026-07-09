@@ -433,9 +433,11 @@ mod tests {
         )
         .expect_err("graph path should not escape root");
 
-        assert!(error
-            .to_string()
-            .contains("dynamic module path must not escape graph root"));
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic module path must not escape graph root")
+        );
 
         assert_eq!(
             resolve_dynamic_module_path("worker.js", "../outside.js").unwrap_err(),
@@ -503,9 +505,11 @@ mod tests {
         )
         .expect_err("missing entrypoint should fail");
 
-        assert!(error
-            .to_string()
-            .contains("dynamic module graph missing entrypoint module: missing.js"));
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic module graph missing entrypoint module: missing.js")
+        );
     }
 
     #[test]
@@ -522,9 +526,11 @@ mod tests {
         )
         .expect_err("duplicate normalized path should fail");
 
-        assert!(error
-            .to_string()
-            .contains("dynamic module graph contains duplicate normalized path: worker.js"));
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic module graph contains duplicate normalized path: worker.js")
+        );
     }
 
     #[test]

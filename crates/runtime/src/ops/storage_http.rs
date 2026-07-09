@@ -523,7 +523,7 @@ pub(crate) async fn op_cache_match(
         .take(headers_handle)
         .unwrap_or_default();
     let request = CacheRequest {
-        cache_name,
+        cache_name: scoped_cache_name(&state, &cache_name),
         method,
         url,
         headers,
@@ -547,9 +547,16 @@ pub(crate) async fn op_cache_match(
         Ok(CacheLookup::StaleWhileRevalidate(response)) => {
             cache_match_hit_result(&state, response, true, true)
         }
-        Ok(CacheLookup::StaleIfError(response)) => {
-            cache_match_hit_result(&state, response, true, false)
-        }
+        Ok(CacheLookup::StaleIfError(_)) => CacheMatchResult {
+            ok: true,
+            found: false,
+            stale: false,
+            should_revalidate: false,
+            status: 0,
+            headers_handle: 0,
+            body_handle: 0,
+            error: String::new(),
+        },
         Ok(CacheLookup::Miss) => CacheMatchResult {
             ok: true,
             found: false,
@@ -638,7 +645,7 @@ pub(crate) async fn op_cache_put(
         (request_headers, response_headers, body)
     };
     let request = CacheRequest {
-        cache_name,
+        cache_name: scoped_cache_name(&state, &cache_name),
         method,
         url,
         headers: request_headers,
@@ -680,7 +687,7 @@ pub(crate) async fn op_cache_delete(
         .take(headers_handle)
         .unwrap_or_default();
     let request = CacheRequest {
-        cache_name,
+        cache_name: scoped_cache_name(&state, &cache_name),
         method,
         url,
         headers,
@@ -728,6 +735,12 @@ fn ensure_cache_allowed(
         return Ok(());
     }
     Err("dynamic child policy blocks cache access".to_string())
+}
+
+fn scoped_cache_name(state: &Rc<RefCell<OpState>>, cache_name: &str) -> String {
+    let state = state.borrow();
+    let worker = &state.borrow::<WorkerCacheNamespace>().0;
+    format!("worker:{worker}:{}", cache_name.trim())
 }
 
 type PreparedHttpFetchRequest = (
@@ -1240,15 +1253,47 @@ pub(crate) fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[EgressAll
     if host.is_empty() {
         return false;
     }
+    let literal_address = host.parse::<std::net::IpAddr>().ok();
     let Some(request_port) = url.port_or_known_default() else {
         return false;
     };
     let Some(default_port) = default_port_for_scheme(url.scheme()) else {
         return false;
     };
-    allow_hosts
-        .iter()
-        .any(|allowed| allowed.matches(&host, request_port, default_port))
+    allow_hosts.iter().any(|allowed| {
+        allowed.matches(&host, request_port, default_port)
+            && literal_address
+                .is_none_or(|address| is_public_egress_address(address) || allowed.allow_private)
+    })
+}
+
+fn is_public_egress_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || octets[0] == 0
+                || octets[0] >= 224
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0))
+        }
+        std::net::IpAddr::V6(address) => {
+            let segments = address.segments();
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+        }
+    }
 }
 
 pub(crate) fn default_port_for_scheme(scheme: &str) -> Option<u16> {

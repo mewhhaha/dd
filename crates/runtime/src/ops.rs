@@ -7,8 +7,8 @@ use crate::memory::{
     MemoryProfileMetricKind, MemorySnapshotEntry, MemoryStore,
 };
 use crate::memory_rpc::{
-    decode_memory_invoke_response, encode_memory_invoke_request, MemoryInvokeCall,
-    MemoryInvokeRequest, MemoryInvokeResponse,
+    MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse, decode_memory_invoke_response,
+    encode_memory_invoke_request,
 };
 use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
 use bytes::Bytes;
@@ -19,12 +19,12 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_traits::impls::RealSys;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 #[path = "ops/dynamic.rs"]
 mod dynamic_ops;
@@ -216,16 +216,15 @@ pub(crate) struct RuntimeExecutionLimits {
     pub(crate) max_isolate_heap_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WorkerCacheNamespace(pub(crate) String);
+
 fn emit_isolate_event(
     state: &OpState,
     payload: IsolateEventPayload,
 ) -> std::result::Result<(), ()> {
     let sender = state.borrow::<IsolateEventSender>();
-    if (sender.0)(payload) {
-        Ok(())
-    } else {
-        Err(())
-    }
+    if (sender.0)(payload) { Ok(()) } else { Err(()) }
 }
 
 fn emit_isolate_event_from_rc(
@@ -511,8 +510,8 @@ fn wall_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_egress_url_allowed, parse_egress_allow_host, DynamicControlInbox, DynamicControlItem,
-        DynamicPendingReplyResult, DynamicPushedReplyPayload, EgressAllowHost,
+        DynamicControlInbox, DynamicControlItem, DynamicPendingReplyResult,
+        DynamicPushedReplyPayload, EgressAllowHost, is_egress_url_allowed, parse_egress_allow_host,
     };
 
     #[test]
@@ -523,6 +522,7 @@ mod tests {
                 host: "api.example.com".to_string(),
                 wildcard: false,
                 port: None,
+                allow_private: false,
             })
         );
         assert_eq!(
@@ -531,6 +531,7 @@ mod tests {
                 host: "api.example.com".to_string(),
                 wildcard: false,
                 port: Some(8443),
+                allow_private: false,
             })
         );
         assert_eq!(
@@ -539,6 +540,7 @@ mod tests {
                 host: "example.com".to_string(),
                 wildcard: true,
                 port: Some(8443),
+                allow_private: false,
             })
         );
     }
@@ -566,6 +568,33 @@ mod tests {
         assert!(is_egress_url_allowed(&exact, &allowed));
         assert!(is_egress_url_allowed(&wildcard_ok, &allowed));
         assert!(!is_egress_url_allowed(&wildcard_bad, &allowed));
+    }
+
+    #[test]
+    fn egress_url_rules_reject_non_public_literal_addresses() {
+        let allow = [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "::1",
+            "fd00::1",
+            "1.1.1.1",
+        ]
+        .into_iter()
+        .map(|host| parse_egress_allow_host(host).expect("allow rule"))
+        .collect::<Vec<_>>();
+        for url in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/",
+            "http://[::1]/",
+            "http://[fd00::1]/",
+        ] {
+            let url = reqwest::Url::parse(url).expect("url");
+            assert!(!is_egress_url_allowed(&url, &allow), "allowed {url}");
+        }
+        let public = reqwest::Url::parse("https://1.1.1.1/").expect("url");
+        assert!(is_egress_url_allowed(&public, &allow));
     }
 
     #[test]

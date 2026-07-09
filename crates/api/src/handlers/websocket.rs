@@ -46,6 +46,8 @@ where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    const MAX_WEBSOCKET_SESSIONS: usize = 4_096;
+    const MAX_WEBSOCKET_SESSIONS_PER_WORKER: usize = 512;
     let Some(ws_upgrade) = ws_upgrade else {
         return Err(PlatformError::bad_request("missing websocket upgrade").into());
     };
@@ -59,6 +61,37 @@ where
         return Err(PlatformError::bad_request("websocket upgrade rejected by worker").into());
     }
 
+    {
+        let mut sessions = state.websocket_sessions.lock().await;
+        let worker_sessions = sessions
+            .values()
+            .filter(|session| session.worker_name == runtime_worker_name)
+            .count();
+        if sessions.len() >= MAX_WEBSOCKET_SESSIONS
+            || worker_sessions >= MAX_WEBSOCKET_SESSIONS_PER_WORKER
+        {
+            drop(sessions);
+            let _ = state
+                .runtime
+                .websocket_close(
+                    runtime_worker_name.clone(),
+                    session_id.clone(),
+                    1013,
+                    "websocket capacity exceeded".to_string(),
+                )
+                .await;
+            return Err(PlatformError::overloaded("websocket capacity exceeded").into());
+        }
+        sessions.insert(
+            session_id.clone(),
+            crate::state::WebSocketSession {
+                id: session_id.clone(),
+                worker_name: runtime_worker_name.clone(),
+                started_at: std::time::Instant::now(),
+            },
+        );
+    }
+
     let filtered_headers = sanitize_websocket_handshake_headers(output.headers);
     let runtime = state.runtime.clone();
     let state_for_session = state.clone();
@@ -69,18 +102,6 @@ where
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                {
-                    let mut sessions = state_for_session.websocket_sessions.lock().await;
-                    sessions.insert(
-                        handshake_session_id.clone(),
-                        crate::state::WebSocketSession {
-                            id: handshake_session_id.clone(),
-                            worker_name: runtime_worker_name_for_frames.clone(),
-                            started_at: std::time::Instant::now(),
-                        },
-                    );
-                }
-
                 let socket =
                     WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
                         .await;
@@ -95,6 +116,19 @@ where
                 .await;
             }
             Err(error) => {
+                state_for_session
+                    .websocket_sessions
+                    .lock()
+                    .await
+                    .remove(&handshake_session_id);
+                let _ = runtime
+                    .websocket_close(
+                        runtime_worker_name_for_frames.clone(),
+                        handshake_session_id.clone(),
+                        1006,
+                        "upgrade failed".to_string(),
+                    )
+                    .await;
                 tracing::warn!(
                     session_id = %handshake_session_id,
                     error = %error,
@@ -238,6 +272,23 @@ pub(crate) async fn handle_websocket_session<S>(
                 match message {
                     Ok(message) => match message {
                         Message::Text(text) => {
+                            if text.len() > 1024 * 1024 {
+                                let _ = sender
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: 1009.into(),
+                                        reason: "message too large".into(),
+                                    })))
+                                    .await;
+                                let _ = runtime
+                                    .websocket_close(
+                                        worker_name.clone(),
+                                        session_id.clone(),
+                                        1009,
+                                        "message too large".to_string(),
+                                    )
+                                    .await;
+                                break;
+                            }
                             if forward_websocket_frame(
                                 &mut sender,
                                 &runtime,
@@ -253,6 +304,23 @@ pub(crate) async fn handle_websocket_session<S>(
                             }
                         }
                         Message::Binary(payload) => {
+                            if payload.len() > 1024 * 1024 {
+                                let _ = sender
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: 1009.into(),
+                                        reason: "message too large".into(),
+                                    })))
+                                    .await;
+                                let _ = runtime
+                                    .websocket_close(
+                                        worker_name.clone(),
+                                        session_id.clone(),
+                                        1009,
+                                        "message too large".to_string(),
+                                    )
+                                    .await;
+                                break;
+                            }
                             if forward_websocket_frame(
                                 &mut sender,
                                 &runtime,

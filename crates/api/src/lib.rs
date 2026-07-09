@@ -7,11 +7,12 @@ mod handlers_runtime_tests;
 mod public_quic;
 mod state;
 
-use common::{PlatformError, Result, DEFAULT_PRIVATE_BIND_ADDR, DEFAULT_PUBLIC_BIND_ADDR};
+use common::{DEFAULT_PRIVATE_BIND_ADDR, DEFAULT_PUBLIC_BIND_ADDR, PlatformError, Result};
 use deploy_tokens::DeployTokenStore;
 use runtime::{RuntimeService, RuntimeServiceConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::warn;
 
 pub use app::serve;
@@ -29,6 +30,30 @@ pub struct ServerConfig {
     pub token_store_path: Option<PathBuf>,
     pub runtime: RuntimeServiceConfig,
     pub invoke_max_body_bytes: usize,
+    pub limits: ServerLimits,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerLimits {
+    pub max_public_connections: usize,
+    pub max_private_connections: usize,
+    pub header_read_timeout: Duration,
+    pub max_headers: usize,
+    pub http2_keep_alive_interval: Duration,
+    pub http2_keep_alive_timeout: Duration,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_public_connections: 4_096,
+            max_private_connections: 256,
+            header_read_timeout: Duration::from_secs(10),
+            max_headers: 100,
+            http2_keep_alive_interval: Duration::from_secs(30),
+            http2_keep_alive_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -48,6 +73,7 @@ impl Default for ServerConfig {
             token_store_path: None,
             runtime: RuntimeServiceConfig::default(),
             invoke_max_body_bytes: 16 * 1024 * 1024,
+            limits: ServerLimits::default(),
         }
     }
 }
@@ -64,6 +90,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         token_store_path,
         runtime,
         invoke_max_body_bytes,
+        limits,
     } = config;
     let private_bearer_token = validate_private_control_plane_auth_config(
         bind_private_addr,
@@ -83,7 +110,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         public_tls_cert_path,
         public_tls_key_path,
     );
-    serve(bind_public_addr, bind_private_addr, state).await
+    serve(bind_public_addr, bind_private_addr, state, limits).await
 }
 
 fn validate_private_control_plane_auth_config(
@@ -160,8 +187,8 @@ mod tests {
         assert!(manifest.contains("http3 = [\"dep:tokio-quiche\", \"websocket\"]"));
         assert!(manifest.contains("websocket = [\"dep:tokio-tungstenite\"]"));
         assert!(manifest.contains("\"dep:opentelemetry-otlp\""));
-        assert!(manifest.contains("tokio-quiche = { version = \"0.16.1\", optional = true }"));
-        assert!(manifest.contains("tokio-tungstenite = { version = \"0.28\", optional = true }"));
+        assert!(manifest.contains("tokio-quiche = { version = \"0.19.0\", optional = true }"));
+        assert!(manifest.contains("tokio-tungstenite = { version = \"0.29\", optional = true }"));
         assert!(manifest.contains("opentelemetry-otlp = { workspace = true, optional = true }"));
     }
 }

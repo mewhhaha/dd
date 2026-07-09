@@ -1,9 +1,9 @@
 use crate::handlers::{
-    annotate_response_with_trace_id, build_public_request_url, ensure_public_worker, full_body,
-    handle_public_h3_request, handle_websocket_session, open_transport_session_from_parts,
-    open_websocket_session_from_parts, parse_public_worker_name_from_request,
-    request_body_not_supported, request_method_forbids_body, sanitize_websocket_handshake_headers,
-    validate_request_body_headers, ResponseBody,
+    ResponseBody, annotate_response_with_trace_id, build_public_request_url, ensure_public_worker,
+    full_body, handle_public_h3_request, handle_websocket_session,
+    open_transport_session_from_parts, open_websocket_session_from_parts,
+    parse_public_worker_name_from_request, request_body_not_supported, request_method_forbids_body,
+    sanitize_websocket_handshake_headers, validate_request_body_headers,
 };
 use crate::state::AppState;
 use bytes::Bytes;
@@ -14,8 +14,8 @@ use http::{HeaderMap, Method, Request, Response, StatusCode, Version};
 use http_body_util::BodyExt;
 use runtime::InvokeRequestBodyReceiver;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_quiche::buf_factory::BufFactory;
@@ -26,13 +26,14 @@ use tokio_quiche::http3::driver::{
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quiche;
+use tokio_quiche::quiche::BufFactory as _;
 use tokio_quiche::quiche::h3::NameValue;
 use tokio_quiche::settings::{
     CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
 };
-use tokio_quiche::{listen, ServerH3Driver};
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_quiche::{ServerH3Driver, listen};
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::Role;
 use tracing::warn;
 
 const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
@@ -469,7 +470,7 @@ async fn handle_public_h3_transport(
         while let Some(datagram) = outbound_datagram_rx.recv().await {
             if outbound_datagram_sender
                 .send(OutboundFrame::Datagram(
-                    BufFactory::dgram_from_slice(&datagram),
+                    BufFactory::dgram_buf_from_slice(&datagram),
                     flow_id,
                 ))
                 .await
@@ -482,7 +483,7 @@ async fn handle_public_h3_transport(
 
     while let Some(chunk) = outbound_stream_rx.recv().await {
         if body_sender
-            .send(OutboundFrame::body(
+            .send(OutboundFrame::Body(
                 BufFactory::buf_from_slice(&chunk),
                 false,
             ))
@@ -494,7 +495,7 @@ async fn handle_public_h3_transport(
     }
 
     let _ = body_sender
-        .send(OutboundFrame::body(BufFactory::buf_from_slice(&[]), true))
+        .send(OutboundFrame::Body(BufFactory::buf_from_slice(&[]), true))
         .await;
     let _ = flow_send
         .send(OutboundFrame::FlowShutdown { flow_id, stream_id })
@@ -550,13 +551,13 @@ pub(crate) async fn websocket_stream_over_h3(
             match transport_reader.read(&mut buffer).await {
                 Ok(0) => {
                     let _ = outbound
-                        .send(OutboundFrame::body(BufFactory::buf_from_slice(&[]), true))
+                        .send(OutboundFrame::Body(BufFactory::buf_from_slice(&[]), true))
                         .await;
                     return;
                 }
                 Ok(read) => {
                     if outbound
-                        .send(OutboundFrame::body(
+                        .send(OutboundFrame::Body(
                             BufFactory::buf_from_slice(&buffer[..read]),
                             false,
                         ))
@@ -568,7 +569,7 @@ pub(crate) async fn websocket_stream_over_h3(
                 }
                 Err(_) => {
                     let _ = outbound
-                        .send(OutboundFrame::body(BufFactory::buf_from_slice(&[]), true))
+                        .send(OutboundFrame::Body(BufFactory::buf_from_slice(&[]), true))
                         .await;
                     return;
                 }
@@ -599,7 +600,7 @@ async fn send_quiche_response(
         })?;
         if let Some(data) = frame.data_ref() {
             sender
-                .send(OutboundFrame::body(
+                .send(OutboundFrame::Body(
                     BufFactory::buf_from_slice(data.as_ref()),
                     false,
                 ))
@@ -609,7 +610,7 @@ async fn send_quiche_response(
     }
 
     sender
-        .send(OutboundFrame::body(BufFactory::buf_from_slice(&[]), true))
+        .send(OutboundFrame::Body(BufFactory::buf_from_slice(&[]), true))
         .await
         .map_err(|_| PlatformError::internal("failed to finish h3 response body"))?;
     Ok(())

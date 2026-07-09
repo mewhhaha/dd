@@ -559,7 +559,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_asset_bundle, resolve_asset, AssetRequest};
+    use super::{AssetRequest, compile_asset_bundle, resolve_asset};
     use base64::Engine;
     use common::DeployAsset;
 
@@ -585,10 +585,12 @@ mod tests {
         .expect("asset should match");
         assert_eq!(response.status, 200);
         assert_eq!(response.body.as_ref(), b"console.log('a');");
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("etag")));
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        );
     }
 
     #[test]
@@ -610,18 +612,24 @@ mod tests {
             },
         )
         .expect("asset should match");
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| name == "cache-control" && value.contains("max-age=3600")));
-        assert!(response
-            .headers
-            .iter()
-            .all(|(name, _)| !name.eq_ignore_ascii_case("content-type")));
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| name == "x-two" && value == "a.js"));
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "cache-control" && value.contains("max-age=3600"))
+        );
+        assert!(
+            response
+                .headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
+        );
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-two" && value == "a.js")
+        );
     }
 
     #[test]
@@ -641,10 +649,12 @@ mod tests {
             },
         )
         .expect("asset should match");
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| name == "x-host" && value == "foo"));
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-host" && value == "foo")
+        );
     }
 
     #[test]

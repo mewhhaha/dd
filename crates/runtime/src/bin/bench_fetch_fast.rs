@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +17,7 @@ use uuid::Uuid;
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
 
-use bench_cli::{bench_arg_action, BenchArgAction};
+use bench_cli::{BenchArgAction, bench_arg_action};
 
 #[derive(Clone)]
 struct BenchConfig {

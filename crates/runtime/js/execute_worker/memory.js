@@ -304,7 +304,7 @@
             `dynamic worker env value for ${name} is RpcTarget, but allow_host_rpc is false`,
           );
         }
-        const targetIdRaw = callOp("op_crypto_random_uuid");
+        const targetIdRaw = globalThis.crypto.randomUUID();
         const targetId = String(targetIdRaw ?? "").trim();
         if (!targetId) {
           throw new Error("failed to allocate dynamic host rpc target id");

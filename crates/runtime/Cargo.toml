@@ -8,9 +8,9 @@ build = "build.rs"
 [dependencies]
 common = { path = "../common" }
 deno_core.workspace = true
-deno_error = "0.7"
-turso = "0.6.0-pre.9"
-capnp = "0.20"
+deno_error = "=0.7.1"
+turso = { version = "0.7.0-pre.18", default-features = false }
+capnp = "0.26"
 serde.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true
@@ -20,20 +20,20 @@ tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 uuid.workspace = true
 reqwest.workspace = true
-getrandom = "0.3"
+getrandom = "0.4"
 base64.workspace = true
 bytes = "1"
 futures-util = "0.3"
-sha2 = "0.10"
+sha2 = "0.11"
 mime_guess = "2"
 regex = "1"
-deno_webidl = "0.241.0"
-deno_web = "0.272.0"
-deno_fetch = "0.265.0"
-deno_crypto = "0.255.0"
-deno_permissions = "0.100.0"
-rustls = "0.23.28"
-sys_traits = { version = "0.1.25", features = ["real", "libc"] }
+deno_webidl = "0.254.0"
+deno_web = "0.285.0"
+deno_fetch = "0.278.0"
+deno_crypto = "0.268.0"
+deno_permissions = "0.113.0"
+rustls = "0.23"
+sys_traits = { version = "0.1.28", features = ["real", "libc"] }
 
 [features]
 default = []

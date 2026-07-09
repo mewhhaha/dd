@@ -4,10 +4,10 @@ use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use turso::{transaction::TransactionBehavior, Builder, Connection, Database};
+use turso::{Builder, Connection, Database, transaction::TransactionBehavior};
 use uuid::Uuid;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -470,13 +470,12 @@ impl CacheStore {
         if existing_variant.len() > 1 {
             self.remove_records(&conn, &existing_variant[1..]).await?;
         }
-        if let Some(existing) = existing_variant.first() {
-            if existing.body_storage == "blob"
-                && !existing.body_ref.is_empty()
-                && existing.body_ref != body_ref
-            {
-                self.blob_store.delete(&existing.body_ref).await?;
-            }
+        if let Some(existing) = existing_variant.first()
+            && existing.body_storage == "blob"
+            && !existing.body_ref.is_empty()
+            && existing.body_ref != body_ref
+        {
+            self.blob_store.delete(&existing.body_ref).await?;
         }
         self.cleanup_expired(&conn, now_ms).await?;
         self.evict_if_needed(&conn).await?;

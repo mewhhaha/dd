@@ -580,7 +580,7 @@ impl RuntimeService {
                 return Err(PlatformError::internal(format!(
                     "failed to read worker store {}: {error}",
                     workers_dir.display()
-                )))
+                )));
             }
         };
 
@@ -1217,6 +1217,12 @@ impl RuntimeService {
         self.asset_catalog
             .get(worker_name)
             .is_some_and(|entry| entry.worker_name == worker_name && entry.public)
+    }
+
+    pub fn worker_cache_enabled(&self, worker_name: &str) -> bool {
+        self.asset_catalog
+            .get(worker_name)
+            .is_some_and(|entry| entry.worker_name == worker_name && entry.cache_enabled)
     }
 
     pub fn resolve_asset(

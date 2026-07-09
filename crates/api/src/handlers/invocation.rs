@@ -141,91 +141,193 @@ async fn invoke_worker_from_body_stream(
     };
     tracing::info!(request_id = %request_id, "invoke request accepted");
 
-    if !is_cacheable_request(&invocation, request_body_stream.is_some()) {
-        let output = state
-            .runtime
-            .invoke_stream_with_request_body(worker_name, invocation, request_body_stream)
-            .await?;
-        let mut response = build_worker_stream_response(output)?;
-        annotate_response_with_trace_id(&mut response);
-        return Ok(response);
-    }
-
-    let cache_request = build_edge_cache_request(&worker_name, &invocation);
-    match state.runtime.cache_match(cache_request.clone()).await? {
-        CacheLookup::Fresh(response) => {
-            tracing::info!(request_id = %request_id, cache_status = "HIT", "edge cache hit");
-            return build_cached_response(response, "HIT");
-        }
-        CacheLookup::StaleWhileRevalidate(response) => {
-            tracing::info!(
-                request_id = %request_id,
-                cache_status = "STALE",
-                "edge cache stale hit, scheduling revalidation"
-            );
-            maybe_spawn_edge_revalidation(
-                state.clone(),
-                worker_name.clone(),
-                invocation.clone(),
-                cache_request.clone(),
-            )
-            .await;
-            return build_cached_response(response, "STALE");
-        }
-        CacheLookup::StaleIfError(response) => {
-            let origin = state
-                .runtime
-                .invoke_with_request_body(worker_name, invocation, request_body_stream)
+    if state.runtime.worker_cache_enabled(&worker_name)
+        && is_front_cacheable_request(&invocation, request_body_stream.is_some())
+    {
+        let cache_request = front_cache_request(&worker_name, &invocation);
+        match state.runtime.cache_match(cache_request.clone()).await? {
+            CacheLookup::Fresh(response) => {
+                return build_front_cached_response(response, &method, "HIT");
+            }
+            CacheLookup::StaleWhileRevalidate(response) => {
+                spawn_front_cache_revalidation(
+                    state.clone(),
+                    worker_name.clone(),
+                    invocation.clone(),
+                    cache_request,
+                )
                 .await;
-            return match origin {
-                Ok(output) => {
-                    if output.status >= 500 {
-                        tracing::warn!(
-                            request_id = %request_id,
-                            status = output.status,
-                            cache_status = "STALE-IF-ERROR",
-                            "origin returned 5xx, serving stale"
-                        );
-                        let mut fallback = build_cached_response(response, "STALE-IF-ERROR")?;
-                        fallback.headers_mut().append(
-                            HeaderName::from_static(HEADER_CACHE_FALLBACK),
-                            HeaderValue::from_static("origin-status"),
-                        );
-                        return Ok(fallback);
+                return build_front_cached_response(response, &method, "STALE");
+            }
+            CacheLookup::StaleIfError(stale) => {
+                return match state
+                    .runtime
+                    .invoke_with_request_body(worker_name, invocation, request_body_stream)
+                    .await
+                {
+                    Ok(output) if output.status < 500 => {
+                        maybe_store_front_cache(&state, &cache_request, &output).await;
+                        build_front_origin_response(output, &method, "MISS")
                     }
-                    store_worker_output_in_cache(&state, &cache_request, &output).await;
-                    tracing::info!(
-                        request_id = %request_id,
-                        cache_status = "MISS",
-                        "cache refreshed from origin"
-                    );
-                    build_worker_buffered_response(output, "MISS")
-                }
-                Err(_error) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        cache_status = "STALE-IF-ERROR",
-                        "origin failed, serving stale"
-                    );
-                    let mut response = build_cached_response(response, "STALE-IF-ERROR")?;
-                    response.headers_mut().append(
-                        HeaderName::from_static(HEADER_CACHE_FALLBACK),
-                        HeaderValue::from_static("origin-error"),
-                    );
-                    Ok(response)
-                }
-            };
+                    Ok(_) | Err(_) => build_front_cached_response(stale, &method, "STALE"),
+                };
+            }
+            CacheLookup::Miss => {
+                let output = state
+                    .runtime
+                    .invoke_with_request_body(worker_name, invocation, request_body_stream)
+                    .await?;
+                maybe_store_front_cache(&state, &cache_request, &output).await;
+                return build_front_origin_response(output, &method, "MISS");
+            }
         }
-        CacheLookup::Miss => {}
     }
 
     let output = state
         .runtime
-        .invoke_with_request_body(worker_name, invocation, request_body_stream)
+        .invoke_stream_with_request_body(worker_name, invocation, request_body_stream)
         .await?;
-    store_worker_output_in_cache(&state, &cache_request, &output).await;
-    tracing::info!(request_id = %request_id, cache_status = "MISS", "origin miss stored");
-    build_worker_buffered_response(output, "MISS")
+    build_worker_stream_response(output)
+}
+
+fn is_front_cacheable_request(invocation: &WorkerInvocation, has_body_stream: bool) -> bool {
+    !has_body_stream
+        && matches!(invocation.method.as_str(), "GET" | "HEAD")
+        && !invocation.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")
+        })
+}
+
+fn front_cache_request(worker_name: &str, invocation: &WorkerInvocation) -> CacheRequest {
+    CacheRequest {
+        cache_name: format!("front:{worker_name}"),
+        method: invocation.method.clone(),
+        url: invocation.url.clone(),
+        headers: invocation.headers.clone(),
+        bypass_stale: false,
+    }
+}
+
+fn front_response_is_cacheable(output: &WorkerOutput) -> bool {
+    if output.status != 200 {
+        return false;
+    }
+    let cache_control = output
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cache-control"))
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(",");
+    let explicitly_public = cache_control
+        .split(',')
+        .any(|directive| directive.trim() == "public");
+    let positive_ttl = cache_control.split(',').any(|directive| {
+        let directive = directive.trim();
+        ["s-maxage=", "max-age="].into_iter().any(|prefix| {
+            directive
+                .strip_prefix(prefix)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .is_some_and(|value| value > 0)
+        })
+    });
+    explicitly_public
+        && positive_ttl
+        && !cache_control.contains("no-store")
+        && !cache_control.contains("private")
+        && !output.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie")
+                || (name.eq_ignore_ascii_case("vary") && value.trim() == "*")
+        })
+}
+
+async fn maybe_store_front_cache(state: &AppState, request: &CacheRequest, output: &WorkerOutput) {
+    if !front_response_is_cacheable(output) {
+        return;
+    }
+    let _ = state
+        .runtime
+        .cache_put(
+            request.clone(),
+            CacheResponse {
+                status: output.status,
+                headers: output.headers.clone(),
+                body: output.body.clone(),
+            },
+        )
+        .await;
+}
+
+async fn spawn_front_cache_revalidation(
+    state: AppState,
+    worker_name: String,
+    invocation: WorkerInvocation,
+    mut cache_request: CacheRequest,
+) {
+    let key = format!("{worker_name}:{}", cache_request.url);
+    if !state
+        .front_cache_revalidations
+        .lock()
+        .await
+        .insert(key.clone())
+    {
+        return;
+    }
+    cache_request.bypass_stale = true;
+    tokio::spawn(async move {
+        if let Ok(output) = state.runtime.invoke(worker_name, invocation).await {
+            maybe_store_front_cache(&state, &cache_request, &output).await;
+        }
+        state.front_cache_revalidations.lock().await.remove(&key);
+    });
+}
+
+fn build_front_cached_response(
+    response: CacheResponse,
+    method: &str,
+    status: &'static str,
+) -> ApiResult<Response<ResponseBody>> {
+    build_front_response(
+        response.status,
+        response.headers,
+        response.body,
+        method,
+        status,
+    )
+}
+
+fn build_front_origin_response(
+    output: WorkerOutput,
+    method: &str,
+    status: &'static str,
+) -> ApiResult<Response<ResponseBody>> {
+    build_front_response(output.status, output.headers, output.body, method, status)
+}
+
+fn build_front_response(
+    status_code: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    method: &str,
+    cache_status: &'static str,
+) -> ApiResult<Response<ResponseBody>> {
+    let content_length = body.len();
+    let response_body = if method == "HEAD" { Vec::new() } else { body };
+    let mut response = Response::builder()
+        .status(status_code)
+        .body(full_body(response_body))
+        .map_err(|error| PlatformError::internal(error.to_string()))?;
+    append_safe_worker_headers(response.headers_mut(), headers);
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
+            .map_err(|error| PlatformError::internal(error.to_string()))?,
+    );
+    response
+        .headers_mut()
+        .insert("x-dd-cache", HeaderValue::from_static(cache_status));
+    annotate_response_with_trace_id(&mut response);
+    Ok(response)
 }
 
 pub(crate) fn parse_public_worker_name_from_request(
@@ -289,7 +391,7 @@ pub(super) fn parse_invoke_request_uri(
     };
     let url = format!("http://worker{}{}", url_path, query_suffix);
 
-    Ok((worker_name.to_string(), url))
+    Ok((validate_worker_name(worker_name)?, url))
 }
 
 pub(crate) fn build_public_request_url(
@@ -440,13 +542,13 @@ fn normalize_host(host: &str) -> Option<String> {
         return Some(lower);
     }
 
-    if let Some((name, port)) = lower.rsplit_once(':') {
-        if port.chars().all(|value| value.is_ascii_digit()) {
-            if name.is_empty() {
-                return None;
-            }
-            return Some(name.to_string());
+    if let Some((name, port)) = lower.rsplit_once(':')
+        && port.chars().all(|value| value.is_ascii_digit())
+    {
+        if name.is_empty() {
+            return None;
         }
+        return Some(name.to_string());
     }
 
     Some(lower)
@@ -534,65 +636,10 @@ fn build_worker_stream_response(
         .body(BodyExt::boxed(StreamBody::new(stream)))
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
-    for (name, value) in worker_response.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            response.headers_mut().append(name, value);
-        }
-    }
+    append_safe_worker_headers(response.headers_mut(), worker_response.headers);
     annotate_response_with_trace_id(&mut response);
 
     Ok(response)
-}
-
-fn is_cacheable_request(invocation: &WorkerInvocation, has_body_stream: bool) -> bool {
-    if has_body_stream || !invocation.method.eq_ignore_ascii_case("GET") {
-        return false;
-    }
-    !invocation.headers.iter().any(|(name, value)| {
-        if name.eq_ignore_ascii_case("content-length") {
-            return value
-                .trim()
-                .parse::<u64>()
-                .map(|size| size > 0)
-                .unwrap_or(true);
-        }
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return !value.trim().is_empty();
-        }
-        false
-    })
-}
-
-fn build_edge_cache_request(worker_name: &str, invocation: &WorkerInvocation) -> CacheRequest {
-    CacheRequest {
-        cache_name: format!("edge:{worker_name}"),
-        method: invocation.method.clone(),
-        url: invocation.url.clone(),
-        headers: invocation.headers.clone(),
-        bypass_stale: false,
-    }
-}
-
-fn build_cached_response(
-    cache_response: CacheResponse,
-    cache_status: &str,
-) -> ApiResult<Response<ResponseBody>> {
-    build_buffered_response(
-        cache_response.status,
-        cache_response.headers,
-        cache_response.body,
-        cache_status,
-    )
-}
-
-fn build_worker_buffered_response(
-    output: WorkerOutput,
-    cache_status: &str,
-) -> ApiResult<Response<ResponseBody>> {
-    build_buffered_response(output.status, output.headers, output.body, cache_status)
 }
 
 fn build_direct_buffered_response(
@@ -600,131 +647,26 @@ fn build_direct_buffered_response(
     headers: Vec<(String, String)>,
     body: Bytes,
 ) -> ApiResult<Response<ResponseBody>> {
+    let declared_content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok());
+    let content_length = if body.is_empty() {
+        declared_content_length.unwrap_or(0)
+    } else {
+        body.len()
+    };
     let mut response = Response::builder()
         .status(status)
         .body(full_body(body))
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
-    for (name, value) in headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            response.headers_mut().append(name, value);
-        }
-    }
-    annotate_response_with_trace_id(&mut response);
-    Ok(response)
-}
-
-fn build_buffered_response(
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    cache_status: &str,
-) -> ApiResult<Response<ResponseBody>> {
-    let mut response = Response::builder()
-        .status(status)
-        .body(full_body(body))
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-
-    for (name, value) in headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            response.headers_mut().append(name, value);
-        }
-    }
-
+    append_safe_worker_headers(response.headers_mut(), headers);
     response.headers_mut().insert(
-        HeaderName::from_static(HEADER_CACHE),
-        HeaderValue::from_str(cache_status)
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string())
             .map_err(|error| PlatformError::internal(error.to_string()))?,
     );
     annotate_response_with_trace_id(&mut response);
     Ok(response)
-}
-
-async fn store_worker_output_in_cache(
-    state: &AppState,
-    request: &CacheRequest,
-    output: &WorkerOutput,
-) {
-    let _ = state
-        .runtime
-        .cache_put(
-            request.clone(),
-            CacheResponse {
-                status: output.status,
-                headers: output.headers.clone(),
-                body: output.body.clone(),
-            },
-        )
-        .await;
-}
-
-async fn maybe_spawn_edge_revalidation(
-    state: AppState,
-    worker_name: String,
-    mut invocation: WorkerInvocation,
-    cache_request: CacheRequest,
-) {
-    let key = edge_revalidation_key(&worker_name, &cache_request);
-    {
-        let mut inflight = state.edge_revalidations.lock().await;
-        if !inflight.insert(key.clone()) {
-            return;
-        }
-    }
-
-    invocation.request_id = format!("edge-revalidate-{}", Uuid::new_v4());
-    if !invocation
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(HEADER_CACHE_BYPASS_STALE))
-    {
-        invocation
-            .headers
-            .push((HEADER_CACHE_BYPASS_STALE.to_string(), "1".to_string()));
-    }
-
-    tokio::spawn(async move {
-        let origin = state.runtime.invoke(worker_name, invocation).await;
-        if let Ok(output) = origin {
-            let _ = state
-                .runtime
-                .cache_put(
-                    cache_request,
-                    CacheResponse {
-                        status: output.status,
-                        headers: output.headers,
-                        body: output.body,
-                    },
-                )
-                .await;
-        }
-        let mut inflight = state.edge_revalidations.lock().await;
-        inflight.remove(&key);
-    });
-}
-
-fn edge_revalidation_key(worker_name: &str, cache_request: &CacheRequest) -> String {
-    let mut headers: Vec<(String, String)> = cache_request
-        .headers
-        .iter()
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-        .collect();
-    headers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let header_key = headers
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!(
-        "{worker_name}:{}:{}:{}:{header_key}",
-        cache_request.cache_name,
-        cache_request.method.to_ascii_uppercase(),
-        cache_request.url
-    )
 }

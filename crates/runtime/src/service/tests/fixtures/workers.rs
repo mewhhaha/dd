@@ -61,8 +61,8 @@ export default {
 
 pub(crate) fn dynamic_plain_namespace_worker() -> String {
     dynamic_plain_namespace_worker_with_source(
-            "let count = 0; export default { async fetch() { count += 1; return new Response(String(count)); } };",
-        )
+        "let count = 0; export default { async fetch() { count += 1; return new Response(String(count)); } };",
+    )
 }
 
 pub(crate) fn dynamic_plain_namespace_worker_with_source(child_source: &str) -> String {

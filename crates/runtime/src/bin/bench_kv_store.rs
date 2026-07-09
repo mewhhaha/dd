@@ -2,8 +2,8 @@ use runtime::KvStore;
 use std::env;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
 
-use bench_cli::{bench_arg_action, BenchArgAction};
+use bench_cli::{BenchArgAction, bench_arg_action};
 
 #[derive(Clone, Copy)]
 struct Scenario {

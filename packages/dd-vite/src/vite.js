@@ -6,7 +6,7 @@ import {
 } from "vite";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -654,7 +654,9 @@ export function ddVitePlugin(options = {}) {
     if (config?.build?.emptyOutDir === false) {
       return;
     }
-    const outRoot = buildOutputRoot ?? resolveBuildOutputRoot(config, resolveFrameworkRoot());
+    const projectRoot = resolveFrameworkRoot();
+    const outRoot = buildOutputRoot ?? resolveBuildOutputRoot(config, projectRoot);
+    await assertSafeBuildOutputRoot(projectRoot, outRoot);
     await rm(outRoot, { recursive: true, force: true });
   }
 
@@ -2749,7 +2751,18 @@ async function writeStaticAssetResponse(req, res, originalUrl, mount, routing) {
 
   let fileStat;
   try {
-    fileStat = await stat(file);
+    const linkStat = await lstat(file);
+    if (linkStat.isSymbolicLink()) {
+      return false;
+    }
+    const [canonicalRoot, canonicalFile] = await Promise.all([
+      realpath(assetRoot),
+      realpath(file),
+    ]);
+    if (canonicalFile === canonicalRoot || !canonicalFile.startsWith(`${canonicalRoot}${sep}`)) {
+      return false;
+    }
+    fileStat = await stat(canonicalFile);
   } catch (error) {
     if (isMissingFileError(error)) {
       return false;
@@ -2928,6 +2941,35 @@ function resolveViteOutDir(config) {
 function resolveBuildOutputRoot(config, root) {
   const configured = config?.build?.outDir ?? "dist";
   return isAbsolute(configured) ? configured : resolve(root ?? config?.root ?? process.cwd(), configured);
+}
+
+async function assertSafeBuildOutputRoot(projectRoot, outRoot) {
+  const resolvedProject = resolve(projectRoot);
+  const resolvedOutput = resolve(outRoot);
+  if (resolvedOutput === resolvedProject || !resolvedOutput.startsWith(`${resolvedProject}${sep}`)) {
+    throw new Error(`ddVitePlugin refuses to empty build.outDir outside the project root: ${resolvedOutput}`);
+  }
+
+  const canonicalProject = await realpath(resolvedProject);
+  let existingAncestor = dirname(resolvedOutput);
+  while (true) {
+    try {
+      existingAncestor = await realpath(existingAncestor);
+      break;
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        throw error;
+      }
+      const parent = dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        throw new Error(`ddVitePlugin could not validate build.outDir: ${resolvedOutput}`);
+      }
+      existingAncestor = parent;
+    }
+  }
+  if (existingAncestor !== canonicalProject && !existingAncestor.startsWith(`${canonicalProject}${sep}`)) {
+    throw new Error(`ddVitePlugin refuses to empty build.outDir through a path outside the project root: ${resolvedOutput}`);
+  }
 }
 
 function childBuildOutDir(baseOutDir, child) {
@@ -3252,7 +3294,7 @@ function isMissingFileError(error) {
 function topLevelRuntimeConfig(config) {
   const runtimeConfig = {};
   let found = false;
-  for (const key of ["public", "bindings", "internal"]) {
+  for (const key of ["public", "cache", "bindings", "internal"]) {
     if (Object.hasOwn(config, key)) {
       runtimeConfig[key] = config[key];
       found = true;

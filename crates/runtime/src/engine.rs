@@ -1,22 +1,22 @@
 use crate::assets::{
-    install_worker_js, BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER,
+    BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER, install_worker_js,
 };
 use crate::dynamic_modules::{
-    dynamic_module, dynamic_module_source, normalize_dynamic_module_path,
-    resolve_dynamic_module_path, RuntimeModuleKind,
+    RuntimeModuleKind, dynamic_module, dynamic_module_source, normalize_dynamic_module_path,
+    resolve_dynamic_module_path,
 };
 use crate::ops::{
-    clear_request_invocation, clear_worker_deployment_config, register_request_invocation,
-    register_worker_deployment_config, runtime_extension, WorkerDeploymentPayload,
-    WorkerRequestPayload, WorkerSource,
+    WorkerDeploymentPayload, WorkerRequestPayload, WorkerSource, clear_request_invocation,
+    clear_worker_deployment_config, register_request_invocation, register_worker_deployment_config,
+    runtime_extension,
 };
 use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
 use base64::Engine;
 use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
-    resolve_import, v8, v8_set_flags, Extension, JsRuntime, JsRuntimeForSnapshot, ModuleCodeBytes,
-    ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType,
-    PollEventLoopOptions, RequestedModuleType, ResolutionKind, RuntimeOptions,
+    Extension, JsRuntime, JsRuntimeForSnapshot, ModuleCodeBytes, ModuleLoadResponse, ModuleLoader,
+    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, PollEventLoopOptions,
+    RequestedModuleType, ResolutionKind, RuntimeOptions, resolve_import, v8, v8_set_flags,
 };
 use deno_crypto::deno_crypto as deno_crypto_ext;
 use deno_error::JsErrorBox;
@@ -37,6 +37,7 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: runtime_extensions(),
         module_loader: Some(Rc::new(RuntimeModuleLoader)),
+        create_params: Some(runtime_create_params(0)),
         ..Default::default()
     });
     runtime
@@ -97,6 +98,7 @@ pub async fn build_worker_snapshot(
     let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
         extensions: runtime_extensions(),
         module_loader: Some(Rc::new(RuntimeModuleLoader)),
+        create_params: Some(runtime_create_params(0)),
         ..Default::default()
     });
     runtime
@@ -334,8 +336,7 @@ fn new_runtime(
     allow_code_generation: bool,
     max_heap_bytes: usize,
 ) -> Result<JsRuntime> {
-    let create_params =
-        (max_heap_bytes > 0).then(|| v8::CreateParams::default().heap_limits(0, max_heap_bytes));
+    let create_params = Some(runtime_create_params(max_heap_bytes));
     let mut runtime = JsRuntime::try_new(RuntimeOptions {
         extensions: runtime_extensions(),
         module_loader: Some(Rc::new(RuntimeModuleLoader)),
@@ -346,6 +347,20 @@ fn new_runtime(
     .map_err(runtime_error)?;
     set_code_generation_from_strings(&mut runtime, allow_code_generation);
     Ok(runtime)
+}
+
+fn runtime_create_params(max_heap_bytes: usize) -> v8::CreateParams {
+    JsRuntime::init_platform(None);
+    let heap = v8::cppgc::Heap::create(
+        v8::V8::get_current_platform(),
+        v8::cppgc::HeapCreateParams::default(),
+    );
+    let params = v8::CreateParams::default().cpp_heap(heap);
+    if max_heap_bytes > 0 {
+        params.heap_limits(0, max_heap_bytes)
+    } else {
+        params
+    }
 }
 
 fn set_code_generation_from_strings(runtime: &mut JsRuntime, allow: bool) {
@@ -431,6 +446,7 @@ fn runtime_extensions() -> Vec<Extension> {
         without_esm(deno_web::deno_web::init(
             Arc::new(BlobStore::default()),
             None,
+            false,
             InMemoryBroadcastChannel::default(),
         )),
         without_esm(deno_fetch::deno_fetch::init(DenoFetchOptions::default())),

@@ -276,11 +276,10 @@ impl ActiveRequestContextHandles {
         if let Some(previous) = self
             .request_ids
             .insert(context.request_id.clone(), context.request_context_handle)
+            && let Some(previous_context) = self.contexts.remove(&previous)
         {
-            if let Some(previous_context) = self.contexts.remove(&previous) {
-                self.completion_handles
-                    .remove(&previous_context.completion_handle);
-            }
+            self.completion_handles
+                .remove(&previous_context.completion_handle);
         }
         if let Some(previous) = self
             .contexts
@@ -425,6 +424,7 @@ pub(crate) struct EgressAllowHost {
     pub(crate) host: String,
     pub(crate) wildcard: bool,
     pub(crate) port: Option<u16>,
+    pub(crate) allow_private: bool,
 }
 
 impl EgressAllowHost {
@@ -452,12 +452,16 @@ pub(crate) fn parse_egress_allow_host(allowed: &str) -> Option<EgressAllowHost> 
     if allowed.is_empty() {
         return None;
     }
+    let (allowed, allow_private) = match allowed.strip_prefix("private:") {
+        Some(value) => (value, true),
+        None => (allowed.as_str(), false),
+    };
     let (host, port) = match allowed.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|char| char.is_ascii_digit()) => {
             let parsed = port.parse::<u16>().ok().filter(|port| *port > 0)?;
             (host, Some(parsed))
         }
-        _ => (allowed.as_str(), None),
+        _ => (allowed, None),
     };
     let (host, wildcard) = match host.strip_prefix("*.") {
         Some(suffix) if !suffix.is_empty() => (suffix, true),
@@ -471,6 +475,7 @@ pub(crate) fn parse_egress_allow_host(allowed: &str) -> Option<EgressAllowHost> 
         host: host.to_string(),
         wildcard,
         port,
+        allow_private,
     })
 }
 

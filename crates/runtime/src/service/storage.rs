@@ -86,7 +86,7 @@ pub(super) async fn delete_worker_deployment(
             return Err(PlatformError::internal(format!(
                 "failed to read worker store {}: {error}",
                 workers_dir.display()
-            )))
+            )));
         }
     };
 

@@ -2,15 +2,15 @@ use common::{PlatformError, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use turso::{transaction::TransactionBehavior, Builder, Connection, Database, Value};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use turso::{Builder, Connection, Database, Value, transaction::TransactionBehavior};
 
-use crate::turso_util::{configure_turso_connection, is_retryable_turso_error, VersionFloor};
+use crate::turso_util::{VersionFloor, configure_turso_connection, is_retryable_turso_error};
 
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
@@ -243,11 +243,9 @@ impl KvWriteWorkerState {
                 .pending
                 .get(&mutation.key)
                 .is_some_and(|pending| pending.version <= mutation.version);
-            if should_remove {
-                if let Some(removed) = self.pending.remove(&mutation.key) {
-                    self.pending_bytes = self.pending_bytes.saturating_sub(removed.size_bytes);
-                    superseded += 1;
-                }
+            if should_remove && let Some(removed) = self.pending.remove(&mutation.key) {
+                self.pending_bytes = self.pending_bytes.saturating_sub(removed.size_bytes);
+                superseded += 1;
             }
         }
         superseded

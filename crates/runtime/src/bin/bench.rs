@@ -6,8 +6,8 @@ use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -16,7 +16,7 @@ use uuid::Uuid;
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
 
-use bench_cli::{bench_arg_action, BenchArgAction};
+use bench_cli::{BenchArgAction, bench_arg_action};
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -245,7 +245,9 @@ fn print_help() {
     println!("This benchmark is configured with environment variables, not CLI flags.");
     println!();
     println!("Core env:");
-    println!("  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, dynamic, lifecycle, kv-writes");
+    println!(
+        "  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, dynamic, lifecycle, kv-writes"
+    );
     println!(
         "  DD_BENCH_CONFIG                comma-separated configs: single-isolate, autoscaling-8"
     );
@@ -608,6 +610,7 @@ export default {
                         KV_WRITE_WORKER_SOURCE.to_string(),
                         DeployConfig {
                             public: false,
+                            cache: Default::default(),
                             bindings: vec![DeployBinding::Kv {
                                 binding: "MY_KV".to_string(),
                             }],
@@ -1181,11 +1184,11 @@ export default {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut time_to_target = None;
     while Instant::now() < deadline {
-        if let Some(stats) = service.stats(worker_name.clone()).await {
-            if stats.isolates_total >= target_isolates {
-                time_to_target = Some(started.elapsed());
-                break;
-            }
+        if let Some(stats) = service.stats(worker_name.clone()).await
+            && stats.isolates_total >= target_isolates
+        {
+            time_to_target = Some(started.elapsed());
+            break;
         }
         sleep(Duration::from_millis(2)).await;
     }
@@ -1213,6 +1216,7 @@ async fn run_websocket_bench(service: &RuntimeService) -> common::Result<WebSock
             WEBSOCKET_ECHO_WORKER_SOURCE.to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![DeployBinding::Memory {
                     binding: "BENCH_MEMORY".to_string(),
                 }],
@@ -1464,6 +1468,7 @@ async fn deploy_dynamic_bench_worker(
             source.to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![DeployBinding::Dynamic {
                     binding: "SANDBOX".to_string(),
                 }],

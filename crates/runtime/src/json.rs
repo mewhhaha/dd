@@ -1,5 +1,5 @@
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 pub fn from_string<T>(input: String) -> Result<T, simd_json::Error>
 where

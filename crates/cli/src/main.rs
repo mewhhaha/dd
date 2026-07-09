@@ -1,12 +1,12 @@
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use common::{
-    first_non_empty_trimmed, DeployAsset, DeployBinding, DeployConfig, DeployInternalConfig,
-    DeployRequest, DeployResponse, DeployServerModule, DeployServerModuleKind,
-    DeployTokenCapabilities, DeployTokenDeleteResponse, DeployTokenGetResponse,
-    DeployTokenListResponse, DeployTokenMintRequest, DeployTokenMintResponse,
-    DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
-    DEFAULT_PRIVATE_SERVER_URL,
+    DEFAULT_PRIVATE_SERVER_URL, DeployAsset, DeployBinding, DeployCacheConfig, DeployConfig,
+    DeployInternalConfig, DeployRequest, DeployResponse, DeployServerModule,
+    DeployServerModuleKind, DeployTokenCapabilities, DeployTokenDeleteResponse,
+    DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
+    DeployTokenMintResponse, DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse,
+    ErrorBody, first_non_empty_trimmed,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -80,6 +80,9 @@ struct DeployCmd {
 
     #[arg(long)]
     public: bool,
+
+    #[arg(long)]
+    cache: bool,
 
     #[arg(long = "assets-dir")]
     assets_dir: Option<String>,
@@ -547,6 +550,9 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
     );
     let config = DeployConfig {
         public: command.public,
+        cache: DeployCacheConfig {
+            enabled: command.cache,
+        },
         bindings,
         internal: DeployInternalConfig {
             trace: command.trace_worker.map(|worker| DeployTraceDestination {
@@ -1380,10 +1386,10 @@ fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        build_deploy_request_from_config_file, build_deploy_token_mint_request, keyring_account,
-        load_workspace_cli_config_from, normalize_asset_relative_path, package_assets_dir,
-        package_server_module_specs, resolve_server_from, Cli, CliConfig, Command,
-        DeployConfigFileCmd, MintDeployTokenCmd, DEFAULT_PRIVATE_SERVER_URL,
+        Cli, CliConfig, Command, DEFAULT_PRIVATE_SERVER_URL, DeployConfigFileCmd,
+        MintDeployTokenCmd, build_deploy_request_from_config_file, build_deploy_token_mint_request,
+        keyring_account, load_workspace_cli_config_from, normalize_asset_relative_path,
+        package_assets_dir, package_server_module_specs, resolve_server_from,
     };
     use base64::Engine;
     use clap::Parser;
@@ -1412,9 +1418,11 @@ mod tests {
         assert_eq!(assets.len(), 2);
         assert_eq!(assets[0].path, "/a.js");
         assert_eq!(assets[1].path, "/nested/b.css");
-        assert!(asset_headers
-            .expect("headers should be present")
-            .contains("Cache-Control"));
+        assert!(
+            asset_headers
+                .expect("headers should be present")
+                .contains("Cache-Control")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

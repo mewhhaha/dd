@@ -90,6 +90,9 @@ impl DeployTokenStore {
 
         let mut state = self.state.lock().await;
         state.tokens.retain(|token| !token.is_expired(now));
+        if state.tokens.len() >= 1_024 {
+            return Err(PlatformError::conflict("token store limit reached"));
+        }
         if state.tokens.iter().any(|token| token.id == id) {
             return Err(PlatformError::conflict("token id already exists"));
         }
@@ -118,7 +121,7 @@ impl DeployTokenStore {
         let Some(token) = state
             .tokens
             .iter_mut()
-            .find(|stored| stored.token_hash == hash)
+            .find(|stored| constant_time_eq(stored.token_hash.as_bytes(), hash.as_bytes()))
         else {
             return Err(PlatformError::unauthorized("invalid token"));
         };
@@ -138,6 +141,29 @@ impl DeployTokenStore {
         token.last_used_at_unix = Some(now);
         state.tokens.retain(|token| !token.is_expired(now));
         self.save_locked(&state).await?;
+        Ok(())
+    }
+
+    pub async fn preflight(&self, bearer_token: &str) -> Result<()> {
+        let hash = token_hash(bearer_token.trim());
+        let now = unix_now()?;
+        let state = self.state.lock().await;
+        let Some(token) = state
+            .tokens
+            .iter()
+            .find(|stored| constant_time_eq(stored.token_hash.as_bytes(), hash.as_bytes()))
+        else {
+            return Err(PlatformError::unauthorized("invalid token"));
+        };
+        if token.is_expired(now) {
+            return Err(PlatformError::unauthorized("token expired"));
+        }
+        if token
+            .max_uses
+            .is_some_and(|max_uses| token.uses >= max_uses)
+        {
+            return Err(PlatformError::unauthorized("token exhausted"));
+        }
         Ok(())
     }
 
@@ -206,7 +232,13 @@ impl DeployTokenStore {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|error| PlatformError::internal(format!("token encode failed: {error}")))?;
         let temp_path = temp_store_path(&self.path);
-        let mut temp_file = tokio::fs::File::create(&temp_path).await.map_err(|error| {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut temp_file = options.open(&temp_path).await.map_err(|error| {
             PlatformError::internal(format!(
                 "failed to create token store {}: {error}",
                 temp_path.display()
@@ -236,6 +268,17 @@ impl DeployTokenStore {
         sync_parent_directory(&self.path).await?;
         Ok(())
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        diff |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    diff == 0
 }
 
 impl StoredDeployToken {
@@ -403,10 +446,10 @@ fn enforce_capabilities(
             "token is not allowed to configure internal tracing",
         ));
     }
-    if let Some(max_source_bytes) = capabilities.max_source_bytes {
-        if request.source.len() as u64 > max_source_bytes {
-            return Err(PlatformError::forbidden("token source byte limit exceeded"));
-        }
+    if let Some(max_source_bytes) = capabilities.max_source_bytes
+        && request.source.len() as u64 > max_source_bytes
+    {
+        return Err(PlatformError::forbidden("token source byte limit exceeded"));
     }
     if let Some(max_assets) = capabilities.max_assets {
         let asset_count = request
@@ -590,6 +633,7 @@ mod tests {
             source: "export default {}".to_string(),
             config: DeployConfig {
                 public: true,
+                cache: Default::default(),
                 bindings: vec![DeployBinding::Memory {
                     binding: "ROOM".to_string(),
                 }],
@@ -613,6 +657,7 @@ mod tests {
             source: "export default {}".to_string(),
             config: DeployConfig {
                 public: true,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
             assets: Vec::new(),
@@ -663,6 +708,7 @@ mod tests {
             source: "export default {}".to_string(),
             config: DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![DeployBinding::Service {
                     binding: "AUTH".to_string(),
                     service: "auth-worker".to_string(),
@@ -697,6 +743,7 @@ mod tests {
             source: "export default {}".to_string(),
             config: DeployConfig {
                 public: true,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
             assets: Vec::new(),

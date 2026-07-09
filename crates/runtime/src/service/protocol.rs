@@ -84,12 +84,12 @@ pub(super) fn parse_websocket_open_metadata(
     let key = internal_header_value(&output.headers, INTERNAL_WS_KEY_HEADER)
         .map(str::to_string)
         .ok_or_else(|| PlatformError::bad_request("missing websocket memory key metadata"))?;
-    if let Some(session_id) = internal_header_value(&output.headers, INTERNAL_WS_SESSION_HEADER) {
-        if session_id != expected_session_id {
-            return Err(PlatformError::bad_request(
-                "websocket session metadata mismatch",
-            ));
-        }
+    if let Some(session_id) = internal_header_value(&output.headers, INTERNAL_WS_SESSION_HEADER)
+        && session_id != expected_session_id
+    {
+        return Err(PlatformError::bad_request(
+            "websocket session metadata mismatch",
+        ));
     }
     Ok((handle, binding, key))
 }
@@ -150,12 +150,11 @@ pub(super) fn parse_transport_open_metadata(
         .ok_or_else(|| PlatformError::bad_request("missing transport memory key metadata"))?;
     if let Some(session_id) =
         internal_header_value(&output.headers, INTERNAL_TRANSPORT_SESSION_HEADER)
+        && session_id != expected_session_id
     {
-        if session_id != expected_session_id {
-            return Err(PlatformError::bad_request(
-                "transport session metadata mismatch",
-            ));
-        }
+        return Err(PlatformError::bad_request(
+            "transport session metadata mismatch",
+        ));
     }
     Ok((handle, binding, key))
 }
@@ -201,7 +200,7 @@ pub(super) fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent
         let extractor = TraceparentExtractor(traceparent);
         let parent = propagator.extract(&extractor);
         if parent.span().span_context().is_valid() {
-            span.set_parent(parent);
+            let _ = span.set_parent(parent);
         }
     });
 }

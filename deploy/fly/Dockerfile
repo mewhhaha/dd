@@ -1,4 +1,4 @@
-FROM rust:1-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -25,7 +25,7 @@ COPY crates ./crates
 
 RUN cargo build --locked --profile dist -p dd_server
 
-FROM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 WORKDIR /app
 ENV BIND_PUBLIC_ADDR=0.0.0.0:8080
@@ -35,7 +35,8 @@ ENV RUST_LOG=info
 
 VOLUME ["/app/store"]
 
-COPY --from=builder /workspace/target/dist/dd_server /app/dd_server
+COPY --from=builder --chown=nonroot:nonroot /workspace/target/dist/dd_server /app/dd_server
 
 EXPOSE 8080
+USER nonroot:nonroot
 CMD ["/app/dd_server"]

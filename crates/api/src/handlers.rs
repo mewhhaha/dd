@@ -17,16 +17,16 @@ use common::{
 };
 use futures_util::StreamExt;
 #[cfg(feature = "websocket")]
-use futures_util::{stream::SplitSink, SinkExt};
+use futures_util::{SinkExt, stream::SplitSink};
 use http::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING,
+    AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue, TRANSFER_ENCODING,
     WWW_AUTHENTICATE,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body::Body as HttpBody;
-use http_body_util::combinators::BoxBody;
 #[cfg(feature = "websocket")]
 use http_body_util::Empty;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 #[cfg(feature = "websocket")]
@@ -44,11 +44,11 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use tokio::sync::mpsc;
 #[cfg(feature = "websocket")]
+use tokio_tungstenite::WebSocketStream;
+#[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::handshake::server::create_response as create_ws_response;
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
-#[cfg(feature = "websocket")]
-use tokio_tungstenite::WebSocketStream;
 use tracing::Span;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -62,9 +62,6 @@ pub type ResponseBody = BoxBody<Bytes, BoxError>;
 pub struct ApiError(pub PlatformError);
 
 const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
-const HEADER_CACHE: &str = "x-dd-cache";
-const HEADER_CACHE_FALLBACK: &str = "x-dd-cache-fallback";
-const HEADER_CACHE_BYPASS_STALE: &str = "x-dd-cache-bypass-stale";
 #[cfg(feature = "otel")]
 const HEADER_TRACE_ID: &str = "x-dd-trace-id";
 #[cfg(feature = "websocket")]
@@ -161,22 +158,23 @@ use self::util::empty_body;
 use self::util::inject_current_trace_context;
 pub(crate) use self::util::{annotate_response_with_trace_id, full_body};
 use self::util::{
-    bearer_token_from_headers, json_response, private_auth_response, private_request_is_authorized,
-    private_route_requires_auth, public_route_is_reserved, read_json_body, respond,
-    set_span_parent_from_http_headers, validate_deploy_bindings, validate_internal_config,
+    append_safe_worker_headers, bearer_token_from_headers, json_response, private_auth_response,
+    private_request_is_authorized, private_route_requires_auth, public_route_is_reserved,
+    read_json_body, respond, set_span_parent_from_http_headers, validate_deploy_bindings,
+    validate_internal_config, validate_worker_name,
+};
+use self::websocket::{
+    PreparedWebSocketUpgrade, invoke_worker_websocket_private, invoke_worker_websocket_public,
+    is_websocket_upgrade, prepare_websocket_upgrade,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use self::websocket::{
     handle_websocket_session, open_transport_session_from_parts, open_websocket_session_from_parts,
     sanitize_websocket_handshake_headers,
 };
-use self::websocket::{
-    invoke_worker_websocket_private, invoke_worker_websocket_public, is_websocket_upgrade,
-    prepare_websocket_upgrade, PreparedWebSocketUpgrade,
-};
 #[cfg(test)]
 mod tests {
-    use super::util::private_token_matches;
+    use super::util::{append_safe_worker_headers, private_token_matches, validate_worker_name};
     use super::{
         build_public_request_url, parse_invoke_request_uri, parse_worker_from_host, read_json_body,
         validate_deploy_bindings, validate_internal_config,
@@ -187,8 +185,8 @@ mod tests {
     use http::{HeaderMap, Request};
     use http_body_util::StreamBody;
     use hyper::body::Frame;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn read_json_body_rejects_oversized_stream_before_polling_rest() {
@@ -280,6 +278,42 @@ mod tests {
             },
         ];
         assert!(validate_deploy_bindings(&bindings).is_err());
+    }
+
+    #[test]
+    fn unsafe_worker_and_binding_names_are_rejected() {
+        assert!(validate_worker_name("valid-worker").is_ok());
+        assert!(validate_worker_name("Uppercase").is_err());
+        assert!(validate_worker_name("-leading").is_err());
+        assert!(validate_worker_name("trailing-").is_err());
+        assert!(
+            validate_deploy_bindings(&[DeployBinding::Kv {
+                binding: "__proto__".to_string(),
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_response_headers_cannot_control_transport_or_internal_metadata() {
+        let mut headers = HeaderMap::new();
+        append_safe_worker_headers(
+            &mut headers,
+            vec![
+                ("connection".to_string(), "x-remove".to_string()),
+                ("x-remove".to_string(), "bad".to_string()),
+                ("content-length".to_string(), "999".to_string()),
+                ("transfer-encoding".to_string(), "chunked".to_string()),
+                ("x-dd-cache".to_string(), "HIT".to_string()),
+                ("set-cookie".to_string(), "a=b".to_string()),
+            ],
+        );
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-remove"));
+        assert!(!headers.contains_key("content-length"));
+        assert!(!headers.contains_key("transfer-encoding"));
+        assert!(!headers.contains_key("x-dd-cache"));
+        assert_eq!(headers.get("set-cookie").expect("cookie"), "a=b");
     }
 
     #[test]

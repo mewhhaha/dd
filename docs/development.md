@@ -304,8 +304,8 @@ Patch files under `./patches` are audit and refresh artifacts. Keep them in sync
 
 ```bash
 just patch deno_crypto
-just patch-save deno_crypto 0.255.0
-just patch-refresh deno_crypto 0.255.0
+just patch-save deno_crypto 0.268.0
+just patch-refresh deno_crypto 0.268.0
 ```
 
 ## Library embedding

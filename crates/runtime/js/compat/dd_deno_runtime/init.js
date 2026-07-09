@@ -32,9 +32,9 @@ import {
 import { URLPattern } from "ext:deno_web/01_urlpattern.js";
 import { performance } from "ext:deno_web/15_performance.js";
 import {
-  crypto,
   Crypto,
   CryptoKey,
+  getCrypto,
   SubtleCrypto,
 } from "ext:deno_crypto/00_crypto.js";
 import { Headers } from "ext:deno_fetch/20_headers.js";
@@ -43,8 +43,7 @@ import { Request } from "ext:deno_fetch/23_request.js";
 import { Response } from "ext:deno_fetch/23_response.js";
 import { fetch } from "ext:deno_fetch/26_fetch.js";
 
-Object.defineProperty(globalThis, "__dd_deno_runtime", {
-  value: {
+const ddRuntime = {
     AbortController,
     AbortSignal,
     Blob,
@@ -73,12 +72,19 @@ Object.defineProperty(globalThis, "__dd_deno_runtime", {
     URLPattern,
     URLSearchParams,
     WritableStream,
-    crypto,
     fetch,
     performance,
     reportError,
     structuredClone,
-  },
+};
+
+Object.defineProperty(ddRuntime, "crypto", {
+  get: getCrypto,
+  enumerable: true,
+});
+
+Object.defineProperty(globalThis, "__dd_deno_runtime", {
+  value: ddRuntime,
   configurable: true,
   writable: true,
 });

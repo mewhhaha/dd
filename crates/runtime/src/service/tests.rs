@@ -464,13 +464,17 @@ export default {
         include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
     assert!(worker_runtime_source.contains("__dd_install_host_fetch"));
     assert!(worker_runtime_source.contains("value: function installHostFetch()"));
-    assert!(worker_runtime_source
-        .contains("const installHostFetch = globalThis.__dd_install_host_fetch"));
+    assert!(
+        worker_runtime_source
+            .contains("const installHostFetch = globalThis.__dd_install_host_fetch")
+    );
     assert!(!worker_runtime_source.contains("const installHostFetch = () =>"));
     assert!(worker_runtime_source.contains("__dd_get_cache_bypass_stale"));
     assert!(worker_runtime_source.contains("cacheBypassStale,"));
     assert!(!worker_runtime_source.contains("globalThis.__dd_get_runtime_request_id ="));
-    assert!(!worker_runtime_source.contains("globalThis.__dd_get_runtime_request_context_handle ="));
+    assert!(
+        !worker_runtime_source.contains("globalThis.__dd_get_runtime_request_context_handle =")
+    );
     assert!(!worker_runtime_source.contains("globalThis.__dd_sync_time_boundary ="));
     assert!(!worker_runtime_source.contains("globalThis.__dd_cache_bypass_stale ="));
     let bootstrap_source = include_str!("../../js/bootstrap.js");
@@ -1203,10 +1207,12 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
     assert!(asset.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("cache-control") && value == "public, max-age=60"
     }));
-    assert!(asset
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("x-host") && value == "foo"));
+    assert!(
+        asset
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-host") && value == "foo")
+    );
 
     let etag = asset
         .headers
@@ -1227,10 +1233,11 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
         .expect("asset should exist");
     assert_eq!(head.status, 200);
     assert!(head.body.is_empty());
-    assert!(head
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("x-splat") && value == "b.css"));
+    assert!(
+        head.headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-splat") && value == "b.css")
+    );
 
     let not_modified = service
         .resolve_asset(
@@ -1283,6 +1290,7 @@ export default {
             .to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
         )
@@ -1309,6 +1317,7 @@ export default {
             .to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![DeployBinding::Service {
                     binding: "AUTH".to_string(),
                     service: "private-auth".to_string(),
@@ -1536,10 +1545,12 @@ async fn temporary_worker_expires_while_runtime_is_running() {
         )
         .await
         .expect("temporary deploy should succeed");
-    assert!(service
-        .resolve_asset("preview-live", "GET", None, "/a.js", &[],)
-        .expect("asset lookup before expiry should succeed")
-        .is_some());
+    assert!(
+        service
+            .resolve_asset("preview-live", "GET", None, "/a.js", &[],)
+            .expect("asset lookup before expiry should succeed")
+            .is_some()
+    );
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -1551,10 +1562,12 @@ async fn temporary_worker_expires_while_runtime_is_running() {
     })
     .await
     .expect("temporary worker should expire");
-    assert!(service
-        .resolve_asset("preview-live", "GET", None, "/a.js", &[],)
-        .expect("asset lookup after expiry should succeed")
-        .is_none());
+    assert!(
+        service
+            .resolve_asset("preview-live", "GET", None, "/a.js", &[],)
+            .expect("asset lookup after expiry should succeed")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1571,9 +1584,11 @@ async fn invalid_asset_headers_fail_deploy() {
         )
         .await
         .expect_err("deploy should fail");
-    assert!(error
-        .to_string()
-        .contains("must be `Name: value` or `! Name`"));
+    assert!(
+        error
+            .to_string()
+            .contains("must be `Name: value` or `! Name`")
+    );
 }
 
 #[tokio::test]
@@ -2905,7 +2920,7 @@ async fn dynamic_worker_fetch_uses_deno_fetch_with_host_policy_and_secret_replac
         .deploy_dynamic(
             dynamic_fetch_probe_worker(&format!("http://{address}/fetch-probe")),
             HashMap::from([("API_TOKEN".to_string(), "secret-value".to_string())]),
-            vec![address.to_string()],
+            vec![format!("private:{address}")],
         )
         .await
         .expect("dynamic deploy should succeed");
@@ -3585,10 +3600,12 @@ export default {
         .await
         .expect("invoke stream should succeed");
     assert_eq!(output.status, 201);
-    assert!(output
-        .headers
-        .iter()
-        .any(|(name, value)| name == "x-mode" && value == "stream"));
+    assert!(
+        output
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-mode" && value == "stream")
+    );
 
     let mut body = Vec::new();
     while let Some(chunk) = output.body.recv().await {
@@ -3835,6 +3852,7 @@ async fn async_context_store_survives_promise_boundaries_and_nested_runs() {
             async_context_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: Vec::new(),
             },
@@ -3912,6 +3930,45 @@ async fn cache_default_reuses_response() {
 
     assert_eq!(String::from_utf8(one.body).expect("utf8"), "cache:1");
     assert_eq!(String::from_utf8(two.body).expect("utf8"), "cache:1");
+}
+
+#[tokio::test]
+#[serial]
+async fn cache_names_are_isolated_by_worker() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy("cache-owner-a".to_string(), cache_worker("shared", "A"))
+        .await
+        .expect("deploy a should succeed");
+    service
+        .deploy("cache-owner-b".to_string(), cache_worker("shared", "B"))
+        .await
+        .expect("deploy b should succeed");
+
+    let a = service
+        .invoke(
+            "cache-owner-a".to_string(),
+            test_invocation_with_path("/", "cache-owner-a-1"),
+        )
+        .await
+        .expect("worker a should succeed");
+    let b = service
+        .invoke(
+            "cache-owner-b".to_string(),
+            test_invocation_with_path("/", "cache-owner-b-1"),
+        )
+        .await
+        .expect("worker b should succeed");
+
+    assert_eq!(String::from_utf8(a.body).expect("utf8"), "A:1");
+    assert_eq!(String::from_utf8(b.body).expect("utf8"), "B:1");
 }
 
 #[tokio::test]
@@ -4209,8 +4266,10 @@ fn worker_invocation_uses_typed_request_handle_runtime_entrypoint() {
     assert!(engine_source.contains("HttpPreparedBodies"));
     assert!(api_invocation_source.contains("tx.send(Ok(chunk))"));
     assert!(!api_invocation_source.contains("tx.send(Ok(chunk.to_vec()))"));
-    assert!(request_types_source
-        .contains("pub type RequestBodyChunk = std::result::Result<Bytes, String>"));
+    assert!(
+        request_types_source
+            .contains("pub type RequestBodyChunk = std::result::Result<Bytes, String>")
+    );
     assert!(request_types_source.contains("bodies: HashMap<u32, Bytes>"));
     assert!(request_ops_source.contains(".insert(bytes)"));
     assert!(storage_http_source.contains("#[buffer] body: JsBuffer"));
@@ -4397,14 +4456,20 @@ fn response_headers_are_prepared_handles_for_lifecycle_ops() {
     let completion_source = &storage_http_source[completion_start..completion_end];
 
     assert!(worker_runtime_source.contains("op_http_store_prepared_headers"));
-    assert!(worker_runtime_source
-        .contains("headersHandle: streamResponse ? 0 : storeResponseHeaders(headers)"));
-    assert!(worker_runtime_source
-        .contains("Math.max(0, Math.trunc(Number(result.headersHandle ?? 0) || 0))"));
+    assert!(
+        worker_runtime_source
+            .contains("headersHandle: streamResponse ? 0 : storeResponseHeaders(headers)")
+    );
+    assert!(
+        worker_runtime_source
+            .contains("Math.max(0, Math.trunc(Number(result.headersHandle ?? 0) || 0))")
+    );
     assert!(worker_runtime_source.contains("bodyHandle: 0"));
     assert!(worker_runtime_source.contains("result.bodyHandle = callOp("));
-    assert!(worker_runtime_source
-        .contains("Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0))"));
+    assert!(
+        worker_runtime_source
+            .contains("Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0))")
+    );
     assert!(!worker_runtime_source.contains("result.body = concatByteChunks"));
     assert!(!worker_runtime_source.contains("result.body == null"));
     assert!(request_types_source.contains("pub struct HttpPreparedHeaders"));
@@ -4588,8 +4653,10 @@ fn vite_dev_websocket_bridge_waits_for_runtime_frames_without_interval_polling()
     assert!(dev_runtime_source.contains("WaitWebsocketFrame"));
     assert!(dev_runtime_source.contains("websocket_wait_frame"));
     assert!(dev_runtime_source.contains("mpsc::channel::<ResponseEnvelope<CommandResult>>"));
-    assert!(dev_runtime_source
-        .contains("matches!(&request.command, DevCommand::WaitWebsocketFrame { .. })"));
+    assert!(
+        dev_runtime_source
+            .contains("matches!(&request.command, DevCommand::WaitWebsocketFrame { .. })")
+    );
     assert!(dev_runtime_source.contains("tokio::spawn(async move"));
 }
 
@@ -4617,7 +4684,9 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
 
     assert!(model_source.contains("by_runtime_request_id: HashMap<String, PendingQueueKey>"));
     assert!(model_source.contains("by_target_isolate_id: HashMap<u64, HashSet<PendingQueueKey>>"));
-    assert!(model_source.contains("by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>"));
+    assert!(
+        model_source.contains("by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>")
+    );
     assert!(model_source.contains("by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>"));
     assert!(model_source.contains("memory_shard_affinity: HashMap<usize, u64>"));
     assert!(model_source.contains("memory_shards: BTreeMap<usize, MemoryShardQueue>"));
@@ -4646,8 +4715,10 @@ fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
     assert!(runtime_source_contains_fair_memory_dispatch());
     assert!(remove_isolate_source.contains("pool.queue.drain_target_isolate_id(isolate.id)"));
     assert!(remove_isolate_source.contains("pool.memory_shard_affinity"));
-    assert!(remove_isolate_source
-        .contains("self.account_dequeued_many(stale_targeted_count, stale_targeted_bytes)"));
+    assert!(
+        remove_isolate_source
+            .contains("self.account_dequeued_many(stale_targeted_count, stale_targeted_bytes)")
+    );
     assert!(
         remove_isolate_source.contains("PlatformError::runtime(\"target isolate is unavailable\")")
     );

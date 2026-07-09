@@ -6,9 +6,9 @@ use crate::handlers::{
 use crate::state::AppState;
 use bytes::Bytes;
 use common::{
-    DeployAsset, DeployBinding, DeployConfig, DeployRequest, DeployTokenCapabilities,
-    DeployTokenDeleteResponse, DeployTokenGetResponse, DeployTokenListResponse,
-    DeployTokenMintRequest, DeployTokenMintResponse, ErrorKind,
+    DeployAsset, DeployBinding, DeployCacheConfig, DeployConfig, DeployRequest,
+    DeployTokenCapabilities, DeployTokenDeleteResponse, DeployTokenGetResponse,
+    DeployTokenListResponse, DeployTokenMintRequest, DeployTokenMintResponse, ErrorKind,
 };
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
@@ -77,6 +77,68 @@ fn test_assets() -> Vec<DeployAsset> {
 
 #[tokio::test]
 #[serial]
+async fn opt_in_front_cache_bypasses_worker_after_first_response() {
+    let state = TestState::new("example.com").await;
+    deploy_worker(
+        state.app(),
+        DeployRequest {
+            name: "cached".to_string(),
+            source: r#"
+let count = 0;
+export default {
+  async fetch() {
+    count += 1;
+    return new Response(String(count), {
+      headers: { "cache-control": "public, max-age=60, stale-while-revalidate=30" },
+    });
+  },
+};
+"#
+            .to_string(),
+            config: DeployConfig {
+                public: true,
+                cache: DeployCacheConfig { enabled: true },
+                ..DeployConfig::default()
+            },
+            assets: Vec::new(),
+            server_modules: Vec::new(),
+            asset_headers: None,
+            temporary: false,
+        },
+    )
+    .await
+    .expect("deploy");
+
+    let invoke = || {
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "cached.example.com")
+            .body(Empty::<Bytes>::new())
+            .expect("request")
+    };
+    let first = invoke_worker_public(state.app(), invoke(), None)
+        .await
+        .expect("first invoke");
+    assert_eq!(first.headers().get("x-dd-cache").expect("cache"), "MISS");
+    assert_eq!(
+        first.into_body().collect().await.expect("body").to_bytes(),
+        Bytes::from_static(b"1")
+    );
+
+    let second = invoke_worker_public(state.app(), invoke(), None)
+        .await
+        .expect("second invoke");
+    assert_eq!(second.headers().get("x-dd-cache").expect("cache"), "HIT");
+    assert_eq!(
+        second.into_body().collect().await.expect("body").to_bytes(),
+        Bytes::from_static(b"1")
+    );
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn public_listener_requires_deploy_token() {
     let state = TestState::new("example.com").await;
     let request = Request::builder()
@@ -137,6 +199,7 @@ async fn private_admin_mints_scoped_deploy_token_for_public_deploy() {
             .to_string(),
         config: DeployConfig {
             public: true,
+            cache: Default::default(),
             bindings: vec![DeployBinding::Memory {
                 binding: "ROOM".to_string(),
             }],
@@ -204,6 +267,7 @@ async fn public_deploy_token_rejects_unscoped_binding() {
         source: "export default { async fetch() { return new Response('bad'); } }".to_string(),
         config: DeployConfig {
             public: true,
+            cache: Default::default(),
             bindings: vec![DeployBinding::Kv {
                 binding: "ROOM".to_string(),
             }],
@@ -309,6 +373,7 @@ async fn private_admin_lists_reads_and_deletes_tokens() {
         source: "export default { async fetch() { return new Response('bad'); } }".to_string(),
         config: DeployConfig {
             public: true,
+            cache: Default::default(),
             ..DeployConfig::default()
         },
         assets: Vec::new(),
@@ -340,6 +405,7 @@ async fn private_deploy_and_invoke_succeeds() {
         source: "export default { async fetch() { return new Response('ok'); } }".to_string(),
         config: DeployConfig {
             public: false,
+            cache: Default::default(),
             bindings: vec![],
             ..Default::default()
         },
@@ -424,6 +490,7 @@ async fn public_host_invoke_routes_by_subdomain() {
             "export default { async fetch() { return new Response('host-ok'); } }".to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 bindings: vec![],
                 ..Default::default()
             },
@@ -463,6 +530,7 @@ async fn public_router_allows_worker_paths_near_reserved_prefixes() {
                 .to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 bindings: vec![],
                 ..Default::default()
             },
@@ -508,6 +576,7 @@ async fn public_host_invoke_ignores_spoofed_forwarded_request_url() {
                 .to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 bindings: vec![],
                 ..Default::default()
             },
@@ -548,6 +617,7 @@ async fn public_host_invoke_rejects_private_worker_assets() {
             "export default { async fetch() { return new Response('private-ok'); } }".to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![],
                 ..Default::default()
             },
@@ -644,6 +714,7 @@ async fn public_host_invoke_serves_assets_for_public_workers() {
                 .to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
             test_assets(),
@@ -699,6 +770,7 @@ async fn public_host_asset_miss_falls_back_to_worker() {
                 .to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
             test_assets(),
@@ -746,6 +818,7 @@ async fn public_host_asset_catalog_swaps_on_redeploy_without_isolate_work() {
             "export default { async fetch() { return new Response('old-worker'); } }".to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
             vec![DeployAsset {
@@ -788,6 +861,7 @@ async fn public_host_asset_catalog_swaps_on_redeploy_without_isolate_work() {
             "export default { async fetch() { return new Response('new-worker'); } }".to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 ..DeployConfig::default()
             },
             vec![DeployAsset {
@@ -845,6 +919,7 @@ async fn private_websocket_route_rejects_non_memory_upgrade() {
             "export default { async fetch() { return new Response('ok'); } }".to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![],
                 ..Default::default()
             },
@@ -901,6 +976,7 @@ async fn public_websocket_route_rejects_non_memory_upgrade() {
             "export default { async fetch() { return new Response('ok'); } }".to_string(),
             DeployConfig {
                 public: true,
+                cache: Default::default(),
                 bindings: vec![],
                 ..Default::default()
             },

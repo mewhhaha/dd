@@ -921,6 +921,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                     op_state.put(kv_store.clone());
                     op_state.put(memory_store.clone());
                     op_state.put(cache_store.clone());
+                    op_state.put(crate::ops::WorkerCacheNamespace(worker_name.clone()));
                     op_state.put(open_handle_registry.clone());
                     op_state.put(crate::ops::HttpPreparedBodies::default());
                     op_state.put(crate::ops::HttpPreparedHeaders::default());
@@ -940,8 +941,8 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                     op_state.put(RuntimeFastCommandSender(runtime_fast_sender.clone()));
                     op_state.put(dynamic_profile.clone());
                 }
-                if !snapshot_preloaded {
-                    if let Err(error) =
+                if !snapshot_preloaded
+                    && let Err(error) =
                         crate::engine::load_worker_source(&mut js_runtime, &source).await
                     {
                         let _ = event_tx.send(RuntimeEvent::IsolateFailed {
@@ -952,7 +953,6 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                         }).await;
                         return;
                     }
-                }
                 if let Err(error) = cache_runtime_entrypoints(&mut js_runtime) {
                     let _ = event_tx.send(RuntimeEvent::IsolateFailed {
                         worker_name: worker_name.clone(),

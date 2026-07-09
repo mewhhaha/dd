@@ -15,11 +15,10 @@ mod storage;
 use crate::blob::{BlobStore, BlobStoreConfig};
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::engine::{
-    abort_worker_request_handle, build_bootstrap_snapshot, cache_runtime_entrypoints,
-    dispatch_worker_request, drain_dynamic_control_queue, ensure_v8_flags,
-    install_worker_deployment_config, new_runtime_from_snapshot,
+    WorkerDispatchRequest, abort_worker_request_handle, build_bootstrap_snapshot,
+    cache_runtime_entrypoints, dispatch_worker_request, drain_dynamic_control_queue,
+    ensure_v8_flags, install_worker_deployment_config, new_runtime_from_snapshot,
     new_runtime_from_snapshot_with_heap_limit, pump_event_loop_once, validate_worker,
-    WorkerDispatchRequest,
 };
 use crate::kv::KvStore;
 use crate::memory::{
@@ -27,17 +26,17 @@ use crate::memory::{
     MemoryProfileMetricKind, MemoryStore,
 };
 use crate::memory_rpc::{
-    decode_memory_invoke_request, decode_memory_invoke_response, encode_memory_invoke_request,
-    encode_memory_invoke_response, MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse,
+    MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse, decode_memory_invoke_request,
+    decode_memory_invoke_response, encode_memory_invoke_request, encode_memory_invoke_response,
 };
 use crate::ops::{
+    CacheRevalidatePayload, IsolateEventPayload, IsolateEventSender, MemoryInvokeEvent,
+    RequestBodyStreams, RequestExecutionContext, RequestExecutionContextInit,
     clear_request_body_stream, clear_request_secret_context, register_memory_request_scope,
-    register_request_body_stream, register_request_secret_context, CacheRevalidatePayload,
-    IsolateEventPayload, IsolateEventSender, MemoryInvokeEvent, RequestBodyStreams,
-    RequestExecutionContext, RequestExecutionContextInit,
+    register_request_body_stream, register_request_secret_context,
 };
 use crate::static_assets::{
-    compile_asset_bundle, resolve_asset, AssetBundle, AssetRequest, AssetResponse,
+    AssetBundle, AssetRequest, AssetResponse, compile_asset_bundle, resolve_asset,
 };
 use bytes::Bytes;
 use common::{
@@ -63,21 +62,21 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
-use tracing::{info, warn, Level};
+use tracing::{Level, info, warn};
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use self::config::{
-    build_dynamic_worker_config, extract_bindings, full_dynamic_internal_policy,
-    validate_runtime_config, DeployBindings, ValidatedDynamicWorkerPolicy,
-    MAX_DYNAMIC_HOST_RPC_ARG_BYTES, MAX_DYNAMIC_HOST_RPC_METHODS, MAX_DYNAMIC_HOST_RPC_REPLY_BYTES,
+    DeployBindings, MAX_DYNAMIC_HOST_RPC_ARG_BYTES, MAX_DYNAMIC_HOST_RPC_METHODS,
+    MAX_DYNAMIC_HOST_RPC_REPLY_BYTES, ValidatedDynamicWorkerPolicy, build_dynamic_worker_config,
+    extract_bindings, full_dynamic_internal_policy, validate_runtime_config,
 };
 use self::control::RuntimeEvent;
 use self::sessions::{
-    memory_outbox_worker_channel, run_memory_outbox_worker, MemoryOutboxDrainSender,
+    MemoryOutboxDrainSender, memory_outbox_worker_channel, run_memory_outbox_worker,
 };
 type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
 type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
@@ -129,6 +128,7 @@ struct AssetCatalogEntry {
     generation: u64,
     assets: Arc<AssetBundle>,
     public: bool,
+    cache_enabled: bool,
 }
 pub(crate) use self::isolate::*;
 pub(crate) use self::model::DynamicQuotaState;
@@ -136,7 +136,7 @@ use self::model::*;
 use self::protocol::*;
 use self::runtime::*;
 use self::storage::{
-    delete_worker_deployment, epoch_ms_i64, persist_worker_deployment, PersistWorkerDeployment,
+    PersistWorkerDeployment, delete_worker_deployment, epoch_ms_i64, persist_worker_deployment,
 };
 
 const INTERNAL_HEADER: &str = "x-dd-internal";

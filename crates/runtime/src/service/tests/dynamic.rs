@@ -356,18 +356,24 @@ async fn dynamic_fast_fetch_preserves_request_response_shape_and_records_direct_
     .await;
     assert_eq!(parity.status, 207);
     assert_eq!(parity.body, binary_body);
-    assert!(parity
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("x-method") && value == "POST"));
-    assert!(parity
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("x-query") && value == "hello"));
-    assert!(parity
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("x-test") && value == "alpha"));
+    assert!(
+        parity
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-method") && value == "POST")
+    );
+    assert!(
+        parity
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-query") && value == "hello")
+    );
+    assert!(
+        parity
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-test") && value == "alpha")
+    );
 
     let metrics_output = invoke_with_timeout_and_dump(
         &service,
@@ -1198,11 +1204,13 @@ export default {
         String::from_utf8(output.body).expect("utf8"),
         r#"{"ok":true}"#
     );
-    assert!(output
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
-            && value == "application/json"));
+    assert!(
+        output
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
+                && value == "application/json")
+    );
 }
 
 #[tokio::test]
@@ -1516,6 +1524,7 @@ async fn dynamic_namespace_child_can_use_response_json() {
             dynamic_response_json_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Dynamic {
                     binding: "SANDBOX".to_string(),
@@ -1556,6 +1565,7 @@ async fn normal_and_dynamic_workers_expose_same_runtime_surface() {
             dynamic_runtime_surface_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Dynamic {
                     binding: "SANDBOX".to_string(),

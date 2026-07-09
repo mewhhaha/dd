@@ -1662,7 +1662,7 @@ pub(super) async fn op_memory_socket_send(
             return MemorySocketSendResult {
                 ok: false,
                 error: error.to_string(),
-            }
+            };
         }
     };
 
@@ -2182,9 +2182,11 @@ mod tests {
 
         let error =
             stage_memory_batch_mutation(&mut batch, mutation("overflow", 1)).expect_err("limit");
-        assert!(error
-            .to_string()
-            .contains("memory batch exceeded 1024 mutations"));
+        assert!(
+            error
+                .to_string()
+                .contains("memory batch exceeded 1024 mutations")
+        );
         assert_eq!(batch.mutations.len(), MEMORY_BATCH_MAX_MUTATIONS);
     }
 
@@ -2213,9 +2215,11 @@ mod tests {
             mutation("huge", MEMORY_BATCH_MAX_STAGED_BYTES),
         )
         .expect_err("oversized mutation should fail");
-        assert!(error
-            .to_string()
-            .contains("memory batch staged data exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("memory batch staged data exceeded")
+        );
         assert_eq!(batch.staged_bytes, 0);
         assert!(batch.mutations.is_empty());
     }
@@ -2272,9 +2276,11 @@ mod tests {
             },
         )
         .expect_err("effect count limit should fail");
-        assert!(error
-            .to_string()
-            .contains("memory batch exceeded 256 effects"));
+        assert!(
+            error
+                .to_string()
+                .contains("memory batch exceeded 256 effects")
+        );
     }
 
     #[test]
@@ -2345,9 +2351,11 @@ mod tests {
         let error = handles
             .insert(7, Bytes::from_static(&[2]), 8)
             .expect_err("owner byte budget should reject overflow");
-        assert!(error
-            .to_string()
-            .contains("memory byte handles exceeded 8 bytes"));
+        assert!(
+            error
+                .to_string()
+                .contains("memory byte handles exceeded 8 bytes")
+        );
         assert_eq!(handles.owner_bytes(7), 8);
 
         handles
@@ -2377,9 +2385,11 @@ mod tests {
         let error = handles
             .insert(command_handle(7, 2), 2)
             .expect_err("third owner handle should fail");
-        assert!(error
-            .to_string()
-            .contains("memory command handles exceeded 2 active handles"));
+        assert!(
+            error
+                .to_string()
+                .contains("memory command handles exceeded 2 active handles")
+        );
         assert_eq!(handles.owner_count(7), 2);
 
         handles.remove(first).expect("first handle should remove");
@@ -2407,9 +2417,11 @@ mod tests {
         let error = handles
             .insert(empty_batch(7), 2)
             .expect_err("third owner batch should fail");
-        assert!(error
-            .to_string()
-            .contains("memory batch handles exceeded 2 active handles"));
+        assert!(
+            error
+                .to_string()
+                .contains("memory batch handles exceeded 2 active handles")
+        );
         assert_eq!(handles.owner_count(1), 2);
 
         handles.remove(first).expect("first batch should remove");

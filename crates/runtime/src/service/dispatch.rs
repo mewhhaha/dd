@@ -170,29 +170,28 @@ impl WorkerManager {
             return;
         }
 
-        if let Some(route) = memory_route.as_mut() {
-            if route.shard_index.is_none() {
-                route.shard_index = Some(
-                    self.memory_store
-                        .shard_index_for_key(&route.binding, &route.key),
-                );
-            }
+        if let Some(route) = memory_route.as_mut()
+            && route.shard_index.is_none()
+        {
+            route.shard_index = Some(
+                self.memory_store
+                    .shard_index_for_key(&route.binding, &route.key),
+            );
         }
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
-            if let Some(route) = &memory_route {
-                if !pool
+            if let Some(route) = &memory_route
+                && !pool
                     .memory_bindings
                     .iter()
                     .any(|binding| binding == &route.binding)
-                {
-                    let error = PlatformError::bad_request(format!(
-                        "unknown memory binding for worker {}: {}",
-                        worker_name, route.binding
-                    ));
-                    let _ = reply.send(Err(error.clone()));
-                    self.fail_stream_registration(&worker_name, &runtime_request_id, error);
-                    return;
-                }
+            {
+                let error = PlatformError::bad_request(format!(
+                    "unknown memory binding for worker {}: {}",
+                    worker_name, route.binding
+                ));
+                let _ = reply.send(Err(error.clone()));
+                self.fail_stream_registration(&worker_name, &runtime_request_id, error);
+                return;
             }
             let enqueued_at = Instant::now();
             pool.queue.push_back(PendingInvoke {
@@ -661,21 +660,20 @@ impl WorkerManager {
         }
         let mut target_generation = None;
         let mut target_isolate_id = None;
-        if payload.caller_worker_name == decoded.worker_name {
-            if let Some(pool) = self
+        if payload.caller_worker_name == decoded.worker_name
+            && let Some(pool) = self
                 .workers
                 .get(&decoded.worker_name)
                 .and_then(|entry| entry.pools.get(&payload.caller_generation))
+        {
+            target_generation = Some(payload.caller_generation);
+            if prefer_caller_isolate
+                && pool
+                    .isolates
+                    .iter()
+                    .any(|isolate| isolate.id == payload.caller_isolate_id)
             {
-                target_generation = Some(payload.caller_generation);
-                if prefer_caller_isolate
-                    && pool
-                        .isolates
-                        .iter()
-                        .any(|isolate| isolate.id == payload.caller_isolate_id)
-                {
-                    target_isolate_id = Some(payload.caller_isolate_id);
-                }
+                target_isolate_id = Some(payload.caller_isolate_id);
             }
         }
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -990,10 +988,10 @@ impl WorkerManager {
             let mut pending_reply = Some(pending_invoke.reply);
             let completion_token = next_runtime_token("done");
             let dispatched_at = Instant::now();
-            if let Some(registration) = self.stream_registrations.get_mut(&runtime_request_id) {
-                if registration.worker_name == worker_name {
-                    registration.completion_token = Some(completion_token.clone());
-                }
+            if let Some(registration) = self.stream_registrations.get_mut(&runtime_request_id)
+                && registration.worker_name == worker_name
+            {
+                registration.completion_token = Some(completion_token.clone());
             }
             let stream_response = self.stream_registrations.contains_key(&runtime_request_id);
             let mut send_failed = false;
@@ -1392,15 +1390,14 @@ impl WorkerManager {
         if clear_revalidation {
             self.clear_revalidation_for_request(request_id);
         }
-        if !stream_registered {
-            if let Ok(output) = &result {
-                if output.body.len() > self.config.max_response_body_bytes {
-                    result = Err(PlatformError::runtime(format!(
-                        "response body exceeded max_response_body_bytes ({} bytes)",
-                        self.config.max_response_body_bytes
-                    )));
-                }
-            }
+        if !stream_registered
+            && let Ok(output) = &result
+            && output.body.len() > self.config.max_response_body_bytes
+        {
+            result = Err(PlatformError::runtime(format!(
+                "response body exceeded max_response_body_bytes ({} bytes)",
+                self.config.max_response_body_bytes
+            )));
         }
         let complete_span = if info_tracing_enabled {
             let result_status = match &result {

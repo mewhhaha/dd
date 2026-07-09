@@ -62,6 +62,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
             source.to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings,
                 ..DeployConfig::default()
             },

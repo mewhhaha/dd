@@ -4358,14 +4358,18 @@ mod tests {
         .await?;
         store.set_profile_enabled(true);
 
-        assert!(store
-            .command_result("ns", "memory-a", "missing")
-            .await?
-            .is_none());
-        assert!(store
-            .command_result("ns", "memory-a", "missing")
-            .await?
-            .is_none());
+        assert!(
+            store
+                .command_result("ns", "memory-a", "missing")
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .command_result("ns", "memory-a", "missing")
+                .await?
+                .is_none()
+        );
         let profile = store.take_profile_snapshot_and_reset();
 
         assert_eq!(profile.store_connection_create.calls, 1);
@@ -4416,8 +4420,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_memory_connection_cap_blocks_new_database_checkout_without_leaking(
-    ) -> Result<()> {
+    async fn global_memory_connection_cap_blocks_new_database_checkout_without_leaking()
+    -> Result<()> {
         let store = Arc::new(
             MemoryStore::new_with_connection_limits(
                 temp_root("connection-global-cap"),
@@ -4736,12 +4740,16 @@ mod tests {
         store.snapshot("ns", &memory_b).await?;
 
         let cache = store.test_entity_cache_snapshot("ns", memory_a).await;
-        assert!(!cache
-            .snapshot_keys
-            .contains(&MemoryStore::memory_snapshot_key("ns", memory_a)));
-        assert!(cache
-            .snapshot_keys
-            .contains(&MemoryStore::memory_snapshot_key("ns", &memory_b)));
+        assert!(
+            !cache
+                .snapshot_keys
+                .contains(&MemoryStore::memory_snapshot_key("ns", memory_a))
+        );
+        assert!(
+            cache
+                .snapshot_keys
+                .contains(&MemoryStore::memory_snapshot_key("ns", &memory_b))
+        );
         assert_eq!(cache.snapshot_entries, 1);
         Ok(())
     }
@@ -5001,9 +5009,11 @@ mod tests {
                 .copied(),
             Some(LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION)
         );
-        assert!(!manifest
-            .namespace_shard_hash_versions
-            .contains_key("AUTH_STATE"));
+        assert!(
+            !manifest
+                .namespace_shard_hash_versions
+                .contains_key("AUTH_STATE")
+        );
         assert_eq!(
             store.shard_index_for_key("AUTH_STATE", &stable_key),
             stable_shard
@@ -5150,9 +5160,11 @@ mod tests {
 
         let error =
             expect_memory_store_new_error(root, 4, "higher shard files must not be ignored").await;
-        assert!(error
-            .to_string()
-            .contains("outside configured memory_namespace_shards=4"));
+        assert!(
+            error
+                .to_string()
+                .contains("outside configured memory_namespace_shards=4")
+        );
         Ok(())
     }
 
@@ -5166,9 +5178,11 @@ mod tests {
         let error =
             expect_memory_store_new_error(root.clone(), 16, "truncated manifest must fail startup")
                 .await;
-        assert!(error
-            .to_string()
-            .contains("failed to parse memory layout manifest"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse memory layout manifest")
+        );
         assert_eq!(std::fs::read(&path).map_err(memory_error)?, b"{");
         Ok(())
     }

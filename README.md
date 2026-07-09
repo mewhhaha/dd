@@ -143,7 +143,18 @@ export default {
 
 ## Cache API
 
-Cache API looks like worker-style response cache. Good for HTTP response reuse, not coordination.
+Cache API looks like worker-style response cache. Good for HTTP response reuse, not coordination. Cache namespaces are isolated per worker.
+
+The platform front cache is separate and opt-in. Set `config.cache.enabled` in `dd.json`/the deployment document, or pass `dd deploy --cache`. It caches only unauthenticated `GET`/`HEAD` responses that explicitly include `Cache-Control: public` and a positive `s-maxage` or `max-age`; `stale-while-revalidate` refreshes stale entries in the background.
+
+```json
+{
+  "config": {
+    "public": true,
+    "cache": { "enabled": true }
+  }
+}
+```
 
 Worker:
 
@@ -196,6 +207,8 @@ const child = await env.SANDBOX.get("agent:v1", async () => ({
   timeout: 2_500,
 }));
 ```
+
+Literal loopback, private, link-local, metadata, multicast, and documentation addresses are rejected even when listed. A trusted administrator can explicitly allow a private literal for local infrastructure with the `private:` prefix, for example `private:127.0.0.1:8080`; do not expose that capability to untrusted child configuration.
 
 If child needs parent callback, opt in explicitly:
 

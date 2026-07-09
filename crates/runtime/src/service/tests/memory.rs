@@ -20,6 +20,7 @@ async fn memory_same_key_atomic_commands_are_serialized() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -95,6 +96,7 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -164,6 +166,7 @@ async fn memory_exported_atomic_commands_do_not_target_busy_caller_isolates() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -232,6 +235,7 @@ async fn memory_atomic_callback_executes_once_for_cold_read() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -275,6 +279,7 @@ async fn memory_atomic_rejects_unsupported_storage_options() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -328,6 +333,7 @@ async fn memory_direct_operations_reject_unsupported_storage_options() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -379,6 +385,7 @@ async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -425,6 +432,7 @@ async fn memory_atomic_idempotency_key_replays_committed_result() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -499,6 +507,7 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -580,6 +589,7 @@ async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -662,6 +672,7 @@ async fn memory_atomic_idempotency_key_replays_read_only_result() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -743,6 +754,7 @@ async fn memory_atomic_can_emit_durable_effect_records() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -794,9 +806,11 @@ async fn memory_atomic_can_emit_durable_effect_records() {
     .expect("outbox effects should drain after response completion");
     assert_eq!(outbox.len(), 2);
     assert!(outbox.iter().all(|record| record.status == "delivered"));
-    assert!(outbox
-        .iter()
-        .all(|record| record.kind.starts_with("audit.")));
+    assert!(
+        outbox
+            .iter()
+            .all(|record| record.kind.starts_with("audit."))
+    );
     let _ = tokio::fs::remove_dir_all(root).await;
 }
 
@@ -829,6 +843,7 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -996,6 +1011,7 @@ async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() 
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1074,6 +1090,7 @@ async fn memory_storage_structured_value_roundtrip_works() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1134,6 +1151,7 @@ async fn memory_direct_write_visibility_roundtrip_works() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1202,6 +1220,7 @@ async fn memory_direct_writes_preserve_distinct_memory_updates() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1282,6 +1301,7 @@ async fn memory_coordinated_set_write_uses_owner_validated_batch_path() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1359,6 +1379,7 @@ async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1447,6 +1468,7 @@ async fn memory_owner_epoch_survives_runtime_restart() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1520,6 +1542,7 @@ async fn memory_direct_read_uses_point_read_lane() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1602,6 +1625,7 @@ async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
             memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1682,6 +1706,7 @@ async fn memory_multiple_atomic_reads_in_one_request_complete() {
             memory_multi_atomic_read_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1734,6 +1759,7 @@ async fn memory_multikey_direct_reads_complete_after_warmup() {
             memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1808,6 +1834,7 @@ async fn memory_multikey_coordinated_reads_complete_after_warmup() {
             memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1882,6 +1909,7 @@ async fn memory_coordinated_benchmark_worker_returns_correct_total() {
             memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -1944,6 +1972,7 @@ async fn memory_direct_writes_complete_past_repeated_worker_threshold() {
             memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2010,6 +2039,7 @@ async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
             memory_multi_key_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2107,6 +2137,7 @@ async fn memory_constructor_reads_hydrated_storage_snapshot_synchronously() {
             memory_constructor_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2206,6 +2237,7 @@ async fn hosted_memory_factories_share_state_and_module_globals() {
             hosted_memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2284,6 +2316,7 @@ async fn hosted_memory_allows_inline_closures() {
             hosted_memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2323,6 +2356,7 @@ async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
             hosted_memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2395,6 +2429,7 @@ async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_
             hosted_memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2479,6 +2514,7 @@ async fn hosted_memory_coordinated_snapshot_read_executes_once() {
             hosted_memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),
@@ -2551,6 +2587,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
             hosted_memory_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MY_MEMORY".to_string(),

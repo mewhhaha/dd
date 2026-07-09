@@ -22,15 +22,16 @@ kill_timeout = "30s"
 
 [http_service]
   internal_port = 8080
-  force_https = false
+  force_https = true
   auto_start_machines = true
   auto_stop_machines = false
   min_machines_running = 1
 
 [checks]
-  [checks.dd_tcp]
-    type = "tcp"
+  [checks.dd_http]
+    type = "http"
     port = 8080
+    path = "/healthz"
     interval = "15s"
     timeout = "2s"
     grace_period = "30s"

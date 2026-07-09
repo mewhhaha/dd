@@ -1,16 +1,16 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
-    stable_memory_shard_index, MemoryBatchMutation, MemoryStore, RuntimeConfig, RuntimeService,
-    RuntimeServiceConfig, RuntimeStorageConfig, WorkerDebugDump, WorkerStats,
+    MemoryBatchMutation, MemoryStore, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
+    RuntimeStorageConfig, WorkerDebugDump, WorkerStats, stable_memory_shard_index,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::time::{sleep, timeout, Instant as TokioInstant};
+use tokio::time::{Instant as TokioInstant, sleep, timeout};
 use uuid::Uuid;
 
 #[path = "bench_memory_storage/debug.rs"]
@@ -39,7 +39,7 @@ use self::workers::*;
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
 
-use bench_cli::{bench_arg_action, BenchArgAction};
+use bench_cli::{BenchArgAction, bench_arg_action};
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -549,6 +549,7 @@ async fn deploy_realworld_auth_worker(
             source.to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: vec![
                     DeployBinding::Kv {
                         binding: "AUTH_DB".to_string(),
@@ -595,7 +596,9 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  cargo run -p runtime --bin bench_memory_storage --release");
-    println!("  DD_BENCH_MODE=direct-read-memory cargo run -p runtime --bin bench_memory_storage --release");
+    println!(
+        "  DD_BENCH_MODE=direct-read-memory cargo run -p runtime --bin bench_memory_storage --release"
+    );
     println!();
     println!("This benchmark is configured with environment variables, not CLI flags.");
     println!();

@@ -27,7 +27,6 @@ const {
   URLPattern: DenoURLPattern,
   URLSearchParams: DenoURLSearchParams,
   WritableStream: DenoWritableStream,
-  crypto: denoCrypto,
   fetch: denoFetch,
   performance: denoPerformance,
   reportError,
@@ -299,7 +298,13 @@ function ensureCryptoGlobals() {
   define("Crypto", Crypto);
   define("CryptoKey", DenoCryptoKey);
   define("SubtleCrypto", SubtleCrypto);
-  define("crypto", denoCrypto);
+  Object.defineProperty(globalThis, "crypto", {
+    get() {
+      return globalThis.__dd_deno_runtime.crypto;
+    },
+    enumerable: false,
+    configurable: true,
+  });
 }
 
 function normalizeTimeBoundaryValue(value) {

@@ -18,7 +18,7 @@ pub struct WebSocketSession {
 pub struct AppState {
     pub runtime: RuntimeService,
     pub deploy_tokens: DeployTokenStore,
-    pub edge_revalidations: Arc<Mutex<HashSet<String>>>,
+    pub front_cache_revalidations: Arc<Mutex<HashSet<String>>>,
     pub invoke_max_body_bytes: usize,
     pub public_base_domain: String,
     pub private_bearer_token: Option<String>,
@@ -40,7 +40,7 @@ impl AppState {
         Self {
             runtime,
             deploy_tokens,
-            edge_revalidations: Arc::new(Mutex::new(HashSet::new())),
+            front_cache_revalidations: Arc::new(Mutex::new(HashSet::new())),
             invoke_max_body_bytes,
             public_base_domain: public_base_domain.trim().to_ascii_lowercase(),
             private_bearer_token,

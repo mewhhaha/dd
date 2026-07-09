@@ -39,6 +39,12 @@ where
     B::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let path = request.uri().path().to_string();
+    if request.method() == Method::GET && path == "/healthz" {
+        return Ok(json_response(
+            StatusCode::OK,
+            &serde_json::json!({"ok": true}),
+        )?);
+    }
     if private_route_requires_auth(&path)
         && !private_request_is_authorized(&state, request.headers())
     {
@@ -96,10 +102,17 @@ where
     B::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let path = request.uri().path().to_string();
+    if request.method() == Method::GET && path == "/healthz" {
+        return Ok(json_response(
+            StatusCode::OK,
+            &serde_json::json!({"ok": true}),
+        )?);
+    }
     if request.method() == Method::POST && path == "/v1/deploy" {
         let token = bearer_token_from_headers(request.headers())
             .ok_or_else(|| PlatformError::unauthorized("public deploy requires a token"))?
             .to_string();
+        state.deploy_tokens.preflight(&token).await?;
         let payload: DeployRequest =
             read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
         validate_deploy_request(&payload)?;
@@ -168,14 +181,11 @@ pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult
 }
 
 fn validate_deploy_request(payload: &DeployRequest) -> ApiResult<String> {
-    let name = payload.name.trim();
-    if name.is_empty() {
-        return Err(PlatformError::bad_request("Worker name must not be empty").into());
-    }
+    let name = validate_worker_name(&payload.name)?;
 
     validate_deploy_bindings(&payload.config.bindings)?;
     validate_internal_config(&payload.config.internal)?;
-    Ok(name.to_string())
+    Ok(name)
 }
 
 pub async fn mint_deploy_token(

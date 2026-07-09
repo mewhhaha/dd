@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -17,7 +17,7 @@ use uuid::Uuid;
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
 
-use bench_cli::{bench_arg_action, BenchArgAction};
+use bench_cli::{BenchArgAction, bench_arg_action};
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -386,7 +386,9 @@ fn print_help() {
     println!("  DD_BENCH_MAX_INFLIGHT          autoscaling max inflight per isolate (default 4)");
     println!("  DD_BENCH_SINGLE_MAX_INFLIGHT   single-isolate max inflight (default 1)");
     println!("  DD_BENCH_AUTOSCALING_ISOLATES  autoscaling config isolate limit (default 8)");
-    println!("  DD_BENCH_WRITE_REQUESTS        write requests per scenario (default min(requests, 5000))");
+    println!(
+        "  DD_BENCH_WRITE_REQUESTS        write requests per scenario (default min(requests, 5000))"
+    );
     println!("  DD_BENCH_WRITE_CONCURRENCY     write concurrency (default min(concurrency, 256))");
     println!("  DD_BENCH_PROFILE_KV            enable KV profile output");
 }
@@ -446,6 +448,7 @@ async fn run_config_scenario(
             scenario.worker_source.to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 bindings: if scenario.use_kv_binding {
                     vec![DeployBinding::Kv {
                         binding: "MY_KV".to_string(),

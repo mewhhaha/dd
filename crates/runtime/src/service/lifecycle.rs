@@ -79,8 +79,8 @@ impl WorkerManager {
             max_outbound_requests: None,
             dynamic_quota_state: None,
         });
-        if persist {
-            if let Err(error) = persist_worker_deployment(PersistWorkerDeployment {
+        if persist
+            && let Err(error) = persist_worker_deployment(PersistWorkerDeployment {
                 storage: &self.storage,
                 worker_name: &worker_name,
                 source: &source,
@@ -92,16 +92,16 @@ impl WorkerManager {
                 expires_at_ms,
             })
             .await
-            {
-                release_worker_source_modules(&worker_source);
-                return Err(error);
-            }
+        {
+            release_worker_source_modules(&worker_source);
+            return Err(error);
         }
         let asset_catalog_entry = AssetCatalogEntry {
             worker_name: worker_name.clone(),
             generation,
             assets: compiled_assets.clone(),
             public: config.public,
+            cache_enabled: config.cache.enabled,
         };
         let pool =
             WorkerPool {
@@ -479,14 +479,12 @@ impl WorkerManager {
                 .isolates
                 .iter_mut()
                 .find(|isolate| isolate.id == isolate_id)
+                && let Some(token) = isolate.pending_wait_until.get(request_id)
+                && token == completion_token
             {
-                if let Some(token) = isolate.pending_wait_until.get(request_id) {
-                    if token == completion_token {
-                        isolate.pending_wait_until.remove(request_id);
-                        if isolate.inflight_count == 0 && isolate.pending_wait_until.is_empty() {
-                            isolate.last_used_at = Instant::now();
-                        }
-                    }
+                isolate.pending_wait_until.remove(request_id);
+                if isolate.inflight_count == 0 && isolate.pending_wait_until.is_empty() {
+                    isolate.last_used_at = Instant::now();
                 }
             }
             pool.log_stats("wait_until_done");
@@ -915,10 +913,8 @@ impl WorkerManager {
                 removed = true;
             }
         }
-        if removed {
-            if let Some((isolate_id, startup)) = removed_slot {
-                self.track_exiting_isolate_slot(worker_name, generation, isolate_id, startup);
-            }
+        if removed && let Some((isolate_id, startup)) = removed_slot {
+            self.track_exiting_isolate_slot(worker_name, generation, isolate_id, startup);
         }
         if let Some(isolate_id) = removed_isolate_id {
             self.reap_owned_sessions(worker_name, Some(generation), Some(isolate_id));

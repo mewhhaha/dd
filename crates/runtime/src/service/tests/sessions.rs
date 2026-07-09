@@ -20,6 +20,7 @@ async fn transport_open_works_with_deno_request_compatibility() {
             transport_echo_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MEDIA".to_string(),
@@ -90,6 +91,7 @@ async fn transport_open_preserves_connect_shape_for_memory_namespace_code() {
             transport_shape_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MEDIA".to_string(),
@@ -134,6 +136,7 @@ async fn transport_wake_can_list_transport_handles_without_deadlock() {
             transport_values_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MEDIA".to_string(),
@@ -209,6 +212,7 @@ async fn transport_session_survives_idle_ttl_and_scales_down_after_close() {
             transport_echo_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MEDIA".to_string(),
@@ -283,6 +287,7 @@ async fn transport_session_reaped_when_owner_isolate_fails() {
             transport_echo_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "MEDIA".to_string(),
@@ -354,6 +359,7 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
             websocket_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -433,6 +439,7 @@ async fn websocket_wake_can_list_socket_handles_without_deadlock() {
             websocket_values_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -530,6 +537,7 @@ async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
             websocket_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -603,6 +611,7 @@ async fn websocket_session_reaped_when_owner_isolate_fails() {
             websocket_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -667,6 +676,7 @@ async fn websocket_session_survives_redeploy_while_old_generation_stays_live() {
 
     let deploy_config = DeployConfig {
         public: false,
+        cache: Default::default(),
         internal: DeployInternalConfig { trace: None },
         bindings: vec![DeployBinding::Memory {
             binding: "CHAT".to_string(),
@@ -748,6 +758,7 @@ async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
             websocket_socket_surface_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -791,6 +802,7 @@ async fn websocket_message_handler_can_close_handle_backed_socket() {
             websocket_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -854,6 +866,7 @@ async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() 
             websocket_storage_worker(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT".to_string(),
@@ -931,6 +944,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
             include_str!("../../../../../examples/chat-worker/src/worker.js").to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT_ROOM".to_string(),
@@ -1102,6 +1116,7 @@ async fn chat_worker_refresh_replaces_prior_participant_socket() {
             include_str!("../../../../../examples/chat-worker/src/worker.js").to_string(),
             DeployConfig {
                 public: false,
+                cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
                 bindings: vec![DeployBinding::Memory {
                     binding: "CHAT_ROOM".to_string(),

@@ -59,6 +59,7 @@ fn blackbox_public_h3_websocket_echoes_text_and_binary() {
             "#,
                         DeployConfig {
                             public: true,
+                            cache: Default::default(),
                             bindings: vec![DeployBinding::Memory {
                                 binding: "CHAT".to_string(),
                             }],
@@ -195,6 +196,7 @@ fn blackbox_public_h3_websocket_storage_on_message_does_not_close() {
             "#,
                         DeployConfig {
                             public: true,
+                            cache: Default::default(),
                             bindings: vec![DeployBinding::Memory {
                                 binding: "CHAT".to_string(),
                             }],
@@ -334,6 +336,7 @@ fn blackbox_public_h3_transport_echoes_stream() {
             "#,
                             DeployConfig {
                                 public: true,
+                                cache: Default::default(),
                                 bindings: vec![DeployBinding::Memory {
                                     binding: "MEDIA".to_string(),
                                 }],
@@ -809,9 +812,7 @@ impl RawQuicheH3Client {
         let flow_id = stream_id / 4;
         let mut datagram = encode_small_varint(flow_id);
         datagram.extend_from_slice(payload);
-        self.conn
-            .dgram_send_vec(datagram)
-            .expect("send h3 datagram");
+        self.conn.dgram_send(&datagram).expect("send h3 datagram");
         self.flush().await;
     }
 
@@ -825,9 +826,10 @@ impl RawQuicheH3Client {
                 "timed out waiting for h3 transport datagram"
             );
             self.pump_only(Duration::from_secs(2)).await;
-            match self.conn.dgram_recv_vec() {
-                Ok(bytes) => {
-                    let (flow_id, payload) = decode_small_varint(&bytes);
+            let mut bytes = vec![0; 65_535];
+            match self.conn.dgram_recv(&mut bytes) {
+                Ok(len) => {
+                    let (flow_id, payload) = decode_small_varint(&bytes[..len]);
                     if flow_id == expected_flow_id {
                         return payload.to_vec();
                     }

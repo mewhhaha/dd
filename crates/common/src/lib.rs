@@ -164,9 +164,17 @@ pub struct DeployConfig {
     #[serde(default)]
     pub public: bool,
     #[serde(default)]
+    pub cache: DeployCacheConfig,
+    #[serde(default)]
     pub bindings: Vec<DeployBinding>,
     #[serde(default)]
     pub internal: DeployInternalConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeployCacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -328,7 +336,7 @@ pub struct WorkerOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_non_empty_trimmed, DeployRequest};
+    use super::{DeployRequest, first_non_empty_trimmed};
 
     #[test]
     fn deploy_binding_rejects_legacy_actor_json_type() {

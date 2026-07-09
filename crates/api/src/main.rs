@@ -1,27 +1,27 @@
 use clap::Parser;
 use common::{
-    first_non_empty_trimmed, PlatformError, Result, DEFAULT_PRIVATE_BIND_ADDR,
-    DEFAULT_PUBLIC_BIND_ADDR,
+    DEFAULT_PRIVATE_BIND_ADDR, DEFAULT_PUBLIC_BIND_ADDR, PlatformError, Result,
+    first_non_empty_trimmed,
 };
 use dd_server::ServerConfig;
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TracerProvider as _;
 #[cfg(feature = "otel")]
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 #[cfg(feature = "otel")]
+use opentelemetry_sdk::Resource;
+#[cfg(feature = "otel")]
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 #[cfg(feature = "otel")]
-use opentelemetry_sdk::trace::TracerProvider as OTelTracerProvider;
-#[cfg(feature = "otel")]
-use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::SdkTracerProvider as OTelTracerProvider;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "dd_server")]
@@ -189,10 +189,12 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
     let endpoint = configured_otlp_http_traces_endpoint();
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", "dd-server"),
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-    ]);
+    let resource = Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new("service.name", "dd-server"),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        ])
+        .build();
     let mut provider_builder = OTelTracerProvider::builder().with_resource(resource);
 
     if let Some(endpoint) = endpoint {
@@ -204,8 +206,7 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
             .map_err(|error| {
                 PlatformError::internal(format!("otlp exporter init failed: {error}"))
             })?;
-        provider_builder =
-            provider_builder.with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
+        provider_builder = provider_builder.with_batch_exporter(exporter);
     }
 
     let provider = provider_builder.build();
@@ -272,9 +273,9 @@ fn otlp_http_traces_endpoint(endpoint: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::Cli;
     #[cfg(feature = "otel")]
     use super::otlp_http_traces_endpoint;
-    use super::Cli;
     use clap::Parser;
     use common::first_non_empty_trimmed;
 

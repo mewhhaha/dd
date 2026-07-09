@@ -493,10 +493,9 @@ impl MemoryShardQueue {
             .ready
             .front()
             .is_some_and(|candidate| candidate == owner_key)
+            && let Some(owner_key) = self.ready.pop_front()
         {
-            if let Some(owner_key) = self.ready.pop_front() {
-                self.ready.push_back(owner_key);
-            }
+            self.ready.push_back(owner_key);
         }
     }
 
@@ -2379,9 +2378,11 @@ mod tests {
         assert_eq!(queue.indexed_target_count(8), 1);
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 0);
         assert!(queue.remove_by_runtime_request_id("targeted-a").is_none());
-        assert!(queue
-            .remove_by_runtime_request_id("targeted-memory")
-            .is_none());
+        assert!(
+            queue
+                .remove_by_runtime_request_id("targeted-memory")
+                .is_none()
+        );
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
             Some("general".to_string())

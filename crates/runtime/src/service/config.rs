@@ -171,6 +171,7 @@ pub(super) fn build_dynamic_worker_config(
     }
     let bindings = extract_bindings(&DeployConfig {
         public: false,
+        cache: Default::default(),
         bindings,
         internal: Default::default(),
     })?;
@@ -293,6 +294,7 @@ fn is_valid_env_name(name: &str) -> bool {
 }
 
 fn is_valid_egress_host(host: &str) -> bool {
+    let host = host.strip_prefix("private:").unwrap_or(host);
     let host = match host.rsplit_once(':') {
         Some((left, right)) if right.chars().all(|char| char.is_ascii_digit()) => {
             let Ok(port) = right.parse::<u16>() else {

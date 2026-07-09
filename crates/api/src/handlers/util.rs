@@ -94,6 +94,7 @@ pub(super) fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(),
             | DeployBinding::Dynamic { binding }
             | DeployBinding::Service { binding, .. } => {
                 let normalized = binding.trim().to_string();
+                validate_binding_name(&normalized)?;
                 if !seen.insert(normalized.clone()) {
                     return Err(PlatformError::bad_request(format!(
                         "duplicate binding name: {normalized}"
@@ -103,6 +104,44 @@ pub(super) fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(),
         }
     }
 
+    Ok(())
+}
+
+pub(super) fn validate_worker_name(value: &str) -> Result<String, PlatformError> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 63
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !valid {
+        return Err(PlatformError::bad_request(
+            "worker name must be a lowercase DNS label of at most 63 characters",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_binding_name(value: &str) -> Result<(), PlatformError> {
+    let mut bytes = value.bytes();
+    let valid_start = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    let valid_rest = bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    let reserved = matches!(value, "__proto__" | "prototype" | "constructor");
+    if !valid_start || !valid_rest || value.len() > 128 || reserved {
+        return Err(PlatformError::bad_request(
+            "binding name must be a safe JavaScript identifier of at most 128 characters",
+        ));
+    }
     Ok(())
 }
 
@@ -133,7 +172,7 @@ pub(super) fn set_span_parent_from_http_headers(span: &Span, headers: &HeaderMap
     global::get_text_map_propagator(|propagator| {
         let parent = propagator.extract(&HttpHeaderExtractor(headers));
         if parent.span().span_context().is_valid() {
-            span.set_parent(parent);
+            let _ = span.set_parent(parent);
         }
     });
     #[cfg(not(feature = "otel"))]
@@ -151,6 +190,44 @@ pub(crate) fn inject_current_trace_context(headers: &mut Vec<(String, String)>) 
     }
     #[cfg(not(feature = "otel"))]
     let _ = headers;
+}
+
+pub(super) fn append_safe_worker_headers(target: &mut HeaderMap, source: Vec<(String, String)>) {
+    let connection_tokens = source
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<HashSet<_>>();
+
+    for (name, value) in source {
+        let normalized = name.trim().to_ascii_lowercase();
+        if normalized.starts_with("x-dd-")
+            || connection_tokens.contains(&normalized)
+            || matches!(
+                normalized.as_str(),
+                "connection"
+                    | "content-length"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "upgrade"
+            )
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            target.append(name, value);
+        }
+    }
 }
 
 pub(crate) fn annotate_response_with_trace_id(response: &mut Response<ResponseBody>) {
@@ -221,7 +298,13 @@ impl ApiError {
             ErrorKind::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = serde_json::to_vec(&ErrorBody::from_error(&self.0))
+        let public_error = if self.0.kind() == ErrorKind::Internal {
+            tracing::error!(error = %self.0, "internal request failure");
+            PlatformError::internal("internal server error")
+        } else {
+            self.0
+        };
+        let body = serde_json::to_vec(&ErrorBody::from_error(&public_error))
             .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
         let mut response = Response::builder()
             .status(status)

@@ -611,10 +611,10 @@ impl WorkerManager {
                     self.dynamic_profile
                         .record_direct_fetch_fast_path_fallback();
                     self.dynamic_profile.record_fallback_dispatch();
-                    if clear_preferred {
-                        if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
-                            entry.preferred_isolate_id = None;
-                        }
+                    if clear_preferred
+                        && let Some(entry) = self.dynamic_worker_handles.get_mut(&handle)
+                    {
+                        entry.preferred_isolate_id = None;
                     }
                     self.enqueue_invoke(
                         EnqueueInvokeRequest {
@@ -999,23 +999,23 @@ impl WorkerManager {
                 );
                 return;
             };
-            if let Some(policy) = &pool.dynamic_child_policy {
-                if !policy.allow_host_rpc {
-                    if let Some(quota_state) = &pool.dynamic_quota_state {
-                        quota_state.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.dynamic_profile.record_rpc_deny();
-                    self.finish_dynamic_reply(
-                        pending_replies,
-                        reply_id,
-                        crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
-                            PlatformError::bad_request(
-                                "dynamic child policy blocks host RPC; set allow_host_rpc: true",
-                            ),
-                        )),
-                    );
-                    return;
+            if let Some(policy) = &pool.dynamic_child_policy
+                && !policy.allow_host_rpc
+            {
+                if let Some(quota_state) = &pool.dynamic_quota_state {
+                    quota_state.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
                 }
+                self.dynamic_profile.record_rpc_deny();
+                self.finish_dynamic_reply(
+                    pending_replies,
+                    reply_id,
+                    crate::ops::DynamicPendingReplyPayload::HostRpc(Err(
+                        PlatformError::bad_request(
+                            "dynamic child policy blocks host RPC; set allow_host_rpc: true",
+                        ),
+                    )),
+                );
+                return;
             }
             pool.dynamic_rpc_bindings
                 .iter()
@@ -1208,10 +1208,10 @@ impl WorkerManager {
     }
 
     fn record_dynamic_rpc_deny_for_pool(&mut self, worker_name: &str, generation: u64) {
-        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-            if let Some(quota_state) = &pool.dynamic_quota_state {
-                quota_state.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(pool) = self.get_pool_mut(worker_name, generation)
+            && let Some(quota_state) = &pool.dynamic_quota_state
+        {
+            quota_state.rpc_deny_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
