@@ -46,8 +46,6 @@ jobs:
           node-version: 24
           cache: pnpm
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11.8.0
       - uses: extractions/setup-just@v3
       - run: pnpm install --frozen-lockfile
       - run: just check-js
@@ -68,8 +66,6 @@ jobs:
         with:
           node-version: 24
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11.8.0
       - run: cargo install cargo-audit --locked
       # Latest Deno 2.8 crates still pin Hickory 0.25 and RustCrypto RSA 0.9.
       # Re-evaluate on every Deno update; DNSSEC is disabled and worker RSA is
