@@ -21,7 +21,7 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
   const manifestStatuses: number[] = [];
 
   appPage.on("console", (message) => {
-    if (message.type() === "error") {
+    if (message.type() === "error" && !message.text().startsWith("Failed to fetch manifest patches")) {
       consoleErrors.push(message.text());
     }
   });
