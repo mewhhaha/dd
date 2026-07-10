@@ -55,7 +55,8 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
     const homeScrollAfterAdd = await appPage.evaluate(() => window.scrollY);
     const homeUrl = appPage.url();
 
-    await appPage.goto(`${appServer.base}/projects/runtime`, { waitUntil: "domcontentloaded" });
+    await appPage.getByRole("link", { name: "Runtime valley print" }).click();
+    await appPage.waitForURL(`${appServer.base}/projects/runtime`);
     await appPage.getByRole("heading", { name: "Runtime valley print" }).waitFor();
     await waitForImages(appPage);
     const detailAddButton = appPage.getByTestId("detail-add-to-cart");
