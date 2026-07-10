@@ -48,7 +48,7 @@ jobs:
         run: |
           mkdir -p packages/${{ matrix.package }}/bin
           cp target/dist/${{ matrix.binary }} packages/${{ matrix.package }}/bin/${{ matrix.binary }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.package }}
           path: packages/${{ matrix.package }}
@@ -74,7 +74,7 @@ jobs:
           path: target/dist
           format: spdx-json
           output-file: dd-linux-x64.spdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dd-linux-platform
           path: |

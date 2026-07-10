@@ -58,7 +58,7 @@ jobs:
             --results benchmarks/results/memory-smoke.json \
             --policy benchmarks/baselines/memory-scaling-policy.json \
             | tee "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: memory-smoke-benchmark
@@ -109,7 +109,7 @@ jobs:
             --baseline "${RUNNER_TEMP}/dd-baseline.json" \
             --candidate "${RUNNER_TEMP}/dd-candidate.json" \
             | tee "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: production-regression-benchmarks
