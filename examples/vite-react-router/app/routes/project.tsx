@@ -107,7 +107,7 @@ export default function Project({
             </div>
           </div>
 
-          <cartFetcher.Form className="grid gap-3 sm:grid-cols-[7rem_1fr]" method="post">
+          <cartFetcher.Form className="grid gap-3 sm:grid-cols-[7rem_1fr]" method="post" preventScrollReset>
             <input name="intent" type="hidden" value="add-to-cart" />
             <input name="slug" type="hidden" value={loaderData.product.slug} />
             <label className="grid gap-1 text-base/7 font-medium text-neutral-950 sm:text-sm/6">

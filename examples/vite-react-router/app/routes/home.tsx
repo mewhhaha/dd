@@ -138,7 +138,7 @@ export default function Home({ loaderData }: { loaderData: LoaderData }) {
                     <p className="text-base/7 font-medium tabular-nums text-neutral-950 sm:text-sm/6">
                       {product.price}
                     </p>
-                    <cartFetcher.Form action="/?index" method="post">
+                    <cartFetcher.Form action="/?index" method="post" preventScrollReset>
                       <input name="intent" type="hidden" value="add-to-cart" />
                       <input name="slug" type="hidden" value={product.slug} />
                       <input name="quantity" type="hidden" value="1" />
