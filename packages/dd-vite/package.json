@@ -49,7 +49,7 @@
     }
   },
   "optionalDependencies": {
-    "@mewhhaha/dd": "0.1.0"
+    "@mewhhaha/dd": "workspace:0.1.0"
   },
   "devDependencies": {
     "vite": "^8.1.3"

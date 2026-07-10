@@ -12,10 +12,10 @@
     "package.json"
   ],
   "optionalDependencies": {
-    "@mewhhaha/dd-darwin-arm64": "0.1.0",
-    "@mewhhaha/dd-darwin-x64": "0.1.0",
-    "@mewhhaha/dd-linux-arm64": "0.1.0",
-    "@mewhhaha/dd-linux-x64": "0.1.0",
-    "@mewhhaha/dd-win32-x64": "0.1.0"
+    "@mewhhaha/dd-darwin-arm64": "workspace:0.1.0",
+    "@mewhhaha/dd-darwin-x64": "workspace:0.1.0",
+    "@mewhhaha/dd-linux-arm64": "workspace:0.1.0",
+    "@mewhhaha/dd-linux-x64": "workspace:0.1.0",
+    "@mewhhaha/dd-win32-x64": "workspace:0.1.0"
   }
 }
