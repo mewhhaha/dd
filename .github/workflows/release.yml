@@ -23,10 +23,10 @@ jobs:
           - runner: ubuntu-24.04-arm
             package: dd-runtime-linux-arm64
             binary: dd_dev_runtime
-          - runner: macos-13
+          - runner: macos-15-intel
             package: dd-runtime-darwin-x64
             binary: dd_dev_runtime
-          - runner: macos-14
+          - runner: macos-15
             package: dd-runtime-darwin-arm64
             binary: dd_dev_runtime
           - runner: windows-2025

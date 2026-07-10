@@ -70,12 +70,13 @@ jobs:
     name: HTTP, memory, storage, limiter, and multi-worker regression
     runs-on: ubuntu-latest
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/dd-benchmark-target
       DD_BENCH_SAMPLES: ${{ inputs.samples || '3' }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
+      - name: Configure benchmark target directory
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/dd-benchmark-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
