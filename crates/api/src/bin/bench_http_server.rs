@@ -4,7 +4,7 @@ use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use runtime::{BlobStoreConfig, RuntimeConfig, RuntimeServiceConfig, RuntimeStorageConfig};
+use runtime::{RuntimeConfig, RuntimeServiceConfig, RuntimeStorageConfig};
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
@@ -743,7 +743,6 @@ async fn run_server_child() -> Result<(), String> {
         store_dir: store_dir.clone(),
         database_url: format!("file:{}/dd-http-bench.db", store_dir.display()),
         worker_store_enabled: false,
-        blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
         ..RuntimeStorageConfig::default()
     };
     let min_isolates = env_usize("DD_BENCH_MIN_ISOLATES", 8);

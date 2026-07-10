@@ -979,6 +979,39 @@ export default {
         .to_string()
 }
 
+pub(crate) fn websocket_stub_apply_worker() -> String {
+    r#"
+export function openSocket(state, payload) {
+  const handles = state.tvar("handles", []);
+  const { handle, response } = state.accept(payload.request);
+  handles.write([...handles.read().filter((value) => value !== handle), handle]);
+  return response;
+}
+
+export default {
+  async fetch(request, env) {
+    const room = env.CHAT.get(env.CHAT.idFromName("global"));
+    const url = new URL(request.url);
+    if (url.pathname === "/ws") {
+      return await room.atomic(openSocket, { request });
+    }
+    if (url.pathname === "/broadcast") {
+      const effects = await room.atomic((state) => state.tvar("handles", []).read().map((handle) => ({
+        type: "socket.send",
+        handle,
+        payload: "broadcast-ready",
+        kind: "text",
+      })));
+      await room.apply(effects);
+      return new Response(`sent:${effects.length}`);
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#
+    .to_string()
+}
+
 pub(crate) fn websocket_values_worker() -> String {
     r#"
 function room(env) {

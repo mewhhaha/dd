@@ -1,6 +1,15 @@
 use super::*;
 pub(super) fn private_route_requires_auth(path: &str) -> bool {
     path == "/v1/deploy"
+        || path == "/v1/admin/drain"
+        || path == "/v1/admin/resume"
+        || path == "/v1/admin/checkpoint"
+        || path == "/v1/admin/status"
+        || path == "/v1/admin/deployments"
+        || path == "/v1/admin/deployment"
+        || path == "/v1/admin/undeploy"
+        || path == "/v1/admin/rollback"
+        || path == "/metrics"
         || path == "/v1/admin/tokens"
         || path.starts_with("/v1/admin/tokens/")
         || path == "/v1/dynamic/deploy"
@@ -51,19 +60,15 @@ fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 pub(super) fn private_auth_response() -> Response<ResponseBody> {
+    let public_error = PlatformError::unauthorized("private control plane requires bearer auth");
+    let error_body = ErrorBody::from_error(&public_error).with_trace_id(current_trace_id());
     let mut response = Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "application/json")
         .header(WWW_AUTHENTICATE, "Bearer")
-        .body(full_body(
-            serde_json::to_vec(&ErrorBody {
-                ok: false,
-                error: "private control plane requires bearer auth".to_string(),
-            })
-            .unwrap_or_else(|_| {
-                b"{\"ok\":false,\"error\":\"private control plane requires bearer auth\"}".to_vec()
-            }),
-        ))
+        .body(full_body(serde_json::to_vec(&error_body).unwrap_or_else(
+            |_| b"{\"ok\":false,\"error\":\"private control plane requires bearer auth\"}".to_vec(),
+        )))
         .unwrap_or_else(|_| {
             Response::new(full_body(
                 b"{\"ok\":false,\"error\":\"private control plane requires bearer auth\"}".to_vec(),
@@ -231,22 +236,30 @@ pub(super) fn append_safe_worker_headers(target: &mut HeaderMap, source: Vec<(St
 }
 
 pub(crate) fn annotate_response_with_trace_id(response: &mut Response<ResponseBody>) {
+    let Some(trace_id) = current_trace_id() else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&trace_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(HEADER_TRACE_ID), value);
+    }
+}
+
+fn current_trace_id() -> Option<String> {
     #[cfg(feature = "otel")]
     {
         let context = Span::current().context();
         let span = context.span();
         let span_context = span.span_context();
-        if !span_context.is_valid() {
-            return;
-        }
-        if let Ok(value) = HeaderValue::from_str(&span_context.trace_id().to_string()) {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static(HEADER_TRACE_ID), value);
-        }
+        span_context
+            .is_valid()
+            .then(|| span_context.trace_id().to_string())
     }
     #[cfg(not(feature = "otel"))]
-    let _ = response;
+    {
+        None
+    }
 }
 
 #[cfg(feature = "otel")]
@@ -296,6 +309,7 @@ impl ApiError {
             ErrorKind::BadRequest | ErrorKind::Runtime => StatusCode::BAD_REQUEST,
             ErrorKind::NotFound => StatusCode::NOT_FOUND,
             ErrorKind::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let public_error = if self.0.kind() == ErrorKind::Internal {
@@ -304,8 +318,10 @@ impl ApiError {
         } else {
             self.0
         };
-        let body = serde_json::to_vec(&ErrorBody::from_error(&public_error))
-            .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
+        let body = serde_json::to_vec(
+            &ErrorBody::from_error(&public_error).with_trace_id(current_trace_id()),
+        )
+        .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
         let mut response = Response::builder()
             .status(status)
             .header("content-type", "application/json")
@@ -313,6 +329,11 @@ impl ApiError {
             .unwrap_or_else(|_| {
                 Response::new(full_body(b"{\"error\":\"internal error\"}".to_vec()))
             });
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+        }
         annotate_response_with_trace_id(&mut response);
         response
     }

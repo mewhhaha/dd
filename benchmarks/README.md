@@ -48,6 +48,15 @@ The runner records git, toolchain, and OS metadata; the parsed benchmark
 environment; raw stdout and stderr for every sample; exit status or signal;
 parsed result rows; and median summaries.
 
+Compare two clean, same-host runs with the production budgets (no more than 5%
+throughput loss or 10% p99 increase):
+
+```bash
+node benchmarks/compare-commits.mjs \
+  --baseline benchmarks/results/baseline.json \
+  --candidate benchmarks/results/candidate.json
+```
+
 Inspect the exact plan without spawning child processes or writing a result
 file:
 

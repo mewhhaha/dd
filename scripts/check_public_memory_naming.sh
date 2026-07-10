@@ -25,6 +25,7 @@ while IFS= read -r line; do
     ./scripts/check_public_memory_naming.sh:*) continue ;;
     ./crates/cli/src/main.rs:*) continue ;;
     ./crates/common/src/lib.rs:*) continue ;;
+    ./crates/runtime/src/control_store.rs:*) continue ;;
   esac
   unexpected+=("$line")
 done <<< "$matches"

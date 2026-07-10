@@ -1,8 +1,7 @@
 use base64::Engine;
 use common::{DeployConfig, ErrorKind, PlatformError, WorkerInvocation, WorkerOutput};
 use runtime::{
-    BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
-    WorkerStats,
+    RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, WorkerStats,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -188,7 +187,6 @@ async fn main() -> Result<(), String> {
             memory_db_max_total_connections: 512,
             memory_db_idle_ttl: Duration::from_secs(30),
             worker_store_enabled: false,
-            blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
         },
     })
     .await
@@ -445,6 +443,7 @@ fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::BadRequest => "bad_request",
         ErrorKind::NotFound => "not_found",
         ErrorKind::Overloaded => "overloaded",
+        ErrorKind::StorageUnavailable => "storage_unavailable",
         ErrorKind::Runtime => "runtime",
         ErrorKind::Internal => "internal",
     }

@@ -456,15 +456,31 @@ pub(crate) fn parse_egress_allow_host(allowed: &str) -> Option<EgressAllowHost> 
         Some(value) => (value, true),
         None => (allowed.as_str(), false),
     };
-    let (host, port) = match allowed.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|char| char.is_ascii_digit()) => {
-            let parsed = port.parse::<u16>().ok().filter(|port| *port > 0)?;
-            (host, Some(parsed))
+    let (host, port) = if let Some(bracketed) = allowed.strip_prefix('[') {
+        let closing = bracketed.find(']')?;
+        let host = &bracketed[..closing];
+        let suffix = &bracketed[closing + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let value = suffix.strip_prefix(':')?;
+            Some(value.parse::<u16>().ok().filter(|port| *port > 0)?)
+        };
+        let address = host.parse::<std::net::Ipv6Addr>().ok()?;
+        (address.to_string(), port)
+    } else if let Ok(address) = allowed.parse::<std::net::IpAddr>() {
+        (address.to_string(), None)
+    } else {
+        match allowed.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|char| char.is_ascii_digit()) => {
+                let parsed = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+                (host.to_string(), Some(parsed))
+            }
+            _ => (allowed.to_string(), None),
         }
-        _ => (allowed, None),
     };
     let (host, wildcard) = match host.strip_prefix("*.") {
-        Some(suffix) if !suffix.is_empty() => (suffix, true),
+        Some(suffix) if !suffix.is_empty() => (suffix.to_string(), true),
         Some(_) => return None,
         None => (host, false),
     };
@@ -472,7 +488,7 @@ pub(crate) fn parse_egress_allow_host(allowed: &str) -> Option<EgressAllowHost> 
         return None;
     }
     Some(EgressAllowHost {
-        host: host.to_string(),
+        host,
         wildcard,
         port,
         allow_private,

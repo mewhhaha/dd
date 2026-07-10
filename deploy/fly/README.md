@@ -41,6 +41,13 @@ Persistent data lives under `/app/store`:
 - KV and memory SQLite files
 - cache blobs and indexes
 
+The container starts through `dd_init`. On the first boot of a volume it repairs
+the store tree to UID/GID 65532, records `.dd-volume-ownership-v1`, drops all
+root and supplementary-group privileges, and then replaces itself with
+`dd_server`. Later boots validate the marker and skip the recursive repair.
+Fly checks `/readyz`, which fails during startup restoration and maintenance
+drains; `/healthz` remains the process liveness endpoint.
+
 ## 3) Configure private auth
 
 Set shared private token for both server and CLI/helpers:
@@ -58,7 +65,7 @@ count. Override these values for production capacity planning:
 
 ```bash
 flyctl secrets set \
-  DD_RUNTIME_MAX_GLOBAL_ISOLATES=1 \
+  DD_RUNTIME_MAX_GLOBAL_ISOLATES=2 \
   DD_RUNTIME_MAX_ISOLATES_PER_WORKER=8 \
   DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE=4 \
   DD_RUNTIME_MIN_ISOLATES_PER_WORKER=0 \
@@ -76,6 +83,10 @@ parallelism value bounds how many physical memory shards can claim, deliver, and
 ack durable effects at once. The memory DB connection values bound reusable
 per-database reader connections plus the single writer connection per active
 database slot.
+
+The Fly production image includes WebSockets and OTLP HTTP trace propagation.
+Direct HTTP/3 and WebTransport support remain an experimental opt-in Cargo
+feature and are not linked into this image.
 
 ## 4) Open private tunnel
 
@@ -209,8 +220,8 @@ PUBLIC_BASE_DOMAIN = "example.com"
 - delete token through tunnel: `just fly-worker-delete-token <token-name>`
 - deploy through public endpoint: `DD_TOKEN=... just fly-worker-public-deploy-config <app> <config>`
 - invoke private worker: `cargo run -p cli -- --server http://127.0.0.1:18081 invoke <name> --method GET --path /`
+- consistent volume snapshot: `DD_PRIVATE_TOKEN=... just fly-snapshot <app> <volume-id>`
 
-Internal escape hatch:
-
-- `just fly-worker-store-deploy ...` writes directly into persisted worker store and restarts machine
-- use only when normal private control plane path is unavailable
+The snapshot helper opens a private Fly proxy, drains writes, checkpoints every
+database, schedules the volume snapshot, and resumes the service even when an
+intermediate command fails.

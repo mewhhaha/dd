@@ -11,13 +11,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use turso::{Builder, Connection, Database, Value, transaction::TransactionBehavior};
 
 use crate::turso_util::{
-    VersionFloor, configure_turso_connection, execute_cached, is_retryable_turso_error,
-    query_cached,
+    VersionFloor, checkpoint_database, configure_turso_connection, ensure_storage_migration_table,
+    execute_cached, health_check_database, is_retryable_turso_error, query_cached,
+    record_storage_retry, record_storage_schema_version, storage_schema_version,
 };
 
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
 const KV_CONNECTION_LIMIT: usize = 32;
+const KV_SCHEMA_VERSION: i64 = 1;
 #[derive(Clone)]
 pub struct KvStore {
     database: Arc<Database>,
@@ -343,6 +345,9 @@ impl KvProfile {
     }
 
     pub fn record(&self, metric: KvProfileMetricKind, duration_us: u64, items: u64) {
+        if metric == KvProfileMetricKind::WriteRetry {
+            record_storage_retry();
+        }
         if !self.enabled() {
             return;
         }
@@ -793,11 +798,20 @@ impl KvWriterInner {
         const MAX_ATTEMPTS: usize = 8;
         let started = Instant::now();
         for attempt in 0..MAX_ATTEMPTS {
-            let mut tx = Some(
-                conn.transaction_with_behavior(TransactionBehavior::Immediate)
-                    .await
-                    .map_err(kv_error)?,
-            );
+            let tx = match conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+            {
+                Ok(tx) => tx,
+                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                    profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
+                    record_storage_retry();
+                    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
+                    continue;
+                }
+                Err(error) => return Err(kv_error_after_retry(error)),
+            };
+            let mut tx = Some(tx);
             let now_ms = epoch_ms_i64()?;
             let mut should_retry = false;
             for mutation in batch {
@@ -854,7 +868,7 @@ impl KvWriterInner {
                             should_retry = true;
                             break;
                         }
-                        return Err(kv_error(error));
+                        return Err(kv_error_after_retry(error));
                     }
                 }
             }
@@ -872,7 +886,7 @@ impl KvWriterInner {
                     tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
                     continue;
                 }
-                return Err(kv_error(error));
+                return Err(kv_error_after_retry(error));
             }
             profile.record(
                 KvProfileMetricKind::WriteFlush,
@@ -881,7 +895,7 @@ impl KvWriterInner {
             );
             return Ok(());
         }
-        Err(PlatformError::runtime(
+        Err(PlatformError::storage_unavailable(
             "kv background flush failed after retries",
         ))
     }
@@ -906,6 +920,11 @@ impl Drop for KvWriterInner {
 
 impl KvStore {
     pub async fn from_database_url(database_url: &str) -> Result<Self> {
+        let database = Self::open_database(database_url).await?;
+        Self::from_database(database).await
+    }
+
+    pub(crate) async fn open_database(database_url: &str) -> Result<Arc<Database>> {
         let local_path = database_url
             .strip_prefix("file:")
             .unwrap_or(database_url)
@@ -915,7 +934,11 @@ impl KvStore {
             .build()
             .await
             .map_err(kv_error)?;
-        let database = Arc::new(database);
+        Ok(Arc::new(database))
+    }
+
+    pub(crate) async fn from_database(database: Arc<Database>) -> Result<Self> {
+        migrate_kv_schema(&database).await?;
         let profile = Arc::new(KvProfile::default());
         let failed_versions = Arc::new(Mutex::new(HashSet::new()));
         let store = Self {
@@ -927,7 +950,6 @@ impl KvStore {
             writer: KvWriter::new(database, profile, Arc::clone(&failed_versions)),
             failed_versions,
         };
-        store.ensure_schema().await?;
         store.sync_version_counter_from_db().await?;
         Ok(store)
     }
@@ -953,6 +975,32 @@ impl KvStore {
 
     pub fn reset_profile(&self) {
         self.profile.reset();
+    }
+
+    pub(crate) async fn checkpoint(&self) -> Result<()> {
+        checkpoint_database(&self.database).await.map_err(kv_error)
+    }
+
+    pub(crate) async fn health_check(&self) -> Result<()> {
+        health_check_database(&self.database)
+            .await
+            .map_err(kv_error)?;
+        let conn = self.database.connect().map_err(kv_error)?;
+        configure_connection(&conn).await?;
+        let version = storage_schema_version(&conn, "kv")
+            .await
+            .map_err(kv_error)?;
+        if version != KV_SCHEMA_VERSION {
+            return Err(PlatformError::runtime(format!(
+                "kv error: schema version {version} is not ready; expected {KV_SCHEMA_VERSION}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_database_owner(&self, database: &Arc<Database>) -> bool {
+        Arc::ptr_eq(&self.database, database)
     }
 
     pub async fn get(
@@ -1238,42 +1286,9 @@ impl KvStore {
         Ok(out)
     }
 
+    #[cfg(test)]
     async fn ensure_schema(&self) -> Result<()> {
-        let conn = self.connect().await?;
-        conn.pragma_update("journal_mode", "'WAL'")
-            .await
-            .map_err(kv_error)?;
-        conn.pragma_update("synchronous", "'NORMAL'")
-            .await
-            .map_err(kv_error)?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS worker_kv (
-              worker_name TEXT NOT NULL,
-              binding TEXT NOT NULL,
-              key TEXT NOT NULL,
-              value TEXT NOT NULL,
-              value_blob BLOB,
-              encoding TEXT NOT NULL DEFAULT 'utf8',
-              deleted INTEGER NOT NULL DEFAULT 0,
-              version INTEGER NOT NULL,
-              updated_at_ms INTEGER NOT NULL,
-              PRIMARY KEY (worker_name, binding, key)
-            )",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        ensure_compat_columns(&conn).await?;
-        conn.execute("DROP INDEX IF EXISTS idx_worker_kv_lookup", ())
-            .await
-            .map_err(kv_error)?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_worker_kv_list ON worker_kv(worker_name, binding, deleted, key)",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        Ok(())
+        migrate_kv_schema(&self.database).await
     }
 
     async fn sync_version_counter_from_db(&self) -> Result<()> {
@@ -1334,6 +1349,97 @@ impl KvStore {
     }
 }
 
+async fn migrate_kv_schema(database: &Database) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 8;
+
+    let mut conn = database.connect().map_err(kv_error)?;
+    configure_connection(&conn).await?;
+    conn.pragma_update("journal_mode", "'WAL'")
+        .await
+        .map_err(kv_error)?;
+    let applied_at_ms = epoch_ms_i64()?;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let tx = match conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                sleep_kv_storage_retry(attempt).await;
+                continue;
+            }
+            Err(error) => return Err(kv_error_after_retry(error)),
+        };
+
+        match migrate_kv_schema_transaction(&tx, applied_at_ms).await {
+            Ok(()) => match tx.commit().await {
+                Ok(()) => return Ok(()),
+                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                    sleep_kv_storage_retry(attempt).await;
+                }
+                Err(error) => return Err(kv_error_after_retry(error)),
+            },
+            Err(error) => {
+                let retryable = is_retryable_turso_error(&error);
+                let _ = tx.rollback().await;
+                if retryable && attempt + 1 < MAX_ATTEMPTS {
+                    sleep_kv_storage_retry(attempt).await;
+                    continue;
+                }
+                return Err(kv_error_after_retry(error));
+            }
+        }
+    }
+
+    Err(PlatformError::storage_unavailable(
+        "kv error: schema migration failed after retries",
+    ))
+}
+
+async fn migrate_kv_schema_transaction(conn: &Connection, applied_at_ms: i64) -> turso::Result<()> {
+    ensure_storage_migration_table(conn).await?;
+    let applied_version = storage_schema_version(conn, "kv").await?;
+    if applied_version > KV_SCHEMA_VERSION {
+        return Err(turso::Error::Error(format!(
+            "unsupported kv schema version {applied_version}; maximum supported version is {KV_SCHEMA_VERSION}"
+        )));
+    }
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS worker_kv (
+          worker_name TEXT NOT NULL,
+          binding TEXT NOT NULL,
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          value_blob BLOB,
+          encoding TEXT NOT NULL DEFAULT 'utf8',
+          deleted INTEGER NOT NULL DEFAULT 0,
+          version INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          PRIMARY KEY (worker_name, binding, key)
+        )",
+        (),
+    )
+    .await?;
+    ensure_compat_columns(conn).await?;
+    conn.execute("DROP INDEX IF EXISTS idx_worker_kv_lookup", ())
+        .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_kv_list
+         ON worker_kv(worker_name, binding, deleted, key)",
+        (),
+    )
+    .await?;
+    record_storage_schema_version(conn, "kv", KV_SCHEMA_VERSION, applied_at_ms).await?;
+    Ok(())
+}
+
+async fn sleep_kv_storage_retry(attempt: usize) {
+    record_storage_retry();
+    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
+}
+
 fn normalize_encoding(raw: &str) -> String {
     match raw {
         ENCODING_UTF8 => ENCODING_UTF8.to_string(),
@@ -1353,33 +1459,40 @@ fn kv_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(format!("kv error: {error}"))
 }
 
-async fn configure_connection(conn: &Connection) -> Result<()> {
-    configure_turso_connection(conn, kv_error)
+fn kv_error_after_retry(error: turso::Error) -> PlatformError {
+    if is_retryable_turso_error(&error) {
+        PlatformError::storage_unavailable(format!("kv error: {error}"))
+    } else {
+        kv_error(error)
+    }
 }
 
-async fn ensure_compat_columns(conn: &Connection) -> Result<()> {
-    let mut rows = conn
-        .query("PRAGMA table_info(worker_kv)", ())
+async fn configure_connection(conn: &Connection) -> Result<()> {
+    configure_turso_connection(conn, kv_error)?;
+    conn.pragma_update("synchronous", "'FULL'")
         .await
         .map_err(kv_error)?;
+    Ok(())
+}
+
+async fn ensure_compat_columns(conn: &Connection) -> turso::Result<()> {
+    let mut rows = conn.query("PRAGMA table_info(worker_kv)", ()).await?;
     let mut columns = HashSet::new();
-    while let Some(row) = rows.next().await.map_err(kv_error)? {
-        let name: String = row.get::<String>(1).map_err(kv_error)?;
+    while let Some(row) = rows.next().await? {
+        let name: String = row.get::<String>(1)?;
         columns.insert(name);
     }
 
     if !columns.contains("value_blob") {
         conn.execute("ALTER TABLE worker_kv ADD COLUMN value_blob BLOB", ())
-            .await
-            .map_err(kv_error)?;
+            .await?;
     }
     if !columns.contains("encoding") {
         conn.execute(
             "ALTER TABLE worker_kv ADD COLUMN encoding TEXT NOT NULL DEFAULT 'utf8'",
             (),
         )
-        .await
-        .map_err(kv_error)?;
+        .await?;
     }
     Ok(())
 }
@@ -1549,6 +1662,198 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), store.connect())
             .await
             .expect("connection should become available after a guard is dropped")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_connections_use_full_synchronous_durability() -> Result<()> {
+        let path = temp_db_path("full-synchronous");
+        let store = test_store(&path).await?;
+        let conn = store.connect().await?;
+        let mut rows = conn
+            .query("PRAGMA synchronous", ())
+            .await
+            .map_err(kv_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(kv_error)?
+            .expect("synchronous row");
+        assert_eq!(row.get::<i64>(0).map_err(kv_error)?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_migrates_transactionally_and_preserves_version_floor() -> Result<()> {
+        let path = temp_db_path("legacy-schema");
+        ensure_parent_dir(&path)?;
+        let database = Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(kv_error)?;
+        let conn = database.connect().map_err(kv_error)?;
+        configure_connection(&conn).await?;
+        conn.execute(
+            "CREATE TABLE worker_kv (
+               worker_name TEXT NOT NULL,
+               binding TEXT NOT NULL,
+               key TEXT NOT NULL,
+               value TEXT NOT NULL,
+               deleted INTEGER NOT NULL DEFAULT 0,
+               version INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY (worker_name, binding, key)
+             )",
+            (),
+        )
+        .await
+        .map_err(kv_error)?;
+        conn.execute(
+            "INSERT INTO worker_kv
+               (worker_name, binding, key, value, deleted, version, updated_at_ms)
+             VALUES ('worker-a', 'MY_KV', 'legacy', 'preserved', 0, 41, 1)",
+            (),
+        )
+        .await
+        .map_err(kv_error)?;
+        conn.execute(
+            "CREATE INDEX idx_worker_kv_lookup
+             ON worker_kv(worker_name, binding, key)",
+            (),
+        )
+        .await
+        .map_err(kv_error)?;
+        drop(conn);
+        drop(database);
+
+        let store = KvStore::from_database_url(&path.to_string_lossy()).await?;
+        let value = store
+            .get("worker-a", "MY_KV", "legacy")
+            .await?
+            .expect("legacy value should survive migration");
+        assert_eq!(decode_utf8(value), "preserved");
+        assert!(store.put("worker-a", "MY_KV", "next", "value").await? > 41);
+
+        let conn = store.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT MAX(version) FROM dd_storage_schema_migrations WHERE component = 'kv'",
+                (),
+            )
+            .await
+            .map_err(kv_error)?;
+        assert_eq!(
+            rows.next()
+                .await
+                .map_err(kv_error)?
+                .expect("migration version row")
+                .get::<i64>(0)
+                .map_err(kv_error)?,
+            KV_SCHEMA_VERSION
+        );
+        drop(rows);
+        let mut columns = conn
+            .query("PRAGMA table_info(worker_kv)", ())
+            .await
+            .map_err(kv_error)?;
+        let mut names = HashSet::new();
+        while let Some(row) = columns.next().await.map_err(kv_error)? {
+            names.insert(row.get::<String>(1).map_err(kv_error)?);
+        }
+        assert!(names.contains("value_blob"));
+        assert!(names.contains("encoding"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_schema_without_migration_metadata_is_adopted() -> Result<()> {
+        let path = temp_db_path("current-schema-adoption");
+        let store = test_store(&path).await?;
+        store
+            .put("worker-a", "MY_KV", "preserved", "current")
+            .await?;
+        drop(store);
+
+        let database = Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(kv_error)?;
+        let conn = database.connect().map_err(kv_error)?;
+        conn.execute(
+            "DELETE FROM dd_storage_schema_migrations WHERE component = 'kv'",
+            (),
+        )
+        .await
+        .map_err(kv_error)?;
+        drop(conn);
+        drop(database);
+
+        let store = KvStore::from_database_url(&path.to_string_lossy()).await?;
+        assert_eq!(
+            decode_utf8(
+                store
+                    .get("worker-a", "MY_KV", "preserved")
+                    .await?
+                    .expect("current value should survive adoption")
+            ),
+            "current"
+        );
+        store.health_check().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn future_schema_version_is_rejected_without_mutating_data() -> Result<()> {
+        let path = temp_db_path("future-schema");
+        let store = test_store(&path).await?;
+        store
+            .put("worker-a", "MY_KV", "preserved", "future-guard")
+            .await?;
+        drop(store);
+
+        let database = Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(kv_error)?;
+        let conn = database.connect().map_err(kv_error)?;
+        conn.execute(
+            "INSERT INTO dd_storage_schema_migrations (component, version, applied_at_ms)
+             VALUES ('kv', ?1, 1)",
+            (KV_SCHEMA_VERSION + 1,),
+        )
+        .await
+        .map_err(kv_error)?;
+        drop(conn);
+        drop(database);
+
+        let error = match KvStore::from_database_url(&path.to_string_lossy()).await {
+            Ok(_) => panic!("future KV schema must fail startup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported kv schema version"));
+
+        let database = Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(kv_error)?;
+        let conn = database.connect().map_err(kv_error)?;
+        let mut rows = conn
+            .query(
+                "SELECT value FROM worker_kv
+                 WHERE worker_name = 'worker-a' AND binding = 'MY_KV' AND key = 'preserved'",
+                (),
+            )
+            .await
+            .map_err(kv_error)?;
+        assert_eq!(
+            rows.next()
+                .await
+                .map_err(kv_error)?
+                .expect("preserved row")
+                .get::<String>(0)
+                .map_err(kv_error)?,
+            "future-guard"
+        );
         Ok(())
     }
 

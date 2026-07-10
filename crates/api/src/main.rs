@@ -16,6 +16,8 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::trace::SdkTracerProvider as OTelTracerProvider;
+#[cfg(feature = "otel")]
+use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,7 +29,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[command(name = "dd_server")]
 #[command(about = "Single-node dd worker runtime server")]
 #[command(
-    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS\n  DD_MEMORY_DB_CACHE_MAX_OPEN\n  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE\n  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
+    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_OTEL_COLLECTOR_VERIFIED\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS\n  DD_MEMORY_DB_CACHE_MAX_OPEN\n  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE\n  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
 )]
 struct Cli {
     #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = DEFAULT_PUBLIC_BIND_ADDR)]
@@ -197,7 +199,15 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
         .build();
     let mut provider_builder = OTelTracerProvider::builder().with_resource(resource);
 
-    if let Some(endpoint) = endpoint {
+    let endpoint_configured = endpoint.is_some();
+    let exporter_enabled = endpoint_configured && otlp_collector_is_operator_verified();
+    dd_server::configure_trace_exporter(endpoint_configured, exporter_enabled);
+    if endpoint_configured && !exporter_enabled {
+        eprintln!(
+            "OTLP endpoint configured but exporter disabled; set DD_OTEL_COLLECTOR_VERIFIED=true after verifying the collector"
+        );
+    }
+    if let Some(endpoint) = endpoint.filter(|_| exporter_enabled) {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(endpoint)
@@ -206,7 +216,7 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
             .map_err(|error| {
                 PlatformError::internal(format!("otlp exporter init failed: {error}"))
             })?;
-        provider_builder = provider_builder.with_batch_exporter(exporter);
+        provider_builder = provider_builder.with_batch_exporter(HealthTrackingExporter(exporter));
     }
 
     let provider = provider_builder.build();
@@ -259,6 +269,44 @@ fn configured_otlp_http_traces_endpoint() -> Option<String> {
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| otlp_http_traces_endpoint(&value))
         })
+}
+
+#[cfg(feature = "otel")]
+fn otlp_collector_is_operator_verified() -> bool {
+    env::var("DD_OTEL_COLLECTOR_VERIFIED").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(feature = "otel")]
+#[derive(Debug)]
+struct HealthTrackingExporter<E>(E);
+
+#[cfg(feature = "otel")]
+impl<E: SpanExporter> SpanExporter for HealthTrackingExporter<E> {
+    async fn export(&self, batch: Vec<SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+        let result = self.0.export(batch).await;
+        dd_server::record_trace_export(result.is_ok());
+        result
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.0.set_resource(resource);
+    }
 }
 
 #[cfg(feature = "otel")]

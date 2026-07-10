@@ -225,7 +225,7 @@ impl WorkerManager {
         let owner_worker_for_handle = owner_worker.clone();
         let result = result.map(|deployed| {
             if let Some(graph_id) = &module_graph_id {
-                crate::dynamic_modules::retain_dynamic_module_graph(graph_id);
+                self.dynamic_modules.retain(graph_id);
             }
             let handle = format!("dynh-{}", Uuid::new_v4().simple());
             let worker_name = deployed.worker;
@@ -1150,6 +1150,7 @@ impl WorkerManager {
                 let mut runtime = new_runtime_from_snapshot(
                     self.bootstrap_snapshot,
                     self.config.debug_code_generation,
+                    self.dynamic_modules.clone(),
                 )?;
                 crate::engine::load_worker_source(&mut runtime, source).await?;
             }
@@ -1225,7 +1226,7 @@ impl WorkerManager {
             return;
         };
         if let Some(graph_id) = &entry.module_graph_id {
-            crate::dynamic_modules::release_dynamic_module_graph(graph_id);
+            self.dynamic_modules.release(graph_id);
         }
         for provider_id in &entry.host_rpc_provider_ids {
             self.host_rpc_providers.remove(provider_id);

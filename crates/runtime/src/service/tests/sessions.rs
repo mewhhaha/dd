@@ -421,6 +421,81 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
 
 #[tokio::test]
 #[serial]
+async fn websocket_stub_apply_can_send_from_a_normal_request() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 2,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "ws-stub-apply".to_string(),
+            websocket_stub_apply_worker(),
+            DeployConfig {
+                public: false,
+                cache: Default::default(),
+                internal: DeployInternalConfig { trace: None },
+                bindings: vec![DeployBinding::Memory {
+                    binding: "CHAT".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let opened = service
+        .open_websocket(
+            "ws-stub-apply".to_string(),
+            test_websocket_invocation("/ws", "ws-stub-apply-open"),
+            None,
+        )
+        .await
+        .expect("websocket open should succeed");
+    assert_eq!(opened.output.status, 101);
+
+    let broadcast = service
+        .invoke(
+            "ws-stub-apply".to_string(),
+            test_invocation_with_path("/broadcast", "ws-stub-apply-broadcast"),
+        )
+        .await
+        .expect("broadcast request should succeed");
+    assert_eq!(broadcast.status, 200);
+    assert_eq!(broadcast.body, b"sent:1");
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.websocket_wait_frame("ws-stub-apply".to_string(), opened.session_id.clone()),
+    )
+    .await
+    .expect("broadcast frame should not hang")
+    .expect("broadcast frame should arrive");
+    let frame = service
+        .websocket_drain_frame("ws-stub-apply".to_string(), opened.session_id.clone())
+        .await
+        .expect("broadcast frame drain should succeed")
+        .expect("broadcast frame should be queued");
+    assert_eq!(frame.body, b"broadcast-ready");
+
+    service
+        .websocket_close(
+            "ws-stub-apply".to_string(),
+            opened.session_id,
+            1000,
+            "done".to_string(),
+        )
+        .await
+        .expect("websocket close should succeed");
+}
+
+#[tokio::test]
+#[serial]
 async fn websocket_wake_can_list_socket_handles_without_deadlock() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,

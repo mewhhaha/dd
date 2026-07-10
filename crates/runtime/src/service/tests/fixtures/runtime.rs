@@ -15,7 +15,6 @@ pub(crate) async fn test_service(config: RuntimeConfig) -> RuntimeService {
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: false,
-            blob_store: BlobStoreConfig::local(PathBuf::from(&store_dir).join("blobs")),
         },
     })
     .await
@@ -40,7 +39,6 @@ pub(crate) async fn test_service_with_paths(
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled,
-            blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
         },
     })
     .await

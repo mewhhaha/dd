@@ -1,5 +1,5 @@
-FROM jaegertracing/all-in-one:1.76.0
+FROM jaegertracing/all-in-one:1.76.0@sha256:ab6f1a1f0fb49ea08bcd19f6b84f6081d0d44b364b6de148e1798eb5816bacac
 
 ENV COLLECTOR_OTLP_ENABLED=true
 
-EXPOSE 16686 4317 4318
+EXPOSE 16686 4318

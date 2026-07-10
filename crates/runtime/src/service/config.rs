@@ -1,5 +1,5 @@
 use super::{DynamicRpcBinding, RuntimeConfig};
-use crate::ops::DynamicWorkerPolicy;
+use crate::ops::{DynamicWorkerPolicy, parse_egress_allow_host};
 use common::{DeployBinding, DeployConfig, PlatformError, Result};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -294,32 +294,17 @@ fn is_valid_env_name(name: &str) -> bool {
 }
 
 fn is_valid_egress_host(host: &str) -> bool {
-    let host = host.strip_prefix("private:").unwrap_or(host);
-    let host = match host.rsplit_once(':') {
-        Some((left, right)) if right.chars().all(|char| char.is_ascii_digit()) => {
-            let Ok(port) = right.parse::<u16>() else {
-                return false;
-            };
-            if port == 0 {
-                return false;
-            }
-            left
-        }
-        _ => host,
-    };
-    if host.is_empty() {
+    let Some(parsed) = parse_egress_allow_host(host) else {
         return false;
+    };
+    if parsed.host.parse::<std::net::IpAddr>().is_ok() {
+        return !parsed.wildcard;
     }
-    if let Some(rest) = host.strip_prefix("*.") {
-        return !rest.is_empty()
-            && rest
-                .chars()
-                .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '.')
-            && rest.contains('.');
-    }
-    host.chars()
+    parsed
+        .host
+        .chars()
         .all(|char| char.is_ascii_alphanumeric() || char == '-' || char == '.')
-        && host.contains('.')
+        && parsed.host.contains('.')
 }
 
 pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {

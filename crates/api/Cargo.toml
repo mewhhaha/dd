@@ -2,6 +2,7 @@
 name = "dd_server"
 edition.workspace = true
 license.workspace = true
+publish = false
 version.workspace = true
 
 [dependencies]
@@ -31,9 +32,10 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 uuid.workspace = true
+url = "2"
 
 [features]
-default = ["http3", "websocket", "otel"]
+default = ["websocket", "otel"]
 http3 = ["dep:tokio-quiche", "websocket"]
 websocket = ["dep:tokio-tungstenite"]
 otel = [

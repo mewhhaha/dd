@@ -1,4 +1,5 @@
 mod invocation;
+mod observability;
 mod routing;
 mod util;
 #[cfg(feature = "websocket")]
@@ -7,13 +8,15 @@ mod websocket;
 #[path = "handlers/websocket_disabled.rs"]
 mod websocket;
 
-use crate::state::AppState;
+use crate::state::{ActiveRequestGuard, AppState};
 use bytes::Bytes;
 use common::{
     DeployBinding, DeployInternalConfig, DeployRequest, DeployResponse, DeployTokenDeleteResponse,
     DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
-    DeployTokenMintResponse, DynamicDeployRequest, DynamicDeployResponse, ErrorBody, ErrorKind,
-    PlatformError, WorkerInvocation, WorkerOutput,
+    DeployTokenMintResponse, DeploymentInspectResponse, DeploymentListResponse,
+    DynamicDeployRequest, DynamicDeployResponse, ErrorBody, ErrorKind, PlatformError,
+    RollbackRequest, RollbackResponse, UndeployResponse, WorkerInvocation, WorkerNameRequest,
+    WorkerOutput,
 };
 use futures_util::StreamExt;
 #[cfg(feature = "websocket")]
@@ -23,7 +26,7 @@ use http::header::{
     WWW_AUTHENTICATE,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode};
-use http_body::Body as HttpBody;
+use http_body::{Body as HttpBody, Frame as BodyFrame, SizeHint};
 #[cfg(feature = "websocket")]
 use http_body_util::Empty;
 use http_body_util::combinators::BoxBody;
@@ -42,6 +45,8 @@ use opentelemetry::trace::TraceContextExt;
 use runtime::{CacheLookup, CacheRequest, CacheResponse};
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::WebSocketStream;
@@ -58,11 +63,62 @@ pub type ApiResult<T> = std::result::Result<T, ApiError>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ResponseBody = BoxBody<Bytes, BoxError>;
 
+struct TrackedResponseBody {
+    inner: ResponseBody,
+    request: Option<ActiveRequestGuard>,
+}
+
+impl TrackedResponseBody {
+    fn new(inner: ResponseBody, request: ActiveRequestGuard) -> Self {
+        Self {
+            inner,
+            request: Some(request),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(mut request) = self.request.take() {
+            request.finish();
+        }
+    }
+}
+
+impl HttpBody for TrackedResponseBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<BodyFrame<Self::Data>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.finish();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn track_response(
+    response: Response<ResponseBody>,
+    request: ActiveRequestGuard,
+) -> Response<ResponseBody> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, BoxBody::new(TrackedResponseBody::new(body, request)))
+}
+
 #[derive(Debug)]
 pub struct ApiError(pub PlatformError);
 
 const REQUEST_BODY_STREAM_CAPACITY: usize = 8;
-#[cfg(feature = "otel")]
 const HEADER_TRACE_ID: &str = "x-dd-trace-id";
 #[cfg(feature = "websocket")]
 const HEADER_WS_INTERNAL_PREFIX: &str = "x-dd-";
@@ -167,7 +223,7 @@ use self::websocket::{
     PreparedWebSocketUpgrade, invoke_worker_websocket_private, invoke_worker_websocket_public,
     is_websocket_upgrade, prepare_websocket_upgrade,
 };
-#[cfg(feature = "websocket")]
+#[cfg(feature = "http3")]
 pub(crate) use self::websocket::{
     handle_websocket_session, open_transport_session_from_parts, open_websocket_session_from_parts,
     sanitize_websocket_handshake_headers,

@@ -506,7 +506,7 @@ impl PoolActivity {
     }
 }
 
-pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
+pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<thread::JoinHandle<()>> {
     let RuntimeThreadStart {
         mut receiver,
         mut cancel_receiver,
@@ -518,8 +518,10 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
         cache_store,
         config,
         storage,
+        control_store,
+        dynamic_modules,
     } = start;
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("dd-runtime".to_string())
         .spawn(move || {
             let runtime = Builder::new_current_thread()
@@ -531,7 +533,7 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                 let (event_tx, mut event_rx) = mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY);
                 let (memory_outbox_drain_sender, memory_outbox_drain_receiver) =
                     memory_outbox_worker_channel();
-                tokio::spawn(run_memory_outbox_worker(
+                let memory_outbox_worker = tokio::spawn(run_memory_outbox_worker(
                     memory_store.clone(),
                     event_tx.clone(),
                     memory_outbox_drain_receiver,
@@ -545,6 +547,8 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                     cache_store,
                     config: config.clone(),
                     storage,
+                    control_store,
+                    dynamic_modules,
                     runtime_fast_sender,
                     asset_catalog,
                 });
@@ -624,11 +628,21 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                 if let Err(error) = manager.cache_store.flush_pending_touches().await {
                     tracing::warn!(error = %error, "failed to flush cache recency while stopping runtime");
                 }
+
+                // Dropping the manager closes the outbox command channel. The
+                // worker finishes any in-flight shard drains before exiting;
+                // close its event destination so no final report can block.
+                drop(manager);
+                event_rx.close();
+                drop(event_tx);
+                if let Err(error) = memory_outbox_worker.await {
+                    tracing::warn!(error = %error, "memory outbox worker failed during shutdown");
+                }
             });
         })
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
-    Ok(())
+    Ok(thread)
 }
 
 pub(super) async fn drain_ready_runtime_work(
@@ -833,6 +847,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         snapshot,
         snapshot_preloaded,
         source,
+        dynamic_modules,
         deployment_config,
         allow_code_generation,
         kv_store,
@@ -891,6 +906,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                     snapshot,
                     allow_code_generation,
                     execution_limits.max_isolate_heap_bytes,
+                    dynamic_modules,
                 ) {
                     Ok(runtime) => runtime,
                     Err(error) => {

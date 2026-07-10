@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ddVitePlugin } from "../packages/dd-vite/src/vite.js";
+import { shouldBypassViteRequest } from "../packages/dd-vite/src/vite/dev.js";
 
 const require = createRequire(new URL("../packages/dd-vite/package.json", import.meta.url));
 const { createBuilder, resolveConfig } = await import(require.resolve("vite"));
@@ -12,22 +13,35 @@ const workerBundleEnv = "DD_VITE_WORKER_BUNDLE";
 const previousWorkerBundleEnv = process.env[workerBundleEnv];
 delete process.env[workerBundleEnv];
 
+const getRequest = { headers: {}, method: "GET" };
+assert.equal(
+  shouldBypassViteRequest(
+    getRequest,
+    "/@react-router/critical.css?pathname=%2Fprojects%2Fruntime",
+    "/",
+    "/",
+  ),
+  true,
+  "React Router development assets must reach the framework middleware",
+);
+assert.equal(
+  shouldBypassViteRequest(getRequest, "/__manifest?p=%2Fprojects%2Fruntime", "/", "/"),
+  false,
+  "React Router route discovery must continue through the worker",
+);
+
 try {
   await mkdir(join(root, "src"), { recursive: true });
   await writeFile(join(root, "package.json"), JSON.stringify({ type: "module" }));
   await writeFile(
     join(root, "dd.json"),
     JSON.stringify({
+      schema_version: 1,
       name: "config-check-worker",
       entrypoint: "src/worker.ts",
       baseUrl: "https://dd.example.test",
       temporary: true,
-      deploy_token: "should-not-leak",
-      local_only: { also: "should-not-leak" },
       asset_excludes: ["secret-local.txt"],
-      public: true,
-      bindings: [{ type: "kv", binding: "TOP_LEVEL_SHOULD_NOT_LEAK" }],
-      internal: { trace: { worker: "top-level-trace" } },
       config: { public: true },
     }),
   );
@@ -144,6 +158,11 @@ try {
   assert(ddEnvironment, "dd environment should be registered");
   assert.equal(ddEnvironment.consumer, "server");
   assert.equal(ddEnvironment.resolve.noExternal, true);
+  assert.equal(
+    ddEnvironment.define["process.env.NODE_ENV"],
+    JSON.stringify("development"),
+    "serve environments must optimize framework dependencies in development mode",
+  );
   assert.equal(ddEnvironment.define.__BEFORE_CONFIG__, JSON.stringify("before"));
   assert.equal(ddEnvironment.define.__BEFORE_ENV__, JSON.stringify("before-env"));
   assert.equal(ddEnvironment.define.__AFTER_CONFIG__, JSON.stringify("after"));
@@ -181,6 +200,7 @@ try {
   });
 
   const generatedConfig = JSON.parse(await readFile(join(root, "dist/config-check-worker/dd.deploy.json"), "utf8"));
+  assert.equal(generatedConfig.schema_version, 1);
   assert.equal(generatedConfig.name, "config-check-worker");
   assert.equal(generatedConfig.entrypoint, "worker.js");
   assert.equal(generatedConfig.assets_dir, "../client");
@@ -248,6 +268,7 @@ try {
     join(lateAppRoot, "dd.json"),
     JSON.stringify({
       name: "late-root-worker",
+      schema_version: 1,
       entrypoint: "src/worker.ts",
       config: { public: true },
     }),

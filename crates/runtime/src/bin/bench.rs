@@ -968,7 +968,6 @@ fn runtime_service_config(
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled,
-            blob_store: runtime::BlobStoreConfig::local(store_dir.join("blobs")),
         },
     }
 }

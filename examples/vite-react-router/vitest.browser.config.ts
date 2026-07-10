@@ -8,6 +8,10 @@ import { defineConfig } from "vitest/config";
 const require = createRequire(import.meta.url);
 const exampleDir = fileURLToPath(new URL(".", import.meta.url));
 const viteBin = resolve(dirname(require.resolve("vite/package.json")), "bin/vite.js");
+const transparentPng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XwK2AAAAAElFTkSuQmCC",
+  "base64",
+);
 
 const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) => {
   const appServer = await startAppServer();
@@ -32,6 +36,13 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
 
   try {
     await appPage.setViewportSize({ width: 390, height: 720 });
+    await appPage.route("https://assets.ui.sh/**", async (route) => {
+      await route.fulfill({
+        body: transparentPng,
+        contentType: "image/png",
+        status: 200,
+      });
+    });
 
     await appPage.goto(appServer.base, { waitUntil: "domcontentloaded" });
     await appPage.getByRole("heading", { name: "Edge Goods" }).waitFor();

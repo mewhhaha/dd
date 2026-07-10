@@ -5,8 +5,10 @@ use common::{
     DeployInternalConfig, DeployRequest, DeployResponse, DeployServerModule,
     DeployServerModuleKind, DeployTokenCapabilities, DeployTokenDeleteResponse,
     DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
-    DeployTokenMintResponse, DeployTraceDestination, DynamicDeployRequest, DynamicDeployResponse,
-    ErrorBody, first_non_empty_trimmed,
+    DeployTokenMintResponse, DeployTraceDestination, DeploymentInspectResponse,
+    DeploymentListResponse, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
+    RollbackRequest, RollbackResponse, UndeployResponse, WorkerNameRequest,
+    first_non_empty_trimmed,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
 const DEFAULT_CONFIG_FILE: &str = "dd.json";
+const CONFIG_SCHEMA_VERSION: u32 = 1;
 const KEYRING_SERVICE: &str = "dd";
 const KEYRING_DEPLOY_TOKEN_PREFIX: &str = "deploy-token:";
 
@@ -49,6 +52,12 @@ enum Command {
     GetToken(TokenIdCmd),
     #[command(name = "delete-token")]
     DeleteToken(TokenIdCmd),
+    #[command(name = "list-deployments")]
+    ListDeployments(ListDeploymentsCmd),
+    #[command(name = "inspect-deployment")]
+    InspectDeployment(DeploymentIdCmd),
+    Undeploy(WorkerCmd),
+    Rollback(RollbackCmd),
     DynamicDeploy(DynamicDeployCmd),
     Invoke(InvokeCmd),
 }
@@ -129,6 +138,28 @@ struct TokenIdCmd {
 }
 
 #[derive(Args)]
+struct ListDeploymentsCmd {
+    #[arg(long)]
+    worker: Option<String>,
+}
+
+#[derive(Args)]
+struct DeploymentIdCmd {
+    id: String,
+}
+
+#[derive(Args)]
+struct WorkerCmd {
+    worker: String,
+}
+
+#[derive(Args)]
+struct RollbackCmd {
+    worker: String,
+    deployment_id: String,
+}
+
+#[derive(Args)]
 struct MintDeployTokenCmd {
     #[arg(long)]
     id: Option<String>,
@@ -186,7 +217,13 @@ struct MintDeployTokenCmd {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeployFileConfig {
+    #[serde(rename = "$schema", default)]
+    _schema: Option<String>,
+    schema_version: u32,
+    #[serde(rename = "base_url", default, alias = "baseUrl")]
+    _base_url: Option<String>,
     name: String,
     entrypoint: String,
     #[serde(default)]
@@ -198,10 +235,19 @@ struct DeployFileConfig {
     #[serde(default)]
     server_modules: Vec<DeployFileServerModule>,
     #[serde(default)]
-    config: DeployConfig,
+    config: Option<DeployConfig>,
+    #[serde(default)]
+    public: Option<bool>,
+    #[serde(default)]
+    cache: Option<DeployCacheConfig>,
+    #[serde(default)]
+    bindings: Option<Vec<DeployBinding>>,
+    #[serde(default)]
+    internal: Option<DeployInternalConfig>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeployFileServerModule {
     path: String,
     #[serde(default)]
@@ -212,6 +258,8 @@ struct DeployFileServerModule {
 
 #[derive(Debug, Default, Deserialize)]
 struct CliConfig {
+    #[serde(rename = "schema_version", default)]
+    _schema_version: u32,
     #[serde(default, alias = "baseUrl")]
     base_url: Option<String>,
 }
@@ -280,6 +328,18 @@ async fn main() -> Result<(), String> {
         }
         Command::DeleteToken(command) => {
             delete_token(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
+        Command::ListDeployments(command) => {
+            list_deployments(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
+        Command::InspectDeployment(command) => {
+            inspect_deployment(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
+        Command::Undeploy(command) => {
+            undeploy(&client, &server, private_bearer_token.as_deref(), command).await?
+        }
+        Command::Rollback(command) => {
+            rollback(&client, &server, private_bearer_token.as_deref(), command).await?
         }
         Command::DynamicDeploy(command) => {
             dynamic_deploy(&client, &server, private_bearer_token.as_deref(), command).await?
@@ -460,6 +520,99 @@ async fn delete_token(
     Ok(())
 }
 
+async fn list_deployments(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: ListDeploymentsCmd,
+) -> Result<(), String> {
+    let path = command
+        .worker
+        .as_deref()
+        .map(|worker| {
+            format!(
+                "/v1/admin/deployments?worker={}",
+                encode_query_value(worker)
+            )
+        })
+        .unwrap_or_else(|| "/v1/admin/deployments".to_string());
+    let request = client.get(api_url(server, &path));
+    let response = with_bearer_auth(request, private_bearer_token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let deployments: DeploymentListResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&deployments)?);
+    Ok(())
+}
+
+async fn inspect_deployment(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: DeploymentIdCmd,
+) -> Result<(), String> {
+    let response = with_bearer_auth(
+        client.get(api_url(
+            server,
+            &format!(
+                "/v1/admin/deployment?id={}",
+                encode_query_value(&command.id)
+            ),
+        )),
+        private_bearer_token,
+    )
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    let deployment: DeploymentInspectResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&deployment)?);
+    Ok(())
+}
+
+async fn undeploy(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: WorkerCmd,
+) -> Result<(), String> {
+    let response = with_bearer_auth(
+        client.post(api_url(server, "/v1/admin/undeploy")),
+        private_bearer_token,
+    )
+    .json(&WorkerNameRequest {
+        worker: command.worker,
+    })
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    let undeployed: UndeployResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&undeployed)?);
+    Ok(())
+}
+
+async fn rollback(
+    client: &reqwest::Client,
+    server: &str,
+    private_bearer_token: Option<&str>,
+    command: RollbackCmd,
+) -> Result<(), String> {
+    let response = with_bearer_auth(
+        client.post(api_url(server, "/v1/admin/rollback")),
+        private_bearer_token,
+    )
+    .json(&RollbackRequest {
+        worker: command.worker,
+        deployment_id: command.deployment_id,
+    })
+    .send()
+    .await
+    .map_err(|error| error.to_string())?;
+    let rolled_back: RollbackResponse = decode_json(response).await?;
+    println!("{}", to_json_string(&rolled_back)?);
+    Ok(())
+}
+
 fn build_deploy_token_mint_request(
     command: MintDeployTokenCmd,
 ) -> Result<DeployTokenMintRequest, String> {
@@ -579,7 +732,14 @@ async fn build_deploy_request_from_config_file(
     let config_bytes = tokio::fs::read(&config_path)
         .await
         .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
+    validate_config_document(&config_bytes)?;
     let deploy_file = parse_json_bytes::<DeployFileConfig>(&config_bytes)?;
+    if deploy_file.schema_version != CONFIG_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported deploy config schema_version {}; expected {CONFIG_SCHEMA_VERSION}",
+            deploy_file.schema_version
+        ));
+    }
     if deploy_file.name.trim().is_empty() {
         return Err("deploy config name must not be empty".to_string());
     }
@@ -634,11 +794,24 @@ async fn build_deploy_request_from_config_file(
         deploy_file.server_modules,
         command.allow_outside_config_root,
     )?;
+    let mut config = deploy_file.config.unwrap_or_default();
+    if let Some(public) = deploy_file.public {
+        config.public = public;
+    }
+    if let Some(cache) = deploy_file.cache {
+        config.cache = cache;
+    }
+    if let Some(bindings) = deploy_file.bindings {
+        config.bindings = bindings;
+    }
+    if let Some(internal) = deploy_file.internal {
+        config.internal = internal;
+    }
 
     Ok(DeployRequest {
         name: deploy_file.name,
         source,
-        config: deploy_file.config,
+        config,
         assets,
         server_modules,
         asset_headers,
@@ -912,7 +1085,53 @@ fn command_config_path(command: &Command) -> Option<&str> {
 fn load_cli_config_file(path: &Path) -> Result<CliConfig, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    validate_config_document(&bytes)
+        .map_err(|error| format!("failed to validate {}: {error}", path.display()))?;
     parse_json_bytes(&bytes).map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn validate_config_document(bytes: &[u8]) -> Result<(), String> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "$schema",
+        "schema_version",
+        "name",
+        "entrypoint",
+        "base_url",
+        "baseUrl",
+        "assets_dir",
+        "temporary",
+        "asset_excludes",
+        "server_modules",
+        "config",
+        "public",
+        "cache",
+        "bindings",
+        "internal",
+    ];
+
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("invalid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "configuration must be a JSON object".to_string())?;
+    let version = object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            format!("schema_version is required and must equal {CONFIG_SCHEMA_VERSION}")
+        })?;
+    if version != u64::from(CONFIG_SCHEMA_VERSION) {
+        return Err(format!(
+            "unsupported schema_version {version}; expected {CONFIG_SCHEMA_VERSION}"
+        ));
+    }
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(format!("unknown configuration field `{field}`"));
+    }
+    Ok(())
 }
 
 fn find_config_file(start: &Path) -> Option<PathBuf> {
@@ -974,6 +1193,19 @@ fn normalize_server_url(server: &str) -> Result<String, String> {
 
 fn api_url(server: &str, path: &str) -> String {
     format!("{}{}", server.trim_end_matches('/'), path)
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 fn stored_deploy_token(server: &str) -> Result<Option<String>, String> {
@@ -1386,10 +1618,11 @@ fn to_json_string<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, CliConfig, Command, DEFAULT_PRIVATE_SERVER_URL, DeployConfigFileCmd,
-        MintDeployTokenCmd, build_deploy_request_from_config_file, build_deploy_token_mint_request,
-        keyring_account, load_workspace_cli_config_from, normalize_asset_relative_path,
-        package_assets_dir, package_server_module_specs, resolve_server_from,
+        Cli, CliConfig, Command, DEFAULT_PRIVATE_SERVER_URL, DeployConfigFileCmd, DeploymentIdCmd,
+        ListDeploymentsCmd, MintDeployTokenCmd, RollbackCmd, WorkerCmd,
+        build_deploy_request_from_config_file, build_deploy_token_mint_request, keyring_account,
+        load_workspace_cli_config_from, normalize_asset_relative_path, package_assets_dir,
+        package_server_module_specs, resolve_server_from,
     };
     use base64::Engine;
     use clap::Parser;
@@ -1440,6 +1673,7 @@ mod tests {
         fs::write(
             root.join("dd.deploy.json"),
             r#"{
+              "schema_version": 1,
               "name": "built-worker",
               "entrypoint": "worker.js",
               "assets_dir": ".",
@@ -1519,6 +1753,7 @@ mod tests {
         fs::write(
             app.join("dd.deploy.json"),
             r#"{
+              "schema_version": 1,
               "name": "escaped-worker",
               "entrypoint": "../worker.js",
               "config": { "public": true, "bindings": [] }
@@ -1551,6 +1786,7 @@ mod tests {
             app.join("dd.deploy.json"),
             format!(
                 r#"{{
+                  "schema_version": 1,
                   "name": "escaped-assets",
                   "entrypoint": "worker.js",
                   "assets_dir": "{}",
@@ -1586,6 +1822,7 @@ mod tests {
             app.join("dd.deploy.json"),
             format!(
                 r#"{{
+                  "schema_version": 1,
                   "name": "outside-worker",
                   "entrypoint": "../worker.js",
                   "assets_dir": "{}",
@@ -1659,6 +1896,41 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_deployment_lifecycle_commands() {
+        let cli = Cli::try_parse_from(["dd", "list-deployments", "--worker", "chat"])
+            .expect("list deployments");
+        assert!(matches!(
+            cli.command,
+            Command::ListDeployments(ListDeploymentsCmd {
+                worker: Some(ref worker)
+            }) if worker == "chat"
+        ));
+
+        let cli = Cli::try_parse_from(["dd", "inspect-deployment", "deployment-id"])
+            .expect("inspect deployment");
+        assert!(matches!(
+            cli.command,
+            Command::InspectDeployment(DeploymentIdCmd { ref id }) if id == "deployment-id"
+        ));
+
+        let cli = Cli::try_parse_from(["dd", "undeploy", "chat"]).expect("undeploy");
+        assert!(matches!(
+            cli.command,
+            Command::Undeploy(WorkerCmd { ref worker }) if worker == "chat"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["dd", "rollback", "chat", "deployment-id"]).expect("rollback");
+        assert!(matches!(
+            cli.command,
+            Command::Rollback(RollbackCmd {
+                ref worker,
+                ref deployment_id
+            }) if worker == "chat" && deployment_id == "deployment-id"
+        ));
+    }
+
+    #[test]
     fn mint_deploy_token_command_builds_capabilities() {
         let request = build_deploy_token_mint_request(MintDeployTokenCmd {
             id: None,
@@ -1699,6 +1971,7 @@ mod tests {
         fs::write(
             root.join("dd.json"),
             r#"{
+              "schema_version": 1,
               "name": "chat",
               "entrypoint": "src/worker.ts",
               "base_url": "https://dd.example.com"
@@ -1713,9 +1986,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_config_rejects_missing_version_and_unknown_fields() {
+        let root = temp_dir("dd-json-schema");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("dd.json"), r#"{"name":"chat"}"#).expect("write config");
+        let missing = load_workspace_cli_config_from(&root).expect_err("version is required");
+        assert!(missing.contains("schema_version"));
+
+        fs::write(
+            root.join("dd.json"),
+            r#"{"schema_version":1,"name":"chat","publik":true}"#,
+        )
+        .expect("write config");
+        let unknown = load_workspace_cli_config_from(&root).expect_err("unknown fields fail");
+        assert!(unknown.contains("unknown configuration field `publik`"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn server_resolution_prefers_cli_env_config_then_default() {
         let config = CliConfig {
             base_url: Some("https://config.example.com/".to_string()),
+            ..CliConfig::default()
         };
         assert_eq!(
             resolve_server_from(

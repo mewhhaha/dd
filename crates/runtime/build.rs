@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,10 +6,12 @@ use std::path::{Path, PathBuf};
 const MEMORY_RPC_SCHEMA_PATH: &str = "schema/memory_rpc.capnp";
 const CHECKED_IN_MEMORY_RPC_PATH: &str = "src/generated/memory_rpc_capnp.rs";
 const MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX: &str = "// dd-memory-rpc-schema-fingerprint: ";
+const DENO_VENDOR_MANIFEST_PATH: &str = "js/vendor/manifest.txt";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
+    println!("cargo:rerun-if-changed={DENO_VENDOR_MANIFEST_PATH}");
     println!("cargo:rerun-if-changed={MEMORY_RPC_SCHEMA_PATH}");
     println!("cargo:rerun-if-changed={CHECKED_IN_MEMORY_RPC_PATH}");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/init.js");
@@ -18,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../patched-crates/deno_crypto/00_crypto.js");
 
     validate_checked_in_memory_rpc();
+    validate_vendored_deno_sources();
 
     generate_execute_worker_bundle();
     generate_deno_js_extension();
@@ -182,7 +186,7 @@ fn deno_lazy_js_source_files() -> Vec<(&'static str, PathBuf)> {
     let dependencies = ["deno_webidl", "deno_web", "deno_fetch"];
     let mut sources = Vec::new();
     for dependency in dependencies {
-        let source_dir = registry_package_source_dir(dependency);
+        let source_dir = PathBuf::from("js/vendor/lazy").join(dependency);
         let mut files = fs::read_dir(&source_dir)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_dir.display()))
             .map(|entry| {
@@ -204,32 +208,58 @@ fn deno_lazy_js_source_files() -> Vec<(&'static str, PathBuf)> {
     sources
 }
 
-fn registry_package_source_dir(package: &str) -> PathBuf {
-    let version = locked_registry_package_version(package);
-    let cargo_home = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-        .expect("CARGO_HOME or HOME should be set");
-    let registry_sources = cargo_home.join("registry/src");
-    let directory_name = format!("{package}-{version}");
-    for registry in fs::read_dir(&registry_sources).unwrap_or_else(|error| {
-        panic!(
-            "failed to read Cargo registry sources at {}: {error}",
-            registry_sources.display()
-        )
-    }) {
-        let candidate = registry
-            .unwrap_or_else(|error| panic!("failed to read Cargo registry entry: {error}"))
-            .path()
-            .join(&directory_name);
-        if candidate.is_dir() {
-            return candidate;
+fn validate_vendored_deno_sources() {
+    let manifest = fs::read_to_string(DENO_VENDOR_MANIFEST_PATH)
+        .unwrap_or_else(|error| panic!("failed to read {DENO_VENDOR_MANIFEST_PATH}: {error}"));
+    for package in ["deno_webidl", "deno_web", "deno_fetch"] {
+        let prefix = format!("{package}=");
+        let manifest_version = manifest
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("{DENO_VENDOR_MANIFEST_PATH} has no version for {package}"));
+        let locked_version = locked_registry_package_version(package);
+        if manifest_version != locked_version {
+            panic!(
+                "vendored {package} version {manifest_version} does not match Cargo.lock version {locked_version}; run scripts/refresh-deno-sources.sh"
+            );
         }
     }
-    panic!(
-        "failed to locate locked registry package {package} {version} below {}",
-        registry_sources.display()
-    );
+    let mut checked = 0usize;
+    for (line_number, line) in manifest.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.contains('=') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let expected = fields.next().unwrap_or_default();
+        let relative = fields.next().unwrap_or_default();
+        if expected.len() != 64 || relative.is_empty() || fields.next().is_some() {
+            panic!(
+                "invalid vendored source manifest entry at {DENO_VENDOR_MANIFEST_PATH}:{}",
+                line_number + 1
+            );
+        }
+        let path = Path::new("js/vendor").join(relative);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let source = fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let digest = Sha256::digest(source);
+        let mut actual = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            let _ = write!(&mut actual, "{byte:02x}");
+        }
+        if actual != expected {
+            panic!(
+                "vendored Deno source hash mismatch for {}; run scripts/refresh-deno-sources.sh",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        panic!("{DENO_VENDOR_MANIFEST_PATH} contains no source hashes");
+    }
 }
 
 fn locked_registry_package_version(package: &str) -> String {

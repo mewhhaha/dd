@@ -26,6 +26,7 @@ pub enum ErrorKind {
     BadRequest,
     NotFound,
     Overloaded,
+    StorageUnavailable,
     Runtime,
     Internal,
 }
@@ -68,6 +69,10 @@ impl PlatformError {
         Self::new(ErrorKind::Overloaded, message)
     }
 
+    pub fn storage_unavailable(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::StorageUnavailable, message)
+    }
+
     pub fn runtime(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Runtime, message)
     }
@@ -78,6 +83,27 @@ impl PlatformError {
 
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self.kind {
+            ErrorKind::Unauthorized => "unauthorized",
+            ErrorKind::Forbidden => "forbidden",
+            ErrorKind::Conflict => "conflict",
+            ErrorKind::BadRequest => "invalid_request",
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::Overloaded => "overloaded",
+            ErrorKind::StorageUnavailable => "storage_unavailable",
+            ErrorKind::Runtime => "worker_runtime",
+            ErrorKind::Internal => "internal",
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::Overloaded | ErrorKind::StorageUnavailable | ErrorKind::Internal
+        )
     }
 }
 
@@ -93,6 +119,12 @@ impl std::error::Error for PlatformError {}
 pub struct ErrorBody {
     pub ok: bool,
     pub error: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 impl ErrorBody {
@@ -100,11 +132,20 @@ impl ErrorBody {
         Self {
             ok: false,
             error: error.message.clone(),
+            code: error.code().to_string(),
+            trace_id: None,
+            retryable: error.retryable(),
         }
+    }
+
+    pub fn with_trace_id(mut self, trace_id: Option<String>) -> Self {
+        self.trace_id = trace_id;
+        self
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployRequest {
     pub name: String,
     pub source: String,
@@ -121,12 +162,14 @@ pub struct DeployRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployAsset {
     pub path: String,
     pub content_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployServerModule {
     pub path: String,
     #[serde(rename = "type", alias = "kind")]
@@ -160,6 +203,7 @@ pub enum DeployServerModuleKind {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployConfig {
     #[serde(default)]
     pub public: bool,
@@ -172,18 +216,21 @@ pub struct DeployConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployCacheConfig {
     #[serde(default)]
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployInternalConfig {
     #[serde(default)]
     pub trace: Option<DeployTraceDestination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployTraceDestination {
     pub worker: String,
     #[serde(default = "default_trace_path")]
@@ -220,7 +267,67 @@ pub struct DeployResponse {
     pub deployment_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentSummary {
+    pub worker: String,
+    pub deployment_id: String,
+    pub created_at_ms: i64,
+    pub active: bool,
+    pub temporary: bool,
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentDetails {
+    #[serde(flatten)]
+    pub summary: DeploymentSummary,
+    pub source: String,
+    pub config: DeployConfig,
+    pub assets: Vec<DeployAsset>,
+    pub server_modules: Vec<DeployServerModule>,
+    pub asset_headers: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentListResponse {
+    pub ok: bool,
+    pub deployments: Vec<DeploymentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentInspectResponse {
+    pub ok: bool,
+    pub deployment: DeploymentDetails,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndeployResponse {
+    pub ok: bool,
+    pub worker: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackResponse {
+    pub ok: bool,
+    pub worker: String,
+    pub deployment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerNameRequest {
+    pub worker: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackRequest {
+    pub worker: String,
+    pub deployment_id: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployTokenCapabilities {
     #[serde(default)]
     pub workers: Vec<String>,
@@ -245,6 +352,7 @@ pub struct DeployTokenCapabilities {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeployTokenMintRequest {
     #[serde(default)]
     pub id: Option<String>,
@@ -302,6 +410,7 @@ pub struct DeployTokenDeleteResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DynamicDeployRequest {
     pub source: String,
     #[serde(default)]
@@ -336,7 +445,7 @@ pub struct WorkerOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeployRequest, first_non_empty_trimmed};
+    use super::{DeployConfig, DeployRequest, ErrorBody, PlatformError, first_non_empty_trimmed};
 
     #[test]
     fn deploy_binding_rejects_legacy_actor_json_type() {
@@ -361,5 +470,27 @@ mod tests {
             Some("fallback")
         );
         assert!(first_non_empty_trimmed(["", "  "]).is_none());
+    }
+
+    #[test]
+    fn deploy_config_rejects_unknown_fields() {
+        let error = serde_json::from_str::<DeployConfig>(r#"{"public":true,"publik":true}"#)
+            .expect_err("unknown fields must be rejected");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn error_body_keeps_message_and_adds_machine_fields() {
+        let error = PlatformError::overloaded("queue is full");
+        let body = ErrorBody::from_error(&error).with_trace_id(Some("abc123".to_string()));
+        assert_eq!(body.error, "queue is full");
+        assert_eq!(body.code, "overloaded");
+        assert_eq!(body.trace_id.as_deref(), Some("abc123"));
+        assert!(body.retryable);
+
+        let storage = PlatformError::storage_unavailable("database remained busy");
+        let storage_body = ErrorBody::from_error(&storage);
+        assert_eq!(storage_body.code, "storage_unavailable");
+        assert!(storage_body.retryable);
     }
 }

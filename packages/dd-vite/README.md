@@ -139,9 +139,8 @@ export default defineConfig({
 If `dd.json` points at a TypeScript entrypoint or source asset directory, the
 generated output config replaces those with the environment-built worker path
 and Vite output asset path while preserving the deploy fields the CLI consumes: `name`,
-`config`, `base_url`, and `temporary`. Arbitrary source config keys are not
-copied into generated deploy configs, so local-only settings do not leak into build
-artifacts.
+`config`, `base_url`, and `temporary`. Source files require `schema_version: 1`
+and reject fields outside the published JSON Schema, so misspellings fail the build.
 
 Pass options inline when you want to override the file:
 

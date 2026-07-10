@@ -10,13 +10,7 @@ kill_timeout = "30s"
   COLLECTOR_OTLP_ENABLED = "true"
   SPAN_STORAGE_TYPE = "memory"
 
-[http_service]
-  internal_port = 16686
-  force_https = true
-  auto_start_machines = true
-  auto_stop_machines = false
-  min_machines_running = 1
-
+# Intentionally no public service. Use Fly private networking or flyctl proxy.
 [checks]
   [checks.jaeger_ui]
     type = "tcp"

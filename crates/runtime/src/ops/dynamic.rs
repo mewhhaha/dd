@@ -30,10 +30,14 @@ pub(super) struct DynamicModuleGraphRegisterResult {
 #[deno_core::op2]
 #[serde]
 pub(super) fn op_dynamic_module_graph_register(
+    state: &mut OpState,
     #[string] entrypoint: String,
     #[serde] modules: HashMap<String, String>,
 ) -> DynamicModuleGraphRegisterResult {
-    match crate::dynamic_modules::register_dynamic_module_graph(&entrypoint, modules) {
+    let registry = state
+        .borrow::<crate::dynamic_modules::DynamicModuleRegistry>()
+        .clone();
+    match registry.register_dynamic_module_graph(&entrypoint, modules) {
         Ok((graph_id, entrypoint)) => DynamicModuleGraphRegisterResult {
             ok: true,
             graph_id,
@@ -50,8 +54,10 @@ pub(super) fn op_dynamic_module_graph_register(
 }
 
 #[deno_core::op2(fast)]
-pub(super) fn op_dynamic_module_graph_release(#[string] graph_id: String) {
-    crate::dynamic_modules::release_dynamic_module_graph(graph_id.trim());
+pub(super) fn op_dynamic_module_graph_release(state: &mut OpState, #[string] graph_id: String) {
+    state
+        .borrow::<crate::dynamic_modules::DynamicModuleRegistry>()
+        .release(graph_id.trim());
 }
 
 pub(super) fn dynamic_worker_owner_for_request(
@@ -395,13 +401,21 @@ pub(super) fn op_dynamic_worker_create(
     if id.is_empty() {
         return dynamic_start_error("dynamic worker id must not be empty");
     }
-    let source =
-        match dynamic_worker_source_from_payload(source, module_graph_id, module_entrypoint) {
-            Ok(source) => source,
-            Err(error) => {
-                return dynamic_start_error(error);
-            }
-        };
+    let dynamic_modules = state
+        .borrow()
+        .borrow::<crate::dynamic_modules::DynamicModuleRegistry>()
+        .clone();
+    let source = match dynamic_worker_source_from_payload(
+        &dynamic_modules,
+        source,
+        module_graph_id,
+        module_entrypoint,
+    ) {
+        Ok(source) => source,
+        Err(error) => {
+            return dynamic_start_error(error);
+        }
+    };
     if !timeout.is_finite() || timeout <= 0.0 {
         return dynamic_start_error("dynamic worker timeout must be greater than 0");
     }
@@ -442,6 +456,7 @@ pub(super) fn op_dynamic_worker_create(
 }
 
 fn dynamic_worker_source_from_payload(
+    dynamic_modules: &crate::dynamic_modules::DynamicModuleRegistry,
     source: String,
     module_graph_id: String,
     module_entrypoint: String,
@@ -463,7 +478,7 @@ fn dynamic_worker_source_from_payload(
         (Some(graph_id), Some(entrypoint)) => {
             let entrypoint = crate::dynamic_modules::normalize_dynamic_module_path(&entrypoint)
                 .map_err(|error| format!("invalid dynamic worker module entrypoint: {error}"))?;
-            if crate::dynamic_modules::dynamic_module_source(&graph_id, &entrypoint).is_none() {
+            if dynamic_modules.source(&graph_id, &entrypoint).is_none() {
                 return Err(format!(
                     "dynamic worker module graph {graph_id} does not contain entrypoint: {entrypoint}"
                 ));

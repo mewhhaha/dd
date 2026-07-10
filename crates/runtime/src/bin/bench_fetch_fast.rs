@@ -585,7 +585,6 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
-            blob_store: runtime::BlobStoreConfig::local(paths.store_dir.join("blobs")),
         },
     })
     .await

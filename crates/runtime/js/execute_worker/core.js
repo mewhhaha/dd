@@ -1058,6 +1058,13 @@ globalThis.__dd_execute_worker = (payload) => {
       && lower !== "transfer-encoding";
   });
 
+  const stripCrossOriginRedirectHeaders = (headers) => headers.filter(([name]) => {
+    const lower = String(name || "").toLowerCase();
+    return lower !== "authorization"
+      && lower !== "proxy-authorization"
+      && lower !== "cookie";
+  });
+
   const checkHostFetchUrl = async (requestContextHandle, url) => {
     const checked = await callOp(
       "op_http_check_url",
@@ -1068,7 +1075,10 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!checked || typeof checked !== "object" || checked.ok === false) {
       throw new Error(String(checked?.error ?? "host fetch URL check failed"));
     }
-    return String(checked.url || url);
+    return {
+      url: String(checked.url || url),
+      clientRid: Math.max(0, Math.trunc(Number(checked.client_rid ?? 0) || 0)),
+    };
   };
 
   const composeAbortSignal = (signals) => {
@@ -1189,6 +1199,10 @@ globalThis.__dd_execute_worker = (payload) => {
             const signal = composeAbortSignal([current.controller.signal, normalized.signal]);
             let method = String(prepared.method || "GET");
             let url = String(prepared.url || normalized.url);
+            let clientRid = Math.max(
+              0,
+              Math.trunc(Number(prepared.client_rid ?? 0) || 0),
+            );
             let headers = callOp(
               "op_http_take_prepared_headers",
               Math.max(0, Math.trunc(Number(prepared.headers_handle ?? 0) || 0)),
@@ -1209,16 +1223,24 @@ globalThis.__dd_execute_worker = (payload) => {
               : "follow";
             let redirectsRemaining = HOST_FETCH_MAX_REDIRECTS;
             for (;;) {
-              const response = await raceAbortSignal(
-                rawFetch(new Request(url, {
-                  method,
-                  headers,
-                  body,
+              const client = clientRid > 0 ? new RuntimeHttpClient(clientRid) : undefined;
+              clientRid = 0;
+              let response;
+              try {
+                response = await raceAbortSignal(
+                  rawFetch(new Request(url, {
+                    method,
+                    headers,
+                    body,
+                    signal,
+                    redirect: "manual",
+                    client,
+                  })),
                   signal,
-                  redirect: "manual",
-                })),
-                signal,
-              );
+                );
+              } finally {
+                client?.close();
+              }
               if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(response.status)) {
                 return response;
               }
@@ -1234,7 +1256,13 @@ globalThis.__dd_execute_worker = (payload) => {
               }
               const nextUrl = new URL(location, response.url || url).toString();
               await response.body?.cancel?.();
-              url = await checkHostFetchUrl(current.requestContextHandle, nextUrl);
+              const previousOrigin = new URL(url).origin;
+              const checked = await checkHostFetchUrl(current.requestContextHandle, nextUrl);
+              if (new URL(checked.url).origin !== previousOrigin) {
+                headers = stripCrossOriginRedirectHeaders(headers);
+              }
+              url = checked.url;
+              clientRid = checked.clientRid;
               const nextMethod = rewriteMethodForRedirect(response.status, method);
               if (nextMethod !== method) {
                 headers = stripRedirectBodyHeaders(headers);

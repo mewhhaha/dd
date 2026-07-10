@@ -391,6 +391,14 @@ impl DynamicPendingReplies {
 const DYNAMIC_INBOX_BATCH_SIZE: usize = 64;
 
 impl DynamicControlInbox {
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("dynamic control inbox lock poisoned")
+            .items
+            .is_empty()
+    }
+
     pub fn push_reply(&self, payload: DynamicPushedReplyPayload) -> bool {
         let mut inner = self
             .inner

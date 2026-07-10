@@ -1020,6 +1020,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "serde",
+ "serde_json",
  "simd-json",
  "tokio",
  "uuid",
@@ -1481,6 +1482,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dd_init"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dd_server"
 version = "0.1.0"
 dependencies = [
@@ -1511,6 +1519,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -5230,6 +5239,7 @@ dependencies = [
  "deno_webidl",
  "futures-util",
  "getrandom 0.4.3",
+ "hyper-util",
  "mime_guess",
  "opentelemetry 0.32.0",
  "regex",

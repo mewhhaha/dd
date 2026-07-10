@@ -6,6 +6,7 @@ pub(crate) struct RuntimeFastCommandSender(pub mpsc::Sender<RuntimeCommand>);
 pub(crate) enum RuntimeCommand {
     Deploy {
         prepared: PreparedWorkerDeployment,
+        deployment_id: Option<String>,
         persist: bool,
         temporary: bool,
         expires_at_ms: Option<i64>,
@@ -17,6 +18,10 @@ pub(crate) enum RuntimeCommand {
         env: HashMap<String, String>,
         egress_allow_hosts: Vec<String>,
         reply: oneshot::Sender<Result<DynamicDeployResult>>,
+    },
+    Undeploy {
+        worker_name: String,
+        reply: oneshot::Sender<Result<()>>,
     },
     Invoke {
         worker_name: String,
@@ -258,6 +263,8 @@ impl WorkerManager {
             cache_store,
             config,
             storage,
+            control_store,
+            dynamic_modules,
             runtime_fast_sender,
             asset_catalog,
         } = init;
@@ -265,6 +272,8 @@ impl WorkerManager {
         Self {
             config,
             storage,
+            control_store,
+            dynamic_modules,
             bootstrap_snapshot,
             runtime_fast_sender,
             kv_store,
@@ -356,6 +365,7 @@ impl WorkerManager {
         match command {
             RuntimeCommand::Deploy {
                 prepared,
+                deployment_id,
                 persist,
                 temporary,
                 expires_at_ms,
@@ -365,6 +375,7 @@ impl WorkerManager {
                 let result = self
                     .deploy(
                         prepared,
+                        deployment_id,
                         persist,
                         temporary,
                         expires_at_ms,
@@ -383,6 +394,19 @@ impl WorkerManager {
                 let result = self
                     .deploy_dynamic(source, env, egress_allow_hosts, Vec::new())
                     .await;
+                let _ = reply.send(result);
+                true
+            }
+            RuntimeCommand::Undeploy { worker_name, reply } => {
+                let result = if self.workers.contains_key(&worker_name) {
+                    self.retire_worker_completely_with_error(
+                        &worker_name,
+                        PlatformError::not_found("worker was undeployed"),
+                    );
+                    Ok(())
+                } else {
+                    Err(PlatformError::not_found("worker not found"))
+                };
                 let _ = reply.send(result);
                 true
             }

@@ -1,5 +1,7 @@
 use super::*;
-use tracing::{info, warn};
+use futures_util::future::join_all;
+use serde::Serialize;
+use tracing::info;
 
 const RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY: usize = 4096;
 
@@ -10,6 +12,7 @@ struct DeployWithConfigRequest {
     assets: Vec<DeployAsset>,
     server_modules: Vec<DeployServerModule>,
     asset_headers: Option<String>,
+    deployment_id: Option<String>,
     persist: bool,
     temporary: bool,
     expires_at_ms: Option<i64>,
@@ -89,7 +92,7 @@ fn default_global_isolate_budget() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
-        .max(1)
+        .max(2)
 }
 
 #[derive(Clone, Debug)]
@@ -103,14 +106,12 @@ pub struct RuntimeStorageConfig {
     pub memory_db_max_total_connections: usize,
     pub memory_db_idle_ttl: Duration,
     pub worker_store_enabled: bool,
-    pub blob_store: BlobStoreConfig,
 }
 
 impl Default for RuntimeStorageConfig {
     fn default() -> Self {
         let store_dir = PathBuf::from("./store");
         let database_url = format!("file:{}/dd-kv.db", store_dir.display());
-        let blob_root = store_dir.join("blobs");
         Self {
             store_dir,
             database_url,
@@ -121,7 +122,6 @@ impl Default for RuntimeStorageConfig {
             memory_db_max_total_connections: 1024,
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: !cfg!(test),
-            blob_store: BlobStoreConfig::local(blob_root),
         }
     }
 }
@@ -140,7 +140,7 @@ pub struct RuntimeServiceConfig {
     pub storage: RuntimeStorageConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct WorkerStats {
     pub generation: u64,
     pub public: bool,
@@ -205,6 +205,53 @@ pub struct WorkerStats {
     pub memory_outbox_duplicate_schedule_coalesced_count: u64,
     pub memory_outbox_task_failure_count: u64,
     pub memory_outbox_shard_requeue_count: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeRestoreFailure {
+    pub worker: Option<String>,
+    pub source: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeWorkerStatus {
+    pub name: String,
+    /// Backlog-based outbox lag proxy. A value of zero means the coordinator
+    /// and outbox workers have no scheduled or in-flight shards.
+    pub outbox_lag_shards: usize,
+    #[serde(flatten)]
+    pub stats: WorkerStats,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeAdminSnapshot {
+    pub active_deployments: usize,
+    pub workers: Vec<RuntimeWorkerStatus>,
+    pub restore_failures: Vec<RuntimeRestoreFailure>,
+    pub readiness: RuntimeReadiness,
+    pub storage_retry_count: u64,
+    pub cache_flush_failure_count: u64,
+    pub cache_pending_recency_touches: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeReadiness {
+    pub ready: bool,
+    pub runtime_ready: bool,
+    pub migrations_ready: bool,
+    pub storage_ready: bool,
+    pub worker_restoration_ready: bool,
+    pub restore_failure_count: usize,
+    pub failed_components: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeCheckpointResult {
+    pub kv: bool,
+    pub cache: bool,
+    pub memory_databases: usize,
+    pub control: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -447,13 +494,122 @@ fn prepare_worker_deployment(
     })
 }
 
+pub(super) struct RuntimeShutdownState {
+    started: AtomicBool,
+    thread: StdMutex<Option<thread::JoinHandle<()>>>,
+    result: StdMutex<Option<Result<()>>>,
+    completed: Notify,
+}
+
+impl RuntimeShutdownState {
+    fn new(thread: thread::JoinHandle<()>) -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            thread: StdMutex::new(Some(thread)),
+            result: StdMutex::new(None),
+            completed: Notify::new(),
+        }
+    }
+
+    fn start(self: &Arc<Self>, sender: mpsc::Sender<RuntimeCommand>) {
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let command_result = if sender
+                .send(RuntimeCommand::Shutdown { reply: reply_tx })
+                .await
+                .is_err()
+            {
+                // The runtime may already have stopped. The thread join below
+                // determines whether that was a clean exit or a panic.
+                Ok(())
+            } else {
+                match reply_rx.await {
+                    Ok(result) => result,
+                    Err(_) => Err(PlatformError::internal("runtime shutdown channel closed")),
+                }
+            };
+
+            let runtime_thread = match state.thread.lock() {
+                Ok(mut thread) => thread.take(),
+                Err(_) => {
+                    state.finish(Err(PlatformError::internal(
+                        "runtime thread join state is poisoned",
+                    )));
+                    return;
+                }
+            };
+            let join_result = match runtime_thread {
+                Some(runtime_thread) => {
+                    match tokio::task::spawn_blocking(move || runtime_thread.join()).await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(_)) => Err(PlatformError::internal(
+                            "runtime thread panicked during shutdown",
+                        )),
+                        Err(error) => Err(PlatformError::internal(format!(
+                            "runtime thread join task failed: {error}"
+                        ))),
+                    }
+                }
+                None => Err(PlatformError::internal(
+                    "runtime thread join handle is unavailable",
+                )),
+            };
+            state.finish(command_result.and(join_result));
+        });
+    }
+
+    fn finish(&self, result: Result<()>) {
+        match self.result.lock() {
+            Ok(mut stored) => *stored = Some(result),
+            Err(mut poisoned) => **poisoned.get_mut() = Some(result),
+        }
+        self.completed.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<()> {
+        loop {
+            let notified = self.completed.notified();
+            let result = match self.result.lock() {
+                Ok(result) => result.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_complete(&self) -> bool {
+        match self.result.lock() {
+            Ok(result) => result.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeService {
     sender: mpsc::Sender<RuntimeCommand>,
     cancel_sender: mpsc::Sender<RuntimeCommand>,
     asset_catalog: AssetCatalog,
+    kv_store: KvStore,
+    memory_store: MemoryStore,
     cache_store: CacheStore,
+    control_store: ControlStore,
+    pub(super) _dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
     storage: RuntimeStorageConfig,
+    pub(super) shutdown: Arc<RuntimeShutdownState>,
 }
 impl RuntimeService {
     pub async fn start() -> Result<Self> {
@@ -512,8 +668,19 @@ impl RuntimeService {
                 ))
             })?;
 
+        let control_store = ControlStore::open(&storage.store_dir).await?;
+        if storage.worker_store_enabled {
+            control_store
+                .import_legacy_workers(&storage.store_dir.join("workers"))
+                .await?;
+        }
+
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
-        let kv_store = KvStore::from_database_url(&storage.database_url).await?;
+        // KV and cache intentionally share one Turso database owner. Each
+        // subsystem still configures its own connections for its durability
+        // class (FULL for KV, NORMAL for rebuildable cache data).
+        let storage_database = KvStore::open_database(&storage.database_url).await?;
+        let kv_store = KvStore::from_database(Arc::clone(&storage_database)).await?;
         kv_store.set_profile_enabled(runtime.kv_profile_enabled);
         let memory_store = MemoryStore::new_with_connection_limits(
             storage.store_dir.join("memory"),
@@ -525,167 +692,196 @@ impl RuntimeService {
         )
         .await?;
         memory_store.set_profile_enabled(runtime.memory_profile_enabled);
-        let blob_store = BlobStore::from_config(storage.blob_store.clone()).await?;
-        let cache_store = CacheStore::from_config(
+        let blob_store = BlobStore::for_legacy_root(storage.store_dir.join("blobs")).await?;
+        let cache_store = CacheStore::from_database(
             CacheConfig {
                 max_entries: runtime.cache_max_entries,
                 max_bytes: runtime.cache_max_bytes,
                 default_ttl: runtime.cache_default_ttl,
                 ..CacheConfig::default()
             },
-            &storage.database_url,
+            storage_database,
             blob_store,
         )
         .await?;
         let (sender, receiver) = mpsc::channel(256);
         let (cancel_sender, cancel_receiver) = mpsc::channel(RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY);
         let asset_catalog = AssetCatalog::default();
-        spawn_runtime_thread(RuntimeThreadStart {
+        let dynamic_modules = crate::dynamic_modules::DynamicModuleRegistry::default();
+        let runtime_thread = spawn_runtime_thread(RuntimeThreadStart {
             receiver,
             cancel_receiver,
             runtime_fast_sender: cancel_sender.clone(),
             asset_catalog: asset_catalog.clone(),
             bootstrap_snapshot,
-            kv_store,
-            memory_store,
+            kv_store: kv_store.clone(),
+            memory_store: memory_store.clone(),
             cache_store: cache_store.clone(),
             config: runtime,
             storage: storage.clone(),
+            control_store: control_store.clone(),
+            dynamic_modules: dynamic_modules.clone(),
         })?;
+        let shutdown = Arc::new(RuntimeShutdownState::new(runtime_thread));
         let service = Self {
             sender,
             cancel_sender,
             asset_catalog,
+            kv_store,
+            memory_store,
             cache_store,
+            control_store,
+            _dynamic_modules: dynamic_modules,
             storage,
+            shutdown,
         };
-        service.restore_workers_from_store().await?;
+        if let Err(error) = service.restore_workers_from_store().await {
+            let _ = service.shutdown().await;
+            return Err(error);
+        }
         Ok(service)
-    }
-
-    fn worker_store_dir(&self) -> PathBuf {
-        self.storage.store_dir.join("workers")
     }
 
     async fn restore_workers_from_store(&self) -> Result<()> {
         if !self.storage.worker_store_enabled {
             return Ok(());
         }
-
-        let workers_dir = self.worker_store_dir();
-        let mut read_dir = match tokio::fs::read_dir(&workers_dir).await {
-            Ok(read_dir) => read_dir,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(PlatformError::internal(format!(
-                    "failed to read worker store {}: {error}",
-                    workers_dir.display()
-                )));
-            }
-        };
-
-        let mut latest_by_worker: HashMap<String, (StoredWorkerDeployment, PathBuf)> =
-            HashMap::new();
-        while let Some(entry) = read_dir.next_entry().await.map_err(|error| {
-            PlatformError::internal(format!(
-                "failed to read worker store entry in {}: {error}",
-                workers_dir.display()
-            ))
-        })? {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-
-            let body = match tokio::fs::read_to_string(&path).await {
-                Ok(body) => body,
-                Err(error) => {
-                    warn!(path = %path.display(), error = %error, "skipping unreadable worker store file");
-                    continue;
-                }
-            };
-            let stored: StoredWorkerDeployment = match crate::json::from_string(body) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    warn!(path = %path.display(), error = %error, "skipping invalid worker store file");
-                    continue;
-                }
-            };
-            match latest_by_worker.get(&stored.name) {
-                Some((current, current_path)) => {
-                    let replace = stored.updated_at_ms > current.updated_at_ms
-                        || (stored.updated_at_ms == current.updated_at_ms
-                            && path.file_name() > current_path.file_name());
-                    if replace {
-                        latest_by_worker.insert(stored.name.clone(), (stored, path));
-                    }
-                }
-                None => {
-                    latest_by_worker.insert(stored.name.clone(), (stored, path));
-                }
-            }
-        }
-
         let now_ms = epoch_ms_i64()?;
         let mut restored = 0usize;
-        for (_worker_name, (stored, path)) in latest_by_worker {
+        for stored in self.control_store.active_deployments().await? {
             if stored
                 .expires_at_ms
                 .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
             {
                 info!(
-                    worker = %stored.name,
-                    path = %path.display(),
-                    "skipping expired temporary worker from local store"
+                    worker = %stored.worker,
+                    deployment_id = %stored.deployment_id,
+                    "deactivating expired temporary worker from control store"
                 );
-                if let Err(error) = delete_worker_deployment(&self.storage, &stored.name).await {
-                    warn!(
-                        worker = %stored.name,
-                        error = %error,
-                        "failed to remove expired worker deployment from local store"
-                    );
-                }
+                self.control_store.deactivate_worker(&stored.worker).await?;
                 continue;
             }
-
-            match self
+            let worker = stored.worker.clone();
+            let deployment_id = stored.deployment_id.clone();
+            let restore_result = self
                 .deploy_with_config_internal(DeployWithConfigRequest {
-                    worker_name: stored.name.clone(),
+                    worker_name: stored.worker,
                     source: stored.source,
                     config: stored.config,
                     assets: stored.assets,
                     server_modules: stored.server_modules,
                     asset_headers: stored.asset_headers,
+                    deployment_id: Some(deployment_id.clone()),
                     persist: false,
                     temporary: stored.expires_at_ms.is_some(),
                     expires_at_ms: stored.expires_at_ms,
                     enforce_temporary_transition: false,
                 })
-                .await
-            {
-                Ok(deployment_id) => {
+                .await;
+            let diagnostic = restore_result.as_ref().map(|_| ()).map_err(Clone::clone);
+            self.control_store
+                .record_restore_result(&worker, Some(&deployment_id), &diagnostic)
+                .await?;
+            match restore_result {
+                Ok(restored_id) => {
                     restored += 1;
                     info!(
-                        worker = %stored.name,
-                        deployment_id = %deployment_id,
-                        "restored worker from local store"
+                        worker = %worker,
+                        deployment_id = %restored_id,
+                        "restored worker from control store"
                     );
                 }
                 Err(error) => {
-                    warn!(
-                        worker = %stored.name,
-                        path = %path.display(),
-                        error = %error,
-                        "failed to restore worker from local store"
-                    );
+                    return Err(PlatformError::internal(format!(
+                        "failed to restore worker {worker} deployment {deployment_id}: {error}"
+                    )));
                 }
             }
         }
 
         if restored > 0 {
-            info!(restored, "restored workers from local store");
+            info!(restored, "restored workers from control store");
         }
         Ok(())
+    }
+
+    pub fn control_store(&self) -> ControlStore {
+        self.control_store.clone()
+    }
+
+    pub async fn deployments(
+        &self,
+        worker: Option<&str>,
+    ) -> Result<Vec<common::DeploymentSummary>> {
+        Ok(self
+            .control_store
+            .list_deployments(worker)
+            .await?
+            .iter()
+            .map(ControlDeployment::summary)
+            .collect())
+    }
+
+    pub async fn deployment(&self, deployment_id: &str) -> Result<common::DeploymentDetails> {
+        Ok(self
+            .control_store
+            .get_deployment(deployment_id)
+            .await?
+            .details())
+    }
+
+    pub async fn undeploy(&self, worker_name: String) -> Result<()> {
+        if !self.control_store.deactivate_worker(&worker_name).await? {
+            return Err(PlatformError::not_found("worker not found"));
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(RuntimeCommand::Undeploy {
+                worker_name,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+        reply_rx
+            .await
+            .map_err(|_| PlatformError::internal("runtime undeploy channel closed"))?
+    }
+
+    pub async fn rollback(&self, worker_name: String, deployment_id: String) -> Result<String> {
+        let stored = self.control_store.get_deployment(&deployment_id).await?;
+        if stored.worker != worker_name {
+            return Err(PlatformError::bad_request(
+                "deployment does not belong to requested worker",
+            ));
+        }
+        let now_ms = epoch_ms_i64()?;
+        if stored
+            .expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+        {
+            return Err(PlatformError::conflict(
+                "expired temporary deployment cannot be rolled back",
+            ));
+        }
+        let restored_id = self
+            .deploy_with_config_internal(DeployWithConfigRequest {
+                worker_name: stored.worker.clone(),
+                source: stored.source,
+                config: stored.config,
+                assets: stored.assets,
+                server_modules: stored.server_modules,
+                asset_headers: stored.asset_headers,
+                deployment_id: Some(stored.deployment_id.clone()),
+                persist: false,
+                temporary: stored.expires_at_ms.is_some(),
+                expires_at_ms: stored.expires_at_ms,
+                enforce_temporary_transition: false,
+            })
+            .await?;
+        self.control_store
+            .activate_deployment(&worker_name, &restored_id)
+            .await?;
+        Ok(restored_id)
     }
 
     pub async fn deploy(&self, worker_name: String, source: String) -> Result<String> {
@@ -786,6 +982,7 @@ impl RuntimeService {
             assets,
             server_modules,
             asset_headers,
+            deployment_id: None,
             persist: true,
             temporary,
             expires_at_ms: None,
@@ -805,6 +1002,7 @@ impl RuntimeService {
             assets,
             server_modules,
             asset_headers,
+            deployment_id,
             persist,
             temporary,
             expires_at_ms,
@@ -822,6 +1020,7 @@ impl RuntimeService {
         self.sender
             .send(RuntimeCommand::Deploy {
                 prepared,
+                deployment_id,
                 persist,
                 temporary,
                 expires_at_ms,
@@ -1219,6 +1418,156 @@ impl RuntimeService {
         reply_rx.await.ok().flatten()
     }
 
+    pub async fn admin_snapshot(&self) -> RuntimeAdminSnapshot {
+        let worker_names = self.asset_catalog.worker_names();
+        let active_deployments = worker_names.len();
+        let workers = self.worker_statuses(worker_names).await;
+        let restore_failures = match self.control_store.restore_failures().await {
+            Ok(failures) => failures
+                .into_iter()
+                .map(|failure| RuntimeRestoreFailure {
+                    worker: Some(failure.worker),
+                    source: failure
+                        .deployment_id
+                        .map(|id| format!("control.db deployment {id}"))
+                        .unwrap_or_else(|| "control.db".to_string()),
+                    error: failure.error,
+                })
+                .collect(),
+            Err(error) => vec![RuntimeRestoreFailure {
+                worker: None,
+                source: "control.db".to_string(),
+                error: error.to_string(),
+            }],
+        };
+        let readiness = self.readiness().await;
+        RuntimeAdminSnapshot {
+            active_deployments,
+            workers,
+            restore_failures,
+            readiness,
+            storage_retry_count: crate::turso_util::storage_retry_count(),
+            cache_flush_failure_count: self.cache_store.flush_failure_count(),
+            cache_pending_recency_touches: self.cache_store.pending_touch_count(),
+        }
+    }
+
+    async fn worker_statuses(&self, worker_names: Vec<String>) -> Vec<RuntimeWorkerStatus> {
+        join_all(worker_names.into_iter().map(|name| async move {
+            self.stats(name.clone())
+                .await
+                .map(|stats| RuntimeWorkerStatus {
+                    name,
+                    outbox_lag_shards: stats
+                        .pending_memory_outbox_shards
+                        .max(stats.memory_outbox_worker_pending_shards)
+                        .saturating_add(stats.memory_outbox_worker_in_flight_shards),
+                    stats,
+                })
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    pub async fn is_quiescent(&self) -> bool {
+        let worker_names = self.asset_catalog.worker_names();
+        let expected = worker_names.len();
+        let workers = self.worker_statuses(worker_names).await;
+        workers.len() == expected
+            && workers.iter().all(|worker| {
+                let stats = &worker.stats;
+                stats.queued == 0
+                    && stats.busy == 0
+                    && stats.inflight_total == 0
+                    && stats.wait_until_total == 0
+                    && stats.pending_memory_outbox_shards == 0
+                    && stats.memory_outbox_worker_pending_shards == 0
+                    && stats.memory_outbox_worker_in_flight_shards == 0
+            })
+    }
+
+    pub async fn wait_for_quiescence(&self, timeout: Duration) -> bool {
+        if self.is_quiescent().await {
+            return true;
+        }
+        if timeout.is_zero() {
+            return false;
+        }
+        let wait = async {
+            loop {
+                if self.is_quiescent().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    pub async fn readiness(&self) -> RuntimeReadiness {
+        let (control, kv, cache, memory, restore_failures) = tokio::join!(
+            self.control_store.health_check(),
+            self.kv_store.health_check(),
+            self.cache_store.health_check(),
+            self.memory_store.health_check(),
+            self.control_store.restore_failures(),
+        );
+        let mut failed_components = Vec::new();
+        if control.is_err() {
+            failed_components.push("control".to_string());
+        }
+        if kv.is_err() {
+            failed_components.push("kv".to_string());
+        }
+        if cache.is_err() {
+            failed_components.push("cache".to_string());
+        }
+        if memory.is_err() {
+            failed_components.push("memory".to_string());
+        }
+        if restore_failures.is_err() {
+            failed_components.push("restoration_diagnostics".to_string());
+        }
+        let runtime_ready = !self.sender.is_closed();
+        if !runtime_ready {
+            failed_components.push("runtime".to_string());
+        }
+        let restore_failure_count = restore_failures
+            .as_ref()
+            .map_or(0, |failures| failures.len());
+        let storage_ready = control.is_ok() && kv.is_ok() && cache.is_ok() && memory.is_ok();
+        // Each component health check also verifies its current migration
+        // version, so migration readiness is intentionally conservative when
+        // any store cannot be inspected.
+        let migrations_ready = storage_ready;
+        let worker_restoration_ready = restore_failures.is_ok() && restore_failure_count == 0;
+        RuntimeReadiness {
+            ready: runtime_ready && migrations_ready && storage_ready && worker_restoration_ready,
+            runtime_ready,
+            migrations_ready,
+            storage_ready,
+            worker_restoration_ready,
+            restore_failure_count,
+            failed_components,
+        }
+    }
+
+    pub async fn checkpoint(&self) -> Result<RuntimeCheckpointResult> {
+        self.cache_store.flush_pending_touches().await?;
+        self.control_store.checkpoint().await?;
+        self.kv_store.checkpoint().await?;
+        self.cache_store.checkpoint().await?;
+        let memory_databases = self.memory_store.checkpoint_all_databases().await?;
+        Ok(RuntimeCheckpointResult {
+            kv: true,
+            cache: true,
+            memory_databases,
+            control: true,
+        })
+    }
+
     pub fn worker_is_public(&self, worker_name: &str) -> bool {
         self.asset_catalog
             .get(worker_name)
@@ -1356,18 +1705,10 @@ impl RuntimeService {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .sender
-            .send(RuntimeCommand::Shutdown { reply: reply_tx })
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-        reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime shutdown channel closed"))?
+        // Use the fast control lane so shutdown is not queued behind a full
+        // request/deploy channel once the bounded drain deadline has elapsed.
+        self.shutdown.start(self.cancel_sender.clone());
+        self.shutdown.wait().await
     }
 
     #[cfg(test)]

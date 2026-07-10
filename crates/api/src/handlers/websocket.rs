@@ -92,6 +92,20 @@ where
         );
     }
 
+    let Some(session_guard) = state.operations.try_begin_session() else {
+        state.websocket_sessions.lock().await.remove(&session_id);
+        let _ = state
+            .runtime
+            .websocket_close(
+                runtime_worker_name.clone(),
+                session_id.clone(),
+                1012,
+                "service is draining".to_string(),
+            )
+            .await;
+        return Err(PlatformError::overloaded("service is draining").into());
+    };
+
     let filtered_headers = sanitize_websocket_handshake_headers(output.headers);
     let runtime = state.runtime.clone();
     let state_for_session = state.clone();
@@ -100,6 +114,7 @@ where
     let on_upgrade = ws_upgrade.on_upgrade;
 
     tokio::spawn(async move {
+        let _session_guard = session_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 let socket =
@@ -210,6 +225,7 @@ pub(crate) async fn open_websocket_session_from_parts(
         .map_err(|error| PlatformError::bad_request(format!("websocket open failed: {error}")))
 }
 
+#[cfg(feature = "http3")]
 pub(crate) async fn open_transport_session_from_parts(
     state: &AppState,
     parts: &http::request::Parts,

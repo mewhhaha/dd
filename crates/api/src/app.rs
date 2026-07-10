@@ -11,12 +11,46 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 pub async fn serve(
+    public_addr: SocketAddr,
+    private_addr: SocketAddr,
+    state: AppState,
+    limits: ServerLimits,
+) -> Result<()> {
+    serve_listeners(public_addr, private_addr, state, limits).await
+}
+
+pub async fn serve_until<F>(
+    public_addr: SocketAddr,
+    private_addr: SocketAddr,
+    state: AppState,
+    limits: ServerLimits,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let listeners = serve_listeners(public_addr, private_addr, state.clone(), limits);
+    tokio::pin!(listeners);
+    tokio::pin!(shutdown);
+
+    tokio::select! {
+        result = &mut listeners => result,
+        () = &mut shutdown => {
+            state.operations.begin_shutdown();
+            info!(active_requests = state.operations.active_requests(), "shutdown signal received; listeners stopped");
+            Ok(())
+        }
+    }
+}
+
+async fn serve_listeners(
     public_addr: SocketAddr,
     private_addr: SocketAddr,
     state: AppState,

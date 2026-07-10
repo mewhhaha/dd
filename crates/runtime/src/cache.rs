@@ -1,19 +1,21 @@
 use crate::blob::BlobStore;
 use crate::turso_util::{
-    configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
-    retry_turso_busy,
+    checkpoint_database, configure_turso_connection, ensure_storage_migration_table,
+    execute_cached, health_check_database, is_retryable_turso_error, query_cached,
+    record_storage_retry, record_storage_schema_version, retry_turso_busy, storage_schema_version,
 };
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(test)]
 use tokio::sync::{Notify, oneshot};
-use turso::{Builder, Connection, Database, transaction::TransactionBehavior};
+#[cfg(test)]
+use turso::Builder;
+use turso::{Connection, Database, transaction::TransactionBehavior};
 use uuid::Uuid;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -22,12 +24,46 @@ const HOT_CACHE_MAX_ENTRIES: usize = 1_024;
 const HOT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const TOUCH_FLUSH_BATCH_SIZE: usize = 256;
+const CACHE_SCHEMA_VERSION: i64 = 1;
+const CREATE_CACHE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS worker_cache_entries (
+  id TEXT PRIMARY KEY,
+  cache_name TEXT NOT NULL,
+  method TEXT NOT NULL,
+  url TEXT NOT NULL,
+  vary_headers_json TEXT NOT NULL,
+  vary_values_json TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  headers_json TEXT NOT NULL,
+  body_blob BLOB NOT NULL,
+  body_size INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  last_access_seq INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+)";
+const CREATE_CACHE_MIGRATION_TABLE_SQL: &str = "CREATE TABLE worker_cache_entries_migrating (
+  id TEXT PRIMARY KEY,
+  cache_name TEXT NOT NULL,
+  method TEXT NOT NULL,
+  url TEXT NOT NULL,
+  vary_headers_json TEXT NOT NULL,
+  vary_values_json TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  headers_json TEXT NOT NULL,
+  body_blob BLOB NOT NULL,
+  body_size INTEGER NOT NULL,
+  expires_at_ms INTEGER NOT NULL,
+  last_access_seq INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+)";
 
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
     pub max_entries: usize,
     pub max_bytes: usize,
     pub default_ttl: Duration,
+    /// Legacy tuning knob retained for configuration compatibility. Cache bodies
+    /// are always stored directly as Turso BLOBs.
+    #[allow(dead_code)]
     pub inline_body_limit_bytes: usize,
 }
 
@@ -69,7 +105,6 @@ pub enum CacheLookup {
 #[derive(Clone)]
 pub struct CacheStore {
     database: Arc<Database>,
-    blob_store: BlobStore,
     config: CacheConfig,
     access_seq: Arc<AtomicU64>,
     mutation_epoch: Arc<AtomicU64>,
@@ -149,6 +184,7 @@ struct HotCache {
     max_bytes: usize,
     state: Mutex<HotCacheState>,
     flush_lock: AsyncMutex<()>,
+    flush_failures: AtomicU64,
 }
 
 struct ScheduledFlushGuard {
@@ -253,24 +289,36 @@ struct CacheRecord {
     vary_values_json: String,
     status: i64,
     headers_json: String,
-    body_storage: String,
-    body_inline_hex: String,
-    body_ref: String,
+    body: Vec<u8>,
     expires_at_ms: i64,
 }
 
 struct CacheDeleteCandidate {
     id: String,
-    body_storage: String,
-    body_ref: String,
 }
 
 struct CacheCleanupCandidate {
     id: String,
     headers_json: String,
-    body_storage: String,
-    body_ref: String,
     expires_at_ms: i64,
+}
+
+struct LegacyCacheRecord {
+    id: String,
+    cache_name: String,
+    method: String,
+    url: String,
+    vary_headers_json: String,
+    vary_values_json: String,
+    status: i64,
+    headers_json: String,
+    body_storage: String,
+    body_inline_hex: String,
+    body_ref: String,
+    body_size: i64,
+    expires_at_ms: i64,
+    last_access_seq: i64,
+    updated_at_ms: i64,
 }
 
 #[derive(Default)]
@@ -293,6 +341,7 @@ impl HotCache {
             max_bytes: config.max_bytes.min(HOT_CACHE_MAX_BYTES),
             state: Mutex::new(HotCacheState::default()),
             flush_lock: AsyncMutex::new(()),
+            flush_failures: AtomicU64::new(0),
         }
     }
 
@@ -434,6 +483,7 @@ impl HotCache {
                 Ok(()) => consecutive_failures = 0,
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    self.flush_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(error = %error, "failed to flush cache recency touches");
                 }
             }
@@ -474,7 +524,7 @@ impl HotCache {
     async fn persist_touch_batch(&self, touches: &[(String, i64)]) -> Result<()> {
         const MAX_ATTEMPTS: usize = 8;
         let mut conn = self.database.connect().map_err(cache_error)?;
-        configure_turso_connection(&conn, cache_error)?;
+        configure_cache_connection(&conn).await?;
 
         for attempt in 0..MAX_ATTEMPTS {
             let tx = match conn
@@ -486,7 +536,7 @@ impl HotCache {
                     sleep_cache_retry(attempt).await;
                     continue;
                 }
-                Err(error) => return Err(cache_error(error)),
+                Err(error) => return Err(cache_error_after_retry(error)),
             };
 
             let mut execute_error = None;
@@ -511,7 +561,7 @@ impl HotCache {
                     sleep_cache_retry(attempt).await;
                     continue;
                 }
-                return Err(cache_error(error));
+                return Err(cache_error_after_retry(error));
             }
 
             match tx.commit().await {
@@ -519,11 +569,11 @@ impl HotCache {
                 Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
                     sleep_cache_retry(attempt).await;
                 }
-                Err(error) => return Err(cache_error(error)),
+                Err(error) => return Err(cache_error_after_retry(error)),
             }
         }
 
-        Err(PlatformError::runtime(
+        Err(PlatformError::storage_unavailable(
             "cache error: recency flush failed after retries",
         ))
     }
@@ -647,17 +697,37 @@ impl HotCacheState {
 }
 
 impl CacheStore {
-    pub async fn from_config(
+    pub(crate) async fn from_database(
         config: CacheConfig,
-        database_url: &str,
-        blob_store: BlobStore,
+        database: Arc<Database>,
+        legacy_blobs: BlobStore,
     ) -> Result<Self> {
-        let local_path = database_url
-            .strip_prefix("file:")
-            .unwrap_or(database_url)
-            .to_string();
-        ensure_parent_dir(&local_path)?;
-        Self::from_local_path(config, local_path, blob_store).await
+        migrate_cache_schema(&database, &legacy_blobs).await?;
+        let store = Self {
+            database: Arc::clone(&database),
+            hot_cache: Arc::new(HotCache::new(database, &config)),
+            config,
+            access_seq: Arc::new(AtomicU64::new(1)),
+            mutation_epoch: Arc::new(AtomicU64::new(0)),
+            mutation_lock: Arc::new(AsyncMutex::new(())),
+            #[cfg(test)]
+            test_hooks: Arc::new(CacheTestHooks::default()),
+        };
+        store.initialize_access_seq().await?;
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    async fn from_local_path(
+        config: CacheConfig,
+        local_path: String,
+        legacy_blobs: BlobStore,
+    ) -> Result<Self> {
+        let database = Builder::new_local(&local_path)
+            .build()
+            .await
+            .map_err(cache_error)?;
+        Self::from_database(config, Arc::new(database), legacy_blobs).await
     }
 
     pub async fn get(&self, request: &CacheRequest) -> Result<CacheLookup> {
@@ -682,10 +752,10 @@ impl CacheStore {
         }
 
         let mutation_epoch = self.mutation_epoch.load(Ordering::Acquire);
-        let conn = self.connect()?;
+        let conn = self.connect().await?;
         let mut rows = query_cached(
             &conn,
-                "SELECT id, vary_headers_json, vary_values_json, status, headers_json, body_storage, body_inline_hex, body_ref, expires_at_ms
+                "SELECT id, vary_headers_json, vary_values_json, status, headers_json, body_blob, expires_at_ms
                  FROM worker_cache_entries
                  WHERE cache_name = ?1 AND method = ?2 AND url = ?3
                  ORDER BY last_access_seq DESC",
@@ -706,11 +776,7 @@ impl CacheStore {
                 match crate::json::from_string(std::mem::take(&mut record.vary_headers_json)) {
                     Ok(value) => value,
                     Err(_) => {
-                        stale.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
+                        stale.push(CacheDeleteCandidate { id: record.id });
                         continue;
                     }
                 };
@@ -718,11 +784,7 @@ impl CacheStore {
                 match crate::json::from_string(std::mem::take(&mut record.vary_values_json)) {
                     Ok(value) => value,
                     Err(_) => {
-                        stale.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
+                        stale.push(CacheDeleteCandidate { id: record.id });
                         continue;
                     }
                 };
@@ -735,52 +797,15 @@ impl CacheStore {
                 match crate::json::from_string(std::mem::take(&mut record.headers_json)) {
                     Ok(value) => value,
                     Err(_) => {
-                        stale.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
+                        stale.push(CacheDeleteCandidate { id: record.id });
                         continue;
                     }
                 };
 
-            let body = if record.body_storage == "inline" {
-                match hex_to_bytes(&record.body_inline_hex) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        stale.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
-                        continue;
-                    }
-                }
-            } else if record.body_storage == "blob" {
-                match self.blob_store.get(&record.body_ref).await {
-                    Ok(value) => value,
-                    Err(_) => {
-                        stale.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
-                        continue;
-                    }
-                }
-            } else {
-                stale.push(CacheDeleteCandidate {
-                    id: record.id,
-                    body_storage: record.body_storage,
-                    body_ref: record.body_ref,
-                });
-                continue;
-            };
-
             let response = CacheResponse {
                 status: record.status as u16,
                 headers,
-                body,
+                body: record.body,
             };
             let response_headers = to_header_map(&response.headers);
             let response_control =
@@ -810,11 +835,7 @@ impl CacheStore {
             }
 
             if now_ms > max_stale_until_ms {
-                expired.push(CacheDeleteCandidate {
-                    id: record.id,
-                    body_storage: record.body_storage,
-                    body_ref: record.body_ref,
-                });
+                expired.push(CacheDeleteCandidate { id: record.id });
                 continue;
             }
 
@@ -931,16 +952,7 @@ impl CacheStore {
         let headers_json = crate::json::to_string(&response.headers)
             .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
 
-        let mut body_storage = "inline".to_string();
-        let mut body_inline_hex = bytes_to_hex(&response.body);
-        let mut body_ref = String::new();
-        if response.body.len() > self.config.inline_body_limit_bytes {
-            body_storage = "blob".to_string();
-            body_inline_hex.clear();
-            body_ref = self.blob_store.put(&response.body).await?;
-        }
-
-        let mut conn = self.connect()?;
+        let mut conn = self.connect().await?;
         let now_ms = epoch_ms_i64()?;
         let expires_at_ms = now_ms + ttl.as_millis() as i64;
         let access_seq = self.next_access_seq();
@@ -948,7 +960,6 @@ impl CacheStore {
         let _mutation_guard = self.mutation_lock.lock().await;
 
         const MAX_ATTEMPTS: usize = 8;
-        let mut commit_attempted = false;
         let existing_variant = 'write: {
             for attempt in 0..MAX_ATTEMPTS {
                 let tx = match conn
@@ -962,11 +973,7 @@ impl CacheStore {
                         sleep_cache_retry(attempt).await;
                         continue;
                     }
-                    Err(error) => {
-                        self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
-                            .await;
-                        return Err(cache_error(error));
-                    }
+                    Err(error) => return Err(cache_error_after_retry(error)),
                 };
                 let existing_variant = match self
                     .load_variant_candidates(
@@ -982,8 +989,6 @@ impl CacheStore {
                     Ok(existing_variant) => existing_variant,
                     Err(error) => {
                         let _ = tx.rollback().await;
-                        self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
-                            .await;
                         return Err(error);
                     }
                 };
@@ -991,16 +996,14 @@ impl CacheStore {
                     &tx,
                     "INSERT INTO worker_cache_entries (
                            id, cache_name, method, url, vary_headers_json, vary_values_json,
-                           status, headers_json, body_storage, body_inline_hex, body_ref,
-                           body_size, expires_at_ms, last_access_seq, updated_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                           status, headers_json, body_blob, body_size,
+                           expires_at_ms, last_access_seq, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                          ON CONFLICT(cache_name, method, url, vary_headers_json, vary_values_json)
                          DO UPDATE SET
                            status = excluded.status,
                            headers_json = excluded.headers_json,
-                           body_storage = excluded.body_storage,
-                           body_inline_hex = excluded.body_inline_hex,
-                           body_ref = excluded.body_ref,
+                           body_blob = excluded.body_blob,
                            body_size = excluded.body_size,
                            expires_at_ms = excluded.expires_at_ms,
                            last_access_seq = excluded.last_access_seq,
@@ -1014,9 +1017,7 @@ impl CacheStore {
                         vary_values_json.as_str(),
                         response.status as i64,
                         headers_json.as_str(),
-                        body_storage.as_str(),
-                        body_inline_hex.as_str(),
-                        body_ref.as_str(),
+                        response.body.as_slice(),
                         size_bytes as i64,
                         expires_at_ms,
                         access_seq,
@@ -1030,11 +1031,8 @@ impl CacheStore {
                         sleep_cache_retry(attempt).await;
                         continue;
                     }
-                    self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
-                        .await;
-                    return Err(cache_error(error));
+                    return Err(cache_error_after_retry(error));
                 }
-                commit_attempted = true;
                 if let Err(error) = tx.commit().await {
                     // A commit error can be ambiguous. Invalidate conservatively
                     // so a prior decoded response cannot outlive a disk commit.
@@ -1044,15 +1042,11 @@ impl CacheStore {
                         sleep_cache_retry(attempt).await;
                         continue;
                     }
-                    self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
-                        .await;
-                    return Err(cache_error(error));
+                    return Err(cache_error_after_retry(error));
                 }
                 break 'write existing_variant;
             }
-            self.cleanup_failed_put_blob(&body_storage, &body_ref, commit_attempted)
-                .await;
-            return Err(PlatformError::runtime(
+            return Err(PlatformError::storage_unavailable(
                 "cache error: put failed after retries",
             ));
         };
@@ -1064,13 +1058,6 @@ impl CacheStore {
         self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
         if existing_variant.len() > 1 {
             self.remove_records(&conn, &existing_variant[1..]).await?;
-        }
-        if let Some(existing) = existing_variant.first()
-            && existing.body_storage == "blob"
-            && !existing.body_ref.is_empty()
-            && existing.body_ref != body_ref
-        {
-            self.blob_store.delete(&existing.body_ref).await?;
         }
         self.cleanup_expired(&conn, now_ms).await?;
         self.evict_if_needed(&conn).await?;
@@ -1094,7 +1081,7 @@ impl CacheStore {
         let base_key = CacheBaseKey::new(cache_name.clone(), method.clone(), request.url.clone());
         let _mutation_guard = self.mutation_lock.lock().await;
         self.hot_cache.invalidate_base(&base_key);
-        let conn = self.connect()?;
+        let conn = self.connect().await?;
         let records = self
             .load_candidates(&conn, &cache_name, &method, &request.url)
             .await?;
@@ -1105,11 +1092,7 @@ impl CacheStore {
                 match crate::json::from_string(std::mem::take(&mut record.vary_headers_json)) {
                     Ok(value) => value,
                     Err(_) => {
-                        to_delete.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
+                        to_delete.push(CacheDeleteCandidate { id: record.id });
                         continue;
                     }
                 };
@@ -1117,20 +1100,12 @@ impl CacheStore {
                 match crate::json::from_string(std::mem::take(&mut record.vary_values_json)) {
                     Ok(value) => value,
                     Err(_) => {
-                        to_delete.push(CacheDeleteCandidate {
-                            id: record.id,
-                            body_storage: record.body_storage,
-                            body_ref: record.body_ref,
-                        });
+                        to_delete.push(CacheDeleteCandidate { id: record.id });
                         continue;
                     }
                 };
             if derive_vary_values(&vary_headers, &request_headers) == stored_vary_values {
-                to_delete.push(CacheDeleteCandidate {
-                    id: record.id,
-                    body_storage: record.body_storage,
-                    body_ref: record.body_ref,
-                });
+                to_delete.push(CacheDeleteCandidate { id: record.id });
             }
         }
 
@@ -1143,94 +1118,16 @@ impl CacheStore {
         Ok(true)
     }
 
-    async fn from_local_path(
-        config: CacheConfig,
-        local_path: String,
-        blob_store: BlobStore,
-    ) -> Result<Self> {
-        let database = Builder::new_local(&local_path)
-            .build()
-            .await
-            .map_err(cache_error)?;
-        let database = Arc::new(database);
-        let store = Self {
-            database: Arc::clone(&database),
-            blob_store,
-            hot_cache: Arc::new(HotCache::new(database, &config)),
-            config,
-            access_seq: Arc::new(AtomicU64::new(1)),
-            mutation_epoch: Arc::new(AtomicU64::new(0)),
-            mutation_lock: Arc::new(AsyncMutex::new(())),
-            #[cfg(test)]
-            test_hooks: Arc::new(CacheTestHooks::default()),
-        };
-        store.ensure_schema().await?;
-        store.initialize_access_seq().await?;
-        Ok(store)
-    }
-
+    #[cfg(test)]
     async fn ensure_schema(&self) -> Result<()> {
-        let conn = self.connect()?;
-        execute_with_retry(|| {
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS worker_cache_entries (
-               id TEXT PRIMARY KEY,
-               cache_name TEXT NOT NULL,
-               method TEXT NOT NULL,
-               url TEXT NOT NULL,
-               vary_headers_json TEXT NOT NULL,
-               vary_values_json TEXT NOT NULL,
-               status INTEGER NOT NULL,
-               headers_json TEXT NOT NULL,
-               body_storage TEXT NOT NULL,
-               body_inline_hex TEXT NOT NULL,
-               body_ref TEXT NOT NULL,
-               body_size INTEGER NOT NULL,
-               expires_at_ms INTEGER NOT NULL,
-               last_access_seq INTEGER NOT NULL,
-               updated_at_ms INTEGER NOT NULL
-             )",
-                (),
-            )
-        })
-        .await?;
-        execute_with_retry(|| {
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_cache_variant
-             ON worker_cache_entries(cache_name, method, url, vary_headers_json, vary_values_json)",
-                (),
-            )
-        })
-        .await?;
-        execute_with_retry(|| {
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worker_cache_lookup
-             ON worker_cache_entries(cache_name, method, url)",
-                (),
-            )
-        })
-        .await?;
-        execute_with_retry(|| {
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worker_cache_expiry
-             ON worker_cache_entries(expires_at_ms)",
-                (),
-            )
-        })
-        .await?;
-        execute_with_retry(|| {
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_worker_cache_lru
-             ON worker_cache_entries(last_access_seq, updated_at_ms)",
-                (),
-            )
-        })
-        .await?;
+        let conn = self.connect().await?;
+        execute_with_retry(|| conn.execute(CREATE_CACHE_TABLE_SQL, ())).await?;
+        ensure_cache_indexes(&conn).await?;
         Ok(())
     }
 
     async fn initialize_access_seq(&self) -> Result<()> {
-        let conn = self.connect()?;
+        let conn = self.connect().await?;
         let mut rows = query_cached(
             &conn,
             "SELECT COALESCE(MAX(last_access_seq), 0)
@@ -1261,7 +1158,7 @@ impl CacheStore {
     ) -> Result<Vec<CacheRecord>> {
         let mut rows = query_cached(
             conn,
-                "SELECT id, vary_headers_json, vary_values_json, status, headers_json, body_storage, body_inline_hex, body_ref, expires_at_ms
+                "SELECT id, vary_headers_json, vary_values_json, status, headers_json, body_blob, expires_at_ms
                  FROM worker_cache_entries
                  WHERE cache_name = ?1 AND method = ?2 AND url = ?3",
                 (cache_name, method, url),
@@ -1287,7 +1184,7 @@ impl CacheStore {
     ) -> Result<Vec<CacheDeleteCandidate>> {
         let mut rows = query_cached(
             conn,
-            "SELECT id, body_storage, body_ref
+            "SELECT id
                  FROM worker_cache_entries
                  WHERE cache_name = ?1 AND method = ?2 AND url = ?3
                    AND vary_headers_json = ?4 AND vary_values_json = ?5",
@@ -1300,8 +1197,6 @@ impl CacheStore {
         while let Some(row) = rows.next().await.map_err(cache_error)? {
             out.push(CacheDeleteCandidate {
                 id: row.get::<String>(0).map_err(cache_error)?,
-                body_storage: row.get::<String>(1).map_err(cache_error)?,
-                body_ref: row.get::<String>(2).map_err(cache_error)?,
             });
         }
         Ok(out)
@@ -1313,7 +1208,7 @@ impl CacheStore {
         loop {
             let mut rows = query_cached(
                 conn,
-                "SELECT id, headers_json, body_storage, body_ref, expires_at_ms
+                "SELECT id, headers_json, expires_at_ms
                      FROM worker_cache_entries
                      WHERE expires_at_ms <= ?1
                        AND (expires_at_ms > ?2 OR (expires_at_ms = ?2 AND id > ?3))
@@ -1330,9 +1225,7 @@ impl CacheStore {
                 let candidate = CacheCleanupCandidate {
                     id: row.get::<String>(0).map_err(cache_error)?,
                     headers_json: row.get::<String>(1).map_err(cache_error)?,
-                    body_storage: row.get::<String>(2).map_err(cache_error)?,
-                    body_ref: row.get::<String>(3).map_err(cache_error)?,
-                    expires_at_ms: row.get::<i64>(4).map_err(cache_error)?,
+                    expires_at_ms: row.get::<i64>(2).map_err(cache_error)?,
                 };
                 cursor_expires_at = candidate.expires_at_ms;
                 cursor_id = candidate.id.clone();
@@ -1348,11 +1241,7 @@ impl CacheStore {
                     Err(_) => true,
                 };
                 if should_delete {
-                    expired.push(CacheDeleteCandidate {
-                        id: candidate.id,
-                        body_storage: candidate.body_storage,
-                        body_ref: candidate.body_ref,
-                    });
+                    expired.push(CacheDeleteCandidate { id: candidate.id });
                 }
             }
             drop(rows);
@@ -1376,7 +1265,7 @@ impl CacheStore {
             }
             let mut rows = query_cached(
                 conn,
-                "SELECT id, body_storage, body_ref
+                "SELECT id
                      FROM worker_cache_entries
                      ORDER BY last_access_seq ASC, updated_at_ms ASC
                      LIMIT 1",
@@ -1389,8 +1278,6 @@ impl CacheStore {
             };
             let victim = CacheDeleteCandidate {
                 id: row.get::<String>(0).map_err(cache_error)?,
-                body_storage: row.get::<String>(1).map_err(cache_error)?,
-                body_ref: row.get::<String>(2).map_err(cache_error)?,
             };
             drop(rows);
             self.remove_records(conn, &[victim]).await?;
@@ -1433,58 +1320,13 @@ impl CacheStore {
             if changed > 0 {
                 self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
             }
-            if record.body_storage == "blob" && !record.body_ref.is_empty() {
-                self.blob_store.delete(&record.body_ref).await?;
-            }
         }
         Ok(())
     }
 
-    async fn cleanup_failed_put_blob(
-        &self,
-        body_storage: &str,
-        body_ref: &str,
-        commit_attempted: bool,
-    ) {
-        if body_storage != "blob" || body_ref.is_empty() {
-            return;
-        }
-        if commit_attempted {
-            self.delete_blob_if_unreferenced(body_ref).await;
-            return;
-        }
-        let _ = self.blob_store.delete(body_ref).await;
-    }
-
-    async fn delete_blob_if_unreferenced(&self, body_ref: &str) {
-        let Ok(conn) = self.connect() else {
-            return;
-        };
-        let mut rows = match query_cached(
-            &conn,
-            "SELECT 1 FROM worker_cache_entries
-                 WHERE body_storage = 'blob' AND body_ref = ?1
-                 LIMIT 1",
-            (body_ref,),
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(_) => return,
-        };
-        match rows.next().await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                drop(rows);
-                let _ = self.blob_store.delete(body_ref).await;
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn connect(&self) -> Result<Connection> {
+    async fn connect(&self) -> Result<Connection> {
         let conn = self.database.connect().map_err(cache_error)?;
-        configure_turso_connection(&conn, cache_error)?;
+        configure_cache_connection(&conn).await?;
         Ok(conn)
     }
 
@@ -1495,7 +1337,44 @@ impl CacheStore {
     }
 
     pub(crate) async fn flush_pending_touches(&self) -> Result<()> {
-        self.hot_cache.flush_pending_touches().await
+        let result = self.hot_cache.flush_pending_touches().await;
+        if result.is_err() {
+            self.hot_cache
+                .flush_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub(crate) fn flush_failure_count(&self) -> u64 {
+        self.hot_cache.flush_failures.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn pending_touch_count(&self) -> usize {
+        self.hot_cache.lock_state().pending_touches.len()
+    }
+
+    pub(crate) async fn checkpoint(&self) -> Result<()> {
+        checkpoint_database(&self.database)
+            .await
+            .map_err(cache_error)
+    }
+
+    pub(crate) async fn health_check(&self) -> Result<()> {
+        health_check_database(&self.database)
+            .await
+            .map_err(cache_error)?;
+        let conn = self.database.connect().map_err(cache_error)?;
+        configure_cache_connection(&conn).await?;
+        let version = storage_schema_version(&conn, "cache")
+            .await
+            .map_err(cache_error)?;
+        if version != CACHE_SCHEMA_VERSION {
+            return Err(PlatformError::runtime(format!(
+                "cache error: schema version {version} is not ready; expected {CACHE_SCHEMA_VERSION}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1506,10 +1385,8 @@ fn row_to_record(row: &turso::Row) -> Result<CacheRecord> {
         vary_values_json: row.get::<String>(2).map_err(cache_error)?,
         status: row.get::<i64>(3).map_err(cache_error)?,
         headers_json: row.get::<String>(4).map_err(cache_error)?,
-        body_storage: row.get::<String>(5).map_err(cache_error)?,
-        body_inline_hex: row.get::<String>(6).map_err(cache_error)?,
-        body_ref: row.get::<String>(7).map_err(cache_error)?,
-        expires_at_ms: row.get::<i64>(8).map_err(cache_error)?,
+        body: row.get::<Vec<u8>>(5).map_err(cache_error)?,
+        expires_at_ms: row.get::<i64>(6).map_err(cache_error)?,
     })
 }
 
@@ -1714,6 +1591,270 @@ fn hot_entry_size(
         .saturating_add(response.body.len())
 }
 
+async fn configure_cache_connection(conn: &Connection) -> Result<()> {
+    configure_turso_connection(conn, cache_error)?;
+    conn.pragma_update("synchronous", "'NORMAL'")
+        .await
+        .map_err(cache_error)?;
+    Ok(())
+}
+
+async fn ensure_cache_indexes(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_worker_cache_variant
+         ON worker_cache_entries(cache_name, method, url, vary_headers_json, vary_values_json)",
+        (),
+    )
+    .await
+    .map_err(cache_error)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_cache_lookup
+         ON worker_cache_entries(cache_name, method, url)",
+        (),
+    )
+    .await
+    .map_err(cache_error)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_cache_expiry
+         ON worker_cache_entries(expires_at_ms)",
+        (),
+    )
+    .await
+    .map_err(cache_error)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_worker_cache_lru
+         ON worker_cache_entries(last_access_seq, updated_at_ms)",
+        (),
+    )
+    .await
+    .map_err(cache_error)?;
+    Ok(())
+}
+
+async fn migrate_cache_schema(database: &Database, legacy_blobs: &BlobStore) -> Result<()> {
+    let mut conn = database.connect().map_err(cache_error)?;
+    configure_cache_connection(&conn).await?;
+
+    const MAX_ATTEMPTS: usize = 8;
+    let mut migrated_blob_refs = HashSet::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let tx = match conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                sleep_cache_retry(attempt).await;
+                continue;
+            }
+            Err(error) => return Err(cache_error_after_retry(error)),
+        };
+
+        let outcome = migrate_cache_schema_transaction(&tx, legacy_blobs).await;
+        match outcome {
+            Ok(result) => match tx.commit().await {
+                Ok(()) => {
+                    migrated_blob_refs.extend(result.blob_refs);
+                    if result.migrated_rows > 0 || result.dropped_rows > 0 {
+                        tracing::info!(
+                            migrated_rows = result.migrated_rows,
+                            dropped_rows = result.dropped_rows,
+                            "migrated cache bodies into Turso BLOB storage"
+                        );
+                    }
+                    break;
+                }
+                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                    // A commit error is ambiguous. Retain the refs and only
+                    // remove them after a subsequent transaction confirms the
+                    // migrated schema is committed.
+                    migrated_blob_refs.extend(result.blob_refs);
+                    sleep_cache_retry(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(cache_error(error)),
+            },
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(error);
+            }
+        }
+    }
+
+    for blob_ref in migrated_blob_refs {
+        if let Err(error) = legacy_blobs.delete_legacy(&blob_ref).await {
+            tracing::warn!(blob_ref, error = %error, "failed to remove migrated cache blob");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CacheMigrationResult {
+    migrated_rows: usize,
+    dropped_rows: usize,
+    blob_refs: HashSet<String>,
+}
+
+async fn migrate_cache_schema_transaction(
+    conn: &Connection,
+    legacy_blobs: &BlobStore,
+) -> Result<CacheMigrationResult> {
+    ensure_storage_migration_table(conn)
+        .await
+        .map_err(cache_error)?;
+    let applied_version = storage_schema_version(conn, "cache")
+        .await
+        .map_err(cache_error)?;
+    if applied_version > CACHE_SCHEMA_VERSION {
+        return Err(PlatformError::runtime(format!(
+            "cache error: unsupported cache schema version {applied_version}; maximum supported version is {CACHE_SCHEMA_VERSION}"
+        )));
+    }
+
+    let columns = cache_table_columns(conn).await?;
+    if columns.is_empty() {
+        conn.execute(CREATE_CACHE_TABLE_SQL, ())
+            .await
+            .map_err(cache_error)?;
+    } else if !columns.contains("body_blob") {
+        return migrate_legacy_cache_table(conn, legacy_blobs).await;
+    }
+
+    ensure_cache_indexes(conn).await?;
+    record_cache_schema_version(conn).await?;
+    Ok(CacheMigrationResult::default())
+}
+
+async fn cache_table_columns(conn: &Connection) -> Result<HashSet<String>> {
+    let mut rows = conn
+        .query("PRAGMA table_info(worker_cache_entries)", ())
+        .await
+        .map_err(cache_error)?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows.next().await.map_err(cache_error)? {
+        columns.insert(row.get::<String>(1).map_err(cache_error)?);
+    }
+    Ok(columns)
+}
+
+async fn migrate_legacy_cache_table(
+    conn: &Connection,
+    legacy_blobs: &BlobStore,
+) -> Result<CacheMigrationResult> {
+    let mut rows = conn
+        .query(
+            "SELECT id, cache_name, method, url, vary_headers_json, vary_values_json,
+                    status, headers_json, body_storage, body_inline_hex, body_ref,
+                    body_size, expires_at_ms, last_access_seq, updated_at_ms
+             FROM worker_cache_entries
+             ORDER BY id",
+            (),
+        )
+        .await
+        .map_err(cache_error)?;
+    let mut legacy_rows = Vec::new();
+    while let Some(row) = rows.next().await.map_err(cache_error)? {
+        legacy_rows.push(LegacyCacheRecord {
+            id: row.get::<String>(0).map_err(cache_error)?,
+            cache_name: row.get::<String>(1).map_err(cache_error)?,
+            method: row.get::<String>(2).map_err(cache_error)?,
+            url: row.get::<String>(3).map_err(cache_error)?,
+            vary_headers_json: row.get::<String>(4).map_err(cache_error)?,
+            vary_values_json: row.get::<String>(5).map_err(cache_error)?,
+            status: row.get::<i64>(6).map_err(cache_error)?,
+            headers_json: row.get::<String>(7).map_err(cache_error)?,
+            body_storage: row.get::<String>(8).map_err(cache_error)?,
+            body_inline_hex: row.get::<String>(9).map_err(cache_error)?,
+            body_ref: row.get::<String>(10).map_err(cache_error)?,
+            body_size: row.get::<i64>(11).map_err(cache_error)?,
+            expires_at_ms: row.get::<i64>(12).map_err(cache_error)?,
+            last_access_seq: row.get::<i64>(13).map_err(cache_error)?,
+            updated_at_ms: row.get::<i64>(14).map_err(cache_error)?,
+        });
+    }
+    drop(rows);
+
+    conn.execute(CREATE_CACHE_MIGRATION_TABLE_SQL, ())
+        .await
+        .map_err(cache_error)?;
+    let mut result = CacheMigrationResult::default();
+    for record in legacy_rows {
+        let body = match record.body_storage.as_str() {
+            "inline" => hex_to_bytes(&record.body_inline_hex),
+            "blob" => {
+                if !record.body_ref.is_empty() {
+                    result.blob_refs.insert(record.body_ref.clone());
+                }
+                legacy_blobs.read_legacy(&record.body_ref).await
+            }
+            other => Err(PlatformError::runtime(format!(
+                "cache error: unsupported legacy body storage {other}"
+            ))),
+        };
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                result.dropped_rows = result.dropped_rows.saturating_add(1);
+                tracing::warn!(
+                    cache_entry_id = %record.id,
+                    error = %error,
+                    "dropping unreadable legacy cache entry during BLOB migration"
+                );
+                continue;
+            }
+        };
+
+        execute_cached(
+            conn,
+            "INSERT INTO worker_cache_entries_migrating (
+               id, cache_name, method, url, vary_headers_json, vary_values_json,
+               status, headers_json, body_blob, body_size, expires_at_ms,
+               last_access_seq, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            (
+                record.id.as_str(),
+                record.cache_name.as_str(),
+                record.method.as_str(),
+                record.url.as_str(),
+                record.vary_headers_json.as_str(),
+                record.vary_values_json.as_str(),
+                record.status,
+                record.headers_json.as_str(),
+                body.as_slice(),
+                record.body_size,
+                record.expires_at_ms,
+                record.last_access_seq,
+                record.updated_at_ms,
+            ),
+        )
+        .await
+        .map_err(cache_error)?;
+        result.migrated_rows = result.migrated_rows.saturating_add(1);
+    }
+
+    conn.execute("DROP TABLE worker_cache_entries", ())
+        .await
+        .map_err(cache_error)?;
+    conn.execute(
+        "ALTER TABLE worker_cache_entries_migrating RENAME TO worker_cache_entries",
+        (),
+    )
+    .await
+    .map_err(cache_error)?;
+    ensure_cache_indexes(conn).await?;
+    record_cache_schema_version(conn).await?;
+    Ok(result)
+}
+
+async fn record_cache_schema_version(conn: &Connection) -> Result<()> {
+    record_storage_schema_version(conn, "cache", CACHE_SCHEMA_VERSION, epoch_ms_i64()?)
+        .await
+        .map_err(cache_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1765,10 +1906,11 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<u64, turso::Error>>,
 {
-    retry_turso_busy(execute, cache_error).await
+    retry_turso_busy(execute, cache_error_after_retry).await
 }
 
 async fn sleep_cache_retry(attempt: usize) {
+    record_storage_retry();
     tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
 }
 
@@ -1776,15 +1918,12 @@ fn cache_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(format!("cache error: {error}"))
 }
 
-fn ensure_parent_dir(path: &str) -> Result<()> {
-    let Some(parent) = Path::new(path).parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
+fn cache_error_after_retry(error: turso::Error) -> PlatformError {
+    if is_retryable_turso_error(&error) {
+        PlatformError::storage_unavailable(format!("cache error: {error}"))
+    } else {
+        cache_error(error)
     }
-    std::fs::create_dir_all(parent).map_err(cache_error)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1792,14 +1931,16 @@ mod tests {
     use super::{
         CacheBaseKey, CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore,
         HOT_CACHE_MAX_BYTES, HOT_CACHE_MAX_ENTRIES, HotCacheEntry, HotCacheState,
-        PendingTouchesGuard,
+        PendingTouchesGuard, bytes_to_hex,
     };
     use crate::blob::local_blob_store_for_tests;
+    use crate::kv::KvStore;
     use common::Result;
     use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Barrier;
+    use turso::Builder;
     use uuid::Uuid;
 
     async fn test_store(config: CacheConfig) -> CacheStore {
@@ -1826,7 +1967,7 @@ mod tests {
     }
 
     async fn persisted_access_seq(store: &CacheStore, url: &str) -> i64 {
-        let conn = store.connect().expect("cache connection");
+        let conn = store.connect().await.expect("cache connection");
         let mut rows = conn
             .query(
                 "SELECT last_access_seq FROM worker_cache_entries WHERE url = ?1",
@@ -2012,7 +2153,7 @@ mod tests {
             "GET".into(),
             req.url.clone(),
         ));
-        let conn = store.connect()?;
+        let conn = store.connect().await?;
         conn.execute(
             "UPDATE worker_cache_entries SET expires_at_ms = 0 WHERE url = ?1",
             (req.url.as_str(),),
@@ -2052,7 +2193,7 @@ mod tests {
         assert!(store.put(&req, response("hot")).await?);
         assert!(matches!(store.get(&req).await?, CacheLookup::Fresh(_)));
 
-        let conn = store.connect()?;
+        let conn = store.connect().await?;
         conn.execute("DROP TABLE worker_cache_entries", ())
             .await
             .expect("drop cache table");
@@ -2229,7 +2370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_body_uses_blob_storage() -> Result<()> {
+    async fn large_body_uses_database_blob_storage() -> Result<()> {
         let store = test_store(CacheConfig {
             max_entries: 8,
             max_bytes: 1024 * 1024,
@@ -2248,8 +2389,22 @@ mod tests {
         assert!(store.put(&req, cached_response).await?);
         match store.get(&req).await? {
             CacheLookup::Fresh(value) => assert_eq!(value.body.len(), 1024),
-            other => panic!("expected blob fresh hit, got {:?}", other),
+            other => panic!("expected BLOB fresh hit, got {:?}", other),
         }
+        let conn = store.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT length(body_blob) FROM worker_cache_entries WHERE url = ?1",
+                (req.url.as_str(),),
+            )
+            .await
+            .map_err(super::cache_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(super::cache_error)?
+            .expect("cache row");
+        assert_eq!(row.get::<i64>(0).map_err(super::cache_error)?, 1024);
         Ok(())
     }
 
@@ -2312,7 +2467,309 @@ mod tests {
             }
             other => panic!("expected fresh concurrent overwrite hit, got {:?}", other),
         }
-        assert_eq!(local_blob_file_count(&blob_dir), 1);
+        assert_eq!(local_blob_file_count(&blob_dir), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_and_external_bodies_migrate_to_database_blobs() -> Result<()> {
+        let database_path = format!("/tmp/dd-cache-migration-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-migration-blobs-{}", Uuid::new_v4());
+        let blob_store = local_blob_store_for_tests(&blob_dir).await?;
+        let external_body = b"legacy external body";
+        let blob_ref = blob_store.put(external_body).await?;
+
+        let database = Builder::new_local(&database_path)
+            .build()
+            .await
+            .map_err(super::cache_error)?;
+        let conn = database.connect().map_err(super::cache_error)?;
+        conn.execute(
+            "CREATE TABLE worker_cache_entries (
+               id TEXT PRIMARY KEY,
+               cache_name TEXT NOT NULL,
+               method TEXT NOT NULL,
+               url TEXT NOT NULL,
+               vary_headers_json TEXT NOT NULL,
+               vary_values_json TEXT NOT NULL,
+               status INTEGER NOT NULL,
+               headers_json TEXT NOT NULL,
+               body_storage TEXT NOT NULL,
+               body_inline_hex TEXT NOT NULL,
+               body_ref TEXT NOT NULL,
+               body_size INTEGER NOT NULL,
+               expires_at_ms INTEGER NOT NULL,
+               last_access_seq INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             )",
+            (),
+        )
+        .await
+        .map_err(super::cache_error)?;
+        let headers_json = r#"[["cache-control","max-age=60"]]"#;
+        conn.execute(
+            "INSERT INTO worker_cache_entries (
+               id, cache_name, method, url, vary_headers_json, vary_values_json,
+               status, headers_json, body_storage, body_inline_hex, body_ref,
+               body_size, expires_at_ms, last_access_seq, updated_at_ms
+             ) VALUES (?1, 'default', 'GET', ?2, '[]', '[]', 200, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            (
+                "inline-id",
+                "http://worker/legacy-inline",
+                headers_json,
+                "inline",
+                bytes_to_hex(b"legacy inline body"),
+                "",
+                18_i64,
+                i64::MAX / 2,
+                7_i64,
+            ),
+        )
+        .await
+        .map_err(super::cache_error)?;
+        conn.execute(
+            "INSERT INTO worker_cache_entries (
+               id, cache_name, method, url, vary_headers_json, vary_values_json,
+               status, headers_json, body_storage, body_inline_hex, body_ref,
+               body_size, expires_at_ms, last_access_seq, updated_at_ms
+             ) VALUES (?1, 'default', 'GET', ?2, '[]', '[]', 200, ?3, 'blob', '', ?4, ?5, ?6, ?7, 1)",
+            (
+                "blob-id",
+                "http://worker/legacy-external",
+                headers_json,
+                blob_ref.as_str(),
+                external_body.len() as i64,
+                i64::MAX / 2,
+                8_i64,
+            ),
+        )
+        .await
+        .map_err(super::cache_error)?;
+        drop(conn);
+        drop(database);
+
+        let store =
+            CacheStore::from_local_path(CacheConfig::default(), database_path, blob_store).await?;
+        match store.get(&request("/legacy-inline")).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"legacy inline body"),
+            other => panic!("expected migrated inline hit, got {other:?}"),
+        }
+        match store.get(&request("/legacy-external")).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, external_body),
+            other => panic!("expected migrated external hit, got {other:?}"),
+        }
+
+        let conn = store.connect().await?;
+        let mut columns = conn
+            .query("PRAGMA table_info(worker_cache_entries)", ())
+            .await
+            .map_err(super::cache_error)?;
+        let mut names = std::collections::HashSet::new();
+        while let Some(row) = columns.next().await.map_err(super::cache_error)? {
+            names.insert(row.get::<String>(1).map_err(super::cache_error)?);
+        }
+        assert!(names.contains("body_blob"));
+        assert!(!names.contains("body_inline_hex"));
+        assert!(!names.contains("body_ref"));
+
+        let mut versions = conn
+            .query(
+                "SELECT version FROM dd_storage_schema_migrations WHERE component = 'cache'",
+                (),
+            )
+            .await
+            .map_err(super::cache_error)?;
+        assert_eq!(
+            versions
+                .next()
+                .await
+                .map_err(super::cache_error)?
+                .expect("cache migration version")
+                .get::<i64>(0)
+                .map_err(super::cache_error)?,
+            super::CACHE_SCHEMA_VERSION
+        );
+        assert_eq!(local_blob_file_count(&blob_dir), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_cache_schema_without_migration_metadata_is_adopted() -> Result<()> {
+        let database_path = format!("/tmp/dd-cache-current-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-current-blobs-{}", Uuid::new_v4());
+        let store = test_store_at_path(
+            CacheConfig::default(),
+            database_path.as_str(),
+            blob_dir.as_str(),
+        )
+        .await;
+        assert!(
+            store
+                .put(&request("/current"), response("preserved"))
+                .await?
+        );
+        drop(store);
+
+        let database = Builder::new_local(&database_path)
+            .build()
+            .await
+            .map_err(super::cache_error)?;
+        let conn = database.connect().map_err(super::cache_error)?;
+        conn.execute(
+            "DELETE FROM dd_storage_schema_migrations WHERE component = 'cache'",
+            (),
+        )
+        .await
+        .map_err(super::cache_error)?;
+        drop(conn);
+        drop(database);
+
+        let store = test_store_at_path(
+            CacheConfig::default(),
+            database_path.as_str(),
+            blob_dir.as_str(),
+        )
+        .await;
+        match store.get(&request("/current")).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"preserved"),
+            other => panic!("expected current-schema cache hit, got {other:?}"),
+        }
+        store.health_check().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn future_cache_schema_version_is_rejected_without_mutating_data() -> Result<()> {
+        let database_path = format!("/tmp/dd-cache-future-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-future-blobs-{}", Uuid::new_v4());
+        let store = test_store_at_path(
+            CacheConfig::default(),
+            database_path.as_str(),
+            blob_dir.as_str(),
+        )
+        .await;
+        assert!(
+            store
+                .put(&request("/future"), response("future-guard"))
+                .await?
+        );
+        drop(store);
+
+        let database = Builder::new_local(&database_path)
+            .build()
+            .await
+            .map_err(super::cache_error)?;
+        let conn = database.connect().map_err(super::cache_error)?;
+        conn.execute(
+            "INSERT INTO dd_storage_schema_migrations (component, version, applied_at_ms)
+             VALUES ('cache', ?1, 1)",
+            (super::CACHE_SCHEMA_VERSION + 1,),
+        )
+        .await
+        .map_err(super::cache_error)?;
+        drop(conn);
+        drop(database);
+
+        let blob_store = local_blob_store_for_tests(&blob_dir).await?;
+        let error = match CacheStore::from_local_path(
+            CacheConfig::default(),
+            database_path.clone(),
+            blob_store,
+        )
+        .await
+        {
+            Ok(_) => panic!("future cache schema must fail startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported cache schema version")
+        );
+
+        let database = Builder::new_local(&database_path)
+            .build()
+            .await
+            .map_err(super::cache_error)?;
+        let conn = database.connect().map_err(super::cache_error)?;
+        let mut rows = conn
+            .query(
+                "SELECT body_blob FROM worker_cache_entries WHERE url = 'http://worker/future'",
+                (),
+            )
+            .await
+            .map_err(super::cache_error)?;
+        assert_eq!(
+            rows.next()
+                .await
+                .map_err(super::cache_error)?
+                .expect("preserved cache row")
+                .get::<Vec<u8>>(0)
+                .map_err(super::cache_error)?,
+            b"future-guard"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_and_cache_share_one_database_owner_and_migration_ledger() -> Result<()> {
+        let database_path = format!("/tmp/dd-shared-storage-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-shared-storage-blobs-{}", Uuid::new_v4());
+        let database = Arc::new(
+            Builder::new_local(&database_path)
+                .build()
+                .await
+                .map_err(super::cache_error)?,
+        );
+        let kv = KvStore::from_database(Arc::clone(&database)).await?;
+        let cache = CacheStore::from_database(
+            CacheConfig::default(),
+            Arc::clone(&database),
+            local_blob_store_for_tests(&blob_dir).await?,
+        )
+        .await?;
+
+        assert!(kv.shares_database_owner(&database));
+        assert!(Arc::ptr_eq(&cache.database, &database));
+        kv.health_check().await?;
+        cache.health_check().await?;
+
+        let conn = database.connect().map_err(super::cache_error)?;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(DISTINCT component)
+                 FROM dd_storage_schema_migrations
+                 WHERE component IN ('kv', 'cache')",
+                (),
+            )
+            .await
+            .map_err(super::cache_error)?;
+        assert_eq!(
+            rows.next()
+                .await
+                .map_err(super::cache_error)?
+                .expect("shared migration ledger row")
+                .get::<i64>(0)
+                .map_err(super::cache_error)?,
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_connections_use_normal_synchronous_durability() -> Result<()> {
+        let store = test_store(CacheConfig::default()).await;
+        let conn = store.connect().await?;
+        let mut rows = conn
+            .query("PRAGMA synchronous", ())
+            .await
+            .map_err(super::cache_error)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(super::cache_error)?
+            .expect("synchronous row");
+        assert_eq!(row.get::<i64>(0).map_err(super::cache_error)?, 1);
         Ok(())
     }
 

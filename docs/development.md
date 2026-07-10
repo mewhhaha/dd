@@ -31,6 +31,8 @@ export DD_SERVER=http://127.0.0.1:8081
 
 ```json
 {
+  "$schema": "./schema/dd.schema.json",
+  "schema_version": 1,
   "name": "my-worker",
   "entrypoint": "src/worker.ts",
   "base_url": "https://your-dd-app.fly.dev",
@@ -52,17 +54,24 @@ Normal builds do not scrape old `target/` artifacts for RPC bindings. Checked-in
 
 If you change the schema, regenerate the checked-in bindings on a machine with `capnp` installed, then commit both files together.
 
+Deno extension modules and the snapshot-ready Cargo-package forms are checked
+in under `crates/runtime/js/vendor` and hash-checked during the runtime build.
+After updating the locked Deno crates, run `just refresh-deno-sources` and commit
+the refreshed `lazy/` tree with `manifest.txt`.
+
 Optional tracing env:
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export DD_OTEL_COLLECTOR_VERIFIED=true
 ```
 
 ## Distribution Builds
 
 Shipped server artifacts use the `dist` Cargo profile rather than the ordinary
-developer release profile. The full server includes HTTP/3, WebSocket, and OTEL
-support. The lean server disables those optional server features.
+developer release profile. Default and Fly production builds include WebSocket
+and OTEL support. Direct HTTP/3 and WebTransport are experimental opt-in
+features; the lean server disables all optional server features.
 
 ```bash
 just server-full
@@ -73,6 +82,7 @@ Those commands write stable artifacts at `target/dist/dd_server-full` and
 `target/dist/dd_server-lean`. To only run Cargo directly:
 
 ```bash
+cargo build --locked --profile dist -p dd_server --no-default-features --features websocket,otel
 cargo build --locked --profile dist -p dd_server --no-default-features --features http3,websocket,otel
 cargo build --locked --profile dist -p dd_server --no-default-features
 ```
@@ -192,8 +202,8 @@ point at `src/worker.ts` and source assets. The generated output config
 preserves only the deploy fields the CLI consumes, such as `name`, `config`,
 `base_url`, and `temporary`, then replaces `entrypoint` with the bundled worker
 path and `assets_dir` with the Vite output directory. It also excludes the
-generated worker and config file from static asset packaging. Arbitrary
-source-only config keys are not copied into `dist/dd.deploy.json`. The plugin
+generated worker and config file from static asset packaging. Unknown source
+config keys are rejected against `schema/dd.schema.json`. The plugin
 also writes `dist/_headers` with an immutable cache policy for Vite's
 fingerprinted build assets, such as `/assets/*`.
 
@@ -272,6 +282,21 @@ Revoke with:
 ```bash
 cargo run -p cli -- --server http://127.0.0.1:18081 delete-token my-worker-ci
 ```
+
+Deployment history and deploy-token metadata live in the durable
+`store/control.db`. Each worker retains its five newest successful deployments.
+The private control plane exposes the matching lifecycle commands:
+
+```bash
+cargo run -p cli -- list-deployments --worker my-worker
+cargo run -p cli -- inspect-deployment DEPLOYMENT_ID
+cargo run -p cli -- rollback my-worker DEPLOYMENT_ID
+cargo run -p cli -- undeploy my-worker
+```
+
+On the first startup after upgrading, recognized `workers/*.json` and
+`tokens.json` stores are imported transactionally. Unknown formats stop startup
+instead of being skipped.
 
 `dd_dev_runtime` is explicitly a debug/dev surface. The JS client starts it with
 `--allow-code-generation` by default so worker code using `eval` or

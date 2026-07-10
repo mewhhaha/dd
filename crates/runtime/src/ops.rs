@@ -543,6 +543,15 @@ mod tests {
                 allow_private: false,
             })
         );
+        assert_eq!(
+            parse_egress_allow_host("private:[::1]:8080"),
+            Some(EgressAllowHost {
+                host: "::1".to_string(),
+                wildcard: false,
+                port: Some(8080),
+                allow_private: true,
+            })
+        );
     }
 
     #[test]
@@ -578,6 +587,7 @@ mod tests {
             "10.0.0.1",
             "::1",
             "fd00::1",
+            "::ffff:127.0.0.1",
             "1.1.1.1",
         ]
         .into_iter()
@@ -589,6 +599,7 @@ mod tests {
             "http://10.0.0.1/",
             "http://[::1]/",
             "http://[fd00::1]/",
+            "http://[::ffff:127.0.0.1]/",
         ] {
             let url = reqwest::Url::parse(url).expect("url");
             assert!(!is_egress_url_allowed(&url, &allow), "allowed {url}");

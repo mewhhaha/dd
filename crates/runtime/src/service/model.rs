@@ -1,9 +1,11 @@
 use super::*;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::ops::Bound::{Excluded, Unbounded};
 pub(super) struct WorkerManager {
     pub(super) config: RuntimeConfig,
     pub(super) storage: RuntimeStorageConfig,
+    pub(super) control_store: ControlStore,
+    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
     pub(super) bootstrap_snapshot: &'static [u8],
     pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
     pub(super) kv_store: KvStore,
@@ -105,6 +107,8 @@ pub(super) struct WorkerManagerInit {
     pub(super) cache_store: CacheStore,
     pub(super) config: RuntimeConfig,
     pub(super) storage: RuntimeStorageConfig,
+    pub(super) control_store: ControlStore,
+    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
     pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
     pub(super) asset_catalog: AssetCatalog,
 }
@@ -1641,12 +1645,15 @@ pub(super) struct RuntimeThreadStart {
     pub(super) cache_store: CacheStore,
     pub(super) config: RuntimeConfig,
     pub(super) storage: RuntimeStorageConfig,
+    pub(super) control_store: ControlStore,
+    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
 }
 
 pub(super) struct IsolateThreadStart {
     pub(super) snapshot: &'static [u8],
     pub(super) snapshot_preloaded: bool,
     pub(super) source: crate::ops::WorkerSource,
+    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
     pub(super) deployment_config: Arc<crate::ops::WorkerDeploymentPayload>,
     pub(super) allow_code_generation: bool,
     pub(super) kv_store: KvStore,
@@ -1774,23 +1781,6 @@ pub(super) struct TraceEventPayload {
     pub(super) error: Option<String>,
     pub(super) execution_ms: u64,
     pub(super) wait_until_count: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct StoredWorkerDeployment {
-    pub(super) name: String,
-    pub(super) source: String,
-    pub(super) config: DeployConfig,
-    #[serde(default)]
-    pub(super) assets: Vec<DeployAsset>,
-    #[serde(default)]
-    pub(super) server_modules: Vec<DeployServerModule>,
-    #[serde(default)]
-    pub(super) asset_headers: Option<String>,
-    pub(super) deployment_id: String,
-    pub(super) updated_at_ms: i64,
-    #[serde(default)]
-    pub(super) expires_at_ms: Option<i64>,
 }
 
 #[cfg(test)]

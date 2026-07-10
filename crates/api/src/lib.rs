@@ -6,6 +6,7 @@ mod handlers_runtime_tests;
 #[cfg(feature = "http3")]
 mod public_quic;
 mod state;
+mod trace_health;
 
 use common::{DEFAULT_PRIVATE_BIND_ADDR, DEFAULT_PUBLIC_BIND_ADDR, PlatformError, Result};
 use deploy_tokens::DeployTokenStore;
@@ -13,10 +14,16 @@ use runtime::{RuntimeService, RuntimeServiceConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
-pub use app::serve;
+pub use app::{serve, serve_until};
 pub use state::AppState;
+
+#[doc(hidden)]
+pub use trace_health::{
+    configure as configure_trace_exporter, record_export as record_trace_export,
+    snapshot as trace_exporter_health,
+};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -99,8 +106,19 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     )?;
     let token_store_path =
         token_store_path.unwrap_or_else(|| runtime.storage.store_dir.join("tokens.json"));
-    let deploy_tokens = DeployTokenStore::load(token_store_path).await?;
     let runtime = RuntimeService::start_with_service_config(runtime).await?;
+    let deploy_tokens = match DeployTokenStore::from_control_store(
+        runtime.control_store(),
+        Some(&token_store_path),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = runtime.shutdown().await;
+            return Err(error);
+        }
+    };
     let state = AppState::new(
         runtime,
         deploy_tokens,
@@ -110,7 +128,63 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         public_tls_cert_path,
         public_tls_key_path,
     );
-    serve(bind_public_addr, bind_private_addr, state, limits).await
+    let serve_result = serve_until(
+        bind_public_addr,
+        bind_private_addr,
+        state.clone(),
+        limits,
+        shutdown_signal(),
+    )
+    .await;
+
+    state.operations.begin_shutdown();
+    let drain_timeout = Duration::from_secs(20);
+    let drain_started_at = std::time::Instant::now();
+    let requests_drained = state.operations.wait_for_drain(drain_timeout).await;
+    let runtime_drained = state
+        .runtime
+        .wait_for_quiescence(drain_timeout.saturating_sub(drain_started_at.elapsed()))
+        .await;
+    if requests_drained && runtime_drained {
+        info!("HTTP requests, runtime work, and outbox delivery drained before shutdown");
+    } else {
+        warn!(
+            active_requests = state.operations.active_requests(),
+            requests_drained, runtime_drained, "drain deadline reached; forcing runtime shutdown"
+        );
+    }
+    let shutdown_result = state.runtime.shutdown().await;
+    serve_result.and(shutdown_result)
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let terminate = signal(SignalKind::terminate());
+    match terminate {
+        Ok(mut terminate) => {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        warn!(%error, "failed to listen for SIGINT");
+                    }
+                }
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(error) => {
+            warn!(%error, "failed to listen for SIGTERM; waiting for SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        warn!(%error, "failed to listen for shutdown signal");
+    }
 }
 
 fn validate_private_control_plane_auth_config(
@@ -177,18 +251,5 @@ mod tests {
             true,
         );
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn lean_server_features_keep_heavy_dependencies_optional() {
-        let manifest = include_str!("../Cargo.toml");
-
-        assert!(manifest.contains("default = [\"http3\", \"websocket\", \"otel\"]"));
-        assert!(manifest.contains("http3 = [\"dep:tokio-quiche\", \"websocket\"]"));
-        assert!(manifest.contains("websocket = [\"dep:tokio-tungstenite\"]"));
-        assert!(manifest.contains("\"dep:opentelemetry-otlp\""));
-        assert!(manifest.contains("tokio-quiche = { version = \"0.19.0\", optional = true }"));
-        assert!(manifest.contains("tokio-tungstenite = { version = \"0.29\", optional = true }"));
-        assert!(manifest.contains("opentelemetry-otlp = { workspace = true, optional = true }"));
     }
 }

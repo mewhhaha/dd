@@ -1,4 +1,6 @@
 {
+  "$schema": "../../schema/dd.schema.json",
+  "schema_version": 1,
   "name": "vite-effect",
   "entrypoint": "src/worker.ts",
   "config": {

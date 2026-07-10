@@ -5,6 +5,7 @@ impl WorkerManager {
     pub(crate) async fn deploy(
         &mut self,
         prepared: PreparedWorkerDeployment,
+        deployment_id: Option<String>,
         persist: bool,
         temporary: bool,
         expires_at_ms: Option<i64>,
@@ -28,22 +29,26 @@ impl WorkerManager {
                 "cannot deploy a permanent worker as temporary; redeploy without --temporary or use a new worker name",
             ));
         }
+        let worker_source =
+            deployed_worker_source(&self.dynamic_modules, &source, &server_modules)?;
+        if let Err(error) = self.validate_worker_cached(&worker_source).await {
+            release_worker_source_modules(&self.dynamic_modules, &worker_source);
+            return Err(error);
+        }
+        // Start a newly requested temporary lifetime only after validation. Validation can
+        // involve a cold V8 startup, so charging it against a short preview lifetime can
+        // make a successful deployment expire before it ever becomes observable.
         let expires_at_ms = if temporary {
             Some(expires_at_ms.unwrap_or(self.temporary_worker_expires_at_ms()?))
         } else {
             None
         };
-        let worker_source = deployed_worker_source(&source, &server_modules)?;
-        if let Err(error) = self.validate_worker_cached(&worker_source).await {
-            release_worker_source_modules(&worker_source);
-            return Err(error);
-        }
         // Keep deployed workers on the bootstrap snapshot. Distinct user-code snapshots
         // can abort V8 when multiple complex workers are instantiated in one process.
         let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
         let generation = self.next_generation;
         self.next_generation += 1;
-        let deployment_id = Uuid::new_v4().to_string();
+        let deployment_id = deployment_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let service_bindings = bindings
             .service
             .iter()
@@ -80,20 +85,24 @@ impl WorkerManager {
             dynamic_quota_state: None,
         });
         if persist
-            && let Err(error) = persist_worker_deployment(PersistWorkerDeployment {
-                storage: &self.storage,
-                worker_name: &worker_name,
-                source: &source,
-                config: &config,
-                assets: &assets,
-                server_modules: &server_modules,
-                asset_headers: asset_headers.as_deref(),
-                deployment_id: &deployment_id,
-                expires_at_ms,
-            })
-            .await
+            && self.storage.worker_store_enabled
+            && let Err(error) = self
+                .control_store
+                .insert_deployment(&ControlDeployment {
+                    worker: worker_name.clone(),
+                    deployment_id: deployment_id.clone(),
+                    source: source.clone(),
+                    config: config.clone(),
+                    assets: assets.clone(),
+                    server_modules: server_modules.clone(),
+                    asset_headers: asset_headers.clone(),
+                    created_at_ms: epoch_ms_i64()?,
+                    expires_at_ms,
+                    active: true,
+                })
+                .await
         {
-            release_worker_source_modules(&worker_source);
+            release_worker_source_modules(&self.dynamic_modules, &worker_source);
             return Err(error);
         }
         let asset_catalog_entry = AssetCatalogEntry {
@@ -197,7 +206,7 @@ impl WorkerManager {
                 &worker_name,
                 PlatformError::not_found("temporary worker expired"),
             );
-            if let Err(error) = delete_worker_deployment(&self.storage, &worker_name).await {
+            if let Err(error) = self.control_store.deactivate_worker(&worker_name).await {
                 warn!(
                     worker = %worker_name,
                     error = %error,
@@ -822,7 +831,7 @@ impl WorkerManager {
         self.reap_owned_sessions(worker_name, None, None);
         if let Some(mut entry) = self.workers.remove(worker_name) {
             for (_, mut pool) in entry.pools.drain() {
-                release_worker_source_modules(&pool.source);
+                release_worker_source_modules(&self.dynamic_modules, &pool.source);
                 self.account_removed_pool_queue(&pool);
                 while let Some(pending) = pool.queue.pop_front() {
                     self.reject_pending_invoke(worker_name, pending, error.clone());
@@ -1009,6 +1018,76 @@ impl WorkerManager {
         }
     }
 
+    pub(crate) fn retire_lru_idle_isolate_for_budget(
+        &mut self,
+        requesting_worker_name: &str,
+        requesting_generation: u64,
+    ) -> bool {
+        let candidate = self
+            .workers
+            .iter()
+            .flat_map(|(worker_name, entry)| {
+                entry.pools.iter().flat_map(move |(generation, pool)| {
+                    pool.isolates.iter().filter_map(move |isolate| {
+                        if (worker_name == requesting_worker_name
+                            && *generation == requesting_generation)
+                            || !pool.queue.is_empty()
+                            || !isolate.startup.is_ready()
+                            || isolate.inflight_count != 0
+                            || !isolate.pending_replies.is_empty()
+                            || !isolate.pending_wait_until.is_empty()
+                            || isolate.active_websocket_sessions != 0
+                            || isolate.active_transport_sessions != 0
+                            || !isolate.dynamic_control_inbox.is_empty()
+                        {
+                            return None;
+                        }
+                        Some((
+                            isolate.last_used_at,
+                            worker_name.clone(),
+                            *generation,
+                            isolate.id,
+                        ))
+                    })
+                })
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.cmp(&right.2))
+                    .then_with(|| left.3.cmp(&right.3))
+            });
+
+        let Some((_last_used_at, worker_name, generation, isolate_id)) = candidate else {
+            return false;
+        };
+        let isolate_idx = self
+            .workers
+            .get(&worker_name)
+            .and_then(|entry| entry.pools.get(&generation))
+            .and_then(|pool| pool.isolate_idx(isolate_id));
+        let Some(isolate_idx) = isolate_idx else {
+            return false;
+        };
+        if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
+            pool.stats.scale_down_count = pool.stats.scale_down_count.saturating_add(1);
+            pool.log_stats("budget_pressure");
+        }
+        let removed = self.remove_isolate(&worker_name, generation, isolate_idx);
+        debug_assert!(removed.removed);
+        debug_assert!(removed.replies.is_empty());
+        tracing::debug!(
+            worker = %worker_name,
+            generation,
+            isolate_id,
+            requesting_worker = %requesting_worker_name,
+            requesting_generation,
+            "retired idle isolate under global budget pressure"
+        );
+        removed.removed
+    }
+
     pub(crate) fn scale_down_pool(&mut self, worker_name: &str, generation: u64, now: Instant) {
         let min_isolates = self.config.min_isolates;
         let idle_ttl = self.config.idle_ttl;
@@ -1104,7 +1183,7 @@ impl WorkerManager {
                 .get_mut(worker_name)
                 .and_then(|entry| entry.pools.remove(&generation))
             {
-                release_worker_source_modules(&pool.source);
+                release_worker_source_modules(&self.dynamic_modules, &pool.source);
                 self.account_removed_pool_queue(&pool);
                 retired_generations.insert(generation);
                 for isolate in pool.isolates {
@@ -1341,13 +1420,14 @@ impl WorkerManager {
 }
 
 fn deployed_worker_source(
+    dynamic_modules: &crate::dynamic_modules::DynamicModuleRegistry,
     source: &str,
     server_modules: &[DeployServerModule],
 ) -> Result<crate::ops::WorkerSource> {
     if server_modules.is_empty() {
         return Ok(crate::ops::WorkerSource::inline(source.to_string()));
     }
-    let (graph_id, entrypoint) = crate::dynamic_modules::register_server_module_graph(
+    let (graph_id, entrypoint) = dynamic_modules.register_server_module_graph(
         "worker.js",
         source.to_string(),
         server_modules.to_vec(),
@@ -1358,8 +1438,11 @@ fn deployed_worker_source(
     })
 }
 
-fn release_worker_source_modules(source: &crate::ops::WorkerSource) {
+fn release_worker_source_modules(
+    dynamic_modules: &crate::dynamic_modules::DynamicModuleRegistry,
+    source: &crate::ops::WorkerSource,
+) {
     if let crate::ops::WorkerSource::DynamicModule { graph_id, .. } = source {
-        crate::dynamic_modules::release_dynamic_module_graph(graph_id);
+        dynamic_modules.release(graph_id);
     }
 }

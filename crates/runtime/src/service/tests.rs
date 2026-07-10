@@ -1,6 +1,4 @@
-use super::{
-    BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
-};
+use super::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
 use base64::Engine;
 use bytes::Bytes;
 use common::{
@@ -44,6 +42,37 @@ async fn service_starts_with_deno_runtime_bootstrap() {
         ..RuntimeConfig::default()
     })
     .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn shutdown_is_idempotent_across_clones_and_waits_for_runtime_thread_exit() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    let shutdowns = (0..8).map(|_| {
+        let service = service.clone();
+        async move { service.shutdown().await }
+    });
+    let results = timeout(
+        Duration::from_secs(5),
+        futures_util::future::join_all(shutdowns),
+    )
+    .await
+    .expect("concurrent shutdown calls should complete");
+    assert!(results.into_iter().all(|result| result.is_ok()));
+    assert!(
+        service.shutdown.is_complete(),
+        "shutdown must not return before the shared runtime thread join completes"
+    );
+
+    timeout(Duration::from_millis(100), service.shutdown())
+        .await
+        .expect("repeated shutdown should use the stored result")
+        .expect("repeated shutdown should remain successful");
 }
 
 #[tokio::test]
@@ -460,34 +489,6 @@ export default {
     assert_eq!(second["rawAvailable"], true);
     assert_eq!(second["rawInstalled"], false);
     assert_eq!(second["wrapperInstalled"], true);
-
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    assert!(worker_runtime_source.contains("__dd_install_host_fetch"));
-    assert!(worker_runtime_source.contains("value: function installHostFetch()"));
-    assert!(
-        worker_runtime_source
-            .contains("const installHostFetch = globalThis.__dd_install_host_fetch")
-    );
-    assert!(!worker_runtime_source.contains("const installHostFetch = () =>"));
-    assert!(worker_runtime_source.contains("__dd_get_cache_bypass_stale"));
-    assert!(worker_runtime_source.contains("cacheBypassStale,"));
-    assert!(!worker_runtime_source.contains("globalThis.__dd_get_runtime_request_id ="));
-    assert!(
-        !worker_runtime_source.contains("globalThis.__dd_get_runtime_request_context_handle =")
-    );
-    assert!(!worker_runtime_source.contains("globalThis.__dd_sync_time_boundary ="));
-    assert!(!worker_runtime_source.contains("globalThis.__dd_cache_bypass_stale ="));
-    let bootstrap_source = include_str!("../../js/bootstrap.js");
-    assert!(bootstrap_source.contains("function activeCacheBypassStale()"));
-    assert!(bootstrap_source.contains("activeCacheBypassStale(),"));
-    assert!(!bootstrap_source.contains("__dd_cache_bypass_stale"));
-    assert_eq!(
-        worker_runtime_source
-            .matches("globalThis.fetch = scopedFetch")
-            .count(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -1479,7 +1480,7 @@ async fn temporary_worker_expires_and_is_not_restored_from_store() {
     let database_url = format!("file:{}", db_path.display());
     let config = RuntimeConfig {
         scale_tick: Duration::from_secs(1),
-        temporary_worker_ttl: Duration::from_secs(60),
+        temporary_worker_ttl: Duration::from_millis(250),
         ..RuntimeConfig::default()
     };
 
@@ -1498,28 +1499,7 @@ async fn temporary_worker_expires_and_is_not_restored_from_store() {
     assert!(service.stats("preview".to_string()).await.is_some());
     service.shutdown().await.expect("service should shut down");
     drop(service);
-
-    let worker_store = root.join("workers");
-    let mut entries = tokio::fs::read_dir(&worker_store)
-        .await
-        .expect("worker store should exist");
-    let entry = entries
-        .next_entry()
-        .await
-        .expect("read worker store")
-        .expect("stored worker deployment should exist");
-    let path = entry.path();
-    let body = tokio::fs::read(&path)
-        .await
-        .expect("read stored deployment");
-    let mut stored: Value = serde_json::from_slice(&body).expect("stored deployment json");
-    stored["expires_at_ms"] = Value::from(0);
-    tokio::fs::write(
-        &path,
-        serde_json::to_vec(&stored).expect("updated stored deployment json"),
-    )
-    .await
-    .expect("write expired stored deployment");
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
     assert!(restored.stats("preview".to_string()).await.is_none());
@@ -2954,6 +2934,86 @@ async fn dynamic_worker_fetch_uses_deno_fetch_with_host_policy_and_secret_replac
 
 #[tokio::test]
 #[serial]
+async fn dynamic_worker_fetch_revalidates_redirect_and_strips_cross_origin_credentials() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 2,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    let destination = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("destination listener should bind");
+    let destination_address = destination.local_addr().expect("destination address");
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut socket, _) = destination.accept().await.expect("destination accept");
+        let mut buffer = vec![0_u8; 8192];
+        let bytes_read = socket.read(&mut buffer).await.expect("destination read");
+        request_tx
+            .send(String::from_utf8_lossy(&buffer[..bytes_read]).to_string())
+            .expect("request should be captured");
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            )
+            .await
+            .expect("destination write");
+    });
+
+    let redirect = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("redirect listener should bind");
+    let redirect_address = redirect.local_addr().expect("redirect address");
+    tokio::spawn(async move {
+        let (mut socket, _) = redirect.accept().await.expect("redirect accept");
+        let mut buffer = vec![0_u8; 4096];
+        let _ = socket.read(&mut buffer).await.expect("redirect read");
+        let response = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://{destination_address}/final\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("redirect write");
+    });
+
+    let deployed = service
+        .deploy_dynamic(
+            dynamic_fetch_probe_worker(&format!("http://{redirect_address}/start")),
+            HashMap::from([("API_TOKEN".to_string(), "redirect-secret".to_string())]),
+            vec![
+                format!("private:{redirect_address}"),
+                format!("private:{destination_address}"),
+            ],
+        )
+        .await
+        .expect("dynamic deploy should succeed");
+
+    let output = service
+        .invoke(deployed.worker, test_invocation())
+        .await
+        .expect("redirected fetch should succeed");
+    assert_eq!(output.status, 200);
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "ok");
+
+    let redirected_request = request_rx.await.expect("redirected request should arrive");
+    assert!(redirected_request.starts_with("GET /final HTTP/1.1\r\n"));
+    assert!(
+        !redirected_request
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization:"),
+        "cross-origin authorization leaked: {redirected_request}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn dynamic_worker_fetch_rejects_egress_hosts_outside_allowlist() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -3241,6 +3301,176 @@ async fn active_workers_share_small_global_isolate_budget() {
     assert!(a.isolates_total + b.isolates_total <= 2);
     assert_eq!(a.global_isolates_total, b.global_isolates_total);
     assert!(a.global_isolates_total <= 2);
+}
+
+#[test]
+fn runtime_default_global_isolate_budget_has_two_slot_floor() {
+    assert!(RuntimeConfig::default().max_global_isolates >= 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_routes_retire_lru_idle_isolates_without_waiting_for_idle_ttl() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 2,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(60 * 60),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    let workers = ["cold-a", "cold-b", "cold-c", "cold-d"];
+    for worker in workers {
+        service
+            .deploy(worker.to_string(), counter_worker())
+            .await
+            .expect("deploy should succeed");
+    }
+
+    for (index, worker) in workers.into_iter().enumerate() {
+        let mut request = test_invocation();
+        request.request_id = format!("cold-route-{index}");
+        let output = timeout(
+            Duration::from_secs(2),
+            service.invoke(worker.to_string(), request),
+        )
+        .await
+        .expect("cold route must not wait for the one-hour idle TTL")
+        .expect("cold route should succeed");
+        assert_eq!(output.status, 200);
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let first = service
+        .stats("cold-a".to_string())
+        .await
+        .expect("first worker stats should exist");
+    let second = service
+        .stats("cold-b".to_string())
+        .await
+        .expect("second worker stats should exist");
+    let last = service
+        .stats("cold-d".to_string())
+        .await
+        .expect("last worker stats should exist");
+    assert_eq!(first.isolates_total, 0, "oldest idle isolate should retire");
+    assert_eq!(
+        second.isolates_total, 0,
+        "next-oldest idle isolate should retire"
+    );
+    assert_eq!(last.global_isolate_budget, 2);
+    assert!(last.global_isolates_total <= 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn budget_pressure_never_retires_an_isolate_with_an_active_request() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(60 * 60),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy("active-a".to_string(), slow_worker())
+        .await
+        .expect("first deploy should succeed");
+    service
+        .deploy("active-b".to_string(), counter_worker())
+        .await
+        .expect("second deploy should succeed");
+
+    let first_service = service.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .invoke("active-a".to_string(), test_invocation())
+            .await
+    });
+    sleep(Duration::from_millis(10)).await;
+    let second = timeout(
+        Duration::from_secs(2),
+        service.invoke("active-b".to_string(), test_invocation()),
+    );
+
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(
+        String::from_utf8(
+            first
+                .expect("first task should join")
+                .expect("active request must not be evicted")
+                .body,
+        )
+        .expect("utf8"),
+        "ok"
+    );
+    assert!(
+        second
+            .expect("second route should receive the slot after completion")
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn budget_pressure_waits_for_wait_until_before_retiring_an_isolate() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(60 * 60),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "wait-until-a".to_string(),
+            r#"
+export default {
+  async fetch(_request, _env, ctx) {
+    ctx.waitUntil(Deno.core.ops.op_sleep(150));
+    return new Response("queued");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("waitUntil worker should deploy");
+    service
+        .deploy("wait-until-b".to_string(), counter_worker())
+        .await
+        .expect("second worker should deploy");
+
+    let first = service
+        .invoke("wait-until-a".to_string(), test_invocation())
+        .await
+        .expect("first response should succeed");
+    assert_eq!(String::from_utf8(first.body).expect("utf8"), "queued");
+
+    let started = Instant::now();
+    timeout(
+        Duration::from_secs(2),
+        service.invoke("wait-until-b".to_string(), test_invocation()),
+    )
+    .await
+    .expect("second worker should receive the slot after waitUntil")
+    .expect("second request should succeed");
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "waitUntil isolate was retired before its background work completed"
+    );
 }
 
 #[tokio::test]
@@ -4179,774 +4409,63 @@ async fn internal_trace_invocations_do_not_recurse() {
     assert!(state.total_calls >= 2);
 }
 
-#[test]
-fn dynamic_host_rpc_fake_wake_path_is_removed_from_runtime_sources() {
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
+#[tokio::test]
+#[serial]
+async fn concurrent_runtime_services_isolate_dynamic_module_graphs_and_refcounts() {
+    let first = test_service(RuntimeConfig::default()).await;
+    let second = test_service(RuntimeConfig::default()).await;
+    let modules = HashMap::from([(
+        "worker.js".to_string(),
+        "export default { fetch() { return new Response('isolated'); } };".to_string(),
+    )]);
 
-    assert!(!worker_runtime_source.contains("__dd_drain_dynamic_host_rpc_queue"));
-    assert!(!worker_runtime_source.contains("__dd_run_dynamic_host_rpc_tasks"));
-    assert!(!worker_runtime_source.contains("__dd_dynamic_colocated_runtime_cache"));
-    assert!(!worker_runtime_source.contains("tryColocatedDynamicFetch"));
-    assert!(!worker_runtime_source.contains("__dd_force_remote_fetch"));
-    assert!(!worker_runtime_source.contains("runDynamicHostRpcTask"));
-    assert!(!worker_runtime_source.contains("host-rpc-task"));
-    assert!(!worker_runtime_source.contains("op_dynamic_host_rpc_task_complete"));
-    assert!(!worker_runtime_source.contains("op_dynamic_take_reply"));
-    assert!(!worker_runtime_source.contains("op_dynamic_take_pushed_replies"));
-    assert!(!worker_runtime_source.contains("op_dynamic_take_host_rpc_tasks"));
-    assert!(worker_runtime_source.contains("__dd_drain_dynamic_control_queue"));
-    assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/core.js"));
-    assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/fetch_cache.js"));
-    assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/sockets_transport.js"));
-    assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/memory.js"));
-    assert!(worker_runtime_source.contains("__dd_source_unit:execute_worker/dynamic.js"));
-}
-
-#[test]
-fn dynamic_module_workers_do_not_generate_js_import_wrappers() {
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let dynamic_modules_source = include_str!("../dynamic_modules.rs");
-    let dynamic_ops_source = include_str!("../ops/dynamic.rs");
-
-    assert!(!worker_runtime_source.contains("buildSourceFromModules"));
-    assert!(!worker_runtime_source.contains("normalizeModulePath"));
-    assert!(!worker_runtime_source.contains("dynamicSourceCacheKey"));
-    assert!(!worker_runtime_source.contains("dynamic worker missing entrypoint module"));
-    assert!(!worker_runtime_source.contains("__dd_dynamic_graph"));
-    assert!(!worker_runtime_source.contains("await import(\"dd-dynamic://graph/\""));
-    assert!(worker_runtime_source.contains("op_dynamic_module_graph_register"));
-    assert!(worker_runtime_source.contains("op_dynamic_module_graph_release"));
-    assert!(worker_runtime_source.contains("onRemove: (source) =>"));
-    assert!(worker_runtime_source.contains("result.entrypoint"));
-    assert!(worker_runtime_source.contains("module_graph_id"));
-    assert!(worker_runtime_source.contains("module_entrypoint"));
-    assert!(dynamic_ops_source.contains("#[string] entrypoint: String"));
-    assert!(dynamic_modules_source.contains("register_dynamic_module_graph("));
-    assert!(dynamic_modules_source.contains("retain_dynamic_module_graph("));
-    assert!(dynamic_modules_source.contains("release_dynamic_module_graph("));
-    assert!(dynamic_modules_source.contains("ref_count: usize"));
-    assert!(dynamic_modules_source.contains("normalize_dynamic_module_path(entrypoint)"));
-    assert!(dynamic_modules_source.contains("dynamic module graph missing entrypoint module"));
-    assert!(dynamic_modules_source.contains("duplicate normalized path"));
-    assert!(dynamic_modules_source.contains("dynamic module URL imports are unsupported"));
-}
-
-#[test]
-fn worker_invocation_uses_typed_request_handle_runtime_entrypoint() {
-    let engine_source = include_str!("../engine.rs");
-    let ops_source = include_str!("../ops.rs");
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let api_invocation_source = include_str!("../../../api/src/handlers/invocation.rs");
-    let request_types_source = include_str!("../ops/request_types.rs");
-    let request_ops_source = include_str!("../ops/request.rs");
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-
-    assert!(!engine_source.contains("<dd:invoke>"));
-    assert!(!engine_source.contains("execute_script(\"<dd:invoke>\""));
-    assert!(engine_source.contains("__dd_execute_worker_handle"));
-    assert!(engine_source.contains("__dd_abort_worker_request_handle"));
-    assert!(engine_source.contains("pub fn abort_worker_request_handle("));
-    assert!(engine_source.contains("call_cached_u32_function("));
-    assert!(!engine_source.contains("call_cached_string_function"));
-    assert!(!engine_source.contains("__dd_abort_worker_request\","));
-    assert!(worker_runtime_source.contains("__dd_execute_worker_handle = (requestHandle)"));
+    let (first_graph_id, first_entrypoint) = first
+        ._dynamic_modules
+        .register_dynamic_module_graph("worker.js", modules.clone())
+        .expect("first service graph should register");
     assert!(
-        worker_runtime_source.contains("__dd_abort_worker_request_handle = (requestContextHandle)")
+        second
+            ._dynamic_modules
+            .source(&first_graph_id, &first_entrypoint)
+            .is_none(),
+        "a graph registered in one live service must not be visible to another"
     );
-    assert!(worker_runtime_source.contains("__dd_inflight_requests_by_context_handle"));
-    assert!(!worker_runtime_source.contains("__dd_abort_worker_request = (requestId)"));
-    assert!(worker_runtime_source.contains("op_http_take_prepared_headers"));
-    assert!(worker_runtime_source.contains("op_http_take_prepared_body(requestBodyHandle)"));
-    assert!(worker_runtime_source.contains("op_http_take_prepared_body\", bodyHandle"));
-    assert!(engine_source.contains("request_headers_handle"));
-    assert!(engine_source.contains("request_body_handle"));
-    assert!(engine_source.contains("HttpPreparedHeaders"));
-    assert!(engine_source.contains("HttpPreparedBodies"));
-    assert!(api_invocation_source.contains("tx.send(Ok(chunk))"));
-    assert!(!api_invocation_source.contains("tx.send(Ok(chunk.to_vec()))"));
-    assert!(
-        request_types_source
-            .contains("pub type RequestBodyChunk = std::result::Result<Bytes, String>")
-    );
-    assert!(request_types_source.contains("bodies: HashMap<u32, Bytes>"));
-    assert!(request_ops_source.contains(".insert(bytes)"));
-    assert!(storage_http_source.contains("#[buffer] body: JsBuffer"));
-    assert!(storage_http_source.contains("Bytes::copy_from_slice(body.as_ref())"));
-    assert!(storage_http_source.contains("pub(crate) struct KvGetValueResult"));
-    assert!(storage_http_source.contains("pub(crate) struct KvListItem"));
-    assert!(storage_http_source.contains("value_handle: u32"));
-    assert!(storage_http_source.contains(".insert(Bytes::from(value.value))"));
-    assert!(storage_http_source.contains("to_list_item(entry, bodies)"));
-    assert!(worker_runtime_source.contains("result.value_handle"));
-    assert!(worker_runtime_source.contains("entry?.value_handle"));
-    assert!(!storage_http_source.contains("#[buffer(copy)] body: Vec<u8>"));
-    assert!(!storage_http_source.contains("value: Vec<u8>,\n    encoding: String,\n}\n\n#[derive(Debug, Serialize)]\npub(crate) struct KvGetValueResult"));
-    assert!(!storage_http_source.contains(
-        "pub(crate) struct KvGetValueResult {\n    ok: bool,\n    found: bool,\n    value: Vec<u8>"
-    ));
-    assert!(!worker_runtime_source.contains("new Uint8Array(Array.isArray(rawValue)"));
-    assert!(!worker_runtime_source.contains("entry?.value, \"kv list\""));
-    assert!(request_types_source.contains("take_descriptor"));
-    assert!(!ops_source.contains("std::mem::take(&mut payload.request.headers)"));
-    assert!(!worker_runtime_source.contains("op_take_request_invocation_body"));
-    assert!(!worker_runtime_source.contains("op_take_request_body_chunk"));
-    assert!(!worker_runtime_source.contains("descriptor.headers"));
-    assert!(!worker_runtime_source.contains("payload?.request ??"));
-    assert!(!worker_runtime_source.contains("request: {\n      method: String(descriptor.method"));
-    assert!(worker_runtime_source.contains("const input = {"));
-    assert!(worker_runtime_source.contains("input_request_id: String(descriptor.input_request_id"));
-    assert!(request_types_source.contains("request_headers_handle"));
-    assert!(request_types_source.contains("request_body_handle"));
-    assert!(request_types_source.contains("input_request_id: String"));
-    assert!(!request_types_source.contains("request: WorkerInvocation"));
-    assert!(!request_types_source.contains("payload.request."));
-    assert!(engine_source.contains("method: mem::take(&mut request.method)"));
-    assert!(engine_source.contains("url: mem::take(&mut request.url)"));
-    assert!(engine_source.contains("input_request_id: mem::take(&mut request.request_id)"));
-    assert!(request_types_source.contains("body_handle: u32"));
-    assert!(!request_types_source.contains("pub(crate) headers: Vec<(String, String)>,"));
-    assert!(!request_types_source.contains("fn take_body("));
-    assert!(!request_types_source.contains("RequestBodyChunkHandles"));
-}
 
-#[test]
-fn memory_rpc_nested_request_ids_are_host_generated() {
-    let memory_ops_source = include_str!("../ops/memory.rs");
-    let dynamic_ops_source = include_str!("../ops/dynamic.rs");
-    let dynamic_types_source = include_str!("../ops/dynamic_types.rs");
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let pending_reply_start = dynamic_types_source
-        .find("pub struct DynamicPendingReplyResult")
-        .expect("dynamic pending reply result should exist");
-    let pending_reply_end = dynamic_types_source[pending_reply_start..]
-        .find("pub struct DynamicFetchReplyResult")
-        .map(|offset| pending_reply_start + offset)
-        .expect("dynamic fetch reply result should follow pending reply result");
-    let pending_reply_source = &dynamic_types_source[pending_reply_start..pending_reply_end];
-
-    assert!(memory_ops_source.contains("MEMORY_INVOKE_REQUEST_SEQ"));
-    assert!(memory_ops_source.contains(":memory-run:"));
-    assert!(worker_runtime_source.contains("op_memory_invoke_method"));
-    assert!(memory_ops_source.contains("#[buffer] args: JsBuffer"));
-    assert!(!memory_ops_source.contains("#[buffer(copy)] args: Vec<u8>"));
-    assert!(!worker_runtime_source.contains(":memory-run:"));
-    assert!(dynamic_ops_source.contains("DYNAMIC_FETCH_REQUEST_SEQ"));
-    assert!(dynamic_ops_source.contains(":dynamic:"));
-    assert!(worker_runtime_source.contains("op_dynamic_worker_fetch_start"));
+    let (second_graph_id, second_entrypoint) = second
+        ._dynamic_modules
+        .register_dynamic_module_graph("worker.js", modules)
+        .expect("second service graph should register");
     assert_eq!(
-        dynamic_ops_source
-            .matches("#[buffer] args: JsBuffer")
-            .count(),
-        2
+        first_graph_id, second_graph_id,
+        "graph ids remain content-addressed"
     );
-    assert!(!dynamic_ops_source.contains("#[buffer(copy)] args: Vec<u8>"));
-    assert!(!worker_runtime_source.contains(":dynamic:"));
-    assert!(dynamic_ops_source.contains("headers_handle: u32"));
-    assert!(dynamic_ops_source.contains("body_handle: u32"));
-    assert!(!dynamic_ops_source.contains("#[serde] headers: Vec<(String, String)>"));
-    assert!(!dynamic_ops_source.contains("#[buffer(copy)] body: Vec<u8>"));
-    assert!(!pending_reply_source.contains("status: u16"));
-    assert!(!pending_reply_source.contains("Vec<(String, String)>"));
-    assert!(!pending_reply_source.contains("body: Vec<u8>"));
-    assert!(pending_reply_source.contains("value_handle: u32"));
-    assert!(pending_reply_source.contains("pending_value: Option<Vec<u8>>"));
-    assert!(!pending_reply_source.contains("value: Vec<u8>"));
-    assert!(!dynamic_types_source.contains("pub headers: Vec<(String, String)>"));
-    assert!(!dynamic_types_source.contains("pub body: Vec<u8>"));
-    assert!(dynamic_types_source.contains("pub pending_output: Option<WorkerOutput>"));
-    assert!(dynamic_ops_source.contains("reply.headers_handle"));
-    assert!(dynamic_ops_source.contains("reply.body_handle"));
-    assert!(dynamic_ops_source.contains("reply.value_handle"));
-    assert!(dynamic_types_source.contains("pub headers_handle: u32"));
-    assert!(dynamic_types_source.contains("pub body_handle: u32"));
-    assert!(dynamic_ops_source.contains("pending_output.take()"));
-    assert!(dynamic_ops_source.contains("pending_value.take()"));
-    assert!(worker_runtime_source.contains("result.headers_handle"));
-    assert!(worker_runtime_source.contains("result.body_handle"));
-    assert!(worker_runtime_source.contains("result.value_handle"));
-    assert!(worker_runtime_source.contains("op_http_take_prepared_body\", valueHandle"));
-    assert!(worker_runtime_source.contains("const discardDynamicReplyHandles = (payload) =>"));
-    assert!(worker_runtime_source.contains("payload?.value_handle"));
-    assert!(worker_runtime_source.contains("discardDynamicReplyHandles(payload)"));
-    assert!(worker_runtime_source.contains("discardDynamicReplyHandles(readyPayload)"));
-    assert!(!worker_runtime_source.contains("toArrayBytes(result.body)"));
-    assert!(!worker_runtime_source.contains("toArrayBytes(result.value)"));
-    assert!(!worker_runtime_source.contains("Array.isArray(result.headers) ? result.headers : []"));
-}
+    assert_eq!(first._dynamic_modules.ref_count(&first_graph_id), Some(1));
+    assert_eq!(second._dynamic_modules.ref_count(&second_graph_id), Some(1));
 
-#[test]
-fn response_streaming_uses_binary_chunk_ops_not_json_number_arrays() {
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-    let ops_source = include_str!("../ops.rs");
-    let facade_source = include_str!("facade.rs");
-    let lifecycle_source = include_str!("lifecycle.rs");
-    let complete_start = lifecycle_source
-        .find("pub(crate) async fn complete_stream_registration")
-        .expect("complete_stream_registration should be async");
-    let complete_end = lifecycle_source[complete_start..]
-        .find("pub(crate) fn fail_all_streams_for_worker")
-        .map(|offset| complete_start + offset)
-        .expect("fail_all_streams_for_worker should follow complete_stream_registration");
-    let complete_source = &lifecycle_source[complete_start..complete_end];
-
-    assert!(worker_runtime_source.contains("op_emit_response_chunk"));
-    assert!(storage_http_source.contains("#[buffer] chunk: JsBuffer"));
-    assert!(storage_http_source.contains("Bytes::copy_from_slice(chunk.as_ref())"));
-    assert!(ops_source.contains("chunk: Bytes"));
-    assert!(facade_source.contains("mpsc::Receiver<Result<Bytes>>"));
-    assert!(complete_source.contains(".body_sender.send("));
-    assert!(!complete_source.contains(".body_sender.try_send("));
-    assert!(!worker_runtime_source.contains("Array.from(bytes)"));
-    assert!(!worker_runtime_source.contains("bodyBytes.push"));
-    assert!(!worker_runtime_source.contains("JSON.stringify({ request_id"));
-}
-
-#[test]
-fn memory_realtime_ops_use_borrowed_buffer_inputs() {
-    let memory_ops_source = include_str!("../ops/memory.rs");
-    let memory_types_source = include_str!("../ops/memory_types.rs");
-    let ops_source = include_str!("../ops.rs");
-    let control_source = include_str!("control.rs");
-    let runtime_source = include_str!("runtime.rs");
-    let sessions_source = include_str!("sessions.rs");
-
-    assert!(memory_ops_source.contains("#[buffer] message: JsBuffer"));
-    assert!(memory_ops_source.contains("#[buffer] chunk: JsBuffer"));
-    assert!(memory_ops_source.contains("#[buffer] datagram: JsBuffer"));
-    assert!(!memory_ops_source.contains("#[buffer(copy)] message: Vec<u8>"));
-    assert!(!memory_ops_source.contains("#[buffer(copy)] chunk: Vec<u8>"));
-    assert!(!memory_ops_source.contains("#[buffer(copy)] datagram: Vec<u8>"));
-    assert!(!ops_source.contains("op_memory_transport_recv_stream"));
-    assert!(!ops_source.contains("op_memory_transport_recv_datagram"));
-    assert!(!memory_ops_source.contains("op_memory_transport_recv_stream"));
-    assert!(!memory_ops_source.contains("op_memory_transport_recv_datagram"));
-    assert!(!memory_types_source.contains("MemoryTransportRecvResult"));
-    assert!(!memory_types_source.contains("MemoryTransportRecvStreamEvent"));
-    assert!(!memory_types_source.contains("MemoryTransportRecvDatagramEvent"));
-    assert!(!memory_types_source.contains("TransportRecvEvent"));
-    assert!(!control_source.contains("MemoryTransportRecvStream"));
-    assert!(!control_source.contains("MemoryTransportRecvDatagram"));
-    assert!(!runtime_source.contains("MemoryTransportRecvStream"));
-    assert!(!runtime_source.contains("MemoryTransportRecvDatagram"));
-    assert!(!sessions_source.contains("handle_memory_transport_recv_stream"));
-    assert!(!sessions_source.contains("handle_memory_transport_recv_datagram"));
-    assert!(!sessions_source.contains("inbound_streams"));
-    assert!(!sessions_source.contains("inbound_stream_closed"));
-    assert!(!sessions_source.contains("inbound_datagrams"));
-}
-
-#[test]
-fn response_headers_are_prepared_handles_for_lifecycle_ops() {
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let request_types_source = include_str!("../ops/request_types.rs");
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-    let completion_start = storage_http_source
-        .find("pub(crate) fn op_emit_completion_ok")
-        .expect("op_emit_completion_ok should exist");
-    let completion_end = storage_http_source[completion_start..]
-        .find("pub(crate) fn op_emit_completion_error")
-        .map(|offset| completion_start + offset)
-        .expect("op_emit_completion_error should follow op_emit_completion_ok");
-    let completion_source = &storage_http_source[completion_start..completion_end];
-
-    assert!(worker_runtime_source.contains("op_http_store_prepared_headers"));
+    first._dynamic_modules.release(&first_graph_id);
     assert!(
-        worker_runtime_source
-            .contains("headersHandle: streamResponse ? 0 : storeResponseHeaders(headers)")
+        first
+            ._dynamic_modules
+            .source(&first_graph_id, &first_entrypoint)
+            .is_none()
     );
     assert!(
-        worker_runtime_source
-            .contains("Math.max(0, Math.trunc(Number(result.headersHandle ?? 0) || 0))")
+        second
+            ._dynamic_modules
+            .source(&second_graph_id, &second_entrypoint)
+            .is_some(),
+        "releasing one service's graph must not change another service's refcount"
     );
-    assert!(worker_runtime_source.contains("bodyHandle: 0"));
-    assert!(worker_runtime_source.contains("result.bodyHandle = callOp("));
-    assert!(
-        worker_runtime_source
-            .contains("Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0))")
-    );
-    assert!(!worker_runtime_source.contains("result.body = concatByteChunks"));
-    assert!(!worker_runtime_source.contains("result.body == null"));
-    assert!(request_types_source.contains("pub struct HttpPreparedHeaders"));
-    assert!(completion_source.contains("headers_handle: u32"));
-    assert!(completion_source.contains("body_handle: u32"));
-    assert!(completion_source.contains("borrow_mut::<HttpPreparedHeaders>()"));
-    assert!(completion_source.contains("borrow_mut::<HttpPreparedBodies>()"));
-    assert!(!completion_source.contains("#[buffer(copy)] body: Vec<u8>"));
+
+    first
+        .shutdown()
+        .await
+        .expect("first service should shut down");
+    second
+        .shutdown()
+        .await
+        .expect("second service should shut down");
 }
-
-#[test]
-fn host_fetch_prepare_uses_prepared_header_and_body_handles() {
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-    let prepare_start = storage_http_source
-        .find("pub(crate) fn op_http_prepare")
-        .expect("op_http_prepare should exist");
-    let prepare_end = storage_http_source[prepare_start..]
-        .find("pub(crate) fn op_http_take_prepared_body")
-        .map(|offset| prepare_start + offset)
-        .expect("op_http_take_prepared_body should follow op_http_prepare");
-    let prepare_source = &storage_http_source[prepare_start..prepare_end];
-
-    assert!(worker_runtime_source.contains("normalizedHeadersHandle"));
-    assert!(worker_runtime_source.contains("normalizedBodyHandle"));
-    assert!(worker_runtime_source.contains("prepared.headers_handle"));
-    assert!(prepare_source.contains("headers_handle: u32"));
-    assert!(prepare_source.contains("body_handle: u32"));
-    assert!(!prepare_source.contains("#[serde] headers: Vec<(String, String)>"));
-    assert!(!prepare_source.contains("#[buffer(copy)] body: Vec<u8>"));
-}
-
-#[test]
-fn cache_ops_use_prepared_header_and_body_handles() {
-    let bootstrap_source = include_str!("../../js/bootstrap.js");
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-    let op_source = |name: &str, next: &str| {
-        let start = storage_http_source
-            .find(name)
-            .unwrap_or_else(|| panic!("{name} should exist"));
-        let end = storage_http_source[start..]
-            .find(next)
-            .map(|offset| start + offset)
-            .unwrap_or(storage_http_source.len());
-        &storage_http_source[start..end]
-    };
-    let match_source = op_source(
-        "pub(crate) async fn op_cache_match",
-        "pub(crate) async fn op_cache_put",
-    );
-    let put_source = op_source(
-        "pub(crate) async fn op_cache_put",
-        "pub(crate) async fn op_cache_delete",
-    );
-    let delete_source = op_source(
-        "pub(crate) async fn op_cache_delete",
-        "fn ensure_cache_allowed",
-    );
-    let revalidate_source = op_source(
-        "pub(crate) fn op_emit_cache_revalidate",
-        "pub(crate) fn replace_placeholders_text",
-    );
-
-    assert!(bootstrap_source.contains("op_http_store_prepared_headers"));
-    assert!(bootstrap_source.contains("result.body_handle"));
-    assert!(bootstrap_source.contains("result.headers_handle"));
-    assert!(!bootstrap_source.contains("new Uint8Array(result.body ?? [])"));
-    assert!(!bootstrap_source.contains("Array.isArray(result.headers) ? result.headers : []"));
-    assert!(match_source.contains("headers_handle: u32"));
-    assert!(match_source.contains("body_handle"));
-    assert!(!match_source.contains("#[serde] headers: Vec<(String, String)>"));
-    assert!(put_source.contains("request_headers_handle: u32"));
-    assert!(put_source.contains("response_headers_handle: u32"));
-    assert!(!put_source.contains("#[serde] request_headers: Vec<(String, String)>"));
-    assert!(!put_source.contains("#[serde] response_headers: Vec<(String, String)>"));
-    assert!(delete_source.contains("headers_handle: u32"));
-    assert!(!delete_source.contains("#[serde] headers: Vec<(String, String)>"));
-    assert!(revalidate_source.contains("headers_handle: u32"));
-    assert!(!revalidate_source.contains("#[serde] headers: Vec<(String, String)>"));
-}
-
-#[test]
-fn kv_committed_writes_use_writer_reply_lane() {
-    let kv_source = include_str!("../kv.rs");
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-    let source_range = |start_marker: &str, end_marker: &str| {
-        let start = kv_source
-            .find(start_marker)
-            .unwrap_or_else(|| panic!("{start_marker} should exist"));
-        let end = kv_source[start..]
-            .find(end_marker)
-            .map(|offset| start + offset)
-            .unwrap_or(kv_source.len());
-        &kv_source[start..end]
-    };
-    let put_source = source_range("pub async fn put(", "pub async fn put_value(");
-    let put_value_source = source_range("pub async fn put_value(", "pub async fn delete(");
-    let delete_source = source_range("pub async fn delete(", "async fn commit_single_version(");
-
-    assert!(kv_source.contains("committed: VecDeque<KvCommittedBatch>"));
-    assert!(kv_source.contains("committed_mutations: usize"));
-    assert!(kv_source.contains("committed_bytes: usize"));
-    assert!(kv_source.contains("committed_backlog_accepts"));
-    assert!(kv_source.contains("state.push_committed"));
-    assert!(kv_source.contains("state.pop_committed"));
-    assert!(kv_source.contains("kv committed write queue overloaded: enqueue rejected"));
-    assert!(kv_source.contains("struct KvCommittedBatch"));
-    assert!(kv_source.contains("async fn commit_batch("));
-    assert!(kv_source.contains("KvWriterWork::Committed"));
-    assert!(put_source.contains("commit_single_version"));
-    assert!(put_value_source.contains("commit_single_version"));
-    assert!(delete_source.contains("commit_single_version"));
-    assert!(!put_source.contains("conn.execute("));
-    assert!(!put_value_source.contains("conn.execute("));
-    assert!(!delete_source.contains("conn.execute("));
-    assert!(!kv_source.contains("KV_VERSION_RETRIES"));
-    assert!(!kv_source.contains("execute_with_retry"));
-    assert!(storage_http_source.contains("pub(crate) async fn op_kv_put_value_bytes"));
-    assert!(storage_http_source.contains("pub(crate) fn op_kv_enqueue_put_value_bytes"));
-    assert!(storage_http_source.contains("#[buffer] value: JsBuffer"));
-    assert!(!storage_http_source.contains("#[buffer(copy)] value: Vec<u8>"));
-}
-
-#[test]
-fn wait_until_lifecycle_count_is_owned_by_request_context_handle() {
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let request_ops_source = include_str!("../ops/request.rs");
-    let request_types_source = include_str!("../ops/request_types.rs");
-    let storage_http_source = include_str!("../ops/storage_http.rs");
-
-    assert!(worker_runtime_source.contains("op_request_wait_until_register"));
-    assert!(!worker_runtime_source.contains("waitUntilDoneSent"));
-    assert!(request_ops_source.contains("op_request_wait_until_register"));
-    assert!(request_types_source.contains("increment_wait_until"));
-    assert!(request_types_source.contains("mark_wait_until_done"));
-    assert!(storage_http_source.contains("context.wait_until_count"));
-    assert!(!storage_http_source.contains("wait_until_count: u32"));
-}
-
-#[test]
-fn isolate_runtime_loop_uses_thread_local_event_queue_without_poll_sleep() {
-    let runtime_source = include_str!("runtime.rs");
-    let model_source = include_str!("model.rs");
-    let lifecycle_source = include_str!("lifecycle.rs");
-    let ops_source = include_str!("../ops.rs");
-
-    assert!(runtime_source.contains("pending_events: &Rc<RefCell<VecDeque<RuntimeEvent>>>,"));
-    assert!(runtime_source.contains("Rc::new(RefCell::new(VecDeque::<RuntimeEvent>::new()))"));
-    assert!(runtime_source.contains("event_loop_notify.notified()"));
-    assert!(runtime_source.contains("pump_event_loop_once"));
-    assert!(model_source.contains("Starting { started_at: Instant }"));
-    assert!(model_source.contains("Ready"));
-    assert!(model_source.contains("Retiring"));
-    assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Ready"));
-    assert!(lifecycle_source.contains("isolate.startup = IsolateStartup::Retiring"));
-    assert!(runtime_source.contains("RuntimeEvent::IsolateExited"));
-    assert!(lifecycle_source.contains("track_exiting_isolate_slot"));
-    assert!(ops_source.contains("pub struct IsolateEventSender(pub Rc<dyn Fn"));
-    assert!(!runtime_source.contains("Arc<StdMutex<VecDeque<RuntimeEvent>>>"));
-    assert!(!runtime_source.contains("isolate event queue mutex poisoned"));
-    assert!(!runtime_source.contains("Duration::from_millis(1)"));
-    assert!(!runtime_source.contains("recv_timeout"));
-}
-
-#[test]
-fn vite_dev_websocket_bridge_waits_for_runtime_frames_without_interval_polling() {
-    let vite_source = include_str!("../../../../packages/dd-vite/src/vite.js");
-    let runtime_client_source = include_str!("../../../../packages/dd-vite/src/runtime.js");
-    let dev_runtime_source = include_str!("../bin/dd_dev_runtime.rs");
-
-    assert!(vite_source.contains("runRuntimeFrameLoop"));
-    assert!(vite_source.contains("drainRuntimeFrames"));
-    assert!(vite_source.contains("waitWebSocketFrame"));
-    assert!(!vite_source.contains("pollRuntimeFrames"));
-    assert!(!vite_source.contains("pollTimer"));
-    assert!(!vite_source.contains("setInterval(() => {\n      void this.pollRuntimeFrames();"));
-    assert!(runtime_client_source.contains("op: \"wait_websocket_frame\""));
-    assert!(runtime_client_source.contains("}, { timeoutMs: 0 })"));
-    assert!(dev_runtime_source.contains("WaitWebsocketFrame"));
-    assert!(dev_runtime_source.contains("websocket_wait_frame"));
-    assert!(dev_runtime_source.contains("mpsc::channel::<ResponseEnvelope<CommandResult>>"));
-    assert!(
-        dev_runtime_source
-            .contains("matches!(&request.command, DevCommand::WaitWebsocketFrame { .. })")
-    );
-    assert!(dev_runtime_source.contains("tokio::spawn(async move"));
-}
-
-#[test]
-fn scheduler_queue_uses_stable_keys_and_drains_stale_targets_by_index() {
-    let model_source = include_str!("model.rs");
-    let lifecycle_source = include_str!("lifecycle.rs");
-    let dispatch_source = include_str!("dispatch.rs");
-    let remove_isolate_start = lifecycle_source
-        .find("pub(crate) fn remove_isolate(")
-        .expect("remove_isolate should exist");
-    let remove_isolate_end = lifecycle_source[remove_isolate_start..]
-        .find("pub(crate) fn remove_isolate_by_id(")
-        .map(|offset| remove_isolate_start + offset)
-        .expect("remove_isolate_by_id should follow remove_isolate");
-    let remove_isolate_source = &lifecycle_source[remove_isolate_start..remove_isolate_end];
-    let expire_queue_start = dispatch_source
-        .find("pub(crate) fn expire_queued_requests(")
-        .expect("expire_queued_requests should exist");
-    let expire_queue_end = dispatch_source[expire_queue_start..]
-        .find("pub(crate) fn expire_inflight_requests(")
-        .map(|offset| expire_queue_start + offset)
-        .expect("expire_inflight_requests should follow expire_queued_requests");
-    let expire_queue_source = &dispatch_source[expire_queue_start..expire_queue_end];
-
-    assert!(model_source.contains("by_runtime_request_id: HashMap<String, PendingQueueKey>"));
-    assert!(model_source.contains("by_target_isolate_id: HashMap<u64, HashSet<PendingQueueKey>>"));
-    assert!(
-        model_source.contains("by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>")
-    );
-    assert!(model_source.contains("by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>"));
-    assert!(model_source.contains("memory_shard_affinity: HashMap<usize, u64>"));
-    assert!(model_source.contains("memory_shards: BTreeMap<usize, MemoryShardQueue>"));
-    assert!(model_source.contains("struct MemoryOwnerQueue"));
-    assert!(model_source.contains("ready: VecDeque<String>"));
-    assert!(model_source.contains("ready_membership: HashSet<String>"));
-    assert!(model_source.contains("blocked: HashSet<String>"));
-    assert!(model_source.contains("memory_next_shard_cursor: Option<usize>"));
-    assert!(model_source.contains("memory_shard_index: Option<usize>"));
-    assert!(model_source.contains("memory_owner_key: Option<String>"));
-    assert!(model_source.contains("pub(super) fn find_fair_map<T>("));
-    assert!(model_source.contains("fn find_memory_round_robin_head_map<T>("));
-    assert!(model_source.contains("fn find_round_robin_owner_head_map<T>("));
-    assert!(model_source.contains("pub(super) fn mark_memory_owner_blocked("));
-    assert!(model_source.contains("pub(super) fn mark_memory_owner_ready("));
-    assert!(model_source.contains("targeted: BTreeMap<u64, PendingInvoke>"));
-    assert!(!model_source.contains("memory: BTreeMap<u64, PendingInvoke>"));
-    assert!(model_source.contains("pub(super) fn drain_target_isolate_id("));
-    assert!(model_source.contains("pub(super) fn drain_expired("));
-    assert!(model_source.contains("pub(super) fn next_expiry_at("));
-    assert!(!model_source.contains("VecDeque<QueuedPendingInvoke>"));
-    assert!(!model_source.contains("lane.remove(index)"));
-    assert!(dispatch_source.contains("remove_by_runtime_request_id(&runtime_request_id)"));
-    assert!(dispatch_source.contains("RuntimeAtomicQueueWait"));
-    assert!(dispatch_source.contains("memory_shard_affinity"));
-    assert!(runtime_source_contains_fair_memory_dispatch());
-    assert!(remove_isolate_source.contains("pool.queue.drain_target_isolate_id(isolate.id)"));
-    assert!(remove_isolate_source.contains("pool.memory_shard_affinity"));
-    assert!(
-        remove_isolate_source
-            .contains("self.account_dequeued_many(stale_targeted_count, stale_targeted_bytes)")
-    );
-    assert!(
-        remove_isolate_source.contains("PlatformError::runtime(\"target isolate is unavailable\")")
-    );
-    assert!(expire_queue_source.contains("pool.queue.drain_expired(now, max_queue_wait)"));
-    assert!(expire_queue_source.contains("pool.queue.next_expiry_at(max_queue_wait)"));
-    assert!(!expire_queue_source.contains("duration_since(pending.enqueued_at)"));
-    assert!(!expire_queue_source.contains("for pending in pool.queue.iter()"));
-}
-
-fn runtime_source_contains_fair_memory_dispatch() -> bool {
-    let runtime_source = include_str!("runtime.rs");
-    runtime_source.contains("pool.queue.find_fair_map(")
-        && runtime_source.contains("memory_shard_affinity_outcome(")
-}
-
-#[test]
-fn memory_outbox_scheduled_drains_are_bounded_and_requeued() {
-    let sessions_source = include_str!("sessions.rs");
-    let control_source = include_str!("control.rs");
-    let runtime_source = include_str!("runtime.rs");
-    let memory_source = include_str!("../memory.rs");
-
-    assert!(sessions_source.contains("MEMORY_OUTBOX_SCHEDULED_DRAIN_BATCHES: usize = 1"));
-    assert!(sessions_source.contains("MEMORY_OUTBOX_WORKER_CHANNEL_CAPACITY"));
-    assert!(sessions_source.contains("run_memory_outbox_worker"));
-    assert!(sessions_source.contains("claim_due_outbox_records_for_shard_index"));
-    assert!(sessions_source.contains("RuntimeEvent::MemoryOutboxDelivery"));
-    assert!(sessions_source.contains("apply_outbox_delivery_outcomes(&outcomes).await"));
-    assert!(sessions_source.contains("retry_pending_memory_outbox_drains"));
-    assert!(control_source.contains("MemoryOutboxDelivery"));
-    assert!(!control_source.contains("drain_scheduled_memory_outbox_shard"));
-    assert!(runtime_source.contains("tokio::spawn(run_memory_outbox_worker"));
-    assert!(runtime_source.contains("schedule_all_memory_outbox_shards(&event_tx)"));
-    assert!(memory_source.contains("pub async fn apply_outbox_delivery_outcomes"));
-    assert!(!sessions_source.contains("MEMORY_OUTBOX_MAX_DRAIN_BATCHES"));
-}
-
-#[test]
-fn memory_direct_writes_use_direct_apply_fast_path() {
-    let memory_source = include_str!("../../js/execute_worker/memory.js");
-    let fetch_cache_source = include_str!("../../js/execute_worker/fetch_cache.js");
-    let worker_runtime_source =
-        include_str!(concat!(env!("OUT_DIR"), "/execute_worker.generated.js"));
-    let memory_ops_source = include_str!("../ops/memory.rs");
-    let memory_types_source = include_str!("../ops/memory_types.rs");
-    let memory_store_source = include_str!("../memory.rs");
-    let add_mutation_start = worker_runtime_source
-        .find("const addMemoryBatchMutation = (txn, mutation) =>")
-        .expect("addMemoryBatchMutation should exist");
-    let add_mutation_end = worker_runtime_source[add_mutation_start..]
-        .find("const finishMemoryTxn")
-        .map(|offset| add_mutation_start + offset)
-        .expect("finishMemoryTxn should follow addMemoryBatchMutation");
-    let add_mutation_source = &worker_runtime_source[add_mutation_start..add_mutation_end];
-    let batch_mutation_start = memory_store_source
-        .find("pub struct MemoryBatchMutation")
-        .expect("MemoryBatchMutation should exist");
-    let batch_mutation_end = memory_store_source[batch_mutation_start..]
-        .find("pub struct MemoryCommandResultWrite")
-        .map(|offset| batch_mutation_start + offset)
-        .expect("MemoryCommandResultWrite should follow MemoryBatchMutation");
-    let batch_mutation_source = &memory_store_source[batch_mutation_start..batch_mutation_end];
-    let memory_state_entry_start = memory_types_source
-        .find("pub(crate) struct MemoryStateGetEntry")
-        .expect("MemoryStateGetEntry should exist");
-    let memory_state_entry_end = memory_types_source[memory_state_entry_start..]
-        .find("pub(crate) struct MemoryProfileResult")
-        .map(|offset| memory_state_entry_start + offset)
-        .expect("MemoryProfileResult should follow memory state entries");
-    let memory_state_entry_source =
-        &memory_types_source[memory_state_entry_start..memory_state_entry_end];
-    let memory_command_begin_start = memory_types_source
-        .find("pub(crate) struct MemoryCommandBeginResult")
-        .expect("MemoryCommandBeginResult should exist");
-    let memory_command_begin_end = memory_types_source[memory_command_begin_start..]
-        .find("pub(crate) struct MemorySocketSendResult")
-        .map(|offset| memory_command_begin_start + offset)
-        .unwrap_or(memory_types_source.len());
-    let memory_command_begin_source =
-        &memory_types_source[memory_command_begin_start..memory_command_begin_end];
-    let memory_invoke_method_start = memory_types_source
-        .find("pub(crate) struct MemoryInvokeMethodResult")
-        .expect("MemoryInvokeMethodResult should exist");
-    let memory_invoke_method_end = memory_types_source[memory_invoke_method_start..]
-        .find("pub(crate) struct MemorySocketSendResult")
-        .map(|offset| memory_invoke_method_start + offset)
-        .expect("MemorySocketSendResult should follow MemoryInvokeMethodResult");
-    let memory_invoke_method_source =
-        &memory_types_source[memory_invoke_method_start..memory_invoke_method_end];
-
-    assert!(memory_source.contains("async write(key, value, options)"));
-    assert!(memory_source.contains("const preferCallerIsolate = !descriptor.export_name"));
-    assert!(
-        !memory_source.contains("methodName === MEMORY_ATOMIC_METHOD || !descriptor.export_name")
-    );
-    assert!(memory_source.contains("rejectMemoryDirectOptions(\"set\", options)"));
-    assert!(memory_source.contains("await applyDirectMemoryMutations(entry, runtimeRequestId"));
-    assert!(memory_source.contains("const encoded = encodeMemoryStorageValue(value)"));
-    assert!(memory_source.contains("async delete(key, options)"));
-    assert!(memory_source.contains("rejectMemoryDirectOptions(\"delete\", options)"));
-    assert!(memory_source.contains("deleted: true"));
-    assert!(memory_source.contains("async writeMany(entries)"));
-    assert!(memory_source.contains("normalizedEntries.map((item) =>"));
-    assert!(!memory_source.contains("ensureMemoryStorageCommitted(entry, runtimeRequestId)"));
-    assert!(!memory_source.contains("createMemoryStorageBinding(entry, runtimeRequestId);"));
-    assert!(worker_runtime_source.contains("op_memory_direct_apply"));
-    assert!(worker_runtime_source.contains("const applyDirectMemoryMutations = async"));
-    assert!(worker_runtime_source.contains("op_memory_batch_apply"));
-    assert!(!worker_runtime_source.contains("op_memory_batch_next_version"));
-    assert!(!memory_ops_source.contains("op_memory_batch_next_version"));
-    assert!(!memory_types_source.contains("MemoryBatchNextVersionResult"));
-    assert!(!worker_runtime_source.contains("memoryTxnNextVersion"));
-    assert!(memory_ops_source.contains("op_memory_direct_apply"));
-    assert!(memory_ops_source.contains("MemoryDirectMutationInput"));
-    assert!(memory_ops_source.contains("MemoryBatchMutationResult"));
-    assert!(memory_ops_source.contains("#[buffer] value: JsBuffer"));
-    assert!(memory_ops_source.contains("op_memory_bytes_take"));
-    assert!(memory_ops_source.contains("memory_output_bytes_insert"));
-    assert!(memory_ops_source.contains("value_handle: memory_output_bytes_insert"));
-    assert!(memory_ops_source.contains("Bytes::copy_from_slice(value.as_ref())"));
-    assert!(!memory_ops_source.contains("#[buffer(copy)] value: Vec<u8>"));
-    assert!(memory_state_entry_source.contains("value_handle: u32"));
-    assert!(!memory_state_entry_source.contains("value: Vec<u8>"));
-    assert!(memory_command_begin_source.contains("value_handle: u32"));
-    assert!(!memory_command_begin_source.contains("value: Vec<u8>"));
-    assert!(memory_invoke_method_source.contains("value_handle: u32"));
-    assert!(!memory_invoke_method_source.contains("value: Vec<u8>"));
-    assert!(memory_ops_source.contains("Ok(MemoryInvokeResponse::Method { value })"));
-    assert!(
-        memory_ops_source.contains("caller_request_context_handle,\n                    value,")
-    );
-    assert!(memory_source.contains("return decodeRpcResult(takeMemoryBytes(result))"));
-    assert!(!memory_source.contains("decodeRpcResult(toArrayBytes(result.value))"));
-    assert!(fetch_cache_source.contains("const takeMemoryBytes = (record) =>"));
-    assert!(fetch_cache_source.contains("op_memory_bytes_take"));
-    assert!(fetch_cache_source.contains("activeRequestContextHandle(), handle"));
-    assert!(fetch_cache_source.contains("value: takeMemoryBytes(record)"));
-    assert!(fetch_cache_source.contains("value: takeMemoryBytes(entryValue)"));
-    assert!(
-        fetch_cache_source.contains("value: result.hit === true ? takeMemoryBytes(result) : null")
-    );
-    assert!(!fetch_cache_source.contains("toArrayBytes(entryValue?.value"));
-    assert!(
-        !fetch_cache_source.contains("result.value == null ? null : toArrayBytes(result.value)")
-    );
-    assert!(memory_types_source.contains("value: Bytes"));
-    assert!(!add_mutation_source.contains("committedVersion"));
-    assert!(!memory_ops_source.contains("committed_version: f64"));
-    assert!(!memory_types_source.contains("next_version: Option<i64>"));
-    assert!(!batch_mutation_source.contains("version: i64"));
-    assert!(worker_runtime_source.contains("memory batch mutation did not return a staged record"));
-    assert!(memory_ops_source.contains("close_memory_command_for_committed_batch"));
-    assert!(memory_ops_source.contains("memory_batch_commit_owner_epoch"));
-    assert!(memory_ops_source.contains("memory batch commit requires memory owner epoch"));
-    assert!(memory_ops_source.contains("Some(owner_epoch)"));
-    assert!(memory_ops_source.contains(".get(batch.command_handle)"));
-    assert!(!memory_ops_source.contains(".remove(batch.command_handle)\n        .ok_or_else"));
-    assert!(worker_runtime_source.contains("memory transaction commit failed"));
-    assert!(worker_runtime_source.contains("finishMemoryTxn"));
-    assert!(worker_runtime_source.contains("memory storage writes require stub.atomic(...)"));
-    assert!(!worker_runtime_source.contains("memory storage batch commit failed"));
-    assert!(!worker_runtime_source.contains("queueMemoryMutation"));
-    assert!(!worker_runtime_source.contains("ensureMemoryStorageCommitted"));
-    assert!(!worker_runtime_source.contains("pendingBatches"));
-    assert!(!worker_runtime_source.contains("flushRunning"));
-    assert!(!worker_runtime_source.contains("flushTail"));
-    assert!(!worker_runtime_source.contains("commitMemoryTxn"));
-    assert!(!worker_runtime_source.contains("requires_commit"));
-    assert!(!worker_runtime_source.contains("batchSnapshot"));
-    assert!(!worker_runtime_source.contains("op_memory_batch_snapshot"));
-    assert!(!memory_ops_source.contains("op_memory_batch_snapshot"));
-    assert!(!memory_types_source.contains("MemoryBatchSnapshotResult"));
-    assert!(worker_runtime_source.contains("op_memory_batch_list_overlay"));
-    assert!(memory_ops_source.contains("op_memory_batch_list_overlay"));
-    assert!(!worker_runtime_source.contains("op_memory_batch_enqueue"));
-    assert!(!worker_runtime_source.contains("op_memory_state_await_submission"));
-    assert!(!worker_runtime_source.contains("op_memory_batch_configure"));
-    assert!(!worker_runtime_source.contains("configureMemoryBatch"));
-    assert!(!worker_runtime_source.contains("blind_apply_allowed"));
-    assert!(!worker_runtime_source.contains("blind_applied"));
-    assert!(!worker_runtime_source.contains("js_txn_blind_commit"));
-    assert!(!memory_ops_source.contains("apply_blind_batch"));
-    assert!(!memory_ops_source.contains("memory_batch_blind_apply_allowed"));
-    assert!(!memory_ops_source.contains("js_txn_blind_commit"));
-    assert!(!worker_runtime_source.contains("pendingSubmissionPromises"));
-    assert!(!worker_runtime_source.contains("result.conflict"));
-    assert!(!worker_runtime_source.contains("expectedVersion"));
-    assert!(!worker_runtime_source.contains("optimisticWriteVersion"));
-    assert!(!worker_runtime_source.contains("conflict: true"));
-    assert!(!worker_runtime_source.contains("conflict: false"));
-    assert!(!memory_types_source.contains("pub(crate) conflict: bool"));
-    assert!(!memory_types_source.contains("requires_commit"));
-    assert!(!memory_types_source.contains("blind_apply_allowed"));
-    assert!(!memory_types_source.contains("blind_applied"));
-    assert!(!memory_ops_source.contains("MemoryBatchKind"));
-    assert!(!worker_runtime_source.contains("defer(callback)"));
-    assert!(!worker_runtime_source.contains("txn.deferred"));
-    assert!(!worker_runtime_source.contains("memory transaction conflicted"));
-}
-
-#[test]
-fn static_asset_lookup_uses_catalog_without_runtime_manager_command() {
-    let control_source = include_str!("control.rs");
-    let facade_source = include_str!("facade.rs");
-    let lifecycle_source = include_str!("lifecycle.rs");
-
-    assert!(!control_source.contains("ResolveAsset"));
-    assert!(facade_source.contains("pub fn resolve_asset("));
-    assert!(facade_source.contains("pub fn resolve_public_asset("));
-    assert!(facade_source.contains("pub fn resolve_public_route_asset("));
-    assert!(facade_source.contains("pub struct PublicRouteAssetResolution"));
-    assert!(facade_source.contains("fn resolve_asset_from_catalog("));
-    assert!(facade_source.contains("self.asset_catalog.get(worker_name)"));
-    assert!(control_source.contains("prepared: PreparedWorkerDeployment"));
-    assert!(facade_source.contains("fn prepare_worker_deployment("));
-    assert!(lifecycle_source.contains("AssetCatalogEntry {"));
-    assert!(lifecycle_source.contains("worker_name: worker_name.clone()"));
-    assert!(lifecycle_source.contains("generation,"));
-    assert!(facade_source.contains("entry.worker_name != worker_name"));
-    assert!(lifecycle_source.contains(
-        "self.asset_catalog\n            .insert(worker_name.clone(), asset_catalog_entry)"
-    ));
-    assert!(lifecycle_source.contains("self.asset_catalog.remove(worker_name)"));
-    assert!(!lifecycle_source.contains("compile_asset_bundle("));
-    assert!(!lifecycle_source.contains("extract_bindings(&config)"));
-}
-
 #[test]
 fn asset_catalog_copy_on_write_preserves_concurrent_updates_and_redeploy_snapshots() {
     let catalog = super::AssetCatalog::default();

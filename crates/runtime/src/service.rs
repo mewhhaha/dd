@@ -12,8 +12,9 @@ mod runtime;
 mod sessions;
 mod storage;
 
-use crate::blob::{BlobStore, BlobStoreConfig};
+use crate::blob::BlobStore;
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
+use crate::control_store::{ControlDeployment, ControlStore};
 use crate::engine::{
     WorkerDispatchRequest, abort_worker_request_handle, build_bootstrap_snapshot,
     cache_runtime_entrypoints, dispatch_worker_request, drain_dynamic_control_queue,
@@ -56,7 +57,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Once};
 use std::task::{Wake, Waker};
 use std::thread;
@@ -86,9 +87,10 @@ pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
     DynamicDeployResult, DynamicHandleDebug, DynamicRuntimeDebugDump, HostRpcProviderDebug,
     InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug, MemoryShardDebug,
-    PublicRouteAssetResolution, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, TransportOpen, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
-    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    PublicRouteAssetResolution, RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig,
+    RuntimeReadiness, RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig,
+    RuntimeStorageConfig, RuntimeWorkerStatus, TransportOpen, WebSocketOpen, WorkerDebugDump,
+    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };
 
 #[derive(Clone)]
@@ -128,6 +130,12 @@ impl AssetCatalog {
             Arc::new(next)
         });
     }
+
+    fn worker_names(&self) -> Vec<String> {
+        let mut names = self.snapshot.load().keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -143,9 +151,7 @@ pub(crate) use self::model::DynamicQuotaState;
 use self::model::*;
 use self::protocol::*;
 use self::runtime::*;
-use self::storage::{
-    PersistWorkerDeployment, delete_worker_deployment, epoch_ms_i64, persist_worker_deployment,
-};
+use self::storage::epoch_ms_i64;
 
 const INTERNAL_HEADER: &str = "x-dd-internal";
 const INTERNAL_REASON_HEADER: &str = "x-dd-internal-reason";

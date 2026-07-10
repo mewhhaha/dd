@@ -4,65 +4,44 @@ use common::{
     DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMetadata, DeployTokenMintRequest,
     DeployTokenMintResponse, PlatformError, Result,
 };
-use serde::{Deserialize, Serialize};
+use runtime::{ControlDeployToken, ControlStore};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DeployTokenStore {
-    path: PathBuf,
-    state: Arc<Mutex<DeployTokenFile>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DeployTokenFile {
-    version: u32,
-    tokens: Vec<StoredDeployToken>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredDeployToken {
-    id: String,
-    name: Option<String>,
-    token_hash: String,
-    created_at_unix: u64,
-    expires_at_unix: Option<u64>,
-    max_uses: Option<u64>,
-    uses: u64,
-    #[serde(default)]
-    last_used_at_unix: Option<u64>,
-    capabilities: DeployTokenCapabilities,
+    control: ControlStore,
+    mutation: Arc<Mutex<()>>,
 }
 
 impl DeployTokenStore {
     pub async fn load(path: PathBuf) -> Result<Self> {
-        let state = match tokio::fs::read(&path).await {
-            Ok(bytes) => serde_json::from_slice::<DeployTokenFile>(&bytes).map_err(|error| {
-                PlatformError::internal(format!(
-                    "failed to parse token store {}: {error}",
-                    path.display()
-                ))
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DeployTokenFile {
-                version: 1,
-                tokens: Vec::new(),
-            },
-            Err(error) => {
-                return Err(PlatformError::internal(format!(
-                    "failed to read token store {}: {error}",
-                    path.display()
-                )));
-            }
+        let file_name = path.file_name().and_then(|value| value.to_str());
+        let store_dir = if matches!(file_name, Some("tokens.json" | "deploy-tokens.json")) {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else {
+            path.with_extension("control")
         };
+        let control = ControlStore::open(store_dir).await?;
+        Self::from_control_store(control, Some(&path)).await
+    }
 
+    pub async fn from_control_store(
+        control: ControlStore,
+        legacy_path: Option<&Path>,
+    ) -> Result<Self> {
+        if let Some(path) = legacy_path {
+            control.import_legacy_tokens(path).await?;
+        }
         Ok(Self {
-            path,
-            state: Arc::new(Mutex::new(state)),
+            control,
+            mutation: Arc::new(Mutex::new(())),
         })
     }
 
@@ -76,7 +55,7 @@ impl DeployTokenStore {
         let id = resolve_token_id(request.id.as_deref(), request.name.as_deref())?;
         let named = request.id.is_some() || request.name.is_some();
         let token = generate_token();
-        let stored = StoredDeployToken {
+        let stored = ControlDeployToken {
             id: id.clone(),
             name: named.then(|| id.clone()),
             token_hash: token_hash(&token),
@@ -88,16 +67,18 @@ impl DeployTokenStore {
             capabilities: request.capabilities.clone(),
         };
 
-        let mut state = self.state.lock().await;
-        state.tokens.retain(|token| !token.is_expired(now));
-        if state.tokens.len() >= 1_024 {
+        let _guard = self.mutation.lock().await;
+        if self.control.list_tokens(now).await?.len() >= 1_024 {
             return Err(PlatformError::conflict("token store limit reached"));
         }
-        if state.tokens.iter().any(|token| token.id == id) {
+        match self.control.get_token(&id, now).await {
+            Ok(_) => return Err(PlatformError::conflict("token id already exists")),
+            Err(error) if error.kind() == common::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if !self.control.insert_token(&stored).await? {
             return Err(PlatformError::conflict("token id already exists"));
         }
-        state.tokens.push(stored.clone());
-        self.save_locked(&state).await?;
 
         Ok(DeployTokenMintResponse {
             ok: true,
@@ -117,12 +98,8 @@ impl DeployTokenStore {
     ) -> Result<()> {
         let hash = token_hash(bearer_token.trim());
         let now = unix_now()?;
-        let mut state = self.state.lock().await;
-        let Some(token) = state
-            .tokens
-            .iter_mut()
-            .find(|stored| constant_time_eq(stored.token_hash.as_bytes(), hash.as_bytes()))
-        else {
+        let _guard = self.mutation.lock().await;
+        let Some(token) = self.control.get_token_by_hash(&hash).await? else {
             return Err(PlatformError::unauthorized("invalid token"));
         };
 
@@ -137,22 +114,16 @@ impl DeployTokenStore {
         }
 
         enforce_capabilities(&token.capabilities, request)?;
-        token.uses = token.uses.saturating_add(1);
-        token.last_used_at_unix = Some(now);
-        state.tokens.retain(|token| !token.is_expired(now));
-        self.save_locked(&state).await?;
+        if !self.control.consume_token(&token.id, now).await? {
+            return Err(PlatformError::unauthorized("token exhausted"));
+        }
         Ok(())
     }
 
     pub async fn preflight(&self, bearer_token: &str) -> Result<()> {
         let hash = token_hash(bearer_token.trim());
         let now = unix_now()?;
-        let state = self.state.lock().await;
-        let Some(token) = state
-            .tokens
-            .iter()
-            .find(|stored| constant_time_eq(stored.token_hash.as_bytes(), hash.as_bytes()))
-        else {
+        let Some(token) = self.control.get_token_by_hash(&hash).await? else {
             return Err(PlatformError::unauthorized("invalid token"));
         };
         if token.is_expired(now) {
@@ -168,26 +139,21 @@ impl DeployTokenStore {
     }
 
     pub async fn list(&self) -> Result<DeployTokenListResponse> {
-        let mut state = self.state.lock().await;
-        self.prune_expired_locked(&mut state).await?;
+        let now = unix_now()?;
         Ok(DeployTokenListResponse {
             ok: true,
-            tokens: state
-                .tokens
+            tokens: self
+                .control
+                .list_tokens(now)
+                .await?
                 .iter()
-                .map(StoredDeployToken::metadata)
+                .map(ControlDeployToken::metadata)
                 .collect(),
         })
     }
 
     pub async fn get(&self, id: &str) -> Result<DeployTokenGetResponse> {
-        let mut state = self.state.lock().await;
-        self.prune_expired_locked(&mut state).await?;
-        let token = state
-            .tokens
-            .iter()
-            .find(|token| token.id == id)
-            .ok_or_else(|| PlatformError::not_found("token not found"))?;
+        let token = self.control.get_token(id, unix_now()?).await?;
         Ok(DeployTokenGetResponse {
             ok: true,
             token: token.metadata(),
@@ -195,93 +161,23 @@ impl DeployTokenStore {
     }
 
     pub async fn delete(&self, id: &str) -> Result<DeployTokenDeleteResponse> {
-        let mut state = self.state.lock().await;
-        self.prune_expired_locked(&mut state).await?;
-        let before = state.tokens.len();
-        state.tokens.retain(|token| token.id != id);
-        if state.tokens.len() == before {
+        let _guard = self.mutation.lock().await;
+        if !self.control.delete_token(id, unix_now()?).await? {
             return Err(PlatformError::not_found("token not found"));
         }
-        self.save_locked(&state).await?;
         Ok(DeployTokenDeleteResponse {
             ok: true,
             id: id.to_string(),
         })
     }
-
-    async fn prune_expired_locked(&self, state: &mut DeployTokenFile) -> Result<()> {
-        let now = unix_now()?;
-        let before = state.tokens.len();
-        state.tokens.retain(|token| !token.is_expired(now));
-        if state.tokens.len() != before {
-            self.save_locked(state).await?;
-        }
-        Ok(())
-    }
-
-    async fn save_locked(&self, state: &DeployTokenFile) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                PlatformError::internal(format!(
-                    "failed to create token store dir {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-
-        let bytes = serde_json::to_vec_pretty(state)
-            .map_err(|error| PlatformError::internal(format!("token encode failed: {error}")))?;
-        let temp_path = temp_store_path(&self.path);
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        let mut temp_file = options.open(&temp_path).await.map_err(|error| {
-            PlatformError::internal(format!(
-                "failed to create token store {}: {error}",
-                temp_path.display()
-            ))
-        })?;
-        temp_file.write_all(&bytes).await.map_err(|error| {
-            PlatformError::internal(format!(
-                "failed to write token store {}: {error}",
-                temp_path.display()
-            ))
-        })?;
-        temp_file.sync_all().await.map_err(|error| {
-            PlatformError::internal(format!(
-                "failed to sync token store {}: {error}",
-                temp_path.display()
-            ))
-        })?;
-        drop(temp_file);
-        tokio::fs::rename(&temp_path, &self.path)
-            .await
-            .map_err(|error| {
-                PlatformError::internal(format!(
-                    "failed to replace token store {}: {error}",
-                    self.path.display()
-                ))
-            })?;
-        sync_parent_directory(&self.path).await?;
-        Ok(())
-    }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        diff |= usize::from(
-            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
-        );
-    }
-    diff == 0
+trait ControlDeployTokenExt {
+    fn is_expired(&self, now: u64) -> bool;
+    fn metadata(&self) -> DeployTokenMetadata;
 }
 
-impl StoredDeployToken {
+impl ControlDeployTokenExt for ControlDeployToken {
     fn is_expired(&self, now: u64) -> bool {
         self.expires_at_unix
             .is_some_and(|expires_at_unix| now >= expires_at_unix)
@@ -565,38 +461,6 @@ fn unix_now() -> Result<u64> {
         })
 }
 
-fn temp_store_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("tokens.json");
-    path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()))
-}
-
-#[cfg(unix)]
-async fn sync_parent_directory(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let directory = tokio::fs::File::open(parent).await.map_err(|error| {
-        PlatformError::internal(format!(
-            "failed to open token store dir {}: {error}",
-            parent.display()
-        ))
-    })?;
-    directory.sync_all().await.map_err(|error| {
-        PlatformError::internal(format!(
-            "failed to sync token store dir {}: {error}",
-            parent.display()
-        ))
-    })
-}
-
-#[cfg(not(unix))]
-async fn sync_parent_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 fn hex_digest(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -773,6 +637,7 @@ mod tests {
             "dd-token-store-test-{}.json",
             Uuid::new_v4().simple()
         ));
+        let control_dir = path.with_extension("control");
         let store = DeployTokenStore::load(path.clone()).await.expect("store");
         let request = DeployTokenMintRequest {
             name: Some("My-Token-At-Home".to_string()),
@@ -799,7 +664,81 @@ mod tests {
             .delete("my-token-at-home")
             .await
             .expect("delete by slug");
-        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_dir_all(control_dir).await;
+    }
+
+    #[tokio::test]
+    async fn imports_legacy_tokens_once_and_persists_usage_in_control_db() {
+        let root =
+            std::env::temp_dir().join(format!("dd-token-import-test-{}", Uuid::new_v4().simple()));
+        tokio::fs::create_dir_all(&root).await.expect("test dir");
+        let path = root.join("tokens.json");
+        let raw_token = "legacy-secret";
+        let capabilities = caps_for_worker("chat");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "tokens": [{
+                "id": "legacy",
+                "name": "legacy",
+                "token_hash": token_hash(raw_token),
+                "created_at_unix": 1,
+                "expires_at_unix": null,
+                "max_uses": 2,
+                "uses": 0,
+                "last_used_at_unix": null,
+                "capabilities": capabilities,
+            }]
+        });
+        tokio::fs::write(&path, serde_json::to_vec(&legacy).expect("legacy json"))
+            .await
+            .expect("legacy token file");
+
+        let store = DeployTokenStore::load(path.clone()).await.expect("import");
+        let deploy = DeployRequest {
+            name: "chat".to_string(),
+            source: "export default {}".to_string(),
+            config: DeployConfig {
+                public: true,
+                bindings: vec![DeployBinding::Memory {
+                    binding: "ROOM".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+            assets: Vec::new(),
+            server_modules: Vec::new(),
+            asset_headers: None,
+            temporary: false,
+        };
+        store
+            .authorize_deploy(raw_token, &deploy)
+            .await
+            .expect("consume legacy token");
+        drop(store);
+
+        let restored = DeployTokenStore::load(path)
+            .await
+            .expect("restore control db");
+        let metadata = restored.get("legacy").await.expect("legacy metadata");
+        assert_eq!(metadata.token.uses, 1);
+        assert!(metadata.token.last_used_at_unix.is_some());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_unrecognized_legacy_token_version() {
+        let root =
+            std::env::temp_dir().join(format!("dd-token-version-test-{}", Uuid::new_v4().simple()));
+        tokio::fs::create_dir_all(&root).await.expect("test dir");
+        let path = root.join("tokens.json");
+        tokio::fs::write(&path, br#"{"version":99,"tokens":[]}"#)
+            .await
+            .expect("legacy token file");
+        let error = match DeployTokenStore::load(path).await {
+            Ok(_) => panic!("future token format should fail startup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("format version 99"));
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]

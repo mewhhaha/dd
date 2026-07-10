@@ -16,10 +16,18 @@ patch-refresh crate version='':
 patch-save crate version='':
   ./scripts/patch-save-crate.sh {{crate}} {{version}}
 
+# Refresh snapshot-ready Deno JS sources from the locked Cargo packages.
+refresh-deno-sources:
+  ./scripts/refresh-deno-sources.sh
+
 # Deploy the dd_server app to Fly.
 fly-deploy app=default_app config=default_fly_config:
   FLYCTL_BIN="${FLYCTL_BIN:-$(if command -v flyctl >/dev/null 2>&1; then command -v flyctl; elif [ -x /home/mewhhaha/.fly/bin/flyctl ]; then printf %s /home/mewhhaha/.fly/bin/flyctl; elif command -v fly >/dev/null 2>&1; then command -v fly; else echo "flyctl not found (set FLYCTL_BIN or install flyctl)" >&2; exit 1; fi)}"; \
   "$FLYCTL_BIN" deploy --app {{app}} --config {{config}} --remote-only --no-cache
+
+# Drain writes, checkpoint every database, schedule a Fly volume snapshot, and always resume.
+fly-snapshot app volume_id port='18081':
+  ./deploy/fly/snapshot.sh {{app}} {{volume_id}} {{port}}
 
 # Open a local proxy to the private deploy port on Fly.
 fly-proxy app=default_app local_port='18081' remote_port='8081':
@@ -57,13 +65,10 @@ fly-worker-deploy-at server name file +flags:
 fly-worker-deploy-config-at server config:
   cargo run -p cli -- --server {{server}} deploy-config {{config}}
 
-# Internal escape hatch: write directly into persisted Fly worker store, then restart machine.
-fly-worker-store-deploy name file +flags:
-  ./deploy/fly/store-worker-deploy.sh {{default_app}} {{name}} {{file}} {{flags}}
-
 # Contributor check path.
 check:
   bash scripts/check_public_memory_naming.sh
+  just check-deno-sources
   just check-js
   cargo fmt --all -- --check
   cargo check --workspace --all-targets --all-features
@@ -92,11 +97,13 @@ check-js:
   node --check benchmarks/run.mjs
   node --check benchmarks/summarize.mjs
   node --check benchmarks/check-regression.mjs
+  node --check benchmarks/compare-commits.mjs
   node --check benchmarks/lib/runner-config.mjs
   node --check benchmarks/lib/results.mjs
   node --test benchmarks/lib/runner-config.test.mjs
   node --test benchmarks/lib/summarize.test.mjs
   node --test benchmarks/lib/check-regression.test.mjs
+  node --test benchmarks/lib/compare-commits.test.mjs
   node --check packages/dd-vite/src/index.js
   node --check packages/dd-runtime/index.cjs
   node --check packages/dd-vite/src/runtime.js
@@ -111,3 +118,7 @@ benchmark-summary fixed='benchmarks/results/local-atomic-memory-scaling-matrix.j
 # Build the size-optimized dd dev runtime binary into the current host package.
 build-dd-runtime-package package='':
   ./scripts/build-dd-runtime-package.sh {{package}}
+
+# Verify the checked-in vendored Deno manifest without accessing Cargo registry sources.
+check-deno-sources:
+  ./scripts/refresh-deno-sources.sh --check

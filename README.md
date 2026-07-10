@@ -35,12 +35,17 @@ Project deploy settings can live in `dd.json`:
 
 ```json
 {
+  "$schema": "./schema/dd.schema.json",
+  "schema_version": 1,
   "name": "hello",
   "entrypoint": "examples/hello.js",
   "base_url": "https://your-dd-app.fly.dev",
   "config": { "public": true }
 }
 ```
+
+Configuration schema version `1` is required. Unknown fields are rejected;
+editors can use [schema/dd.schema.json](schema/dd.schema.json) for validation and completion.
 
 `base_url` is non-secret. Store deploy tokens in the OS credential store:
 
@@ -57,6 +62,7 @@ be called from another worker with a service binding:
 
 ```json
 {
+  "schema_version": 1,
   "name": "frontend",
   "entrypoint": "worker.js",
   "config": {
@@ -309,28 +315,14 @@ Keyed memory benchmark:
 cargo run -p runtime --bin bench_memory_storage --release
 ```
 
-Benchmark configurations and current throughput results live in
+Benchmark configurations and reproducible measurement instructions live in
 [benchmarks/README.md](benchmarks/README.md). Contributor/dev notes live in
 [docs/development.md](docs/development.md).
 
-## Current metrics
+## Reproducible reports
 
-Measured on `2026-06-19T09:35:25+02:00` from the current worktree on `Linux 7.0.9-1-cachyos x86_64 GNU/Linux` with `rustc 1.96.0-nightly (3645249d7 2026-03-16)`.
-
-Project shape:
-
-| metric | value |
-| --- | ---: |
-| workspace crates | 4 |
-| tracked files | 199 |
-| Rust files | 84 |
-| Rust source lines | 52,475 |
-| total tracked lines | 106,694 |
-| Rust test attributes | 224 |
-
-Distribution artifacts use the `dist` Cargo profile. The full server includes
-HTTP/3, WebSocket, and OTEL support; the lean server disables those optional
-server features:
+Distribution artifacts use the `dist` Cargo profile. Generate full and lean
+server reports with:
 
 ```bash
 just server-full
@@ -338,17 +330,13 @@ just server-lean
 just size-report-all
 ```
 
-Those commands write `target/dist/dd_server-full`, `target/dist/dd_server-lean`,
-and matching reports under `target/size-report/<git-sha>/dist/<variant>/`.
+Reports are dated and stored below
+`target/size-report/<git-sha>/dist/<variant>/`, tying every measurement to the
+exact source commit. Benchmark commands and the same commit-addressed result
+format are documented in [benchmarks/README.md](benchmarks/README.md), while
+binary-size methodology lives in
+[docs/binary-size-report.md](docs/binary-size-report.md).
 
-Historical release artifacts from `cargo build --release -p dd_server -p cli`:
+## License
 
-| artifact | unstripped | stripped temporary copy |
-| --- | ---: | ---: |
-| `target/release/dd_server` | 116,086,200 bytes / 110.71 MiB | 88,256,352 bytes / 84.17 MiB |
-| `target/release/cli` | 7,458,232 bytes / 7.11 MiB | 5,430,640 bytes / 5.18 MiB |
-
-Current `dd_server` size work and the selected `dist` profile report are summarized in [docs/binary-size-report.md](docs/binary-size-report.md).
-
-Current throughput benchmark configurations and results are summarized in
-[benchmarks/README.md](benchmarks/README.md).
+Licensed under the [MIT License](LICENSE).

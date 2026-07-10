@@ -39,6 +39,7 @@ import {
 } from "ext:deno_crypto/00_crypto.js";
 import { Headers } from "ext:deno_fetch/20_headers.js";
 import { FormData } from "ext:deno_fetch/21_formdata.js";
+import { HttpClient } from "ext:deno_fetch/22_http_client.js";
 import { Request } from "ext:deno_fetch/23_request.js";
 import { Response } from "ext:deno_fetch/23_response.js";
 import { fetch } from "ext:deno_fetch/26_fetch.js";
@@ -58,6 +59,7 @@ const ddRuntime = {
     File,
     FormData,
     Headers,
+    HttpClient,
     MessageEvent,
     ProgressEvent,
     PromiseRejectionEvent,

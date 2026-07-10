@@ -1,7 +1,5 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
-use runtime::{
-    BlobStoreConfig, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
-};
+use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
@@ -435,7 +433,6 @@ async fn run_config_scenario(
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
-            blob_store: BlobStoreConfig::local(store_dir.join("blobs")),
         },
     })
     .await

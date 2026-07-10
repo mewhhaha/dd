@@ -113,19 +113,38 @@
       if (!Array.isArray(effects)) {
         throw new Error("stub.apply(effects) requires an array");
       }
+      let socketRuntime = null;
+      const requireSocketRuntime = async () => {
+        if (socketRuntime) {
+          return socketRuntime;
+        }
+        const runtimeRequestId = activeRequestId();
+        const entry = await ensureMemoryEntry(namespace, memoryKey, runtimeRequestId, { hydrate: false });
+        const state = createMemoryRuntimeState(entry, runtimeRequestId, false, false);
+        socketRuntime = state.__dd_socket_runtime;
+        return socketRuntime;
+      };
       for (const effect of effects) {
         if (!effect || typeof effect !== "object") {
           continue;
         }
         const type = String(effect.type ?? "").trim();
         if (type === "socket.send") {
-          const socket = new WebSocket(String(effect.handle ?? ""));
-          socket.send(effect.payload, effect.kind == null ? undefined : String(effect.kind));
+          const runtime = await requireSocketRuntime();
+          await runtime.sendEffect(
+            String(effect.handle ?? ""),
+            effect.payload,
+            effect.kind == null ? undefined : String(effect.kind),
+          );
           continue;
         }
         if (type === "socket.close") {
-          const socket = new WebSocket(String(effect.handle ?? ""));
-          socket.close(Number(effect.code ?? 1000), String(effect.reason ?? ""));
+          const runtime = await requireSocketRuntime();
+          await runtime.closeEffect(
+            String(effect.handle ?? ""),
+            Number(effect.code ?? 1000),
+            String(effect.reason ?? ""),
+          );
           continue;
         }
         if (type === "transport.stream") {

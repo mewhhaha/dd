@@ -8,7 +8,9 @@ use bytes::Bytes;
 use common::{
     DeployAsset, DeployBinding, DeployCacheConfig, DeployConfig, DeployRequest,
     DeployTokenCapabilities, DeployTokenDeleteResponse, DeployTokenGetResponse,
-    DeployTokenListResponse, DeployTokenMintRequest, DeployTokenMintResponse, ErrorKind,
+    DeployTokenListResponse, DeployTokenMintRequest, DeployTokenMintResponse,
+    DeploymentInspectResponse, DeploymentListResponse, ErrorKind, RollbackRequest,
+    RollbackResponse, UndeployResponse, WorkerInvocation, WorkerNameRequest,
 };
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
@@ -40,7 +42,7 @@ impl TestState {
         let storage = RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             database_url: format!("file:{}/dd-test.db", store_dir.display()),
-            worker_store_enabled: false,
+            worker_store_enabled: true,
             ..RuntimeStorageConfig::default()
         };
         let runtime = RuntimeService::start_with_service_config(RuntimeServiceConfig {
@@ -49,9 +51,11 @@ impl TestState {
         })
         .await
         .expect("runtime");
-        let deploy_tokens = DeployTokenStore::load(store_dir.join("tokens.json"))
-            .await
-            .expect("token store");
+        let legacy_token_path = store_dir.join("tokens.json");
+        let deploy_tokens =
+            DeployTokenStore::from_control_store(runtime.control_store(), Some(&legacy_token_path))
+                .await
+                .expect("token store");
         let state = AppState::new(
             runtime,
             deploy_tokens,
@@ -76,6 +80,241 @@ impl TestState {
             .expect("runtime shutdown");
         let _ = tokio::fs::remove_dir_all(self.store_dir).await;
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn readiness_fails_during_maintenance_drain_while_liveness_stays_healthy() {
+    let state = TestState::new("example.com").await;
+
+    let ready = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Empty::<Bytes>::new())
+        .expect("ready request");
+    assert_eq!(
+        handle_private_request(state.app(), ready).await.status(),
+        StatusCode::OK
+    );
+
+    let drain = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/drain")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("drain request");
+    assert_eq!(
+        handle_private_request(state.app(), drain).await.status(),
+        StatusCode::OK
+    );
+
+    let ready = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Empty::<Bytes>::new())
+        .expect("ready request");
+    assert_eq!(
+        handle_private_request(state.app(), ready).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let health = Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Empty::<Bytes>::new())
+        .expect("health request");
+    assert_eq!(
+        handle_private_request(state.app(), health).await.status(),
+        StatusCode::OK
+    );
+
+    let blocked = Request::builder()
+        .method("GET")
+        .uri("/")
+        .header("host", "missing.example.com")
+        .body(Empty::<Bytes>::new())
+        .expect("blocked request");
+    let blocked = handle_public_request(state.app(), blocked).await;
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        blocked.headers().get("retry-after").expect("retry-after"),
+        "1"
+    );
+    let body = blocked
+        .into_body()
+        .collect()
+        .await
+        .expect("error body")
+        .to_bytes();
+    let error: common::ErrorBody = serde_json::from_slice(&body).expect("error json");
+    assert_eq!(error.error, "service is draining");
+    assert_eq!(error.code, "overloaded");
+    assert!(error.retryable);
+
+    let resume = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/resume")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("resume request");
+    assert_eq!(
+        handle_private_request(state.app(), resume).await.status(),
+        StatusCode::OK
+    );
+    assert!(state.app().operations.is_ready());
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn private_status_metrics_and_checkpoint_are_authenticated_and_operational() {
+    let state = TestState::new("example.com").await;
+    state
+        .app()
+        .runtime
+        .deploy(
+            "observed".to_string(),
+            "export default { fetch() { return new Response('ok'); } }".to_string(),
+        )
+        .await
+        .expect("deploy observed worker");
+
+    let unauthorized = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/status")
+        .body(Empty::<Bytes>::new())
+        .expect("status request");
+    assert_eq!(
+        handle_private_request(state.app(), unauthorized)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let status = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/status")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("status request");
+    let status = handle_private_request(state.app(), status).await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status_body = status
+        .into_body()
+        .collect()
+        .await
+        .expect("status body")
+        .to_bytes();
+    let status: serde_json::Value = serde_json::from_slice(&status_body).expect("status json");
+    assert_eq!(status["runtime"]["active_deployments"], 1);
+    assert_eq!(status["runtime"]["workers"][0]["name"], "observed");
+    assert!(status["runtime"]["storage_retry_count"].is_number());
+    assert!(status["trace_exporter"]["state"].is_string());
+
+    let metrics = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("metrics request");
+    let metrics = handle_private_request(state.app(), metrics).await;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    assert_eq!(
+        metrics
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+    let metrics = String::from_utf8(
+        metrics
+            .into_body()
+            .collect()
+            .await
+            .expect("metrics body")
+            .to_bytes()
+            .to_vec(),
+    )
+    .expect("metrics utf8");
+    assert!(metrics.contains("dd_runtime_active_deployments 1"));
+    assert!(metrics.contains("dd_runtime_worker_isolates{worker=\"observed\"}"));
+    assert!(metrics.contains("dd_storage_retries_total"));
+
+    let restore_failure: common::Result<()> =
+        Err(common::PlatformError::runtime("restore fixture failed"));
+    state
+        .app()
+        .runtime
+        .control_store()
+        .record_restore_result("observed", Some("fixture-deployment"), &restore_failure)
+        .await
+        .expect("record restore failure");
+    let not_ready = Request::builder()
+        .method("GET")
+        .uri("/readyz")
+        .body(Empty::<Bytes>::new())
+        .expect("ready request");
+    let not_ready = handle_private_request(state.app(), not_ready).await;
+    assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let not_ready_body = not_ready
+        .into_body()
+        .collect()
+        .await
+        .expect("ready body")
+        .to_bytes();
+    let not_ready: serde_json::Value = serde_json::from_slice(&not_ready_body).expect("ready json");
+    assert_eq!(not_ready["worker_restoration_ready"], false);
+    assert_eq!(not_ready["restore_failure_count"], 1);
+    state
+        .app()
+        .runtime
+        .control_store()
+        .record_restore_result("observed", Some("fixture-deployment"), &Ok(()))
+        .await
+        .expect("clear restore failure");
+
+    let before_drain = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/checkpoint")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("checkpoint request");
+    assert_eq!(
+        handle_private_request(state.app(), before_drain)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let drain = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/drain")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("drain request");
+    assert_eq!(
+        handle_private_request(state.app(), drain).await.status(),
+        StatusCode::OK
+    );
+    let checkpoint = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/checkpoint")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("checkpoint request");
+    let checkpoint = handle_private_request(state.app(), checkpoint).await;
+    assert_eq!(checkpoint.status(), StatusCode::OK);
+    let checkpoint_body = checkpoint
+        .into_body()
+        .collect()
+        .await
+        .expect("checkpoint body")
+        .to_bytes();
+    let checkpoint: serde_json::Value =
+        serde_json::from_slice(&checkpoint_body).expect("checkpoint json");
+    assert_eq!(checkpoint["checkpoint"]["kv"], true);
+    assert_eq!(checkpoint["checkpoint"]["cache"], true);
+
+    state.shutdown().await;
 }
 
 fn test_assets() -> Vec<DeployAsset> {
@@ -382,6 +621,164 @@ async fn public_deploy_token_rejects_unscoped_binding() {
         .expect("request");
     let response = handle_public_request(state.app(), request).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn private_deployment_history_rolls_back_and_undeploys() {
+    let state = TestState::new("example.com").await;
+    let deploy = |source: &str| DeployRequest {
+        name: "history-name".to_string(),
+        source: format!(
+            "export default {{ async fetch() {{ return new Response({source:?}); }} }}"
+        ),
+        config: DeployConfig::default(),
+        assets: Vec::new(),
+        server_modules: Vec::new(),
+        asset_headers: None,
+        temporary: false,
+    };
+    let first = deploy_worker(state.app(), deploy("first"))
+        .await
+        .expect("first deploy");
+    let second = deploy_worker(state.app(), deploy("second"))
+        .await
+        .expect("second deploy");
+
+    let list = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/deployments?worker=history%2Dname")
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("list request");
+    let list = handle_private_request(state.app(), list).await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let list: DeploymentListResponse = serde_json::from_slice(
+        &list
+            .into_body()
+            .collect()
+            .await
+            .expect("list body")
+            .to_bytes(),
+    )
+    .expect("deployment list");
+    assert_eq!(list.deployments.len(), 2);
+    assert!(
+        list.deployments.iter().any(
+            |deployment| deployment.deployment_id == second.deployment_id && deployment.active
+        )
+    );
+
+    let inspect = Request::builder()
+        .method("GET")
+        .uri(format!("/v1/admin/deployment?id={}", first.deployment_id))
+        .header("authorization", "Bearer test-private-token")
+        .body(Empty::<Bytes>::new())
+        .expect("inspect request");
+    let inspect = handle_private_request(state.app(), inspect).await;
+    assert_eq!(inspect.status(), StatusCode::OK);
+    let inspect: DeploymentInspectResponse = serde_json::from_slice(
+        &inspect
+            .into_body()
+            .collect()
+            .await
+            .expect("inspect body")
+            .to_bytes(),
+    )
+    .expect("deployment inspect");
+    assert_eq!(
+        inspect.deployment.summary.deployment_id,
+        first.deployment_id
+    );
+    assert!(inspect.deployment.source.contains("first"));
+
+    let rollback = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/rollback")
+        .header("authorization", "Bearer test-private-token")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&RollbackRequest {
+                worker: "history-name".to_string(),
+                deployment_id: first.deployment_id.clone(),
+            })
+            .expect("rollback json"),
+        )))
+        .expect("rollback request");
+    let rollback = handle_private_request(state.app(), rollback).await;
+    assert_eq!(rollback.status(), StatusCode::OK);
+    let rollback: RollbackResponse = serde_json::from_slice(
+        &rollback
+            .into_body()
+            .collect()
+            .await
+            .expect("rollback body")
+            .to_bytes(),
+    )
+    .expect("rollback response");
+    assert_eq!(rollback.deployment_id, first.deployment_id);
+
+    let output = state
+        .app()
+        .runtime
+        .invoke(
+            "history-name".to_string(),
+            WorkerInvocation {
+                method: "GET".to_string(),
+                url: "http://history-name/".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+                request_id: "history-after-rollback".to_string(),
+            },
+        )
+        .await
+        .expect("invoke rollback");
+    assert_eq!(output.body, b"first");
+
+    let undeploy = Request::builder()
+        .method("POST")
+        .uri("/v1/admin/undeploy")
+        .header("authorization", "Bearer test-private-token")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&WorkerNameRequest {
+                worker: "history-name".to_string(),
+            })
+            .expect("undeploy json"),
+        )))
+        .expect("undeploy request");
+    let undeploy = handle_private_request(state.app(), undeploy).await;
+    assert_eq!(undeploy.status(), StatusCode::OK);
+    let undeploy: UndeployResponse = serde_json::from_slice(
+        &undeploy
+            .into_body()
+            .collect()
+            .await
+            .expect("undeploy body")
+            .to_bytes(),
+    )
+    .expect("undeploy response");
+    assert_eq!(undeploy.worker, "history-name");
+    assert!(
+        state
+            .app()
+            .runtime
+            .stats("history-name".to_string())
+            .await
+            .is_none()
+    );
+    assert!(
+        state
+            .app()
+            .runtime
+            .deployments(Some("history-name"))
+            .await
+            .expect("history remains inspectable")
+            .iter()
+            .all(|deployment| !deployment.active)
+    );
+
     state.shutdown().await;
 }
 

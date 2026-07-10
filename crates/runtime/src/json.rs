@@ -22,10 +22,3 @@ where
 {
     simd_json::serde::to_string(value)
 }
-
-pub fn to_vec<T>(value: &T) -> Result<Vec<u8>, simd_json::Error>
-where
-    T: Serialize + ?Sized,
-{
-    simd_json::serde::to_vec(value)
-}

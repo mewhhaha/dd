@@ -1145,6 +1145,7 @@ impl WorkerManager {
             snapshot,
             snapshot_preloaded,
             source,
+            dynamic_modules: self.dynamic_modules.clone(),
             deployment_config,
             allow_code_generation,
             kv_store,
@@ -1187,10 +1188,7 @@ impl WorkerManager {
 
     pub(crate) fn process_scale_up_requests(&mut self, event_tx: &RuntimeEventSender) {
         let mut remaining = self.scale_up_requests.len();
-        while remaining > 0
-            && self.global_isolate_slots_used < self.config.max_global_isolates
-            && !self.scale_up_requests.is_empty()
-        {
+        while remaining > 0 && !self.scale_up_requests.is_empty() {
             remaining -= 1;
             let Some((worker_name, generation)) = self.scale_up_requests.pop_front() else {
                 break;
@@ -1199,6 +1197,16 @@ impl WorkerManager {
                 .remove(&(worker_name.clone(), generation));
             if !self.pool_needs_scale_up(&worker_name, generation) {
                 continue;
+            }
+            if self.global_isolate_slots_used >= self.config.max_global_isolates {
+                self.request_scale_up(&worker_name, generation);
+                let live_slots = self
+                    .global_isolate_slots_used
+                    .saturating_sub(self.exiting_isolate_slots.len());
+                if live_slots >= self.config.max_global_isolates {
+                    self.retire_lru_idle_isolate_for_budget(&worker_name, generation);
+                }
+                break;
             }
             match self.spawn_isolate(&worker_name, generation, event_tx.clone()) {
                 Ok(()) => {

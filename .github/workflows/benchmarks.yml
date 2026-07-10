@@ -1,6 +1,8 @@
 name: Benchmarks
 
 on:
+  schedule:
+    - cron: "23 3 * * 1"
   workflow_dispatch:
     inputs:
       samples:
@@ -20,6 +22,9 @@ jobs:
   memory-smoke:
     name: Memory smoke regression check
     runs-on: ubuntu-latest
+    env:
+      DD_BENCH_SAMPLES: ${{ inputs.samples || '3' }}
+      DD_BENCH_ALLOW_LARGE_RUN: ${{ inputs.allow_large_run || 'false' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,19 +37,19 @@ jobs:
           DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
           DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
           DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
-          node benchmarks/run.mjs --plan --samples "${{ inputs.samples }}" \
+          node benchmarks/run.mjs --plan --samples "$DD_BENCH_SAMPLES" \
             --config scaling-atomic-memory-matrix.sh
       - name: Run benchmark smoke matrix
         run: |
           extra_flags=()
-          if [ "${{ inputs.allow_large_run }}" = "true" ]; then
+          if [ "$DD_BENCH_ALLOW_LARGE_RUN" = "true" ]; then
             extra_flags+=(--allow-large-run)
           fi
           DD_BENCH_MATRIX_ISOLATES="1 8" \
           DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
           DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
           DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
-          node benchmarks/run.mjs --samples "${{ inputs.samples }}" \
+          node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
             --config scaling-atomic-memory-matrix.sh \
             --out benchmarks/results/memory-smoke.json \
             "${extra_flags[@]}"
@@ -62,3 +67,56 @@ jobs:
           path: benchmarks/results/memory-smoke.json
           if-no-files-found: ignore
           retention-days: 14
+
+  production-regression:
+    name: HTTP, memory, storage, limiter, and multi-worker regression
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/dd-benchmark-target
+      DD_BENCH_SAMPLES: ${{ inputs.samples || '3' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: scheduled-production-benchmarks
+      - name: Create previous-commit worktree
+        run: git worktree add --detach "${RUNNER_TEMP}/dd-baseline" HEAD^
+      - name: Run previous-commit baseline
+        working-directory: ${{ runner.temp }}/dd-baseline
+        run: |
+          node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
+            --config http1-server-front-cache.sh \
+            --config focused-memory-read.sh \
+            --config storage-memory-write-cross-shard.sh \
+            --config realworld-rate-limiter.sh \
+            --config realworld-multiworker-auth.sh \
+            --out "${RUNNER_TEMP}/dd-baseline.json"
+      - name: Run candidate
+        run: |
+          node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
+            --config http1-server-front-cache.sh \
+            --config focused-memory-read.sh \
+            --config storage-memory-write-cross-shard.sh \
+            --config realworld-rate-limiter.sh \
+            --config realworld-multiworker-auth.sh \
+            --out "${RUNNER_TEMP}/dd-candidate.json"
+      - name: Enforce 5% throughput and 10% p99 budgets
+        run: |
+          node benchmarks/compare-commits.mjs \
+            --baseline "${RUNNER_TEMP}/dd-baseline.json" \
+            --candidate "${RUNNER_TEMP}/dd-candidate.json" \
+            | tee "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-regression-benchmarks
+          path: |
+            ${{ runner.temp }}/dd-baseline.json
+            ${{ runner.temp }}/dd-candidate.json
+          if-no-files-found: ignore
+          retention-days: 30

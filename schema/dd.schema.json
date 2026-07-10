@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/mewhhaha/dd/main/schema/dd.schema.json",
+  "title": "dd project and deployment configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name", "entrypoint"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "entrypoint": { "type": "string", "minLength": 1 },
+    "base_url": { "type": "string", "format": "uri" },
+    "baseUrl": { "type": "string", "format": "uri" },
+    "assets_dir": { "type": ["string", "null"] },
+    "temporary": { "type": "boolean" },
+    "asset_excludes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "server_modules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/server_module" }
+    },
+    "config": { "$ref": "#/$defs/runtime_config" },
+    "public": { "type": "boolean" },
+    "cache": { "$ref": "#/$defs/cache_config" },
+    "bindings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/binding" }
+    },
+    "internal": { "$ref": "#/$defs/internal_config" }
+  },
+  "$defs": {
+    "cache_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "trace_destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker"],
+      "properties": {
+        "worker": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "pattern": "^/" }
+      }
+    },
+    "internal_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trace": {
+          "anyOf": [
+            { "$ref": "#/$defs/trace_destination" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "binding"],
+          "properties": {
+            "type": { "const": "kv" },
+            "binding": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "binding"],
+          "properties": {
+            "type": { "const": "memory" },
+            "binding": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "binding"],
+          "properties": {
+            "type": { "const": "dynamic" },
+            "binding": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "binding", "service"],
+          "properties": {
+            "type": { "const": "service" },
+            "binding": { "type": "string", "minLength": 1 },
+            "service": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "runtime_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "public": { "type": "boolean" },
+        "cache": { "$ref": "#/$defs/cache_config" },
+        "bindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/binding" }
+        },
+        "internal": { "$ref": "#/$defs/internal_config" }
+      }
+    },
+    "server_module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "oneOf": [
+        { "required": ["type"] },
+        { "required": ["kind"] }
+      ],
+      "properties": {
+        "type": {
+          "enum": ["ESModule", "CompiledWasm", "Text", "Data", "Json"]
+        },
+        "kind": {
+          "enum": ["ESModule", "CompiledWasm", "Text", "Data", "Json"]
+        },
+        "path": { "type": "string", "minLength": 1 },
+        "file": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

@@ -13,6 +13,7 @@ const {
   File: DenoFile,
   FormData: DenoFormData,
   Headers: DenoHeaders,
+  HttpClient: DenoHttpClient,
   MessageEvent,
   ProgressEvent,
   PromiseRejectionEvent,
@@ -50,6 +51,7 @@ const requireRuntimeFunction = (name, value) => {
 };
 
 const RuntimeHeaders = requireRuntimeFunction("Headers", DenoHeaders);
+const RuntimeHttpClient = requireRuntimeFunction("HttpClient", DenoHttpClient);
 const RuntimeResponse = requireRuntimeFunction("Response", DenoResponse);
 const RuntimeFormData = requireRuntimeFunction("FormData", DenoFormData);
 const RuntimeRequest = requireRuntimeFunction("Request", DenoRequest);
