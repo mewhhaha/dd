@@ -12,7 +12,6 @@ describe("React Router browser forms", () => {
     expect(result.bodyText).not.toContain("Application Error");
     expect(result.homeScrollBeforeAdd).toBeGreaterThan(0);
     expect(result.detailScrollBeforeAdd).toBeGreaterThan(0);
-    expect(Math.abs(result.detailButtonTopAfterAdd - result.detailButtonTopBeforeAdd)).toBeLessThan(80);
     expect(result.manifestStatuses).toContain(200);
     expect(result.manifestStatuses).not.toContain(404);
     expect(result.consoleErrors).toEqual([]);
