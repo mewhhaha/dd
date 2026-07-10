@@ -8,6 +8,7 @@ const MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX: &str = "// dd-memory-rpc-schema-fing
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed={MEMORY_RPC_SCHEMA_PATH}");
     println!("cargo:rerun-if-changed={CHECKED_IN_MEMORY_RPC_PATH}");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/init.js");
@@ -155,9 +156,111 @@ fn generate_deno_js_extension() {
         generated.push_str(&format!("    {specifier:?} = {{ source = {source:?} }},\n"));
     }
     generated.push_str("  ],\n);\n");
+    generated.push_str(
+        "\nfn dd_embedded_lazy_js_source(\n  specifier: &'static str,\n) -> Option<deno_core::ExtensionFileSource> {\n  match specifier {\n",
+    );
+    for (extension, path) in deno_lazy_js_source_files() {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("lazy JS source has no UTF-8 file name: {}", path.display()));
+        let specifier = format!("ext:{extension}/{file_name}");
+        println!("cargo:rerun-if-changed={}", path.display());
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        generated.push_str(&format!(
+            "    {specifier:?} => Some(deno_core::ExtensionFileSource::loaded_from_memory_during_snapshot(\n      {specifier:?},\n      deno_core::ascii_str!({source:?}),\n    )),\n"
+        ));
+    }
+    generated.push_str("    _ => None,\n  }\n}\n");
 
     fs::write(&output_path, generated)
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
+}
+
+fn deno_lazy_js_source_files() -> Vec<(&'static str, PathBuf)> {
+    let dependencies = ["deno_webidl", "deno_web", "deno_fetch"];
+    let mut sources = Vec::new();
+    for dependency in dependencies {
+        let source_dir = registry_package_source_dir(dependency);
+        let mut files = fs::read_dir(&source_dir)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_dir.display()))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| {
+                        panic!("failed to read entry in {}: {error}", source_dir.display())
+                    })
+                    .path()
+            })
+            .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "js"))
+            .collect::<Vec<_>>();
+        files.sort();
+        sources.extend(files.into_iter().map(|path| (dependency, path)));
+    }
+    sources.push((
+        "deno_crypto",
+        PathBuf::from("../../patched-crates/deno_crypto/00_crypto.js"),
+    ));
+    sources
+}
+
+fn registry_package_source_dir(package: &str) -> PathBuf {
+    let version = locked_registry_package_version(package);
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+        .expect("CARGO_HOME or HOME should be set");
+    let registry_sources = cargo_home.join("registry/src");
+    let directory_name = format!("{package}-{version}");
+    for registry in fs::read_dir(&registry_sources).unwrap_or_else(|error| {
+        panic!(
+            "failed to read Cargo registry sources at {}: {error}",
+            registry_sources.display()
+        )
+    }) {
+        let candidate = registry
+            .unwrap_or_else(|error| panic!("failed to read Cargo registry entry: {error}"))
+            .path()
+            .join(&directory_name);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    panic!(
+        "failed to locate locked registry package {package} {version} below {}",
+        registry_sources.display()
+    );
+}
+
+fn locked_registry_package_version(package: &str) -> String {
+    let lock_path = Path::new("../../Cargo.lock");
+    let lock = fs::read_to_string(lock_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", lock_path.display()));
+    let mut versions = lock
+        .split("[[package]]")
+        .filter(|block| toml_string(block, "name").as_deref() == Some(package))
+        .filter(|block| {
+            toml_string(block, "source").is_some_and(|source| source.starts_with("registry+"))
+        })
+        .filter_map(|block| toml_string(block, "version"))
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    match versions.as_slice() {
+        [version] => version.clone(),
+        [] => panic!("Cargo.lock has no registry package named {package}"),
+        _ => panic!("Cargo.lock has multiple versions of registry package {package}: {versions:?}"),
+    }
+}
+
+fn toml_string(block: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key} = \"");
+    block
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.strip_suffix('"'))
+        .map(ToOwned::to_owned)
 }
 
 fn generate_execute_worker_bundle() {

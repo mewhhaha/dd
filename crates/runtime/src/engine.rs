@@ -457,8 +457,16 @@ fn runtime_extensions() -> Vec<Extension> {
 }
 
 fn without_esm(extension: Extension) -> Extension {
+    let lazy_loaded_js_files = extension
+        .lazy_loaded_js_files
+        .iter()
+        .map(|source| {
+            dd_embedded_lazy_js_source(source.specifier).unwrap_or_else(|| source.clone())
+        })
+        .collect();
     Extension {
         js_files: Cow::Borrowed(&[]),
+        lazy_loaded_js_files: Cow::Owned(lazy_loaded_js_files),
         lazy_loaded_esm_files: Cow::Borrowed(&[]),
         esm_files: Cow::Borrowed(&[]),
         esm_entry_point: None,
@@ -832,6 +840,25 @@ mod tests {
         let _ = build_bootstrap_snapshot()
             .await
             .expect("bootstrap snapshot should build");
+    }
+
+    #[test]
+    fn bootstrap_extensions_do_not_depend_on_build_tree_files() {
+        for extension in runtime_extensions() {
+            for source in extension.js_files.iter().chain(
+                extension
+                    .lazy_loaded_js_files
+                    .iter()
+                    .chain(extension.esm_files.iter())
+                    .chain(extension.lazy_loaded_esm_files.iter()),
+            ) {
+                assert!(
+                    source.is_runtime_loadable(),
+                    "extension {} requires unavailable build-tree source {source:?}",
+                    extension.name
+                );
+            }
+        }
     }
 
     #[tokio::test]
