@@ -956,8 +956,8 @@ impl WorkerManager {
                     1,
                 );
             }
-            let info_tracing_enabled = tracing::enabled!(Level::INFO);
-            let needs_completion_meta = info_tracing_enabled
+            let debug_tracing_enabled = tracing::enabled!(Level::DEBUG);
+            let needs_completion_meta = debug_tracing_enabled
                 || self
                     .get_pool_mut(worker_name, generation)
                     .and_then(|pool| pool.internal_trace.as_ref())
@@ -967,9 +967,9 @@ impl WorkerManager {
             } else {
                 None
             };
-            let dispatch_span = if info_tracing_enabled {
+            let dispatch_span = if debug_tracing_enabled {
                 let queue_wait_ms = pending_invoke.enqueued_at.elapsed().as_millis() as u64;
-                Some(tracing::info_span!(
+                Some(tracing::debug_span!(
                     "runtime.dispatch",
                     worker.name = %worker_name,
                     worker.generation = generation,
@@ -1158,6 +1158,7 @@ impl WorkerManager {
             generation,
             isolate_id,
             event_tx: event_tx.clone(),
+            thread_tracker: self.isolate_thread_tracker.clone(),
         }) {
             Ok(isolate) => isolate,
             Err(error) => {
@@ -1302,7 +1303,7 @@ impl WorkerManager {
         let trace_destination = self
             .get_pool_mut(worker_name, generation)
             .and_then(|pool| pool.internal_trace.clone());
-        let info_tracing_enabled = tracing::enabled!(Level::INFO);
+        let debug_tracing_enabled = tracing::enabled!(Level::DEBUG);
         let stream_registered = self.stream_registrations.contains_key(request_id);
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool
@@ -1399,13 +1400,13 @@ impl WorkerManager {
                 self.config.max_response_body_bytes
             )));
         }
-        let complete_span = if info_tracing_enabled {
+        let complete_span = if debug_tracing_enabled {
             let result_status = match &result {
                 Ok(output) => output.status as i64,
                 Err(_) => -1,
             };
             let result_ok = result.is_ok();
-            let span = tracing::info_span!(
+            let span = tracing::debug_span!(
                 "runtime.complete",
                 worker.name = %worker_name,
                 worker.generation = generation,
@@ -1422,101 +1423,99 @@ impl WorkerManager {
         } else {
             None
         };
-        let _complete_guard = complete_span.as_ref().map(|span| span.enter());
+        async move {
+            let stream_consumes_result =
+                stream_registered && matches!(&pending_kind, PendingReplyKind::Stream);
+            let mut stream_result = if stream_registered && !stream_consumes_result {
+                Some(result.clone())
+            } else {
+                None
+            };
+            let trace_result = if trace_destination.is_some() {
+                Some(match &result {
+                    Ok(output) => TraceResultMeta {
+                        status: Some(output.status),
+                        error: None,
+                    },
+                    Err(error) => TraceResultMeta {
+                        status: None,
+                        error: Some(error.to_string()),
+                    },
+                })
+            } else {
+                None
+            };
 
-        let stream_consumes_result =
-            stream_registered && matches!(&pending_kind, PendingReplyKind::Stream);
-        let mut stream_result = if stream_registered && !stream_consumes_result {
-            Some(result.clone())
-        } else {
-            None
-        };
-        let trace_result = if trace_destination.is_some() {
-            Some(match &result {
-                Ok(output) => TraceResultMeta {
-                    status: Some(output.status),
-                    error: None,
-                },
-                Err(error) => TraceResultMeta {
-                    status: None,
-                    error: Some(error.to_string()),
-                },
-            })
-        } else {
-            None
-        };
-
-        if stream_consumes_result {
-            stream_result = Some(result);
-            if canceled {
-                if info_tracing_enabled {
-                    info!(
-                        worker = %worker_name,
-                        generation,
-                        isolate_id,
-                        request_id,
-                        "dropped completion for canceled request"
-                    );
-                }
-            } else if info_tracing_enabled {
-                tracing::info!("request completion delivered");
-            }
-        } else if !canceled {
-            match pending_kind {
-                PendingReplyKind::Normal | PendingReplyKind::Stream => {
-                    if let Some(reply) = reply {
-                        let _ = reply.send(result);
+            if stream_consumes_result {
+                stream_result = Some(result);
+                if canceled {
+                    if debug_tracing_enabled {
+                        tracing::debug!(
+                            worker = %worker_name,
+                            generation,
+                            isolate_id,
+                            request_id,
+                            "dropped completion for canceled request"
+                        );
                     }
+                } else if debug_tracing_enabled {
+                    tracing::debug!("request completion delivered");
                 }
-                PendingReplyKind::DynamicFetch { handle } => {
-                    if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
-                        match &result {
-                            Ok(_) => {
-                                entry.preferred_isolate_id = Some(isolate_id);
-                            }
-                            Err(_) if entry.preferred_isolate_id == Some(isolate_id) => {
-                                entry.preferred_isolate_id = None;
-                            }
-                            Err(_) => {}
+            } else if !canceled {
+                match pending_kind {
+                    PendingReplyKind::Normal | PendingReplyKind::Stream => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(result);
                         }
                     }
-                    if let Some(reply) = reply {
-                        let _ = reply.send(result);
+                    PendingReplyKind::DynamicFetch { handle } => {
+                        if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
+                            match &result {
+                                Ok(_) => {
+                                    entry.preferred_isolate_id = Some(isolate_id);
+                                }
+                                Err(_) if entry.preferred_isolate_id == Some(isolate_id) => {
+                                    entry.preferred_isolate_id = None;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        if let Some(reply) = reply {
+                            let _ = reply.send(result);
+                        }
+                    }
+                    PendingReplyKind::WebsocketOpen { session_id } => {
+                        self.complete_websocket_open(
+                            worker_name,
+                            generation,
+                            isolate_id,
+                            session_id,
+                            result,
+                        );
+                    }
+                    PendingReplyKind::WebsocketFrame { session_id } => {
+                        self.complete_websocket_frame(
+                            session_id,
+                            reply,
+                            result,
+                            memory_outbox_shard.is_some(),
+                        );
+                    }
+                    PendingReplyKind::TransportOpen { session_id } => {
+                        self.complete_transport_open(
+                            worker_name,
+                            generation,
+                            isolate_id,
+                            session_id,
+                            result,
+                        );
                     }
                 }
-                PendingReplyKind::WebsocketOpen { session_id } => {
-                    self.complete_websocket_open(
-                        worker_name,
-                        generation,
-                        isolate_id,
-                        session_id,
-                        result,
-                    );
+                if debug_tracing_enabled {
+                    tracing::debug!("request completion delivered");
                 }
-                PendingReplyKind::WebsocketFrame { session_id } => {
-                    self.complete_websocket_frame(
-                        session_id,
-                        reply,
-                        result,
-                        memory_outbox_shard.is_some(),
-                    );
-                }
-                PendingReplyKind::TransportOpen { session_id } => {
-                    self.complete_transport_open(
-                        worker_name,
-                        generation,
-                        isolate_id,
-                        session_id,
-                        result,
-                    );
-                }
-            }
-            if info_tracing_enabled {
-                tracing::info!("request completion delivered");
-            }
-        } else {
-            if info_tracing_enabled {
-                info!(
+            } else if debug_tracing_enabled {
+                tracing::debug!(
                     worker = %worker_name,
                     generation,
                     isolate_id,
@@ -1524,37 +1523,40 @@ impl WorkerManager {
                     "dropped completion for canceled request"
                 );
             }
+            if let Some(shard_index) = memory_outbox_shard {
+                self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
+            }
+            if let (Some(trace_destination), Some(trace_result)) = (trace_destination, trace_result)
+            {
+                self.enqueue_trace_forward(
+                    TraceForwardRequest {
+                        worker_name: worker_name.to_string(),
+                        generation,
+                        request_method,
+                        request_url,
+                        runtime_request_id: request_id.to_string(),
+                        user_request_id,
+                        result: trace_result,
+                        execution_ms: execution_ms.unwrap_or_default(),
+                        wait_until_count,
+                        internal_origin,
+                        trace_destination: Some(trace_destination),
+                    },
+                    event_tx,
+                );
+            }
+            if let Some(stream_result) = stream_result {
+                self.complete_stream_registration(
+                    worker_name,
+                    request_id,
+                    completion_token,
+                    stream_result,
+                )
+                .await;
+            }
         }
-        if let Some(shard_index) = memory_outbox_shard {
-            self.schedule_memory_outbox_drain_shard(shard_index, event_tx);
-        }
-        if let (Some(trace_destination), Some(trace_result)) = (trace_destination, trace_result) {
-            self.enqueue_trace_forward(
-                TraceForwardRequest {
-                    worker_name: worker_name.to_string(),
-                    generation,
-                    request_method,
-                    request_url,
-                    runtime_request_id: request_id.to_string(),
-                    user_request_id,
-                    result: trace_result,
-                    execution_ms: execution_ms.unwrap_or_default(),
-                    wait_until_count,
-                    internal_origin,
-                    trace_destination: Some(trace_destination),
-                },
-                event_tx,
-            );
-        }
-        if let Some(stream_result) = stream_result {
-            self.complete_stream_registration(
-                worker_name,
-                request_id,
-                completion_token,
-                stream_result,
-            )
-            .await;
-        }
+        .instrument(complete_span.unwrap_or_else(tracing::Span::none))
+        .await;
     }
 
     pub(crate) fn enqueue_trace_forward(

@@ -48,10 +48,53 @@ pub(super) struct WorkerManager {
     pub(super) global_isolate_slots_used: usize,
     pub(super) global_isolates_starting: usize,
     pub(super) exiting_isolate_slots: HashMap<IsolateSlotKey, IsolateStartup>,
+    pub(super) isolate_thread_tracker: IsolateThreadTracker,
     pub(super) stats: RuntimeManagerStats,
     pub(super) next_generation: u64,
     pub(super) next_isolate_id: u64,
     pub(super) next_memory_entity_epoch: u64,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct IsolateThreadTracker {
+    state: Arc<IsolateThreadTrackerState>,
+}
+
+#[derive(Default)]
+struct IsolateThreadTrackerState {
+    active: AtomicUsize,
+    empty: Notify,
+}
+
+pub(super) struct IsolateThreadGuard {
+    tracker: IsolateThreadTracker,
+}
+
+impl IsolateThreadTracker {
+    pub(super) fn register(&self) -> IsolateThreadGuard {
+        self.state.active.fetch_add(1, Ordering::AcqRel);
+        IsolateThreadGuard {
+            tracker: self.clone(),
+        }
+    }
+
+    pub(super) async fn wait_for_empty(&self) {
+        loop {
+            let notified = self.state.empty.notified();
+            if self.state.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for IsolateThreadGuard {
+    fn drop(&mut self) {
+        if self.tracker.state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.state.empty.notify_waiters();
+        }
+    }
 }
 
 pub(super) struct WorkerManagerInit {
@@ -1617,6 +1660,7 @@ pub(super) struct IsolateThreadStart {
     pub(super) generation: u64,
     pub(super) isolate_id: u64,
     pub(super) event_tx: RuntimeEventSender,
+    pub(super) thread_tracker: IsolateThreadTracker,
 }
 
 pub(super) struct WebSocketSessionRegistration {

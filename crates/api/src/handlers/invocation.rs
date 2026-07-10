@@ -105,89 +105,91 @@ async fn invoke_worker_from_body_stream(
         http.route = %parts.uri.path()
     );
     set_span_parent_from_http_headers(&invoke_span, &parts.headers);
-    let _invoke_guard = invoke_span.enter();
+    async move {
+        let mut headers = Vec::with_capacity(parts.headers.len());
+        for (name, value) in &parts.headers {
+            let value = value.to_str().map_err(|error| {
+                PlatformError::bad_request(format!("invalid header value for {name}: {error}"))
+            })?;
+            headers.push((name.as_str().to_string(), value.to_string()));
+        }
+        let static_asset = try_serve_static_asset(
+            &state,
+            &worker_name,
+            &method,
+            request_host_for_matching(&parts.headers, &parts.uri),
+            &worker_asset_path(&url)?,
+            &headers,
+            require_public_worker,
+        )?;
+        if let Some(asset_response) = static_asset.response {
+            return Ok(asset_response);
+        }
+        if require_public_worker && !static_asset.public_worker {
+            return Err(PlatformError::not_found("not found").into());
+        }
+        inject_current_trace_context(&mut headers);
+        let request_id = Uuid::new_v4().to_string();
 
-    let mut headers = Vec::with_capacity(parts.headers.len());
-    for (name, value) in &parts.headers {
-        let value = value.to_str().map_err(|error| {
-            PlatformError::bad_request(format!("invalid header value for {name}: {error}"))
-        })?;
-        headers.push((name.as_str().to_string(), value.to_string()));
-    }
-    let static_asset = try_serve_static_asset(
-        &state,
-        &worker_name,
-        &method,
-        request_host_for_matching(&parts.headers, &parts.uri),
-        &worker_asset_path(&url)?,
-        &headers,
-        require_public_worker,
-    )?;
-    if let Some(asset_response) = static_asset.response {
-        return Ok(asset_response);
-    }
-    if require_public_worker && !static_asset.public_worker {
-        return Err(PlatformError::not_found("not found").into());
-    }
-    inject_current_trace_context(&mut headers);
-    let request_id = Uuid::new_v4().to_string();
+        let invocation = WorkerInvocation {
+            method: method.clone(),
+            url,
+            headers,
+            body: Vec::new(),
+            request_id: request_id.clone(),
+        };
+        tracing::debug!(request_id = %request_id, "invoke request accepted");
 
-    let invocation = WorkerInvocation {
-        method: method.clone(),
-        url,
-        headers,
-        body: Vec::new(),
-        request_id: request_id.clone(),
-    };
-    tracing::info!(request_id = %request_id, "invoke request accepted");
-
-    if state.runtime.worker_cache_enabled(&worker_name)
-        && is_front_cacheable_request(&invocation, request_body_stream.is_some())
-    {
-        let cache_request = front_cache_request(&worker_name, &invocation);
-        match state.runtime.cache_match(cache_request.clone()).await? {
-            CacheLookup::Fresh(response) => {
-                return build_front_cached_response(response, &method, "HIT");
-            }
-            CacheLookup::StaleWhileRevalidate(response) => {
-                spawn_front_cache_revalidation(
-                    state.clone(),
-                    worker_name.clone(),
-                    invocation.clone(),
-                    cache_request,
-                )
-                .await;
-                return build_front_cached_response(response, &method, "STALE");
-            }
-            CacheLookup::StaleIfError(stale) => {
-                return match state
-                    .runtime
-                    .invoke_with_request_body(worker_name, invocation, request_body_stream)
-                    .await
-                {
-                    Ok(output) if output.status < 500 => {
-                        maybe_store_front_cache(&state, &cache_request, &output).await;
-                        build_front_origin_response(output, &method, "MISS")
-                    }
-                    Ok(_) | Err(_) => build_front_cached_response(stale, &method, "STALE"),
-                };
-            }
-            CacheLookup::Miss => {
-                let output = state
-                    .runtime
-                    .invoke_with_request_body(worker_name, invocation, request_body_stream)
-                    .await?;
-                maybe_store_front_cache(&state, &cache_request, &output).await;
-                return build_front_origin_response(output, &method, "MISS");
+        if state.runtime.worker_cache_enabled(&worker_name)
+            && is_front_cacheable_request(&invocation, request_body_stream.is_some())
+        {
+            let cache_request = front_cache_request(&worker_name, &invocation);
+            match state.runtime.cache_match(cache_request.clone()).await? {
+                CacheLookup::Fresh(response) => {
+                    return build_front_cached_response(response, &method, "HIT");
+                }
+                CacheLookup::StaleWhileRevalidate(response) => {
+                    spawn_front_cache_revalidation(
+                        state.clone(),
+                        worker_name.clone(),
+                        invocation.clone(),
+                        cache_request,
+                    )
+                    .await;
+                    return build_front_cached_response(response, &method, "STALE");
+                }
+                CacheLookup::StaleIfError(stale) => {
+                    return match state
+                        .runtime
+                        .invoke_with_request_body(worker_name, invocation, request_body_stream)
+                        .await
+                    {
+                        Ok(output) if output.status < 500 => {
+                            maybe_store_front_cache(&state, &cache_request, &output).await;
+                            build_front_origin_response(output, &method, "MISS")
+                        }
+                        Ok(_) | Err(_) => build_front_cached_response(stale, &method, "STALE"),
+                    };
+                }
+                CacheLookup::Miss => {
+                    let output = state
+                        .runtime
+                        .invoke_with_request_body(worker_name, invocation, request_body_stream)
+                        .await?;
+                    maybe_store_front_cache(&state, &cache_request, &output).await;
+                    return build_front_origin_response(output, &method, "MISS");
+                }
             }
         }
-    }
 
-    let output = state
-        .runtime
-        .invoke_stream_with_request_body(worker_name, invocation, request_body_stream)
-        .await?;
-    build_worker_stream_response(output)
+        let output = state
+            .runtime
+            .invoke_stream_with_request_body(worker_name, invocation, request_body_stream)
+            .await?;
+        build_worker_stream_response(output)
+    }
+    .instrument(invoke_span)
+    .await
 }
 
 fn is_front_cacheable_request(invocation: &WorkerInvocation, has_body_stream: bool) -> bool {

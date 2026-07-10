@@ -10,7 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use turso::{Builder, Connection, Database, Value, transaction::TransactionBehavior};
 
-use crate::turso_util::{VersionFloor, configure_turso_connection, is_retryable_turso_error};
+use crate::turso_util::{
+    VersionFloor, configure_turso_connection, execute_cached, is_retryable_turso_error,
+    query_cached,
+};
 
 const ENCODING_UTF8: &str = "utf8";
 const ENCODING_V8SC: &str = "v8sc";
@@ -812,10 +815,9 @@ impl KvWriterInner {
                 } else {
                     Some(mutation.value.clone())
                 };
-                match tx
-                    .as_ref()
-                    .expect("kv write transaction should be present")
-                    .execute(
+                match execute_cached(
+                    tx.as_ref()
+                        .expect("kv write transaction should be present"),
                         "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                          ON CONFLICT(worker_name, binding, key) DO UPDATE SET
@@ -961,15 +963,15 @@ impl KvStore {
     ) -> Result<Option<KvValue>> {
         let started = Instant::now();
         let conn = self.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT value_blob, encoding, value, deleted
+        let mut rows = query_cached(
+            &conn,
+            "SELECT value_blob, encoding, value, deleted
                  FROM worker_kv
                  WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
-                (worker_name, binding, key),
-            )
-            .await
-            .map_err(kv_error)?;
+            (worker_name, binding, key),
+        )
+        .await
+        .map_err(kv_error)?;
         if let Some(row) = rows.next().await.map_err(kv_error)? {
             let deleted: i64 = row.get::<i64>(3).map_err(kv_error)?;
             if deleted != 0 {
@@ -1005,15 +1007,15 @@ impl KvStore {
     ) -> Result<std::result::Result<String, KvUtf8Lookup>> {
         let started = Instant::now();
         let conn = self.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT value, encoding, deleted
+        let mut rows = query_cached(
+            &conn,
+            "SELECT value, encoding, deleted
                  FROM worker_kv
                  WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
-                (worker_name, binding, key),
-            )
-            .await
-            .map_err(kv_error)?;
+            (worker_name, binding, key),
+        )
+        .await
+        .map_err(kv_error)?;
         if let Some(row) = rows.next().await.map_err(kv_error)? {
             let deleted: i64 = row.get::<i64>(2).map_err(kv_error)?;
             if deleted != 0 {
@@ -1209,17 +1211,17 @@ impl KvStore {
     ) -> Result<Vec<KvEntry>> {
         let conn = self.connect().await?;
         let pattern = format!("{prefix}%");
-        let mut rows = conn
-            .query(
-                "SELECT key, value_blob, encoding, value
+        let mut rows = query_cached(
+            &conn,
+            "SELECT key, value_blob, encoding, value
                  FROM worker_kv
                  WHERE worker_name = ?1 AND binding = ?2 AND deleted = 0 AND key LIKE ?3
                  ORDER BY key ASC
                  LIMIT ?4",
-                (worker_name, binding, pattern, limit as i64),
-            )
-            .await
-            .map_err(kv_error)?;
+            (worker_name, binding, pattern, limit as i64),
+        )
+        .await
+        .map_err(kv_error)?;
 
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(kv_error)? {
@@ -1262,12 +1264,9 @@ impl KvStore {
         .await
         .map_err(kv_error)?;
         ensure_compat_columns(&conn).await?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_worker_kv_lookup ON worker_kv(worker_name, binding, key)",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
+        conn.execute("DROP INDEX IF EXISTS idx_worker_kv_lookup", ())
+            .await
+            .map_err(kv_error)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_worker_kv_list ON worker_kv(worker_name, binding, deleted, key)",
             (),
@@ -1289,8 +1288,7 @@ impl KvStore {
     }
 
     async fn next_version_floor(&self, conn: &Connection) -> Result<u64> {
-        let mut rows = conn
-            .query("SELECT COALESCE(MAX(version), 0) FROM worker_kv", ())
+        let mut rows = query_cached(conn, "SELECT COALESCE(MAX(version), 0) FROM worker_kv", ())
             .await
             .map_err(kv_error)?;
         let max_version = if let Some(row) = rows.next().await.map_err(kv_error)? {
@@ -1551,6 +1549,45 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), store.connect())
             .await
             .expect("connection should become available after a guard is dropped")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_migration_drops_redundant_lookup_index() -> Result<()> {
+        let path = temp_db_path("drop-redundant-index");
+        let store = test_store(&path).await?;
+        let conn = store.connect().await?;
+        conn.execute(
+            "CREATE INDEX idx_worker_kv_lookup ON worker_kv(worker_name, binding, key)",
+            (),
+        )
+        .await
+        .map_err(kv_error)?;
+        drop(conn);
+
+        store.ensure_schema().await?;
+
+        let conn = store.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                ("idx_worker_kv_lookup",),
+            )
+            .await
+            .map_err(kv_error)?;
+        let row = rows.next().await.map_err(kv_error)?.expect("count row");
+        assert_eq!(row.get::<i64>(0).map_err(kv_error)?, 0);
+        drop(rows);
+        drop(conn);
+
+        store.put("worker-a", "MY_KV", "key", "value").await?;
+        assert_eq!(
+            store
+                .get("worker-a", "MY_KV", "key")
+                .await?
+                .map(decode_utf8),
+            Some("value".to_string())
+        );
         Ok(())
     }
 

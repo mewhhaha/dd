@@ -297,6 +297,12 @@ Runtime benchmark:
 cargo run -p runtime --bin bench --release
 ```
 
+Real HTTP/1 server benchmark (uncached and warmed front-cache traffic):
+
+```bash
+cargo run -p dd_server --bin bench_http_server --release
+```
+
 Keyed memory benchmark:
 
 ```bash

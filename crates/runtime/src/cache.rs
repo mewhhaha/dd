@@ -1,17 +1,27 @@
 use crate::blob::BlobStore;
-use crate::turso_util::{configure_turso_connection, is_retryable_turso_error, retry_turso_busy};
+use crate::turso_util::{
+    configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
+    retry_turso_busy,
+};
 use common::{PlatformError, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex as AsyncMutex;
+#[cfg(test)]
+use tokio::sync::{Notify, oneshot};
 use turso::{Builder, Connection, Database, transaction::TransactionBehavior};
 use uuid::Uuid;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
 const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const HOT_CACHE_MAX_ENTRIES: usize = 1_024;
+const HOT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const TOUCH_FLUSH_BATCH_SIZE: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
@@ -62,6 +72,179 @@ pub struct CacheStore {
     blob_store: BlobStore,
     config: CacheConfig,
     access_seq: Arc<AtomicU64>,
+    mutation_epoch: Arc<AtomicU64>,
+    mutation_lock: Arc<AsyncMutex<()>>,
+    hot_cache: Arc<HotCache>,
+    #[cfg(test)]
+    test_hooks: Arc<CacheTestHooks>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CacheBaseKey {
+    cache_name: String,
+    method: String,
+    url: String,
+}
+
+impl CacheBaseKey {
+    fn new(cache_name: String, method: String, url: String) -> Self {
+        Self {
+            cache_name,
+            method,
+            url,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HotCacheEntry {
+    id: String,
+    base_key: CacheBaseKey,
+    vary_headers: Vec<String>,
+    vary_values: Vec<String>,
+    response: CacheResponse,
+    expires_at_ms: i64,
+    swr_until_ms: i64,
+    sie_until_ms: i64,
+    size_bytes: usize,
+}
+
+impl HotCacheEntry {
+    fn new(
+        id: String,
+        base_key: CacheBaseKey,
+        vary_headers: Vec<String>,
+        vary_values: Vec<String>,
+        response: CacheResponse,
+        expires_at_ms: i64,
+    ) -> Self {
+        let response_headers = to_header_map(&response.headers);
+        let response_control =
+            parse_cache_control(header_value(&response_headers, "cache-control"));
+        let swr_until_ms = stale_deadline_ms(
+            expires_at_ms,
+            response_control.stale_while_revalidate.unwrap_or(0),
+        );
+        let sie_until_ms =
+            stale_deadline_ms(expires_at_ms, response_control.stale_if_error.unwrap_or(0));
+        let size_bytes = hot_entry_size(&id, &base_key, &vary_headers, &vary_values, &response);
+        Self {
+            id,
+            base_key,
+            vary_headers,
+            vary_values,
+            response,
+            expires_at_ms,
+            swr_until_ms,
+            sie_until_ms,
+            size_bytes,
+        }
+    }
+}
+
+struct HotCache {
+    database: Arc<Database>,
+    flush_runtime: tokio::runtime::Handle,
+    max_entries: usize,
+    max_bytes: usize,
+    state: Mutex<HotCacheState>,
+    flush_lock: AsyncMutex<()>,
+}
+
+struct ScheduledFlushGuard {
+    hot_cache: Arc<HotCache>,
+    armed: bool,
+}
+
+struct PendingTouchesGuard<'a> {
+    hot_cache: &'a HotCache,
+    touches: Vec<(String, i64)>,
+    persisted: usize,
+}
+
+impl Drop for PendingTouchesGuard<'_> {
+    fn drop(&mut self) {
+        self.hot_cache
+            .requeue_touches(&self.touches[self.persisted..]);
+    }
+}
+
+impl ScheduledFlushGuard {
+    fn new(hot_cache: Arc<HotCache>) -> Self {
+        Self {
+            hot_cache,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ScheduledFlushGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hot_cache.lock_state().flush_scheduled = false;
+        }
+    }
+}
+
+#[derive(Default)]
+struct HotCacheState {
+    entries: HashMap<String, Arc<HotCacheEntry>>,
+    base_index: HashMap<CacheBaseKey, Vec<String>>,
+    lru: VecDeque<(String, u64)>,
+    lru_recency: HashMap<String, u64>,
+    lru_clock: u64,
+    total_bytes: usize,
+    pending_touches: HashMap<String, i64>,
+    flush_scheduled: bool,
+}
+
+#[cfg(test)]
+struct CacheTestPause {
+    reached: oneshot::Sender<()>,
+    resume: Arc<Notify>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CacheTestHooks {
+    after_disk_read: Mutex<Option<CacheTestPause>>,
+    before_hot_insert: Mutex<Option<CacheTestPause>>,
+}
+
+#[cfg(test)]
+impl CacheTestHooks {
+    fn install(slot: &Mutex<Option<CacheTestPause>>) -> (oneshot::Receiver<()>, Arc<Notify>) {
+        let (reached, wait_reached) = oneshot::channel();
+        let resume = Arc::new(Notify::new());
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CacheTestPause {
+            reached,
+            resume: Arc::clone(&resume),
+        });
+        (wait_reached, resume)
+    }
+
+    fn install_after_disk_read(&self) -> (oneshot::Receiver<()>, Arc<Notify>) {
+        Self::install(&self.after_disk_read)
+    }
+
+    fn install_before_hot_insert(&self) -> (oneshot::Receiver<()>, Arc<Notify>) {
+        Self::install(&self.before_hot_insert)
+    }
+
+    async fn pause(slot: &Mutex<Option<CacheTestPause>>) {
+        let pause = slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            pause.resume.notified().await;
+        }
+    }
 }
 
 struct CacheRecord {
@@ -101,6 +284,368 @@ struct CacheControl {
     stale_if_error: Option<u64>,
 }
 
+impl HotCache {
+    fn new(database: Arc<Database>, config: &CacheConfig) -> Self {
+        Self {
+            database,
+            flush_runtime: tokio::runtime::Handle::current(),
+            max_entries: config.max_entries.min(HOT_CACHE_MAX_ENTRIES),
+            max_bytes: config.max_bytes.min(HOT_CACHE_MAX_BYTES),
+            state: Mutex::new(HotCacheState::default()),
+            flush_lock: AsyncMutex::new(()),
+        }
+    }
+
+    fn lookup(
+        &self,
+        base_key: &CacheBaseKey,
+        request_headers: &HashMap<String, String>,
+        now_ms: i64,
+        bypass_stale: bool,
+    ) -> Option<(String, CacheLookup)> {
+        let mut candidates = {
+            let state = self.lock_state();
+            state
+                .base_index
+                .get(base_key)?
+                .iter()
+                .filter_map(|id| {
+                    Some((
+                        *state.lru_recency.get(id)?,
+                        Arc::clone(state.entries.get(id)?),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+
+        for (_, entry) in candidates {
+            if !vary_values_match(&entry.vary_headers, &entry.vary_values, request_headers) {
+                continue;
+            }
+
+            if now_ms <= entry.expires_at_ms {
+                self.touch_if_current(&entry);
+                return Some((entry.id.clone(), CacheLookup::Fresh(entry.response.clone())));
+            }
+
+            if now_ms > entry.swr_until_ms.max(entry.sie_until_ms) {
+                self.remove_if_current(&entry);
+                continue;
+            }
+            if bypass_stale {
+                continue;
+            }
+
+            if now_ms <= entry.swr_until_ms && entry.swr_until_ms > entry.expires_at_ms {
+                self.touch_if_current(&entry);
+                return Some((
+                    entry.id.clone(),
+                    CacheLookup::StaleWhileRevalidate(entry.response.clone()),
+                ));
+            }
+            if now_ms <= entry.sie_until_ms && entry.sie_until_ms > entry.expires_at_ms {
+                self.touch_if_current(&entry);
+                return Some((
+                    entry.id.clone(),
+                    CacheLookup::StaleIfError(entry.response.clone()),
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn insert(&self, entry: HotCacheEntry) {
+        let mut state = self.lock_state();
+        state.insert(entry, self.max_entries, self.max_bytes);
+    }
+
+    fn touch_if_current(&self, entry: &Arc<HotCacheEntry>) {
+        let mut state = self.lock_state();
+        if state
+            .entries
+            .get(&entry.id)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            state.touch_lru(&entry.id);
+        }
+    }
+
+    fn remove_if_current(&self, entry: &Arc<HotCacheEntry>) {
+        let mut state = self.lock_state();
+        if state
+            .entries
+            .get(&entry.id)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            state.remove_entry(&entry.id);
+        }
+    }
+
+    fn invalidate_ids<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let mut state = self.lock_state();
+        for id in ids {
+            state.remove_entry(id);
+            state.pending_touches.remove(id);
+        }
+    }
+
+    fn invalidate_base(&self, base_key: &CacheBaseKey) {
+        let mut state = self.lock_state();
+        let ids = state.base_index.get(base_key).cloned().unwrap_or_default();
+        for id in ids {
+            state.remove_entry(&id);
+            state.pending_touches.remove(&id);
+        }
+    }
+
+    fn queue_touch(self: &Arc<Self>, id: String, access_seq: i64) {
+        let should_spawn = {
+            let mut state = self.lock_state();
+            state
+                .pending_touches
+                .entry(id)
+                .and_modify(|pending| *pending = (*pending).max(access_seq))
+                .or_insert(access_seq);
+            if state.flush_scheduled {
+                false
+            } else {
+                state.flush_scheduled = true;
+                true
+            }
+        };
+
+        if should_spawn {
+            let hot_cache = Arc::clone(self);
+            let schedule_guard = ScheduledFlushGuard::new(Arc::clone(self));
+            self.flush_runtime.spawn(async move {
+                hot_cache.run_scheduled_flushes(schedule_guard).await;
+            });
+        }
+    }
+
+    async fn run_scheduled_flushes(self: Arc<Self>, mut schedule_guard: ScheduledFlushGuard) {
+        const MAX_BACKGROUND_FAILURES: usize = 8;
+        let mut consecutive_failures = 0usize;
+        loop {
+            tokio::time::sleep(TOUCH_FLUSH_INTERVAL).await;
+            match self.flush_pending_touches().await {
+                Ok(()) => consecutive_failures = 0,
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    tracing::warn!(error = %error, "failed to flush cache recency touches");
+                }
+            }
+
+            let mut state = self.lock_state();
+            if state.pending_touches.is_empty() || consecutive_failures >= MAX_BACKGROUND_FAILURES {
+                state.flush_scheduled = false;
+                schedule_guard.disarm();
+                break;
+            }
+        }
+    }
+
+    async fn flush_pending_touches(&self) -> Result<()> {
+        let _flush_guard = self.flush_lock.lock().await;
+        let touches = {
+            let mut state = self.lock_state();
+            state.pending_touches.drain().collect::<Vec<_>>()
+        };
+        if touches.is_empty() {
+            return Ok(());
+        }
+
+        let mut pending = PendingTouchesGuard {
+            hot_cache: self,
+            touches,
+            persisted: 0,
+        };
+        while pending.persisted < pending.touches.len() {
+            let end = (pending.persisted + TOUCH_FLUSH_BATCH_SIZE).min(pending.touches.len());
+            self.persist_touch_batch(&pending.touches[pending.persisted..end])
+                .await?;
+            pending.persisted = end;
+        }
+        Ok(())
+    }
+
+    async fn persist_touch_batch(&self, touches: &[(String, i64)]) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 8;
+        let mut conn = self.database.connect().map_err(cache_error)?;
+        configure_turso_connection(&conn, cache_error)?;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let tx = match conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .await
+            {
+                Ok(tx) => tx,
+                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                    sleep_cache_retry(attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(cache_error(error)),
+            };
+
+            let mut execute_error = None;
+            for (id, access_seq) in touches {
+                if let Err(error) = execute_cached(
+                    &tx,
+                    "UPDATE worker_cache_entries
+                         SET last_access_seq = MAX(last_access_seq, ?1)
+                         WHERE id = ?2",
+                    (*access_seq, id.as_str()),
+                )
+                .await
+                {
+                    execute_error = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = execute_error {
+                let retry = is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS;
+                let _ = tx.rollback().await;
+                if retry {
+                    sleep_cache_retry(attempt).await;
+                    continue;
+                }
+                return Err(cache_error(error));
+            }
+
+            match tx.commit().await {
+                Ok(()) => return Ok(()),
+                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                    sleep_cache_retry(attempt).await;
+                }
+                Err(error) => return Err(cache_error(error)),
+            }
+        }
+
+        Err(PlatformError::runtime(
+            "cache error: recency flush failed after retries",
+        ))
+    }
+
+    fn requeue_touches(&self, touches: &[(String, i64)]) {
+        let mut state = self.lock_state();
+        for (id, access_seq) in touches {
+            state
+                .pending_touches
+                .entry(id.clone())
+                .and_modify(|pending| *pending = (*pending).max(*access_seq))
+                .or_insert(*access_seq);
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, HotCacheState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl HotCacheState {
+    fn insert(&mut self, entry: HotCacheEntry, max_entries: usize, max_bytes: usize) {
+        self.remove_entry(&entry.id);
+        if max_entries == 0 || max_bytes == 0 || entry.size_bytes > max_bytes {
+            return;
+        }
+
+        while self.entries.len() >= max_entries
+            || self.total_bytes.saturating_add(entry.size_bytes) > max_bytes
+        {
+            let Some(victim_id) = self.oldest_live_entry() else {
+                break;
+            };
+            self.remove_entry(&victim_id);
+        }
+
+        let entry = Arc::new(entry);
+        self.total_bytes = self.total_bytes.saturating_add(entry.size_bytes);
+        self.base_index
+            .entry(entry.base_key.clone())
+            .or_default()
+            .push(entry.id.clone());
+        self.entries.insert(entry.id.clone(), Arc::clone(&entry));
+        self.mark_recent(&entry.id);
+    }
+
+    fn remove_entry(&mut self, id: &str) {
+        let Some(entry) = self.entries.remove(id) else {
+            return;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(entry.size_bytes);
+        self.lru_recency.remove(id);
+        let remove_base = if let Some(ids) = self.base_index.get_mut(&entry.base_key) {
+            ids.retain(|candidate| candidate != id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if remove_base {
+            self.base_index.remove(&entry.base_key);
+        }
+    }
+
+    fn touch_lru(&mut self, id: &str) {
+        if !self.entries.contains_key(id) {
+            return;
+        }
+        self.mark_recent(id);
+    }
+
+    fn mark_recent(&mut self, id: &str) {
+        if self.lru_clock == u64::MAX {
+            self.renumber_lru();
+        }
+        self.lru_clock += 1;
+        let sequence = self.lru_clock;
+        self.lru_recency.insert(id.to_string(), sequence);
+        self.lru.push_back((id.to_string(), sequence));
+        if self.lru.len() > self.entries.len().max(64).saturating_mul(16) {
+            self.rebuild_lru();
+        }
+    }
+
+    fn oldest_live_entry(&mut self) -> Option<String> {
+        while let Some((id, sequence)) = self.lru.pop_front() {
+            if self.lru_recency.get(&id) == Some(&sequence) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn rebuild_lru(&mut self) {
+        let mut live = self
+            .lru_recency
+            .iter()
+            .map(|(id, sequence)| (id.clone(), *sequence))
+            .collect::<Vec<_>>();
+        live.sort_unstable_by_key(|(_, sequence)| *sequence);
+        self.lru = live.into();
+    }
+
+    fn renumber_lru(&mut self) {
+        let mut ids = self
+            .lru_recency
+            .iter()
+            .map(|(id, sequence)| (id.clone(), *sequence))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by_key(|(_, sequence)| *sequence);
+        self.lru.clear();
+        self.lru_recency.clear();
+        for (index, (id, _)) in ids.into_iter().enumerate() {
+            let sequence = index as u64 + 1;
+            self.lru_recency.insert(id.clone(), sequence);
+            self.lru.push_back((id, sequence));
+        }
+        self.lru_clock = self.lru_recency.len() as u64;
+    }
+}
+
 impl CacheStore {
     pub async fn from_config(
         config: CacheConfig,
@@ -127,9 +672,19 @@ impl CacheStore {
 
         let cache_name = normalize_cache_name(&request.cache_name);
         let now_ms = epoch_ms_i64()?;
+        let base_key = CacheBaseKey::new(cache_name.clone(), method.clone(), request.url.clone());
+        if let Some((id, lookup)) =
+            self.hot_cache
+                .lookup(&base_key, &request_headers, now_ms, request.bypass_stale)
+        {
+            self.hot_cache.queue_touch(id, self.next_access_seq());
+            return Ok(lookup);
+        }
+
+        let mutation_epoch = self.mutation_epoch.load(Ordering::Acquire);
         let conn = self.connect()?;
-        let mut rows = conn
-            .query(
+        let mut rows = query_cached(
+            &conn,
                 "SELECT id, vary_headers_json, vary_values_json, status, headers_json, body_storage, body_inline_hex, body_ref, expires_at_ms
                  FROM worker_cache_entries
                  WHERE cache_name = ?1 AND method = ?2 AND url = ?3
@@ -142,6 +697,7 @@ impl CacheStore {
         let mut expired = Vec::new();
         let mut stale = Vec::new();
         let mut selected_id = String::new();
+        let mut selected_hot_entry = None;
         let mut lookup = CacheLookup::Miss;
 
         while let Some(row) = rows.next().await.map_err(cache_error)? {
@@ -240,7 +796,15 @@ impl CacheStore {
             let max_stale_until_ms = swr_until_ms.max(sie_until_ms);
 
             if now_ms <= record.expires_at_ms {
-                selected_id = record.id;
+                selected_id = record.id.clone();
+                selected_hot_entry = Some(HotCacheEntry::new(
+                    record.id,
+                    base_key.clone(),
+                    vary_headers,
+                    stored_vary_values,
+                    response.clone(),
+                    record.expires_at_ms,
+                ));
                 lookup = CacheLookup::Fresh(response);
                 break;
             }
@@ -258,10 +822,27 @@ impl CacheStore {
                 continue;
             }
 
-            selected_id = record.id;
             if now_ms <= swr_until_ms && response_control.stale_while_revalidate.unwrap_or(0) > 0 {
+                selected_id = record.id.clone();
+                selected_hot_entry = Some(HotCacheEntry::new(
+                    record.id,
+                    base_key.clone(),
+                    vary_headers,
+                    stored_vary_values,
+                    response.clone(),
+                    record.expires_at_ms,
+                ));
                 lookup = CacheLookup::StaleWhileRevalidate(response);
             } else if now_ms <= sie_until_ms && response_control.stale_if_error.unwrap_or(0) > 0 {
+                selected_id = record.id.clone();
+                selected_hot_entry = Some(HotCacheEntry::new(
+                    record.id,
+                    base_key.clone(),
+                    vary_headers,
+                    stored_vary_values,
+                    response.clone(),
+                    record.expires_at_ms,
+                ));
                 lookup = CacheLookup::StaleIfError(response);
             } else {
                 continue;
@@ -269,28 +850,30 @@ impl CacheStore {
             break;
         }
         drop(rows);
+        #[cfg(test)]
+        CacheTestHooks::pause(&self.test_hooks.after_disk_read).await;
 
-        if !expired.is_empty() {
-            self.remove_records(&conn, &expired).await?;
+        if !expired.is_empty() || !stale.is_empty() || selected_hot_entry.is_some() {
+            let _mutation_guard = self.mutation_lock.lock().await;
+            if self.mutation_epoch.load(Ordering::Acquire) == mutation_epoch {
+                if !expired.is_empty() {
+                    self.remove_records(&conn, &expired).await?;
+                }
+                if !stale.is_empty() {
+                    self.remove_records(&conn, &stale).await?;
+                }
+                #[cfg(test)]
+                if selected_hot_entry.is_some() {
+                    CacheTestHooks::pause(&self.test_hooks.before_hot_insert).await;
+                }
+                if let Some(entry) = selected_hot_entry.take() {
+                    self.hot_cache.insert(entry);
+                }
+            }
         }
-        if !stale.is_empty() {
-            self.remove_records(&conn, &stale).await?;
-        }
-
         if !selected_id.is_empty() {
-            let changed = execute_with_retry(|| {
-                conn.execute(
-                    "UPDATE worker_cache_entries
-                     SET last_access_seq = ?1
-                     WHERE id = ?2",
-                    (self.next_access_seq(), selected_id.as_str()),
-                )
-            })
-            .await?;
-            debug_assert_eq!(
-                changed, 1,
-                "selected cache hit should update one recency row"
-            );
+            self.hot_cache
+                .queue_touch(selected_id, self.next_access_seq());
         }
 
         Ok(lookup)
@@ -339,6 +922,7 @@ impl CacheStore {
         if size_bytes > self.config.max_bytes {
             return Ok(false);
         }
+        let base_key = CacheBaseKey::new(cache_name.clone(), method.clone(), request.url.clone());
 
         let vary_headers_json = crate::json::to_string(&vary_headers)
             .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
@@ -361,6 +945,7 @@ impl CacheStore {
         let expires_at_ms = now_ms + ttl.as_millis() as i64;
         let access_seq = self.next_access_seq();
         let entry_id = Uuid::new_v4().to_string();
+        let _mutation_guard = self.mutation_lock.lock().await;
 
         const MAX_ATTEMPTS: usize = 8;
         let mut commit_attempted = false;
@@ -402,9 +987,9 @@ impl CacheStore {
                         return Err(error);
                     }
                 };
-                let put_result = tx
-                    .execute(
-                        "INSERT INTO worker_cache_entries (
+                let put_result = execute_cached(
+                    &tx,
+                    "INSERT INTO worker_cache_entries (
                            id, cache_name, method, url, vary_headers_json, vary_values_json,
                            status, headers_json, body_storage, body_inline_hex, body_ref,
                            body_size, expires_at_ms, last_access_seq, updated_at_ms
@@ -420,25 +1005,25 @@ impl CacheStore {
                            expires_at_ms = excluded.expires_at_ms,
                            last_access_seq = excluded.last_access_seq,
                            updated_at_ms = excluded.updated_at_ms",
-                        (
-                            entry_id.as_str(),
-                            cache_name.as_str(),
-                            method.as_str(),
-                            request.url.as_str(),
-                            vary_headers_json.as_str(),
-                            vary_values_json.as_str(),
-                            response.status as i64,
-                            headers_json.as_str(),
-                            body_storage.as_str(),
-                            body_inline_hex.as_str(),
-                            body_ref.as_str(),
-                            size_bytes as i64,
-                            expires_at_ms,
-                            access_seq,
-                            now_ms,
-                        ),
-                    )
-                    .await;
+                    (
+                        entry_id.as_str(),
+                        cache_name.as_str(),
+                        method.as_str(),
+                        request.url.as_str(),
+                        vary_headers_json.as_str(),
+                        vary_values_json.as_str(),
+                        response.status as i64,
+                        headers_json.as_str(),
+                        body_storage.as_str(),
+                        body_inline_hex.as_str(),
+                        body_ref.as_str(),
+                        size_bytes as i64,
+                        expires_at_ms,
+                        access_seq,
+                        now_ms,
+                    ),
+                )
+                .await;
                 if let Err(error) = put_result {
                     let _ = tx.rollback().await;
                     if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
@@ -451,6 +1036,10 @@ impl CacheStore {
                 }
                 commit_attempted = true;
                 if let Err(error) = tx.commit().await {
+                    // A commit error can be ambiguous. Invalidate conservatively
+                    // so a prior decoded response cannot outlive a disk commit.
+                    self.hot_cache.invalidate_base(&base_key);
+                    self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
                     if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
                         sleep_cache_retry(attempt).await;
                         continue;
@@ -467,6 +1056,12 @@ impl CacheStore {
                 "cache error: put failed after retries",
             ));
         };
+        let committed_id = existing_variant
+            .first()
+            .map(|existing| existing.id.clone())
+            .unwrap_or_else(|| entry_id.clone());
+        self.hot_cache.invalidate_base(&base_key);
+        self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
         if existing_variant.len() > 1 {
             self.remove_records(&conn, &existing_variant[1..]).await?;
         }
@@ -479,6 +1074,14 @@ impl CacheStore {
         }
         self.cleanup_expired(&conn, now_ms).await?;
         self.evict_if_needed(&conn).await?;
+        self.hot_cache.insert(HotCacheEntry::new(
+            committed_id,
+            base_key,
+            vary_headers,
+            vary_values,
+            response,
+            expires_at_ms,
+        ));
         Ok(true)
     }
 
@@ -488,6 +1091,9 @@ impl CacheStore {
         };
         let request_headers = to_header_map(&request.headers);
         let cache_name = normalize_cache_name(&request.cache_name);
+        let base_key = CacheBaseKey::new(cache_name.clone(), method.clone(), request.url.clone());
+        let _mutation_guard = self.mutation_lock.lock().await;
+        self.hot_cache.invalidate_base(&base_key);
         let conn = self.connect()?;
         let records = self
             .load_candidates(&conn, &cache_name, &method, &request.url)
@@ -533,6 +1139,7 @@ impl CacheStore {
         }
 
         self.remove_records(&conn, &to_delete).await?;
+        self.hot_cache.invalidate_base(&base_key);
         Ok(true)
     }
 
@@ -545,13 +1152,20 @@ impl CacheStore {
             .build()
             .await
             .map_err(cache_error)?;
+        let database = Arc::new(database);
         let store = Self {
-            database: Arc::new(database),
+            database: Arc::clone(&database),
             blob_store,
+            hot_cache: Arc::new(HotCache::new(database, &config)),
             config,
             access_seq: Arc::new(AtomicU64::new(1)),
+            mutation_epoch: Arc::new(AtomicU64::new(0)),
+            mutation_lock: Arc::new(AsyncMutex::new(())),
+            #[cfg(test)]
+            test_hooks: Arc::new(CacheTestHooks::default()),
         };
         store.ensure_schema().await?;
+        store.initialize_access_seq().await?;
         Ok(store)
     }
 
@@ -615,6 +1229,29 @@ impl CacheStore {
         Ok(())
     }
 
+    async fn initialize_access_seq(&self) -> Result<()> {
+        let conn = self.connect()?;
+        let mut rows = query_cached(
+            &conn,
+            "SELECT COALESCE(MAX(last_access_seq), 0)
+                 FROM worker_cache_entries",
+            (),
+        )
+        .await
+        .map_err(cache_error)?;
+        let persisted_max = rows
+            .next()
+            .await
+            .map_err(cache_error)?
+            .map(|row| row.get::<i64>(0).map_err(cache_error))
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.access_seq
+            .store(persisted_max.saturating_add(1), Ordering::Release);
+        Ok(())
+    }
+
     async fn load_candidates(
         &self,
         conn: &Connection,
@@ -622,8 +1259,8 @@ impl CacheStore {
         method: &str,
         url: &str,
     ) -> Result<Vec<CacheRecord>> {
-        let mut rows = conn
-            .query(
+        let mut rows = query_cached(
+            conn,
                 "SELECT id, vary_headers_json, vary_values_json, status, headers_json, body_storage, body_inline_hex, body_ref, expires_at_ms
                  FROM worker_cache_entries
                  WHERE cache_name = ?1 AND method = ?2 AND url = ?3",
@@ -648,16 +1285,16 @@ impl CacheStore {
         vary_headers_json: &str,
         vary_values_json: &str,
     ) -> Result<Vec<CacheDeleteCandidate>> {
-        let mut rows = conn
-            .query(
-                "SELECT id, body_storage, body_ref
+        let mut rows = query_cached(
+            conn,
+            "SELECT id, body_storage, body_ref
                  FROM worker_cache_entries
                  WHERE cache_name = ?1 AND method = ?2 AND url = ?3
                    AND vary_headers_json = ?4 AND vary_values_json = ?5",
-                (cache_name, method, url, vary_headers_json, vary_values_json),
-            )
-            .await
-            .map_err(cache_error)?;
+            (cache_name, method, url, vary_headers_json, vary_values_json),
+        )
+        .await
+        .map_err(cache_error)?;
 
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(cache_error)? {
@@ -674,18 +1311,18 @@ impl CacheStore {
         let mut cursor_expires_at = i64::MIN;
         let mut cursor_id = String::new();
         loop {
-            let mut rows = conn
-                .query(
-                    "SELECT id, headers_json, body_storage, body_ref, expires_at_ms
+            let mut rows = query_cached(
+                conn,
+                "SELECT id, headers_json, body_storage, body_ref, expires_at_ms
                      FROM worker_cache_entries
                      WHERE expires_at_ms <= ?1
                        AND (expires_at_ms > ?2 OR (expires_at_ms = ?2 AND id > ?3))
                      ORDER BY expires_at_ms ASC, id ASC
                      LIMIT 64",
-                    (now_ms, cursor_expires_at, cursor_id.as_str()),
-                )
-                .await
-                .map_err(cache_error)?;
+                (now_ms, cursor_expires_at, cursor_id.as_str()),
+            )
+            .await
+            .map_err(cache_error)?;
             let mut expired = Vec::new();
             let mut scanned_any = false;
             while let Some(row) = rows.next().await.map_err(cache_error)? {
@@ -731,21 +1368,22 @@ impl CacheStore {
     }
 
     async fn evict_if_needed(&self, conn: &Connection) -> Result<()> {
+        self.flush_pending_touches().await?;
         loop {
             let (count, total_bytes) = self.cache_usage(conn).await?;
             if count <= self.config.max_entries && total_bytes <= self.config.max_bytes {
                 break;
             }
-            let mut rows = conn
-                .query(
-                    "SELECT id, body_storage, body_ref
+            let mut rows = query_cached(
+                conn,
+                "SELECT id, body_storage, body_ref
                      FROM worker_cache_entries
                      ORDER BY last_access_seq ASC, updated_at_ms ASC
                      LIMIT 1",
-                    (),
-                )
-                .await
-                .map_err(cache_error)?;
+                (),
+            )
+            .await
+            .map_err(cache_error)?;
             let Some(row) = rows.next().await.map_err(cache_error)? else {
                 break;
             };
@@ -761,14 +1399,14 @@ impl CacheStore {
     }
 
     async fn cache_usage(&self, conn: &Connection) -> Result<(usize, usize)> {
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*), COALESCE(SUM(body_size), 0)
+        let mut rows = query_cached(
+            conn,
+            "SELECT COUNT(*), COALESCE(SUM(body_size), 0)
                  FROM worker_cache_entries",
-                (),
-            )
-            .await
-            .map_err(cache_error)?;
+            (),
+        )
+        .await
+        .map_err(cache_error)?;
         if let Some(row) = rows.next().await.map_err(cache_error)? {
             let count = row.get::<i64>(0).map_err(cache_error)?.max(0) as usize;
             let bytes = row.get::<i64>(1).map_err(cache_error)?.max(0) as usize;
@@ -783,13 +1421,18 @@ impl CacheStore {
         records: &[CacheDeleteCandidate],
     ) -> Result<()> {
         for record in records {
-            execute_with_retry(|| {
-                conn.execute(
+            self.hot_cache.invalidate_ids([record.id.as_str()]);
+            let changed = execute_with_retry(|| {
+                execute_cached(
+                    conn,
                     "DELETE FROM worker_cache_entries WHERE id = ?1",
                     (record.id.as_str(),),
                 )
             })
             .await?;
+            if changed > 0 {
+                self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+            }
             if record.body_storage == "blob" && !record.body_ref.is_empty() {
                 self.blob_store.delete(&record.body_ref).await?;
             }
@@ -817,14 +1460,14 @@ impl CacheStore {
         let Ok(conn) = self.connect() else {
             return;
         };
-        let mut rows = match conn
-            .query(
-                "SELECT 1 FROM worker_cache_entries
+        let mut rows = match query_cached(
+            &conn,
+            "SELECT 1 FROM worker_cache_entries
                  WHERE body_storage = 'blob' AND body_ref = ?1
                  LIMIT 1",
-                (body_ref,),
-            )
-            .await
+            (body_ref,),
+        )
+        .await
         {
             Ok(rows) => rows,
             Err(_) => return,
@@ -846,7 +1489,13 @@ impl CacheStore {
     }
 
     fn next_access_seq(&self) -> i64 {
-        self.access_seq.fetch_add(1, Ordering::SeqCst) as i64
+        self.access_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .min(i64::MAX as u64) as i64
+    }
+
+    pub(crate) async fn flush_pending_touches(&self) -> Result<()> {
+        self.hot_cache.flush_pending_touches().await
     }
 }
 
@@ -1005,6 +1654,18 @@ fn derive_vary_values(
         .collect()
 }
 
+fn vary_values_match(
+    vary_headers: &[String],
+    vary_values: &[String],
+    request_headers: &HashMap<String, String>,
+) -> bool {
+    vary_headers.len() == vary_values.len()
+        && vary_headers
+            .iter()
+            .zip(vary_values)
+            .all(|(name, value)| header_value(request_headers, name) == value)
+}
+
 fn choose_ttl(control: CacheControl, fallback: Duration) -> Duration {
     let secs = control
         .s_maxage
@@ -1029,6 +1690,28 @@ fn estimate_entry_size(
         .sum::<usize>();
     let vary_bytes = vary_values.iter().map(String::len).sum::<usize>();
     cache_name.len() + method.len() + url.len() + headers_bytes + vary_bytes + response.body.len()
+}
+
+fn hot_entry_size(
+    id: &str,
+    base_key: &CacheBaseKey,
+    vary_headers: &[String],
+    vary_values: &[String],
+    response: &CacheResponse,
+) -> usize {
+    let headers_bytes = response
+        .headers
+        .iter()
+        .map(|(name, value)| name.len().saturating_add(value.len()))
+        .sum::<usize>();
+    id.len()
+        .saturating_add(base_key.cache_name.len())
+        .saturating_add(base_key.method.len())
+        .saturating_add(base_key.url.len())
+        .saturating_add(vary_headers.iter().map(String::len).sum::<usize>())
+        .saturating_add(vary_values.iter().map(String::len).sum::<usize>())
+        .saturating_add(headers_bytes)
+        .saturating_add(response.body.len())
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -1106,7 +1789,11 @@ fn ensure_parent_dir(path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
+    use super::{
+        CacheBaseKey, CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore,
+        HOT_CACHE_MAX_BYTES, HOT_CACHE_MAX_ENTRIES, HotCacheEntry, HotCacheState,
+        PendingTouchesGuard,
+    };
     use crate::blob::local_blob_store_for_tests;
     use common::Result;
     use std::fs;
@@ -1122,12 +1809,37 @@ mod tests {
 
     async fn test_store_with_blob_dir(config: CacheConfig, blob_dir: &str) -> CacheStore {
         let database_path = format!("/tmp/dd-cache-test-{}.db", Uuid::new_v4());
+        test_store_at_path(config, &database_path, blob_dir).await
+    }
+
+    async fn test_store_at_path(
+        config: CacheConfig,
+        database_path: &str,
+        blob_dir: &str,
+    ) -> CacheStore {
         let blob_store = local_blob_store_for_tests(blob_dir)
             .await
             .expect("blob store");
-        CacheStore::from_local_path(config, database_path, blob_store)
+        CacheStore::from_local_path(config, database_path.to_string(), blob_store)
             .await
             .expect("cache store")
+    }
+
+    async fn persisted_access_seq(store: &CacheStore, url: &str) -> i64 {
+        let conn = store.connect().expect("cache connection");
+        let mut rows = conn
+            .query(
+                "SELECT last_access_seq FROM worker_cache_entries WHERE url = ?1",
+                (url,),
+            )
+            .await
+            .expect("query cache recency");
+        rows.next()
+            .await
+            .expect("read cache recency")
+            .expect("cache entry")
+            .get::<i64>(0)
+            .expect("last access sequence")
     }
 
     fn request(path: &str) -> CacheRequest {
@@ -1156,6 +1868,43 @@ mod tests {
             .count()
     }
 
+    #[test]
+    fn hot_cache_enforces_entry_and_byte_bounds() {
+        fn hot_entry(id: usize) -> HotCacheEntry {
+            HotCacheEntry::new(
+                id.to_string(),
+                CacheBaseKey::new(
+                    "default".into(),
+                    "GET".into(),
+                    format!("http://worker/{id}"),
+                ),
+                Vec::new(),
+                Vec::new(),
+                CacheResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: vec![id as u8],
+                },
+                i64::MAX,
+            )
+        }
+
+        let mut state = HotCacheState::default();
+        for id in 0..=HOT_CACHE_MAX_ENTRIES {
+            state.insert(hot_entry(id), HOT_CACHE_MAX_ENTRIES, HOT_CACHE_MAX_BYTES);
+        }
+        assert_eq!(state.entries.len(), HOT_CACHE_MAX_ENTRIES);
+        assert!(!state.entries.contains_key("0"));
+        assert!(state.total_bytes <= HOT_CACHE_MAX_BYTES);
+
+        let mut oversized = hot_entry(HOT_CACHE_MAX_ENTRIES + 1);
+        oversized.size_bytes = HOT_CACHE_MAX_BYTES + 1;
+        let oversized_id = oversized.id.clone();
+        state.insert(oversized, HOT_CACHE_MAX_ENTRIES, HOT_CACHE_MAX_BYTES);
+        assert!(!state.entries.contains_key(&oversized_id));
+        assert_eq!(state.entries.len(), HOT_CACHE_MAX_ENTRIES);
+    }
+
     #[tokio::test]
     async fn put_then_get_hits() -> Result<()> {
         let store = test_store(CacheConfig {
@@ -1172,6 +1921,207 @@ mod tests {
             CacheLookup::Fresh(value) => assert_eq!(value.body, b"one"),
             other => panic!("expected fresh hit, got {:?}", other),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_hits_coalesce_recency_until_flush() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/coalesced-recency");
+        assert!(store.put(&req, response("hot")).await?);
+        let before = persisted_access_seq(&store, &req.url).await;
+
+        for _ in 0..32 {
+            assert!(matches!(store.get(&req).await?, CacheLookup::Fresh(_)));
+        }
+        {
+            let state = store.hot_cache.lock_state();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.pending_touches.len(), 1);
+        }
+        assert_eq!(persisted_access_seq(&store, &req.url).await, before);
+
+        let expected = store.access_seq.load(std::sync::atomic::Ordering::Relaxed) as i64 - 1;
+        store.flush_pending_touches().await?;
+        assert_eq!(persisted_access_seq(&store, &req.url).await, expected);
+        assert!(store.hot_cache.lock_state().pending_touches.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_delete_cannot_be_overwritten_by_inflight_disk_read() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/delete-read-race");
+        assert!(store.put(&req, response("old")).await?);
+        store.hot_cache.invalidate_base(&CacheBaseKey::new(
+            "default".into(),
+            "GET".into(),
+            req.url.clone(),
+        ));
+
+        let (reached, resume) = store.test_hooks.install_before_hot_insert();
+        let get_store = store.clone();
+        let get_request = req.clone();
+        let get = tokio::spawn(async move { get_store.get(&get_request).await });
+        reached.await.expect("disk read should reach hot insert");
+
+        let delete_store = store.clone();
+        let delete_request = req.clone();
+        let delete = tokio::spawn(async move { delete_store.delete(&delete_request).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !delete.is_finished(),
+            "delete must wait for the disk-read insertion boundary"
+        );
+
+        resume.notify_one();
+        assert!(matches!(
+            get.await.expect("get task")?,
+            CacheLookup::Fresh(_)
+        ));
+        assert!(delete.await.expect("delete task")?);
+        assert!(matches!(store.get(&req).await?, CacheLookup::Miss));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_disk_cleanup_cannot_delete_concurrent_refresh() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/cleanup-refresh-race");
+        assert!(store.put(&req, response("old")).await?);
+        store.hot_cache.invalidate_base(&CacheBaseKey::new(
+            "default".into(),
+            "GET".into(),
+            req.url.clone(),
+        ));
+        let conn = store.connect()?;
+        conn.execute(
+            "UPDATE worker_cache_entries SET expires_at_ms = 0 WHERE url = ?1",
+            (req.url.as_str(),),
+        )
+        .await
+        .expect("expire cache row");
+
+        let (reached, resume) = store.test_hooks.install_after_disk_read();
+        let get_store = store.clone();
+        let get_request = req.clone();
+        let stale_get = tokio::spawn(async move { get_store.get(&get_request).await });
+        reached.await.expect("stale disk read should pause");
+
+        assert!(store.put(&req, response("fresh")).await?);
+        resume.notify_one();
+        assert!(matches!(
+            stale_get.await.expect("stale get task")?,
+            CacheLookup::Miss
+        ));
+        match store.get(&req).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body, b"fresh"),
+            other => panic!("expected refreshed cache row, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_recency_flush_is_requeued_and_recovers() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/flush-recovery");
+        assert!(store.put(&req, response("hot")).await?);
+        assert!(matches!(store.get(&req).await?, CacheLookup::Fresh(_)));
+
+        let conn = store.connect()?;
+        conn.execute("DROP TABLE worker_cache_entries", ())
+            .await
+            .expect("drop cache table");
+        assert!(store.flush_pending_touches().await.is_err());
+        assert_eq!(store.hot_cache.lock_state().pending_touches.len(), 1);
+
+        store.ensure_schema().await?;
+        store.flush_pending_touches().await?;
+        assert!(store.hot_cache.lock_state().pending_touches.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canceled_recency_batch_requeues_unpersisted_touches() {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        {
+            let _pending = PendingTouchesGuard {
+                hot_cache: store.hot_cache.as_ref(),
+                touches: vec![
+                    ("persisted".into(), 1),
+                    ("retry-a".into(), 2),
+                    ("retry-b".into(), 3),
+                ],
+                persisted: 1,
+            };
+        }
+        let state = store.hot_cache.lock_state();
+        assert!(!state.pending_touches.contains_key("persisted"));
+        assert_eq!(state.pending_touches.get("retry-a"), Some(&2));
+        assert_eq!(state.pending_touches.get("retry-b"), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn restart_initializes_access_sequence_from_persisted_max() -> Result<()> {
+        let database_path = format!("/tmp/dd-cache-restart-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-restart-blob-test-{}", Uuid::new_v4());
+        let config = CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(60),
+            inline_body_limit_bytes: 64 * 1024,
+        };
+        let first = test_store_at_path(config.clone(), &database_path, &blob_dir).await;
+        let first_request = request("/before-restart");
+        assert!(first.put(&first_request, response("first")).await?);
+        assert!(matches!(
+            first.get(&first_request).await?,
+            CacheLookup::Fresh(_)
+        ));
+        first.flush_pending_touches().await?;
+        let persisted_max = persisted_access_seq(&first, &first_request.url).await;
+        drop(first);
+
+        let restarted = test_store_at_path(config, &database_path, &blob_dir).await;
+        assert_eq!(
+            restarted
+                .access_seq
+                .load(std::sync::atomic::Ordering::Acquire),
+            persisted_max as u64 + 1
+        );
+        let second_request = request("/after-restart");
+        assert!(restarted.put(&second_request, response("second")).await?);
+        assert!(persisted_access_seq(&restarted, &second_request.url).await > persisted_max);
         Ok(())
     }
 

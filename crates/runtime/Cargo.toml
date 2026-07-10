@@ -6,10 +6,11 @@ version.workspace = true
 build = "build.rs"
 
 [dependencies]
+arc-swap.workspace = true
 common = { path = "../common" }
 deno_core.workspace = true
 deno_error = "=0.7.1"
-turso = { version = "0.7.0-pre.18", default-features = false }
+turso = { git = "https://github.com/tursodatabase/turso", rev = "f548e012cd6ef4ecc3d0f6112d69813e13c54dcb", default-features = false }
 capnp = "0.26"
 serde.workspace = true
 serde_json.workspace = true

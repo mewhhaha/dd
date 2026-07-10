@@ -358,6 +358,7 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 - smoke examples: `bash scripts/smoke_examples.sh`
 - runtime benchmark: `cargo run -p runtime --bin bench --release`
 - keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`
+- real HTTP/1 server benchmark: `cargo run -p dd_server --bin bench_http_server --release`
 - public naming guard: `bash scripts/check_public_memory_naming.sh`
 
 ## Fly helpers

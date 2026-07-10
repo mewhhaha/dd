@@ -874,8 +874,8 @@ impl RuntimeService {
         request_body: Option<InvokeRequestBodyReceiver>,
     ) -> Result<WorkerOutput> {
         let runtime_request_id = next_runtime_token("req");
-        let invoke_span = if tracing::enabled!(Level::INFO) {
-            let span = tracing::info_span!(
+        let invoke_span = if tracing::enabled!(Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "runtime.invoke",
                 worker.name = %worker_name,
                 runtime.request_id = %runtime_request_id,
@@ -886,24 +886,27 @@ impl RuntimeService {
         } else {
             None
         };
-        let _invoke_guard = invoke_span.as_ref().map(|span| span.enter());
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::Invoke {
-                worker_name: worker_name.clone(),
-                runtime_request_id: runtime_request_id.clone(),
-                request,
-                request_body,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+        async move {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.sender
+                .send(RuntimeCommand::Invoke {
+                    worker_name: worker_name.clone(),
+                    runtime_request_id: runtime_request_id.clone(),
+                    request,
+                    request_body,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
 
-        let mut cancel_guard =
-            InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
-        let reply = reply_rx.await;
-        cancel_guard.disarm();
-        reply.map_err(|_| PlatformError::internal("runtime invoke channel closed"))?
+            let mut cancel_guard =
+                InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
+            let reply = reply_rx.await;
+            cancel_guard.disarm();
+            reply.map_err(|_| PlatformError::internal("runtime invoke channel closed"))?
+        }
+        .instrument(invoke_span.unwrap_or_else(tracing::Span::none))
+        .await
     }
 
     pub async fn invoke_stream(
@@ -922,8 +925,8 @@ impl RuntimeService {
         request_body: Option<InvokeRequestBodyReceiver>,
     ) -> Result<WorkerStreamOutput> {
         let runtime_request_id = next_runtime_token("req");
-        let stream_span = if tracing::enabled!(Level::INFO) {
-            let span = tracing::info_span!(
+        let stream_span = if tracing::enabled!(Level::DEBUG) {
+            let span = tracing::debug_span!(
                 "runtime.invoke_stream",
                 worker.name = %worker_name,
                 runtime.request_id = %runtime_request_id,
@@ -934,36 +937,39 @@ impl RuntimeService {
         } else {
             None
         };
-        let _stream_guard = stream_span.as_ref().map(|span| span.enter());
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (reply_tx, _reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::InvokeStream {
-                worker_name: worker_name.clone(),
-                runtime_request_id: runtime_request_id.clone(),
-                request,
-                request_body,
-                ready: ready_tx,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-        let mut cancel_guard =
-            InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
+        async move {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (reply_tx, _reply_rx) = oneshot::channel();
+            self.sender
+                .send(RuntimeCommand::InvokeStream {
+                    worker_name: worker_name.clone(),
+                    runtime_request_id: runtime_request_id.clone(),
+                    request,
+                    request_body,
+                    ready: ready_tx,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+            let mut cancel_guard =
+                InvokeCancelGuard::new(self.cancel_sender.clone(), worker_name, runtime_request_id);
 
-        let ready = ready_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime stream channel closed"))?;
-        match ready {
-            Ok(mut output) => {
-                output.body.attach_cancel_guard(cancel_guard);
-                Ok(output)
-            }
-            Err(error) => {
-                cancel_guard.disarm();
-                Err(error)
+            let ready = ready_rx
+                .await
+                .map_err(|_| PlatformError::internal("runtime stream channel closed"))?;
+            match ready {
+                Ok(mut output) => {
+                    output.body.attach_cancel_guard(cancel_guard);
+                    Ok(output)
+                }
+                Err(error) => {
+                    cancel_guard.disarm();
+                    Err(error)
+                }
             }
         }
+        .instrument(stream_span.unwrap_or_else(tracing::Span::none))
+        .await
     }
 
     pub async fn open_websocket(
@@ -1361,8 +1367,7 @@ impl RuntimeService {
         }
         reply_rx
             .await
-            .map_err(|_| PlatformError::internal("runtime shutdown channel closed"))?;
-        Ok(())
+            .map_err(|_| PlatformError::internal("runtime shutdown channel closed"))?
     }
 
     #[cfg(test)]
@@ -1390,18 +1395,17 @@ impl RuntimeService {
     }
 
     pub async fn cache_match(&self, request: CacheRequest) -> Result<CacheLookup> {
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "runtime.cache.match",
             cache.name = %request.cache_name,
             http.method = %request.method,
             http.url = %request.url
         );
-        let _guard = span.enter();
-        self.cache_store.get(&request).await
+        self.cache_store.get(&request).instrument(span).await
     }
 
     pub async fn cache_put(&self, request: CacheRequest, response: CacheResponse) -> Result<bool> {
-        let span = tracing::info_span!(
+        let span = tracing::debug_span!(
             "runtime.cache.put",
             cache.name = %request.cache_name,
             http.method = %request.method,
@@ -1409,8 +1413,10 @@ impl RuntimeService {
             response.status = response.status as u64,
             response.body_size = response.body.len() as u64
         );
-        let _guard = span.enter();
-        self.cache_store.put(&request, response).await
+        self.cache_store
+            .put(&request, response)
+            .instrument(span)
+            .await
     }
 }
 

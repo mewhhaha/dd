@@ -18,6 +18,9 @@ pub(super) enum IsolateCommand {
     },
     DrainDynamicControl,
     Shutdown,
+    ShutdownAndFlushCache {
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 pub(super) struct IsolateEventLoopWaker {

@@ -67,8 +67,25 @@ large jobs. A child failure stops the run by default after writing partial JSON
 with `complete: false`, `failure`, and `failures`; use `--keep-going` for
 deliberate batch collection.
 
-All throughput runs measure `RuntimeService` directly unless noted. They do not
-include public API or network listener overhead.
+All throughput runs measure `RuntimeService` directly unless noted. The
+`http1-server-front-cache.sh` configuration is deliberately separate: it runs
+the complete `dd_server` against a temporary store and includes the public API,
+TCP listener, and persistent HTTP/1.1 connection overhead.
+
+Run five same-host samples of the network benchmark with:
+
+```bash
+node benchmarks/run.mjs --samples 5 \
+  --config http1-server-front-cache.sh \
+  --out benchmarks/results/local-http1-server-front-cache.json
+```
+
+Each sample deploys one uncached worker and one front-cache-enabled worker,
+warms the latter, then reports `http1-server/uncached-small` and
+`http1-server/front-cache-hit` as distinct result rows under `INFO` tracing.
+Every measured response is checked for its body, status, cache header, and
+propagated trace id. Captured server output also makes the run fail on a panic
+or a `WHOPPER_*` debug probe.
 
 ## Atomic scaling matrix
 
@@ -142,6 +159,9 @@ worktree before treating medians as release or main-branch evidence.
   concurrency, 1-4 isolates, and 8 max inflight.
 - Saturated fast fetch prestarts 16 isolates and uses 256 concurrent client
   tasks. It checks peak simple-fetch throughput.
+- HTTP/1 server coverage uses a dedicated server process, a temporary Turso
+  store, and persistent raw HTTP/1.1 connections. It is intentionally not
+  comparable to the in-process `RuntimeService` result rows.
 - Saturated wide memory read also prestarts 16 isolates with 256 concurrency,
   but measures keyed-memory routing and hydration.
 - Legacy `scaling-memory-*` configs fix the memory shard count at 16 and compare

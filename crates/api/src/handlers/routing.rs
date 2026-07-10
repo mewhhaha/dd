@@ -158,26 +158,29 @@ async fn route_public_h3_request(
 pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult<DeployResponse> {
     let name = validate_deploy_request(&payload)?;
     let span = tracing::info_span!("http.deploy", worker.name = %name);
-    let _guard = span.enter();
-    let deployment_id = state
-        .runtime
-        .deploy_with_bundle_config_lifecycle_and_server_modules(
-            name.clone(),
-            payload.source,
-            payload.config,
-            payload.assets,
-            payload.server_modules,
-            payload.asset_headers,
-            payload.temporary,
-        )
-        .await?;
-    tracing::info!(deployment_id = %deployment_id, "worker deployed");
+    async move {
+        let deployment_id = state
+            .runtime
+            .deploy_with_bundle_config_lifecycle_and_server_modules(
+                name.clone(),
+                payload.source,
+                payload.config,
+                payload.assets,
+                payload.server_modules,
+                payload.asset_headers,
+                payload.temporary,
+            )
+            .await?;
+        tracing::info!(deployment_id = %deployment_id, "worker deployed");
 
-    Ok(DeployResponse {
-        ok: true,
-        worker: name,
-        deployment_id,
-    })
+        Ok(DeployResponse {
+            ok: true,
+            worker: name,
+            deployment_id,
+        })
+    }
+    .instrument(span)
+    .await
 }
 
 fn validate_deploy_request(payload: &DeployRequest) -> ApiResult<String> {

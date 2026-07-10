@@ -618,7 +618,12 @@ pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<()> {
                     }
                 }
 
-                manager.shutdown_all();
+                if let Err(error) = manager.shutdown_all().await {
+                    tracing::warn!(error = %error, "failed to flush cache recency while stopping isolates");
+                }
+                if let Err(error) = manager.cache_store.flush_pending_touches().await {
+                    tracing::warn!(error = %error, "failed to flush cache recency while stopping runtime");
+                }
             });
         })
         .map_err(|error| PlatformError::internal(error.to_string()))?;
@@ -841,6 +846,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         generation,
         isolate_id,
         event_tx,
+        thread_tracker,
     } = start;
     let (command_tx, mut command_rx) = mpsc::channel(ISOLATE_COMMAND_CHANNEL_CAPACITY);
     let dynamic_control_inbox = crate::ops::DynamicControlInbox::default();
@@ -855,6 +861,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
     let thread_event_tx = event_tx.clone();
     let exit_event_tx = event_tx.clone();
     let exit_worker_name = worker_name.clone();
+    let thread_guard = thread_tracker.register();
 
     thread::Builder::new()
         .name(thread_name)
@@ -862,6 +869,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
             let runtime = match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    drop(thread_guard);
                     let _ = thread_event_tx.blocking_send(RuntimeEvent::IsolateFailed {
                         worker_name: worker_name.clone(),
                         generation,
@@ -1056,6 +1064,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                     }
                 }
             });
+            drop(thread_guard);
             let _ = exit_event_tx.blocking_send(RuntimeEvent::IsolateExited {
                 worker_name: exit_worker_name,
                 generation,
@@ -1154,8 +1163,8 @@ pub(super) async fn handle_isolate_command(
                     request_context_handle,
                 );
             }
-            let execute_span = if tracing::enabled!(Level::INFO) {
-                let span = tracing::info_span!(
+            let execute_span = if tracing::enabled!(Level::DEBUG) {
+                let span = tracing::debug_span!(
                     "runtime.isolate.execute",
                     worker.name = %worker_name,
                     worker.generation = generation,
@@ -1168,59 +1177,71 @@ pub(super) async fn handle_isolate_command(
             } else {
                 None
             };
-            let _execute_guard = execute_span.as_ref().map(|span| span.enter());
-            let started_at = Instant::now();
-            if let Err(error) = dispatch_worker_request(
-                js_runtime,
-                WorkerDispatchRequest {
-                    request_id: &runtime_request_id,
-                    request_context_handle,
-                    completion_handle,
-                    memory_request_scope_handle,
-                    request_body_stream_handle,
-                    stream_response,
-                    memory_call: memory_call.as_ref(),
-                    host_rpc_call: host_rpc_call.as_ref(),
-                    request,
-                },
-            ) {
-                {
-                    let op_state = js_runtime.op_state();
-                    let mut op_state = op_state.borrow_mut();
-                    clear_request_body_stream(&mut op_state, request_body_stream_handle);
-                    crate::ops::clear_memory_request_scope(
-                        &mut op_state,
+            async move {
+                let started_at = Instant::now();
+                if let Err(error) = dispatch_worker_request(
+                    js_runtime,
+                    WorkerDispatchRequest {
+                        request_id: &runtime_request_id,
+                        request_context_handle,
+                        completion_handle,
                         memory_request_scope_handle,
+                        request_body_stream_handle,
+                        stream_response,
+                        memory_call: memory_call.as_ref(),
+                        host_rpc_call: host_rpc_call.as_ref(),
+                        request,
+                    },
+                ) {
+                    {
+                        let op_state = js_runtime.op_state();
+                        let mut op_state = op_state.borrow_mut();
+                        clear_request_body_stream(&mut op_state, request_body_stream_handle);
+                        crate::ops::clear_memory_request_scope(
+                            &mut op_state,
+                            memory_request_scope_handle,
+                        );
+                        crate::ops::clear_memory_command_handles(
+                            &mut op_state,
+                            request_context_handle,
+                        );
+                        crate::ops::clear_memory_byte_handles(
+                            &mut op_state,
+                            request_context_handle,
+                        );
+                        crate::ops::clear_memory_batch_handles(
+                            &mut op_state,
+                            request_context_handle,
+                        );
+                        clear_request_secret_context(&mut op_state, request_context_handle);
+                    }
+                    tracing::warn!(
+                        dispatch_ms = started_at.elapsed().as_millis() as u64,
+                        error = %error,
+                        "failed to dispatch request into isolate"
                     );
-                    crate::ops::clear_memory_command_handles(&mut op_state, request_context_handle);
-                    crate::ops::clear_memory_byte_handles(&mut op_state, request_context_handle);
-                    crate::ops::clear_memory_batch_handles(&mut op_state, request_context_handle);
-                    clear_request_secret_context(&mut op_state, request_context_handle);
+                    let _ = event_tx
+                        .send(RuntimeEvent::RequestFinished {
+                            worker_name: worker_name.to_string(),
+                            generation,
+                            isolate_id,
+                            request_id: runtime_request_id,
+                            completion_token,
+                            finished_at: Instant::now(),
+                            wait_until_count: 0,
+                            result: Err(error),
+                        })
+                        .await;
+                } else {
+                    tracing::debug!(
+                        dispatch_ms = started_at.elapsed().as_millis() as u64,
+                        "request dispatched into isolate event loop"
+                    );
                 }
-                tracing::warn!(
-                    dispatch_ms = started_at.elapsed().as_millis() as u64,
-                    error = %error,
-                    "failed to dispatch request into isolate"
-                );
-                let _ = event_tx
-                    .send(RuntimeEvent::RequestFinished {
-                        worker_name: worker_name.to_string(),
-                        generation,
-                        isolate_id,
-                        request_id: runtime_request_id,
-                        completion_token,
-                        finished_at: Instant::now(),
-                        wait_until_count: 0,
-                        result: Err(error),
-                    })
-                    .await;
-            } else {
-                tracing::info!(
-                    dispatch_ms = started_at.elapsed().as_millis() as u64,
-                    "request dispatched into isolate event loop"
-                );
+                Ok(true)
             }
-            Ok(true)
+            .instrument(execute_span.unwrap_or_else(tracing::Span::none))
+            .await
         }
         IsolateCommand::Abort { runtime_request_id } => {
             let request_context_handle = {
@@ -1250,8 +1271,42 @@ pub(super) async fn handle_isolate_command(
             }
             Ok(true)
         }
-        IsolateCommand::Shutdown => Ok(false),
+        IsolateCommand::Shutdown => {
+            if let Err(error) = flush_isolate_cache(js_runtime).await {
+                tracing::warn!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    error = %error,
+                    "failed to flush cache recency before isolate retirement"
+                );
+            }
+            Ok(false)
+        }
+        IsolateCommand::ShutdownAndFlushCache { reply } => {
+            let result = flush_isolate_cache(js_runtime).await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    worker = %worker_name,
+                    generation,
+                    isolate_id,
+                    error = %error,
+                    "failed to flush cache recency before isolate shutdown"
+                );
+            }
+            let _ = reply.send(result);
+            Ok(false)
+        }
     }
+}
+
+async fn flush_isolate_cache(js_runtime: &mut deno_core::JsRuntime) -> Result<()> {
+    let cache_store = js_runtime
+        .op_state()
+        .borrow()
+        .borrow::<CacheStore>()
+        .clone();
+    cache_store.flush_pending_touches().await
 }
 
 async fn handle_isolate_command_or_fail(

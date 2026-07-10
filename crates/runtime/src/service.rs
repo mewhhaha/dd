@@ -38,6 +38,7 @@ use crate::ops::{
 use crate::static_assets::{
     AssetBundle, AssetRequest, AssetResponse, compile_asset_bundle, resolve_asset,
 };
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use common::{
     DeployAsset, DeployBinding, DeployConfig, DeployServerModule, ErrorKind, PlatformError, Result,
@@ -64,7 +65,7 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
-use tracing::{Level, info, warn};
+use tracing::{Instrument, Level, info, warn};
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -80,7 +81,7 @@ use self::sessions::{
 };
 type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
 type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
-type AssetCatalogSnapshot = Arc<StdMutex<Arc<HashMap<String, Arc<AssetCatalogEntry>>>>>;
+type AssetCatalogSnapshot = Arc<ArcSwap<HashMap<String, Arc<AssetCatalogEntry>>>>;
 pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
     DynamicDeployResult, DynamicHandleDebug, DynamicRuntimeDebugDump, HostRpcProviderDebug,
@@ -90,35 +91,42 @@ pub use self::facade::{
     WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AssetCatalog {
     snapshot: AssetCatalogSnapshot,
 }
 
+impl Default for AssetCatalog {
+    fn default() -> Self {
+        Self {
+            snapshot: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        }
+    }
+}
+
 impl AssetCatalog {
     fn get(&self, worker_name: &str) -> Option<Arc<AssetCatalogEntry>> {
-        self.snapshot
-            .lock()
-            .expect("asset catalog mutex poisoned")
-            .get(worker_name)
-            .cloned()
+        self.snapshot.load().get(worker_name).cloned()
     }
 
     fn insert(&self, worker_name: String, entry: AssetCatalogEntry) {
-        let mut snapshot = self.snapshot.lock().expect("asset catalog mutex poisoned");
-        let mut next = (**snapshot).clone();
-        next.insert(worker_name, Arc::new(entry));
-        *snapshot = Arc::new(next);
+        let entry = Arc::new(entry);
+        self.snapshot.rcu(|snapshot| {
+            let mut next = (**snapshot).clone();
+            next.insert(worker_name.clone(), Arc::clone(&entry));
+            next
+        });
     }
 
     fn remove(&self, worker_name: &str) {
-        let mut snapshot = self.snapshot.lock().expect("asset catalog mutex poisoned");
-        if !snapshot.contains_key(worker_name) {
-            return;
-        }
-        let mut next = (**snapshot).clone();
-        next.remove(worker_name);
-        *snapshot = Arc::new(next);
+        self.snapshot.rcu(|snapshot| {
+            if !snapshot.contains_key(worker_name) {
+                return Arc::clone(snapshot);
+            }
+            let mut next = (**snapshot).clone();
+            next.remove(worker_name);
+            Arc::new(next)
+        });
     }
 }
 

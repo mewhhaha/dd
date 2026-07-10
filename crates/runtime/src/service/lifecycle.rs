@@ -615,7 +615,7 @@ impl WorkerManager {
         if method != "GET" {
             return;
         }
-        let revalidate_span = tracing::info_span!(
+        let revalidate_span = tracing::debug_span!(
             "runtime.cache.revalidate_schedule",
             worker.name = %worker_name,
             worker.generation = generation,
@@ -631,7 +631,7 @@ impl WorkerManager {
 
         let key = cache_revalidation_key(worker_name, generation, &request);
         if !self.revalidation_keys.insert(key.clone()) {
-            tracing::info!("skipping duplicate cache revalidation");
+            tracing::debug!("skipping duplicate cache revalidation");
             return;
         }
 
@@ -689,7 +689,7 @@ impl WorkerManager {
             self.account_queued_pending(queued_bytes);
             self.revalidation_requests.insert(runtime_request_id, key);
             self.dispatch_pool(worker_name, generation, event_tx);
-            tracing::info!("scheduled background cache revalidation");
+            tracing::debug!("scheduled background cache revalidation");
         } else {
             self.revalidation_keys.remove(&key);
         }

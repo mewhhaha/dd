@@ -2,7 +2,7 @@ use common::{PlatformError, Result};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use turso::Connection;
+use turso::{Connection, IntoParams, Rows};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const MAX_BUSY_RETRY_ATTEMPTS: usize = 8;
@@ -13,6 +13,31 @@ pub(crate) fn configure_turso_connection(
 ) -> Result<()> {
     conn.busy_timeout(BUSY_TIMEOUT).map_err(map_error)?;
     Ok(())
+}
+
+/// Query using Turso's per-connection prepared-statement cache.
+///
+/// Requiring a static SQL string keeps generated selectors and variable-sized
+/// `IN` queries from growing the cache without bound.
+pub(crate) async fn query_cached(
+    conn: &Connection,
+    sql: &'static str,
+    params: impl IntoParams,
+) -> turso::Result<Rows> {
+    let mut statement = conn.prepare_cached(sql).await?;
+    statement.query(params).await
+}
+
+/// Execute using Turso's per-connection prepared-statement cache.
+///
+/// See [`query_cached`] for why this accepts only static SQL.
+pub(crate) async fn execute_cached(
+    conn: &Connection,
+    sql: &'static str,
+    params: impl IntoParams,
+) -> turso::Result<u64> {
+    let mut statement = conn.prepare_cached(sql).await?;
+    statement.execute(params).await
 }
 
 pub(crate) async fn retry_turso_busy<F, Fut, T, E>(

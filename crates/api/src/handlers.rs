@@ -49,7 +49,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::server::create_response as create_ws_response;
 #[cfg(feature = "websocket")]
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
-use tracing::Span;
+use tracing::{Instrument, Span};
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;

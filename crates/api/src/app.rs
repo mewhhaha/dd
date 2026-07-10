@@ -105,6 +105,15 @@ enum ListenerKind {
     Private,
 }
 
+impl ListenerKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Public { .. } => "public",
+            Self::Private => "private",
+        }
+    }
+}
+
 async fn serve_listener(
     listener: tokio::net::TcpListener,
     state: AppState,
@@ -127,6 +136,14 @@ async fn serve_listener(
             .accept()
             .await
             .map_err(|error| PlatformError::internal(error.to_string()))?;
+        if let Err(error) = stream.set_nodelay(true) {
+            warn!(
+                %remote_addr,
+                listener = kind.label(),
+                error = %error,
+                "failed to enable TCP_NODELAY on accepted connection"
+            );
+        }
         let io = TokioIo::new(stream);
         let state = state.clone();
         let kind = kind.clone();

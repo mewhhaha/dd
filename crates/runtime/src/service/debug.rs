@@ -130,11 +130,11 @@ impl WorkerPool {
     }
 
     pub(super) fn log_stats(&self, event: &str) {
-        if !tracing::enabled!(Level::INFO) {
+        if !tracing::enabled!(Level::TRACE) {
             return;
         }
         let snapshot = self.stats_snapshot();
-        info!(
+        tracing::trace!(
             worker = %self.worker_name,
             generation = snapshot.generation,
             public = snapshot.public,

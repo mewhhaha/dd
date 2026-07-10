@@ -51,3 +51,8 @@ serial_test = "3"
 [[test]]
 name = "public_h3_websocket_blackbox"
 required-features = ["http3", "websocket"]
+
+[[bin]]
+name = "bench_http_server"
+path = "src/bin/bench_http_server.rs"
+required-features = ["otel"]

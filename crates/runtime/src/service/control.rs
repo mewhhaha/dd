@@ -75,7 +75,7 @@ pub(crate) enum RuntimeCommand {
         reply: oneshot::Sender<DynamicRuntimeDebugDump>,
     },
     Shutdown {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<()>>,
     },
     #[cfg(test)]
     ForceFailIsolate {
@@ -309,6 +309,7 @@ impl WorkerManager {
             global_isolate_slots_used: 0,
             global_isolates_starting: 0,
             exiting_isolate_slots: HashMap::new(),
+            isolate_thread_tracker: IsolateThreadTracker::default(),
             stats: RuntimeManagerStats::default(),
             next_generation: 1,
             next_isolate_id: 1,
@@ -697,8 +698,15 @@ impl WorkerManager {
                 true
             }
             RuntimeCommand::Shutdown { reply } => {
-                self.shutdown_all();
-                let _ = reply.send(());
+                let isolate_flush = self.shutdown_all().await;
+                if let Err(error) = &isolate_flush {
+                    tracing::warn!(error = %error, "failed to flush cache recency in isolate shutdown");
+                }
+                let final_flush = self.cache_store.flush_pending_touches().await;
+                if let Err(error) = &final_flush {
+                    tracing::warn!(error = %error, "failed to flush cache recency during shutdown");
+                }
+                let _ = reply.send(isolate_flush.and(final_flush));
                 false
             }
             #[cfg(test)]
@@ -1606,7 +1614,7 @@ impl WorkerManager {
             .and_then(|entry| entry.pools.get_mut(&generation))
     }
 
-    pub(super) fn shutdown_all(&mut self) {
+    pub(super) async fn shutdown_all(&mut self) -> Result<()> {
         let worker_names = self.workers.keys().cloned().collect::<Vec<_>>();
         for worker_name in worker_names {
             self.reap_owned_sessions(&worker_name, None, None);
@@ -1616,6 +1624,7 @@ impl WorkerManager {
         let mut dequeued_count = 0usize;
         let mut dequeued_bytes = 0usize;
         let mut exiting_slots = Vec::new();
+        let mut shutdown_senders = Vec::new();
         for (worker_name, entry) in &mut self.workers {
             for (generation, pool) in &mut entry.pools {
                 while let Some(pending) = pool.queue.pop_front() {
@@ -1625,7 +1634,7 @@ impl WorkerManager {
                 }
                 pool.clear_isolate_indices();
                 for isolate in pool.isolates.drain(..) {
-                    let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                    shutdown_senders.push(isolate.sender);
                     exiting_slots.push((
                         worker_name.clone(),
                         *generation,
@@ -1689,5 +1698,36 @@ impl WorkerManager {
         self.dynamic_worker_handles.clear();
         self.dynamic_worker_ids.clear();
         self.host_rpc_providers.clear();
+
+        let thread_tracker = self.isolate_thread_tracker.clone();
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut flush_replies = Vec::with_capacity(shutdown_senders.len());
+            for sender in shutdown_senders {
+                let (reply, flushed) = oneshot::channel();
+                if sender
+                    .send(IsolateCommand::ShutdownAndFlushCache { reply })
+                    .await
+                    .is_ok()
+                {
+                    flush_replies.push(flushed);
+                }
+            }
+            let mut flush_error = None;
+            for reply in flush_replies {
+                if let Ok(Err(error)) = reply.await
+                    && flush_error.is_none()
+                {
+                    flush_error = Some(error);
+                }
+            }
+            thread_tracker.wait_for_empty().await;
+            if let Some(error) = flush_error {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|_| PlatformError::internal("timed out waiting for isolate shutdown"))?
     }
 }

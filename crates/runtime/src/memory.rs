@@ -11,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
 use turso::{Builder, Connection, Database, Value};
 
-use crate::turso_util::{configure_turso_connection, is_retryable_turso_error};
+use crate::turso_util::{
+    configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
+};
 
 const MEMORY_SHARD_HASH_DOMAIN: &[u8] = b"dd-memory-shard-v1\0";
 const MEMORY_LAYOUT_MANIFEST_FILE: &str = "memory-layout.json";
@@ -829,16 +831,16 @@ impl MemoryStore {
             return Ok(snapshot);
         }
         let conn = self.connect(namespace, memory_key).await?;
-        let mut rows = conn
-            .query(
-                "SELECT item_key, value_blob, encoding, value, version, deleted
+        let mut rows = query_cached(
+            &conn,
+            "SELECT item_key, value_blob, encoding, value, version, deleted
                  FROM memory_state
                  WHERE entity_key = ?1
                  ORDER BY item_key ASC",
-                (memory_key,),
-            )
-            .await
-            .map_err(memory_error)?;
+            (memory_key,),
+        )
+        .await
+        .map_err(memory_error)?;
 
         let mut entries = Vec::new();
         let mut max_version = -1i64;
@@ -1152,12 +1154,10 @@ impl MemoryStore {
 
             let outcome = async {
                 let validate_started = Instant::now();
-                let current = self
-                    .max_version_for_memory(&conn, memory_key)
-                    .await?
-                    .unwrap_or(-1);
-                self.validate_owner_epoch(&conn, memory_key, owner_epoch)
-                    .await?;
+                let (current, current_owner_epoch) =
+                    self.memory_meta_for_commit(&conn, memory_key).await?;
+                let current = current.unwrap_or(-1);
+                validate_owner_epoch(current_owner_epoch, owner_epoch)?;
                 self.record_profile(
                     MemoryProfileMetricKind::StoreApplyBatchValidate,
                     validate_started.elapsed().as_micros() as u64,
@@ -1296,16 +1296,16 @@ impl MemoryStore {
             return Ok(None);
         }
         let conn = self.connect(namespace, memory_key).await?;
-        let mut rows = conn
-            .query(
-                "SELECT result_blob, revision
+        let mut rows = query_cached(
+            &conn,
+            "SELECT result_blob, revision
                  FROM memory_commands
                  WHERE entity_key = ?1 AND idempotency_key = ?2
                  LIMIT 1",
-                (memory_key, key),
-            )
-            .await
-            .map_err(memory_error)?;
+            (memory_key, key),
+        )
+        .await
+        .map_err(memory_error)?;
         let Some(row) = rows.next().await.map_err(memory_error)? else {
             return Ok(None);
         };
@@ -1322,8 +1322,8 @@ impl MemoryStore {
         memory_key: &str,
     ) -> Result<Vec<MemoryOutboxRecord>> {
         let conn = self.connect(namespace, memory_key).await?;
-        let mut rows = conn
-            .query(
+        let mut rows = query_cached(
+            &conn,
                 "SELECT effect_id, kind, payload_blob, revision, status, attempt_count, next_attempt_at_ms
                  FROM memory_outbox
                  WHERE entity_key = ?1
@@ -1379,8 +1379,8 @@ impl MemoryStore {
             }
 
             let outcome = async {
-                let mut rows = conn
-                    .query(
+                let mut rows = query_cached(
+                    &conn,
                         "SELECT effect_id, kind, payload_blob, revision, status, attempt_count, next_attempt_at_ms
                          FROM memory_outbox
                          WHERE entity_key = ?1
@@ -1405,7 +1405,8 @@ impl MemoryStore {
                     });
                 }
                 for record in &records {
-                    conn.execute(
+                    execute_cached(
+                        &conn,
                         "UPDATE memory_outbox
                          SET status = 'inflight',
                              attempt_count = ?1,
@@ -1533,7 +1534,8 @@ impl MemoryStore {
         }
         let now_ms = epoch_ms_i64()?;
         let conn = self.writer_connection(namespace, memory_key).await?;
-        conn.execute(
+        execute_cached(
+            &conn,
             "UPDATE memory_outbox
              SET status = 'delivered',
                  updated_at_ms = ?1
@@ -1563,7 +1565,8 @@ impl MemoryStore {
         let now_ms = epoch_ms_i64()?;
         let next_attempt_at_ms = now_ms.saturating_add(duration_ms_i64(retry_after)?);
         let conn = self.writer_connection(namespace, memory_key).await?;
-        conn.execute(
+        execute_cached(
+            &conn,
             "UPDATE memory_outbox
              SET status = 'pending',
                  next_attempt_at_ms = ?1,
@@ -1623,7 +1626,8 @@ impl MemoryStore {
                         match delivery.action {
                             MemoryOutboxDeliveryAction::Delivered
                             | MemoryOutboxDeliveryAction::DroppedTerminal => {
-                                conn.execute(
+                                execute_cached(
+                                    &conn,
                                     "UPDATE memory_outbox
                                      SET status = 'delivered',
                                          updated_at_ms = ?1
@@ -1637,7 +1641,8 @@ impl MemoryStore {
                             MemoryOutboxDeliveryAction::Retry { retry_after } => {
                                 let next_attempt_at_ms =
                                     now_ms.saturating_add(duration_ms_i64(retry_after)?);
-                                conn.execute(
+                                execute_cached(
+                                    &conn,
                                     "UPDATE memory_outbox
                                      SET status = 'pending',
                                          next_attempt_at_ms = ?1,
@@ -1827,7 +1832,8 @@ impl MemoryStore {
                     });
                 }
                 for claim in &claims {
-                    conn.execute(
+                    execute_cached(
+                        &conn,
                         "UPDATE memory_outbox
                          SET status = 'inflight',
                              attempt_count = ?1,
@@ -2155,71 +2161,33 @@ impl MemoryStore {
         conn: &Connection,
         memory_key: &str,
     ) -> Result<Option<i64>> {
-        let mut rows = conn
-            .query(
-                "SELECT max_version FROM memory_meta
-                 WHERE entity_key = ?1
-                 LIMIT 1",
-                (memory_key,),
-            )
-            .await
-            .map_err(memory_error)?;
-        let version = if let Some(row) = rows.next().await.map_err(memory_error)? {
-            row.get::<Option<i64>>(0).map_err(memory_error)?
-        } else {
-            return Ok(None);
-        };
-        let _ = rows.next().await.map_err(memory_error)?;
-        Ok(version)
+        Ok(self.memory_meta_for_commit(conn, memory_key).await?.0)
     }
 
-    async fn owner_epoch_for_memory(
+    async fn memory_meta_for_commit(
         &self,
         conn: &Connection,
         memory_key: &str,
-    ) -> Result<Option<i64>> {
-        let mut rows = conn
-            .query(
-                "SELECT owner_epoch FROM memory_meta
+    ) -> Result<(Option<i64>, Option<i64>)> {
+        let mut rows = query_cached(
+            conn,
+            "SELECT max_version, owner_epoch FROM memory_meta
                  WHERE entity_key = ?1
                  LIMIT 1",
-                (memory_key,),
+            (memory_key,),
+        )
+        .await
+        .map_err(memory_error)?;
+        let meta = if let Some(row) = rows.next().await.map_err(memory_error)? {
+            (
+                row.get::<Option<i64>>(0).map_err(memory_error)?,
+                row.get::<Option<i64>>(1).map_err(memory_error)?,
             )
-            .await
-            .map_err(memory_error)?;
-        let epoch = if let Some(row) = rows.next().await.map_err(memory_error)? {
-            row.get::<Option<i64>>(0).map_err(memory_error)?
         } else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let _ = rows.next().await.map_err(memory_error)?;
-        Ok(epoch)
-    }
-
-    async fn validate_owner_epoch(
-        &self,
-        conn: &Connection,
-        memory_key: &str,
-        owner_epoch: Option<i64>,
-    ) -> Result<()> {
-        let Some(owner_epoch) = owner_epoch else {
-            return Ok(());
-        };
-        let owner_epoch = owner_epoch.max(0);
-        if owner_epoch == 0 {
-            return Ok(());
-        }
-        let current_owner_epoch = self
-            .owner_epoch_for_memory(conn, memory_key)
-            .await?
-            .unwrap_or(0)
-            .max(0);
-        if current_owner_epoch > owner_epoch {
-            return Err(PlatformError::runtime(format!(
-                "stale memory entity owner epoch {owner_epoch}; current owner epoch is {current_owner_epoch}"
-            )));
-        }
-        Ok(())
+        Ok(meta)
     }
 
     async fn record_for_key(
@@ -2228,16 +2196,16 @@ impl MemoryStore {
         memory_key: &str,
         item_key: &str,
     ) -> Result<Option<MemorySnapshotEntry>> {
-        let mut rows = conn
-            .query(
-                "SELECT value_blob, encoding, value, version, deleted
+        let mut rows = query_cached(
+            conn,
+            "SELECT value_blob, encoding, value, version, deleted
                  FROM memory_state
                  WHERE entity_key = ?1 AND item_key = ?2
                  LIMIT 1",
-                (memory_key, item_key),
-            )
-            .await
-            .map_err(memory_error)?;
+            (memory_key, item_key),
+        )
+        .await
+        .map_err(memory_error)?;
         let Some(row) = rows.next().await.map_err(memory_error)? else {
             return Ok(None);
         };
@@ -2762,6 +2730,23 @@ impl MemoryStore {
     }
 }
 
+fn validate_owner_epoch(current_owner_epoch: Option<i64>, owner_epoch: Option<i64>) -> Result<()> {
+    let Some(owner_epoch) = owner_epoch else {
+        return Ok(());
+    };
+    let owner_epoch = owner_epoch.max(0);
+    if owner_epoch == 0 {
+        return Ok(());
+    }
+    let current_owner_epoch = current_owner_epoch.unwrap_or(0).max(0);
+    if current_owner_epoch > owner_epoch {
+        return Err(PlatformError::runtime(format!(
+            "stale memory entity owner epoch {owner_epoch}; current owner epoch is {current_owner_epoch}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 struct MemoryEntityCacheDebugSnapshot {
     snapshot_keys: HashSet<String>,
@@ -2781,7 +2766,8 @@ async fn upsert_memory_state_row(
     let now_ms = epoch_ms_i64()?;
     if deleted {
         let empty_blob: &[u8] = &[];
-        conn.execute(
+        execute_cached(
+            conn,
             "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
              VALUES (?1, ?2, '', ?3, ?4, 1, ?5, ?6)
              ON CONFLICT(entity_key, item_key) DO UPDATE SET
@@ -2811,7 +2797,8 @@ async fn upsert_memory_state_row(
     } else {
         ""
     };
-    conn.execute(
+    execute_cached(
+        conn,
         "INSERT INTO memory_state (entity_key, item_key, value, value_blob, encoding, deleted, version, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
          ON CONFLICT(entity_key, item_key) DO UPDATE SET
@@ -2838,7 +2825,8 @@ async fn upsert_memory_meta_row(
 ) -> Result<()> {
     let now_ms = epoch_ms_i64()?;
     let owner_epoch = owner_epoch.unwrap_or(0).max(0);
-    conn.execute(
+    execute_cached(
+        conn,
         "INSERT INTO memory_meta (entity_key, max_version, owner_epoch, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(entity_key) DO UPDATE SET
@@ -2860,7 +2848,8 @@ async fn insert_memory_command_result_row(
     revision: i64,
 ) -> Result<()> {
     let now_ms = epoch_ms_i64()?;
-    conn.execute(
+    execute_cached(
+        conn,
         "INSERT INTO memory_commands (entity_key, idempotency_key, result_blob, revision, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         (memory_key, idempotency_key, result, revision, now_ms),
@@ -2879,7 +2868,8 @@ async fn insert_memory_outbox_row(
 ) -> Result<()> {
     let now_ms = epoch_ms_i64()?;
     let effect_id = memory_outbox_effect_id(memory_key, revision, ordinal, effect);
-    conn.execute(
+    execute_cached(
+        conn,
         "INSERT INTO memory_outbox (
            effect_id,
            entity_key,
@@ -3169,13 +3159,9 @@ async fn ensure_schema(database: &Database) -> Result<()> {
     .await
     .map_err(memory_error)?;
     ensure_compat_columns(&conn).await?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_memory_state_lookup
-         ON memory_state(entity_key, item_key)",
-        (),
-    )
-    .await
-    .map_err(memory_error)?;
+    conn.execute("DROP INDEX IF EXISTS idx_memory_state_lookup", ())
+        .await
+        .map_err(memory_error)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memory_state_list
          ON memory_state(entity_key, deleted, item_key)",
@@ -4241,6 +4227,55 @@ mod tests {
         assert_ne!(first, memory_outbox_effect_id("entity", 8, 0, &effect));
         assert!(first.starts_with("memfx_"));
         assert_eq!(first.len(), "memfx_".len() + 64);
+    }
+
+    #[tokio::test]
+    async fn schema_migration_drops_redundant_state_lookup_index() -> Result<()> {
+        let path = temp_root("drop-redundant-index").join("memory.db");
+        ensure_parent_dir(&path)?;
+        let database = Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(memory_error)?;
+        ensure_schema(&database).await?;
+        let conn = database.connect().map_err(memory_error)?;
+        configure_connection(&conn).await?;
+        conn.execute(
+            "CREATE INDEX idx_memory_state_lookup ON memory_state(entity_key, item_key)",
+            (),
+        )
+        .await
+        .map_err(memory_error)?;
+        drop(conn);
+
+        ensure_schema(&database).await?;
+
+        let conn = database.connect().map_err(memory_error)?;
+        configure_connection(&conn).await?;
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                ("idx_memory_state_lookup",),
+            )
+            .await
+            .map_err(memory_error)?;
+        let row = rows.next().await.map_err(memory_error)?.expect("count row");
+        assert_eq!(row.get::<i64>(0).map_err(memory_error)?, 0);
+        drop(rows);
+
+        let insert = "INSERT INTO memory_state (
+            entity_key, item_key, value, encoding, deleted, version, updated_at_ms
+        ) VALUES (?1, ?2, ?3, 'utf8', 0, 1, 0)";
+        conn.execute(insert, ("entity", "item", "one"))
+            .await
+            .map_err(memory_error)?;
+        assert!(
+            conn.execute(insert, ("entity", "item", "two"))
+                .await
+                .is_err(),
+            "the primary key must continue enforcing uniqueness"
+        );
+        Ok(())
     }
 
     #[tokio::test]

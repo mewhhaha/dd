@@ -12,6 +12,7 @@ use serde_json::Value;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -4944,6 +4945,58 @@ fn static_asset_lookup_uses_catalog_without_runtime_manager_command() {
     assert!(lifecycle_source.contains("self.asset_catalog.remove(worker_name)"));
     assert!(!lifecycle_source.contains("compile_asset_bundle("));
     assert!(!lifecycle_source.contains("extract_bindings(&config)"));
+}
+
+#[test]
+fn asset_catalog_copy_on_write_preserves_concurrent_updates_and_redeploy_snapshots() {
+    let catalog = super::AssetCatalog::default();
+    let assets = Arc::new(crate::static_assets::AssetBundle::default());
+
+    std::thread::scope(|scope| {
+        for generation in 1..=32 {
+            let catalog = catalog.clone();
+            let assets = Arc::clone(&assets);
+            scope.spawn(move || {
+                let worker_name = format!("worker-{generation}");
+                catalog.insert(
+                    worker_name.clone(),
+                    super::AssetCatalogEntry {
+                        worker_name,
+                        generation,
+                        assets,
+                        public: true,
+                        cache_enabled: false,
+                    },
+                );
+            });
+        }
+    });
+
+    for generation in 1..=32 {
+        let worker_name = format!("worker-{generation}");
+        let entry = catalog
+            .get(&worker_name)
+            .expect("concurrent catalog update should not be lost");
+        assert_eq!(entry.worker_name, worker_name);
+        assert_eq!(entry.generation, generation);
+    }
+
+    let original = catalog.get("worker-1").expect("original snapshot");
+    catalog.insert(
+        "worker-1".to_string(),
+        super::AssetCatalogEntry {
+            worker_name: "worker-1".to_string(),
+            generation: 100,
+            assets,
+            public: false,
+            cache_enabled: true,
+        },
+    );
+    let redeployed = catalog.get("worker-1").expect("redeployed snapshot");
+    assert_eq!(original.generation, 1);
+    assert_eq!(redeployed.generation, 100);
+    assert!(original.public);
+    assert!(!redeployed.public);
 }
 
 #[test]
