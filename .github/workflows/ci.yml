@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - uses: Swatinem/rust-cache@v2
       - run: just check
       - name: Verify default server excludes direct HTTP/3
@@ -48,7 +48,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - run: pnpm install --frozen-lockfile
       - run: just check-js
       - run: pnpm typecheck:vite-examples
