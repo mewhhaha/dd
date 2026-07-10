@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p runtime --bin dd_dev_runtime
       - run: pnpm smoke:vite-examples
-      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm --filter './examples/vite-react-router' exec playwright install --with-deps chromium
       - run: pnpm browser:vite-examples
 
   security:
