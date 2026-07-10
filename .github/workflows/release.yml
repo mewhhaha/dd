@@ -53,7 +53,7 @@ jobs:
           name: ${{ matrix.package }}
           path: packages/${{ matrix.package }}
           if-no-files-found: error
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/dist/${{ matrix.binary }}
 
@@ -81,7 +81,7 @@ jobs:
             target/dist/dd_server
             target/dist/cli
             dd-linux-x64.spdx.json
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             target/dist/dd_server
