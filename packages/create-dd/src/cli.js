@@ -1,10 +1,13 @@
 #!/usr/bin/env node
+import { TextPrompt } from '@clack/core';
 import * as clack from '@clack/prompts';
 import cac from 'cac';
 import { spawn } from 'node:child_process';
+import { randomInt } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
+import { styleText } from 'node:util';
 import { TEMPLATE_IDS, installCommand, packageManagerFromUserAgent, scaffold } from './core.js';
 
 const packageVersion = JSON.parse(
@@ -16,6 +19,71 @@ const templateOptions = [
   { value: 'react-router-rsc', label: 'React Router RSC', hint: 'server components' },
   { value: 'hono', label: 'Hono', hint: 'lightweight web app' },
 ];
+
+const projectNameAdjectives = [
+  'amber', 'brisk', 'coral', 'daring', 'ember', 'frosty', 'golden', 'harbor',
+  'indigo', 'jolly', 'lunar', 'mossy', 'nimble', 'orbit', 'pebble', 'quiet',
+  'ripple', 'solar', 'tidal', 'velvet', 'willow', 'zephyr',
+];
+
+const projectNameNouns = [
+  'badger', 'beacon', 'comet', 'dolphin', 'falcon', 'forest', 'garden', 'heron',
+  'island', 'jaguar', 'lantern', 'meadow', 'otter', 'planet', 'quartz', 'rocket',
+  'saffron', 'thunder', 'voyager', 'whale',
+];
+
+export function generateProjectName() {
+  const wordCount = randomInt(3, 5);
+  return Array.from({ length: wordCount }, (_, index) => {
+    const words = index % 2 === 0 ? projectNameAdjectives : projectNameNouns;
+    return words[randomInt(words.length)];
+  }).join('-');
+}
+
+export function relativeDirectoryPrompt(options) {
+  const prompt = new TextPrompt({
+    defaultValue: options.defaultValue,
+    initialValue: options.initialValue,
+    input: options.input,
+    output: options.output,
+    signal: options.signal,
+    validate: options.validate,
+    render() {
+      const withGuide = options.withGuide ?? clack.settings.withGuide;
+      const header = `${withGuide ? `${styleText('gray', clack.S_BAR)}\n` : ''}${clack.symbol(this.state)}  ${options.message}\n`;
+      const placeholder = options.placeholder
+        ? styleText('inverse', options.placeholder[0]) + styleText('dim', options.placeholder.slice(1))
+        : styleText(['inverse', 'hidden'], '_');
+      const input = this.userInput ? this.userInputWithCursor : placeholder;
+      const value = this.value ?? '';
+      const prefix = styleText('dim', './');
+
+      if (this.state === 'error') {
+        const bar = withGuide ? `${styleText('yellow', clack.S_BAR)}  ` : '';
+        const barEnd = withGuide ? styleText('yellow', clack.S_BAR_END) : '';
+        const error = this.error ? `  ${styleText('yellow', this.error)}` : '';
+        return `${header.trim()}\n${bar}${prefix}${input}\n${barEnd}${error}\n`;
+      }
+      if (this.state === 'submit') {
+        const bar = withGuide ? styleText('gray', clack.S_BAR) : '';
+        const submitted = value ? `  ${styleText('dim', `./${value}`)}` : '';
+        return `${header}${bar}${submitted}`;
+      }
+      if (this.state === 'cancel') {
+        const bar = withGuide ? styleText('gray', clack.S_BAR) : '';
+        const cancelled = value ? `  ${styleText(['strikethrough', 'dim'], `./${value}`)}` : '';
+        return `${header}${bar}${cancelled}${value.trim() ? `\n${bar}` : ''}`;
+      }
+
+      const bar = withGuide ? `${styleText('cyan', clack.S_BAR)}  ` : '';
+      const barEnd = withGuide ? styleText('cyan', clack.S_BAR_END) : '';
+      return `${header}${bar}${prefix}${input}\n${barEnd}\n`;
+    },
+  });
+  return prompt.prompt();
+}
+
+const defaultPrompts = { ...clack, text: relativeDirectoryPrompt };
 
 export function shellEscapePath(target, platform = process.platform) {
   if (platform === 'win32') return JSON.stringify(target);
@@ -102,7 +170,7 @@ function cancelPrompts(prompts) {
 
 export async function promptMissing(
   options,
-  prompts = clack,
+  prompts = defaultPrompts,
   interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY),
 ) {
   if (options.target && options.template) return options;
@@ -111,16 +179,14 @@ export async function promptMissing(
   }
 
   if (!options.target) {
+    const defaultTarget = generateProjectName();
     const target = await prompts.text({
       message: 'Where should we create your project?',
-      placeholder: 'my-dd-app',
-      defaultValue: 'my-dd-app',
-      validate(value) {
-        if (!value.trim()) return 'Project directory is required.';
-      },
+      placeholder: defaultTarget,
+      defaultValue: defaultTarget,
     });
     if (prompts.isCancel(target)) return cancelPrompts(prompts);
-    options.target = target.trim();
+    options.target = target?.trim() || defaultTarget;
   }
 
   if (!options.template) {
@@ -148,7 +214,7 @@ function spawnInstall(command, args, cwd) {
   });
 }
 
-export async function run(argv = process.argv.slice(2), prompts = clack) {
+export async function run(argv = process.argv.slice(2), prompts = defaultPrompts) {
   let options = parseArgs(argv);
   if (options.help || options.version) return;
 

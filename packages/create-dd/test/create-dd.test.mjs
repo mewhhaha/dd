@@ -3,10 +3,12 @@ import { execFile, spawnSync } from 'node:child_process';
 import { access, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
+import { stripVTControlCharacters } from 'node:util';
 import { x as extractTar } from 'tar';
 import { TEMPLATE_IDS, assertUsableTarget, packageManagerFromUserAgent, scaffold } from '../src/core.js';
-import { directoryInstructions, parseArgs, promptMissing, shellEscapePath } from '../src/cli.js';
+import { directoryInstructions, generateProjectName, parseArgs, promptMissing, relativeDirectoryPrompt, shellEscapePath } from '../src/cli.js';
 
 function runPnpm(args, cwd) {
   const command = process.env.npm_execpath ? process.execPath : process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
@@ -162,6 +164,55 @@ test('clack prompts collect missing project options', async () => {
   assert.equal(result.target, 'my app');
   assert.equal(result.template, 'react-router-rsc');
   assert.deepEqual(calls.map(([kind]) => kind), ['text', 'select']);
+});
+
+test('directory prompt renders a fixed relative-path prefix without returning it', async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  output.columns = 80;
+  let rendered = '';
+  output.on('data', chunk => { rendered += chunk; });
+
+  const resultPromise = relativeDirectoryPrompt({
+    message: 'Where should we create your project?',
+    placeholder: 'random-folder',
+    defaultValue: 'random-folder',
+    input,
+    output,
+  });
+  queueMicrotask(() => {
+    for (const character of 'custom-folder') {
+      input.emit('keypress', character, { name: character, sequence: character });
+    }
+    input.emit('keypress', '', { name: 'return', sequence: '\r' });
+  });
+
+  assert.equal(await resultPromise, 'custom-folder');
+  assert.match(stripVTControlCharacters(rendered), /\.\/custom-folder/);
+});
+
+test('uses a generated project name when the directory prompt is submitted empty', async () => {
+  let textOptions;
+  const prompts = {
+    cancel() { assert.fail('prompt should not cancel'); },
+    isCancel() { return false; },
+    async select() { return 'hono'; },
+    async text(options) {
+      textOptions = options;
+      assert.equal(options.validate?.(''), undefined);
+      return '';
+    },
+  };
+  const result = await promptMissing({ install: true }, prompts, true);
+  assert.equal(result.target, textOptions.defaultValue);
+  assert.equal(textOptions.placeholder, textOptions.defaultValue);
+  assert.match(result.target, /^(?:[a-z]+-){2,3}[a-z]+$/);
+});
+
+test('generates three or four dash-delimited project-name words', () => {
+  for (let index = 0; index < 100; index++) {
+    assert.match(generateProjectName(), /^(?:[a-z]+-){2,3}[a-z]+$/);
+  }
 });
 
 test('clack cancellation stops before scaffolding', async () => {
