@@ -150,6 +150,7 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
 async fn memory_exported_atomic_commands_do_not_target_busy_caller_isolates() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
+        max_global_isolates: 16,
         max_isolates: 16,
         max_inflight_per_isolate: 1,
         request_wall_timeout: Duration::from_secs(5),
