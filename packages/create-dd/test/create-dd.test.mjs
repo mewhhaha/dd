@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { x as extractTar } from 'tar';
 import { TEMPLATE_IDS, assertUsableTarget, packageManagerFromUserAgent, scaffold } from '../src/core.js';
-import { directoryInstructions, parseArgs, shellEscapePath } from '../src/cli.js';
+import { directoryInstructions, parseArgs, promptMissing, shellEscapePath } from '../src/cli.js';
 
 function runPnpm(args, cwd) {
   const command = process.env.npm_execpath ? process.execPath : process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
@@ -114,9 +114,66 @@ test('detects package manager from npm user agent', () => {
   assert.equal(packageManagerFromUserAgent('npm/11.0.0 node/v24'), 'npm');
 });
 
-test('rejects missing option values before treating options as values', () => {
-  assert.throws(() => parseArgs(['app', '--template', '--no-install']), /Missing value for --template/);
-  assert.throws(() => parseArgs(['app', '--package-manager', '-t', 'hono']), /Missing value for --package-manager/);
+test('cac parses the public CLI interface', () => {
+  assert.deepEqual(parseArgs(['app', '-t', 'hono', '--no-install', '--package-manager', 'pnpm']), {
+    install: false,
+    packageManager: 'pnpm',
+    target: 'app',
+    template: 'hono',
+  });
+  assert.equal(parseArgs(['app', '--no-install', '--install']).install, true);
+  assert.equal(
+    parseArgs(['app', '-t', 'hono', '--template', 'react-router']).template,
+    'react-router',
+  );
+  assert.equal(
+    parseArgs(['app', '--package-manager', 'npm', '--package-manager=pnpm']).packageManager,
+    'pnpm',
+  );
+  assert.throws(() => parseArgs(['app', '--wat']), /Unknown option/);
+  assert.throws(() => parseArgs(['one', 'two']), /Unused args/);
+  assert.throws(() => parseArgs(['app', '--', '--wat']), /Unused args/);
+});
+
+test('cac rejects missing option values before treating options as values', () => {
+  assert.throws(() => parseArgs(['app', '--template', '--no-install']), /value is missing/);
+  assert.throws(() => parseArgs(['app', '--package-manager', '-t', 'hono']), /value is missing/);
+  assert.throws(
+    () => parseArgs(['app', '--template=hono', '--template']),
+    /value is missing/,
+  );
+  assert.throws(
+    () => parseArgs([
+      'app', '--template', 'hono', '--package-manager', 'pnpm', '--package-manager', '--no-install',
+    ]),
+    /value is missing/,
+  );
+});
+
+test('clack prompts collect missing project options', async () => {
+  const calls = [];
+  const prompts = {
+    cancel() { assert.fail('prompt should not cancel'); },
+    isCancel() { return false; },
+    async select(options) { calls.push(['select', options]); return 'react-router-rsc'; },
+    async text(options) { calls.push(['text', options]); return 'my app'; },
+  };
+  const result = await promptMissing({ install: true }, prompts, true);
+  assert.equal(result.target, 'my app');
+  assert.equal(result.template, 'react-router-rsc');
+  assert.deepEqual(calls.map(([kind]) => kind), ['text', 'select']);
+});
+
+test('clack cancellation stops before scaffolding', async () => {
+  const cancelled = Symbol('cancelled');
+  let message;
+  const prompts = {
+    cancel(value) { message = value; },
+    isCancel(value) { return value === cancelled; },
+    async text() { return cancelled; },
+  };
+  assert.equal(await promptMissing({ install: true }, prompts, true), undefined);
+  assert.equal(message, 'Operation cancelled.');
 });
 
 test('shell-escapes literal target paths', () => {

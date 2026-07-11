@@ -75,6 +75,17 @@ check:
   cargo clippy --workspace --all-targets --all-features -- -D warnings
   cargo test --workspace
 
+# Pack and run the local create-dd CLI through pnpm.
+[positional-arguments]
+create *args:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  temporary="$(mktemp -d "${TMPDIR:-/tmp}/create-dd.XXXXXX")"
+  trap 'rm -rf "$temporary"' EXIT
+  archive="$temporary/create-dd.tgz"
+  pnpm --dir packages/create-dd pack --out "$archive" >/dev/null
+  pnpm dlx "$archive" "$@"
+
 # Build the full dd_server artifact and write a size report.
 server-full profile="dist":
   ./scripts/measure-binary-size.sh {{profile}} full
