@@ -1,0 +1,16 @@
+{
+  "name": "@mewhhaha/create-dd",
+  "version": "0.1.0",
+  "description": "Create a new dd application",
+  "type": "module",
+  "bin": { "create-dd": "./dist/cli.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "pnpm run build",
+    "test": "pnpm run build && node --test test/*.test.mjs",
+    "check": "node --check src/core.js && node --check src/cli.js && node --check scripts/build.mjs"
+  },
+  "devDependencies": { "tar": "^7.5.19" }
+}

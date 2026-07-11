@@ -241,6 +241,16 @@ Workers can be tested and developed against the native runtime without starting
 `dd_dev_runtime` over stdio, deploys worker source into `RuntimeService`, and
 invokes it directly from Vitest helpers or a Vite plugin.
 
+Start a new TypeScript project with the interactive creator:
+
+```bash
+pnpm create @mewhhaha/dd
+```
+
+The creator includes Hono, React Router, and React Router RSC starters. Pass a
+directory and `--template` to skip the prompts, for example
+`pnpm create @mewhhaha/dd my-app --template hono`.
+
 This is the debug/dev path where `eval` and `new Function` are allowed. It is
 not a production control plane.
 

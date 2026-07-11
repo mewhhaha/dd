@@ -9,6 +9,12 @@ directly to `RuntimeService`.
 binary package such as `@mewhhaha/dd-linux-x64` or `@mewhhaha/dd-darwin-arm64`.
 Package managers install only the runtime package matching the current platform.
 
+Create a new Hono, React Router, or React Router RSC project with:
+
+```bash
+pnpm create @mewhhaha/dd
+```
+
 ## Vitest
 
 ```js

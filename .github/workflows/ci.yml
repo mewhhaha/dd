@@ -71,6 +71,9 @@ jobs:
       - uses: extractions/setup-just@v4
       - run: pnpm install --frozen-lockfile
       - run: just check-js
+      - run: pnpm test:create-dd
+      - run: pnpm typecheck:templates
+      - run: pnpm build:templates
       - run: pnpm typecheck:vite-examples
       - run: pnpm build:vite-examples
       - uses: dtolnay/rust-toolchain@stable

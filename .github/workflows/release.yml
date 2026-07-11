@@ -122,6 +122,9 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - uses: pnpm/action-setup@v6
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:create-dd
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -132,12 +135,14 @@ jobs:
             rm -rf "packages/${package}"
             cp -R "$directory" "packages/${package}"
           done
-      - name: Publish platform and selector packages
+      - name: Publish npm packages
         run: |
+          # pnpm rewrites workspace: dependency specs in the published manifests.
           for package in packages/dd-runtime-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}; do
-            npm publish "$package" --provenance --access public
+            pnpm --dir "./$package" publish --provenance --access public --no-git-checks
           done
-          npm publish packages/dd-runtime --provenance --access public
-          npm publish packages/dd-vite --provenance --access public
+          pnpm --dir ./packages/dd-runtime publish --provenance --access public --no-git-checks
+          pnpm --dir ./packages/dd-vite publish --provenance --access public --no-git-checks
+          pnpm --dir ./packages/create-dd publish --provenance --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

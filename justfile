@@ -110,6 +110,9 @@ check-js:
   node --check packages/dd-vite/src/vite.js
   node --check packages/dd-vite/src/vitest.js
   node --check packages/dd-vite/src/vitest-environment.js
+  node --check packages/create-dd/src/cli.js
+  node --check packages/create-dd/src/core.js
+  node --check packages/create-dd/scripts/build.mjs
 
 # Regenerate the checked-in keyed-memory scaling summary from local ignored JSON.
 benchmark-summary fixed='benchmarks/results/local-atomic-memory-scaling-matrix.json' core='benchmarks/results/local-atomic-memory-scaling-matrix.json':

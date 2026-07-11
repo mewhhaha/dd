@@ -1,0 +1,5 @@
+dist
+dd-env.d.ts
+.react-router
+node_modules
+.vite
