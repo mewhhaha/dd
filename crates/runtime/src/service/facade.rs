@@ -499,6 +499,7 @@ pub(super) struct RuntimeShutdownState {
     thread: StdMutex<Option<thread::JoinHandle<()>>>,
     result: StdMutex<Option<Result<()>>>,
     completed: Notify,
+    completed_blocking: std::sync::Condvar,
 }
 
 impl RuntimeShutdownState {
@@ -508,6 +509,7 @@ impl RuntimeShutdownState {
             thread: StdMutex::new(Some(thread)),
             result: StdMutex::new(None),
             completed: Notify::new(),
+            completed_blocking: std::sync::Condvar::new(),
         }
     }
 
@@ -521,50 +523,94 @@ impl RuntimeShutdownState {
         }
 
         let state = Arc::clone(self);
-        tokio::spawn(async move {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let command_result = if sender
-                .send(RuntimeCommand::Shutdown { reply: reply_tx })
-                .await
-                .is_err()
-            {
-                // The runtime may already have stopped. The thread join below
-                // determines whether that was a clean exit or a panic.
-                Ok(())
-            } else {
-                match reply_rx.await {
-                    Ok(result) => result,
-                    Err(_) => Err(PlatformError::internal("runtime shutdown channel closed")),
-                }
-            };
+        let shutdown_sender = sender.clone();
+        let shutdown_worker = thread::Builder::new()
+            .name("dd-runtime-shutdown".to_string())
+            .spawn(move || {
+                state.shutdown_and_join_from_worker(shutdown_sender);
+            });
 
-            let runtime_thread = match state.thread.lock() {
-                Ok(mut thread) => thread.take(),
-                Err(_) => {
-                    state.finish(Err(PlatformError::internal(
-                        "runtime thread join state is poisoned",
-                    )));
+        if let Err(error) = shutdown_worker {
+            tracing::warn!(error = %error, "failed to spawn runtime shutdown worker; shutting down inline");
+            self.shutdown_and_join_inline(sender);
+        }
+    }
+
+    fn shutdown_and_join_from_worker(&self, sender: mpsc::Sender<RuntimeCommand>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let command_result = if sender
+            .blocking_send(RuntimeCommand::Shutdown { reply: reply_tx })
+            .is_err()
+        {
+            // The runtime may already have stopped. The thread join below
+            // determines whether that was a clean exit or a panic.
+            Ok(())
+        } else {
+            match reply_rx.blocking_recv() {
+                Ok(result) => result,
+                Err(_) => Err(PlatformError::internal("runtime shutdown channel closed")),
+            }
+        };
+        self.finish_after_runtime_thread_join(command_result);
+    }
+
+    /// This path can run from a Tokio task while handling a failed thread
+    /// spawn, so it uses `try_send` rather than Tokio's panicking
+    /// `blocking_send`. The runtime manager consumes this dedicated fast lane
+    /// on another OS thread.
+    fn shutdown_and_join_inline(&self, sender: mpsc::Sender<RuntimeCommand>) {
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let mut command = RuntimeCommand::Shutdown { reply: reply_tx };
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    command = returned;
+                    thread::yield_now();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.finish_after_runtime_thread_join(Ok(()));
                     return;
                 }
-            };
-            let join_result = match runtime_thread {
-                Some(runtime_thread) => {
-                    match tokio::task::spawn_blocking(move || runtime_thread.join()).await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(_)) => Err(PlatformError::internal(
-                            "runtime thread panicked during shutdown",
-                        )),
-                        Err(error) => Err(PlatformError::internal(format!(
-                            "runtime thread join task failed: {error}"
-                        ))),
-                    }
-                }
-                None => Err(PlatformError::internal(
-                    "runtime thread join handle is unavailable",
-                )),
-            };
-            state.finish(command_result.and(join_result));
+            }
+        }
+
+        // Joining the dedicated runtime thread guarantees it has either sent
+        // this reply or dropped its sender, so no Tokio blocking receive is
+        // needed on this inline path.
+        let join_result = self.join_runtime_thread();
+        let command_result = reply_rx.try_recv().map_err(|error| {
+            PlatformError::internal(format!("runtime shutdown reply unavailable: {error}"))
         });
+        self.finish(command_result.and(join_result));
+    }
+
+    fn finish_after_runtime_thread_join(&self, command_result: Result<()>) {
+        self.finish(command_result.and(self.join_runtime_thread()));
+    }
+
+    fn join_runtime_thread(&self) -> Result<()> {
+        let (runtime_thread, lock_result) = match self.thread.lock() {
+            Ok(mut thread) => (thread.take(), Ok(())),
+            Err(poisoned) => (
+                poisoned.into_inner().take(),
+                Err(PlatformError::internal(
+                    "runtime thread join state is poisoned",
+                )),
+            ),
+        };
+        let join_result = match runtime_thread {
+            Some(runtime_thread) => match runtime_thread.join() {
+                Ok(()) => Ok(()),
+                Err(_) => Err(PlatformError::internal(
+                    "runtime thread panicked during shutdown",
+                )),
+            },
+            None => Err(PlatformError::internal(
+                "runtime thread join handle is unavailable",
+            )),
+        };
+        join_result.and(lock_result)
     }
 
     fn finish(&self, result: Result<()>) {
@@ -573,9 +619,10 @@ impl RuntimeShutdownState {
             Err(mut poisoned) => **poisoned.get_mut() = Some(result),
         }
         self.completed.notify_waiters();
+        self.completed_blocking.notify_all();
     }
 
-    async fn wait(&self) -> Result<()> {
+    pub(super) async fn wait(&self) -> Result<()> {
         loop {
             let notified = self.completed.notified();
             let result = match self.result.lock() {
@@ -589,11 +636,46 @@ impl RuntimeShutdownState {
         }
     }
 
+    fn wait_blocking(&self) -> Result<()> {
+        let mut result = match self.result.lock() {
+            Ok(result) => result,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        loop {
+            if let Some(result) = result.clone() {
+                return result;
+            }
+            result = match self.completed_blocking.wait(result) {
+                Ok(result) => result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn is_complete(&self) -> bool {
         match self.result.lock() {
             Ok(result) => result.is_some(),
             Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+}
+
+/// Owns automatic shutdown for the complete set of `RuntimeService` clones.
+///
+/// The worker is deliberately a standard thread: dropping a service often
+/// happens while a `#[tokio::test]` runtime is winding down, when spawned
+/// Tokio work would be cancelled before it can stop the runtime thread.
+struct RuntimeServiceLifetime {
+    cancel_sender: mpsc::Sender<RuntimeCommand>,
+    shutdown: Arc<RuntimeShutdownState>,
+}
+
+impl Drop for RuntimeServiceLifetime {
+    fn drop(&mut self) {
+        self.shutdown.start(self.cancel_sender.clone());
+        if let Err(error) = self.shutdown.wait_blocking() {
+            tracing::warn!(error = %error, "runtime service automatic shutdown failed");
         }
     }
 }
@@ -610,6 +692,7 @@ pub struct RuntimeService {
     pub(super) _dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
     storage: RuntimeStorageConfig,
     pub(super) shutdown: Arc<RuntimeShutdownState>,
+    _lifetime: Arc<RuntimeServiceLifetime>,
 }
 impl RuntimeService {
     pub async fn start() -> Result<Self> {
@@ -723,6 +806,10 @@ impl RuntimeService {
             dynamic_modules: dynamic_modules.clone(),
         })?;
         let shutdown = Arc::new(RuntimeShutdownState::new(runtime_thread));
+        let lifetime = Arc::new(RuntimeServiceLifetime {
+            cancel_sender: cancel_sender.clone(),
+            shutdown: Arc::clone(&shutdown),
+        });
         let service = Self {
             sender,
             cancel_sender,
@@ -734,6 +821,7 @@ impl RuntimeService {
             _dynamic_modules: dynamic_modules,
             storage,
             shutdown,
+            _lifetime: lifetime,
         };
         if let Err(error) = service.restore_workers_from_store().await {
             let _ = service.shutdown().await;

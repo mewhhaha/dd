@@ -15,20 +15,40 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    env:
-      RUST_TEST_THREADS: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
           components: clippy,rustfmt
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - uses: Swatinem/rust-cache@v2
-      - run: just check
+      - run: bash scripts/check_public_memory_naming.sh
+      - run: just check-deno-sources
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  rust-test:
+    runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  http3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@v2
       - name: Verify default server excludes direct HTTP/3
         run: |
           default_tree="$(cargo tree --locked -p dd_server -e normal --prefix none)"
@@ -42,13 +62,13 @@ jobs:
   javascript:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - run: pnpm install --frozen-lockfile
       - run: just check-js
       - run: pnpm typecheck:vite-examples
@@ -65,20 +85,60 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - uses: pnpm/action-setup@v4
-      - run: cargo install cargo-audit --locked
+          cache: pnpm
+      - name: Cache cargo-audit
+        id: cargo-audit-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-0.22.2-${{ runner.os }}-${{ runner.arch }}
+      - name: Install pinned cargo-audit
+        if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.22.2
       # Latest Deno 2.8 crates still pin Hickory 0.25 and RustCrypto RSA 0.9.
       # Re-evaluate on every Deno update; DNSSEC is disabled and worker RSA is
       # not considered a cross-tenant boundary in the semi-trusted model.
       - run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2023-0071
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --prod --audit-level=moderate
-      - run: docker build --tag dd-server-smoke -f deploy/fly/Dockerfile .
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+        id: buildx
+      - name: Cache Docker Cargo build state
+        id: docker-cargo-cache
+        uses: actions/cache@v5
+        with:
+          path: .buildkit-cache
+          key: docker-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/fly/Dockerfile', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'patches/**', 'scripts/patch-crate.sh') }}
+          restore-keys: |
+            docker-cargo-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore Docker Cargo cache mounts
+        # v3.4.0, pinned so third-party workflow code cannot move underneath us.
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-dir: .buildkit-cache
+          dockerfile: deploy/fly/Dockerfile
+          skip-extraction: ${{ steps.docker-cargo-cache.outputs.cache-hit }}
+      - name: Build smoke image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/fly/Dockerfile
+          tags: dd-server-smoke
+          load: true
+          cache-from: type=gha,scope=dd-server-smoke
+          cache-to: type=gha,mode=max,scope=dd-server-smoke
       - run: bash scripts/smoke_fly_container.sh dd-server-smoke

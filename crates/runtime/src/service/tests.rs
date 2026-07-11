@@ -77,6 +77,46 @@ async fn shutdown_is_idempotent_across_clones_and_waits_for_runtime_thread_exit(
 
 #[tokio::test]
 #[serial]
+async fn last_service_handle_drop_shuts_down_and_joins_runtime_thread() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let worker = "automatic-shutdown".to_string();
+    service
+        .deploy(worker.clone(), counter_worker())
+        .await
+        .expect("worker should deploy");
+    service
+        .invoke(worker.clone(), test_invocation())
+        .await
+        .expect("worker invocation should start the configured isolate");
+    wait_for_isolate_total(&service, &worker, 1).await;
+
+    let shutdown = Arc::clone(&service.shutdown);
+    let remaining_handle = service.clone();
+
+    drop(service);
+    assert!(
+        !shutdown.is_complete(),
+        "dropping one clone must not shut down the runtime"
+    );
+
+    drop(remaining_handle);
+    assert!(
+        shutdown.is_complete(),
+        "last service handle drop must not return before runtime teardown completes"
+    );
+    shutdown
+        .wait()
+        .await
+        .expect("automatic runtime shutdown should succeed");
+}
+
+#[tokio::test]
+#[serial]
 async fn isolate_starts_with_configured_heap_limit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
