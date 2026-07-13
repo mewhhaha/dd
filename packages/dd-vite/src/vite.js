@@ -82,38 +82,34 @@ const DD_VITE_MODULE_HEADER = "x-dd-vite-module-token";
 const DD_VITE_MODULE_ENDPOINT_PATH = "/__dd_vite/module";
 const DD_VITE_MODULE_INVALIDATE_PATH = "/__dd_vite/invalidate";
 const DD_NODE_ASYNC_HOOKS_SHIM_SOURCE = `
+const asyncContext = globalThis.__dd_async_context;
+
 export class AsyncLocalStorage {
-  #store;
+  #storage;
 
   run(store, callback, ...args) {
-    const previous = this.#store;
-    this.#store = store;
-    let result;
-    try {
-      result = callback(...args);
-    } catch (error) {
-      this.#store = previous;
-      throw error;
-    }
-    if (result && typeof result.then === "function") {
-      return Promise.resolve(result).finally(() => {
-        this.#store = previous;
-      });
-    }
-    this.#store = previous;
-    return result;
+    this.#storage ??= {};
+    return asyncContext.runWithAsyncLocalStore(this.#storage, store, callback, ...args);
   }
 
   getStore() {
-    return this.#store;
+    if (!this.#storage) {
+      return undefined;
+    }
+    return asyncContext.getAsyncLocalStore(this.#storage);
   }
 
   enterWith(store) {
-    this.#store = store;
+    this.#storage ??= {};
+    asyncContext.enterWithAsyncLocalStore(this.#storage, store);
   }
 
   disable() {
-    this.#store = undefined;
+    if (!this.#storage) {
+      return;
+    }
+    asyncContext.disableAsyncLocalStore(this.#storage);
+    this.#storage = undefined;
   }
 }
 `;

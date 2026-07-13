@@ -264,6 +264,7 @@ function ensureStructuredCloneGlobal() {
 
 function ensureAsyncContextGlobal() {
   const core = globalThis.Deno?.core;
+  const asyncContextFrame = Symbol("dd.asyncContextFrame");
   const getAsyncContext = typeof core?.getAsyncContext === "function"
     ? () => core.getAsyncContext()
     : () => globalThis.__dd_fallback_async_context ?? null;
@@ -272,13 +273,30 @@ function ensureAsyncContextGlobal() {
     : (value) => {
       globalThis.__dd_fallback_async_context = value ?? null;
     };
+  const frameFor = (context) => context?.[asyncContextFrame] === true
+    ? context
+    : {
+      [asyncContextFrame]: true,
+      requestStore: context ?? null,
+      asyncLocalStores: new Map(),
+    };
+  const derivedFrame = (context) => {
+    const frame = frameFor(context);
+    return {
+      [asyncContextFrame]: true,
+      requestStore: frame.requestStore,
+      asyncLocalStores: new Map(frame.asyncLocalStores),
+    };
+  };
 
   define("__dd_async_context", {
     getStore() {
-      return getAsyncContext() ?? null;
+      return frameFor(getAsyncContext()).requestStore;
     },
     enterWith(store) {
-      setAsyncContext(store ?? null);
+      const frame = derivedFrame(getAsyncContext());
+      frame.requestStore = store ?? null;
+      setAsyncContext(frame);
       return store ?? null;
     },
     run(store, callback, ...args) {
@@ -286,12 +304,41 @@ function ensureAsyncContextGlobal() {
         throw new TypeError("__dd_async_context.run(store, callback) requires a function");
       }
       const previous = getAsyncContext() ?? null;
-      setAsyncContext(store ?? null);
+      const frame = derivedFrame(previous);
+      frame.requestStore = store ?? null;
+      setAsyncContext(frame);
       try {
         return callback(...args);
       } finally {
         setAsyncContext(previous);
       }
+    },
+    getAsyncLocalStore(storage) {
+      return frameFor(getAsyncContext()).asyncLocalStores.get(storage);
+    },
+    enterWithAsyncLocalStore(storage, store) {
+      const frame = derivedFrame(getAsyncContext());
+      frame.asyncLocalStores.set(storage, store);
+      setAsyncContext(frame);
+    },
+    runWithAsyncLocalStore(storage, store, callback, ...args) {
+      if (typeof callback !== "function") {
+        throw new TypeError("AsyncLocalStorage.run(store, callback) requires a function");
+      }
+      const previous = getAsyncContext() ?? null;
+      const frame = derivedFrame(previous);
+      frame.asyncLocalStores.set(storage, store);
+      setAsyncContext(frame);
+      try {
+        return callback(...args);
+      } finally {
+        setAsyncContext(previous);
+      }
+    },
+    disableAsyncLocalStore(storage) {
+      const frame = derivedFrame(getAsyncContext());
+      frame.asyncLocalStores.delete(storage);
+      setAsyncContext(frame);
     },
   });
 }

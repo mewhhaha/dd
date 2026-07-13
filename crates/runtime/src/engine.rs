@@ -31,6 +31,8 @@ use std::task::{Context, Poll, Waker};
 
 include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 
+const NODE_ASYNC_HOOKS_SOURCE: &str = include_str!("../js/node_async_hooks.js");
+
 static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
 
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
@@ -470,8 +472,14 @@ impl ModuleLoader for RuntimeModuleLoader {
                 module_specifier,
                 options.requested_module_type,
             ),
+            "node" if module_specifier.as_str() == "node:async_hooks" => Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(NODE_ASYNC_HOOKS_SOURCE.to_string().into()),
+                module_specifier,
+                None,
+            )),
             _ => Err(JsErrorBox::generic(format!(
-                "dynamic module loader only supports dd-dynamic: URLs, got {module_specifier}"
+                "runtime module loader does not support: {module_specifier}"
             ))),
         })
     }

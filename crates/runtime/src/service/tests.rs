@@ -262,6 +262,73 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn deployed_worker_imports_async_local_storage_from_node_async_hooks() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "async-local-storage".to_string(),
+            r#"
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const storage = new AsyncLocalStorage();
+
+export default {
+  async fetch(request, env, ctx) {
+    const requestId = globalThis.__dd_get_runtime_request_id?.();
+    const values = await Promise.all([
+      storage.run("slow", async () => {
+        await ctx.sleep(20);
+        return storage.getStore();
+      }),
+      storage.run("fast", async () => {
+        await ctx.sleep(1);
+        return storage.getStore();
+      }),
+    ]);
+    storage.enterWith("entered");
+    const entered = storage.getStore();
+    storage.disable();
+    return Response.json({
+      values,
+      entered,
+      disabled: storage.getStore() ?? null,
+      requestContextPreserved: globalThis.__dd_get_runtime_request_id?.() === requestId,
+    });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = timeout(
+        Duration::from_secs(2),
+        service.invoke("async-local-storage".to_string(), test_invocation()),
+    )
+    .await
+    .expect("invoke should not hang")
+    .expect("request should succeed");
+    assert_eq!(output.status, 200);
+    let body: Value = serde_json::from_slice(&output.body).expect("body should be json");
+    assert_eq!(body["values"], serde_json::json!(["slow", "fast"]));
+    assert_eq!(body["entered"], "entered");
+    assert_eq!(body["disabled"], Value::Null);
+    assert_eq!(body["requestContextPreserved"], true);
+}
+
+#[tokio::test]
+#[serial]
 async fn isolate_startup_does_not_block_manager_commands() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
