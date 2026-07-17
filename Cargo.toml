@@ -17,7 +17,7 @@ version = "0.1.0"
 [workspace.dependencies]
 arc-swap = "1"
 base64 = "0.22"
-deno_core = "0.407"
+deno_core = "0.408"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 simd-json = { version = "0.17", features = ["serde_impl"] }
