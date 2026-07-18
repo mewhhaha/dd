@@ -23,8 +23,9 @@ use crate::engine::{
 };
 use crate::kv::KvStore;
 use crate::memory::{
-    MemoryOutboxClaim, MemoryOutboxDeliveryAction, MemoryOutboxDeliveryOutcome,
-    MemoryProfileMetricKind, MemoryStore,
+    DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES, DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
+    MEMORY_ENTITY_CACHE_STRIPES, MemoryOutboxClaim, MemoryOutboxDeliveryAction,
+    MemoryOutboxDeliveryOutcome, MemoryProfileMetricKind, MemoryStore,
 };
 use crate::memory_rpc::{
     MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse, decode_memory_invoke_request,

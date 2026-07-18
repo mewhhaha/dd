@@ -739,19 +739,49 @@ async fn run_server_child() -> Result<(), String> {
         std::env::var_os("DD_HTTP_BENCH_STORE_DIR")
             .ok_or_else(|| "DD_HTTP_BENCH_STORE_DIR is required in server child".to_string())?,
     );
+    let storage_defaults = RuntimeStorageConfig::default();
     let storage = RuntimeStorageConfig {
         store_dir: store_dir.clone(),
         database_url: format!("file:{}/dd-http-bench.db", store_dir.display()),
+        memory_namespace_shards: env_usize(
+            "DD_BENCH_MEMORY_NAMESPACE_SHARDS",
+            storage_defaults.memory_namespace_shards,
+        ),
+        memory_outbox_max_concurrent_shards: env_usize(
+            "DD_BENCH_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS",
+            storage_defaults.memory_outbox_max_concurrent_shards,
+        ),
+        memory_db_cache_max_open: env_usize(
+            "DD_BENCH_MEMORY_DB_CACHE_MAX_OPEN",
+            storage_defaults.memory_db_cache_max_open,
+        ),
+        memory_snapshot_cache_max_entries: env_usize(
+            "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
+            storage_defaults.memory_snapshot_cache_max_entries,
+        ),
+        memory_snapshot_cache_max_bytes: env_usize(
+            "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES",
+            storage_defaults.memory_snapshot_cache_max_bytes,
+        ),
+        memory_db_read_connections_per_database: env_usize(
+            "DD_BENCH_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE",
+            storage_defaults.memory_db_read_connections_per_database,
+        ),
+        memory_db_max_total_connections: env_usize(
+            "DD_BENCH_MEMORY_DB_MAX_TOTAL_CONNECTIONS",
+            storage_defaults.memory_db_max_total_connections,
+        ),
         worker_store_enabled: false,
-        ..RuntimeStorageConfig::default()
+        ..storage_defaults
     };
-    let min_isolates = env_usize("DD_BENCH_MIN_ISOLATES", 8);
+    let min_isolates = env_usize_allow_zero("DD_BENCH_MIN_ISOLATES", 8);
     let max_isolates = env_usize("DD_BENCH_MAX_ISOLATES", 8).max(min_isolates);
     let runtime = RuntimeConfig {
         min_isolates,
-        // Both benchmark workers stay deployed so each scenario can use its
-        // requested per-worker pool without starving the other worker.
-        max_global_isolates: max_isolates.saturating_mul(2),
+        max_global_isolates: env_usize(
+            "DD_BENCH_MAX_GLOBAL_ISOLATES",
+            max_isolates.saturating_mul(2),
+        ),
         max_isolates,
         max_inflight_per_isolate: env_usize("DD_BENCH_MAX_INFLIGHT", 16),
         ..RuntimeConfig::default()
@@ -824,6 +854,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_usize_allow_zero(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn percentile_ms(latencies: &[Duration], percentile: f64) -> f64 {
     if latencies.is_empty() {
         return 0.0;
@@ -860,6 +897,7 @@ fn print_help() {
     println!("  DD_BENCH_CONCURRENCY    persistent HTTP/1 connections (default 128)");
     println!("  DD_BENCH_MIN_ISOLATES   prewarmed isolates (default 8)");
     println!("  DD_BENCH_MAX_ISOLATES   isolate limit (default 8)");
+    println!("  DD_BENCH_MAX_GLOBAL_ISOLATES global isolate limit (default 2x max)");
     println!("  DD_BENCH_MAX_INFLIGHT   requests per isolate (default 16)");
 }
 

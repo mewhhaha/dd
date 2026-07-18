@@ -249,7 +249,7 @@ fn print_help() {
         "  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, dynamic, lifecycle, kv-writes"
     );
     println!(
-        "  DD_BENCH_CONFIG                comma-separated configs: single-isolate, autoscaling-8"
+        "  DD_BENCH_CONFIG                comma-separated configs: single-isolate, autoscaling-8, fly-production"
     );
     println!("  DD_BENCH_SCENARIO              comma-separated steady-state scenarios by name");
     println!("  DD_BENCH_VERBOSE_PROGRESS      print dynamic benchmark progress markers");
@@ -259,6 +259,7 @@ fn print_help() {
     println!("  DD_BENCH_DYNAMIC_REQUESTS      dynamic requests per hot scenario (default 500)");
     println!("  DD_BENCH_DYNAMIC_CONCURRENCY   dynamic concurrency (default 64)");
     println!("  DD_BENCH_DYNAMIC_COLD_ROUNDS   dynamic create+invoke rounds (default 50)");
+    println!("  DD_BENCH_COLD_ROUNDS           lifecycle cold-start rounds (default 40)");
     println!("  DD_BENCH_TIMEOUT_MS            dynamic stage timeout (default 15000)");
 }
 
@@ -266,7 +267,7 @@ fn print_help() {
 async fn main() -> Result<(), String> {
     let action = bench_arg_action(std::env::args().skip(1))?;
 
-    let configs = [
+    let mut configs = vec![
         BenchConfig {
             name: "single-isolate",
             runtime: RuntimeConfig {
@@ -293,6 +294,26 @@ async fn main() -> Result<(), String> {
             },
         },
     ];
+    let fly_profile_selected = std::env::var("DD_BENCH_CONFIG").ok().is_some_and(|value| {
+        value
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case("fly-production"))
+    });
+    if fly_profile_selected {
+        configs.push(BenchConfig {
+            name: "fly-production",
+            runtime: RuntimeConfig {
+                min_isolates: 0,
+                max_global_isolates: 2,
+                max_isolates: 8,
+                max_inflight_per_isolate: 4,
+                idle_ttl: Duration::from_secs(30),
+                scale_tick: Duration::from_secs(1),
+                queue_warn_thresholds: vec![10, 100, 1000],
+                ..RuntimeConfig::default()
+            },
+        });
+    }
 
     let scenarios = [
         Scenario {
@@ -553,13 +574,14 @@ export default {
             println!();
         }
 
-        if config.name == "autoscaling-8" && section_enabled("lifecycle") {
+        if matches!(config.name, "autoscaling-8" | "fly-production") && section_enabled("lifecycle")
+        {
             println!("== lifecycle: {} ==", config.name);
 
             let cold_service = start_service("cold-start", config.runtime.clone())
                 .await
                 .map_err(|error| error.to_string())?;
-            let cold = run_cold_start(&cold_service, 40)
+            let cold = run_cold_start(&cold_service, env_usize("DD_BENCH_COLD_ROUNDS", 40))
                 .await
                 .map_err(|error| error.to_string())?;
             println!("{}", format_cold_start_result(cold));
@@ -676,7 +698,7 @@ fn print_benchmark_list(configs: &[BenchConfig], scenarios: &[Scenario]) {
         }
         println!("section websocket config={}", config.name);
         println!("section dynamic config={}", config.name);
-        if config.name == "autoscaling-8" {
+        if matches!(config.name, "autoscaling-8" | "fly-production") {
             println!("section lifecycle config={}", config.name);
             println!("section kv-writes config={}", config.name);
         }
@@ -964,6 +986,8 @@ fn runtime_service_config(
             memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
             memory_db_cache_max_open: 4096,
+            memory_snapshot_cache_max_entries: 4096,
+            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             memory_db_read_connections_per_database: 4,
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),
@@ -1179,7 +1203,7 @@ export default {
             async move { run_scenario(&service_for_burst, &worker_for_burst, scenario).await },
         );
 
-    let target_isolates = runtime.max_isolates;
+    let target_isolates = runtime.max_isolates.min(runtime.max_global_isolates);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut time_to_target = None;
     while Instant::now() < deadline {

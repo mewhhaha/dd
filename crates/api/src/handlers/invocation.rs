@@ -254,7 +254,7 @@ async fn maybe_store_front_cache(state: &AppState, request: &CacheRequest, outpu
             CacheResponse {
                 status: output.status,
                 headers: output.headers.clone(),
-                body: output.body.clone(),
+                body: Bytes::copy_from_slice(&output.body),
             },
         )
         .await;
@@ -303,18 +303,24 @@ fn build_front_origin_response(
     method: &str,
     status: &'static str,
 ) -> ApiResult<Response<ResponseBody>> {
-    build_front_response(output.status, output.headers, output.body, method, status)
+    build_front_response(
+        output.status,
+        output.headers,
+        output.body.into(),
+        method,
+        status,
+    )
 }
 
 fn build_front_response(
     status_code: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: Bytes,
     method: &str,
     cache_status: &'static str,
 ) -> ApiResult<Response<ResponseBody>> {
     let content_length = body.len();
-    let response_body = if method == "HEAD" { Vec::new() } else { body };
+    let response_body = if method == "HEAD" { Bytes::new() } else { body };
     let mut response = Response::builder()
         .status(status_code)
         .body(full_body(response_body))

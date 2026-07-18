@@ -429,6 +429,8 @@ async fn run_config_scenario(
             memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
             memory_db_cache_max_open: 4096,
+            memory_snapshot_cache_max_entries: 4096,
+            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             memory_db_read_connections_per_database: 4,
             memory_db_max_total_connections: 4096usize.saturating_mul(5),
             memory_db_idle_ttl: Duration::from_secs(60),

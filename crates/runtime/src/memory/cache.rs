@@ -89,9 +89,10 @@ impl MemoryStore {
             return;
         }
         let (_, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
-        state
-            .memory_versions
-            .insert(Self::memory_version_key(namespace, memory_key), version);
+        let key = Self::memory_version_key(namespace, memory_key);
+        if state.snapshots.entries.contains_key(&key) {
+            state.memory_versions.insert(key, version);
+        }
     }
 
     async fn cached_full_snapshot(
@@ -163,13 +164,14 @@ impl MemoryStore {
             .memory_versions
             .get(&Self::memory_version_key(namespace, memory_key))
             .copied();
-        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state, now);
         let Some(entry) = state.snapshots.get_cloned(&key, now) else {
             self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
             return None;
         };
         if current_version.is_some_and(|current| current > entry.max_version) {
             state.snapshots.remove(&key);
+            state.memory_versions.remove(&key);
             self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
             return None;
         }
@@ -209,7 +211,7 @@ impl MemoryStore {
         let now = Instant::now();
         let shard_index = self.shard_index(namespace, memory_key);
         let (stripe_index, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
-        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state, now);
         let existing = state.snapshots.entries.remove(&key);
         let existing = if let Some(existing) = existing {
             state.snapshots.approximate_bytes = state
@@ -279,8 +281,10 @@ impl MemoryStore {
             approximate_snapshot_cache_bytes(&key, &next_records, &next_loaded_keys);
         if approximate_bytes > self.snapshot_cache_byte_budget_for_stripe(shard_index, stripe_index)
         {
+            state.memory_versions.remove(&key);
             return;
         }
+        state.memory_versions.insert(key.clone(), max_version);
         state.snapshots.insert_or_replace(
             key,
             MemorySharedSnapshotEntry {
@@ -293,7 +297,7 @@ impl MemoryStore {
                 approximate_bytes,
             },
         );
-        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state, now);
     }
 
     async fn update_cached_snapshot_after_commit(
@@ -307,8 +311,9 @@ impl MemoryStore {
         let now = Instant::now();
         let shard_index = self.shard_index(namespace, memory_key);
         let (stripe_index, mut state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
-        self.prune_snapshots_locked(shard_index, stripe_index, &mut state.snapshots, now);
+        self.prune_snapshots_locked(shard_index, stripe_index, &mut state, now);
         let Some(entry) = state.snapshots.remove(&key) else {
+            state.memory_versions.remove(&key);
             return;
         };
         let mut next_records = entry.records.as_ref().clone();
@@ -332,8 +337,10 @@ impl MemoryStore {
             approximate_snapshot_cache_bytes(&key, &next_records, &next_loaded_keys);
         if approximate_bytes > self.snapshot_cache_byte_budget_for_stripe(shard_index, stripe_index)
         {
+            state.memory_versions.remove(&key);
             return;
         }
+        state.memory_versions.insert(key.clone(), max_version);
         state.snapshots.insert_or_replace(
             key,
             MemorySharedSnapshotEntry {
@@ -372,15 +379,18 @@ impl MemoryStore {
         &self,
         shard_index: usize,
         stripe_index: usize,
-        snapshots: &mut MemorySharedSnapshotCache,
+        state: &mut MemoryEntityCacheState,
         now: Instant,
     ) {
-        let evicted = snapshots.prune(
+        let evicted = state.snapshots.prune(
             now,
             self.db_idle_ttl,
             self.snapshot_cache_entry_budget_for_stripe(shard_index, stripe_index),
             self.snapshot_cache_byte_budget_for_stripe(shard_index, stripe_index),
         );
+        state
+            .memory_versions
+            .retain(|key, _| state.snapshots.entries.contains_key(key));
         if evicted > 0 {
             self.record_profile(
                 MemoryProfileMetricKind::StoreSnapshotCacheEviction,
@@ -395,7 +405,7 @@ impl MemoryStore {
         );
         self.record_profile(
             MemoryProfileMetricKind::EntityCachePeakEntriesPerStripe,
-            snapshots.entries.len() as u64,
+            state.snapshots.entries.len() as u64,
             1,
         );
         self.record_profile(
@@ -460,6 +470,7 @@ impl MemoryStore {
             snapshot_keys: state.snapshots.entries.keys().cloned().collect(),
             snapshot_entries: state.snapshots.entries.len(),
             snapshot_approximate_bytes: state.snapshots.approximate_bytes,
+            version_entries: state.memory_versions.len(),
         }
     }
 

@@ -76,6 +76,8 @@ flyctl secrets set \
   DD_RUNTIME_MIN_ISOLATES_PER_WORKER=0 \
   DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS=1 \
   DD_MEMORY_DB_CACHE_MAX_OPEN=256 \
+  DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES=4096 \
+  DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES=67108864 \
   DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE=2 \
   DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS=256 \
   --app your-dd-app
@@ -85,9 +87,16 @@ The global value is shared by all deployed workers in one process. The
 per-worker value is a ceiling; it may be higher than the global value, but one
 worker can only reach it when global slots are available. The memory outbox
 parallelism value bounds how many physical memory shards can claim, deliver, and
-ack durable effects at once. The memory DB connection values bound reusable
+ack durable effects at once. Internal service and memory calls may temporarily
+use up to the same number of rescue isolates above the global value so workers
+cannot deadlock while every regular isolate waits on another worker. The memory
+DB connection values bound reusable
 per-database reader connections plus the single writer connection per active
-database slot.
+database slot. Snapshot entries and bytes have independent limits because
+cached entity state does not consume an open database slot. The entry limit
+must provide at least one entry for every namespace-shard/cache-stripe pair;
+the server rejects smaller values instead of silently disabling part of the
+cache.
 
 The Fly production image includes WebSockets and OTLP HTTP trace propagation.
 Direct HTTP/3 and WebTransport support remain an experimental opt-in Cargo

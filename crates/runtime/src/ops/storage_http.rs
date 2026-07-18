@@ -662,7 +662,7 @@ pub(crate) async fn op_cache_put(
     let response = CacheResponse {
         status: response_status,
         headers: response_headers,
-        body: body.to_vec(),
+        body,
     };
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.put(&request, response).await {

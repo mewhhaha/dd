@@ -20,6 +20,7 @@ struct MemoryEntityCacheDebugSnapshot {
     snapshot_keys: HashSet<String>,
     snapshot_entries: usize,
     snapshot_approximate_bytes: usize,
+    version_entries: usize,
 }
 
 async fn upsert_memory_state_row(

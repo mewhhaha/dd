@@ -147,12 +147,12 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
 
 #[tokio::test]
 #[serial]
-async fn memory_exported_atomic_commands_do_not_target_busy_caller_isolates() {
+async fn memory_exported_atomic_commands_progress_when_regular_isolates_are_saturated() {
     let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_global_isolates: 16,
-        max_isolates: 16,
-        max_inflight_per_isolate: 1,
+        min_isolates: 0,
+        max_global_isolates: 2,
+        max_isolates: 8,
+        max_inflight_per_isolate: 4,
         request_wall_timeout: Duration::from_secs(5),
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -200,6 +200,13 @@ async fn memory_exported_atomic_commands_do_not_target_busy_caller_isolates() {
     })
     .await
     .expect("exported atomic invokes should not wait on saturated caller isolates");
+
+    let stats = service
+        .stats("memory".to_string())
+        .await
+        .expect("memory worker stats should exist");
+    assert!(stats.global_isolates_total <= 4);
+    assert!((1..=2).contains(&stats.global_internal_rescue_isolates));
 
     for idx in 0..8 {
         let output = service

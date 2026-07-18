@@ -85,26 +85,28 @@ jobs:
           shared-key: scheduled-production-benchmarks
       - name: Create previous-commit worktree
         run: git worktree add --detach "${RUNNER_TEMP}/dd-baseline" HEAD^
+      - name: Check whether the baseline has the Fly benchmark profile
+        id: baseline-profile
+        run: |
+          if test -x "${RUNNER_TEMP}/dd-baseline/benchmarks/configs/fly-production.sh"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run previous-commit baseline
+        if: steps.baseline-profile.outputs.available == 'true'
         working-directory: ${{ runner.temp }}/dd-baseline
         run: |
           node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
-            --config http1-server-front-cache.sh \
-            --config focused-memory-read.sh \
-            --config storage-memory-write-cross-shard.sh \
-            --config realworld-rate-limiter.sh \
-            --config realworld-multiworker-auth.sh \
+            --config fly-production.sh \
             --out "${RUNNER_TEMP}/dd-baseline.json"
       - name: Run candidate
         run: |
           node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
-            --config http1-server-front-cache.sh \
-            --config focused-memory-read.sh \
-            --config storage-memory-write-cross-shard.sh \
-            --config realworld-rate-limiter.sh \
-            --config realworld-multiworker-auth.sh \
+            --config fly-production.sh \
             --out "${RUNNER_TEMP}/dd-candidate.json"
       - name: Enforce 5% throughput and 10% p99 budgets
+        if: steps.baseline-profile.outputs.available == 'true'
         run: |
           node benchmarks/compare-commits.mjs \
             --baseline "${RUNNER_TEMP}/dd-baseline.json" \

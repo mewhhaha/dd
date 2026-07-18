@@ -317,6 +317,7 @@ impl WorkerManager {
             scale_up_request_members: HashSet::new(),
             global_isolate_slots_used: 0,
             global_isolates_starting: 0,
+            internal_rescue_isolate_slots: HashSet::new(),
             exiting_isolate_slots: HashMap::new(),
             isolate_thread_tracker: IsolateThreadTracker::default(),
             stats: RuntimeManagerStats::default(),

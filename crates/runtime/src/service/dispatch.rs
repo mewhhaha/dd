@@ -688,7 +688,7 @@ impl WorkerManager {
                 host_rpc_call: None,
                 target_isolate_id,
                 target_generation,
-                internal_origin: false,
+                internal_origin: true,
                 reply: reply_tx,
                 reply_kind: PendingReplyKind::Normal,
             },
@@ -892,8 +892,12 @@ impl WorkerManager {
                     pool.strict_request_isolation,
                     allow_memory_atomic_overflow,
                 );
+                let internal_request_needs_capacity =
+                    pool.queue.has_internal_request() && !pool.has_dispatch_capacity(max_inflight);
+                let external_request_needs_capacity = pool.queue.has_external_request()
+                    && !pool.has_regular_dispatch_capacity(max_inflight);
                 let spawn_needed = selection.is_none()
-                    && !pool.has_dispatch_capacity(max_inflight)
+                    && (internal_request_needs_capacity || external_request_needs_capacity)
                     && !pool.has_starting_isolate()
                     && pool.isolates.len() < max_isolates;
                 (selection, spawn_needed)
@@ -1107,6 +1111,7 @@ impl WorkerManager {
         worker_name: &str,
         generation: u64,
         event_tx: RuntimeEventSender,
+        spawn_policy: IsolateSpawnPolicy,
     ) -> Result<()> {
         let (snapshot, snapshot_preloaded, source, deployment_config) = self
             .workers
@@ -1121,14 +1126,14 @@ impl WorkerManager {
                 )
             })
             .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
-        if !self.try_reserve_global_isolate_slot() {
+        let Some(reservation) = self.try_reserve_global_isolate_slot(spawn_policy) else {
             self.stats.scale_up_budget_denied_count =
                 self.stats.scale_up_budget_denied_count.saturating_add(1);
             return Err(PlatformError::overloaded(format!(
                 "runtime isolate budget is exhausted (max {} global isolates)",
                 self.config.max_global_isolates
             )));
-        }
+        };
         let allow_code_generation = self.config.debug_code_generation;
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
@@ -1141,7 +1146,7 @@ impl WorkerManager {
             max_request_body_bytes: self.config.max_request_body_bytes,
             max_isolate_heap_bytes: self.config.max_isolate_heap_bytes,
         };
-        let isolate = match spawn_isolate_thread(IsolateThreadStart {
+        let mut isolate = match spawn_isolate_thread(IsolateThreadStart {
             snapshot,
             snapshot_preloaded,
             source,
@@ -1167,6 +1172,11 @@ impl WorkerManager {
                 return Err(error);
             }
         };
+        if matches!(reservation, IsolateSlotReservation::InternalRescue) {
+            isolate.internal_rescue = true;
+            self.internal_rescue_isolate_slots
+                .insert(IsolateSlotKey::new(worker_name, generation, isolate.id));
+        }
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             pool.stats.spawn_count += 1;
             pool.push_isolate(isolate);
@@ -1198,17 +1208,31 @@ impl WorkerManager {
             if !self.pool_needs_scale_up(&worker_name, generation) {
                 continue;
             }
-            if self.global_isolate_slots_used >= self.config.max_global_isolates {
+            let allow_internal_rescue =
+                self.internal_rescue_available_for_pool(&worker_name, generation);
+            if self.regular_isolate_slots_used() >= self.config.max_global_isolates
+                && !allow_internal_rescue
+            {
                 self.request_scale_up(&worker_name, generation);
+                let exiting_regular_slots = self
+                    .exiting_isolate_slots
+                    .keys()
+                    .filter(|key| !self.internal_rescue_isolate_slots.contains(*key))
+                    .count();
                 let live_slots = self
-                    .global_isolate_slots_used
-                    .saturating_sub(self.exiting_isolate_slots.len());
+                    .regular_isolate_slots_used()
+                    .saturating_sub(exiting_regular_slots);
                 if live_slots >= self.config.max_global_isolates {
                     self.retire_lru_idle_isolate_for_budget(&worker_name, generation);
                 }
-                break;
+                continue;
             }
-            match self.spawn_isolate(&worker_name, generation, event_tx.clone()) {
+            let spawn_policy = if allow_internal_rescue {
+                IsolateSpawnPolicy::AllowInternalRescue
+            } else {
+                IsolateSpawnPolicy::WithinGlobalBudget
+            };
+            match self.spawn_isolate(&worker_name, generation, event_tx.clone(), spawn_policy) {
                 Ok(()) => {
                     self.dispatch_pool(&worker_name, generation, event_tx);
                     if self.pool_needs_scale_up(&worker_name, generation) {
@@ -1217,7 +1241,7 @@ impl WorkerManager {
                 }
                 Err(error) if error.kind() == ErrorKind::Overloaded => {
                     self.request_scale_up(&worker_name, generation);
-                    break;
+                    continue;
                 }
                 Err(error) => {
                     let pending = self
@@ -1231,7 +1255,7 @@ impl WorkerManager {
             }
         }
         if !self.scale_up_requests.is_empty()
-            && self.global_isolate_slots_used >= self.config.max_global_isolates
+            && self.regular_isolate_slots_used() >= self.config.max_global_isolates
         {
             self.stats.scale_up_budget_denied_count =
                 self.stats.scale_up_budget_denied_count.saturating_add(1);
@@ -1249,19 +1273,50 @@ impl WorkerManager {
         } else {
             max_inflight
         };
+        let internal_request_needs_capacity =
+            pool.queue.has_internal_request() && !pool.has_dispatch_capacity(max_inflight);
+        let external_request_needs_capacity =
+            pool.queue.has_external_request() && !pool.has_regular_dispatch_capacity(max_inflight);
         !pool.queue.is_empty()
-            && !pool.has_dispatch_capacity(max_inflight)
+            && (internal_request_needs_capacity || external_request_needs_capacity)
             && !pool.has_starting_isolate()
             && pool.isolates.len() < max_isolates
     }
 
-    fn try_reserve_global_isolate_slot(&mut self) -> bool {
-        if self.global_isolate_slots_used >= self.config.max_global_isolates {
-            return false;
-        }
+    fn internal_rescue_available_for_pool(&self, worker_name: &str, generation: u64) -> bool {
+        self.internal_rescue_isolate_slots.len() < self.internal_rescue_isolate_limit()
+            && self
+                .workers
+                .get(worker_name)
+                .and_then(|entry| entry.pools.get(&generation))
+                .is_some_and(|pool| pool.queue.has_internal_request())
+    }
+
+    fn internal_rescue_isolate_limit(&self) -> usize {
+        self.config.max_global_isolates.max(1)
+    }
+
+    pub(super) fn regular_isolate_slots_used(&self) -> usize {
+        self.global_isolate_slots_used
+            .saturating_sub(self.internal_rescue_isolate_slots.len())
+    }
+
+    fn try_reserve_global_isolate_slot(
+        &mut self,
+        spawn_policy: IsolateSpawnPolicy,
+    ) -> Option<IsolateSlotReservation> {
+        let reservation = if self.regular_isolate_slots_used() < self.config.max_global_isolates {
+            IsolateSlotReservation::Regular
+        } else if matches!(spawn_policy, IsolateSpawnPolicy::AllowInternalRescue)
+            && self.internal_rescue_isolate_slots.len() < self.internal_rescue_isolate_limit()
+        {
+            IsolateSlotReservation::InternalRescue
+        } else {
+            return None;
+        };
         self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_add(1);
         self.global_isolates_starting = self.global_isolates_starting.saturating_add(1);
-        true
+        Some(reservation)
     }
 
     fn release_global_isolate_slot_for_startup_failure(&mut self) {
@@ -1269,7 +1324,12 @@ impl WorkerManager {
         self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
     }
 
-    pub(crate) fn global_isolate_slot_released(&mut self, startup: IsolateStartup) {
+    pub(crate) fn global_isolate_slot_released(
+        &mut self,
+        key: &IsolateSlotKey,
+        startup: IsolateStartup,
+    ) {
+        self.internal_rescue_isolate_slots.remove(key);
         self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_sub(1);
         if startup.is_starting() {
             self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);

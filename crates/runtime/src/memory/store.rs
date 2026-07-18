@@ -79,8 +79,9 @@ impl MemoryStore {
             shard_hash_version: layout.shard_hash_version,
             namespace_shard_hash_versions: Arc::new(layout.namespace_shard_hash_versions),
             namespace_key_shard_overrides: Arc::new(layout.namespace_key_shard_overrides),
-            snapshot_cache_max_entries: db_cache_max_open.max(64),
-            snapshot_cache_max_bytes: db_cache_max_open.max(64).saturating_mul(64 * 1024),
+            snapshot_cache_max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES
+                .max(namespace_shards.saturating_mul(MEMORY_ENTITY_CACHE_STRIPES)),
+            snapshot_cache_max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
             owner_epoch_floor: Arc::new(AtomicU64::new(floors.owner_epoch_floor.max(1))),
             profile: Arc::new(MemoryProfile::default()),
         };
@@ -93,6 +94,15 @@ impl MemoryStore {
 
     pub fn set_profile_enabled(&self, enabled: bool) {
         self.profile.set_enabled(enabled);
+    }
+
+    pub(crate) fn set_snapshot_cache_limits(&mut self, max_entries: usize, max_bytes: usize) {
+        self.snapshot_cache_max_entries = max_entries;
+        self.snapshot_cache_max_bytes = max_bytes;
+    }
+
+    pub(crate) fn cache_performance_snapshot(&self) -> MemoryCachePerformanceSnapshot {
+        self.profile.cache_performance_snapshot()
     }
 
     pub fn record_profile(&self, metric: MemoryProfileMetricKind, duration_us: u64, items: u64) {

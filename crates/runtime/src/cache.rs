@@ -4,6 +4,7 @@ use crate::turso_util::{
     execute_cached, health_check_database, is_retryable_turso_error, query_cached,
     record_storage_retry, record_storage_schema_version, retry_turso_busy, storage_schema_version,
 };
+use bytes::Bytes;
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -91,7 +92,7 @@ pub struct CacheRequest {
 pub struct CacheResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 #[derive(Clone, Debug)]
@@ -805,7 +806,7 @@ impl CacheStore {
             let response = CacheResponse {
                 status: record.status as u16,
                 headers,
-                body: record.body,
+                body: Bytes::from(record.body),
             };
             let response_headers = to_header_map(&response.headers);
             let response_control =
@@ -1017,7 +1018,7 @@ impl CacheStore {
                         vary_values_json.as_str(),
                         response.status as i64,
                         headers_json.as_str(),
-                        response.body.as_slice(),
+                        response.body.as_ref(),
                         size_bytes as i64,
                         expires_at_ms,
                         access_seq,
@@ -1935,6 +1936,7 @@ mod tests {
     };
     use crate::blob::local_blob_store_for_tests;
     use crate::kv::KvStore;
+    use bytes::Bytes;
     use common::Result;
     use std::fs;
     use std::sync::Arc;
@@ -1997,7 +1999,7 @@ mod tests {
         CacheResponse {
             status: 200,
             headers: vec![("cache-control".to_string(), "max-age=60".to_string())],
-            body: body.as_bytes().to_vec(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
         }
     }
 
@@ -2024,7 +2026,7 @@ mod tests {
                 CacheResponse {
                     status: 200,
                     headers: Vec::new(),
-                    body: vec![id as u8],
+                    body: Bytes::from(vec![id as u8]),
                 },
                 i64::MAX,
             )
@@ -2059,9 +2061,32 @@ mod tests {
         assert!(store.put(&req, response("one")).await?);
         let hit = store.get(&req).await?;
         match hit {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"one"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"one"),
             other => panic!("expected fresh hit, got {:?}", other),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_hot_hits_share_response_body_storage() -> Result<()> {
+        let store = test_store(CacheConfig {
+            max_entries: 8,
+            max_bytes: 1024 * 1024,
+            default_ttl: Duration::from_secs(5),
+            inline_body_limit_bytes: 64 * 1024,
+        })
+        .await;
+        let req = request("/shared-body");
+        assert!(store.put(&req, response("shared")).await?);
+
+        let CacheLookup::Fresh(first) = store.get(&req).await? else {
+            panic!("first cache lookup should be fresh");
+        };
+        let CacheLookup::Fresh(second) = store.get(&req).await? else {
+            panic!("second cache lookup should be fresh");
+        };
+
+        assert_eq!(first.body.as_ptr(), second.body.as_ptr());
         Ok(())
     }
 
@@ -2174,7 +2199,7 @@ mod tests {
             CacheLookup::Miss
         ));
         match store.get(&req).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"fresh"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"fresh"),
             other => panic!("expected refreshed cache row, got {other:?}"),
         }
         Ok(())
@@ -2296,11 +2321,11 @@ mod tests {
         assert!(store.put(&req_a, res_a).await?);
         assert!(store.put(&req_b, res_b).await?);
         match store.get(&req_a).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"hello"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"hello"),
             other => panic!("expected fresh en hit, got {:?}", other),
         }
         match store.get(&req_b).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"salut"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"salut"),
             other => panic!("expected fresh fr hit, got {:?}", other),
         }
         Ok(())
@@ -2326,11 +2351,11 @@ mod tests {
 
         assert!(matches!(store.get(&req_a).await?, CacheLookup::Miss));
         match store.get(&req_b).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"b"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"b"),
             other => panic!("expected fresh b hit, got {:?}", other),
         }
         match store.get(&req_c).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"c"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"c"),
             other => panic!("expected fresh c hit, got {:?}", other),
         }
         Ok(())
@@ -2352,18 +2377,18 @@ mod tests {
         assert!(store.put(&req_a, response("a")).await?);
         assert!(store.put(&req_b, response("b")).await?);
         match store.get(&req_a).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"a"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"a"),
             other => panic!("expected fresh a hit, got {:?}", other),
         }
         assert!(store.put(&req_c, response("c")).await?);
 
         assert!(matches!(store.get(&req_b).await?, CacheLookup::Miss));
         match store.get(&req_a).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"a"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"a"),
             other => panic!("expected fresh a hit after eviction, got {:?}", other),
         }
         match store.get(&req_c).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"c"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"c"),
             other => panic!("expected fresh c hit, got {:?}", other),
         }
         Ok(())
@@ -2383,7 +2408,7 @@ mod tests {
         let cached_response = CacheResponse {
             status: 200,
             headers: vec![("cache-control".to_string(), "max-age=60".to_string())],
-            body: body.as_bytes().to_vec(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
         };
 
         assert!(store.put(&req, cached_response).await?);
@@ -2423,7 +2448,7 @@ mod tests {
         assert!(store.put(&req, response("two")).await?);
 
         match store.get(&req).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"two"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"two"),
             other => panic!("expected overwritten cache entry, got {:?}", other),
         }
         Ok(())
@@ -2462,7 +2487,8 @@ mod tests {
 
         match store.get(&req).await? {
             CacheLookup::Fresh(value) => {
-                let body = String::from_utf8(value.body).expect("cache body should be utf8");
+                let body =
+                    String::from_utf8(value.body.to_vec()).expect("cache body should be utf8");
                 assert!(body.starts_with("body-"));
             }
             other => panic!("expected fresh concurrent overwrite hit, got {:?}", other),
@@ -2551,11 +2577,13 @@ mod tests {
         let store =
             CacheStore::from_local_path(CacheConfig::default(), database_path, blob_store).await?;
         match store.get(&request("/legacy-inline")).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"legacy inline body"),
+            CacheLookup::Fresh(value) => {
+                assert_eq!(value.body.as_ref(), b"legacy inline body")
+            }
             other => panic!("expected migrated inline hit, got {other:?}"),
         }
         match store.get(&request("/legacy-external")).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, external_body),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), external_body),
             other => panic!("expected migrated external hit, got {other:?}"),
         }
 
@@ -2631,7 +2659,7 @@ mod tests {
         )
         .await;
         match store.get(&request("/current")).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"preserved"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"preserved"),
             other => panic!("expected current-schema cache hit, got {other:?}"),
         }
         store.health_check().await?;
@@ -2807,7 +2835,7 @@ mod tests {
                 "cache-control".to_string(),
                 "max-age=1, stale-while-revalidate=30".to_string(),
             )],
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
         };
 
         assert!(store.put(&req, cached_response).await?);
@@ -2835,7 +2863,7 @@ mod tests {
                 "cache-control".to_string(),
                 "max-age=1, stale-while-revalidate=30".to_string(),
             )],
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
         };
 
         assert!(store.put(&req, cached_response).await?);
@@ -2868,7 +2896,7 @@ mod tests {
                 "cache-control".to_string(),
                 "max-age=1, stale-if-error=30".to_string(),
             )],
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
         };
 
         assert!(store.put(&req, cached_response).await?);
@@ -2896,7 +2924,7 @@ mod tests {
                 "cache-control".to_string(),
                 "max-age=1, stale-if-error=30".to_string(),
             )],
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
         };
 
         assert!(store.put(&req, cached_response).await?);
@@ -2929,7 +2957,7 @@ mod tests {
                 "cache-control".to_string(),
                 "max-age=1, stale-while-revalidate=30, stale-if-error=30".to_string(),
             )],
-            body: b"stale".to_vec(),
+            body: Bytes::from_static(b"stale"),
         };
 
         assert!(store.put(&req, response).await?);
@@ -2954,7 +2982,7 @@ mod tests {
         assert!(store.put(&req, response("second")).await?);
 
         match store.get(&req).await? {
-            CacheLookup::Fresh(value) => assert_eq!(value.body, b"second"),
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"second"),
             other => panic!("expected fresh second value, got {:?}", other),
         }
         assert!(store.delete(&req).await?);

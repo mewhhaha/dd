@@ -45,6 +45,32 @@ async fn service_starts_with_deno_runtime_bootstrap() {
 }
 
 #[tokio::test]
+async fn service_rejects_snapshot_budgets_that_leave_empty_cache_stripes() {
+    let storage = RuntimeStorageConfig {
+        memory_snapshot_cache_max_entries: 1,
+        ..RuntimeStorageConfig::default()
+    };
+    let result = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+        runtime: RuntimeConfig::default(),
+        storage,
+    })
+    .await;
+    let error = match result {
+        Ok(service) => {
+            let _ = service.shutdown().await;
+            panic!("undersized snapshot budget should be rejected");
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("memory_snapshot_cache_max_entries must be at least 1024")
+    );
+}
+
+#[tokio::test]
 #[serial]
 async fn shutdown_is_idempotent_across_clones_and_waits_for_runtime_thread_exit() {
     let service = test_service(RuntimeConfig {
@@ -1457,6 +1483,94 @@ export default {
     assert!(body.contains("\"path\":\"/session\""), "body was {body}");
     assert!(body.contains("\"service\":\"app\""), "body was {body}");
     assert!(body.contains("\"body\":\"hello\""), "body was {body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn internal_service_calls_make_progress_when_frontends_fill_the_global_isolate_budget() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 2,
+        max_isolates: 2,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "budget-auth".to_string(),
+            r#"
+export default {
+  fetch() {
+    return new Response("authorized");
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                public: false,
+                cache: Default::default(),
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("auth deploy should succeed");
+
+    service
+        .deploy_with_config(
+            "budget-app".to_string(),
+            r#"
+export default {
+  async fetch(_request, env) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return env.AUTH.fetch("/session");
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                public: false,
+                cache: Default::default(),
+                bindings: vec![DeployBinding::Service {
+                    binding: "AUTH".to_string(),
+                    service: "budget-auth".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("app deploy should succeed");
+
+    let requests = (0..8).map(|index| {
+        let service = service.clone();
+        async move {
+            let request = test_invocation_with_path("/", &format!("budget-service-{index}"));
+            service.invoke("budget-app".to_string(), request).await
+        }
+    });
+    let outputs = timeout(
+        Duration::from_secs(5),
+        futures_util::future::join_all(requests),
+    )
+    .await
+    .expect("internal calls should not deadlock");
+    for output in outputs {
+        let output = output.expect("request should succeed");
+        assert_eq!(output.status, 200);
+        assert_eq!(output.body, b"authorized");
+    }
+
+    let stats = service
+        .stats("budget-app".to_string())
+        .await
+        .expect("app stats should exist");
+    assert_eq!(stats.global_isolate_budget, 2);
+    assert!(stats.global_isolates_total <= 4);
+    assert!((1..=2).contains(&stats.global_internal_rescue_isolates));
 }
 
 #[tokio::test]

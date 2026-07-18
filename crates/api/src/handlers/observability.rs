@@ -138,6 +138,36 @@ pub(super) async fn metrics_response(state: &AppState) -> ApiResult<Response<Res
         "dd_cache_pending_recency_touches",
         runtime.cache_pending_recency_touches,
     );
+    counter_help(
+        &mut body,
+        "dd_memory_snapshot_cache_hits_total",
+        "Memory snapshot cache hits.",
+    );
+    metric(
+        &mut body,
+        "dd_memory_snapshot_cache_hits_total",
+        runtime.memory_snapshot_cache_hits,
+    );
+    counter_help(
+        &mut body,
+        "dd_memory_snapshot_cache_misses_total",
+        "Memory snapshot cache misses.",
+    );
+    metric(
+        &mut body,
+        "dd_memory_snapshot_cache_misses_total",
+        runtime.memory_snapshot_cache_misses,
+    );
+    counter_help(
+        &mut body,
+        "dd_memory_snapshot_cache_evictions_total",
+        "Memory snapshot cache entries evicted by capacity or idle limits.",
+    );
+    metric(
+        &mut body,
+        "dd_memory_snapshot_cache_evictions_total",
+        runtime.memory_snapshot_cache_evictions,
+    );
 
     metric_help(
         &mut body,
@@ -178,6 +208,31 @@ pub(super) async fn metrics_response(state: &AppState) -> ApiResult<Response<Res
         &mut body,
         "dd_runtime_worker_isolate_budget_denials_total",
         "Worker scale-up attempts denied by the global isolate budget.",
+    );
+    counter_help(
+        &mut body,
+        "dd_runtime_worker_isolate_spawns_total",
+        "Worker isolates started.",
+    );
+    counter_help(
+        &mut body,
+        "dd_runtime_worker_isolate_reuses_total",
+        "Requests dispatched to an isolate that had already served a request.",
+    );
+    counter_help(
+        &mut body,
+        "dd_runtime_worker_isolate_scale_downs_total",
+        "Worker isolates retired by idle or budget pressure.",
+    );
+    metric_help(
+        &mut body,
+        "dd_runtime_worker_memory_max_shard_depth",
+        "Largest queued memory shard for a worker.",
+    );
+    metric_help(
+        &mut body,
+        "dd_runtime_worker_memory_blocked_owner_queues",
+        "Memory owner queues blocked by an active entity lease.",
     );
     for worker in &runtime.workers {
         let label = prometheus_label(&worker.name);
@@ -232,6 +287,36 @@ pub(super) async fn metrics_response(state: &AppState) -> ApiResult<Response<Res
             &label,
             worker.stats.scale_up_budget_denied_count,
         );
+        worker_metric(
+            &mut body,
+            "dd_runtime_worker_isolate_spawns_total",
+            &label,
+            worker.stats.spawn_count,
+        );
+        worker_metric(
+            &mut body,
+            "dd_runtime_worker_isolate_reuses_total",
+            &label,
+            worker.stats.reuse_count,
+        );
+        worker_metric(
+            &mut body,
+            "dd_runtime_worker_isolate_scale_downs_total",
+            &label,
+            worker.stats.scale_down_count,
+        );
+        worker_metric(
+            &mut body,
+            "dd_runtime_worker_memory_max_shard_depth",
+            &label,
+            worker.stats.memory_max_shard_depth,
+        );
+        worker_metric(
+            &mut body,
+            "dd_runtime_worker_memory_blocked_owner_queues",
+            &label,
+            worker.stats.memory_blocked_owner_queues,
+        );
     }
 
     let global = runtime.workers.first().map(|worker| &worker.stats);
@@ -244,6 +329,16 @@ pub(super) async fn metrics_response(state: &AppState) -> ApiResult<Response<Res
         &mut body,
         "dd_runtime_global_isolates",
         global.map_or(0, |stats| stats.global_isolates_total),
+    );
+    metric_help(
+        &mut body,
+        "dd_runtime_internal_rescue_isolates",
+        "Temporary isolates above the global budget serving internal dependencies.",
+    );
+    metric(
+        &mut body,
+        "dd_runtime_internal_rescue_isolates",
+        global.map_or(0, |stats| stats.global_internal_rescue_isolates),
     );
     metric_help(
         &mut body,

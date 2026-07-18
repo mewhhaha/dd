@@ -439,8 +439,12 @@ async fn main() -> Result<(), String> {
     let mode = env_mode_checked()?;
     let profile_enabled = env_flag("DD_BENCH_PROFILE_MEMORY");
     let options = bench_options_from_env();
+    let min_isolates = std::env::var("DD_BENCH_MIN_ISOLATES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1);
     let runtime = RuntimeConfig {
-        min_isolates: env_usize("DD_BENCH_MIN_ISOLATES", 1),
+        min_isolates,
         max_isolates: env_usize("DD_BENCH_MAX_ISOLATES", 1),
         max_inflight_per_isolate: env_usize("DD_BENCH_MAX_INFLIGHT", 1),
         idle_ttl: env_duration_ms("DD_BENCH_IDLE_TTL_MS", 30_000),
@@ -466,7 +470,7 @@ async fn main() -> Result<(), String> {
     );
     println!(
         "# runtime min_isolates={} max_isolates={} max_inflight_per_isolate={}",
-        env_usize("DD_BENCH_MIN_ISOLATES", 1),
+        min_isolates,
         env_usize("DD_BENCH_MAX_ISOLATES", 1),
         env_usize("DD_BENCH_MAX_INFLIGHT", 1),
     );
@@ -613,6 +617,11 @@ fn print_help() {
     println!("  DD_BENCH_WIDE_KEY_SPACE        wide scenario key space (default 256)");
     println!("  DD_BENCH_MEMORY_KEY_MODE       pool, unique, same-shard, or cross-shard");
     println!("  DD_BENCH_MEMORY_NAMESPACE_SHARDS memory namespace shards (default 16)");
+    println!("  DD_BENCH_MEMORY_DB_CACHE_MAX_OPEN open memory database budget (default 4096)");
+    println!("  DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES snapshot entry budget (default 4096)");
+    println!("  DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES snapshot byte budget (default 67108864)");
+    println!("  DD_BENCH_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE readers per database (default 4)");
+    println!("  DD_BENCH_MEMORY_DB_MAX_TOTAL_CONNECTIONS total memory connections (default 20480)");
     println!("  DD_BENCH_PROFILE_MEMORY        enable memory profile output");
     println!();
     println!("Modes:");

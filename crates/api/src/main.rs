@@ -29,7 +29,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[command(name = "dd_server")]
 #[command(about = "Single-node dd worker runtime server")]
 #[command(
-    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_OTEL_COLLECTOR_VERIFIED\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS\n  DD_MEMORY_DB_CACHE_MAX_OPEN\n  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE\n  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
+    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_OTEL_COLLECTOR_VERIFIED\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS\n  DD_MEMORY_DB_CACHE_MAX_OPEN\n  DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES\n  DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES\n  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE\n  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
 )]
 struct Cli {
     #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = DEFAULT_PUBLIC_BIND_ADDR)]
@@ -100,6 +100,18 @@ struct Cli {
     memory_db_cache_max_open: Option<usize>,
 
     #[arg(
+        long = "memory-snapshot-cache-max-entries",
+        env = "DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES"
+    )]
+    memory_snapshot_cache_max_entries: Option<usize>,
+
+    #[arg(
+        long = "memory-snapshot-cache-max-bytes",
+        env = "DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES"
+    )]
+    memory_snapshot_cache_max_bytes: Option<usize>,
+
+    #[arg(
         long = "memory-db-read-connections-per-database",
         env = "DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE"
     )]
@@ -165,6 +177,18 @@ async fn main() -> Result<()> {
     if let Some(value) = cli.memory_db_cache_max_open {
         server_config.runtime.storage.memory_db_cache_max_open = value;
     }
+    if let Some(value) = cli.memory_snapshot_cache_max_entries {
+        server_config
+            .runtime
+            .storage
+            .memory_snapshot_cache_max_entries = value;
+    }
+    if let Some(value) = cli.memory_snapshot_cache_max_bytes {
+        server_config
+            .runtime
+            .storage
+            .memory_snapshot_cache_max_bytes = value;
+    }
     if let Some(value) = cli.memory_db_read_connections_per_database {
         server_config
             .runtime
@@ -186,19 +210,9 @@ async fn main() -> Result<()> {
 
 #[cfg(feature = "otel")]
 fn init_tracing() -> Result<Option<OTelTracerProvider>> {
-    global::set_text_map_propagator(TraceContextPropagator::new());
-
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
     let endpoint = configured_otlp_http_traces_endpoint();
-    let resource = Resource::builder_empty()
-        .with_attributes([
-            KeyValue::new("service.name", "dd-server"),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-        ])
-        .build();
-    let mut provider_builder = OTelTracerProvider::builder().with_resource(resource);
-
     let endpoint_configured = endpoint.is_some();
     let exporter_enabled = endpoint_configured && otlp_collector_is_operator_verified();
     dd_server::configure_trace_exporter(endpoint_configured, exporter_enabled);
@@ -207,20 +221,33 @@ fn init_tracing() -> Result<Option<OTelTracerProvider>> {
             "OTLP endpoint configured but exporter disabled; set DD_OTEL_COLLECTOR_VERIFIED=true after verifying the collector"
         );
     }
-    if let Some(endpoint) = endpoint.filter(|_| exporter_enabled) {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(endpoint)
-            .with_protocol(Protocol::HttpBinary)
-            .build()
-            .map_err(|error| {
-                PlatformError::internal(format!("otlp exporter init failed: {error}"))
-            })?;
-        provider_builder = provider_builder.with_batch_exporter(HealthTrackingExporter(exporter));
+    if !exporter_enabled {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+        return Ok(None);
     }
 
-    let provider = provider_builder.build();
+    let endpoint = endpoint.expect("enabled exporter must have an endpoint");
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .with_protocol(Protocol::HttpBinary)
+        .build()
+        .map_err(|error| PlatformError::internal(format!("otlp exporter init failed: {error}")))?;
+    let resource = Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new("service.name", "dd-server"),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        ])
+        .build();
+    let provider = OTelTracerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(HealthTrackingExporter(exporter))
+        .build();
     let tracer = provider.tracer("dd");
+    global::set_text_map_propagator(TraceContextPropagator::new());
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_layer)
@@ -361,6 +388,10 @@ mod tests {
             "4",
             "--memory-db-cache-max-open",
             "16",
+            "--memory-snapshot-cache-max-entries",
+            "2048",
+            "--memory-snapshot-cache-max-bytes",
+            "33554432",
             "--memory-db-read-connections-per-database",
             "2",
             "--memory-db-max-total-connections",
@@ -374,6 +405,8 @@ mod tests {
         assert_eq!(cli.runtime_min_isolates_per_worker, Some(1));
         assert_eq!(cli.memory_outbox_max_concurrent_shards, Some(4));
         assert_eq!(cli.memory_db_cache_max_open, Some(16));
+        assert_eq!(cli.memory_snapshot_cache_max_entries, Some(2048));
+        assert_eq!(cli.memory_snapshot_cache_max_bytes, Some(33_554_432));
         assert_eq!(cli.memory_db_read_connections_per_database, Some(2));
         assert_eq!(cli.memory_db_max_total_connections, Some(32));
     }

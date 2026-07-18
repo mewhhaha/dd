@@ -40,6 +40,21 @@ impl MemoryProfile {
     }
 
     fn record(&self, metric: MemoryProfileMetricKind, duration_us: u64, items: u64) {
+        match metric {
+            MemoryProfileMetricKind::StoreSnapshotCacheHit => {
+                self.snapshot_cache_hits_total
+                    .fetch_add(items.max(1), Ordering::Relaxed);
+            }
+            MemoryProfileMetricKind::StoreSnapshotCacheMiss => {
+                self.snapshot_cache_misses_total
+                    .fetch_add(items.max(1), Ordering::Relaxed);
+            }
+            MemoryProfileMetricKind::StoreSnapshotCacheEviction => {
+                self.snapshot_cache_evictions_total
+                    .fetch_add(items.max(1), Ordering::Relaxed);
+            }
+            _ => {}
+        }
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -102,6 +117,14 @@ impl MemoryProfile {
             MemoryProfileMetricKind::RuntimeAtomicOutboxDrain => &self.runtime_atomic_outbox_drain,
         };
         target.record(duration_us, items.max(1));
+    }
+
+    fn cache_performance_snapshot(&self) -> MemoryCachePerformanceSnapshot {
+        MemoryCachePerformanceSnapshot {
+            snapshot_hits: self.snapshot_cache_hits_total.load(Ordering::Relaxed),
+            snapshot_misses: self.snapshot_cache_misses_total.load(Ordering::Relaxed),
+            snapshot_evictions: self.snapshot_cache_evictions_total.load(Ordering::Relaxed),
+        }
     }
 
     fn take_snapshot_and_reset(&self) -> MemoryProfileSnapshot {

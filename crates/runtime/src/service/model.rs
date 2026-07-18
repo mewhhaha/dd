@@ -49,6 +49,7 @@ pub(super) struct WorkerManager {
     pub(super) scale_up_request_members: HashSet<(String, u64)>,
     pub(super) global_isolate_slots_used: usize,
     pub(super) global_isolates_starting: usize,
+    pub(super) internal_rescue_isolate_slots: HashSet<IsolateSlotKey>,
     pub(super) exiting_isolate_slots: HashMap<IsolateSlotKey, IsolateStartup>,
     pub(super) isolate_thread_tracker: IsolateThreadTracker,
     pub(super) stats: RuntimeManagerStats,
@@ -614,6 +615,7 @@ pub(super) struct PendingInvokeQueue {
     memory_next_shard_cursor: Option<usize>,
     general: BTreeMap<u64, PendingInvoke>,
     queued: usize,
+    internal_queued: usize,
     queued_bytes: usize,
 }
 
@@ -631,6 +633,7 @@ impl PendingInvokeQueue {
             memory_next_shard_cursor: None,
             general: BTreeMap::new(),
             queued: 0,
+            internal_queued: 0,
             queued_bytes: 0,
         }
     }
@@ -1016,6 +1019,14 @@ impl PendingInvokeQueue {
             .chain(self.general.values())
     }
 
+    pub(super) fn has_internal_request(&self) -> bool {
+        self.internal_queued > 0
+    }
+
+    pub(super) fn has_external_request(&self) -> bool {
+        self.queued > self.internal_queued
+    }
+
     fn oldest_key(
         &self,
         lanes: impl IntoIterator<Item = PendingQueueLane>,
@@ -1122,6 +1133,9 @@ impl PendingInvokeQueue {
     }
 
     fn index_pending(&mut self, key: PendingQueueKey, pending: &PendingInvoke) {
+        if pending.internal_origin {
+            self.internal_queued = self.internal_queued.saturating_add(1);
+        }
         self.by_runtime_request_id
             .insert(pending.runtime_request_id.clone(), key.clone());
         if let Some(target_isolate_id) = pending.target_isolate_id {
@@ -1143,6 +1157,9 @@ impl PendingInvokeQueue {
     }
 
     fn unindex_pending(&mut self, key: PendingQueueKey, pending: &PendingInvoke) {
+        if pending.internal_origin {
+            self.internal_queued = self.internal_queued.saturating_sub(1);
+        }
         self.by_runtime_request_id
             .remove(&pending.runtime_request_id);
         if let Some(target_isolate_id) = pending.target_isolate_id {
@@ -1503,6 +1520,18 @@ pub(super) struct RemovedIsolate {
     pub(super) was_starting: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum IsolateSlotReservation {
+    Regular,
+    InternalRescue,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum IsolateSpawnPolicy {
+    WithinGlobalBudget,
+    AllowInternalRescue,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct IsolateSlotKey {
     pub(super) worker_name: String,
@@ -1735,6 +1764,7 @@ pub(super) struct IsolateHandle {
     pub(super) v8_handle: Arc<StdMutex<Option<deno_core::v8::IsolateHandle>>>,
     pub(super) dynamic_control_inbox: crate::ops::DynamicControlInbox,
     pub(super) startup: IsolateStartup,
+    pub(super) internal_rescue: bool,
     pub(super) inflight_count: usize,
     pub(super) active_websocket_sessions: usize,
     pub(super) active_transport_sessions: usize,
@@ -1829,6 +1859,13 @@ mod tests {
             .map(|pending| pending.queued_bytes)
             .sum::<usize>();
         assert_eq!(queue.len(), actual_count);
+        assert_eq!(
+            queue.internal_queued,
+            queue
+                .iter()
+                .filter(|pending| pending.internal_origin)
+                .count()
+        );
         assert_eq!(queue.queued_bytes(), actual_bytes);
         assert_eq!(
             queue.is_empty(),
@@ -1845,6 +1882,24 @@ mod tests {
             assert_eq!(shard.queued_bytes, shard_bytes);
             assert_eq!(shard.is_empty(), shard_count == 0);
         }
+    }
+
+    #[test]
+    fn pending_invoke_queue_tracks_internal_and_external_work() {
+        let mut queue = PendingInvokeQueue::new();
+        let mut internal = pending_invoke("internal", None, None, None);
+        internal.internal_origin = true;
+        queue.push_back(internal);
+        queue.push_back(pending_invoke("external", None, None, None));
+
+        assert!(queue.has_internal_request());
+        assert!(queue.has_external_request());
+        queue
+            .pop_front()
+            .expect("internal request should be present");
+        assert!(!queue.has_internal_request());
+        assert!(queue.has_external_request());
+        assert_queue_accounting(&queue);
     }
 
     #[test]

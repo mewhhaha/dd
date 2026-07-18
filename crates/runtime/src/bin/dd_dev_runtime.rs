@@ -183,6 +183,8 @@ async fn main() -> Result<(), String> {
             memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
             memory_db_cache_max_open: 256,
+            memory_snapshot_cache_max_entries: 4096,
+            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             memory_db_read_connections_per_database: 2,
             memory_db_max_total_connections: 512,
             memory_db_idle_ttl: Duration::from_secs(30),

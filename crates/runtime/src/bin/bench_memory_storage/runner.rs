@@ -102,6 +102,14 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
                 print_profile_on_failure(service, &worker_name, label).await;
             }
             print_debug_dump_on_failure(service, &worker_name, label).await;
+            if let Some(stats_worker_name) = profile_stats_worker.as_deref() {
+                print_debug_dump_on_failure(
+                    service,
+                    stats_worker_name,
+                    &format!("{label}-dependency"),
+                )
+                .await;
+            }
             println!(
                 "bench-final label={} outcome=error phase={} message={}",
                 label,
@@ -164,6 +172,14 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
                 print_profile_on_failure(service, &worker_name, label).await;
             }
             print_debug_dump_on_failure(service, &worker_name, label).await;
+            if let Some(stats_worker_name) = profile_stats_worker.as_deref() {
+                print_debug_dump_on_failure(
+                    service,
+                    stats_worker_name,
+                    &format!("{label}-dependency"),
+                )
+                .await;
+            }
             println!(
                 "bench-final label={} outcome=error phase={} message={}",
                 label,

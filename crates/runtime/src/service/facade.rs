@@ -102,6 +102,8 @@ pub struct RuntimeStorageConfig {
     pub memory_namespace_shards: usize,
     pub memory_outbox_max_concurrent_shards: usize,
     pub memory_db_cache_max_open: usize,
+    pub memory_snapshot_cache_max_entries: usize,
+    pub memory_snapshot_cache_max_bytes: usize,
     pub memory_db_read_connections_per_database: usize,
     pub memory_db_max_total_connections: usize,
     pub memory_db_idle_ttl: Duration,
@@ -118,6 +120,8 @@ impl Default for RuntimeStorageConfig {
             memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: default_memory_outbox_parallelism(16),
             memory_db_cache_max_open: 512,
+            memory_snapshot_cache_max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
+            memory_snapshot_cache_max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
             memory_db_read_connections_per_database: 2,
             memory_db_max_total_connections: 1024,
             memory_db_idle_ttl: Duration::from_secs(60),
@@ -186,6 +190,7 @@ pub struct WorkerStats {
     pub global_isolate_budget: usize,
     pub global_isolates_total: usize,
     pub global_isolates_starting: usize,
+    pub global_internal_rescue_isolates: usize,
     pub global_isolate_slots_available: usize,
     pub scale_up_waiting_pools: usize,
     pub scale_up_budget_denied_count: u64,
@@ -233,6 +238,9 @@ pub struct RuntimeAdminSnapshot {
     pub storage_retry_count: u64,
     pub cache_flush_failure_count: u64,
     pub cache_pending_recency_touches: usize,
+    pub memory_snapshot_cache_hits: u64,
+    pub memory_snapshot_cache_misses: u64,
+    pub memory_snapshot_cache_evictions: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -295,6 +303,7 @@ pub struct MemorySchedulerDebug {
     pub global_isolate_budget: usize,
     pub global_isolates_total: usize,
     pub global_isolates_starting: usize,
+    pub global_internal_rescue_isolates: usize,
     pub global_isolate_slots_available: usize,
     pub scale_up_waiting_pools: usize,
     pub scale_up_budget_denied_count: u64,
@@ -717,6 +726,20 @@ impl RuntimeService {
                 "memory_db_cache_max_open must be greater than 0",
             ));
         }
+        let minimum_snapshot_entries = storage
+            .memory_namespace_shards
+            .saturating_mul(MEMORY_ENTITY_CACHE_STRIPES);
+        if storage.memory_snapshot_cache_max_entries < minimum_snapshot_entries {
+            return Err(PlatformError::internal(format!(
+                "memory_snapshot_cache_max_entries must be at least {minimum_snapshot_entries} for {} namespace shards and {MEMORY_ENTITY_CACHE_STRIPES} cache stripes",
+                storage.memory_namespace_shards
+            )));
+        }
+        if storage.memory_snapshot_cache_max_bytes == 0 {
+            return Err(PlatformError::internal(
+                "memory_snapshot_cache_max_bytes must be greater than 0",
+            ));
+        }
         if storage.memory_namespace_shards == 0 {
             return Err(PlatformError::internal(
                 "memory_namespace_shards must be greater than 0",
@@ -765,7 +788,7 @@ impl RuntimeService {
         let storage_database = KvStore::open_database(&storage.database_url).await?;
         let kv_store = KvStore::from_database(Arc::clone(&storage_database)).await?;
         kv_store.set_profile_enabled(runtime.kv_profile_enabled);
-        let memory_store = MemoryStore::new_with_connection_limits(
+        let mut memory_store = MemoryStore::new_with_connection_limits(
             storage.store_dir.join("memory"),
             storage.memory_namespace_shards,
             storage.memory_db_cache_max_open,
@@ -774,6 +797,10 @@ impl RuntimeService {
             storage.memory_db_max_total_connections,
         )
         .await?;
+        memory_store.set_snapshot_cache_limits(
+            storage.memory_snapshot_cache_max_entries,
+            storage.memory_snapshot_cache_max_bytes,
+        );
         memory_store.set_profile_enabled(runtime.memory_profile_enabled);
         let blob_store = BlobStore::for_legacy_root(storage.store_dir.join("blobs")).await?;
         let cache_store = CacheStore::from_database(
@@ -1529,6 +1556,7 @@ impl RuntimeService {
             }],
         };
         let readiness = self.readiness().await;
+        let memory_cache = self.memory_store.cache_performance_snapshot();
         RuntimeAdminSnapshot {
             active_deployments,
             workers,
@@ -1537,6 +1565,9 @@ impl RuntimeService {
             storage_retry_count: crate::turso_util::storage_retry_count(),
             cache_flush_failure_count: self.cache_store.flush_failure_count(),
             cache_pending_recency_touches: self.cache_store.pending_touch_count(),
+            memory_snapshot_cache_hits: memory_cache.snapshot_hits,
+            memory_snapshot_cache_misses: memory_cache.snapshot_misses,
+            memory_snapshot_cache_evictions: memory_cache.snapshot_evictions,
         }
     }
 

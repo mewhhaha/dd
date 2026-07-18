@@ -7,6 +7,26 @@ const ISOLATE_COMMAND_DRAIN_BUDGET: usize = 256;
 const ISOLATE_COMMAND_CHANNEL_CAPACITY: usize = 1024;
 const ISOLATE_EVENT_QUEUE_CAPACITY: usize = 8192;
 
+#[derive(Clone, Copy)]
+enum IsolateEligibility {
+    RegularOnly,
+    IncludeInternalRescue,
+}
+
+impl IsolateEligibility {
+    fn for_pending(pending: &PendingInvoke) -> Self {
+        if pending.internal_origin {
+            Self::IncludeInternalRescue
+        } else {
+            Self::RegularOnly
+        }
+    }
+
+    fn accepts(self, isolate: &IsolateHandle) -> bool {
+        matches!(self, Self::IncludeInternalRescue) || !isolate.internal_rescue
+    }
+}
+
 pub(super) fn select_dispatch_candidate(
     pool: &mut WorkerPool,
     max_inflight: usize,
@@ -31,7 +51,10 @@ pub(super) fn select_dispatch_candidate(
                     return None;
                 }
                 if let Some(isolate_idx) = target_isolate_idx(isolate_indices, target_isolate_id) {
-                    if isolates[isolate_idx].startup.is_ready() {
+                    let isolate = &isolates[isolate_idx];
+                    if isolate.startup.is_ready()
+                        && IsolateEligibility::for_pending(pending).accepts(isolate)
+                    {
                         Some(DispatchSelection::Dispatch(DispatchCandidate {
                             queue_key,
                             isolate_idx,
@@ -65,11 +88,13 @@ pub(super) fn select_dispatch_candidate(
                 ],
                 |queue_key, pending| {
                     let Some(target_isolate_id) = pending.target_isolate_id else {
+                        let eligibility = IsolateEligibility::for_pending(pending);
                         if pending.memory_route.is_none() {
                             return least_loaded_isolate_idx(
                                 isolates,
                                 max_inflight,
                                 require_wait_until_idle,
+                                eligibility,
                             )
                             .map(|isolate_idx| {
                                 DispatchReadiness::Ready(DispatchSelection::Dispatch(
@@ -101,6 +126,7 @@ pub(super) fn select_dispatch_candidate(
                                 pending,
                                 max_inflight,
                                 require_wait_until_idle,
+                                eligibility,
                             ) {
                                 MemoryAffinityOutcome::Hit(idx) => {
                                     attempt_stats.memory_affinity_hit_count =
@@ -131,6 +157,7 @@ pub(super) fn select_dispatch_candidate(
                                 isolates,
                                 max_inflight,
                                 require_wait_until_idle,
+                                eligibility,
                             );
                             if isolate_idx.is_some() && memory_route_is_atomic(pending) {
                                 attempt_stats.memory_least_loaded_fallback_count = attempt_stats
@@ -142,7 +169,7 @@ pub(super) fn select_dispatch_candidate(
                             && allow_memory_atomic_overflow
                             && memory_route_is_atomic(pending)
                         {
-                            isolate_idx = least_loaded_isolate_any_idx(isolates);
+                            isolate_idx = least_loaded_isolate_any_idx(isolates, eligibility);
                             if isolate_idx.is_some() {
                                 attempt_stats.memory_atomic_overflow_dispatch_count = attempt_stats
                                     .memory_atomic_overflow_dispatch_count
@@ -172,6 +199,7 @@ pub(super) fn select_dispatch_candidate(
                         debug_assert!(pending.host_rpc_call.is_none());
                         debug_assert!(pending.memory_route.is_none());
                         if isolate.startup.is_ready()
+                            && IsolateEligibility::for_pending(pending).accepts(isolate)
                             && isolate.inflight_count < max_inflight
                             && (!require_wait_until_idle || isolate.pending_wait_until.is_empty())
                         {
@@ -252,6 +280,7 @@ fn memory_shard_affinity_outcome(
     pending: &PendingInvoke,
     max_inflight: usize,
     require_wait_until_idle: bool,
+    eligibility: IsolateEligibility,
 ) -> MemoryAffinityOutcome {
     let Some(shard_index) = pending
         .memory_route
@@ -268,6 +297,7 @@ fn memory_shard_affinity_outcome(
     };
     let isolate = &isolates[isolate_idx];
     if isolate.startup.is_ready()
+        && eligibility.accepts(isolate)
         && isolate.inflight_count < max_inflight
         && (!require_wait_until_idle || isolate.pending_wait_until.is_empty())
     {
@@ -293,26 +323,32 @@ pub(super) fn host_rpc_method_blocked(method: &str) -> bool {
         || method.starts_with("__dd_")
 }
 
-pub(super) fn least_loaded_isolate_idx(
+fn least_loaded_isolate_idx(
     isolates: &[IsolateHandle],
     max_inflight: usize,
     require_wait_until_idle: bool,
+    eligibility: IsolateEligibility,
 ) -> Option<usize> {
     isolates
         .iter()
         .enumerate()
         .filter(|(_, isolate)| isolate.startup.is_ready())
+        .filter(|(_, isolate)| eligibility.accepts(isolate))
         .filter(|(_, isolate)| isolate.inflight_count < max_inflight)
         .filter(|(_, isolate)| !require_wait_until_idle || isolate.pending_wait_until.is_empty())
         .min_by_key(|(_, isolate)| isolate.inflight_count)
         .map(|(idx, _)| idx)
 }
 
-pub(super) fn least_loaded_isolate_any_idx(isolates: &[IsolateHandle]) -> Option<usize> {
+fn least_loaded_isolate_any_idx(
+    isolates: &[IsolateHandle],
+    eligibility: IsolateEligibility,
+) -> Option<usize> {
     isolates
         .iter()
         .enumerate()
         .filter(|(_, isolate)| isolate.startup.is_ready())
+        .filter(|(_, isolate)| eligibility.accepts(isolate))
         .min_by_key(|(_, isolate)| isolate.inflight_count)
         .map(|(idx, _)| idx)
 }
@@ -349,6 +385,15 @@ impl WorkerPool {
     pub(super) fn has_dispatch_capacity(&self, max_inflight: usize) -> bool {
         self.isolates.iter().any(|isolate| {
             isolate.startup.is_ready()
+                && isolate.inflight_count < max_inflight
+                && (!self.strict_request_isolation || isolate.pending_wait_until.is_empty())
+        })
+    }
+
+    pub(super) fn has_regular_dispatch_capacity(&self, max_inflight: usize) -> bool {
+        self.isolates.iter().any(|isolate| {
+            !isolate.internal_rescue
+                && isolate.startup.is_ready()
                 && isolate.inflight_count < max_inflight
                 && (!self.strict_request_isolation || isolate.pending_wait_until.is_empty())
         })
@@ -446,6 +491,7 @@ impl WorkerPool {
             global_isolate_budget: 0,
             global_isolates_total: 0,
             global_isolates_starting: 0,
+            global_internal_rescue_isolates: 0,
             global_isolate_slots_available: 0,
             scale_up_waiting_pools: 0,
             scale_up_budget_denied_count: 0,
@@ -1097,6 +1143,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         startup: IsolateStartup::Starting {
             started_at: Instant::now(),
         },
+        internal_rescue: false,
         inflight_count: 0,
         active_websocket_sessions: 0,
         active_transport_sessions: 0,

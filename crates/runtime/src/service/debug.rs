@@ -51,6 +51,7 @@ impl WorkerPool {
             global_isolate_budget: 0,
             global_isolates_total: 0,
             global_isolates_starting: 0,
+            global_internal_rescue_isolates: 0,
             global_isolate_slots_available: 0,
             scale_up_waiting_pools: 0,
             scale_up_budget_denied_count: 0,

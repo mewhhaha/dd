@@ -928,6 +928,10 @@ mod tests {
 
         assert_eq!(total_entry_budget, store.snapshot_cache_max_entries);
         assert_eq!(total_byte_budget, store.snapshot_cache_max_bytes);
+        assert!(
+            (0..MEMORY_ENTITY_CACHE_STRIPES)
+                .all(|stripe| store.snapshot_cache_entry_budget_for_stripe(0, stripe) > 0)
+        );
         Ok(())
     }
 
@@ -979,6 +983,37 @@ mod tests {
                 .contains(&MemoryStore::memory_snapshot_key("ns", &memory_b))
         );
         assert_eq!(cache.snapshot_entries, 1);
+        assert_eq!(cache.version_entries, 1);
+        assert_eq!(store.cache_performance_snapshot().snapshot_evictions, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_cache_performance_totals_are_recorded_without_profiling() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("snapshot-performance-totals"),
+            1,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+
+        store.snapshot("ns", "memory-a").await?;
+        store.snapshot("ns", "memory-a").await?;
+
+        let metrics = store.cache_performance_snapshot();
+        assert_eq!(metrics.snapshot_misses, 1);
+        assert_eq!(metrics.snapshot_hits, 1);
         Ok(())
     }
 
@@ -1007,6 +1042,7 @@ mod tests {
         let cache = store.test_entity_cache_snapshot("ns", "memory-a").await;
         assert_eq!(cache.snapshot_entries, 0);
         assert_eq!(cache.snapshot_approximate_bytes, 0);
+        assert_eq!(cache.version_entries, 0);
         Ok(())
     }
 

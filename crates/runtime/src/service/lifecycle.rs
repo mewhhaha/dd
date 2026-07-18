@@ -418,7 +418,7 @@ impl WorkerManager {
         };
 
         if let Some(startup) = self.exiting_isolate_slots.remove(&key) {
-            self.global_isolate_slot_released(startup);
+            self.global_isolate_slot_released(&key, startup);
         } else if !removed.removed {
             warn!(
                 worker = %worker_name,
@@ -1091,24 +1091,35 @@ impl WorkerManager {
     pub(crate) fn scale_down_pool(&mut self, worker_name: &str, generation: u64, now: Instant) {
         let min_isolates = self.config.min_isolates;
         let idle_ttl = self.config.idle_ttl;
+        let internal_rescue_isolate_ids = self
+            .internal_rescue_isolate_slots
+            .iter()
+            .filter(|key| key.worker_name == worker_name && key.generation == generation)
+            .map(|key| key.isolate_id)
+            .collect::<HashSet<_>>();
         let mut removed = Vec::new();
         let mut removed_slots = Vec::new();
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             loop {
-                if pool.isolates.len() <= min_isolates {
-                    break;
-                }
-
+                let above_minimum = pool.isolates.len() > min_isolates;
                 let candidate = pool
                     .isolates
                     .iter()
                     .enumerate()
+                    .filter(|(_, isolate)| {
+                        above_minimum || internal_rescue_isolate_ids.contains(&isolate.id)
+                    })
                     .filter(|(_, isolate)| isolate.inflight_count == 0)
                     .filter(|(_, isolate)| isolate.pending_wait_until.is_empty())
                     .filter(|(_, isolate)| isolate.active_websocket_sessions == 0)
                     .filter(|(_, isolate)| isolate.active_transport_sessions == 0)
                     .filter(|(_, isolate)| now.duration_since(isolate.last_used_at) >= idle_ttl)
-                    .min_by_key(|(_, isolate)| isolate.last_used_at);
+                    .min_by_key(|(_, isolate)| {
+                        (
+                            !internal_rescue_isolate_ids.contains(&isolate.id),
+                            isolate.last_used_at,
+                        )
+                    });
                 let Some((idx, _)) = candidate else {
                     break;
                 };
@@ -1242,10 +1253,11 @@ impl WorkerManager {
         stats.global_isolate_budget = self.config.max_global_isolates;
         stats.global_isolates_total = self.global_isolate_slots_used;
         stats.global_isolates_starting = self.global_isolates_starting;
+        stats.global_internal_rescue_isolates = self.internal_rescue_isolate_slots.len();
         stats.global_isolate_slots_available = self
             .config
             .max_global_isolates
-            .saturating_sub(self.global_isolate_slots_used);
+            .saturating_sub(self.regular_isolate_slots_used());
         stats.scale_up_waiting_pools = self.scale_up_request_members.len();
         stats.scale_up_budget_denied_count = self.stats.scale_up_budget_denied_count;
         stats.memory_outbox_claim_batch_count = self.stats.memory_outbox_claim_batch_count;
@@ -1287,10 +1299,12 @@ impl WorkerManager {
         dump.memory_scheduler.global_isolate_budget = self.config.max_global_isolates;
         dump.memory_scheduler.global_isolates_total = self.global_isolate_slots_used;
         dump.memory_scheduler.global_isolates_starting = self.global_isolates_starting;
+        dump.memory_scheduler.global_internal_rescue_isolates =
+            self.internal_rescue_isolate_slots.len();
         dump.memory_scheduler.global_isolate_slots_available = self
             .config
             .max_global_isolates
-            .saturating_sub(self.global_isolate_slots_used);
+            .saturating_sub(self.regular_isolate_slots_used());
         dump.memory_scheduler.scale_up_waiting_pools = self.scale_up_request_members.len();
         dump.memory_scheduler.scale_up_budget_denied_count =
             self.stats.scale_up_budget_denied_count;

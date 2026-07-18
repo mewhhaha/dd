@@ -47,9 +47,23 @@ pub(super) fn runtime_service_config(
                         .unwrap_or(1),
                 )
                 .clamp(1, 8),
-            memory_db_cache_max_open: 4096,
-            memory_db_read_connections_per_database: 4,
-            memory_db_max_total_connections: 4096usize.saturating_mul(5),
+            memory_db_cache_max_open: env_usize("DD_BENCH_MEMORY_DB_CACHE_MAX_OPEN", 4096),
+            memory_snapshot_cache_max_entries: env_usize(
+                "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
+                4096,
+            ),
+            memory_snapshot_cache_max_bytes: env_usize(
+                "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES",
+                64 * 1024 * 1024,
+            ),
+            memory_db_read_connections_per_database: env_usize(
+                "DD_BENCH_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE",
+                4,
+            ),
+            memory_db_max_total_connections: env_usize(
+                "DD_BENCH_MEMORY_DB_MAX_TOTAL_CONNECTIONS",
+                4096usize.saturating_mul(5),
+            ),
             memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
         },

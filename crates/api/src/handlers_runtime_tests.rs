@@ -237,7 +237,11 @@ async fn private_status_metrics_and_checkpoint_are_authenticated_and_operational
     .expect("metrics utf8");
     assert!(metrics.contains("dd_runtime_active_deployments 1"));
     assert!(metrics.contains("dd_runtime_worker_isolates{worker=\"observed\"}"));
+    assert!(metrics.contains("dd_runtime_worker_isolate_spawns_total{worker=\"observed\"}"));
+    assert!(metrics.contains("dd_runtime_worker_memory_max_shard_depth{worker=\"observed\"}"));
     assert!(metrics.contains("dd_storage_retries_total"));
+    assert!(metrics.contains("dd_memory_snapshot_cache_hits_total"));
+    assert!(metrics.contains("dd_runtime_internal_rescue_isolates"));
 
     let restore_failure: common::Result<()> =
         Err(common::PlatformError::runtime("restore fixture failed"));

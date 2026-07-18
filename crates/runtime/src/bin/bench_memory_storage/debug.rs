@@ -118,11 +118,15 @@ pub(super) fn print_debug_dump(label: &str, dump: &WorkerDebugDump) {
         .collect::<Vec<_>>()
         .join("|");
     println!(
-        "bench-dump label={} outcome=ok generation={} queued={} isolates={} memory_queued={} memory_active_shards={} memory_owner_queues={} memory_blocked_owner_queues={} active_memory_leases={} memory_affinity_entries={} stale_memory_affinity_entries={} oldest_queue_ms={} pending_memory_outbox_shards={} top_memory_shards={} queued_requests={} pending_requests={}",
+        "bench-dump label={} outcome=ok generation={} queued={} isolates={} global_isolates={} global_budget={} internal_rescue_isolates={} scale_up_waiting_pools={} memory_queued={} memory_active_shards={} memory_owner_queues={} memory_blocked_owner_queues={} active_memory_leases={} memory_affinity_entries={} stale_memory_affinity_entries={} oldest_queue_ms={} pending_memory_outbox_shards={} top_memory_shards={} queued_requests={} pending_requests={}",
         label,
         dump.generation,
         dump.queued,
         isolate_summary,
+        dump.memory_scheduler.global_isolates_total,
+        dump.memory_scheduler.global_isolate_budget,
+        dump.memory_scheduler.global_internal_rescue_isolates,
+        dump.memory_scheduler.scale_up_waiting_pools,
         dump.memory_scheduler.queued,
         dump.memory_scheduler.active_shards,
         dump.memory_scheduler.owner_queues,

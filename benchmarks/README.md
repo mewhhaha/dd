@@ -96,6 +96,28 @@ Every measured response is checked for its body, status, cache header, and
 propagated trace id. Captured server output also makes the run fail on a panic
 or a `WHOPPER_*` debug probe.
 
+## Fly production profile
+
+[`fly-production.sh`](configs/fly-production.sh) pins benchmark processes to one
+CPU when `taskset` is available and uses the isolate, inflight, memory-cache,
+reader, and total-connection limits from `deploy/fly/fly.toml`. It covers the
+real HTTP server, direct and atomic memory paths, durable effects, the rate
+limiter, multi-worker auth, and lifecycle cold starts under the two-isolate
+global budget.
+
+Run it directly or through the sampler:
+
+```bash
+node benchmarks/run.mjs --samples 3 \
+  --config fly-production.sh \
+  --out benchmarks/results/local-fly-production.json
+```
+
+Set `DD_BENCH_CPUSET` to select a different CPU. The scheduled production
+regression workflow compares this profile against the previous main commit;
+the wider scaling matrix remains separate because it answers a different
+question.
+
 ## Atomic scaling matrix
 
 [`scaling-atomic-memory-matrix.sh`](configs/scaling-atomic-memory-matrix.sh)
