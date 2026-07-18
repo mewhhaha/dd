@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
       - name: Plan benchmark smoke matrix
         run: |
           DD_BENCH_MATRIX_ISOLATES="1 8" \
