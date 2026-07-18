@@ -25,6 +25,35 @@ just fly-proxy your-dd-app
 just fly-worker-deploy chat examples/chat-worker/src/worker.js --memory-binding CHAT_ROOM --public --assets-dir examples/chat-worker/assets
 ```
 
+The equivalent config-driven deploy uses the same source, binding, assets, and
+production endpoint as CI:
+
+```bash
+DD_TOKEN=dddt_... cargo run -p cli -- deploy-config examples/chat-worker/dd.json
+```
+
+## CI deploy
+
+The `Deploy Workers` GitHub Actions workflow deploys `chat` after `CI` succeeds
+on `main`, then checks `https://chat.wdyt.chat/`. Mint its scoped token once
+through the private proxy:
+
+```bash
+just fly-worker-mint-token \
+  --name github-actions-chat \
+  --worker chat \
+  --public \
+  --memory-binding CHAT_ROOM \
+  --max-source-bytes 1048576 \
+  --max-assets 256 \
+  --max-asset-bytes 16777216
+```
+
+Store the returned `token` as the `DD_CHAT_DEPLOY_TOKEN` secret in the
+`production` GitHub environment. The workflow carries no private control-plane
+credential and the token cannot deploy another worker or add another binding.
+Run the workflow manually to redeploy the current `main` commit.
+
 ## Use
 
 - `https://chat.wdyt.chat/` shows the join page

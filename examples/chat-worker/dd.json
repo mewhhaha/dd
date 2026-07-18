@@ -1,0 +1,17 @@
+{
+  "$schema": "../../schema/dd.schema.json",
+  "schema_version": 1,
+  "name": "chat",
+  "entrypoint": "src/worker.js",
+  "base_url": "https://dd-private-8956e096.fly.dev",
+  "assets_dir": "assets",
+  "config": {
+    "public": true,
+    "bindings": [
+      {
+        "type": "memory",
+        "binding": "CHAT_ROOM"
+      }
+    ]
+  }
+}

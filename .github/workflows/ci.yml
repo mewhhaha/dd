@@ -71,6 +71,27 @@ jobs:
       - uses: extractions/setup-just@v4
       - run: pnpm install --frozen-lockfile
       - run: just check-js
+      - name: Verify publishable package manifests
+        run: |
+          release_package_dir="${RUNNER_TEMP}/release-packages"
+          mkdir -p "$release_package_dir"
+          pnpm --dir packages/dd-runtime pack --pack-destination "$release_package_dir"
+          pnpm --dir packages/dd-vite pack --pack-destination "$release_package_dir"
+          for archive in "$release_package_dir"/*.tgz; do
+            tar -xOf "$archive" package/package.json | node -e '
+              const fs = require("node:fs");
+              const manifest = JSON.parse(fs.readFileSync(0, "utf8"));
+              const dependencySections = ["dependencies", "optionalDependencies", "peerDependencies"];
+              for (const section of dependencySections) {
+                for (const [name, range] of Object.entries(manifest[section] ?? {})) {
+                  if (String(range).startsWith("workspace:")) {
+                    throw new Error(`${manifest.name} retains ${section}.${name}=${range}`);
+                  }
+                }
+              }
+              console.log(`${manifest.name}@${manifest.version}: packed dependency ranges are publishable`);
+            '
+          done
       - run: pnpm typecheck:vite-examples
       - run: pnpm build:vite-examples
       - uses: dtolnay/rust-toolchain@stable

@@ -1,0 +1,74 @@
+name: Deploy Workers
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workers-production
+  cancel-in-progress: false
+
+jobs:
+  chat:
+    name: Chat
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      # v7, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Check whether this is still the current main commit
+        id: current-commit
+        env:
+          CI_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          current_commit="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$CI_COMMIT" = "$current_commit" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping superseded commit ${CI_COMMIT}."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+      # stable, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        if: steps.current-commit.outputs.deploy == 'true'
+        with:
+          toolchain: 1.94.0
+      # v2, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        if: steps.current-commit.outputs.deploy == 'true'
+        with:
+          shared-key: deploy-cli
+      - name: Build deployment CLI
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: cargo build --locked -p cli
+      - name: Deploy chat worker
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: target/debug/cli deploy-config examples/chat-worker/dd.json
+        env:
+          DD_TOKEN: ${{ secrets.DD_CHAT_DEPLOY_TOKEN }}
+      - name: Smoke chat worker
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: >-
+          curl
+          --fail
+          --silent
+          --show-error
+          --retry 5
+          --retry-all-errors
+          --retry-delay 2
+          --max-time 10
+          https://chat.wdyt.chat/
+          > /dev/null
