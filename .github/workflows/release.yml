@@ -107,6 +107,7 @@ jobs:
           cp artifacts/dd-linux-platform/target/dist/cli release/dd-cli-linux-x64
       - run: gh release upload "${GITHUB_REF_NAME}" release/* --clobber
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
 
   npm-publish:
@@ -118,6 +119,7 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -135,9 +137,9 @@ jobs:
       - name: Publish platform and selector packages
         run: |
           for package in packages/dd-runtime-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}; do
-            npm publish "$package" --provenance --access public
+            pnpm publish "$package" --provenance --access public --no-git-checks
           done
-          npm publish packages/dd-runtime --provenance --access public
-          npm publish packages/dd-vite --provenance --access public
+          pnpm publish packages/dd-runtime --provenance --access public --no-git-checks
+          pnpm publish packages/dd-vite --provenance --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

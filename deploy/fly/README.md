@@ -9,12 +9,11 @@ Workers are deployed into that running app. They are not separate Fly apps.
 
 ## Canonical flow
 
-1. deploy platform container with `flyctl deploy`
-2. open WireGuard tunnel to private port with `just fly-proxy <app>`
-3. mint a scoped token through the private control plane
-4. deploy workers through the public endpoint with that token
-
-Use direct worker-store writes only as recovery/maintenance escape hatch, not normal workflow.
+1. provision the Fly app, volume, runtime secrets, and CI deploy token once
+2. merge to `main`; successful CI deploys the platform container
+3. open a WireGuard tunnel to the private port with `just fly-proxy <app>`
+4. mint a scoped token through the private control plane
+5. deploy workers through the public endpoint with that token
 
 ## 1) Create app and volume
 
@@ -23,40 +22,46 @@ flyctl apps create your-dd-app
 flyctl volumes create dd_store --region ams --size 1 --app your-dd-app
 ```
 
-## 2) Deploy platform
+## 2) Configure platform CI
+
+Create an app-scoped token with a practical expiry:
 
 ```bash
-flyctl deploy --app your-dd-app --config deploy/fly/fly.toml --remote-only --no-cache
+flyctl tokens create deploy \
+  --app your-dd-app \
+  --name github-actions \
+  --expiry 720h
 ```
 
-Helper:
+Store the complete token as the `FLY_API_TOKEN` GitHub Actions secret. The
+`Deploy Platform` workflow uses the `production` GitHub environment, waits for
+the `CI` workflow to pass on `main`, and skips a successful commit if a newer
+commit has already reached `main`. Images are labeled with the deployed Git
+commit. Protect the `production` environment with required reviewers if
+deployments should require manual approval.
 
-```bash
-just fly-deploy your-dd-app
-```
+The workflow uses the app name and production settings from
+`deploy/fly/fly.toml`. Fly deploy tokens are scoped to one app; do not use a
+personal authentication token in CI.
 
-Persistent data lives under `/app/store`:
-
-- deployed worker source/config
-- KV and memory SQLite files
-- cache blobs and indexes
-
-The container starts through `dd_init`. On the first boot of a volume it repairs
-the store tree to UID/GID 65532, records `.dd-volume-ownership-v1`, drops all
-root and supplementary-group privileges, and then replaces itself with
-`dd_server`. Later boots validate the marker and skip the recursive repair.
-Fly checks `/readyz`, which fails during startup restoration and maintenance
-drains; `/healthz` remains the process liveness endpoint.
+To deploy the current `main` commit again without another push, run the
+`Deploy Platform` workflow manually from GitHub Actions.
 
 ## 3) Configure private auth
 
-Set shared private token for both server and CLI/helpers:
+Generate a shared private token, store it in Fly, and keep it in the current
+shell for the CLI and operational helpers:
 
 ```bash
-export DD_PRIVATE_TOKEN=replace-me-with-long-random-secret
+read -rsp 'DD private token: ' DD_PRIVATE_TOKEN
+export DD_PRIVATE_TOKEN
+printf '\n'
+printf 'DD_PRIVATE_TOKEN=%s\n' "$DD_PRIVATE_TOKEN" \
+  | flyctl secrets import --stage --app your-dd-app
 ```
 
-This value in docs is placeholder only. Replace it with fresh random secret.
+Use a newly generated, long random value. The server refuses to start without
+this secret because its private listener is reachable inside the Fly network.
 
 ## Runtime isolate tuning
 
@@ -88,7 +93,34 @@ The Fly production image includes WebSockets and OTLP HTTP trace propagation.
 Direct HTTP/3 and WebTransport support remain an experimental opt-in Cargo
 feature and are not linked into this image.
 
-## 4) Open private tunnel
+## 4) Deploy platform manually
+
+CI is the normal platform deployment path. For recovery or initial setup, run:
+
+```bash
+flyctl deploy --app your-dd-app --config deploy/fly/fly.toml --remote-only
+```
+
+Helper:
+
+```bash
+just fly-deploy your-dd-app
+```
+
+Persistent data lives under `/app/store`:
+
+- deployed worker source/config
+- KV and memory SQLite files
+- cache blobs and indexes
+
+The container starts through `dd_init`. On the first boot of a volume it repairs
+the store tree to UID/GID 65532, records `.dd-volume-ownership-v1`, drops all
+root and supplementary-group privileges, and then replaces itself with
+`dd_server`. Later boots validate the marker and skip the recursive repair.
+Fly checks `/readyz`, which fails during startup restoration and maintenance
+drains; `/healthz` remains the process liveness endpoint.
+
+## 5) Open private tunnel
 
 ```bash
 just fly-proxy your-dd-app
@@ -100,7 +132,10 @@ Equivalent direct helper:
 ./deploy/fly/proxy-private-deploy.sh your-dd-app 18081 8081
 ```
 
-## 5) Deploy workers through tunnel
+`18081` is only the local end of the tunnel. The server continues to listen on
+private port `8081` inside the Fly network.
+
+## 6) Deploy workers through tunnel
 
 The private control plane can always deploy directly, and remains useful for
 local admin work:
@@ -123,7 +158,7 @@ cargo run -p cli -- --server http://127.0.0.1:18081 deploy hello examples/hello.
 cargo run -p cli -- --server http://127.0.0.1:18081 deploy static-assets-site examples/static-assets-site/worker.js --public --assets-dir examples/static-assets-site/assets
 ```
 
-## 6) Mint a public token
+## 7) Mint a public token
 
 For CI and GitHub Actions, mint a narrow token once, then store only that
 token in the repository secret store. Tokens are hashed at rest by `dd_server`.
@@ -144,9 +179,11 @@ just fly-worker-mint-token \
 `--name` is the token id used by `list-tokens`, `get-token`, and
 `delete-token`. It must be a unique lowercase, dash-delimited slug such as
 `github-actions-chat`; uppercase input is normalized to lowercase. The response
-includes `token`. Put that value in `DD_TOKEN` in CI. Omit expiry for a
-long-lived token, or add `--expires-in-seconds` and/or `--max-uses` for
-short-lived release tokens.
+includes `token`. Generic CI jobs expose that value as `DD_TOKEN`; the checked-in
+`Deploy Workers` workflow stores the chat-specific value as the
+`DD_CHAT_DEPLOY_TOKEN` GitHub secret and maps it to `DD_TOKEN` only for the
+deploy step. Omit expiry for a long-lived token, or add `--expires-in-seconds`
+and/or `--max-uses` for short-lived release tokens.
 
 Token admin stays on the private control plane:
 
@@ -183,7 +220,7 @@ Helper:
 DD_TOKEN=dddt_... just fly-worker-public-deploy-config your-dd-app dist/dd.deploy.json
 ```
 
-## 7) Public routing
+## 8) Public routing
 
 Once deployed with `--public`, host routing maps subdomain to worker name:
 
@@ -196,7 +233,7 @@ For built-in Fly hostname:
 
 Fly app apex hostname itself is not mapped to worker and returns `404`.
 
-## 8) Custom domains
+## 9) Custom domains
 
 ```bash
 flyctl certs add example.com --app your-dd-app
@@ -212,7 +249,9 @@ PUBLIC_BASE_DOMAIN = "example.com"
 
 ## Operations
 
-- redeploy platform: `just fly-deploy your-dd-app`
+- redeploy platform through CI: rerun the `Deploy Platform` workflow
+- deploy platform manually: `just fly-deploy your-dd-app`
+- deploy workers through CI: rerun the `Deploy Workers` workflow
 - open tunnel: `just fly-proxy your-dd-app`
 - deploy worker through tunnel: `just fly-worker-deploy <name> <file> [flags...]`
 - mint token through tunnel: `just fly-worker-mint-token --name <token-name> --worker <worker> --public ...`
@@ -221,6 +260,12 @@ PUBLIC_BASE_DOMAIN = "example.com"
 - deploy through public endpoint: `DD_TOKEN=... just fly-worker-public-deploy-config <app> <config>`
 - invoke private worker: `cargo run -p cli -- --server http://127.0.0.1:18081 invoke <name> --method GET --path /`
 - consistent volume snapshot: `DD_PRIVATE_TOKEN=... just fly-snapshot <app> <volume-id>`
+
+To roll back the platform, find the previous image with
+`flyctl releases --app <app> --image`, then run
+`flyctl deploy --app <app> --config deploy/fly/fly.toml --image <image>`. This
+restores only the container image. It does not restore or reverse changes to the
+attached volume.
 
 The snapshot helper opens a private Fly proxy, drains writes, checkpoints every
 database, schedules the volume snapshot, and resumes the service even when an

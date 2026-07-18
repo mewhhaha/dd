@@ -1,0 +1,58 @@
+name: Deploy Platform
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-production
+  cancel-in-progress: false
+
+jobs:
+  fly:
+    name: Fly production
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      # v7, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Check whether this is still the current main commit
+        id: current-commit
+        env:
+          CI_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          current_commit="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$CI_COMMIT" = "$current_commit" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping superseded commit ${CI_COMMIT}."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install flyctl
+        if: steps.current-commit.outputs.deploy == 'true'
+        # v1, pinned so third-party workflow code cannot move underneath us.
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+      - name: Deploy
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: >-
+          flyctl deploy
+          --config deploy/fly/fly.toml
+          --image-label "$DEPLOY_COMMIT"
+          --remote-only
+        env:
+          DEPLOY_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          NO_COLOR: 1
