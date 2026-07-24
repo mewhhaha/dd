@@ -117,7 +117,7 @@ jobs:
           cache: pnpm
       - name: Cache cargo-audit
         id: cargo-audit-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-audit
           key: cargo-audit-0.22.2-${{ runner.os }}-${{ runner.arch }}
@@ -139,7 +139,7 @@ jobs:
         id: buildx
       - name: Cache Docker Cargo build state
         id: docker-cargo-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .buildkit-cache
           key: docker-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('deploy/fly/Dockerfile', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'patches/**', 'scripts/patch-crate.sh') }}
