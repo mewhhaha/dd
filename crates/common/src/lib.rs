@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -144,289 +144,53 @@ impl ErrorBody {
     }
 }
 
+/// Deploy protocol between the `dd` CLI and `dd_server`. Workers arrive as
+/// Perry-compiled wasm; the CLI compiles TypeScript with `perry` first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeployRequest {
     pub name: String,
-    pub source: String,
+    pub wasm_base64: String,
     #[serde(default)]
-    pub config: DeployConfig,
-    #[serde(default)]
-    pub assets: Vec<DeployAsset>,
-    #[serde(default)]
-    pub server_modules: Vec<DeployServerModule>,
-    #[serde(default)]
-    pub asset_headers: Option<String>,
-    #[serde(default)]
-    pub temporary: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployAsset {
-    pub path: String,
-    pub content_base64: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployServerModule {
-    pub path: String,
-    #[serde(rename = "type", alias = "kind")]
-    pub kind: DeployServerModuleKind,
-    pub content_base64: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeployServerModuleKind {
-    #[serde(
-        rename = "ESModule",
-        alias = "esmodule",
-        alias = "esm",
-        alias = "javascript",
-        alias = "module"
-    )]
-    EsModule,
-    #[serde(
-        rename = "CompiledWasm",
-        alias = "compiledwasm",
-        alias = "wasm",
-        alias = "wasm_module"
-    )]
-    CompiledWasm,
-    #[serde(rename = "Text", alias = "text")]
-    Text,
-    #[serde(rename = "Data", alias = "data", alias = "bytes")]
-    Data,
-    #[serde(rename = "Json", alias = "JSON", alias = "json")]
-    Json,
+    pub config: WorkerConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeployConfig {
+pub struct WorkerConfig {
     #[serde(default)]
     pub public: bool,
+    /// Service binding name -> co-deployed worker name (dd_service_fetch).
     #[serde(default)]
-    pub cache: DeployCacheConfig,
-    #[serde(default)]
-    pub bindings: Vec<DeployBinding>,
-    #[serde(default)]
-    pub internal: DeployInternalConfig,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployCacheConfig {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployInternalConfig {
-    #[serde(default)]
-    pub trace: Option<DeployTraceDestination>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployTraceDestination {
-    pub worker: String,
-    #[serde(default = "default_trace_path")]
-    pub path: String,
-}
-
-fn default_trace_path() -> String {
-    "/ingest".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum DeployBinding {
-    Kv {
-        binding: String,
-    },
-    #[serde(rename = "memory")]
-    Memory {
-        binding: String,
-    },
-    Dynamic {
-        binding: String,
-    },
-    Service {
-        binding: String,
-        service: String,
-    },
+    pub services: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployResponse {
     pub ok: bool,
-    pub worker: String,
-    pub deployment_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeploymentSummary {
-    pub worker: String,
-    pub deployment_id: String,
-    pub created_at_ms: i64,
-    pub active: bool,
-    pub temporary: bool,
-    pub expires_at_ms: Option<i64>,
+    pub name: String,
+    pub wasm_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentDetails {
-    #[serde(flatten)]
-    pub summary: DeploymentSummary,
-    pub source: String,
-    pub config: DeployConfig,
-    pub assets: Vec<DeployAsset>,
-    pub server_modules: Vec<DeployServerModule>,
-    pub asset_headers: Option<String>,
+pub struct WorkerSummary {
+    pub name: String,
+    pub public: bool,
+    pub wasm_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentListResponse {
+pub struct WorkerListResponse {
+    pub workers: Vec<WorkerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteWorkerResponse {
     pub ok: bool,
-    pub deployments: Vec<DeploymentSummary>,
+    pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentInspectResponse {
-    pub ok: bool,
-    pub deployment: DeploymentDetails,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UndeployResponse {
-    pub ok: bool,
-    pub worker: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RollbackResponse {
-    pub ok: bool,
-    pub worker: String,
-    pub deployment_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerNameRequest {
-    pub worker: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RollbackRequest {
-    pub worker: String,
-    pub deployment_id: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployTokenCapabilities {
-    #[serde(default)]
-    pub workers: Vec<String>,
-    #[serde(default)]
-    pub allow_any_worker: bool,
-    #[serde(default)]
-    pub allow_public: bool,
-    #[serde(default)]
-    pub allow_private: bool,
-    #[serde(default)]
-    pub bindings: Vec<DeployBinding>,
-    #[serde(default)]
-    pub allow_any_bindings: bool,
-    #[serde(default)]
-    pub allow_internal_trace: bool,
-    #[serde(default)]
-    pub max_source_bytes: Option<u64>,
-    #[serde(default)]
-    pub max_assets: Option<u64>,
-    #[serde(default)]
-    pub max_asset_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeployTokenMintRequest {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub expires_in_seconds: Option<u64>,
-    #[serde(default)]
-    pub expires_at_unix: Option<u64>,
-    #[serde(default)]
-    pub max_uses: Option<u64>,
-    #[serde(default)]
-    pub capabilities: DeployTokenCapabilities,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployTokenMintResponse {
-    pub ok: bool,
-    pub id: String,
-    pub name: Option<String>,
-    pub token: String,
-    pub expires_at_unix: Option<u64>,
-    pub max_uses: Option<u64>,
-    pub capabilities: DeployTokenCapabilities,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployTokenMetadata {
-    pub id: String,
-    pub name: Option<String>,
-    pub created_at_unix: u64,
-    pub expires_at_unix: Option<u64>,
-    pub max_uses: Option<u64>,
-    pub uses: u64,
-    pub last_used_at_unix: Option<u64>,
-    pub capabilities: DeployTokenCapabilities,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployTokenListResponse {
-    pub ok: bool,
-    pub tokens: Vec<DeployTokenMetadata>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployTokenGetResponse {
-    pub ok: bool,
-    pub token: DeployTokenMetadata,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployTokenDeleteResponse {
-    pub ok: bool,
-    pub id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DynamicDeployRequest {
-    pub source: String,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub egress_allow_hosts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicDeployResponse {
-    pub ok: bool,
-    pub worker: String,
-    pub deployment_id: String,
-    pub env_placeholders: HashMap<String, String>,
-}
-
+/// One worker request, as carried across the runtime boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInvocation {
     pub method: String,
@@ -445,52 +209,21 @@ pub struct WorkerOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeployConfig, DeployRequest, ErrorBody, PlatformError, first_non_empty_trimmed};
+    use super::{DeployRequest, PlatformError};
 
     #[test]
-    fn deploy_binding_rejects_legacy_actor_json_type() {
-        let result = serde_json::from_str::<DeployRequest>(
-            r#"{
-                "name": "worker",
-                "source": "export default {}",
-                "config": {
-                    "bindings": [
-                        { "type": "actor", "binding": "ROOMS" }
-                    ]
-                }
-            }"#,
-        );
-        assert!(result.is_err());
+    fn deploy_request_rejects_unknown_fields() {
+        let error = serde_json::from_str::<DeployRequest>(
+            r#"{"name":"a","wasm_base64":"AA==","entrypoint":"x.js"}"#,
+        )
+        .expect_err("legacy fields must be rejected");
+        assert!(error.to_string().contains("entrypoint"));
     }
 
     #[test]
-    fn first_non_empty_trimmed_skips_missing_or_blank_values() {
-        assert_eq!(
-            first_non_empty_trimmed(["", "  ", " fallback "]).as_deref(),
-            Some("fallback")
-        );
-        assert!(first_non_empty_trimmed(["", "  "]).is_none());
-    }
-
-    #[test]
-    fn deploy_config_rejects_unknown_fields() {
-        let error = serde_json::from_str::<DeployConfig>(r#"{"public":true,"publik":true}"#)
-            .expect_err("unknown fields must be rejected");
-        assert!(error.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn error_body_keeps_message_and_adds_machine_fields() {
-        let error = PlatformError::overloaded("queue is full");
-        let body = ErrorBody::from_error(&error).with_trace_id(Some("abc123".to_string()));
-        assert_eq!(body.error, "queue is full");
-        assert_eq!(body.code, "overloaded");
-        assert_eq!(body.trace_id.as_deref(), Some("abc123"));
-        assert!(body.retryable);
-
-        let storage = PlatformError::storage_unavailable("database remained busy");
-        let storage_body = ErrorBody::from_error(&storage);
-        assert_eq!(storage_body.code, "storage_unavailable");
-        assert!(storage_body.retryable);
+    fn platform_errors_carry_their_message() {
+        let error = PlatformError::bad_request("missing name");
+        assert_eq!(error.to_string(), "missing name");
+        assert_eq!(error.code(), "invalid_request");
     }
 }

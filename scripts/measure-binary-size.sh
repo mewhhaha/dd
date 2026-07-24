@@ -2,22 +2,10 @@
 set -euo pipefail
 
 profile="${1:-dist}"
-variant="${2:-full}"
-package="dd_server"
+variant="${2:-wasm}"
+package="wasm_host"
 binary_name="dd_server"
-
-case "$variant" in
-  full)
-    feature_args=(--no-default-features --features http3,websocket,otel)
-    ;;
-  lean)
-    feature_args=(--no-default-features)
-    ;;
-  *)
-    echo "usage: $0 [profile] [full|lean]" >&2
-    exit 1
-    ;;
-esac
+feature_args=()
 
 case "$profile" in
   dev)

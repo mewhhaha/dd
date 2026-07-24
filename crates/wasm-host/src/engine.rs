@@ -11,7 +11,7 @@
 use crate::bridge::{call_closure, dispatch, resolve_promise};
 use crate::heap::{HostValue, PromiseState};
 use crate::nanbox::{JsValue, TAG_UNDEFINED, decode, encode, encode_number};
-use crate::state::{CurrentRequest, HostState, ServiceRegistry, WorkerContext, WorkerStores};
+use crate::state::{CurrentRequest, HostState, WorkerContext, WorkerRegistry, WorkerStores};
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -63,9 +63,10 @@ pub struct WorkerOptions {
     /// Disk-backed stores (KV, memory namespaces, cache). Workers without
     /// stores get clear errors from the storage `ffi` functions.
     pub stores: Option<Arc<WorkerStores>>,
-    /// Registry for `dd_service_fetch`; share one registry across co-deployed
-    /// workers and insert the modules after construction.
-    pub services: Option<ServiceRegistry>,
+    /// Service binding name -> worker name for `dd_service_fetch`.
+    pub service_bindings: std::collections::HashMap<String, String>,
+    /// All deployed workers; share one registry across the server.
+    pub workers: Option<WorkerRegistry>,
 }
 
 /// Instances kept warm per worker; requests beyond this instantiate fresh.
@@ -132,8 +133,9 @@ impl WorkerModule {
             context.worker_name = name;
         }
         context.stores = options.stores;
-        if let Some(services) = options.services {
-            context.services = services;
+        context.service_bindings = options.service_bindings;
+        if let Some(workers) = options.workers {
+            context.workers = workers;
         }
         Ok(WorkerModule {
             instance_pre,

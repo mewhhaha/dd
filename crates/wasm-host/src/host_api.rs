@@ -314,19 +314,28 @@ pub fn dispatch_ffi(caller: &mut Caller<'_, HostState>, name: &str, args: &[u64]
                 ));
             }
             let binding = string_arg(caller.data(), args, 0);
+            // Bindings map to worker names; an unmapped binding falls back to
+            // being a worker name itself (single-server ergonomics).
+            let target_name = caller
+                .data()
+                .context
+                .service_bindings
+                .get(&binding)
+                .cloned()
+                .unwrap_or_else(|| binding.clone());
             let target = {
-                let services = caller
+                let workers = caller
                     .data()
                     .context
-                    .services
+                    .workers
                     .read()
-                    .expect("service registry is never poisoned");
-                services.get(&binding).cloned()
+                    .expect("worker registry is never poisoned");
+                workers.get(&target_name).cloned()
             };
             let Some(target) = target else {
                 return Err(fail(
                     name,
-                    format!("no service registered under binding {binding:?}"),
+                    format!("service binding {binding:?} points at unknown worker {target_name:?}"),
                 ));
             };
             let invocation = WorkerInvocation {

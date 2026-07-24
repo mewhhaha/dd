@@ -70,9 +70,9 @@ impl WorkerStores {
     }
 }
 
-/// Registry of co-deployed workers reachable through `dd_service_fetch`.
-/// Filled in after all modules are loaded so bindings can be cyclic.
-pub type ServiceRegistry = Arc<RwLock<HashMap<String, Arc<crate::engine::WorkerModule>>>>;
+/// All deployed workers by name; `dd_service_fetch` resolves through this,
+/// so bindings can point at workers deployed later (or cyclically).
+pub type WorkerRegistry = Arc<RwLock<HashMap<String, Arc<crate::engine::WorkerModule>>>>;
 
 /// Live websocket connections of one worker: outbound senders keyed by
 /// connection id. Shared between the websocket dispatcher instance and
@@ -122,7 +122,9 @@ impl WsConnections {
 pub struct WorkerContext {
     pub worker_name: String,
     pub stores: Option<Arc<WorkerStores>>,
-    pub services: ServiceRegistry,
+    /// Service binding name -> target worker name.
+    pub service_bindings: HashMap<String, String>,
+    pub workers: WorkerRegistry,
     pub http: reqwest::Client,
     pub ws_connections: Arc<WsConnections>,
 }
@@ -132,7 +134,8 @@ impl Default for WorkerContext {
         WorkerContext {
             worker_name: "worker".to_string(),
             stores: None,
-            services: Arc::new(RwLock::new(HashMap::new())),
+            service_bindings: HashMap::new(),
+            workers: Arc::new(RwLock::new(HashMap::new())),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()

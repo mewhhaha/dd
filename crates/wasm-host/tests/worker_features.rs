@@ -6,7 +6,7 @@ use common::{WorkerInvocation, WorkerOutput};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, RwLock};
-use wasm_host::{InvokeOptions, ServiceRegistry, WorkerModule, WorkerOptions, WorkerStores};
+use wasm_host::{InvokeOptions, WorkerModule, WorkerOptions, WorkerRegistry, WorkerStores};
 
 fn fixture_bytes(fixture: &str) -> Vec<u8> {
     let path = format!("{}/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
@@ -53,7 +53,8 @@ fn memory_atomic_counts_per_key_and_kv_persists_across_requests() {
         WorkerOptions {
             name: Some("stateful".to_string()),
             stores: Some(stores),
-            services: None,
+            service_bindings: Default::default(),
+            workers: None,
         },
     )
     .expect("module");
@@ -82,7 +83,8 @@ fn cache_misses_then_hits_for_the_same_url() {
         WorkerOptions {
             name: Some("edge".to_string()),
             stores: Some(stores),
-            services: None,
+            service_bindings: Default::default(),
+            workers: None,
         },
     )
     .expect("module");
@@ -113,19 +115,20 @@ fn cache_misses_then_hits_for_the_same_url() {
 #[test]
 fn service_binding_reaches_co_deployed_worker() {
     let (_dir, stores) = temp_store();
-    let services: ServiceRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let workers: WorkerRegistry = Arc::new(RwLock::new(HashMap::new()));
     let auth = Arc::new(
         WorkerModule::new(
             &fixture_bytes("auth_worker.wasm"),
             WorkerOptions {
                 name: Some("auth".to_string()),
                 stores: None,
-                services: None,
+                service_bindings: Default::default(),
+                workers: None,
             },
         )
         .expect("auth module"),
     );
-    services
+    workers
         .write()
         .expect("registry")
         .insert("auth".to_string(), auth);
@@ -134,7 +137,8 @@ fn service_binding_reaches_co_deployed_worker() {
         WorkerOptions {
             name: Some("edge".to_string()),
             stores: Some(stores),
-            services: Some(services),
+            service_bindings: Default::default(),
+            workers: Some(workers),
         },
     )
     .expect("edge module");

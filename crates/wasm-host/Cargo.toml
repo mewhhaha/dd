@@ -16,6 +16,7 @@ mime_guess = "2"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "tokio"] }
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 storage = { path = "../storage" }
 sha2 = "0.11"
@@ -28,8 +29,8 @@ uuid.workspace = true
 wasmtime.workspace = true
 
 [[bin]]
-name = "dd_wasm_server"
-path = "src/bin/dd_wasm_server.rs"
+name = "dd_server"
+path = "src/bin/dd_server.rs"
 
 [[bin]]
 name = "bench_wasm_worker"

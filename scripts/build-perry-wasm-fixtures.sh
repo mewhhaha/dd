@@ -7,7 +7,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 fixtures="$repo_root/crates/wasm-host/fixtures"
 perry="${PERRY:-perry}"
 
-"$perry" compile "$repo_root/examples/perry-wasm-worker/worker.ts" \
+"$perry" compile "$repo_root/examples/hello.ts" \
   -o "$fixtures/hello_worker.wasm" --target wasm
 
 for name in features stateful edge auth chat; do
