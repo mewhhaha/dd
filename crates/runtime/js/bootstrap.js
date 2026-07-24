@@ -1,0 +1,589 @@
+const {
+  AbortController: DenoAbortController,
+  AbortSignal: DenoAbortSignal,
+  Blob: DenoBlob,
+  CloseEvent,
+  Crypto,
+  CryptoKey: DenoCryptoKey,
+  CustomEvent,
+  DOMException,
+  ErrorEvent,
+  Event,
+  EventTarget,
+  File: DenoFile,
+  FormData: DenoFormData,
+  Headers: DenoHeaders,
+  HttpClient: DenoHttpClient,
+  MessageEvent,
+  ProgressEvent,
+  PromiseRejectionEvent,
+  ReadableStream: DenoReadableStream,
+  Request: DenoRequest,
+  Response: DenoResponse,
+  SubtleCrypto,
+  TextDecoder: DenoTextDecoder,
+  TextEncoder: DenoTextEncoder,
+  TransformStream: DenoTransformStream,
+  URL: DenoURL,
+  URLPattern: DenoURLPattern,
+  URLSearchParams: DenoURLSearchParams,
+  WritableStream: DenoWritableStream,
+  fetch: denoFetch,
+  performance: denoPerformance,
+  reportError,
+  structuredClone: denoStructuredClone,
+} = globalThis.__dd_deno_runtime ?? {};
+
+const define = (name, value, enumerable = false) => {
+  Object.defineProperty(globalThis, name, {
+    value,
+    enumerable,
+    configurable: true,
+    writable: true,
+  });
+};
+
+const requireRuntimeFunction = (name, value) => {
+  if (typeof value !== "function") {
+    throw new Error(`dd bootstrap missing required Deno runtime global: ${name}`);
+  }
+  return value;
+};
+
+const RuntimeHeaders = requireRuntimeFunction("Headers", DenoHeaders);
+const RuntimeHttpClient = requireRuntimeFunction("HttpClient", DenoHttpClient);
+const RuntimeResponse = requireRuntimeFunction("Response", DenoResponse);
+const RuntimeFormData = requireRuntimeFunction("FormData", DenoFormData);
+const RuntimeRequest = requireRuntimeFunction("Request", DenoRequest);
+const RuntimeURL = requireRuntimeFunction("URL", DenoURL);
+const RuntimeURLSearchParams = requireRuntimeFunction("URLSearchParams", DenoURLSearchParams);
+const RuntimeURLPattern = requireRuntimeFunction("URLPattern", DenoURLPattern);
+const RuntimeBlob = requireRuntimeFunction("Blob", DenoBlob);
+const RuntimeFile = requireRuntimeFunction("File", DenoFile);
+const RuntimeReadableStream = requireRuntimeFunction("ReadableStream", DenoReadableStream);
+const RuntimeWritableStream = requireRuntimeFunction("WritableStream", DenoWritableStream);
+const RuntimeTransformStream = requireRuntimeFunction("TransformStream", DenoTransformStream);
+
+const textEncoder = new DenoTextEncoder();
+const textDecoder = new DenoTextDecoder("utf-8");
+
+const createAbortError = (reason) => reason ?? new Error("Aborted");
+let frozenNowMs = Date.now();
+let frozenPerfMs = globalThis.performance?.now?.() ?? 0;
+
+function ensureAbortGlobals() {
+  define("AbortSignal", DenoAbortSignal);
+  define("AbortController", DenoAbortController);
+}
+
+function setFrozenTime(nowMs, perfMs = nowMs) {
+  const nextNowMs = Number(nowMs);
+  if (Number.isFinite(nextNowMs)) {
+    frozenNowMs = nextNowMs;
+  }
+  const nextPerfMs = Number(perfMs);
+  if (Number.isFinite(nextPerfMs)) {
+    frozenPerfMs = nextPerfMs;
+  }
+}
+
+function ensureFrozenTimeGlobals() {
+  Date.now = () => frozenNowMs;
+
+  if (globalThis.performance === undefined) {
+    define("performance", denoPerformance);
+  }
+
+  try {
+    globalThis.performance.now = () => frozenPerfMs;
+  } catch {
+    define("performance", {
+      ...globalThis.performance,
+      now: () => frozenPerfMs,
+    });
+  }
+}
+
+const RequestCtor = RuntimeRequest;
+const ResponseCtor = RuntimeResponse;
+
+function runtimeOp(name, ...args) {
+  const op = Deno?.core?.ops?.[name];
+  if (typeof op !== "function") {
+    return undefined;
+  }
+  return op(...args);
+}
+
+function ensureTimerGlobals() {
+  let nextTimerId = 1;
+  const timers = new Map();
+
+  const clampDelay = (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return 0;
+    }
+    return Math.floor(parsed);
+  };
+
+  const runCallback = (callback, args) => {
+    try {
+      callback(...args);
+    } catch (error) {
+      Promise.resolve().then(() => {
+        throw error;
+      });
+    }
+  };
+
+  const sleepWithBoundarySync = async (delayMs) => {
+    let remaining = delayMs;
+    while (remaining > 0) {
+      const step = Math.min(remaining, 0x7fffffff);
+      await runtimeOp("op_sleep", step);
+      await syncFrozenTimeBoundary();
+      remaining -= step;
+    }
+  };
+
+  const schedule = (callback, delay, args, repeat) => {
+    if (typeof callback !== "function") {
+      throw new TypeError("Timer callback must be a function");
+    }
+    const id = nextTimerId++;
+    const state = {
+      canceled: false,
+      delay: clampDelay(delay),
+      repeat: Boolean(repeat),
+    };
+    timers.set(id, state);
+
+    (async () => {
+      while (!state.canceled) {
+        await sleepWithBoundarySync(state.delay);
+        if (state.canceled) {
+          break;
+        }
+        runCallback(callback, args);
+        if (!state.repeat) {
+          timers.delete(id);
+          break;
+        }
+      }
+    })();
+
+    return id;
+  };
+
+  const cancel = (id) => {
+    const key = Number(id);
+    const state = timers.get(key);
+    if (!state) {
+      return;
+    }
+    state.canceled = true;
+    timers.delete(key);
+  };
+
+  define("setTimeout", (callback, delay = 0, ...args) => schedule(callback, delay, args, false));
+  define("clearTimeout", (id) => cancel(id));
+  define(
+    "setInterval",
+    (callback, delay = 0, ...args) => schedule(callback, delay, args, true),
+  );
+  define("clearInterval", (id) => cancel(id));
+}
+
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function ensureEncodingGlobals() {
+  define("TextEncoder", DenoTextEncoder);
+  define("TextDecoder", DenoTextDecoder);
+
+  if (globalThis.btoa === undefined) {
+    define("btoa", (value) => {
+      const input = String(value);
+      let output = "";
+      let i = 0;
+      while (i < input.length) {
+        const a = input.charCodeAt(i++);
+        const b = input.charCodeAt(i++);
+        const c = input.charCodeAt(i++);
+        if (a > 0xff || (Number.isFinite(b) && b > 0xff) || (Number.isFinite(c) && c > 0xff)) {
+          throw new TypeError("btoa input must be Latin1");
+        }
+        const triplet = (a << 16) | ((b || 0) << 8) | (c || 0);
+        output += BASE64_ALPHABET[(triplet >> 18) & 0x3f];
+        output += BASE64_ALPHABET[(triplet >> 12) & 0x3f];
+        output += Number.isFinite(b) ? BASE64_ALPHABET[(triplet >> 6) & 0x3f] : "=";
+        output += Number.isFinite(c) ? BASE64_ALPHABET[triplet & 0x3f] : "=";
+      }
+      return output;
+    });
+  }
+
+  if (globalThis.atob === undefined) {
+    define("atob", (value) => {
+      const input = String(value).replace(/\s+/g, "");
+      if (input.length % 4 === 1) {
+        throw new TypeError("Invalid base64 input");
+      }
+      const padded = input.padEnd(Math.ceil(input.length / 4) * 4, "=");
+      let output = "";
+      for (let i = 0; i < padded.length; i += 4) {
+        const chars = padded.slice(i, i + 4);
+        const sextets = chars.split("").map((char) => {
+          if (char === "=") {
+            return 0;
+          }
+          const idx = BASE64_ALPHABET.indexOf(char);
+          if (idx === -1) {
+            throw new TypeError("Invalid base64 input");
+          }
+          return idx;
+        });
+        const triplet =
+          (sextets[0] << 18) | (sextets[1] << 12) | (sextets[2] << 6) | sextets[3];
+        output += String.fromCharCode((triplet >> 16) & 0xff);
+        if (chars[2] !== "=") {
+          output += String.fromCharCode((triplet >> 8) & 0xff);
+        }
+        if (chars[3] !== "=") {
+          output += String.fromCharCode(triplet & 0xff);
+        }
+      }
+      return output;
+    });
+  }
+}
+
+function ensureStructuredCloneGlobal() {
+  define("structuredClone", denoStructuredClone);
+}
+
+function ensureAsyncContextGlobal() {
+  const core = globalThis.Deno?.core;
+  const asyncContextFrame = Symbol("dd.asyncContextFrame");
+  const getAsyncContext = typeof core?.getAsyncContext === "function"
+    ? () => core.getAsyncContext()
+    : () => globalThis.__dd_fallback_async_context ?? null;
+  const setAsyncContext = typeof core?.setAsyncContext === "function"
+    ? (value) => core.setAsyncContext(value ?? null)
+    : (value) => {
+      globalThis.__dd_fallback_async_context = value ?? null;
+    };
+  const frameFor = (context) => context?.[asyncContextFrame] === true
+    ? context
+    : {
+      [asyncContextFrame]: true,
+      requestStore: context ?? null,
+      asyncLocalStores: new Map(),
+    };
+  const derivedFrame = (context) => {
+    const frame = frameFor(context);
+    return {
+      [asyncContextFrame]: true,
+      requestStore: frame.requestStore,
+      asyncLocalStores: new Map(frame.asyncLocalStores),
+    };
+  };
+
+  define("__dd_async_context", {
+    getStore() {
+      return frameFor(getAsyncContext()).requestStore;
+    },
+    enterWith(store) {
+      const frame = derivedFrame(getAsyncContext());
+      frame.requestStore = store ?? null;
+      setAsyncContext(frame);
+      return store ?? null;
+    },
+    run(store, callback, ...args) {
+      if (typeof callback !== "function") {
+        throw new TypeError("__dd_async_context.run(store, callback) requires a function");
+      }
+      const previous = getAsyncContext() ?? null;
+      const frame = derivedFrame(previous);
+      frame.requestStore = store ?? null;
+      setAsyncContext(frame);
+      try {
+        return callback(...args);
+      } finally {
+        setAsyncContext(previous);
+      }
+    },
+    getAsyncLocalStore(storage) {
+      return frameFor(getAsyncContext()).asyncLocalStores.get(storage);
+    },
+    enterWithAsyncLocalStore(storage, store) {
+      const frame = derivedFrame(getAsyncContext());
+      frame.asyncLocalStores.set(storage, store);
+      setAsyncContext(frame);
+    },
+    runWithAsyncLocalStore(storage, store, callback, ...args) {
+      if (typeof callback !== "function") {
+        throw new TypeError("AsyncLocalStorage.run(store, callback) requires a function");
+      }
+      const previous = getAsyncContext() ?? null;
+      const frame = derivedFrame(previous);
+      frame.asyncLocalStores.set(storage, store);
+      setAsyncContext(frame);
+      try {
+        return callback(...args);
+      } finally {
+        setAsyncContext(previous);
+      }
+    },
+    disableAsyncLocalStore(storage) {
+      const frame = derivedFrame(getAsyncContext());
+      frame.asyncLocalStores.delete(storage);
+      setAsyncContext(frame);
+    },
+  });
+}
+
+function ensureCryptoGlobals() {
+  define("Crypto", Crypto);
+  define("CryptoKey", DenoCryptoKey);
+  define("SubtleCrypto", SubtleCrypto);
+  Object.defineProperty(globalThis, "crypto", {
+    get() {
+      return globalThis.__dd_deno_runtime.crypto;
+    },
+    enumerable: false,
+    configurable: true,
+  });
+}
+
+function normalizeTimeBoundaryValue(value) {
+  if (value == null) {
+    return null;
+  }
+  if (typeof value === "number") {
+    return { nowMs: value, perfMs: value };
+  }
+  if (Array.isArray(value)) {
+    const [nowMs, perfMs = nowMs] = value;
+    return { nowMs, perfMs };
+  }
+  if (typeof value === "object") {
+    const nowMs =
+      value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
+    const perfMs =
+      value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
+    return { nowMs, perfMs };
+  }
+  return null;
+}
+
+async function syncFrozenTimeBoundary() {
+  if (typeof globalThis.__dd_sync_time_boundary === "function") {
+    await globalThis.__dd_sync_time_boundary();
+    return;
+  }
+
+  const boundaryRaw = await runtimeOp("op_time_boundary_now");
+  const boundary = normalizeTimeBoundaryValue(boundaryRaw);
+  if (boundary && typeof globalThis.__dd_set_time === "function") {
+    globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+  }
+}
+
+function activeRuntimeRequestId() {
+  return typeof globalThis.__dd_get_runtime_request_id === "function"
+    ? String(globalThis.__dd_get_runtime_request_id() ?? "")
+    : "";
+}
+
+function activeRuntimeRequestContextHandle() {
+  return typeof globalThis.__dd_get_runtime_request_context_handle === "function"
+    ? Math.max(
+      0,
+      Math.trunc(Number(globalThis.__dd_get_runtime_request_context_handle() ?? 0) || 0),
+    )
+    : 0;
+}
+
+function activeCacheBypassStale() {
+  return typeof globalThis.__dd_get_cache_bypass_stale === "function"
+    ? Boolean(globalThis.__dd_get_cache_bypass_stale())
+    : false;
+}
+
+class Cache {
+  constructor(name = "default") {
+    this.name = String(name || "default");
+  }
+
+  async match(request, options = {}) {
+    const _ = options;
+    const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
+    const requestHeaders = Array.from(normalizedRequest.headers.entries());
+    const requestHeadersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      requestHeaders,
+    );
+    const result = await runtimeOp(
+      "op_cache_match",
+      activeRuntimeRequestContextHandle(),
+      this.name,
+      normalizedRequest.method,
+      normalizedRequest.url,
+      Number(requestHeadersHandle ?? 0),
+      activeCacheBypassStale(),
+    );
+    await syncFrozenTimeBoundary();
+
+    if (result && typeof result === "object" && result.ok === false) {
+      throw new Error(String(result.error ?? "cache match failed"));
+    }
+    if (!(result && typeof result === "object" && result.found === true)) {
+      return undefined;
+    }
+
+    if (result.should_revalidate === true) {
+      const revalidateHeadersHandle = runtimeOp(
+        "op_http_store_prepared_headers",
+        requestHeaders,
+      );
+      runtimeOp(
+        "op_emit_cache_revalidate",
+        this.name,
+        normalizedRequest.method,
+        normalizedRequest.url,
+        Number(revalidateHeadersHandle ?? 0),
+      );
+      await syncFrozenTimeBoundary();
+    }
+
+    const body = runtimeOp(
+      "op_http_take_prepared_body",
+      Number(result.body_handle ?? 0),
+    );
+    const headers = runtimeOp(
+      "op_http_take_prepared_headers",
+      Number(result.headers_handle ?? 0),
+    );
+    return new ResponseCtor(body, {
+      status: Number(result.status ?? 200),
+      headers: Array.isArray(headers) ? headers : [],
+    });
+  }
+
+  async put(request, response) {
+    const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
+    if (!(response instanceof ResponseCtor) && typeof response?.arrayBuffer !== "function") {
+      throw new TypeError("cache.put expects a Response");
+    }
+    const bodyHandle = runtimeOp(
+      "op_http_store_prepared_body",
+      new Uint8Array(await response.arrayBuffer()),
+    );
+    const requestHeadersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      Array.from(normalizedRequest.headers.entries()),
+    );
+    const responseHeadersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      Array.from(response.headers.entries()),
+    );
+    const result = await runtimeOp(
+      "op_cache_put",
+      activeRuntimeRequestContextHandle(),
+      this.name,
+      normalizedRequest.method,
+      normalizedRequest.url,
+      Number(requestHeadersHandle ?? 0),
+      Number(response.status ?? 200),
+      Number(responseHeadersHandle ?? 0),
+      Number(bodyHandle ?? 0),
+    );
+    await syncFrozenTimeBoundary();
+    if (result && typeof result === "object" && result.ok === false) {
+      throw new Error(String(result.error ?? "cache put failed"));
+    }
+  }
+
+  async delete(request, options = {}) {
+    const _ = options;
+    const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
+    const headersHandle = runtimeOp(
+      "op_http_store_prepared_headers",
+      Array.from(normalizedRequest.headers.entries()),
+    );
+    const result = await runtimeOp(
+      "op_cache_delete",
+      activeRuntimeRequestContextHandle(),
+      this.name,
+      normalizedRequest.method,
+      normalizedRequest.url,
+      Number(headersHandle ?? 0),
+    );
+    await syncFrozenTimeBoundary();
+    if (result && typeof result === "object" && result.ok === false) {
+      throw new Error(String(result.error ?? "cache delete failed"));
+    }
+    return Boolean(result?.deleted);
+  }
+}
+
+class CacheStorage {
+  constructor() {
+    this.default = new Cache("default");
+    this._named = new Map();
+    this._named.set("default", this.default);
+  }
+
+  async open(name) {
+    const normalized = String(name ?? "").trim();
+    if (!normalized) {
+      throw new TypeError("caches.open(name) requires a non-empty cache name");
+    }
+    const existing = this._named.get(normalized);
+    if (existing) {
+      return existing;
+    }
+    const cache = new Cache(normalized);
+    this._named.set(normalized, cache);
+    return cache;
+  }
+}
+
+ensureAbortGlobals();
+ensureFrozenTimeGlobals();
+ensureTimerGlobals();
+ensureEncodingGlobals();
+ensureStructuredCloneGlobal();
+ensureAsyncContextGlobal();
+ensureCryptoGlobals();
+define("DOMException", DOMException);
+define("Event", Event);
+define("EventTarget", EventTarget);
+define("CustomEvent", CustomEvent);
+define("ErrorEvent", ErrorEvent);
+define("MessageEvent", MessageEvent);
+define("ProgressEvent", ProgressEvent);
+define("PromiseRejectionEvent", PromiseRejectionEvent);
+define("CloseEvent", CloseEvent);
+define("reportError", reportError);
+define("Headers", RuntimeHeaders);
+define("Request", RuntimeRequest);
+define("Response", RuntimeResponse);
+define("URL", RuntimeURL);
+define("URLSearchParams", RuntimeURLSearchParams);
+define("URLPattern", RuntimeURLPattern);
+define("Blob", RuntimeBlob);
+define("File", RuntimeFile);
+define("FormData", RuntimeFormData);
+define("WritableStream", RuntimeWritableStream);
+define("TransformStream", RuntimeTransformStream);
+define("Cache", Cache);
+define("CacheStorage", CacheStorage);
+define("RpcTarget", class RpcTarget {});
+define("ReadableStream", RuntimeReadableStream);
+if (typeof denoFetch === "function") {
+  define("fetch", denoFetch);
+}
+define("caches", new CacheStorage());
+define("__dd_set_time", setFrozenTime);

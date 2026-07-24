@@ -9,6 +9,8 @@ matches="$(
     . \
     -g '!target/**' \
     -g '!.git/**' \
+    -g '!crates/runtime/js/vendor/**' \
+    -g '!crates/runtime/src/generated/memory_rpc_capnp.rs' \
   || true
 )"
 
@@ -23,6 +25,7 @@ while IFS= read -r line; do
     ./scripts/check_public_memory_naming.sh:*) continue ;;
     ./crates/cli/src/main.rs:*) continue ;;
     ./crates/common/src/lib.rs:*) continue ;;
+    ./crates/runtime/src/control_store.rs:*) continue ;;
   esac
   unexpected+=("$line")
 done <<< "$matches"

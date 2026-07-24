@@ -1,0 +1,19 @@
+{
+  "$schema": "../../schema/dd.schema.json",
+  "schema_version": 1,
+  "name": "vite-hono",
+  "entrypoint": "src/worker.ts",
+  "config": {
+    "public": true,
+    "bindings": [
+      {
+        "type": "memory",
+        "binding": "EXAMPLE_MEMORY"
+      },
+      {
+        "type": "kv",
+        "binding": "STORE_DB"
+      }
+    ]
+  }
+}

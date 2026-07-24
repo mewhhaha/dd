@@ -5,20 +5,33 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
+    capnproto \
+    clang \
+    cmake \
+    curl \
     git \
+    libssl-dev \
+    ninja-build \
+    perl \
+    pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
+COPY scripts ./scripts
+COPY patches ./patches
+RUN ./scripts/patch-crate.sh deno_crypto
 COPY crates ./crates
 
 RUN --mount=type=cache,id=dd-cargo-registry,target=/usr/local/cargo/registry \
   --mount=type=cache,id=dd-cargo-git,target=/usr/local/cargo/git \
   --mount=type=cache,id=dd-cargo-target,target=/workspace/target \
   cargo build --locked --profile dist \
-  -p runtime --bin dd_server \
+  -p dd_server \
   -p dd_init \
+  --no-default-features \
+  --features dd_server/websocket,dd_server/otel \
   && mkdir -p /out \
   && cp /workspace/target/dist/dd_init /workspace/target/dist/dd_server /out/
 
@@ -27,7 +40,7 @@ FROM gcr.io/distroless/cc-debian12@sha256:a90cf0f046efb32466b38b0972fef3a95e7c58
 WORKDIR /app
 ENV BIND_PUBLIC_ADDR=0.0.0.0:8080
 ENV BIND_PRIVATE_ADDR=[::]:8081
-ENV DD_STORE_DIR=/app/store
+ENV PUBLIC_BASE_DOMAIN=example.com
 ENV RUST_LOG=info
 
 VOLUME ["/app/store"]

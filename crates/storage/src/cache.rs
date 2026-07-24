@@ -1,3 +1,4 @@
+use crate::blob::BlobStore;
 use crate::turso_util::{
     checkpoint_database, configure_turso_connection, ensure_storage_migration_table,
     execute_cached, health_check_database, is_retryable_turso_error, query_cached,
@@ -184,6 +185,7 @@ struct HotCache {
     max_bytes: usize,
     state: Mutex<HotCacheState>,
     flush_lock: AsyncMutex<()>,
+    flush_failures: AtomicU64,
 }
 
 struct ScheduledFlushGuard {
@@ -313,6 +315,7 @@ struct LegacyCacheRecord {
     headers_json: String,
     body_storage: String,
     body_inline_hex: String,
+    body_ref: String,
     body_size: i64,
     expires_at_ms: i64,
     last_access_seq: i64,
@@ -339,6 +342,7 @@ impl HotCache {
             max_bytes: config.max_bytes.min(HOT_CACHE_MAX_BYTES),
             state: Mutex::new(HotCacheState::default()),
             flush_lock: AsyncMutex::new(()),
+            flush_failures: AtomicU64::new(0),
         }
     }
 
@@ -480,6 +484,7 @@ impl HotCache {
                 Ok(()) => consecutive_failures = 0,
                 Err(error) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    self.flush_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(error = %error, "failed to flush cache recency touches");
                 }
             }
@@ -693,8 +698,12 @@ impl HotCacheState {
 }
 
 impl CacheStore {
-    pub async fn from_database(config: CacheConfig, database: Arc<Database>) -> Result<Self> {
-        migrate_cache_schema(&database).await?;
+    pub async fn from_database(
+        config: CacheConfig,
+        database: Arc<Database>,
+        legacy_blobs: BlobStore,
+    ) -> Result<Self> {
+        migrate_cache_schema(&database, &legacy_blobs).await?;
         let store = Self {
             database: Arc::clone(&database),
             hot_cache: Arc::new(HotCache::new(database, &config)),
@@ -710,12 +719,16 @@ impl CacheStore {
     }
 
     #[cfg(test)]
-    async fn from_local_path(config: CacheConfig, local_path: String) -> Result<Self> {
+    async fn from_local_path(
+        config: CacheConfig,
+        local_path: String,
+        legacy_blobs: BlobStore,
+    ) -> Result<Self> {
         let database = Builder::new_local(&local_path)
             .build()
             .await
             .map_err(cache_error)?;
-        Self::from_database(config, Arc::new(database)).await
+        Self::from_database(config, Arc::new(database), legacy_blobs).await
     }
 
     pub async fn get(&self, request: &CacheRequest) -> Result<CacheLookup> {
@@ -759,16 +772,17 @@ impl CacheStore {
         let mut lookup = CacheLookup::Miss;
 
         while let Some(row) = rows.next().await.map_err(cache_error)? {
-            let record = row_to_record(&row)?;
-            let vary_headers: Vec<String> = match serde_json::from_str(&record.vary_headers_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    stale.push(CacheDeleteCandidate { id: record.id });
-                    continue;
-                }
-            };
+            let mut record = row_to_record(&row)?;
+            let vary_headers: Vec<String> =
+                match crate::json::from_string(std::mem::take(&mut record.vary_headers_json)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stale.push(CacheDeleteCandidate { id: record.id });
+                        continue;
+                    }
+                };
             let stored_vary_values: Vec<String> =
-                match serde_json::from_str(&record.vary_values_json) {
+                match crate::json::from_string(std::mem::take(&mut record.vary_values_json)) {
                     Ok(value) => value,
                     Err(_) => {
                         stale.push(CacheDeleteCandidate { id: record.id });
@@ -780,13 +794,14 @@ impl CacheStore {
                 continue;
             }
 
-            let headers: Vec<(String, String)> = match serde_json::from_str(&record.headers_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    stale.push(CacheDeleteCandidate { id: record.id });
-                    continue;
-                }
-            };
+            let headers: Vec<(String, String)> =
+                match crate::json::from_string(std::mem::take(&mut record.headers_json)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        stale.push(CacheDeleteCandidate { id: record.id });
+                        continue;
+                    }
+                };
 
             let response = CacheResponse {
                 status: record.status as u16,
@@ -931,9 +946,12 @@ impl CacheStore {
         }
         let base_key = CacheBaseKey::new(cache_name.clone(), method.clone(), request.url.clone());
 
-        let vary_headers_json = serde_json::to_string(&vary_headers).map_err(cache_error)?;
-        let vary_values_json = serde_json::to_string(&vary_values).map_err(cache_error)?;
-        let headers_json = serde_json::to_string(&response.headers).map_err(cache_error)?;
+        let vary_headers_json = crate::json::to_string(&vary_headers)
+            .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
+        let vary_values_json = crate::json::to_string(&vary_values)
+            .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
+        let headers_json = crate::json::to_string(&response.headers)
+            .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
 
         let mut conn = self.connect().await?;
         let now_ms = epoch_ms_i64()?;
@@ -1070,16 +1088,17 @@ impl CacheStore {
             .await?;
 
         let mut to_delete = Vec::new();
-        for record in records {
-            let vary_headers: Vec<String> = match serde_json::from_str(&record.vary_headers_json) {
-                Ok(value) => value,
-                Err(_) => {
-                    to_delete.push(CacheDeleteCandidate { id: record.id });
-                    continue;
-                }
-            };
+        for mut record in records {
+            let vary_headers: Vec<String> =
+                match crate::json::from_string(std::mem::take(&mut record.vary_headers_json)) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        to_delete.push(CacheDeleteCandidate { id: record.id });
+                        continue;
+                    }
+                };
             let stored_vary_values: Vec<String> =
-                match serde_json::from_str(&record.vary_values_json) {
+                match crate::json::from_string(std::mem::take(&mut record.vary_values_json)) {
                     Ok(value) => value,
                     Err(_) => {
                         to_delete.push(CacheDeleteCandidate { id: record.id });
@@ -1211,19 +1230,17 @@ impl CacheStore {
                 };
                 cursor_expires_at = candidate.expires_at_ms;
                 cursor_id = candidate.id.clone();
-                let should_delete =
-                    match serde_json::from_str::<Vec<(String, String)>>(&candidate.headers_json) {
-                        Ok(headers) => {
-                            let response_headers = to_header_map(&headers);
-                            let response_control = parse_cache_control(header_value(
-                                &response_headers,
-                                "cache-control",
-                            ));
-                            now_ms
-                                > max_stale_deadline_ms(candidate.expires_at_ms, &response_control)
-                        }
-                        Err(_) => true,
-                    };
+                let should_delete = match crate::json::from_string::<Vec<(String, String)>>(
+                    candidate.headers_json.clone(),
+                ) {
+                    Ok(headers) => {
+                        let response_headers = to_header_map(&headers);
+                        let response_control =
+                            parse_cache_control(header_value(&response_headers, "cache-control"));
+                        now_ms > max_stale_deadline_ms(candidate.expires_at_ms, &response_control)
+                    }
+                    Err(_) => true,
+                };
                 if should_delete {
                     expired.push(CacheDeleteCandidate { id: candidate.id });
                 }
@@ -1241,7 +1258,7 @@ impl CacheStore {
     }
 
     async fn evict_if_needed(&self, conn: &Connection) -> Result<()> {
-        self.hot_cache.flush_pending_touches().await?;
+        self.flush_pending_touches().await?;
         loop {
             let (count, total_bytes) = self.cache_usage(conn).await?;
             if count <= self.config.max_entries && total_bytes <= self.config.max_bytes {
@@ -1318,6 +1335,24 @@ impl CacheStore {
         self.access_seq
             .fetch_add(1, Ordering::Relaxed)
             .min(i64::MAX as u64) as i64
+    }
+
+    pub async fn flush_pending_touches(&self) -> Result<()> {
+        let result = self.hot_cache.flush_pending_touches().await;
+        if result.is_err() {
+            self.hot_cache
+                .flush_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    pub fn flush_failure_count(&self) -> u64 {
+        self.hot_cache.flush_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn pending_touch_count(&self) -> usize {
+        self.hot_cache.lock_state().pending_touches.len()
     }
 
     pub async fn checkpoint(&self) -> Result<()> {
@@ -1597,11 +1632,12 @@ async fn ensure_cache_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-async fn migrate_cache_schema(database: &Database) -> Result<()> {
+async fn migrate_cache_schema(database: &Database, legacy_blobs: &BlobStore) -> Result<()> {
     let mut conn = database.connect().map_err(cache_error)?;
     configure_cache_connection(&conn).await?;
 
     const MAX_ATTEMPTS: usize = 8;
+    let mut migrated_blob_refs = HashSet::new();
     for attempt in 0..MAX_ATTEMPTS {
         let tx = match conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1615,10 +1651,11 @@ async fn migrate_cache_schema(database: &Database) -> Result<()> {
             Err(error) => return Err(cache_error_after_retry(error)),
         };
 
-        let outcome = migrate_cache_schema_transaction(&tx).await;
+        let outcome = migrate_cache_schema_transaction(&tx, legacy_blobs).await;
         match outcome {
             Ok(result) => match tx.commit().await {
                 Ok(()) => {
+                    migrated_blob_refs.extend(result.blob_refs);
                     if result.migrated_rows > 0 || result.dropped_rows > 0 {
                         tracing::info!(
                             migrated_rows = result.migrated_rows,
@@ -1629,6 +1666,10 @@ async fn migrate_cache_schema(database: &Database) -> Result<()> {
                     break;
                 }
                 Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                    // A commit error is ambiguous. Retain the refs and only
+                    // remove them after a subsequent transaction confirms the
+                    // migrated schema is committed.
+                    migrated_blob_refs.extend(result.blob_refs);
                     sleep_cache_retry(attempt).await;
                     continue;
                 }
@@ -1640,6 +1681,12 @@ async fn migrate_cache_schema(database: &Database) -> Result<()> {
             }
         }
     }
+
+    for blob_ref in migrated_blob_refs {
+        if let Err(error) = legacy_blobs.delete_legacy(&blob_ref).await {
+            tracing::warn!(blob_ref, error = %error, "failed to remove migrated cache blob");
+        }
+    }
     Ok(())
 }
 
@@ -1647,9 +1694,13 @@ async fn migrate_cache_schema(database: &Database) -> Result<()> {
 struct CacheMigrationResult {
     migrated_rows: usize,
     dropped_rows: usize,
+    blob_refs: HashSet<String>,
 }
 
-async fn migrate_cache_schema_transaction(conn: &Connection) -> Result<CacheMigrationResult> {
+async fn migrate_cache_schema_transaction(
+    conn: &Connection,
+    legacy_blobs: &BlobStore,
+) -> Result<CacheMigrationResult> {
     ensure_storage_migration_table(conn)
         .await
         .map_err(cache_error)?;
@@ -1668,7 +1719,7 @@ async fn migrate_cache_schema_transaction(conn: &Connection) -> Result<CacheMigr
             .await
             .map_err(cache_error)?;
     } else if !columns.contains("body_blob") {
-        return migrate_legacy_cache_table(conn).await;
+        return migrate_legacy_cache_table(conn, legacy_blobs).await;
     }
 
     ensure_cache_indexes(conn).await?;
@@ -1688,11 +1739,14 @@ async fn cache_table_columns(conn: &Connection) -> Result<HashSet<String>> {
     Ok(columns)
 }
 
-async fn migrate_legacy_cache_table(conn: &Connection) -> Result<CacheMigrationResult> {
+async fn migrate_legacy_cache_table(
+    conn: &Connection,
+    legacy_blobs: &BlobStore,
+) -> Result<CacheMigrationResult> {
     let mut rows = conn
         .query(
             "SELECT id, cache_name, method, url, vary_headers_json, vary_values_json,
-                    status, headers_json, body_storage, body_inline_hex,
+                    status, headers_json, body_storage, body_inline_hex, body_ref,
                     body_size, expires_at_ms, last_access_seq, updated_at_ms
              FROM worker_cache_entries
              ORDER BY id",
@@ -1713,10 +1767,11 @@ async fn migrate_legacy_cache_table(conn: &Connection) -> Result<CacheMigrationR
             headers_json: row.get::<String>(7).map_err(cache_error)?,
             body_storage: row.get::<String>(8).map_err(cache_error)?,
             body_inline_hex: row.get::<String>(9).map_err(cache_error)?,
-            body_size: row.get::<i64>(10).map_err(cache_error)?,
-            expires_at_ms: row.get::<i64>(11).map_err(cache_error)?,
-            last_access_seq: row.get::<i64>(12).map_err(cache_error)?,
-            updated_at_ms: row.get::<i64>(13).map_err(cache_error)?,
+            body_ref: row.get::<String>(10).map_err(cache_error)?,
+            body_size: row.get::<i64>(11).map_err(cache_error)?,
+            expires_at_ms: row.get::<i64>(12).map_err(cache_error)?,
+            last_access_seq: row.get::<i64>(13).map_err(cache_error)?,
+            updated_at_ms: row.get::<i64>(14).map_err(cache_error)?,
         });
     }
     drop(rows);
@@ -1728,6 +1783,12 @@ async fn migrate_legacy_cache_table(conn: &Connection) -> Result<CacheMigrationR
     for record in legacy_rows {
         let body = match record.body_storage.as_str() {
             "inline" => hex_to_bytes(&record.body_inline_hex),
+            "blob" => {
+                if !record.body_ref.is_empty() {
+                    result.blob_refs.insert(record.body_ref.clone());
+                }
+                legacy_blobs.read_legacy(&record.body_ref).await
+            }
             other => Err(PlatformError::runtime(format!(
                 "cache error: unsupported legacy body storage {other}"
             ))),
@@ -1873,9 +1934,11 @@ mod tests {
         HOT_CACHE_MAX_BYTES, HOT_CACHE_MAX_ENTRIES, HotCacheEntry, HotCacheState,
         PendingTouchesGuard, bytes_to_hex,
     };
+    use crate::blob::local_blob_store_for_tests;
     use crate::kv::KvStore;
     use bytes::Bytes;
     use common::Result;
+    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Barrier;
@@ -1883,12 +1946,24 @@ mod tests {
     use uuid::Uuid;
 
     async fn test_store(config: CacheConfig) -> CacheStore {
-        let database_path = format!("/tmp/dd-cache-test-{}.db", Uuid::new_v4());
-        test_store_at_path(config, &database_path).await
+        let blob_dir = format!("/tmp/dd-cache-blob-test-{}", Uuid::new_v4());
+        test_store_with_blob_dir(config, &blob_dir).await
     }
 
-    async fn test_store_at_path(config: CacheConfig, database_path: &str) -> CacheStore {
-        CacheStore::from_local_path(config, database_path.to_string())
+    async fn test_store_with_blob_dir(config: CacheConfig, blob_dir: &str) -> CacheStore {
+        let database_path = format!("/tmp/dd-cache-test-{}.db", Uuid::new_v4());
+        test_store_at_path(config, &database_path, blob_dir).await
+    }
+
+    async fn test_store_at_path(
+        config: CacheConfig,
+        database_path: &str,
+        blob_dir: &str,
+    ) -> CacheStore {
+        let blob_store = local_blob_store_for_tests(blob_dir)
+            .await
+            .expect("blob store");
+        CacheStore::from_local_path(config, database_path.to_string(), blob_store)
             .await
             .expect("cache store")
     }
@@ -1926,6 +2001,14 @@ mod tests {
             headers: vec![("cache-control".to_string(), "max-age=60".to_string())],
             body: Bytes::copy_from_slice(body.as_bytes()),
         }
+    }
+
+    fn local_blob_file_count(blob_dir: &str) -> usize {
+        fs::read_dir(blob_dir)
+            .expect("blob dir should exist")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "blob"))
+            .count()
     }
 
     #[test]
@@ -2031,7 +2114,7 @@ mod tests {
         assert_eq!(persisted_access_seq(&store, &req.url).await, before);
 
         let expected = store.access_seq.load(std::sync::atomic::Ordering::Relaxed) as i64 - 1;
-        store.hot_cache.flush_pending_touches().await?;
+        store.flush_pending_touches().await?;
         assert_eq!(persisted_access_seq(&store, &req.url).await, expected);
         assert!(store.hot_cache.lock_state().pending_touches.is_empty());
         Ok(())
@@ -2139,11 +2222,11 @@ mod tests {
         conn.execute("DROP TABLE worker_cache_entries", ())
             .await
             .expect("drop cache table");
-        assert!(store.hot_cache.flush_pending_touches().await.is_err());
+        assert!(store.flush_pending_touches().await.is_err());
         assert_eq!(store.hot_cache.lock_state().pending_touches.len(), 1);
 
         store.ensure_schema().await?;
-        store.hot_cache.flush_pending_touches().await?;
+        store.flush_pending_touches().await?;
         assert!(store.hot_cache.lock_state().pending_touches.is_empty());
         Ok(())
     }
@@ -2177,24 +2260,25 @@ mod tests {
     #[tokio::test]
     async fn restart_initializes_access_sequence_from_persisted_max() -> Result<()> {
         let database_path = format!("/tmp/dd-cache-restart-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-restart-blob-test-{}", Uuid::new_v4());
         let config = CacheConfig {
             max_entries: 8,
             max_bytes: 1024 * 1024,
             default_ttl: Duration::from_secs(60),
             inline_body_limit_bytes: 64 * 1024,
         };
-        let first = test_store_at_path(config.clone(), &database_path).await;
+        let first = test_store_at_path(config.clone(), &database_path, &blob_dir).await;
         let first_request = request("/before-restart");
         assert!(first.put(&first_request, response("first")).await?);
         assert!(matches!(
             first.get(&first_request).await?,
             CacheLookup::Fresh(_)
         ));
-        first.hot_cache.flush_pending_touches().await?;
+        first.flush_pending_touches().await?;
         let persisted_max = persisted_access_seq(&first, &first_request.url).await;
         drop(first);
 
-        let restarted = test_store_at_path(config, &database_path).await;
+        let restarted = test_store_at_path(config, &database_path, &blob_dir).await;
         assert_eq!(
             restarted
                 .access_seq
@@ -2372,12 +2456,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_same_variant_are_normal_overwrites() -> Result<()> {
-        let store = test_store(CacheConfig {
-            max_entries: 8,
-            max_bytes: 1024 * 1024,
-            default_ttl: Duration::from_secs(60),
-            inline_body_limit_bytes: 1,
-        })
+        let blob_dir = format!("/tmp/dd-cache-blob-test-{}", Uuid::new_v4());
+        let store = test_store_with_blob_dir(
+            CacheConfig {
+                max_entries: 8,
+                max_bytes: 1024 * 1024,
+                default_ttl: Duration::from_secs(60),
+                inline_body_limit_bytes: 1,
+            },
+            &blob_dir,
+        )
         .await;
         let req = request("/concurrent-overwrite");
         let barrier = Arc::new(Barrier::new(16));
@@ -2405,12 +2493,17 @@ mod tests {
             }
             other => panic!("expected fresh concurrent overwrite hit, got {:?}", other),
         }
+        assert_eq!(local_blob_file_count(&blob_dir), 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn legacy_inline_bodies_migrate_and_external_blob_rows_are_dropped() -> Result<()> {
+    async fn legacy_inline_and_external_bodies_migrate_to_database_blobs() -> Result<()> {
         let database_path = format!("/tmp/dd-cache-migration-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-cache-migration-blobs-{}", Uuid::new_v4());
+        let blob_store = local_blob_store_for_tests(&blob_dir).await?;
+        let external_body = b"legacy external body";
+        let blob_ref = blob_store.put(external_body).await?;
 
         let database = Builder::new_local(&database_path)
             .build()
@@ -2470,8 +2563,8 @@ mod tests {
                 "blob-id",
                 "http://worker/legacy-external",
                 headers_json,
-                "local:0e18ee1b-6a04-4d0e-b032-533f4b1b1f1f",
-                20_i64,
+                blob_ref.as_str(),
+                external_body.len() as i64,
                 i64::MAX / 2,
                 8_i64,
             ),
@@ -2481,20 +2574,18 @@ mod tests {
         drop(conn);
         drop(database);
 
-        let store = CacheStore::from_local_path(CacheConfig::default(), database_path).await?;
+        let store =
+            CacheStore::from_local_path(CacheConfig::default(), database_path, blob_store).await?;
         match store.get(&request("/legacy-inline")).await? {
             CacheLookup::Fresh(value) => {
                 assert_eq!(value.body.as_ref(), b"legacy inline body")
             }
             other => panic!("expected migrated inline hit, got {other:?}"),
         }
-        assert!(
-            matches!(
-                store.get(&request("/legacy-external")).await?,
-                CacheLookup::Miss
-            ),
-            "external blob bodies are unreadable without the removed blob store and must be dropped"
-        );
+        match store.get(&request("/legacy-external")).await? {
+            CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), external_body),
+            other => panic!("expected migrated external hit, got {other:?}"),
+        }
 
         let conn = store.connect().await?;
         let mut columns = conn
@@ -2526,13 +2617,20 @@ mod tests {
                 .map_err(super::cache_error)?,
             super::CACHE_SCHEMA_VERSION
         );
+        assert_eq!(local_blob_file_count(&blob_dir), 0);
         Ok(())
     }
 
     #[tokio::test]
     async fn current_cache_schema_without_migration_metadata_is_adopted() -> Result<()> {
         let database_path = format!("/tmp/dd-cache-current-test-{}.db", Uuid::new_v4());
-        let store = test_store_at_path(CacheConfig::default(), database_path.as_str()).await;
+        let blob_dir = format!("/tmp/dd-cache-current-blobs-{}", Uuid::new_v4());
+        let store = test_store_at_path(
+            CacheConfig::default(),
+            database_path.as_str(),
+            blob_dir.as_str(),
+        )
+        .await;
         assert!(
             store
                 .put(&request("/current"), response("preserved"))
@@ -2554,7 +2652,12 @@ mod tests {
         drop(conn);
         drop(database);
 
-        let store = test_store_at_path(CacheConfig::default(), database_path.as_str()).await;
+        let store = test_store_at_path(
+            CacheConfig::default(),
+            database_path.as_str(),
+            blob_dir.as_str(),
+        )
+        .await;
         match store.get(&request("/current")).await? {
             CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"preserved"),
             other => panic!("expected current-schema cache hit, got {other:?}"),
@@ -2566,7 +2669,13 @@ mod tests {
     #[tokio::test]
     async fn future_cache_schema_version_is_rejected_without_mutating_data() -> Result<()> {
         let database_path = format!("/tmp/dd-cache-future-test-{}.db", Uuid::new_v4());
-        let store = test_store_at_path(CacheConfig::default(), database_path.as_str()).await;
+        let blob_dir = format!("/tmp/dd-cache-future-blobs-{}", Uuid::new_v4());
+        let store = test_store_at_path(
+            CacheConfig::default(),
+            database_path.as_str(),
+            blob_dir.as_str(),
+        )
+        .await;
         assert!(
             store
                 .put(&request("/future"), response("future-guard"))
@@ -2589,8 +2698,13 @@ mod tests {
         drop(conn);
         drop(database);
 
-        let error = match CacheStore::from_local_path(CacheConfig::default(), database_path.clone())
-            .await
+        let blob_store = local_blob_store_for_tests(&blob_dir).await?;
+        let error = match CacheStore::from_local_path(
+            CacheConfig::default(),
+            database_path.clone(),
+            blob_store,
+        )
+        .await
         {
             Ok(_) => panic!("future cache schema must fail startup"),
             Err(error) => error,
@@ -2628,6 +2742,7 @@ mod tests {
     #[tokio::test]
     async fn kv_and_cache_share_one_database_owner_and_migration_ledger() -> Result<()> {
         let database_path = format!("/tmp/dd-shared-storage-test-{}.db", Uuid::new_v4());
+        let blob_dir = format!("/tmp/dd-shared-storage-blobs-{}", Uuid::new_v4());
         let database = Arc::new(
             Builder::new_local(&database_path)
                 .build()
@@ -2635,8 +2750,12 @@ mod tests {
                 .map_err(super::cache_error)?,
         );
         let kv = KvStore::from_database(Arc::clone(&database)).await?;
-        let cache =
-            CacheStore::from_database(CacheConfig::default(), Arc::clone(&database)).await?;
+        let cache = CacheStore::from_database(
+            CacheConfig::default(),
+            Arc::clone(&database),
+            local_blob_store_for_tests(&blob_dir).await?,
+        )
+        .await?;
 
         assert!(kv.shares_database_owner(&database));
         assert!(Arc::ptr_eq(&cache.database, &database));

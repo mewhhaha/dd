@@ -5,11 +5,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore};
-use turso::{Builder, Connection, Database, transaction::TransactionBehavior};
+use turso::{Builder, Connection, Database, Value, transaction::TransactionBehavior};
 
 use crate::turso_util::{
     checkpoint_database, configure_turso_connection, ensure_storage_migration_table,
@@ -118,6 +118,7 @@ impl Drop for MemoryReadConnection {
 
 struct MemoryWriterConnection {
     guard: tokio::sync::OwnedMutexGuard<Option<PooledMemoryConnection>>,
+    profile: Arc<MemoryProfile>,
     healthy: bool,
 }
 
@@ -135,6 +136,8 @@ impl std::ops::Deref for MemoryWriterConnection {
 
 impl MemoryWriterConnection {
     fn discard(&mut self) {
+        self.profile
+            .record(MemoryProfileMetricKind::StoreConnectionDiscard, 0, 1);
         self.healthy = false;
     }
 }
@@ -447,12 +450,181 @@ pub struct MemoryStore {
     db_read_connections_per_database: usize,
     db_connection_permits: Arc<Semaphore>,
     db_live_connections: Arc<AtomicUsize>,
+    db_peak_connections: Arc<AtomicUsize>,
     namespace_shards: usize,
     shard_hash_version: u32,
     namespace_shard_hash_versions: Arc<BTreeMap<String, u32>>,
     namespace_key_shard_overrides: Arc<BTreeMap<String, BTreeMap<String, usize>>>,
     snapshot_cache_max_entries: usize,
     snapshot_cache_max_bytes: usize,
+    owner_epoch_floor: Arc<AtomicU64>,
+    profile: Arc<MemoryProfile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryProfileMetricKind {
+    JsReadOnlyTotal,
+    JsHydrateFull,
+    JsHydrateKeys,
+    JsTxnCommit,
+    JsCacheHit,
+    JsCacheMiss,
+    JsCacheStale,
+    OpRead,
+    OpSnapshot,
+    OpVersionIfNewer,
+    OpApplyBatch,
+    StoreRead,
+    StoreSnapshot,
+    StoreSnapshotKeys,
+    StoreVersionIfNewer,
+    StoreApplyBatch,
+    StoreApplyBatchValidate,
+    StoreApplyBatchWrite,
+    StoreDatabaseCacheHit,
+    StoreDatabaseCacheMiss,
+    StoreDatabaseCacheEviction,
+    StoreConnectionCreate,
+    StoreConnectionReuse,
+    StoreReaderPoolWait,
+    StoreWriterLaneWait,
+    StoreWriterBusyRetry,
+    StoreConnectionDiscard,
+    StoreConnectionsLive,
+    StoreConnectionsPeak,
+    StoreSnapshotCacheHit,
+    StoreSnapshotCacheMiss,
+    StoreSnapshotCacheEviction,
+    EntityCacheLockWait,
+    EntityCacheStripeCount,
+    EntityCachePeakEntriesPerStripe,
+    EntityCacheMaxEntriesPerStripe,
+    RuntimeAtomicInvokeEventWait,
+    RuntimeAtomicQueueWait,
+    RuntimeAtomicDispatchWait,
+    RuntimeAtomicExecution,
+    RuntimeAtomicCompletionWait,
+    RuntimeAtomicOutboxDrain,
+}
+
+#[derive(Default)]
+struct MemoryProfileMetric {
+    calls: AtomicU64,
+    total_us: AtomicU64,
+    total_items: AtomicU64,
+    max_us: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryProfileMetricSnapshot {
+    pub calls: u64,
+    pub total_us: u64,
+    pub total_items: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryProfileSnapshot {
+    pub enabled: bool,
+    pub js_read_only_total: MemoryProfileMetricSnapshot,
+    pub js_hydrate_full: MemoryProfileMetricSnapshot,
+    pub js_hydrate_keys: MemoryProfileMetricSnapshot,
+    pub js_txn_commit: MemoryProfileMetricSnapshot,
+    pub js_cache_hit: MemoryProfileMetricSnapshot,
+    pub js_cache_miss: MemoryProfileMetricSnapshot,
+    pub js_cache_stale: MemoryProfileMetricSnapshot,
+    pub op_read: MemoryProfileMetricSnapshot,
+    pub op_snapshot: MemoryProfileMetricSnapshot,
+    pub op_version_if_newer: MemoryProfileMetricSnapshot,
+    pub op_apply_batch: MemoryProfileMetricSnapshot,
+    pub store_read: MemoryProfileMetricSnapshot,
+    pub store_snapshot: MemoryProfileMetricSnapshot,
+    pub store_snapshot_keys: MemoryProfileMetricSnapshot,
+    pub store_version_if_newer: MemoryProfileMetricSnapshot,
+    pub store_apply_batch: MemoryProfileMetricSnapshot,
+    pub store_apply_batch_validate: MemoryProfileMetricSnapshot,
+    pub store_apply_batch_write: MemoryProfileMetricSnapshot,
+    pub store_database_cache_hit: MemoryProfileMetricSnapshot,
+    pub store_database_cache_miss: MemoryProfileMetricSnapshot,
+    pub store_database_cache_eviction: MemoryProfileMetricSnapshot,
+    pub store_connection_create: MemoryProfileMetricSnapshot,
+    pub store_connection_reuse: MemoryProfileMetricSnapshot,
+    pub store_reader_pool_wait: MemoryProfileMetricSnapshot,
+    pub store_writer_lane_wait: MemoryProfileMetricSnapshot,
+    pub store_writer_busy_retry: MemoryProfileMetricSnapshot,
+    pub store_connection_discard: MemoryProfileMetricSnapshot,
+    pub store_connections_live: MemoryProfileMetricSnapshot,
+    pub store_connections_peak: MemoryProfileMetricSnapshot,
+    pub store_snapshot_cache_hit: MemoryProfileMetricSnapshot,
+    pub store_snapshot_cache_miss: MemoryProfileMetricSnapshot,
+    pub store_snapshot_cache_eviction: MemoryProfileMetricSnapshot,
+    pub entity_cache_lock_wait: MemoryProfileMetricSnapshot,
+    pub entity_cache_stripe_count: MemoryProfileMetricSnapshot,
+    pub entity_cache_peak_entries_per_stripe: MemoryProfileMetricSnapshot,
+    pub entity_cache_max_entries_per_stripe: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_invoke_event_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_queue_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_dispatch_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_execution: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_completion_wait: MemoryProfileMetricSnapshot,
+    pub runtime_atomic_outbox_drain: MemoryProfileMetricSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MemoryCachePerformanceSnapshot {
+    pub snapshot_hits: u64,
+    pub snapshot_misses: u64,
+    pub snapshot_evictions: u64,
+}
+
+#[derive(Default)]
+pub struct MemoryProfile {
+    enabled: AtomicBool,
+    snapshot_cache_hits_total: AtomicU64,
+    snapshot_cache_misses_total: AtomicU64,
+    snapshot_cache_evictions_total: AtomicU64,
+    js_read_only_total: MemoryProfileMetric,
+    js_hydrate_full: MemoryProfileMetric,
+    js_hydrate_keys: MemoryProfileMetric,
+    js_txn_commit: MemoryProfileMetric,
+    js_cache_hit: MemoryProfileMetric,
+    js_cache_miss: MemoryProfileMetric,
+    js_cache_stale: MemoryProfileMetric,
+    op_read: MemoryProfileMetric,
+    op_snapshot: MemoryProfileMetric,
+    op_version_if_newer: MemoryProfileMetric,
+    op_apply_batch: MemoryProfileMetric,
+    store_read: MemoryProfileMetric,
+    store_snapshot: MemoryProfileMetric,
+    store_snapshot_keys: MemoryProfileMetric,
+    store_version_if_newer: MemoryProfileMetric,
+    store_apply_batch: MemoryProfileMetric,
+    store_apply_batch_validate: MemoryProfileMetric,
+    store_apply_batch_write: MemoryProfileMetric,
+    store_database_cache_hit: MemoryProfileMetric,
+    store_database_cache_miss: MemoryProfileMetric,
+    store_database_cache_eviction: MemoryProfileMetric,
+    store_connection_create: MemoryProfileMetric,
+    store_connection_reuse: MemoryProfileMetric,
+    store_reader_pool_wait: MemoryProfileMetric,
+    store_writer_lane_wait: MemoryProfileMetric,
+    store_writer_busy_retry: MemoryProfileMetric,
+    store_connection_discard: MemoryProfileMetric,
+    store_connections_live: MemoryProfileMetric,
+    store_connections_peak: MemoryProfileMetric,
+    store_snapshot_cache_hit: MemoryProfileMetric,
+    store_snapshot_cache_miss: MemoryProfileMetric,
+    store_snapshot_cache_eviction: MemoryProfileMetric,
+    entity_cache_lock_wait: MemoryProfileMetric,
+    entity_cache_stripe_count: MemoryProfileMetric,
+    entity_cache_peak_entries_per_stripe: MemoryProfileMetric,
+    entity_cache_max_entries_per_stripe: MemoryProfileMetric,
+    runtime_atomic_invoke_event_wait: MemoryProfileMetric,
+    runtime_atomic_queue_wait: MemoryProfileMetric,
+    runtime_atomic_dispatch_wait: MemoryProfileMetric,
+    runtime_atomic_execution: MemoryProfileMetric,
+    runtime_atomic_completion_wait: MemoryProfileMetric,
+    runtime_atomic_outbox_drain: MemoryProfileMetric,
 }
 
 #[derive(Debug, Clone)]
@@ -467,6 +639,12 @@ pub struct MemorySnapshotEntry {
 #[derive(Debug, Clone)]
 pub struct MemorySnapshot {
     pub entries: Vec<MemorySnapshotEntry>,
+    pub max_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryPointRead {
+    pub record: Option<MemorySnapshotEntry>,
     pub max_version: i64,
 }
 
@@ -493,6 +671,44 @@ pub struct MemoryOutboxEffectWrite {
 #[derive(Debug, Clone)]
 pub struct MemoryBatchApplyResult {
     pub max_version: i64,
+}
+
+pub struct MemoryCommandResult {
+    pub result: Vec<u8>,
+    pub revision: i64,
+}
+
+#[allow(dead_code)]
+pub struct MemoryOutboxRecord {
+    pub effect_id: String,
+    pub kind: String,
+    pub payload: Vec<u8>,
+    pub revision: i64,
+    pub status: String,
+    pub attempt_count: i64,
+    pub next_attempt_at_ms: i64,
+}
+
+#[allow(dead_code)]
+pub struct MemoryOutboxClaim {
+    pub namespace: String,
+    pub memory_key: String,
+    pub record: MemoryOutboxRecord,
+}
+
+#[derive(Debug, Clone)]
+pub enum MemoryOutboxDeliveryAction {
+    Delivered,
+    DroppedTerminal,
+    Retry { retry_after: Duration },
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryOutboxDeliveryOutcome {
+    pub namespace: String,
+    pub memory_key: String,
+    pub effect_id: String,
+    pub action: MemoryOutboxDeliveryAction,
 }
 
 struct MemoryBatchCommitOutcome {
@@ -535,7 +751,7 @@ impl From<MemoryTransactionError> for PlatformError {
     }
 }
 
-// MemoryStore construction and state operations.
+// MemoryStore construction and state/outbox operations.
 include!("memory/store.rs");
 
 // Database handles, pooled connections, and transaction-local reads.
@@ -546,6 +762,9 @@ include!("memory/cache.rs");
 
 // Direct persistence row helpers and transactional validation.
 include!("memory/persistence.rs");
+
+// Runtime and store profiling counters/snapshots.
+include!("memory/profiling.rs");
 
 // Schema creation, compatibility migration, and durable version floors.
 include!("memory/migrations.rs");

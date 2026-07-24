@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>dd static assets example</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <p class="eyebrow">Deploy-time assets</p>
+      <h1>Simple site with worker fallback</h1>
+      <p class="lede">
+        This page, stylesheet, and script are served directly from the deployed asset bundle.
+      </p>
+      <div class="card">
+        <p class="label">Worker-backed JSON</p>
+        <pre id="output">Loading /api/time ...</pre>
+      </div>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

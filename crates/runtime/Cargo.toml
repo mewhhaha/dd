@@ -4,37 +4,47 @@ edition.workspace = true
 license.workspace = true
 publish = false
 version.workspace = true
+build = "build.rs"
 
 [dependencies]
-base64.workspace = true
-clap.workspace = true
+arc-swap.workspace = true
 common = { path = "../common" }
-futures-util = "0.3"
-getrandom = "0.4"
-http-body-util = "0.1"
-mime_guess = "2"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-reqwest.workspace = true
+storage = { path = "../storage" }
+deno_core.workspace = true
+deno_error = "=0.7.1"
+turso = { git = "https://github.com/tursodatabase/turso", rev = "f548e012cd6ef4ecc3d0f6112d69813e13c54dcb", default-features = false }
+capnp = "0.26"
 serde.workspace = true
 serde_json.workspace = true
-storage = { path = "../storage" }
-sha2 = "0.11"
+simd-json.workspace = true
 tokio.workspace = true
-tokio-tungstenite = "0.29"
 tracing.workspace = true
-tracing-subscriber.workspace = true
-url = "2"
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
 uuid.workspace = true
-wasmtime.workspace = true
+reqwest.workspace = true
+getrandom = "0.4"
+base64.workspace = true
+bytes = "1"
+futures-util = "0.3"
+sha2 = "0.11"
+mime_guess = "2"
+regex = "1"
+deno_webidl = "0.254.0"
+deno_web = "0.285.0"
+deno_fetch = "0.278.0"
+deno_crypto = "0.268.0"
+deno_permissions = "0.113.0"
+hyper-util = { version = "0.1", features = ["client-legacy"] }
+rustls = "0.23"
+sys_traits = { version = "0.1.28", features = ["real", "libc"] }
 
-[[bin]]
-name = "dd_server"
-path = "src/bin/dd_server.rs"
-
-[[bin]]
-name = "bench_wasm_worker"
-path = "src/bin/bench_wasm_worker.rs"
+[features]
+default = []
+otel = ["dep:tracing-opentelemetry", "dep:opentelemetry"]
 
 [dev-dependencies]
-tempfile = "3"
+serial_test = "3"
+
+[build-dependencies]
+sha2 = "0.11"

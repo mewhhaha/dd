@@ -1,0 +1,604 @@
+use base64::Engine;
+use common::{DeployServerModule, DeployServerModuleKind, PlatformError, Result};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+const MAX_DYNAMIC_MODULE_COUNT: usize = 256;
+const MAX_DYNAMIC_GRAPH_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SERVER_MODULE_COUNT: usize = 512;
+const MAX_SERVER_MODULE_GRAPH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DYNAMIC_REGISTERED_GRAPHS: usize = 1024;
+
+#[derive(Clone)]
+struct DynamicModuleGraph {
+    modules: Arc<HashMap<String, RuntimeModule>>,
+    ref_count: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeModule {
+    pub(crate) kind: RuntimeModuleKind,
+    pub(crate) code: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RuntimeModuleKind {
+    JavaScript,
+    Wasm,
+    Json,
+    Text,
+    Bytes,
+}
+
+/// Module graphs owned by one runtime service.
+///
+/// A registry handle is cloned into the service's manager, isolate module
+/// loaders, and op state. Separate services always create separate registries,
+/// so graph ids and their refcounts cannot cross a service boundary.
+#[derive(Clone, Default)]
+pub(crate) struct DynamicModuleRegistry {
+    graphs: Arc<Mutex<HashMap<String, DynamicModuleGraph>>>,
+}
+
+impl DynamicModuleRegistry {
+    pub(crate) fn register_dynamic_module_graph(
+        &self,
+        entrypoint: &str,
+        modules: HashMap<String, String>,
+    ) -> Result<(String, String)> {
+        if modules.is_empty() {
+            return Err(PlatformError::bad_request(
+                "dynamic module graph must not be empty",
+            ));
+        }
+        if modules.len() > MAX_DYNAMIC_MODULE_COUNT {
+            return Err(PlatformError::bad_request(format!(
+                "dynamic module graph exceeds {MAX_DYNAMIC_MODULE_COUNT} modules"
+            )));
+        }
+
+        let mut normalized = HashMap::with_capacity(modules.len());
+        let mut total_bytes = 0usize;
+        for (path, source) in modules {
+            let path = normalize_dynamic_module_path(&path).map_err(|error| {
+                PlatformError::bad_request(format!("invalid module path: {error}"))
+            })?;
+            if source.trim().is_empty() {
+                return Err(PlatformError::bad_request(format!(
+                    "dynamic module must not be empty: {path}"
+                )));
+            }
+            let source = source.into_bytes();
+            total_bytes = total_bytes
+                .saturating_add(path.len())
+                .saturating_add(source.len());
+            if total_bytes > MAX_DYNAMIC_GRAPH_BYTES {
+                return Err(PlatformError::bad_request(format!(
+                    "dynamic module graph exceeds {MAX_DYNAMIC_GRAPH_BYTES} bytes"
+                )));
+            }
+            if normalized
+                .insert(
+                    path.clone(),
+                    RuntimeModule {
+                        kind: RuntimeModuleKind::JavaScript,
+                        code: Arc::from(source.into_boxed_slice()),
+                    },
+                )
+                .is_some()
+            {
+                return Err(PlatformError::bad_request(format!(
+                    "dynamic module graph contains duplicate normalized path: {path}"
+                )));
+            }
+        }
+        self.register_dynamic_module_graph_normalized(
+            entrypoint,
+            normalized,
+            MAX_DYNAMIC_REGISTERED_GRAPHS,
+            "dynamic module",
+        )
+    }
+
+    pub(crate) fn register_server_module_graph(
+        &self,
+        entrypoint: &str,
+        source: String,
+        server_modules: Vec<DeployServerModule>,
+    ) -> Result<(String, String)> {
+        let module_count = server_modules.len().saturating_add(1);
+        if module_count > MAX_SERVER_MODULE_COUNT {
+            return Err(PlatformError::bad_request(format!(
+                "server module graph exceeds {MAX_SERVER_MODULE_COUNT} modules"
+            )));
+        }
+
+        let mut modules = HashMap::with_capacity(module_count);
+        let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
+            PlatformError::bad_request(format!("invalid server module entrypoint: {error}"))
+        })?;
+        modules.insert(
+            entrypoint.clone(),
+            RuntimeModule {
+                kind: RuntimeModuleKind::JavaScript,
+                code: Arc::from(source.into_bytes().into_boxed_slice()),
+            },
+        );
+
+        let mut total_bytes = modules
+            .iter()
+            .map(|(path, module)| path.len().saturating_add(module.code.len()))
+            .sum::<usize>();
+        for module in server_modules {
+            let path = normalize_dynamic_module_path(&module.path).map_err(|error| {
+                PlatformError::bad_request(format!("invalid server module path: {error}"))
+            })?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(module.content_base64.as_bytes())
+                .map_err(|error| {
+                    PlatformError::bad_request(format!(
+                        "invalid server module base64 for {path}: {error}"
+                    ))
+                })?;
+            total_bytes = total_bytes
+                .saturating_add(path.len())
+                .saturating_add(bytes.len());
+            if total_bytes > MAX_SERVER_MODULE_GRAPH_BYTES {
+                return Err(PlatformError::bad_request(format!(
+                    "server module graph exceeds {MAX_SERVER_MODULE_GRAPH_BYTES} bytes"
+                )));
+            }
+            if modules
+                .insert(
+                    path.clone(),
+                    RuntimeModule {
+                        kind: server_module_kind(module.kind),
+                        code: Arc::from(bytes.into_boxed_slice()),
+                    },
+                )
+                .is_some()
+            {
+                return Err(PlatformError::bad_request(format!(
+                    "server module graph contains duplicate normalized path: {path}"
+                )));
+            }
+        }
+
+        self.register_dynamic_module_graph_normalized(
+            &entrypoint,
+            modules,
+            MAX_DYNAMIC_REGISTERED_GRAPHS,
+            "server module",
+        )
+    }
+
+    fn register_dynamic_module_graph_normalized(
+        &self,
+        entrypoint: &str,
+        normalized: HashMap<String, RuntimeModule>,
+        max_registered_graphs: usize,
+        graph_label: &str,
+    ) -> Result<(String, String)> {
+        let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
+            PlatformError::bad_request(format!("invalid module entrypoint: {error}"))
+        })?;
+        if !normalized.contains_key(&entrypoint) {
+            return Err(PlatformError::bad_request(format!(
+                "{graph_label} graph missing entrypoint module: {entrypoint}"
+            )));
+        }
+
+        let graph_id = dynamic_module_graph_id(&normalized);
+        let mut graphs = self
+            .graphs
+            .lock()
+            .expect("dynamic module graph registry mutex poisoned");
+        if let Some(graph) = graphs.get_mut(&graph_id) {
+            graph.ref_count = graph.ref_count.saturating_add(1);
+            return Ok((graph_id, entrypoint));
+        }
+        if graphs.len() >= max_registered_graphs {
+            return Err(PlatformError::bad_request(format!(
+                "dynamic module graph registry exceeds {max_registered_graphs} graphs"
+            )));
+        }
+        graphs.insert(
+            graph_id.clone(),
+            DynamicModuleGraph {
+                modules: Arc::new(normalized),
+                ref_count: 1,
+            },
+        );
+        Ok((graph_id, entrypoint))
+    }
+
+    pub(crate) fn retain(&self, graph_id: &str) -> bool {
+        let mut graphs = self
+            .graphs
+            .lock()
+            .expect("dynamic module graph registry mutex poisoned");
+        let Some(graph) = graphs.get_mut(graph_id) else {
+            return false;
+        };
+        graph.ref_count = graph.ref_count.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn release(&self, graph_id: &str) {
+        let mut graphs = self
+            .graphs
+            .lock()
+            .expect("dynamic module graph registry mutex poisoned");
+        let Some(graph) = graphs.get_mut(graph_id) else {
+            return;
+        };
+        graph.ref_count = graph.ref_count.saturating_sub(1);
+        if graph.ref_count == 0 {
+            graphs.remove(graph_id);
+        }
+    }
+
+    pub(crate) fn source(&self, graph_id: &str, module_path: &str) -> Option<String> {
+        self.module(graph_id, module_path).and_then(|module| {
+            (module.kind == RuntimeModuleKind::JavaScript)
+                .then(|| String::from_utf8(module.code.as_ref().to_vec()).ok())
+                .flatten()
+        })
+    }
+
+    pub(crate) fn module(&self, graph_id: &str, module_path: &str) -> Option<RuntimeModule> {
+        let graphs = self
+            .graphs
+            .lock()
+            .expect("dynamic module graph registry mutex poisoned");
+        graphs
+            .get(graph_id)
+            .and_then(|graph| graph.modules.get(module_path).cloned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ref_count(&self, graph_id: &str) -> Option<usize> {
+        let graphs = self
+            .graphs
+            .lock()
+            .expect("dynamic module graph registry mutex poisoned");
+        graphs.get(graph_id).map(|graph| graph.ref_count)
+    }
+}
+
+fn server_module_kind(kind: DeployServerModuleKind) -> RuntimeModuleKind {
+    match kind {
+        DeployServerModuleKind::EsModule => RuntimeModuleKind::JavaScript,
+        DeployServerModuleKind::CompiledWasm => RuntimeModuleKind::Wasm,
+        DeployServerModuleKind::Text => RuntimeModuleKind::Text,
+        DeployServerModuleKind::Data => RuntimeModuleKind::Bytes,
+        DeployServerModuleKind::Json => RuntimeModuleKind::Json,
+    }
+}
+
+pub(crate) fn normalize_dynamic_module_path(value: &str) -> std::result::Result<String, String> {
+    normalize_dynamic_module_parts(value.replace('\\', "/").split('/').map(ToOwned::to_owned))
+}
+
+pub(crate) fn resolve_dynamic_module_path(
+    referrer_path: &str,
+    specifier: &str,
+) -> std::result::Result<String, String> {
+    let specifier = specifier.trim();
+    if specifier.is_empty() {
+        return Err("dynamic module specifier must not be empty".to_string());
+    }
+    if specifier.starts_with('/') {
+        return normalize_dynamic_module_path(specifier.trim_start_matches('/'));
+    }
+    if has_url_scheme(specifier) {
+        return Err(format!(
+            "dynamic module URL imports are unsupported: {specifier}"
+        ));
+    }
+    if !specifier.starts_with("./") && !specifier.starts_with("../") {
+        return Err(format!(
+            "dynamic module bare imports are unsupported: {specifier}"
+        ));
+    }
+    let mut base = referrer_path
+        .split('/')
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let _ = base.pop();
+    base.extend(specifier.split('/').map(ToOwned::to_owned));
+    normalize_dynamic_module_parts(base)
+}
+
+fn normalize_dynamic_module_parts(
+    parts: impl IntoIterator<Item = String>,
+) -> std::result::Result<String, String> {
+    let mut out = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if out.pop().is_none() {
+                return Err("dynamic module path must not escape graph root".to_string());
+            }
+            continue;
+        }
+        out.push(part.to_string());
+    }
+    if out.is_empty() {
+        return Err("dynamic module path must not be empty".to_string());
+    }
+    Ok(out.join("/"))
+}
+
+fn has_url_scheme(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    for ch in chars {
+        if ch == ':' {
+            return true;
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.') {
+            return false;
+        }
+    }
+    false
+}
+
+fn dynamic_module_graph_id(modules: &HashMap<String, RuntimeModule>) -> String {
+    let mut hasher = Sha256::new();
+    let mut keys = modules.keys().collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        hasher.update((key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        let module = modules.get(key).expect("key came from modules map");
+        hasher.update([module_kind_tag(module.kind)]);
+        hasher.update((module.code.len() as u64).to_le_bytes());
+        hasher.update(module.code.as_ref());
+        hasher.update([0xff]);
+    }
+    hex_encode(&hasher.finalize())
+}
+
+fn module_kind_tag(kind: RuntimeModuleKind) -> u8 {
+    match kind {
+        RuntimeModuleKind::JavaScript => 0,
+        RuntimeModuleKind::Wasm => 1,
+        RuntimeModuleKind::Json => 2,
+        RuntimeModuleKind::Text => 3,
+        RuntimeModuleKind::Bytes => 4,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_module_registry_uses_stable_graph_ids_and_normalized_paths() {
+        let registry = DynamicModuleRegistry::default();
+        let (graph_id, entrypoint) = registry
+            .register_dynamic_module_graph(
+                "./worker.js",
+                HashMap::from([
+                    (
+                        "./worker.js".to_string(),
+                        "import { value } from './lib/value.js'; export default value;".to_string(),
+                    ),
+                    (
+                        "lib/./value.js".to_string(),
+                        "export const value = 7;".to_string(),
+                    ),
+                ]),
+            )
+            .expect("graph should register");
+        let (same_graph_id, same_entrypoint) = registry
+            .register_dynamic_module_graph(
+                "worker.js",
+                HashMap::from([
+                    (
+                        "lib/value.js".to_string(),
+                        "export const value = 7;".to_string(),
+                    ),
+                    (
+                        "worker.js".to_string(),
+                        "import { value } from './lib/value.js'; export default value;".to_string(),
+                    ),
+                ]),
+            )
+            .expect("same normalized graph should register");
+
+        assert_eq!(graph_id, same_graph_id);
+        assert_eq!(entrypoint, "worker.js");
+        assert_eq!(same_entrypoint, "worker.js");
+        assert_eq!(
+            registry.source(&graph_id, "lib/value.js").as_deref(),
+            Some("export const value = 7;")
+        );
+        assert_eq!(
+            resolve_dynamic_module_path("worker.js", "./lib/value.js").as_deref(),
+            Ok("lib/value.js")
+        );
+    }
+
+    #[test]
+    fn dynamic_module_paths_must_stay_inside_graph_root() {
+        let registry = DynamicModuleRegistry::default();
+        let error = registry
+            .register_dynamic_module_graph(
+                "../worker.js",
+                HashMap::from([("../worker.js".to_string(), "export default {};".to_string())]),
+            )
+            .expect_err("graph path should not escape root");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic module path must not escape graph root")
+        );
+
+        assert_eq!(
+            resolve_dynamic_module_path("worker.js", "../outside.js").unwrap_err(),
+            "dynamic module path must not escape graph root"
+        );
+    }
+
+    #[test]
+    fn dynamic_module_import_resolver_rejects_bare_specifiers() {
+        assert_eq!(
+            resolve_dynamic_module_path("worker.js", "lib/value.js").unwrap_err(),
+            "dynamic module bare imports are unsupported: lib/value.js"
+        );
+        assert_eq!(
+            resolve_dynamic_module_path("worker.js", "./lib/value.js").as_deref(),
+            Ok("lib/value.js")
+        );
+        assert_eq!(
+            resolve_dynamic_module_path("dir/worker.js", "/shared/value.js").as_deref(),
+            Ok("shared/value.js")
+        );
+    }
+
+    #[test]
+    fn dynamic_module_import_resolver_rejects_url_schemes() {
+        assert_eq!(
+            resolve_dynamic_module_path("worker.js", "https://example.com/mod.js").unwrap_err(),
+            "dynamic module URL imports are unsupported: https://example.com/mod.js"
+        );
+        assert_eq!(
+            resolve_dynamic_module_path("worker.js", "data:text/javascript,export{}").unwrap_err(),
+            "dynamic module URL imports are unsupported: data:text/javascript,export{}"
+        );
+    }
+
+    #[test]
+    fn dynamic_module_registration_enforces_graph_size_limits() {
+        let registry = DynamicModuleRegistry::default();
+        let too_many_modules = (0..=MAX_DYNAMIC_MODULE_COUNT)
+            .map(|idx| {
+                (
+                    format!("module-{idx}.js"),
+                    "export const value = 1;".to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let error = registry
+            .register_dynamic_module_graph("module-0.js", too_many_modules)
+            .expect_err("module count limit should fail");
+        assert!(error.to_string().contains("dynamic module graph exceeds"));
+        assert!(error.to_string().contains("modules"));
+
+        let error = registry
+            .register_dynamic_module_graph(
+                "worker.js",
+                HashMap::from([("worker.js".to_string(), "x".repeat(MAX_DYNAMIC_GRAPH_BYTES))]),
+            )
+            .expect_err("source byte limit should fail");
+        assert!(error.to_string().contains("dynamic module graph exceeds"));
+        assert!(error.to_string().contains("bytes"));
+    }
+
+    #[test]
+    fn dynamic_module_registration_validates_entrypoint_in_rust() {
+        let registry = DynamicModuleRegistry::default();
+        let error = registry
+            .register_dynamic_module_graph(
+                "missing.js",
+                HashMap::from([("worker.js".to_string(), "export default {};".to_string())]),
+            )
+            .expect_err("missing entrypoint should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic module graph missing entrypoint module: missing.js")
+        );
+    }
+
+    #[test]
+    fn dynamic_module_registration_rejects_duplicate_normalized_paths() {
+        let registry = DynamicModuleRegistry::default();
+        let error = registry
+            .register_dynamic_module_graph(
+                "worker.js",
+                HashMap::from([
+                    ("./worker.js".to_string(), "export default {};".to_string()),
+                    (
+                        "worker.js".to_string(),
+                        "export const duplicate = true;".to_string(),
+                    ),
+                ]),
+            )
+            .expect_err("duplicate normalized path should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dynamic module graph contains duplicate normalized path: worker.js")
+        );
+    }
+
+    #[test]
+    fn dynamic_module_graph_release_removes_unreferenced_graph() {
+        let registry = DynamicModuleRegistry::default();
+        let (graph_id, _) = registry
+            .register_dynamic_module_graph(
+                "worker.js",
+                HashMap::from([(
+                    "worker.js".to_string(),
+                    format!("export default {{ value: {:?} }};", uuid::Uuid::new_v4()),
+                )]),
+            )
+            .expect("graph should register");
+        assert_eq!(registry.ref_count(&graph_id), Some(1));
+        assert!(registry.retain(&graph_id));
+        assert_eq!(registry.ref_count(&graph_id), Some(2));
+        registry.release(&graph_id);
+        assert_eq!(registry.ref_count(&graph_id), Some(1));
+        registry.release(&graph_id);
+        assert_eq!(registry.ref_count(&graph_id), None);
+        assert_eq!(registry.source(&graph_id, "worker.js"), None);
+    }
+
+    #[test]
+    fn registries_do_not_share_graphs_or_refcounts() {
+        let first = DynamicModuleRegistry::default();
+        let second = DynamicModuleRegistry::default();
+        let (graph_id, _) = first
+            .register_dynamic_module_graph(
+                "worker.js",
+                HashMap::from([(
+                    "worker.js".to_string(),
+                    "export default { fetch() { return new Response('first'); } };".to_string(),
+                )]),
+            )
+            .expect("graph should register in first registry");
+
+        assert!(first.source(&graph_id, "worker.js").is_some());
+        assert!(second.source(&graph_id, "worker.js").is_none());
+        assert_eq!(first.ref_count(&graph_id), Some(1));
+        assert_eq!(second.ref_count(&graph_id), None);
+        assert!(!second.retain(&graph_id));
+        assert_eq!(first.ref_count(&graph_id), Some(1));
+    }
+}

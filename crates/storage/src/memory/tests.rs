@@ -16,83 +16,6 @@ mod tests {
         }
     }
 
-    async fn snapshot_value(
-        store: &MemoryStore,
-        namespace: &str,
-        memory_key: &str,
-        item_key: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        let snapshot = store.snapshot(namespace, memory_key).await?;
-        Ok(snapshot
-            .entries
-            .into_iter()
-            .find(|entry| entry.key == item_key && !entry.deleted)
-            .map(|entry| entry.value))
-    }
-
-    struct PersistedOutboxRow {
-        effect_id: String,
-        kind: String,
-        payload: Vec<u8>,
-        revision: i64,
-        status: String,
-    }
-
-    async fn persisted_outbox_rows(
-        store: &MemoryStore,
-        namespace: &str,
-        memory_key: &str,
-    ) -> Result<Vec<PersistedOutboxRow>> {
-        let conn = store.connect(namespace, memory_key).await?;
-        let mut rows = conn
-            .query(
-                "SELECT effect_id, kind, payload_blob, revision, status
-                 FROM memory_outbox
-                 WHERE entity_key = ?1
-                 ORDER BY revision, effect_id",
-                (memory_key,),
-            )
-            .await
-            .map_err(memory_error)?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next().await.map_err(memory_error)? {
-            records.push(PersistedOutboxRow {
-                effect_id: row.get::<String>(0).map_err(memory_error)?,
-                kind: row.get::<String>(1).map_err(memory_error)?,
-                payload: row.get::<Vec<u8>>(2).map_err(memory_error)?,
-                revision: row.get::<i64>(3).map_err(memory_error)?,
-                status: row.get::<String>(4).map_err(memory_error)?,
-            });
-        }
-        Ok(records)
-    }
-
-    async fn persisted_command_results(
-        store: &MemoryStore,
-        namespace: &str,
-        memory_key: &str,
-        idempotency_key: &str,
-    ) -> Result<Vec<(Vec<u8>, i64)>> {
-        let conn = store.connect(namespace, memory_key).await?;
-        let mut rows = conn
-            .query(
-                "SELECT result_blob, revision
-                 FROM memory_commands
-                 WHERE entity_key = ?1 AND idempotency_key = ?2",
-                (memory_key, idempotency_key),
-            )
-            .await
-            .map_err(memory_error)?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next().await.map_err(memory_error)? {
-            records.push((
-                row.get::<Vec<u8>>(0).map_err(memory_error)?,
-                row.get::<i64>(1).map_err(memory_error)?,
-            ));
-        }
-        Ok(records)
-    }
-
     fn same_entity_cache_stripe_key(
         store: &MemoryStore,
         namespace: &str,
@@ -661,16 +584,25 @@ mod tests {
             4,
         )
         .await?;
+        store.set_profile_enabled(true);
 
-        // Empty batches take the read-only path through the pooled reader.
-        store.apply_batch("ns", "memory-a", &[], None, &[], None).await?;
-        store.apply_batch("ns", "memory-a", &[], None, &[], None).await?;
-
-        assert_eq!(
-            store.db_live_connections.load(Ordering::Relaxed),
-            1,
-            "second read should reuse the idle pooled connection"
+        assert!(
+            store
+                .command_result("ns", "memory-a", "missing")
+                .await?
+                .is_none()
         );
+        assert!(
+            store
+                .command_result("ns", "memory-a", "missing")
+                .await?
+                .is_none()
+        );
+        let profile = store.take_profile_snapshot_and_reset();
+
+        assert_eq!(profile.store_connection_create.calls, 1);
+        assert_eq!(profile.store_connection_reuse.calls, 1);
+        assert_eq!(profile.store_connections_peak.max_us, 1);
         Ok(())
     }
 
@@ -685,6 +617,7 @@ mod tests {
             4,
         )
         .await?;
+        store.set_profile_enabled(true);
 
         store
             .apply_batch(
@@ -706,12 +639,11 @@ mod tests {
                 None,
             )
             .await?;
+        let profile = store.take_profile_snapshot_and_reset();
 
-        assert_eq!(
-            store.db_live_connections.load(Ordering::Relaxed),
-            1,
-            "second write should reuse the cached writer connection"
-        );
+        assert_eq!(profile.store_connection_create.calls, 1);
+        assert_eq!(profile.store_connection_reuse.calls, 1);
+        assert_eq!(profile.store_writer_busy_retry.calls, 0);
         Ok(())
     }
 
@@ -735,7 +667,7 @@ mod tests {
         let waiting_store = Arc::clone(&store);
         let waiting = tokio::spawn(async move {
             waiting_store
-                .apply_batch("ns", "memory-b", &[], None, &[], None)
+                .command_result("ns", "memory-b", "missing")
                 .await
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -784,9 +716,12 @@ mod tests {
             .await
             .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
         assert_eq!(
-            snapshot_value(&store, "ns", "memory-a", "count")
+            store
+                .point_read("ns", "memory-a", "count")
                 .await?
-                .expect("count should be written"),
+                .record
+                .expect("count should be written")
+                .value,
             b"1"
         );
         Ok(())
@@ -830,9 +765,12 @@ mod tests {
             .map_err(|error| PlatformError::runtime(format!("join error: {error}")))??;
         drop(writer);
         assert_eq!(
-            snapshot_value(&store, "ns", "memory-b", "count")
+            store
+                .point_read("ns", "memory-b", "count")
                 .await?
-                .expect("count should be written"),
+                .record
+                .expect("count should be written")
+                .value,
             b"1"
         );
         Ok(())
@@ -877,6 +815,7 @@ mod tests {
             4,
         )
         .await?;
+        store.set_profile_enabled(true);
         let command = MemoryCommandResultWrite {
             idempotency_key: "command-1".to_string(),
             result: b"ok".to_vec(),
@@ -902,11 +841,6 @@ mod tests {
             )
             .await;
         assert!(duplicate.is_err());
-        assert_eq!(
-            store.db_live_connections.load(Ordering::Relaxed),
-            0,
-            "failed commit must discard the poisoned writer connection"
-        );
         store
             .apply_batch(
                 "ns",
@@ -918,12 +852,15 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(
-            snapshot_value(&store, "ns", "memory-a", "count")
-                .await?
-                .expect("count should exist"),
-            b"2"
-        );
+        let point = store
+            .point_read("ns", "memory-a", "count")
+            .await?
+            .record
+            .expect("count should exist");
+        assert_eq!(point.value, b"2");
+        let profile = store.take_profile_snapshot_and_reset();
+        assert_eq!(profile.store_connection_discard.calls, 1);
+        assert!(profile.store_connection_create.calls >= 2);
         Ok(())
     }
 
@@ -1047,6 +984,36 @@ mod tests {
         );
         assert_eq!(cache.snapshot_entries, 1);
         assert_eq!(cache.version_entries, 1);
+        assert_eq!(store.cache_performance_snapshot().snapshot_evictions, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_cache_performance_totals_are_recorded_without_profiling() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("snapshot-performance-totals"),
+            1,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+
+        store.snapshot("ns", "memory-a").await?;
+        store.snapshot("ns", "memory-a").await?;
+
+        let metrics = store.cache_performance_snapshot();
+        assert_eq!(metrics.snapshot_misses, 1);
+        assert_eq!(metrics.snapshot_hits, 1);
         Ok(())
     }
 
@@ -1208,10 +1175,9 @@ mod tests {
         std::fs::remove_file(memory_layout_manifest_path(&root)).map_err(memory_error)?;
 
         let store = MemoryStore::new(root.clone(), 4, 4, Duration::from_secs(60)).await?;
+        let point = store.point_read("ns", "memory-a", "count").await?;
         assert_eq!(
-            snapshot_value(&store, "ns", "memory-a", "count")
-                .await?
-                .expect("record should survive adoption"),
+            point.record.expect("record should survive adoption").value,
             b"1"
         );
         assert_eq!(
@@ -1241,11 +1207,16 @@ mod tests {
             manifest.namespace_shard_hash_versions.get("ns").copied(),
             Some(LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION)
         );
-        assert_eq!(store.shard_index("ns", &memory_key), expected_legacy_shard);
         assert_eq!(
-            snapshot_value(&store, "ns", &memory_key, "count")
-                .await?
-                .expect("legacy state should remain readable"),
+            store.shard_index_for_key("ns", &memory_key),
+            expected_legacy_shard
+        );
+        let point = store.point_read("ns", &memory_key, "count").await?;
+        assert_eq!(
+            point
+                .record
+                .expect("legacy state should remain readable")
+                .value,
             b"1"
         );
         Ok(())
@@ -1268,7 +1239,7 @@ mod tests {
             )
             .await?;
         assert_eq!(
-            stable_store.shard_index("AUTH_STATE", &stable_key),
+            stable_store.shard_index_for_key("AUTH_STATE", &stable_key),
             stable_shard
         );
         assert_ne!(legacy_shard_for_stable_key, stable_shard);
@@ -1307,18 +1278,30 @@ mod tests {
                 .namespace_shard_hash_versions
                 .contains_key("AUTH_STATE")
         );
-        assert_eq!(store.shard_index("AUTH_STATE", &stable_key), stable_shard);
-        assert_eq!(store.shard_index("CHAT_ROOM", &legacy_key), legacy_shard);
         assert_eq!(
-            snapshot_value(&store, "AUTH_STATE", &stable_key, "token")
+            store.shard_index_for_key("AUTH_STATE", &stable_key),
+            stable_shard
+        );
+        assert_eq!(
+            store.shard_index_for_key("CHAT_ROOM", &legacy_key),
+            legacy_shard
+        );
+        assert_eq!(
+            store
+                .point_read("AUTH_STATE", &stable_key, "token")
                 .await?
-                .expect("stable namespace state should remain readable"),
+                .record
+                .expect("stable namespace state should remain readable")
+                .value,
             b"stable"
         );
         assert_eq!(
-            snapshot_value(&store, "CHAT_ROOM", &legacy_key, "count")
+            store
+                .point_read("CHAT_ROOM", &legacy_key, "count")
                 .await?
-                .expect("legacy namespace state should remain readable"),
+                .record
+                .expect("legacy namespace state should remain readable")
+                .value,
             b"legacy"
         );
         Ok(())
@@ -1353,19 +1336,22 @@ mod tests {
             Some(physical_shard)
         );
         assert_eq!(
-            store.shard_index("EXAMPLE_MEMORY", &memory_key),
+            store.shard_index_for_key("EXAMPLE_MEMORY", &memory_key),
             physical_shard
         );
         assert_eq!(
-            snapshot_value(&store, "EXAMPLE_MEMORY", &memory_key, "count")
+            store
+                .point_read("EXAMPLE_MEMORY", &memory_key, "count")
                 .await?
-                .expect("physically routed state should remain readable"),
+                .record
+                .expect("physically routed state should remain readable")
+                .value,
             b"physical"
         );
 
         let new_key = "new-example-memory-key";
         assert_eq!(
-            store.shard_index("EXAMPLE_MEMORY", new_key),
+            store.shard_index_for_key("EXAMPLE_MEMORY", new_key),
             stable_memory_shard_index(new_key, 16)
         );
         Ok(())
@@ -1411,13 +1397,16 @@ mod tests {
             Some(second_shard)
         );
         assert_eq!(
-            store.shard_index("EXAMPLE_MEMORY", &memory_key),
+            store.shard_index_for_key("EXAMPLE_MEMORY", &memory_key),
             second_shard
         );
         assert_eq!(
-            snapshot_value(&store, "EXAMPLE_MEMORY", &memory_key, "count")
+            store
+                .point_read("EXAMPLE_MEMORY", &memory_key, "count")
                 .await?
-                .expect("newest duplicate physical shard should remain readable"),
+                .record
+                .expect("newest duplicate physical shard should remain readable")
+                .value,
             b"two"
         );
         Ok(())
@@ -1561,6 +1550,31 @@ mod tests {
             String::from_utf8(snapshot.entries[0].value.clone()).expect("utf8"),
             "1"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_version_if_newer_observes_commits() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("version-if-newer"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        assert_eq!(store.version_if_newer("ns", "memory-a", -1).await?, None);
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+        assert_eq!(store.version_if_newer("ns", "memory-a", -1).await?, Some(1));
+        assert_eq!(store.version_if_newer("ns", "memory-a", 1).await?, None);
         Ok(())
     }
 
@@ -1749,11 +1763,12 @@ mod tests {
             .await?,
             43
         );
-        drop(conn);
-        let value = snapshot_value(&store, "ns", "memory-a", "count")
+        let point = store
+            .point_read("ns", "memory-a", "count")
             .await?
+            .record
             .expect("count should remain committed by current owner");
-        assert_eq!(String::from_utf8(value).expect("utf8"), "2");
+        assert_eq!(String::from_utf8(point.value).expect("utf8"), "2");
         Ok(())
     }
 
@@ -1782,10 +1797,12 @@ mod tests {
             .await?;
         assert_eq!(result.max_version, 1);
 
-        let persisted = persisted_command_results(&store, "ns", "memory-a", "command-1").await?;
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].0, b"ok");
-        assert_eq!(persisted[0].1, result.max_version);
+        let cached = store
+            .command_result("ns", "memory-a", "command-1")
+            .await?
+            .expect("command result should be persisted with the commit");
+        assert_eq!(cached.result, b"ok");
+        assert_eq!(cached.revision, result.max_version);
 
         let duplicate = store
             .apply_batch(
@@ -1812,14 +1829,17 @@ mod tests {
                     .contains("constraint"),
             "{duplicate}"
         );
-        let value = snapshot_value(&store, "ns", "memory-a", "count")
+        let point = store
+            .point_read("ns", "memory-a", "count")
             .await?
+            .record
             .expect("count should remain from original command");
-        assert_eq!(String::from_utf8(value).expect("utf8"), "1");
-        let after_duplicate =
-            persisted_command_results(&store, "ns", "memory-a", "command-1").await?;
-        assert_eq!(after_duplicate.len(), 1);
-        assert_eq!(after_duplicate[0].0, b"ok");
+        assert_eq!(String::from_utf8(point.value).expect("utf8"), "1");
+        let cached_after_duplicate = store
+            .command_result("ns", "memory-a", "command-1")
+            .await?
+            .expect("original command result should remain");
+        assert_eq!(cached_after_duplicate.result, b"ok");
 
         store
             .apply_batch(
@@ -1853,9 +1873,10 @@ mod tests {
             "{stale}"
         );
         assert!(
-            persisted_command_results(&store, "ns", "memory-a", "command-2")
+            store
+                .command_result("ns", "memory-a", "command-2")
                 .await?
-                .is_empty(),
+                .is_none(),
             "failed memory commit must not persist a command result",
         );
         Ok(())
@@ -1886,7 +1907,7 @@ mod tests {
             .await?;
         assert_eq!(result.max_version, 1);
 
-        let outbox = persisted_outbox_rows(&store, "ns", "memory-a").await?;
+        let outbox = store.outbox_records("ns", "memory-a").await?;
         assert_eq!(outbox.len(), 1);
         assert_eq!(outbox[0].kind, "audit.created");
         assert_eq!(outbox[0].payload, br#"{"count":1}"#);
@@ -1952,7 +1973,7 @@ mod tests {
             "{stale}"
         );
 
-        let outbox = persisted_outbox_rows(&store, "ns", "memory-a").await?;
+        let outbox = store.outbox_records("ns", "memory-a").await?;
         assert_eq!(outbox.len(), 2);
         assert_eq!(outbox[1].kind, "audit.effect-only");
         assert_eq!(outbox[1].revision, effect_only.max_version);
@@ -1968,6 +1989,206 @@ mod tests {
                 },
             )
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_outbox_claims_marks_and_retries_due_effects() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("transactional-outbox-claim"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        for (idx, kind) in ["effect.one", "effect.two", "effect.three"]
+            .into_iter()
+            .enumerate()
+        {
+            let result = store
+                .apply_batch(
+                    "ns",
+                    "memory-a",
+                    &[],
+                    None,
+                    &[MemoryOutboxEffectWrite {
+                        kind: kind.to_string(),
+                        payload: kind.as_bytes().to_vec(),
+                    }],
+                    None,
+                )
+                .await?;
+            assert_eq!(result.max_version, idx as i64 + 1);
+        }
+
+        let claimed = store
+            .claim_outbox_records("ns", "memory-a", 2, Duration::from_secs(60))
+            .await?;
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].kind, "effect.one");
+        assert_eq!(claimed[1].kind, "effect.two");
+        assert_eq!(claimed[0].attempt_count, 1);
+        assert_eq!(claimed[1].attempt_count, 1);
+        assert_eq!(claimed[0].status, "inflight");
+
+        let next_claim = store
+            .claim_outbox_records("ns", "memory-a", 10, Duration::from_secs(60))
+            .await?;
+        assert_eq!(next_claim.len(), 1);
+        assert_eq!(next_claim[0].kind, "effect.three");
+
+        store
+            .mark_outbox_delivered("ns", "memory-a", &claimed[0].effect_id)
+            .await?;
+        store
+            .mark_outbox_delivered("ns", "memory-a", &next_claim[0].effect_id)
+            .await?;
+        store
+            .retry_outbox_record(
+                "ns",
+                "memory-a",
+                &claimed[1].effect_id,
+                Duration::from_secs(60),
+            )
+            .await?;
+
+        let no_due = store
+            .claim_outbox_records("ns", "memory-a", 10, Duration::from_secs(60))
+            .await?;
+        assert!(no_due.is_empty());
+
+        store
+            .retry_outbox_record("ns", "memory-a", &claimed[1].effect_id, Duration::ZERO)
+            .await?;
+        let retry = store
+            .claim_outbox_records("ns", "memory-a", 10, Duration::from_secs(60))
+            .await?;
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].kind, "effect.two");
+        assert_eq!(retry[0].attempt_count, 2);
+        store
+            .mark_outbox_delivered("ns", "memory-a", &retry[0].effect_id)
+            .await?;
+
+        let records = store.outbox_records("ns", "memory-a").await?;
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.status == "delivered"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_outbox_global_claim_filters_supported_effects() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("transactional-outbox-global-claim"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        for (namespace, memory_key, kind) in [
+            ("ns-a", "memory-a", "socket.send"),
+            ("ns-a", "memory-b", "audit.created"),
+            ("ns-b", "memory-c", "transport.close"),
+        ] {
+            store
+                .apply_batch(
+                    namespace,
+                    memory_key,
+                    &[],
+                    None,
+                    &[MemoryOutboxEffectWrite {
+                        kind: kind.to_string(),
+                        payload: br#"{"handle":"h"}"#.to_vec(),
+                    }],
+                    None,
+                )
+                .await?;
+        }
+
+        let mut claims = store
+            .claim_due_outbox_records(
+                10,
+                Duration::from_secs(60),
+                &["socket.send", "transport.close"],
+            )
+            .await?;
+        claims.sort_by(|a, b| {
+            (a.namespace.as_str(), a.memory_key.as_str())
+                .cmp(&(b.namespace.as_str(), b.memory_key.as_str()))
+        });
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].namespace, "ns-a");
+        assert_eq!(claims[0].memory_key, "memory-a");
+        assert_eq!(claims[0].record.kind, "socket.send");
+        assert_eq!(claims[1].namespace, "ns-b");
+        assert_eq!(claims[1].memory_key, "memory-c");
+        assert_eq!(claims[1].record.kind, "transport.close");
+
+        let no_due = store
+            .claim_due_outbox_records(
+                10,
+                Duration::from_secs(60),
+                &["socket.send", "transport.close"],
+            )
+            .await?;
+        assert!(no_due.is_empty());
+
+        let audit = store.outbox_records("ns-a", "memory-b").await?;
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].kind, "audit.created");
+        assert_eq!(audit[0].status, "pending");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_outbox_global_claim_supports_prefix_kinds() -> Result<()> {
+        let store = MemoryStore::new(
+            temp_root("transactional-outbox-prefix-claim"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        for (namespace, memory_key, kind) in [
+            ("ns-a", "memory-a", "audit.created"),
+            ("ns-a", "memory-b", "audit.updated"),
+            ("ns-b", "memory-c", "trace.request"),
+            ("ns-b", "memory-d", "effect.unsupported"),
+        ] {
+            store
+                .apply_batch(
+                    namespace,
+                    memory_key,
+                    &[],
+                    None,
+                    &[MemoryOutboxEffectWrite {
+                        kind: kind.to_string(),
+                        payload: kind.as_bytes().to_vec(),
+                    }],
+                    None,
+                )
+                .await?;
+        }
+
+        let mut claims = store
+            .claim_due_outbox_records(10, Duration::from_secs(60), &["audit.*", "trace.*"])
+            .await?;
+        claims.sort_by(|a, b| {
+            (a.namespace.as_str(), a.memory_key.as_str())
+                .cmp(&(b.namespace.as_str(), b.memory_key.as_str()))
+        });
+        assert_eq!(claims.len(), 3);
+        assert_eq!(claims[0].record.kind, "audit.created");
+        assert_eq!(claims[1].record.kind, "audit.updated");
+        assert_eq!(claims[2].record.kind, "trace.request");
+
+        let unsupported = store.outbox_records("ns-b", "memory-d").await?;
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].kind, "effect.unsupported");
+        assert_eq!(unsupported[0].status, "pending");
         Ok(())
     }
 
@@ -2014,6 +2235,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_point_read_populates_partial_shared_cache_and_tracks_misses() -> Result<()> {
+        let mut store = MemoryStore::new(
+            temp_root("point-read-cache"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
+
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+
+        let hit = store.point_read("ns", "memory-a", "count").await?;
+        assert_eq!(hit.max_version, 1);
+        assert_eq!(
+            String::from_utf8(
+                hit.record
+                    .as_ref()
+                    .expect("count record should be present")
+                    .value
+                    .clone()
+            )
+            .expect("utf8"),
+            "1"
+        );
+
+        {
+            let entry = store
+                .cached_snapshot_entry("ns", "memory-a")
+                .await
+                .expect("shared cache entry should exist");
+            assert!(!entry.complete);
+            assert!(entry.loaded_keys.contains("count"));
+            assert!(entry.records.contains_key("count"));
+        }
+
+        let miss = store.point_read("ns", "memory-a", "missing").await?;
+        assert_eq!(miss.max_version, 1);
+        assert!(miss.record.is_none());
+
+        let entry = store
+            .cached_snapshot_entry("ns", "memory-a")
+            .await
+            .expect("shared cache entry should exist");
+        assert!(entry.loaded_keys.contains("missing"));
+        assert!(!entry.records.contains_key("missing"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_point_read_cache_updates_after_commit() -> Result<()> {
+        let mut store = MemoryStore::new(
+            temp_root("point-read-commit"),
+            16,
+            4,
+            Duration::from_secs(60),
+        )
+        .await?;
+        enable_one_snapshot_slot_per_entity_stripe(&mut store);
+
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "1")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+        let first = store.point_read("ns", "memory-a", "count").await?;
+        assert_eq!(first.max_version, 1);
+
+        store
+            .apply_batch(
+                "ns",
+                "memory-a",
+                &[utf8_mutation("count", "2")],
+                None,
+                &[],
+                None,
+            )
+            .await?;
+
+        let updated = store.point_read("ns", "memory-a", "count").await?;
+        assert_eq!(updated.max_version, 2);
+        assert_eq!(
+            String::from_utf8(
+                updated
+                    .record
+                    .as_ref()
+                    .expect("count record should still be present")
+                    .value
+                    .clone()
+            )
+            .expect("utf8"),
+            "2"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn memory_transactional_writes_complete_past_repeated_commit_threshold() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
             let store = MemoryStore::new(
@@ -2038,10 +2370,17 @@ mod tests {
                     .await?;
             }
 
-            let final_value = snapshot_value(&store, "ns", "memory-a", "count")
-                .await?
-                .expect("count should be present after repeated transactional writes");
-            assert_eq!(String::from_utf8(final_value).expect("utf8"), "64");
+            let final_value = store.point_read("ns", "memory-a", "count").await?;
+            assert_eq!(
+                String::from_utf8(
+                    final_value
+                        .record
+                        .expect("count should be present after repeated transactional writes")
+                        .value
+                )
+                .expect("utf8"),
+                "64"
+            );
             Ok::<(), PlatformError>(())
         })
         .await

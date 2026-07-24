@@ -1,0 +1,21 @@
+{
+  "name": "@mewhhaha/dd",
+  "version": "0.1.0",
+  "description": "Platform selector for the dd dev runtime binary",
+  "main": "./index.cjs",
+  "exports": {
+    ".": "./index.cjs"
+  },
+  "files": [
+    "index.cjs",
+    "README.md",
+    "package.json"
+  ],
+  "optionalDependencies": {
+    "@mewhhaha/dd-darwin-arm64": "workspace:0.1.0",
+    "@mewhhaha/dd-darwin-x64": "workspace:0.1.0",
+    "@mewhhaha/dd-linux-arm64": "workspace:0.1.0",
+    "@mewhhaha/dd-linux-x64": "workspace:0.1.0",
+    "@mewhhaha/dd-win32-x64": "workspace:0.1.0"
+  }
+}

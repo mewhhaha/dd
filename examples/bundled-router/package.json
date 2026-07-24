@@ -1,0 +1,13 @@
+{
+  "name": "dd-bundled-router-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsdown src/worker.ts --format esm --target esnext --out-dir dist --clean",
+    "watch": "tsdown src/worker.ts --format esm --target esnext --out-dir dist --watch"
+  },
+  "devDependencies": {
+    "tsdown": "^0.22.4",
+    "typescript": "^7.0.2"
+  }
+}

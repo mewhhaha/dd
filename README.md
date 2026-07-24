@@ -1,132 +1,352 @@
 # dd
 
-`dd` is a single-node worker platform in Rust. Workers are written in
-TypeScript, compiled ahead of time to WebAssembly by
-[Perry](https://github.com/PerryTS/perry), and executed in wasmtime against a
-native host runtime — there is no JavaScript engine in the loop. It is
-inspired by Cloudflare Workers, aimed at "run Cloudflare-like workers on one
-machine with disk-backed storage" rather than "managed global edge platform."
+`dd` is single-node worker runtime in Rust with Deno-backed isolates. It is inspired by Cloudflare Workers and Durable Objects, but aimed at "run Cloudflare-like workers on one machine with disk-backed storage" rather than "managed global edge platform."
 
-Public traffic is routed by host name, so `hello.example.com` maps to worker
-`hello`. State lives on disk (turso). For coordination, `dd` uses keyed
-memory namespaces as durable single-writer actors: shard state by key, run
-atomic commands once for that key, and commit state on completion. KV covers
-simple persistence, a worker-scoped cache covers response reuse, websockets
-cover live connections, and service bindings let workers call each other.
+Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. State lives on disk. For coordination, `dd` does not use Durable Objects as the public model. It uses keyed memory namespaces as durable single-writer actors: shard state by key, run `atomic(...)` commands once for that key, and commit state plus effects through durable storage.
+
+Worker shape stays familiar: `fetch(request, env, ctx)` plus worker bindings. KV handles simple persistence, Cache API handles response reuse, and memory namespaces handle shardable coordination.
 
 ## Quickstart
 
+Private control plane uses bearer auth. CLI reads `DD_PRIVATE_TOKEN` automatically.
+
 ```bash
-npm install -g @perryts/perry     # the TypeScript -> wasm compiler
-cargo run -p runtime --bin dd_server
+export DD_PRIVATE_TOKEN=dev-token
+cargo run -p dd_server
 ```
 
 In another shell:
 
 ```bash
-cargo run -p cli --bin dd -- deploy hello examples/hello.ts --public
-cargo run -p cli --bin dd -- invoke hello --path /
+export DD_PRIVATE_TOKEN=dev-token
+cargo run -p cli -- --server http://127.0.0.1:8081 deploy hello examples/hello.js --public
+cargo run -p cli -- --server http://127.0.0.1:8081 invoke hello --method GET --path /
 curl -H 'host: hello.example.com' http://127.0.0.1:8080/
 ```
 
-`dd deploy` compiles TypeScript through Perry and uploads the wasm; a
-prebuilt `.wasm` module is accepted directly. Default ports are `8080` for
-public traffic and `8081` for the private control plane. Set
-`DD_PRIVATE_TOKEN` to require bearer auth on the private API. Deployed
-workers persist under the store directory and reload on restart.
+Add `--temporary` to deploy a worker that expires one hour after deployment.
+Redeploying the same temporary worker with `--temporary` refreshes the hour;
+redeploying it without `--temporary` makes it permanent. Deploying
+`--temporary` over an already permanent worker is rejected.
 
-## Worker shape
+Default ports for `cargo run -p dd_server` are `8080` for public traffic and `8081` for private deploy/invoke traffic.
 
-Workers reach the platform through plain `declare function` statements —
-Perry compiles each into a host import:
+Project deploy settings can live in `dd.json`:
 
-```ts
-declare function dd_register(
-  fetchHandler: (method: string, url: string, body: string) => unknown,
-): void;
-declare function dd_json(value: unknown): string;
-
-dd_register((method, url, body) => ({
-  status: 200,
-  headers: { "content-type": "application/json" },
-  body: dd_json({ hello: new URL(url).pathname }),
-}));
+```json
+{
+  "$schema": "./schema/dd.schema.json",
+  "schema_version": 1,
+  "name": "hello",
+  "entrypoint": "examples/hello.js",
+  "base_url": "https://your-dd-app.fly.dev",
+  "config": { "public": true }
+}
 ```
 
-The full host surface — KV, memory namespaces, cache, outbound fetch,
-service bindings, websockets, request headers — is documented in
-[docs/wasm-runtime.md](docs/wasm-runtime.md), together with the execution
-model and current limitations. Working examples for every feature live in
-[examples/](examples), exercised end to end by `just smoke-examples`.
+Configuration schema version `1` is required. Unknown fields are rejected;
+editors can use [schema/dd.schema.json](schema/dd.schema.json) for validation and completion.
+
+`base_url` is non-secret. Store deploy tokens in the OS credential store:
+
+```bash
+cargo run -p cli -- auth login
+cargo run -p cli -- deploy-config dist/dd.deploy.json
+```
+
+CLI server precedence is `--server`, `DD_SERVER`, config `base_url`, then the
+local private default.
+
+Workers are private unless `config.public` is `true`. A private worker can still
+be called from another worker with a service binding:
+
+```json
+{
+  "schema_version": 1,
+  "name": "frontend",
+  "entrypoint": "worker.js",
+  "config": {
+    "public": true,
+    "bindings": [
+      { "type": "service", "binding": "AUTH", "service": "auth-worker" }
+    ]
+  }
+}
+```
+
+```js
+export default {
+  async fetch(request, env) {
+    return env.AUTH.fetch(new URL("/session", request.url));
+  },
+};
+```
 
 ## Memory namespaces
 
-The main coordination primitive. Pick a key, run an atomic command against
-it: commands for one key are serialized, and tvar writes commit together
-with the command's completion.
+Memory namespace is the main coordination primitive. You pick a key, get the coordinator for that key, and run a synchronous `atomic(...)` command against it. Commands for one key are ordered, the callback runs once, and state plus emitted effects commit together.
 
-```ts
-declare function dd_memory_atomic(
-  binding: string, key: string, command: () => unknown,
-): any;
-declare function dd_tvar_read(name: string): any;
-declare function dd_tvar_write(name: string, value: unknown): void;
+Deploy with memory binding:
 
-const count = dd_memory_atomic("COUNTERS", user, () => {
-  const current = dd_tvar_read("count");
-  const next = (current === undefined || current === null ? 0 : current) + 1;
-  dd_tvar_write("count", next);
-  return next;
-});
+```bash
+cargo run -p cli -- --server http://127.0.0.1:8081 \
+  deploy counter worker.js --memory-binding COUNTERS
 ```
 
-See [examples/memory-counter.ts](examples/memory-counter.ts).
+Worker:
 
-## KV, cache, websockets, services
+```js
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const user = url.searchParams.get("user") ?? "anonymous";
+    const memory = env.COUNTERS.get(env.COUNTERS.idFromName(user));
+    const count = memory.tvar("count", 0);
 
-- **KV** (`dd_kv_get/set/delete/list`): write-last key/value persistence,
-  scoped per worker and binding — [examples/kv-counter.ts](examples/kv-counter.ts)
-- **Cache** (`dd_cache_match/put/delete`): worker-scoped response reuse
-  honoring `cache-control` — [examples/cache.ts](examples/cache.ts)
-- **Websockets** (`dd_ws_register/send/close`): callback handlers on one
-  dedicated instance per worker, sends from any handler —
-  [examples/chat.ts](examples/chat.ts)
-- **Service bindings** (`dd_service_fetch`): call co-deployed workers by
-  binding — [examples/router.ts](examples/router.ts) +
-  [examples/auth.ts](examples/auth.ts)
-- **Outbound fetch**: native `fetch(url).then(...)` promise chains plus a
-  synchronous `dd_fetch` — [examples/proxy.ts](examples/proxy.ts)
+    if (request.method === "POST") {
+      const next = await memory.atomic(() => {
+        const value = Number(count.read()) + 1;
+        count.write(value);
+        return value;
+      });
+      return Response.json({ user, count: next });
+    }
 
-Static assets are served before worker code runs via `--assets-dir`.
+    const current = await memory.atomic(() => Number(count.read()) || 0);
+    return Response.json({ user, count: current });
+  },
+};
+```
+
+This is the closest thing to Durable Objects, but the model is different. You are not instantiating a long-lived object class with a special lifecycle. You are sending ordered commands to a durable keyed coordinator.
+
+## KV
+
+KV is for simpler key/value storage where you do not need shard-local coordination.
+
+Deploy with KV binding:
+
+```bash
+cargo run -p cli -- --server http://127.0.0.1:8081 \
+  deploy kv worker.js --kv-binding MY_KV
+```
+
+Worker:
+
+```js
+export default {
+  async fetch(_request, env) {
+    const current = Number((await env.MY_KV.get("hits")) ?? "0") || 0;
+    const next = current + 1;
+    await env.MY_KV.set("hits", String(next));
+
+    return new Response(`hits=${next}`, {
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  },
+};
+```
+
+## Cache API
+
+Cache API looks like worker-style response cache. Good for HTTP response reuse, not coordination. Cache namespaces are isolated per worker.
+
+The platform front cache is separate and opt-in. Set `config.cache.enabled` in `dd.json`/the deployment document, or pass `dd deploy --cache`. It caches only unauthenticated `GET`/`HEAD` responses that explicitly include `Cache-Control: public` and a positive `s-maxage` or `max-age`; `stale-while-revalidate` refreshes stale entries in the background.
+
+```json
+{
+  "config": {
+    "public": true,
+    "cache": { "enabled": true }
+  }
+}
+```
+
+Worker:
+
+```js
+export default {
+  async fetch(request) {
+    const cache = caches.default;
+    const key = new Request(request.url, { method: "GET" });
+    const cached = await cache.match(key);
+    if (cached) {
+      return cached;
+    }
+
+    const response = new Response("fresh response", {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "public, max-age=60",
+      },
+    });
+
+    await cache.put(key, response.clone());
+    return response;
+  },
+};
+```
+
+## Dynamic workers and assets
+
+Workers can create other workers with `env.SANDBOX.get/list/delete`. Dynamic workers run in separate Deno isolates inside same process, so they fit buggy or semi-hostile agent code that should not share parent runtime state. That is runtime isolation and containment, not OS process, VM, or container sandboxing.
+
+Default child policy is deny-first. No outbound fetch, no host RPC, no websocket/transport upgrade, no cache access unless child opts in:
+
+```js
+const child = await env.SANDBOX.get("agent:v1", async () => ({
+  entrypoint: "worker.js",
+  modules: {
+    "worker.js": `
+      export default {
+        async fetch(request) {
+          return new Response("ok");
+        },
+      };
+    `,
+  },
+  egress_allow_hosts: ["api.openai.com"],
+  max_request_bytes: 1_048_576,
+  max_response_bytes: 2_097_152,
+  max_outbound_requests: 8,
+  max_concurrency: 8,
+  timeout: 2_500,
+}));
+```
+
+Literal loopback, private, link-local, metadata, multicast, and documentation addresses are rejected even when listed. A trusted administrator can explicitly allow a private literal for local infrastructure with the `private:` prefix, for example `private:127.0.0.1:8080`; do not expose that capability to untrusted child configuration.
+
+If child needs parent callback, opt in explicitly:
+
+```js
+const child = await env.SANDBOX.get("preview:v1", async () => ({
+  entrypoint: "worker.js",
+  modules: previewModules(),
+  allow_host_rpc: true,
+  env: { PREVIEW: new PreviewControl("preview:v1") },
+  timeout: 3_000,
+}));
+```
+
+See [examples/dynamic-namespace.js](examples/dynamic-namespace.js), [examples/preview-dynamic.js](examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](examples/llm-dynamic-exec.js).
+
+Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](examples/static-assets-site).
+
+Chat app example combines memory namespace, websockets, and deploy-time assets in [examples/chat-worker](examples/chat-worker).
+
+## Vite and Vitest dev mode
+
+Workers can be tested and developed against the native runtime without starting
+`dd_server`. The dev package in [packages/dd-vite](packages/dd-vite) launches
+`dd_dev_runtime` over stdio, deploys worker source into `RuntimeService`, and
+invokes it directly from Vitest helpers or a Vite plugin.
+
+This is the debug/dev path where `eval` and `new Function` are allowed. It is
+not a production control plane.
+
+`@mewhhaha/vite-plugin-dd` can use `@mewhhaha/dd`, a small wrapper with platform-specific optional
+runtime packages, so installs pull only the binary for the current OS/CPU.
+
+The Vite plugin uses Vite's Environment API shape and preserves normal Vite HMR;
+hot updates invalidate the deployed worker and rebuild it lazily on the next
+worker request. Framework integrations use subpath presets such as
+`@mewhhaha/vite-plugin-dd/react-router` and
+`@mewhhaha/vite-plugin-dd/react-router-rsc`.
+
+During `vite build`, the plugin emits `dist/dd.deploy.json` and a bundled
+`dist/worker.js`. The generated config keeps the deploy fields the CLI consumes
+while pointing at the bundled worker and Vite output assets.
+
+`@mewhhaha/vite-plugin-dd` has a default plugin export, so configs can use any local name:
+`import dd from "@mewhhaha/vite-plugin-dd"`. By default it reads `dd.json` from the nearest
+package root for the worker name, source entrypoint, and deploy config; inline
+plugin options override that file.
+
+See [docs/development.md](docs/development.md#vite-and-vitest-worker-development).
+
+## Perry wasm runtime (experiment)
+
+`crates/wasm-host` is an experimental alternative runtime with no JS engine:
+workers are TypeScript compiled to WebAssembly by
+[Perry](https://github.com/PerryTS/perry), executed in wasmtime against a
+native Rust implementation of Perry's runtime ABI. Workers register a fetch
+handler through a small `declare function` host API and are served by
+`dd_wasm_server`. See
+[docs/perry-wasm-experiment.md](docs/perry-wasm-experiment.md) for the
+contract and current limitations.
 
 ## How to think about it
 
-If you want "Cloudflare-style worker runtime on one box," `dd` is that
-shape — with ahead-of-time compiled workers, microsecond-scale per-request
-dispatch, and a ~31 MB server binary instead of an embedded JS engine.
+If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.
 
-If you want "Durable Objects, but expressed as disk-backed keyed actors
-instead of object instances," memory namespaces are that shape.
+If you want "Durable Objects, but expressed as disk-backed keyed actors instead of object instances," memory namespaces are that shape.
+
+If you want one app process you can deploy to Fly or another VM and then load with named workers, `dd_server` is that shape.
 
 ## Fly
 
-Fly runs one `dd_server` app process; workers are deployed into it.
+Fly runs one `dd_server` app process. Workers are deployed into that app; they are not separate Fly apps.
 
-1. deploy the container with `just fly-deploy <app>`
-2. open the private tunnel with `just fly-proxy <app>`
-3. deploy workers with `just fly-worker-deploy <name> <file.ts> --public`
+Canonical flow:
+
+1. deploy app/container with `flyctl deploy`
+2. open private tunnel with `just fly-proxy <app>`
+3. mint a scoped token with `just fly-worker-mint-token ...`
+4. deploy through the public endpoint with `DD_TOKEN`
+
+The private admin resource `/v1/admin/tokens` creates, lists, reads, and deletes
+bearer tokens with explicit capabilities: worker names, public/private deploy
+permission, allowed bindings, internal trace permission, source and asset size
+limits, optional expiry, and optional max uses. Token names are unique
+lowercase, dash-delimited ids, so `my-token-at-home` is the value used later for
+listing, reading, and deletion. Public `POST /v1/deploy` accepts those scoped
+tokens, so GitHub Actions can deploy one worker without carrying the private
+control-plane secret. Locally, `dd auth login` stores that deploy token in the
+OS credential store, scoped by the resolved `base_url`.
 
 Full guide: [deploy/fly/README.md](deploy/fly/README.md)
 
-## Benchmarks and contributing
+## Benchmarks and docs
+
+Runtime benchmark:
 
 ```bash
-just bench            # worker invoke throughput/latency
-just check            # fmt, clippy, tests — the CI path
-just smoke-examples   # deploy + exercise every example locally
+cargo run -p runtime --bin bench --release
 ```
 
-Contributor notes live in [docs/development.md](docs/development.md).
+Real HTTP/1 server benchmark (uncached and warmed front-cache traffic):
+
+```bash
+cargo run -p dd_server --bin bench_http_server --release
+```
+
+Keyed memory benchmark:
+
+```bash
+cargo run -p runtime --bin bench_memory_storage --release
+```
+
+Benchmark configurations and reproducible measurement instructions live in
+[benchmarks/README.md](benchmarks/README.md). Contributor/dev notes live in
+[docs/development.md](docs/development.md).
+
+## Reproducible reports
+
+Distribution artifacts use the `dist` Cargo profile. Generate full and lean
+server reports with:
+
+```bash
+just server-full
+just server-lean
+just size-report-all
+```
+
+Reports are dated and stored below
+`target/size-report/<git-sha>/dist/<variant>/`, tying every measurement to the
+exact source commit. Benchmark commands and the same commit-addressed result
+format are documented in [benchmarks/README.md](benchmarks/README.md), while
+binary-size methodology lives in
+[docs/binary-size-report.md](docs/binary-size-report.md).
 
 ## License
 

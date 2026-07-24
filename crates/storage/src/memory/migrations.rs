@@ -157,15 +157,24 @@ async fn migrate_existing_memory_databases(root_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn detect_memory_version_floors(
+struct MemoryDurabilityFloors {
+    version_floors: Vec<u64>,
+    owner_epoch_floor: u64,
+}
+
+async fn detect_memory_floors(
     root_dir: &Path,
     namespace_shards: usize,
-) -> Result<Vec<u64>> {
+) -> Result<MemoryDurabilityFloors> {
     let mut max_versions = vec![0u64; namespace_shards];
+    let mut max_owner_epoch = 0u64;
     let entries = match std::fs::read_dir(root_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(vec![1; namespace_shards]);
+            return Ok(MemoryDurabilityFloors {
+                version_floors: vec![1; namespace_shards],
+                owner_epoch_floor: 1,
+            });
         }
         Err(error) => return Err(memory_error(error)),
     };
@@ -198,10 +207,16 @@ async fn detect_memory_version_floors(
             max_versions[shard_index] = max_versions[shard_index].max(
                 read_single_i64(&conn, "SELECT MAX(max_version) FROM memory_meta").await? as u64,
             );
+            max_owner_epoch = max_owner_epoch.max(
+                read_single_i64(&conn, "SELECT MAX(owner_epoch) FROM memory_meta").await? as u64,
+            );
         }
     }
-    Ok(max_versions
-        .into_iter()
-        .map(|version| version.saturating_add(1).max(1))
-        .collect())
+    Ok(MemoryDurabilityFloors {
+        version_floors: max_versions
+            .into_iter()
+            .map(|version| version.saturating_add(1).max(1))
+            .collect(),
+        owner_epoch_floor: max_owner_epoch.saturating_add(1).max(1),
+    })
 }

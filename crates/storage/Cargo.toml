@@ -10,8 +10,12 @@ bytes = "1"
 common = { path = "../common" }
 serde.workspace = true
 serde_json.workspace = true
+simd-json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 turso = { git = "https://github.com/tursodatabase/turso", rev = "f548e012cd6ef4ecc3d0f6112d69813e13c54dcb", default-features = false }
 sha2 = "0.11"
 uuid.workspace = true
+
+[dev-dependencies]
+serial_test = "3"

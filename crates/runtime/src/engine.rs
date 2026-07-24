@@ -1,849 +1,1061 @@
-//! Perry wasm worker engine: instantiation, the event loop, and request
-//! dispatch. dd's `ffi` feature surface lives in [`crate::host_api`].
-//!
-//! Execution model: instances are pooled and reused across requests, so
-//! module-level state persists the way it does in a reused V8 isolate.
-//! `_start` runs once per instance (string interning, class registration,
-//! `dd_register`); each request then calls the registered fetch closure with
-//! `(method, url, body)`. Instances are recycled once their host heap grows
-//! past a threshold, bounding the leak inherent to Perry's interning ABI.
-
-use crate::bridge::{call_closure, dispatch, resolve_promise};
-use crate::heap::{HostValue, PromiseState};
-use crate::nanbox::{JsValue, TAG_UNDEFINED, decode, encode, encode_number};
-use crate::state::{CurrentRequest, HostState, WorkerContext, WorkerRegistry, WorkerStores};
-use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-use wasmtime::{
-    Caller, Config, Engine, Extern, FuncType, InstancePre, Linker, Module, Store, Val, ValType,
+use crate::assets::{
+    BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER, install_worker_js,
 };
+use crate::dynamic_modules::{
+    DynamicModuleRegistry, RuntimeModuleKind, normalize_dynamic_module_path,
+    resolve_dynamic_module_path,
+};
+use crate::ops::{
+    WorkerDeploymentPayload, WorkerRequestPayload, WorkerSource, clear_request_invocation,
+    clear_worker_deployment_config, register_request_invocation, register_worker_deployment_config,
+    runtime_extension,
+};
+use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
+use base64::Engine;
+use common::{PlatformError, Result, WorkerInvocation};
+use deno_core::{
+    Extension, JsRuntime, JsRuntimeForSnapshot, ModuleCodeBytes, ModuleLoadResponse, ModuleLoader,
+    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, PollEventLoopOptions,
+    RequestedModuleType, ResolutionKind, RuntimeOptions, resolve_import, v8, v8_set_flags,
+};
+use deno_crypto::deno_crypto as deno_crypto_ext;
+use deno_error::JsErrorBox;
+use deno_fetch::Options as DenoFetchOptions;
+use deno_web::{BlobStore, InMemoryBroadcastChannel};
+use std::borrow::Cow;
+use std::mem;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::task::{Context, Poll, Waker};
 
-const EPOCH_TICK: Duration = Duration::from_millis(50);
+include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 
-/// Engine shared by all worker modules; a single ticker thread drives epoch
-/// interruption so runaway guest code hits its deadline.
-fn shared_engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let mut config = Config::new();
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config).expect("wasmtime engine construction cannot fail");
-        let ticker = engine.clone();
-        std::thread::Builder::new()
-            .name("perry-wasm-epoch".to_string())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(EPOCH_TICK);
-                    ticker.increment_epoch();
-                }
-            })
-            .expect("epoch ticker thread failed to spawn");
-        engine
+const NODE_ASYNC_HOOKS_SOURCE: &str = include_str!("../js/node_async_hooks.js");
+
+static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
+
+pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
+    let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
+        extensions: runtime_extensions(),
+        module_loader: Some(Rc::new(RuntimeModuleLoader::default())),
+        create_params: Some(runtime_create_params(0)),
+        ..Default::default()
+    });
+    runtime
+        .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
+        .map_err(runtime_error)?;
+    let snapshot = runtime.snapshot();
+    Ok(Box::leak(snapshot))
+}
+
+pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
+    let normalized = flags
+        .iter()
+        .map(|flag| flag.trim())
+        .filter(|flag| !flag.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if let Some(existing) = CONFIGURED_V8_FLAGS.get() {
+        if existing != &normalized {
+            return Err(PlatformError::internal(format!(
+                "v8 flags were already initialized as {:?}; cannot reinitialize with {:?}",
+                existing, normalized
+            )));
+        }
+        return Ok(());
+    }
+
+    let mut argv = Vec::with_capacity(normalized.len() + 1);
+    argv.push("dd-runtime".to_string());
+    argv.extend(normalized.iter().cloned());
+    let leftovers = v8_set_flags(argv);
+    if leftovers.len() > 1 {
+        return Err(PlatformError::internal(format!(
+            "unsupported v8 flags: {:?}",
+            &leftovers[1..]
+        )));
+    }
+
+    let _ = CONFIGURED_V8_FLAGS.set(normalized);
+    Ok(())
+}
+
+pub async fn validate_worker(
+    bootstrap_snapshot: &'static [u8],
+    source: &str,
+    allow_code_generation: bool,
+) -> Result<()> {
+    let mut runtime = new_runtime(
+        bootstrap_snapshot,
+        allow_code_generation,
+        0,
+        DynamicModuleRegistry::default(),
+    )?;
+    load_worker(&mut runtime, source).await
+}
+
+pub fn new_runtime_from_snapshot(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+    dynamic_modules: DynamicModuleRegistry,
+) -> Result<JsRuntime> {
+    new_runtime(startup_snapshot, allow_code_generation, 0, dynamic_modules)
+}
+
+pub fn new_runtime_from_snapshot_with_heap_limit(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+    max_heap_bytes: usize,
+    dynamic_modules: DynamicModuleRegistry,
+) -> Result<JsRuntime> {
+    new_runtime(
+        startup_snapshot,
+        allow_code_generation,
+        max_heap_bytes,
+        dynamic_modules,
+    )
+}
+
+pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
+    evaluate_module(runtime, WORKER_SPECIFIER, source, false).await?;
+    let install_code = install_worker_js();
+    evaluate_module(runtime, INSTALL_SPECIFIER, &install_code, true).await
+}
+
+pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) -> Result<()> {
+    let dynamic_modules = runtime
+        .op_state()
+        .borrow()
+        .borrow::<DynamicModuleRegistry>()
+        .clone();
+    let source = worker_source_text(source, &dynamic_modules)?;
+    load_worker(runtime, source.as_ref()).await
+}
+
+struct RuntimeEntrypoints {
+    install_worker_deployment_handle: Rc<v8::Global<v8::Function>>,
+    execute_worker_handle: Rc<v8::Global<v8::Function>>,
+    abort_worker_request_handle: Rc<v8::Global<v8::Function>>,
+    drain_dynamic_control_queue: Rc<v8::Global<v8::Function>>,
+}
+
+pub fn install_worker_deployment_config(
+    runtime: &mut JsRuntime,
+    payload: WorkerDeploymentPayload,
+) -> Result<()> {
+    let deployment_handle = {
+        let op_state = runtime.op_state();
+        let mut op_state = op_state.borrow_mut();
+        register_worker_deployment_config(&mut op_state, payload)
+    };
+
+    match call_cached_u32_function(
+        runtime,
+        "__dd_install_worker_deployment_handle",
+        deployment_handle,
+        |entrypoints| Rc::clone(&entrypoints.install_worker_deployment_handle),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let op_state = runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            clear_worker_deployment_config(&mut op_state, deployment_handle);
+            Err(error)
+        }
+    }
+}
+
+pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
+    let entrypoints = {
+        let context = runtime.main_context();
+        deno_core::scope!(scope, runtime);
+        let context = v8::Local::new(scope, context);
+        let global = context.global(scope);
+        let install_worker_deployment_handle =
+            global_function(scope, global, "__dd_install_worker_deployment_handle")?;
+        let execute_worker_handle = global_function(scope, global, "__dd_execute_worker_handle")?;
+        let abort_worker_request_handle =
+            global_function(scope, global, "__dd_abort_worker_request_handle")?;
+        let drain_dynamic_control_queue =
+            global_function(scope, global, "__dd_drain_dynamic_control_queue_handle")?;
+        RuntimeEntrypoints {
+            install_worker_deployment_handle: Rc::new(v8::Global::new(
+                scope,
+                install_worker_deployment_handle,
+            )),
+            execute_worker_handle: Rc::new(v8::Global::new(scope, execute_worker_handle)),
+            abort_worker_request_handle: Rc::new(v8::Global::new(
+                scope,
+                abort_worker_request_handle,
+            )),
+            drain_dynamic_control_queue: Rc::new(v8::Global::new(
+                scope,
+                drain_dynamic_control_queue,
+            )),
+        }
+    };
+    let op_state = runtime.op_state();
+    op_state.borrow_mut().put(entrypoints);
+    Ok(())
+}
+
+pub struct WorkerDispatchRequest<'a> {
+    pub request_id: &'a str,
+    pub request_context_handle: u32,
+    pub completion_handle: u32,
+    pub memory_request_scope_handle: u32,
+    pub request_body_stream_handle: u32,
+    pub stream_response: bool,
+    pub memory_call: Option<&'a MemoryExecutionCall>,
+    pub host_rpc_call: Option<&'a HostRpcExecutionCall>,
+    pub request: WorkerInvocation,
+}
+
+pub fn dispatch_worker_request(
+    runtime: &mut JsRuntime,
+    dispatch: WorkerDispatchRequest<'_>,
+) -> Result<()> {
+    let WorkerDispatchRequest {
+        request_id,
+        request_context_handle,
+        completion_handle,
+        memory_request_scope_handle,
+        request_body_stream_handle,
+        stream_response,
+        memory_call,
+        host_rpc_call,
+        mut request,
+    } = dispatch;
+    let request_handle = {
+        let op_state = runtime.op_state();
+        let mut op_state = op_state.borrow_mut();
+        let request_headers_handle = op_state
+            .borrow_mut::<crate::ops::HttpPreparedHeaders>()
+            .insert(mem::take(&mut request.headers));
+        let request_body_handle = op_state
+            .borrow_mut::<crate::ops::HttpPreparedBodies>()
+            .insert(mem::take(&mut request.body));
+        let payload = WorkerRequestPayload {
+            request_id: request_id.to_string(),
+            request_context_handle,
+            completion_handle,
+            memory_request_scope_handle,
+            memory_call: memory_call.cloned(),
+            host_rpc_call: host_rpc_call.cloned(),
+            request_body_stream_handle,
+            request_headers_handle,
+            request_body_handle,
+            stream_response,
+            method: mem::take(&mut request.method),
+            url: mem::take(&mut request.url),
+            input_request_id: mem::take(&mut request.request_id),
+        };
+        register_request_invocation(&mut op_state, payload)
+    };
+
+    match call_cached_u32_function(
+        runtime,
+        "__dd_execute_worker_handle",
+        request_handle,
+        |entrypoints| Rc::clone(&entrypoints.execute_worker_handle),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let op_state = runtime.op_state();
+            let mut op_state = op_state.borrow_mut();
+            clear_request_invocation(&mut op_state, request_handle);
+            Err(error)
+        }
+    }
+}
+
+pub fn abort_worker_request_handle(
+    runtime: &mut JsRuntime,
+    request_context_handle: u32,
+) -> Result<()> {
+    call_cached_u32_function(
+        runtime,
+        "__dd_abort_worker_request_handle",
+        request_context_handle,
+        |entrypoints| Rc::clone(&entrypoints.abort_worker_request_handle),
+    )
+}
+
+pub fn drain_dynamic_control_queue(runtime: &mut JsRuntime) -> Result<()> {
+    call_cached_noarg_function(
+        runtime,
+        "__dd_drain_dynamic_control_queue_handle",
+        |entrypoints| Rc::clone(&entrypoints.drain_dynamic_control_queue),
+    )
+}
+
+pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()> {
+    let mut cx = Context::from_waker(waker);
+    match runtime.poll_event_loop(&mut cx, PollEventLoopOptions::default()) {
+        Poll::Ready(Ok(())) | Poll::Pending => Ok(()),
+        Poll::Ready(Err(error)) => Err(runtime_error(error)),
+    }
+}
+
+fn new_runtime(
+    startup_snapshot: &'static [u8],
+    allow_code_generation: bool,
+    max_heap_bytes: usize,
+    dynamic_modules: DynamicModuleRegistry,
+) -> Result<JsRuntime> {
+    let create_params = Some(runtime_create_params(max_heap_bytes));
+    let mut runtime = JsRuntime::try_new(RuntimeOptions {
+        extensions: runtime_extensions(),
+        module_loader: Some(Rc::new(RuntimeModuleLoader {
+            dynamic_modules: dynamic_modules.clone(),
+        })),
+        startup_snapshot: Some(startup_snapshot),
+        create_params,
+        ..Default::default()
     })
+    .map_err(runtime_error)?;
+    runtime.op_state().borrow_mut().put(dynamic_modules);
+    set_code_generation_from_strings(&mut runtime, allow_code_generation);
+    Ok(runtime)
 }
 
-#[derive(Clone, Copy)]
-pub struct InvokeOptions {
-    pub timeout: Duration,
-}
-
-impl Default for InvokeOptions {
-    fn default() -> Self {
-        InvokeOptions {
-            timeout: Duration::from_secs(5),
-        }
+fn runtime_create_params(max_heap_bytes: usize) -> v8::CreateParams {
+    JsRuntime::init_platform(None);
+    let heap = v8::cppgc::Heap::create(
+        v8::V8::get_current_platform(),
+        v8::cppgc::HeapCreateParams::default(),
+    );
+    let params = v8::CreateParams::default().cpp_heap(heap);
+    if max_heap_bytes > 0 {
+        params.heap_limits(0, max_heap_bytes)
+    } else {
+        params
     }
 }
 
-/// Deployment-time options for one worker.
+fn set_code_generation_from_strings(runtime: &mut JsRuntime, allow: bool) {
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    context.set_allow_generation_from_strings(allow);
+}
+
+fn call_cached_u32_function(
+    runtime: &mut JsRuntime,
+    name: &str,
+    arg: u32,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Result<()> {
+    let function = cached_entrypoint(runtime, select);
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    let global = context.global(scope);
+    let function = v8::Local::new(scope, function.as_ref());
+    let arg = v8::Integer::new_from_unsigned(scope, arg).into();
+    function
+        .call(scope, global.into(), &[arg])
+        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+    Ok(())
+}
+
+fn call_cached_noarg_function(
+    runtime: &mut JsRuntime,
+    name: &str,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Result<()> {
+    let function = cached_entrypoint(runtime, select);
+    let context = runtime.main_context();
+    deno_core::scope!(scope, runtime);
+    let context = v8::Local::new(scope, context);
+    let global = context.global(scope);
+    let function = v8::Local::new(scope, function.as_ref());
+    function
+        .call(scope, global.into(), &[])
+        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+    Ok(())
+}
+
+fn cached_entrypoint(
+    runtime: &mut JsRuntime,
+    select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
+) -> Rc<v8::Global<v8::Function>> {
+    let op_state = runtime.op_state();
+    let op_state = op_state.borrow();
+    select(op_state.borrow::<RuntimeEntrypoints>())
+}
+
+fn global_function<'scope>(
+    scope: &mut v8::PinScope<'scope, '_>,
+    global: v8::Local<'scope, v8::Object>,
+    name: &str,
+) -> Result<v8::Local<'scope, v8::Function>> {
+    let name_value = v8::String::new(scope, name)
+        .ok_or_else(|| PlatformError::runtime("failed to allocate V8 function name"))?;
+    let value = global.get(scope, name_value.into()).ok_or_else(|| {
+        PlatformError::runtime(format!("global runtime entrypoint {name} is unavailable"))
+    })?;
+    let function = v8::Local::<v8::Function>::try_from(value).map_err(|_| {
+        PlatformError::runtime(format!(
+            "global runtime entrypoint {name} is not a function"
+        ))
+    })?;
+    Ok(function)
+}
+
+fn runtime_extensions() -> Vec<Extension> {
+    vec![
+        without_esm(deno_webidl::deno_webidl::init()),
+        without_esm(deno_web::deno_web::init(
+            Arc::new(BlobStore::default()),
+            None,
+            false,
+            InMemoryBroadcastChannel::default(),
+        )),
+        without_esm(deno_fetch::deno_fetch::init(DenoFetchOptions::default())),
+        without_esm(deno_crypto_ext::init(None)),
+        dd_deno_js::init(),
+        runtime_extension(),
+    ]
+}
+
+fn without_esm(extension: Extension) -> Extension {
+    let lazy_loaded_js_files = extension
+        .lazy_loaded_js_files
+        .iter()
+        .map(|source| {
+            dd_embedded_lazy_js_source(source.specifier).unwrap_or_else(|| source.clone())
+        })
+        .collect();
+    Extension {
+        js_files: Cow::Borrowed(&[]),
+        lazy_loaded_js_files: Cow::Owned(lazy_loaded_js_files),
+        lazy_loaded_esm_files: Cow::Borrowed(&[]),
+        esm_files: Cow::Borrowed(&[]),
+        esm_entry_point: None,
+        ..extension
+    }
+}
+
 #[derive(Default)]
-pub struct WorkerOptions {
-    pub name: Option<String>,
-    /// Disk-backed stores (KV, memory namespaces, cache). Workers without
-    /// stores get clear errors from the storage `ffi` functions.
-    pub stores: Option<Arc<WorkerStores>>,
-    /// Service binding name -> worker name for `dd_service_fetch`.
-    pub service_bindings: std::collections::HashMap<String, String>,
-    /// All deployed workers; share one registry across the server.
-    pub workers: Option<WorkerRegistry>,
+struct RuntimeModuleLoader {
+    dynamic_modules: DynamicModuleRegistry,
 }
 
-/// Instances kept warm per worker; requests beyond this instantiate fresh.
-const POOL_LIMIT: usize = 32;
-/// Recycle an instance once its interned-string table grows past this —
-/// Perry's ABI interns every dynamic string, so long-lived instances leak.
-const RECYCLE_STRING_THRESHOLD: usize = 262_144;
-
-pub(crate) struct ReadyInstance {
-    store: Store<HostState>,
-}
-
-impl ReadyInstance {
-    pub(crate) fn store_mut(&mut self) -> &mut Store<HostState> {
-        &mut self.store
+impl ModuleLoader for RuntimeModuleLoader {
+    fn resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+        _kind: ResolutionKind,
+    ) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
+        if referrer.starts_with("dd-dynamic:")
+            && !specifier.starts_with("//")
+            && !has_url_scheme(specifier)
+        {
+            return resolve_dd_dynamic_import(specifier, referrer);
+        }
+        resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
     }
 
-    /// Give the instance a fresh execution budget; call before dispatching
-    /// each request or websocket event.
-    pub(crate) fn arm_deadline(&mut self, timeout: Duration) {
-        self.store
-            .set_epoch_deadline((timeout.as_millis() / EPOCH_TICK.as_millis() + 2) as u64);
-    }
-}
-
-/// A compiled Perry worker. Compilation and import linking happen once; each
-/// request runs on a pooled warm instance (or a fresh one under load).
-pub struct WorkerModule {
-    instance_pre: InstancePre<HostState>,
-    context: Arc<WorkerContext>,
-    pool: Mutex<Vec<ReadyInstance>>,
-    ws_events: Mutex<Option<std::sync::mpsc::Sender<crate::ws::WsEvent>>>,
-}
-
-impl WorkerModule {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Self::new(bytes, WorkerOptions::default())
-    }
-
-    pub fn new(bytes: &[u8], options: WorkerOptions) -> Result<Self> {
-        let module = Module::new(shared_engine(), bytes)
-            .map_err(|error| PlatformError::bad_request(format!("invalid wasm module: {error}")))?;
-
-        for import in module.imports() {
-            match import.module() {
-                "rt" if import.name().starts_with("__async_") => {
-                    return Err(PlatformError::bad_request(format!(
-                        "worker uses async function {:?}: Perry compiles async bodies to JavaScript, \
-                         which the dd wasm host cannot run — use explicit .then() chains instead",
-                        import.name().trim_start_matches("__async_"),
-                    )));
-                }
-                "rt" | "ffi" => {}
-                other => {
-                    return Err(PlatformError::bad_request(format!(
-                        "worker imports from unsupported module {other:?} \
-                         (expected only \"rt\" and \"ffi\")"
-                    )));
-                }
-            }
-        }
-
-        let linker = build_linker(&module)?;
-        let instance_pre = linker.instantiate_pre(&module).map_err(runtime_error)?;
-        let mut context = WorkerContext::default();
-        if let Some(name) = options.name {
-            context.worker_name = name;
-        }
-        context.stores = options.stores;
-        context.service_bindings = options.service_bindings;
-        if let Some(workers) = options.workers {
-            context.workers = workers;
-        }
-        Ok(WorkerModule {
-            instance_pre,
-            context: Arc::new(context),
-            pool: Mutex::new(Vec::new()),
-            ws_events: Mutex::new(None),
+    fn load(
+        &self,
+        module_specifier: &ModuleSpecifier,
+        _maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
+        options: deno_core::ModuleLoadOptions,
+    ) -> ModuleLoadResponse {
+        ModuleLoadResponse::Sync(match module_specifier.scheme() {
+            "dd-dynamic" => load_dd_dynamic_module(
+                &self.dynamic_modules,
+                module_specifier,
+                options.requested_module_type,
+            ),
+            "node" if module_specifier.as_str() == "node:async_hooks" => Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(NODE_ASYNC_HOOKS_SOURCE.to_string().into()),
+                module_specifier,
+                None,
+            )),
+            _ => Err(JsErrorBox::generic(format!(
+                "runtime module loader does not support: {module_specifier}"
+            ))),
         })
     }
+}
 
-    pub fn invoke(
-        &self,
-        invocation: WorkerInvocation,
-        options: InvokeOptions,
-    ) -> Result<WorkerOutput> {
-        self.invoke_at_depth(invocation, options, 0)
+fn resolve_dd_dynamic_import(
+    specifier: &str,
+    referrer: &str,
+) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
+    let referrer = ModuleSpecifier::parse(referrer).map_err(JsErrorBox::from_err)?;
+    let (graph_id, referrer_path) = dd_dynamic_module_parts(&referrer)?;
+    let module_path =
+        resolve_dynamic_module_path(&referrer_path, specifier).map_err(JsErrorBox::generic)?;
+    let encoded_path = module_path
+        .split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    ModuleSpecifier::parse(&format!("dd-dynamic://graph/{graph_id}/{encoded_path}"))
+        .map_err(JsErrorBox::from_err)
+}
+
+fn load_dd_dynamic_module(
+    dynamic_modules: &DynamicModuleRegistry,
+    module_specifier: &ModuleSpecifier,
+    requested_module_type: RequestedModuleType,
+) -> std::result::Result<ModuleSource, JsErrorBox> {
+    let (graph_id, module_path) = dd_dynamic_module_parts(module_specifier)?;
+    let module = dynamic_modules
+        .module(&graph_id, &module_path)
+        .ok_or_else(|| {
+            JsErrorBox::generic(format!(
+                "dynamic module graph {graph_id} does not contain module: {module_path}"
+            ))
+        })?;
+    let module_type = deno_module_type(module.kind);
+    if requested_module_type != module_type.clone() {
+        return Err(JsErrorBox::generic(format!(
+            "requested module type {requested_module_type} does not match {module_type} module: {module_path}"
+        )));
     }
-
-    /// `depth` tracks the `dd_service_fetch` chain; the limit is enforced at
-    /// the call site in `host_api`.
-    pub(crate) fn invoke_at_depth(
-        &self,
-        invocation: WorkerInvocation,
-        options: InvokeOptions,
-        depth: u32,
-    ) -> Result<WorkerOutput> {
-        let deadline = Instant::now() + options.timeout;
-        let ticks = (options.timeout.as_millis() / EPOCH_TICK.as_millis() + 2) as u64;
-
-        let mut ready = match self.checkout() {
-            Some(ready) => ready,
-            None => self.instantiate(deadline, ticks)?,
-        };
-        ready.store.set_epoch_deadline(ticks);
-
-        let outcome = dispatch_request(&mut ready, invocation, deadline, depth);
-
-        // Only healthy instances return to the pool: after an error, guest
-        // and host state can no longer be trusted.
-        if outcome.is_ok() && ready.store.data().heap.strings_len() < RECYCLE_STRING_THRESHOLD {
-            let mut pool = self.pool.lock().expect("pool mutex is never poisoned");
-            if pool.len() < POOL_LIMIT {
-                pool.push(ready);
-            }
+    let code = match module.kind {
+        RuntimeModuleKind::JavaScript => ModuleSourceCode::String(
+            String::from_utf8(module.code.as_ref().to_vec())
+                .map_err(|error| {
+                    JsErrorBox::generic(format!(
+                        "dynamic JavaScript module is not valid UTF-8: {module_path}: {error}"
+                    ))
+                })?
+                .into(),
+        ),
+        RuntimeModuleKind::Wasm => {
+            ModuleSourceCode::String(compiled_wasm_module_source(module.code.as_ref()))
         }
-        outcome
-    }
+        RuntimeModuleKind::Json | RuntimeModuleKind::Text => ModuleSourceCode::String(
+            String::from_utf8(module.code.as_ref().to_vec())
+                .map_err(|error| {
+                    JsErrorBox::generic(format!(
+                        "dynamic text module is not valid UTF-8: {module_path}: {error}"
+                    ))
+                })?
+                .into(),
+        ),
+        RuntimeModuleKind::Bytes => ModuleSourceCode::Bytes(ModuleCodeBytes::Arc(module.code)),
+    };
+    Ok(ModuleSource::new(module_type, code, module_specifier, None))
+}
 
-    /// The per-worker connection registry, used by the server's upgrade path
-    /// and by `dd_ws_send` from any instance.
-    pub fn ws_connections(&self) -> Arc<crate::state::WsConnections> {
-        Arc::clone(&self.context.ws_connections)
-    }
-
-    /// Sender feeding the worker's websocket dispatcher; the dispatcher
-    /// thread and its dedicated instance start on first use.
-    pub fn websocket_events(self: &Arc<Self>) -> std::sync::mpsc::Sender<crate::ws::WsEvent> {
-        let mut slot = self
-            .ws_events
-            .lock()
-            .expect("ws sender mutex is never poisoned");
-        if let Some(sender) = slot.as_ref() {
-            return sender.clone();
-        }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let module = Arc::clone(self);
-        std::thread::Builder::new()
-            .name("dd-wasm-ws".to_string())
-            .spawn(move || crate::ws::run_dispatcher(&module, receiver))
-            .expect("websocket dispatcher thread failed to spawn");
-        *slot = Some(sender.clone());
-        sender
-    }
-
-    /// A warm instance for the websocket dispatcher (not pooled).
-    pub(crate) fn websocket_instance(&self) -> Result<ReadyInstance> {
-        let timeout = Duration::from_secs(5);
-        let ticks = (timeout.as_millis() / EPOCH_TICK.as_millis() + 2) as u64;
-        self.instantiate(Instant::now() + timeout, ticks)
-    }
-
-    fn checkout(&self) -> Option<ReadyInstance> {
-        self.pool
-            .lock()
-            .expect("pool mutex is never poisoned")
-            .pop()
-    }
-
-    /// Build a warm instance: instantiate, run `_start`, verify registration.
-    fn instantiate(&self, deadline: Instant, ticks: u64) -> Result<ReadyInstance> {
-        let mut store = Store::new(
-            shared_engine(),
-            HostState::with_context(Arc::clone(&self.context)),
-        );
-        store.set_epoch_deadline(ticks);
-        let instance = self
-            .instance_pre
-            .instantiate(&mut store)
-            .map_err(runtime_error)?;
-
-        store.data_mut().table = instance.get_table(&mut store, "__indirect_function_table");
-        store.data_mut().memory = instance.get_memory(&mut store, "memory");
-        if store.data().table.is_none() {
-            return Err(PlatformError::bad_request(
-                "worker does not export __indirect_function_table",
-            ));
-        }
-
-        let start = instance
-            .get_func(&mut store, "_start")
-            .ok_or_else(|| PlatformError::bad_request("worker does not export _start"))?;
-        start
-            .call(&mut store, &[], &mut [])
-            .map_err(runtime_error)?;
-        drain_event_loop(&mut store, deadline, None)?;
-
-        if store.data().registered_handler.is_none() {
-            return Err(PlatformError::bad_request(
-                "worker never called dd_register(fetchHandler) during startup",
-            ));
-        }
-        Ok(ReadyInstance { store })
+fn deno_module_type(kind: RuntimeModuleKind) -> ModuleType {
+    match kind {
+        RuntimeModuleKind::JavaScript => ModuleType::JavaScript,
+        RuntimeModuleKind::Wasm => ModuleType::JavaScript,
+        RuntimeModuleKind::Json => ModuleType::Json,
+        RuntimeModuleKind::Text => ModuleType::Text,
+        RuntimeModuleKind::Bytes => ModuleType::Bytes,
     }
 }
 
-fn dispatch_request(
-    ready: &mut ReadyInstance,
-    invocation: WorkerInvocation,
-    deadline: Instant,
-    depth: u32,
-) -> Result<WorkerOutput> {
-    let store = &mut ready.store;
-    let handler = store
-        .data()
-        .registered_handler
-        .expect("pooled instances always have a registered handler");
+fn compiled_wasm_module_source(bytes: &[u8]) -> deno_core::ModuleCodeString {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!(
+        r#"
+const encoded = {encoded:?};
+const binary = atob(encoded);
+const bytes = new Uint8Array(binary.length);
+for (let index = 0; index < binary.length; index += 1) {{
+  bytes[index] = binary.charCodeAt(index);
+}}
+export default new WebAssembly.Module(bytes);
+"#
+    )
+    .into()
+}
 
+fn dd_dynamic_module_parts(
+    module_specifier: &ModuleSpecifier,
+) -> std::result::Result<(String, String), JsErrorBox> {
+    if module_specifier.scheme() != "dd-dynamic" {
+        return Err(JsErrorBox::generic(format!(
+            "expected dd-dynamic module URL, got {module_specifier}"
+        )));
+    }
+    if module_specifier.host_str() != Some("graph") {
+        return Err(JsErrorBox::generic(format!(
+            "expected dd-dynamic://graph module URL, got {module_specifier}"
+        )));
+    }
+    let path = module_specifier.path().trim_start_matches('/');
+    let (graph_id, module_path) = path.split_once('/').ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "dd-dynamic module URL is missing graph id or module path: {module_specifier}"
+        ))
+    })?;
+    let graph_id = graph_id.trim();
+    if graph_id.is_empty()
+        || graph_id.len() > 128
+        || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        let state = store.data_mut();
-        state.current_request = Some(CurrentRequest {
-            headers: invocation.headers,
-        });
-        state.service_depth = depth;
-        state.pending_exception = None;
+        return Err(JsErrorBox::generic(format!(
+            "invalid dd-dynamic graph id in module URL: {module_specifier}"
+        )));
     }
-    let args = {
-        let state = store.data_mut();
-        [
-            state.heap.intern_bits(invocation.method),
-            state.heap.intern_bits(invocation.url),
-            state
-                .heap
-                .intern_bits(String::from_utf8_lossy(&invocation.body).into_owned()),
-        ]
-    };
-    let result = call_closure(&mut *store, handler, &args).map_err(runtime_error);
-
-    let outcome = match result {
-        Ok(result) => {
-            if let Some(exception) = store.data().pending_exception {
-                let message = store.data().heap.display(exception);
-                Err(PlatformError::runtime(format!(
-                    "worker fetch handler threw: {message}"
-                )))
-            } else {
-                settle(store, result, deadline).and_then(|bits| decode_response(store.data(), bits))
-            }
-        }
-        Err(error) => Err(error),
-    };
-
-    let state = store.data_mut();
-    state.current_request = None;
-    state.pending_exception = None;
-    state.service_depth = 0;
-    outcome
+    let bytes = percent_decode(module_path).map_err(JsErrorBox::generic)?;
+    let path = String::from_utf8(bytes).map_err(|error| {
+        JsErrorBox::generic(format!("invalid UTF-8 in dd-dynamic module path: {error}"))
+    })?;
+    normalize_dynamic_module_path(&path)
+        .map(|path| (graph_id.to_string(), path))
+        .map_err(JsErrorBox::generic)
 }
 
-/// Wait for a promise result to resolve, pumping timers and microtasks.
-fn settle(store: &mut Store<HostState>, bits: u64, deadline: Instant) -> Result<u64> {
-    let JsValue::Handle(id) = decode(bits) else {
-        return Ok(bits);
+fn has_url_scheme(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
     };
-    if !matches!(
-        store.data().heap.handle(id),
-        Some(HostValue::Promise { .. })
-    ) {
-        return Ok(bits);
+    if !first.is_ascii_alphabetic() {
+        return false;
     }
-    let resolved = move |state: &HostState| {
-        matches!(
-            state.heap.handle(id),
-            Some(HostValue::Promise {
-                state: PromiseState::Resolved(_),
-                ..
-            })
-        )
-    };
-    drain_event_loop(store, deadline, Some(&resolved))?;
-    match store.data().heap.handle(id) {
-        Some(HostValue::Promise {
-            state: PromiseState::Resolved(value),
-            ..
-        }) => {
-            let value = *value;
-            settle(store, value, deadline)
+    for ch in chars {
+        if ch == ':' {
+            return true;
         }
-        _ => Err(PlatformError::runtime(
-            "worker response promise never resolved (no pending timers or host operations)",
+        if !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.') {
+            return false;
+        }
+    }
+    false
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn worker_source_text<'a>(
+    source: &'a WorkerSource,
+    dynamic_modules: &DynamicModuleRegistry,
+) -> Result<Cow<'a, str>> {
+    match source {
+        WorkerSource::Inline(source) => Ok(Cow::Borrowed(source.as_ref())),
+        WorkerSource::DynamicModule {
+            graph_id,
+            entrypoint,
+        } => {
+            let specifier =
+                dynamic_module_entrypoint_specifier(dynamic_modules, graph_id, entrypoint)?;
+            Ok(Cow::Owned(format!(
+                "export {{ default }} from {specifier:?};\n"
+            )))
+        }
+    }
+}
+
+fn dynamic_module_entrypoint_specifier(
+    dynamic_modules: &DynamicModuleRegistry,
+    graph_id: &str,
+    entrypoint: &str,
+) -> Result<String> {
+    let graph_id = graph_id.trim();
+    if graph_id.is_empty()
+        || graph_id.len() > 128
+        || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(PlatformError::bad_request(
+            "dynamic module graph id is invalid",
+        ));
+    }
+    let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
+        PlatformError::bad_request(format!("invalid dynamic module entrypoint: {error}"))
+    })?;
+    if dynamic_modules.source(graph_id, &entrypoint).is_none() {
+        return Err(PlatformError::bad_request(format!(
+            "dynamic module graph {graph_id} does not contain entrypoint: {entrypoint}"
+        )));
+    }
+    let encoded_path = entrypoint
+        .split('/')
+        .map(percent_encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(format!("dd-dynamic://graph/{graph_id}/{encoded_path}"))
+}
+
+fn percent_decode(value: &str) -> std::result::Result<Vec<u8>, String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'%' => {
+                if idx + 2 >= bytes.len() {
+                    return Err("truncated percent-escape in module URL".to_string());
+                }
+                let hi = decode_hex_digit(bytes[idx + 1])?;
+                let lo = decode_hex_digit(bytes[idx + 2])?;
+                out.push((hi << 4) | lo);
+                idx += 3;
+            }
+            b => {
+                out.push(b);
+                idx += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_hex_digit(value: u8) -> std::result::Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(format!(
+            "invalid hex digit in module URL escape: {}",
+            value as char
         )),
     }
 }
 
-/// Run already-due microtasks, timers, and host-op completions without
-/// blocking; used after startup and each websocket event so `.then` chains
-/// settle before the next unit of work.
-pub(crate) fn pump_microtasks(store: &mut Store<HostState>) -> Result<()> {
-    drain_event_loop(store, Instant::now() + Duration::from_secs(1), None)
-}
-
-/// Resolve promises for host operations (fetch, sleep) that have completed.
-/// Non-blocking; returns how many were resolved.
-fn harvest_host_completions(state: &mut HostState) -> usize {
-    let mut resolved = 0;
-    while let Ok(completion) = state.host_ops.receiver.try_recv() {
-        apply_completion(state, completion);
-        resolved += 1;
-    }
-    resolved
-}
-
-/// Resolve one completed host operation's promise. Perry's wasm target has
-/// no promise rejection path, so failed operations resolve with `undefined`
-/// and log the cause.
-fn apply_completion(state: &mut HostState, completion: crate::state::HostCompletion) {
-    state.host_ops.pending = state.host_ops.pending.saturating_sub(1);
-    let value = match completion.outcome {
-        Ok(outcome) => crate::bridge::fetch::outcome_to_heap(state, outcome),
-        Err(message) => {
-            tracing::warn!(target: "perry_worker", "async host op failed: {message}");
-            TAG_UNDEFINED
-        }
-    };
-    resolve_promise(state, encode(JsValue::Handle(completion.promise)), value);
-}
-
-fn drain_event_loop(
-    store: &mut Store<HostState>,
-    deadline: Instant,
-    waiting_for: Option<&dyn Fn(&HostState) -> bool>,
+async fn evaluate_module(
+    runtime: &mut JsRuntime,
+    specifier: &str,
+    source: &str,
+    is_main: bool,
 ) -> Result<()> {
-    loop {
-        while let Some(task) = {
-            let state = store.data_mut();
-            state.microtasks.pop_front()
-        } {
-            let outcome = if task.callback_bits == TAG_UNDEFINED {
-                task.value_bits
-            } else {
-                call_closure(&mut *store, task.callback_bits, &[task.value_bits])
-                    .map_err(runtime_error)?
-            };
-            chain_into(store.data_mut(), task.downstream, outcome);
-            if Instant::now() > deadline {
-                return Err(PlatformError::runtime("worker exceeded its time budget"));
-            }
-        }
-
-        if harvest_host_completions(store.data_mut()) > 0 {
-            continue;
-        }
-
-        if let Some(done) = waiting_for
-            && done(store.data())
-        {
-            return Ok(());
-        }
-
-        let next_timer = store
-            .data()
-            .timers
-            .iter()
-            .min_by_key(|timer| timer.due)
-            .map(|timer| (timer.id, timer.due));
-        let pending_ops = store.data().host_ops.pending;
-        let now = Instant::now();
-
-        // Pump mode never blocks: run what is due, leave the rest.
-        if waiting_for.is_none() {
-            match next_timer {
-                Some((timer_id, due)) if due <= now => {
-                    fire_timer(store, timer_id, deadline)?;
-                    continue;
-                }
-                _ => return Ok(()),
-            }
-        }
-
-        // Waiting mode: block until a timer is due or a host op completes.
-        match next_timer {
-            Some((timer_id, due)) if due <= now => {
-                fire_timer(store, timer_id, deadline)?;
-                continue;
-            }
-            Some((_, due)) if due <= deadline || pending_ops > 0 => {
-                let wake = due.min(deadline);
-                wait_for_completion(store.data_mut(), wake.saturating_duration_since(now));
-            }
-            Some(_) => {
-                return Err(PlatformError::runtime(
-                    "worker response is waiting on a timer due after the request time budget",
-                ));
-            }
-            None if pending_ops > 0 => {
-                wait_for_completion(store.data_mut(), deadline.saturating_duration_since(now));
-            }
-            None => return Ok(()),
-        }
-        if Instant::now() > deadline {
-            return Err(PlatformError::runtime("worker exceeded its time budget"));
-        }
-    }
-}
-
-/// Block on the completion channel for at most `wait`; a received completion
-/// is pushed back through the non-blocking harvest on the next loop pass.
-fn wait_for_completion(state: &mut HostState, wait: Duration) {
-    if state.host_ops.pending == 0 {
-        std::thread::sleep(wait);
-        return;
-    }
-    if let Ok(completion) = state
-        .host_ops
-        .receiver
-        .recv_timeout(wait.min(Duration::from_millis(250)))
-    {
-        apply_completion(state, completion);
-    }
-}
-
-fn fire_timer(store: &mut Store<HostState>, timer_id: u32, deadline: Instant) -> Result<()> {
-    let fired = {
-        let state = store.data_mut();
-        let Some(position) = state.timers.iter().position(|timer| timer.id == timer_id) else {
-            return Ok(());
-        };
-        match state.timers[position].every {
-            Some(every) => {
-                state.timers[position].due = Instant::now() + every;
-                state.timers[position].callback_bits
-            }
-            None => state.timers.remove(position).callback_bits,
-        }
-    };
-    call_closure(&mut *store, fired, &[]).map_err(runtime_error)?;
-    if Instant::now() > deadline {
-        return Err(PlatformError::runtime("worker exceeded its time budget"));
-    }
-    Ok(())
-}
-
-/// Resolve `downstream` with a callback's outcome, chaining through promises.
-fn chain_into(state: &mut HostState, downstream: u32, outcome: u64) {
-    if let JsValue::Handle(id) = decode(outcome) {
-        match state.heap.handle(id) {
-            Some(HostValue::Promise {
-                state: PromiseState::Resolved(value),
-                ..
-            }) => {
-                let value = *value;
-                resolve_promise(state, encode(JsValue::Handle(downstream)), value);
-                return;
-            }
-            Some(HostValue::Promise { .. }) => {
-                if let Some(HostValue::Promise { reactions, .. }) = state.heap.handle_mut(id) {
-                    reactions.push(crate::heap::PromiseReaction {
-                        callback_bits: TAG_UNDEFINED,
-                        downstream,
-                    });
-                }
-                return;
-            }
-            _ => {}
-        }
-    }
-    resolve_promise(state, encode(JsValue::Handle(downstream)), outcome);
-}
-
-fn decode_response(state: &HostState, bits: u64) -> Result<WorkerOutput> {
-    match decode(bits) {
-        JsValue::Str(id) => Ok(WorkerOutput {
-            status: 200,
-            headers: vec![(
-                "content-type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
-            body: state.heap.string(id).unwrap_or("").as_bytes().to_vec(),
-        }),
-        JsValue::Handle(id) => {
-            let Some(HostValue::Object(object)) = state.heap.handle(id) else {
-                return Err(PlatformError::runtime(format!(
-                    "worker fetch handler returned a non-response handle: {:?}",
-                    state.heap.handle(id)
-                )));
-            };
-            let status = object
-                .get("status")
-                .map(|bits| state.heap.to_number(bits))
-                .filter(|n| n.is_finite() && *n >= 100.0 && *n <= 599.0)
-                .map(|n| n as u16)
-                .unwrap_or(200);
-            let headers = match object.get("headers").map(decode) {
-                Some(JsValue::Handle(headers_id)) => match state.heap.handle(headers_id) {
-                    Some(HostValue::Object(header_object)) => header_object
-                        .props
-                        .iter()
-                        .filter(|(key, _)| key != "__class__")
-                        .map(|(key, value)| (key.clone(), state.heap.display(*value)))
-                        .collect(),
-                    _ => Vec::new(),
-                },
-                _ => Vec::new(),
-            };
-            let body = match object.get("body").map(decode) {
-                None | Some(JsValue::Undefined) | Some(JsValue::Null) => Vec::new(),
-                Some(JsValue::Str(body_id)) => {
-                    state.heap.string(body_id).unwrap_or("").as_bytes().to_vec()
-                }
-                Some(JsValue::Handle(body_id)) => match state.heap.handle(body_id) {
-                    Some(HostValue::Buffer(bytes)) => bytes.clone(),
-                    _ => state.heap.display(object.get("body").unwrap()).into_bytes(),
-                },
-                Some(_) => state.heap.display(object.get("body").unwrap()).into_bytes(),
-            };
-            Ok(WorkerOutput {
-                status,
-                headers,
-                body,
-            })
-        }
-        other => Err(PlatformError::runtime(format!(
-            "worker fetch handler returned {other:?} instead of a response object or string"
-        ))),
-    }
-}
-
-/// Bind every import the module declares. Real logic lives in the name-keyed
-/// bridge dispatcher; individually-declared `rt.*` imports adapt into it so
-/// both entry paths (direct call and `mem_call`) share one implementation.
-fn build_linker(module: &Module) -> Result<Linker<HostState>> {
-    let engine = shared_engine();
-    let mut linker: Linker<HostState> = Linker::new(engine);
-
-    for import in module.imports() {
-        let Some(func_type) = import.ty().func().cloned() else {
-            return Err(PlatformError::bad_request(format!(
-                "worker declares a non-function import {}.{}",
-                import.module(),
-                import.name()
-            )));
-        };
-        let name = import.name().to_string();
-        let bound = match (import.module(), name.as_str()) {
-            ("rt", "string_new") => bind_string_new(&mut linker, func_type),
-            ("rt", "mem_call") => bind_mem_call(&mut linker, func_type, false),
-            ("rt", "mem_call_i32") => bind_mem_call(&mut linker, func_type, true),
-            ("rt", _) => bind_rt_adapter(&mut linker, func_type, name.clone()),
-            ("ffi", _) => bind_ffi(&mut linker, func_type, name.clone()),
-            _ => unreachable!("import modules validated in from_bytes"),
-        };
-        bound.map_err(|error| {
-            PlatformError::runtime(format!("failed to bind import rt/{name}: {error}"))
-        })?;
-    }
-    Ok(linker)
-}
-
-/// wasmtime errors are anyhow-style chains; `{:#}` keeps every cause on one
-/// line so host bridge failures aren't hidden behind "error while executing".
-fn runtime_error(error: wasmtime::Error) -> PlatformError {
-    PlatformError::runtime(format!("{error:#}"))
-}
-
-fn guest_memory(
-    caller: &mut Caller<'_, HostState>,
-    who: &str,
-) -> std::result::Result<wasmtime::Memory, wasmtime::Error> {
-    if let Some(memory) = caller.data().memory {
-        return Ok(memory);
-    }
-    match caller.get_export("memory") {
-        Some(Extern::Memory(memory)) => Ok(memory),
-        _ => Err(wasmtime::Error::msg(format!(
-            "{who}: guest memory unavailable"
-        ))),
-    }
-}
-
-/// `rt.string_new(offset, len)`: intern a UTF-8 literal from guest memory.
-/// Ids are implicit — assignment order must match the guest's interning order.
-fn bind_string_new(
-    linker: &mut Linker<HostState>,
-    func_type: FuncType,
-) -> std::result::Result<(), wasmtime::Error> {
-    linker.func_new(
-        "rt",
-        "string_new",
-        func_type,
-        |mut caller, params, _results| {
-            let (offset, len) = match (params[0].i32(), params[1].i32()) {
-                (Some(offset), Some(len)) => (offset as u32 as usize, len as u32 as usize),
-                _ => return Err(wasmtime::Error::msg("string_new: malformed parameters")),
-            };
-            let memory = guest_memory(&mut caller, "string_new")?;
-            let mut bytes = vec![0u8; len];
-            memory
-                .read(&caller, offset, &mut bytes)
-                .map_err(|e| wasmtime::Error::msg(format!("string_new: bad range: {e}")))?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            tracing::trace!(target: "perry_bridge", "string_new {text:?}");
-            caller.data_mut().heap.append_literal(text);
-            Ok(())
-        },
-    )?;
-    Ok(())
-}
-
-/// `rt.mem_call(name_id, arg_count, base)`: the generic bridge bus. Arguments
-/// sit in guest memory as raw NaN-box bits; the result is written back to
-/// `base` (f64 variant) or returned directly (i32 variant).
-fn bind_mem_call(
-    linker: &mut Linker<HostState>,
-    func_type: FuncType,
-    returns_i32: bool,
-) -> std::result::Result<(), wasmtime::Error> {
-    let import_name = if returns_i32 {
-        "mem_call_i32"
+    let specifier = ModuleSpecifier::parse(specifier)
+        .map_err(|error| PlatformError::runtime(error.to_string()))?;
+    let module_id = if is_main {
+        runtime
+            .load_main_es_module_from_code(&specifier, source.to_string())
+            .await
+            .map_err(runtime_error)?
     } else {
-        "mem_call"
+        runtime
+            .load_side_es_module_from_code(&specifier, source.to_string())
+            .await
+            .map_err(runtime_error)?
     };
-    linker.func_new(
-        "rt",
-        import_name,
-        func_type,
-        move |mut caller, params, results| {
-            let name_id = params[0].f64().unwrap_or(0.0) as u32;
-            let arg_count = params[1].f64().unwrap_or(0.0) as usize;
-            let base = params[2].i32().unwrap_or(0) as u32 as usize;
 
-            let name = caller
-                .data()
-                .heap
-                .string(name_id)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    wasmtime::Error::msg(format!("mem_call: unknown bridge name id {name_id}"))
-                })?;
-            let memory = guest_memory(&mut caller, "mem_call")?;
+    let evaluation = runtime.mod_evaluate(module_id);
+    runtime
+        .run_event_loop(PollEventLoopOptions::default())
+        .await
+        .map_err(runtime_error)?;
+    evaluation.await.map_err(runtime_error)?;
+    Ok(())
+}
 
-            // Arguments are raw NaN-box bits in guest memory; almost every
-            // call has few, so read into a stack buffer instead of allocating.
-            let mut raw_stack = [0u8; 16 * 8];
-            let mut raw_spill = Vec::new();
-            let raw: &mut [u8] = if arg_count <= 16 {
-                &mut raw_stack[..arg_count * 8]
-            } else {
-                raw_spill.resize(arg_count * 8, 0);
-                &mut raw_spill
-            };
-            memory.read(&caller, base, raw).map_err(|e| {
-                wasmtime::Error::msg(format!("mem_call {name}: bad arg range: {e}"))
-            })?;
-            let mut args_stack = [0u64; 16];
-            let mut args_spill = Vec::new();
-            let args: &[u64] =
-                if arg_count <= 16 {
-                    for (slot, chunk) in args_stack.iter_mut().zip(raw.chunks_exact(8)) {
-                        *slot = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
-                    }
-                    &args_stack[..arg_count]
-                } else {
-                    args_spill.extend(raw.chunks_exact(8).map(|chunk| {
-                        u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"))
-                    }));
-                    &args_spill
-                };
+fn runtime_error(error: impl std::fmt::Display) -> PlatformError {
+    PlatformError::runtime(error.to_string())
+}
 
-            let result = dispatch(&mut caller, &name, args)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
 
-            if returns_i32 {
-                let value = match decode(result) {
-                    JsValue::Bool(b) => i32::from(b),
-                    JsValue::Number(n) => n as i32,
-                    _ => 0,
-                };
-                results[0] = Val::I32(value);
-            } else {
-                memory
-                    .write(&mut caller, base, &result.to_le_bytes())
-                    .map_err(|e| {
-                        wasmtime::Error::msg(format!("mem_call {name}: result writeback: {e}"))
-                    })?;
-                results[0] = Val::F64(0);
+    async fn resolve_with_event_loop(
+        js_runtime: &mut JsRuntime,
+        value: deno_core::v8::Global<deno_core::v8::Value>,
+    ) -> std::result::Result<deno_core::v8::Global<deno_core::v8::Value>, deno_core::error::CoreError>
+    {
+        let promise = {
+            deno_core::scope!(scope, js_runtime);
+            JsRuntime::scoped_resolve(scope, value)
+        };
+        js_runtime
+            .with_event_loop_promise(promise, PollEventLoopOptions::default())
+            .await
+    }
+
+    fn simple_worker_source() -> &'static str {
+        r#"
+        export default {
+          async fetch(_request) {
+            return new Response("ok");
+          }
+        };
+        "#
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bootstrap_snapshot_builds() {
+        let _ = build_bootstrap_snapshot()
+            .await
+            .expect("bootstrap snapshot should build");
+    }
+
+    #[test]
+    fn bootstrap_extensions_do_not_depend_on_build_tree_files() {
+        for extension in runtime_extensions() {
+            for source in extension.js_files.iter().chain(
+                extension
+                    .lazy_loaded_js_files
+                    .iter()
+                    .chain(extension.esm_files.iter())
+                    .chain(extension.lazy_loaded_esm_files.iter()),
+            ) {
+                assert!(
+                    source.is_runtime_loadable(),
+                    "extension {} requires unavailable build-tree source {source:?}",
+                    extension.name
+                );
             }
-            Ok(())
-        },
-    )?;
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum ResultKind {
-    None,
-    I32,
-    I64,
-    F64,
-}
-
-fn result_kind(func_type: &FuncType) -> ResultKind {
-    match func_type.results().next() {
-        None => ResultKind::None,
-        Some(ValType::I32) => ResultKind::I32,
-        Some(ValType::F64) => ResultKind::F64,
-        _ => ResultKind::I64,
-    }
-}
-
-fn params_to_bits(params: &[Val]) -> Vec<u64> {
-    params
-        .iter()
-        .map(|param| match param {
-            Val::I64(bits) => *bits as u64,
-            Val::I32(n) => encode_number(f64::from(*n)),
-            Val::F64(bits) => encode_number(f64::from_bits(*bits)),
-            _ => TAG_UNDEFINED,
-        })
-        .collect()
-}
-
-fn write_result(
-    caller: &mut Caller<'_, HostState>,
-    kind: ResultKind,
-    outcome: u64,
-    results: &mut [Val],
-) {
-    match kind {
-        ResultKind::None => {}
-        ResultKind::I32 => {
-            results[0] = Val::I32(match decode(outcome) {
-                JsValue::Bool(b) => i32::from(b),
-                JsValue::Number(n) => n as i32,
-                _ => 0,
-            });
-        }
-        ResultKind::F64 => {
-            results[0] = Val::F64(caller.data().heap.to_number(outcome).to_bits());
-        }
-        ResultKind::I64 => {
-            results[0] = Val::I64(outcome as i64);
         }
     }
-}
 
-/// Adapter for individually-declared `rt.*` imports: convert wasm params to
-/// NaN-box bits, run the shared dispatcher, convert back per the declared
-/// result type.
-fn bind_rt_adapter(
-    linker: &mut Linker<HostState>,
-    func_type: FuncType,
-    name: String,
-) -> std::result::Result<(), wasmtime::Error> {
-    let kind = result_kind(&func_type);
-    let import_name = name.clone();
-    linker.func_new(
-        "rt",
-        &import_name,
-        func_type,
-        move |mut caller, params, results| {
-            let args = params_to_bits(params);
-            let outcome = dispatch(&mut caller, &name, &args)?;
-            write_result(&mut caller, kind, outcome, results);
-            Ok(())
-        },
-    )?;
-    Ok(())
-}
+    #[tokio::test]
+    #[serial]
+    async fn runtime_starts_from_bootstrap_snapshot() {
+        let snapshot = build_bootstrap_snapshot()
+            .await
+            .expect("bootstrap snapshot should build");
+        let _ = new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+    }
 
-/// dd's own host surface, reachable from TS via `declare function`; the
-/// implementations live in [`crate::host_api`].
-fn bind_ffi(
-    linker: &mut Linker<HostState>,
-    func_type: FuncType,
-    name: String,
-) -> std::result::Result<(), wasmtime::Error> {
-    let kind = result_kind(&func_type);
-    let import_name = name.clone();
-    linker.func_new(
-        "ffi",
-        &import_name,
-        func_type,
-        move |mut caller, params, results| {
-            let args = params_to_bits(params);
-            let outcome = crate::host_api::dispatch_ffi(&mut caller, &name, &args)?;
-            write_result(&mut caller, kind, outcome, results);
-            Ok(())
-        },
-    )?;
-    Ok(())
+    #[test]
+    #[serial]
+    fn deno_fetch_classes_work_from_bootstrap_snapshot() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime =
+            new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
+                .expect("runtime should start from snapshot");
+
+        js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                globalThis.__dd_test_request = new Request("http://example.com/test", {
+                  method: "POST",
+                  body: "hi",
+                });
+                globalThis.__dd_test_response = Response.json({ ok: true });
+                globalThis.__dd_test_headers = new Headers([["x-dd", "ok"]]);
+                globalThis.__dd_test_form_data = new FormData();
+                globalThis.__dd_test_form_data.append("name", "value");
+                globalThis.__dd_test_ctor_match = JSON.stringify({
+                  fetch: typeof globalThis.fetch === "function"
+                    && globalThis.fetch === globalThis.__dd_deno_runtime.fetch,
+                  request: globalThis.Request === globalThis.__dd_deno_runtime.Request,
+                  headers: globalThis.Headers === globalThis.__dd_deno_runtime.Headers,
+                  response: globalThis.Response === globalThis.__dd_deno_runtime.Response,
+                  formData: globalThis.FormData === globalThis.__dd_deno_runtime.FormData,
+                });
+                "#,
+            )
+            .expect("fetch classes should construct");
+
+        let request_url = js_runtime
+            .execute_script("<dd:test>", "globalThis.__dd_test_request.url")
+            .expect("request url should execute");
+        let response_text_promise = js_runtime
+            .execute_script("<dd:test>", "globalThis.__dd_test_response.text()")
+            .expect("response.text should execute");
+        let response_content_type = js_runtime
+            .execute_script(
+                "<dd:test>",
+                "globalThis.__dd_test_response.headers.get('content-type')",
+            )
+            .expect("response content-type should execute");
+        let header_value = js_runtime
+            .execute_script("<dd:test>", "globalThis.__dd_test_headers.get('x-dd')")
+            .expect("headers get should execute");
+        let form_value = js_runtime
+            .execute_script("<dd:test>", "globalThis.__dd_test_form_data.get('name')")
+            .expect("formdata get should execute");
+        let ctor_match = js_runtime
+            .execute_script("<dd:test>", "globalThis.__dd_test_ctor_match")
+            .expect("constructor match should execute");
+        runtime
+            .block_on(async {
+                js_runtime
+                    .run_event_loop(PollEventLoopOptions::default())
+                    .await
+            })
+            .expect("event loop should run");
+        let request_url = runtime
+            .block_on(resolve_with_event_loop(&mut js_runtime, request_url))
+            .expect("request url should resolve");
+        let response_text = runtime
+            .block_on(resolve_with_event_loop(
+                &mut js_runtime,
+                response_text_promise,
+            ))
+            .expect("response text should resolve");
+        let response_content_type = runtime
+            .block_on(resolve_with_event_loop(
+                &mut js_runtime,
+                response_content_type,
+            ))
+            .expect("response content-type should resolve");
+        let header_value = runtime
+            .block_on(resolve_with_event_loop(&mut js_runtime, header_value))
+            .expect("header value should resolve");
+        let form_value = runtime
+            .block_on(resolve_with_event_loop(&mut js_runtime, form_value))
+            .expect("form value should resolve");
+        let ctor_match = runtime
+            .block_on(resolve_with_event_loop(&mut js_runtime, ctor_match))
+            .expect("constructor match should resolve");
+        {
+            deno_core::scope!(scope, js_runtime);
+            let request_url = request_url
+                .open(scope)
+                .to_string(scope)
+                .expect("request url should stringify")
+                .to_rust_string_lossy(scope);
+            let response_text = response_text
+                .open(scope)
+                .to_string(scope)
+                .expect("response text should stringify")
+                .to_rust_string_lossy(scope);
+            let response_content_type = response_content_type
+                .open(scope)
+                .to_string(scope)
+                .expect("content type should stringify")
+                .to_rust_string_lossy(scope);
+            let header_value = header_value
+                .open(scope)
+                .to_string(scope)
+                .expect("header value should stringify")
+                .to_rust_string_lossy(scope);
+            let form_value = form_value
+                .open(scope)
+                .to_string(scope)
+                .expect("form value should stringify")
+                .to_rust_string_lossy(scope);
+            let ctor_match = ctor_match
+                .open(scope)
+                .to_string(scope)
+                .expect("constructor match should stringify")
+                .to_rust_string_lossy(scope);
+            assert_eq!(request_url, "http://example.com/test");
+            assert_eq!(response_text, r#"{"ok":true}"#);
+            assert_eq!(response_content_type, "application/json");
+            assert_eq!(header_value, "ok");
+            assert_eq!(form_value, "value");
+            assert_eq!(
+                ctor_match,
+                r#"{"fetch":true,"request":true,"headers":true,"response":true,"formData":true}"#
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn direct_worker_fetch_works_after_loading_worker_into_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime.block_on(async {
+            let bootstrap = build_bootstrap_snapshot()
+                .await
+                .expect("bootstrap snapshot should build");
+            validate_worker(bootstrap, simple_worker_source(), false)
+                .await
+                .expect("worker should validate");
+            bootstrap
+        });
+        let mut js_runtime =
+            new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
+                .expect("runtime should start from bootstrap snapshot");
+        runtime
+            .block_on(load_worker(&mut js_runtime, simple_worker_source()))
+            .expect("worker should load into runtime");
+
+        let response_promise = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                globalThis.__dd_test_direct_fetch = globalThis.__dd_worker.fetch(
+                  new Request("http://worker/"),
+                  {},
+                  { waitUntil() {} },
+                );
+                globalThis.__dd_test_direct_fetch.then((response) => String(response.status));
+                "#,
+            )
+            .expect("direct worker fetch should execute");
+        runtime
+            .block_on(async {
+                js_runtime
+                    .run_event_loop(PollEventLoopOptions::default())
+                    .await
+            })
+            .expect("event loop should run");
+        let response_value = runtime
+            .block_on(resolve_with_event_loop(&mut js_runtime, response_promise))
+            .expect("response promise should resolve");
+        deno_core::scope!(scope, js_runtime);
+        let response_json = response_value
+            .open(scope)
+            .to_string(scope)
+            .expect("response should stringify")
+            .to_rust_string_lossy(scope);
+        assert_eq!(response_json, "200");
+    }
+
+    #[test]
+    #[serial]
+    fn response_constructor_works_after_loading_worker_into_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime.block_on(async {
+            let bootstrap = build_bootstrap_snapshot()
+                .await
+                .expect("bootstrap snapshot should build");
+            validate_worker(bootstrap, simple_worker_source(), false)
+                .await
+                .expect("worker should validate");
+            bootstrap
+        });
+        let mut js_runtime =
+            new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
+                .expect("runtime should start from bootstrap snapshot");
+        runtime
+            .block_on(load_worker(&mut js_runtime, simple_worker_source()))
+            .expect("worker should load into runtime");
+
+        let response_value = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                String(new Response("ok").status)
+                "#,
+            )
+            .expect("response constructor should execute");
+        deno_core::scope!(scope, js_runtime);
+        let response_value = response_value
+            .open(scope)
+            .to_string(scope)
+            .expect("response should stringify")
+            .to_rust_string_lossy(scope);
+        assert_eq!(response_value, "200");
+    }
 }
