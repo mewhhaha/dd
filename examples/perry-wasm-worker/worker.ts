@@ -1,7 +1,8 @@
 // Experimental dd worker for the Perry wasm runtime (crates/wasm-host).
 // Compile with: perry compile worker.ts -o worker.wasm --target wasm
 //
-// The host provides these three functions; everything else is plain TS.
+// The host provides these functions (full surface incl. KV, memory, cache,
+// fetch, and service bindings: docs/perry-wasm-experiment.md).
 declare function dd_register(
   fetchHandler: (method: string, url: string, body: string) => unknown,
 ): void;

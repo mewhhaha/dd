@@ -93,6 +93,11 @@ impl Heap {
         self.strings.get(id as usize).map(String::as_str)
     }
 
+    /// Interned-string count, used by the engine to decide instance recycling.
+    pub fn strings_len(&self) -> usize {
+        self.strings.len()
+    }
+
     pub fn intern_bits(&mut self, value: String) -> u64 {
         let id = self.intern_string(value);
         encode(JsValue::Str(id))

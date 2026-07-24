@@ -12,34 +12,69 @@ every runtime function the module imports.
 ```bash
 npm install -g @perryts/perry
 perry compile examples/perry-wasm-worker/worker.ts -o worker.wasm --target wasm
-cargo run -p wasm_host --bin dd_wasm_server -- --worker worker.wasm --port 8090
+cargo run -p wasm_host --bin dd_wasm_server -- --worker worker.wasm \
+  --store-dir ./wasm-store --port 8090
 curl http://127.0.0.1:8090/perry
 ```
+
+`--store-dir` attaches disk-backed KV, memory namespaces, and the response
+cache (shared `storage` crate with the V8 runtime). `--service name=path`
+loads co-deployed workers reachable through `dd_service_fetch`;
+`--assets-dir` serves static files before worker code runs.
 
 ## Worker contract
 
 Perry has no module-export story under `--target wasm`, but a bodyless
 `declare function` compiles to a wasm import in the `ffi` namespace. dd uses
-that as its host API — a worker declares and calls:
+that as its host API. Declare only what you use — but never with optional
+parameters (Perry emits an invalid call for omitted optional args on `ffi`
+imports; pass every argument explicitly):
 
 ```ts
+// Registration and request access
 declare function dd_register(
   fetchHandler: (method: string, url: string, body: string) => unknown,
 ): void;
-declare function dd_header(name: string): string | null; // current request header
-declare function dd_json(value: unknown): string;        // host-side JSON.stringify
+declare function dd_header(name: string): string | null;
+declare function dd_json(value: unknown): string; // host-side JSON.stringify
 
-dd_register((method, url, body) => ({
-  status: 200,
-  headers: { "content-type": "application/json" },
-  body: dd_json({ hello: new URL(url).pathname }),
-}));
+// KV (write-last, monotonic versions — same store as the V8 runtime)
+declare function dd_kv_get(binding: string, key: string): string | null;
+declare function dd_kv_set(binding: string, key: string, value: string): void;
+declare function dd_kv_delete(binding: string, key: string): void;
+declare function dd_kv_list(binding: string, prefix: string): string[];
+
+// Keyed memory namespaces: `command` runs under the key's lock; tvar writes
+// commit atomically with the command's completion
+declare function dd_memory_atomic(
+  binding: string, key: string, command: () => unknown,
+): any;
+declare function dd_tvar_read(name: string): any;   // inside command only
+declare function dd_tvar_write(name: string, value: unknown): void;
+
+// Worker-scoped response cache (honors cache-control on the stored response)
+declare function dd_cache_match(url: string): any;  // {status, headers, body} | null
+declare function dd_cache_put(url: string, response: unknown): void;
+declare function dd_cache_delete(url: string): boolean;
+
+// Outbound HTTP (synchronous; 16 MiB response cap, 10 s timeout)
+declare function dd_fetch(url: string, options: unknown): any;
+
+// Co-deployed workers
+declare function dd_service_fetch(
+  binding: string, method: string, url: string, body: string,
+): any;
 ```
 
 The handler returns either a plain string (served as `text/plain`) or an
-object with optional `status`, `headers`, and `body` fields. Each request
-runs in a fresh instance: module top level re-runs, so workers are stateless
-across requests by construction.
+object with optional `status`, `headers`, and `body` fields. Values coming
+back from the host (`dd_fetch`, `dd_cache_match`, `dd_service_fetch`,
+`dd_tvar_read`) must be typed `any` and accessed dynamically — Perry's
+typed-shape field lowering breaks on host-created objects.
+
+Instances are pooled and reused across requests, so module-level state
+persists the way it does in a reused V8 isolate (and is lost on recycle —
+use KV or memory namespaces for anything durable).
 
 ## How it works
 
@@ -85,12 +120,19 @@ has the same behavior):
 - **Mutating an array stored in a class field** (`this.items.push(x)`) is a
   silent no-op (frame-layout bug in the generic `class_call_method`
   fallback). Use local arrays.
+- **Optional parameters on `declare function`** produce invalid wasm when an
+  argument is omitted at a call site — declare exact arities.
 
 Host limitations of this experiment:
 
-- No outbound `fetch` (errors loudly), no KV/cache/memory bindings yet, no
-  UI bridge. String indices are Unicode scalar positions (exact for BMP
-  text). Regex support is literal-plus-anchors only.
+- No websockets (long-lived connection upgrades are not wired through the
+  server) and no dynamic workers (`env.SANDBOX`) — dynamic workers would
+  need the Perry compiler itself at runtime, since worker code arrives as
+  TypeScript source. No UI bridge. String indices are Unicode scalar
+  positions (exact for BMP text). Regex support is literal-plus-anchors
+  only. Memory namespaces commit tvar state but not the outbox-effect
+  machinery of the V8 runtime, and tvars written by the V8 runtime (v8sc
+  encoding) are rejected rather than decoded.
 
 ## Benchmarks
 
@@ -102,17 +144,15 @@ DD_BENCH_REQUESTS=5000 DD_BENCH_CONCURRENCY=64 \
 
 Reports module compile time plus invoke throughput and mean/p50/p95/p99
 latency, the same metrics as `cargo run -p runtime --bin bench --release`
-(steady-state section) for the V8 runtime. When comparing, remember the
-methodology difference: the wasm engine pays a full cold start (fresh
-instance + `_start`) on every request, while the V8 bench measures warm
-reused isolates; the wasm bench also drives the engine directly where the
-V8 bench goes through `RuntimeService` dispatch, and the workers differ
-(the wasm fixture parses the URL and builds JSON via `dd_json`).
+(steady-state section) for the V8 runtime. Instances are pooled, so both
+runtimes measure warm request paths; the wasm bench drives the engine
+directly where the V8 bench goes through `RuntimeService` dispatch, and the
+workers differ (the wasm fixture parses the URL and builds JSON via
+`dd_json`).
 
 ## Fixtures
 
 Integration tests run against real Perry-compiled modules vendored in
 `crates/wasm-host/fixtures/`. Rebuild them with
-`scripts/build-perry-wasm-fixtures.sh` after Perry upgrades (fixture sources
-are `examples/perry-wasm-worker/worker.ts` and
-`crates/wasm-host/fixtures/features_worker.ts`).
+`scripts/build-perry-wasm-fixtures.sh` after Perry upgrades (each fixture's
+TypeScript source sits next to its `.wasm`).

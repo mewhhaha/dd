@@ -2174,6 +2174,21 @@ pub fn json_stringify_bits(
     }
 }
 
+/// Decode a heap value to JSON (`None` for `undefined`/functions), used by
+/// the tvar persistence in `dd_memory_atomic`.
+pub fn heap_to_json_value(
+    state: &HostState,
+    bits: u64,
+) -> Result<Option<serde_json::Value>, wasmtime::Error> {
+    heap_to_json(state, bits, 0)
+}
+
+/// Materialize a JSON value into the heap, used to hand persisted tvars back
+/// to the guest.
+pub fn json_value_to_heap(state: &mut HostState, value: &serde_json::Value) -> u64 {
+    json_to_heap(state, value)
+}
+
 /// Extremely small regex support: Perry's `regexp_test` goes through the host,
 /// and full JS regex is out of scope for the experiment. Literal text plus
 /// `^`/`$` anchors and `.` are handled; anything else is rejected loudly.

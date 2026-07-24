@@ -11,7 +11,9 @@
 mod bridge;
 mod engine;
 mod heap;
+mod host_api;
 mod nanbox;
 mod state;
 
-pub use engine::{InvokeOptions, WorkerModule};
+pub use engine::{InvokeOptions, WorkerModule, WorkerOptions};
+pub use state::{ServiceRegistry, WorkerStores};

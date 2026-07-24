@@ -55,10 +55,7 @@ pub async fn ensure_storage_migration_table(conn: &Connection) -> turso::Result<
     Ok(())
 }
 
-pub async fn storage_schema_version(
-    conn: &Connection,
-    component: &str,
-) -> turso::Result<i64> {
+pub async fn storage_schema_version(conn: &Connection, component: &str) -> turso::Result<i64> {
     let mut rows = query_cached(
         conn,
         "SELECT COALESCE(MAX(version), 0)

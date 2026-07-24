@@ -1,19 +1,23 @@
-//! Perry wasm worker engine: instantiation, dd's `ffi` surface, the event
-//! loop, and request dispatch.
+//! Perry wasm worker engine: instantiation, the event loop, and request
+//! dispatch. dd's `ffi` feature surface lives in [`crate::host_api`].
 //!
-//! Execution model: one fresh instance per request. `_start` runs the
-//! worker's top level (string interning, class registration, `dd_register`),
-//! then the registered fetch closure is called with `(method, url, body)`.
-//! The worker is stateless across requests by construction.
+//! Execution model: instances are pooled and reused across requests, so
+//! module-level state persists the way it does in a reused V8 isolate.
+//! `_start` runs once per instance (string interning, class registration,
+//! `dd_register`); each request then calls the registered fetch closure with
+//! `(method, url, body)`. Instances are recycled once their host heap grows
+//! past a threshold, bounding the leak inherent to Perry's interning ABI.
 
-use crate::bridge::{call_closure, dispatch, json_stringify_bits, resolve_promise};
+use crate::bridge::{call_closure, dispatch, resolve_promise};
 use crate::heap::{HostValue, PromiseState};
-use crate::nanbox::{JsValue, TAG_NULL, TAG_UNDEFINED, decode, encode, encode_number};
-use crate::state::{CurrentRequest, HostState};
+use crate::nanbox::{JsValue, TAG_UNDEFINED, decode, encode, encode_number};
+use crate::state::{CurrentRequest, HostState, ServiceRegistry, WorkerContext, WorkerStores};
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use wasmtime::{Caller, Config, Engine, Extern, FuncType, Linker, Module, Store, Val, ValType};
+use wasmtime::{
+    Caller, Config, Engine, Extern, FuncType, InstancePre, Linker, Module, Store, Val, ValType,
+};
 
 const EPOCH_TICK: Duration = Duration::from_millis(50);
 
@@ -52,14 +56,42 @@ impl Default for InvokeOptions {
     }
 }
 
-/// A compiled Perry worker. Compilation happens once; each `invoke` runs in a
-/// fresh instance.
+/// Deployment-time options for one worker.
+#[derive(Default)]
+pub struct WorkerOptions {
+    pub name: Option<String>,
+    /// Disk-backed stores (KV, memory namespaces, cache). Workers without
+    /// stores get clear errors from the storage `ffi` functions.
+    pub stores: Option<Arc<WorkerStores>>,
+    /// Registry for `dd_service_fetch`; share one registry across co-deployed
+    /// workers and insert the modules after construction.
+    pub services: Option<ServiceRegistry>,
+}
+
+/// Instances kept warm per worker; requests beyond this instantiate fresh.
+const POOL_LIMIT: usize = 32;
+/// Recycle an instance once its interned-string table grows past this —
+/// Perry's ABI interns every dynamic string, so long-lived instances leak.
+const RECYCLE_STRING_THRESHOLD: usize = 262_144;
+
+struct ReadyInstance {
+    store: Store<HostState>,
+}
+
+/// A compiled Perry worker. Compilation and import linking happen once; each
+/// request runs on a pooled warm instance (or a fresh one under load).
 pub struct WorkerModule {
-    module: Module,
+    instance_pre: InstancePre<HostState>,
+    context: Arc<WorkerContext>,
+    pool: Mutex<Vec<ReadyInstance>>,
 }
 
 impl WorkerModule {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::new(bytes, WorkerOptions::default())
+    }
+
+    pub fn new(bytes: &[u8], options: WorkerOptions) -> Result<Self> {
         let module = Module::new(shared_engine(), bytes)
             .map_err(|error| PlatformError::bad_request(format!("invalid wasm module: {error}")))?;
 
@@ -81,7 +113,22 @@ impl WorkerModule {
                 }
             }
         }
-        Ok(WorkerModule { module })
+
+        let linker = build_linker(&module)?;
+        let instance_pre = linker.instantiate_pre(&module).map_err(runtime_error)?;
+        let mut context = WorkerContext::default();
+        if let Some(name) = options.name {
+            context.worker_name = name;
+        }
+        context.stores = options.stores;
+        if let Some(services) = options.services {
+            context.services = services;
+        }
+        Ok(WorkerModule {
+            instance_pre,
+            context: Arc::new(context),
+            pool: Mutex::new(Vec::new()),
+        })
     }
 
     pub fn invoke(
@@ -89,14 +136,56 @@ impl WorkerModule {
         invocation: WorkerInvocation,
         options: InvokeOptions,
     ) -> Result<WorkerOutput> {
-        let deadline = Instant::now() + options.timeout;
-        let mut store = Store::new(shared_engine(), HostState::default());
-        let ticks = options.timeout.as_millis() / EPOCH_TICK.as_millis() + 2;
-        store.set_epoch_deadline(ticks as u64);
+        self.invoke_at_depth(invocation, options, 0)
+    }
 
-        let linker = build_linker(&self.module)?;
-        let instance = linker
-            .instantiate(&mut store, &self.module)
+    /// `depth` tracks the `dd_service_fetch` chain; the limit is enforced at
+    /// the call site in `host_api`.
+    pub(crate) fn invoke_at_depth(
+        &self,
+        invocation: WorkerInvocation,
+        options: InvokeOptions,
+        depth: u32,
+    ) -> Result<WorkerOutput> {
+        let deadline = Instant::now() + options.timeout;
+        let ticks = (options.timeout.as_millis() / EPOCH_TICK.as_millis() + 2) as u64;
+
+        let mut ready = match self.checkout() {
+            Some(ready) => ready,
+            None => self.instantiate(deadline, ticks)?,
+        };
+        ready.store.set_epoch_deadline(ticks);
+
+        let outcome = dispatch_request(&mut ready, invocation, deadline, depth);
+
+        // Only healthy instances return to the pool: after an error, guest
+        // and host state can no longer be trusted.
+        if outcome.is_ok() && ready.store.data().heap.strings_len() < RECYCLE_STRING_THRESHOLD {
+            let mut pool = self.pool.lock().expect("pool mutex is never poisoned");
+            if pool.len() < POOL_LIMIT {
+                pool.push(ready);
+            }
+        }
+        outcome
+    }
+
+    fn checkout(&self) -> Option<ReadyInstance> {
+        self.pool
+            .lock()
+            .expect("pool mutex is never poisoned")
+            .pop()
+    }
+
+    /// Build a warm instance: instantiate, run `_start`, verify registration.
+    fn instantiate(&self, deadline: Instant, ticks: u64) -> Result<ReadyInstance> {
+        let mut store = Store::new(
+            shared_engine(),
+            HostState::with_context(Arc::clone(&self.context)),
+        );
+        store.set_epoch_deadline(ticks);
+        let instance = self
+            .instance_pre
+            .instantiate(&mut store)
             .map_err(runtime_error)?;
 
         store.data_mut().table = instance.get_table(&mut store, "__indirect_function_table");
@@ -115,37 +204,66 @@ impl WorkerModule {
             .map_err(runtime_error)?;
         drain_event_loop(&mut store, deadline, None)?;
 
-        let handler = store.data().registered_handler.ok_or_else(|| {
-            PlatformError::bad_request(
+        if store.data().registered_handler.is_none() {
+            return Err(PlatformError::bad_request(
                 "worker never called dd_register(fetchHandler) during startup",
-            )
-        })?;
-
-        store.data_mut().current_request = Some(CurrentRequest {
-            headers: invocation.headers.clone(),
-        });
-        let args = {
-            let state = store.data_mut();
-            [
-                state.heap.intern_bits(invocation.method),
-                state.heap.intern_bits(invocation.url),
-                state
-                    .heap
-                    .intern_bits(String::from_utf8_lossy(&invocation.body).into_owned()),
-            ]
-        };
-        let result = call_closure(&mut store, handler, &args).map_err(runtime_error)?;
-
-        if let Some(exception) = store.data().pending_exception {
-            let message = store.data().heap.display(exception);
-            return Err(PlatformError::runtime(format!(
-                "worker fetch handler threw: {message}"
-            )));
+            ));
         }
-
-        let result = settle(&mut store, result, deadline)?;
-        decode_response(store.data(), result)
+        Ok(ReadyInstance { store })
     }
+}
+
+fn dispatch_request(
+    ready: &mut ReadyInstance,
+    invocation: WorkerInvocation,
+    deadline: Instant,
+    depth: u32,
+) -> Result<WorkerOutput> {
+    let store = &mut ready.store;
+    let handler = store
+        .data()
+        .registered_handler
+        .expect("pooled instances always have a registered handler");
+
+    {
+        let state = store.data_mut();
+        state.current_request = Some(CurrentRequest {
+            headers: invocation.headers,
+        });
+        state.service_depth = depth;
+        state.pending_exception = None;
+    }
+    let args = {
+        let state = store.data_mut();
+        [
+            state.heap.intern_bits(invocation.method),
+            state.heap.intern_bits(invocation.url),
+            state
+                .heap
+                .intern_bits(String::from_utf8_lossy(&invocation.body).into_owned()),
+        ]
+    };
+    let result = call_closure(&mut *store, handler, &args).map_err(runtime_error);
+
+    let outcome = match result {
+        Ok(result) => {
+            if let Some(exception) = store.data().pending_exception {
+                let message = store.data().heap.display(exception);
+                Err(PlatformError::runtime(format!(
+                    "worker fetch handler threw: {message}"
+                )))
+            } else {
+                settle(store, result, deadline).and_then(|bits| decode_response(store.data(), bits))
+            }
+        }
+        Err(error) => Err(error),
+    };
+
+    let state = store.data_mut();
+    state.current_request = None;
+    state.pending_exception = None;
+    state.service_depth = 0;
+    outcome
 }
 
 /// Wait for a promise result to resolve, pumping timers and microtasks.
@@ -565,10 +683,8 @@ fn bind_rt_adapter(
     Ok(())
 }
 
-/// dd's own host surface, reachable from TS via `declare function`:
-///  - `dd_register(handler)` — install the fetch handler
-///  - `dd_header(name)` — current request header (or null)
-///  - `dd_json(value)` — host-side JSON.stringify
+/// dd's own host surface, reachable from TS via `declare function`; the
+/// implementations live in [`crate::host_api`].
 fn bind_ffi(
     linker: &mut Linker<HostState>,
     func_type: FuncType,
@@ -582,37 +698,7 @@ fn bind_ffi(
         func_type,
         move |mut caller, params, results| {
             let args = params_to_bits(params);
-            let first = args.first().copied().unwrap_or(TAG_UNDEFINED);
-            let outcome = match name.as_str() {
-                "dd_register" => {
-                    caller.data_mut().registered_handler = Some(first);
-                    TAG_UNDEFINED
-                }
-                "dd_header" => {
-                    let wanted = caller.data().heap.display(first).to_ascii_lowercase();
-                    let found = caller.data().current_request.as_ref().and_then(|request| {
-                        request
-                            .headers
-                            .iter()
-                            .find(|(key, _)| key.to_ascii_lowercase() == wanted)
-                            .map(|(_, value)| value.clone())
-                    });
-                    match found {
-                        Some(value) => caller.data_mut().heap.intern_bits(value),
-                        None => TAG_NULL,
-                    }
-                }
-                "dd_json" => match json_stringify_bits(caller.data(), first)? {
-                    Some(text) => caller.data_mut().heap.intern_bits(text),
-                    None => TAG_UNDEFINED,
-                },
-                other => {
-                    return Err(wasmtime::Error::msg(format!(
-                        "worker calls undeclared host function ffi.{other} — \
-                     the dd wasm host provides dd_register, dd_header, and dd_json"
-                    )));
-                }
-            };
+            let outcome = crate::host_api::dispatch_ffi(&mut caller, &name, &args)?;
             write_result(&mut caller, kind, outcome, results);
             Ok(())
         },

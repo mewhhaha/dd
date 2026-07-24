@@ -11,9 +11,12 @@ clap.workspace = true
 common = { path = "../common" }
 getrandom = "0.4"
 http-body-util = "0.1"
+mime_guess = "2"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "tokio"] }
+reqwest.workspace = true
 serde_json.workspace = true
+storage = { path = "../storage" }
 sha2 = "0.11"
 tokio.workspace = true
 tracing.workspace = true
@@ -29,3 +32,6 @@ path = "src/bin/dd_wasm_server.rs"
 [[bin]]
 name = "bench_wasm_worker"
 path = "src/bin/bench_wasm_worker.rs"
+
+[dev-dependencies]
+tempfile = "3"
