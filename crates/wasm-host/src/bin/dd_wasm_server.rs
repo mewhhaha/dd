@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
-use wasm_host::{InvokeOptions, ServiceRegistry, WorkerModule, WorkerOptions, WorkerStores};
+use wasm_host::{
+    InvokeOptions, ServiceRegistry, WorkerModule, WorkerOptions, WorkerStores, WsEvent, WsOutbound,
+};
 
 #[derive(Parser)]
 #[command(about = "Serve HTTP through Perry-compiled wasm workers (experimental)")]
@@ -110,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             if let Err(error) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
                 .await
             {
                 tracing::debug!("connection ended: {error}");
@@ -165,6 +168,9 @@ async fn handle(
     server: Arc<Server>,
     request: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if is_websocket_upgrade(&request) {
+        return Ok(accept_websocket(server, request));
+    }
     let (parts, body) = request.into_parts();
 
     if parts.method == hyper::Method::GET
@@ -225,4 +231,120 @@ fn plain_error(message: String) -> Response<Full<Bytes>> {
         .header("content-type", "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(message)))
         .expect("static error response cannot fail to build")
+}
+
+fn is_websocket_upgrade(request: &Request<hyper::body::Incoming>) -> bool {
+    let headers = request.headers();
+    request.method() == hyper::Method::GET
+        && headers
+            .get(hyper::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        && headers.contains_key(hyper::header::SEC_WEBSOCKET_KEY)
+}
+
+/// Complete the websocket handshake and bridge frames to the worker's
+/// dispatcher: inbound text becomes `WsEvent`s, outbound `WsOutbound`s from
+/// any handler are written back to this client.
+fn accept_websocket(
+    server: Arc<Server>,
+    mut request: Request<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let key = request
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_KEY)
+        .expect("checked by is_websocket_upgrade")
+        .clone();
+    let accept = derive_accept_key(key.as_bytes());
+    let host = request
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+    let url = format!("http://{host}{}", request.uri());
+
+    let module = Arc::clone(&server.module);
+    tokio::spawn(async move {
+        let upgraded = match hyper::upgrade::on(&mut request).await {
+            Ok(upgraded) => upgraded,
+            Err(error) => {
+                tracing::debug!("websocket upgrade failed: {error}");
+                return;
+            }
+        };
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            TokioIo::new(upgraded),
+            Role::Server,
+            None,
+        )
+        .await;
+        run_websocket_connection(module, url, ws).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(hyper::header::UPGRADE, "websocket")
+        .header(hyper::header::CONNECTION, "Upgrade")
+        .header(hyper::header::SEC_WEBSOCKET_ACCEPT, accept)
+        .body(Full::new(Bytes::new()))
+        .expect("static upgrade response cannot fail to build")
+}
+
+async fn run_websocket_connection<S>(
+    module: Arc<WorkerModule>,
+    url: String,
+    ws: tokio_tungstenite::WebSocketStream<S>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (connection, mut outbound) = module.ws_connections().register();
+    let events = module.websocket_events();
+    let (mut sink, mut stream) = ws.split();
+
+    if events.send(WsEvent::Open { connection, url }).is_err() {
+        module.ws_connections().remove(connection);
+        return;
+    }
+
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = outbound.recv().await {
+            let message = match frame {
+                WsOutbound::Text(text) => Message::Text(text.into()),
+                WsOutbound::Close => Message::Close(None),
+            };
+            let is_close = matches!(message, Message::Close(_));
+            if sink.send(message).await.is_err() || is_close {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    while let Some(frame) = stream.next().await {
+        match frame {
+            Ok(Message::Text(text)) => {
+                if events
+                    .send(WsEvent::Message {
+                        connection,
+                        text: text.to_string(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {} // ping/pong handled by tungstenite; binary unsupported
+        }
+    }
+
+    module.ws_connections().remove(connection);
+    let _ = events.send(WsEvent::Closed { connection });
+    writer.abort();
 }

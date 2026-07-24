@@ -74,8 +74,18 @@ const POOL_LIMIT: usize = 32;
 /// Perry's ABI interns every dynamic string, so long-lived instances leak.
 const RECYCLE_STRING_THRESHOLD: usize = 262_144;
 
-struct ReadyInstance {
+pub(crate) struct ReadyInstance {
     store: Store<HostState>,
+}
+
+impl ReadyInstance {
+    pub(crate) fn store_mut(&mut self) -> &mut Store<HostState> {
+        // Re-arm the epoch deadline so each websocket event gets a fresh
+        // budget instead of inheriting the countdown from instance creation.
+        self.store
+            .set_epoch_deadline((5_000 / EPOCH_TICK.as_millis() + 2) as u64);
+        &mut self.store
+    }
 }
 
 /// A compiled Perry worker. Compilation and import linking happen once; each
@@ -84,6 +94,7 @@ pub struct WorkerModule {
     instance_pre: InstancePre<HostState>,
     context: Arc<WorkerContext>,
     pool: Mutex<Vec<ReadyInstance>>,
+    ws_events: Mutex<Option<std::sync::mpsc::Sender<crate::ws::WsEvent>>>,
 }
 
 impl WorkerModule {
@@ -128,6 +139,7 @@ impl WorkerModule {
             instance_pre,
             context: Arc::new(context),
             pool: Mutex::new(Vec::new()),
+            ws_events: Mutex::new(None),
         })
     }
 
@@ -167,6 +179,39 @@ impl WorkerModule {
             }
         }
         outcome
+    }
+
+    /// The per-worker connection registry, used by the server's upgrade path
+    /// and by `dd_ws_send` from any instance.
+    pub fn ws_connections(&self) -> Arc<crate::state::WsConnections> {
+        Arc::clone(&self.context.ws_connections)
+    }
+
+    /// Sender feeding the worker's websocket dispatcher; the dispatcher
+    /// thread and its dedicated instance start on first use.
+    pub fn websocket_events(self: &Arc<Self>) -> std::sync::mpsc::Sender<crate::ws::WsEvent> {
+        let mut slot = self
+            .ws_events
+            .lock()
+            .expect("ws sender mutex is never poisoned");
+        if let Some(sender) = slot.as_ref() {
+            return sender.clone();
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let module = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("dd-wasm-ws".to_string())
+            .spawn(move || crate::ws::run_dispatcher(&module, receiver))
+            .expect("websocket dispatcher thread failed to spawn");
+        *slot = Some(sender.clone());
+        sender
+    }
+
+    /// A warm instance for the websocket dispatcher (not pooled).
+    pub(crate) fn websocket_instance(&self) -> Result<ReadyInstance> {
+        let timeout = Duration::from_secs(5);
+        let ticks = (timeout.as_millis() / EPOCH_TICK.as_millis() + 2) as u64;
+        self.instantiate(Instant::now() + timeout, ticks)
     }
 
     fn checkout(&self) -> Option<ReadyInstance> {
@@ -306,6 +351,12 @@ fn settle(store: &mut Store<HostState>, bits: u64, deadline: Instant) -> Result<
 /// (used while a response promise is pending). With `None`, only run work
 /// that is already due and return — a worker that schedules a long timer at
 /// startup must not delay its synchronous responses.
+/// Run already-due microtasks and timers without sleeping; used after each
+/// websocket event so `.then` chains settle before the next event.
+pub(crate) fn pump_microtasks(store: &mut Store<HostState>) -> Result<()> {
+    drain_event_loop(store, Instant::now() + Duration::from_secs(1), None)
+}
+
 fn drain_event_loop(
     store: &mut Store<HostState>,
     deadline: Instant,

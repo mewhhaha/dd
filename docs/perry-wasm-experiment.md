@@ -64,6 +64,12 @@ declare function dd_fetch(url: string, options: unknown): any;
 declare function dd_service_fetch(
   binding: string, method: string, url: string, body: string,
 ): any;
+
+// Websockets: handlers run on one dedicated instance per worker, so
+// module-level state spans connections; sends work from any handler
+declare function dd_ws_register(handlers: unknown): void; // {open?, message?, close?}
+declare function dd_ws_send(connection: number, data: string): boolean;
+declare function dd_ws_close(connection: number): void;
 ```
 
 The handler returns either a plain string (served as `text/plain`) or an
@@ -125,10 +131,10 @@ has the same behavior):
 
 Host limitations of this experiment:
 
-- No websockets (long-lived connection upgrades are not wired through the
-  server) and no dynamic workers (`env.SANDBOX`) — dynamic workers would
-  need the Perry compiler itself at runtime, since worker code arrives as
-  TypeScript source. No UI bridge. String indices are Unicode scalar
+- No dynamic workers (`env.SANDBOX`) — they would need the Perry compiler
+  itself at runtime, since worker code arrives as TypeScript source. No UI
+  bridge. Websocket messages are text-only (binary frames are dropped), and
+  all websocket handlers of a worker share one serialized instance. String indices are Unicode scalar
   positions (exact for BMP text). Regex support is literal-plus-anchors
   only. Memory namespaces commit tvar state but not the outbox-effect
   machinery of the V8 runtime, and tvars written by the V8 runtime (v8sc

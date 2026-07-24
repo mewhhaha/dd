@@ -10,7 +10,7 @@ perry="${PERRY:-perry}"
 "$perry" compile "$repo_root/examples/perry-wasm-worker/worker.ts" \
   -o "$fixtures/hello_worker.wasm" --target wasm
 
-for name in features stateful edge auth; do
+for name in features stateful edge auth chat; do
   "$perry" compile "$fixtures/${name}_worker.ts" \
     -o "$fixtures/${name}_worker.wasm" --target wasm
 done

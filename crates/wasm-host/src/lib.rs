@@ -14,6 +14,8 @@ mod heap;
 mod host_api;
 mod nanbox;
 mod state;
+mod ws;
 
 pub use engine::{InvokeOptions, WorkerModule, WorkerOptions};
-pub use state::{ServiceRegistry, WorkerStores};
+pub use state::{ServiceRegistry, WorkerStores, WsConnections};
+pub use ws::{WsEvent, WsOutbound};

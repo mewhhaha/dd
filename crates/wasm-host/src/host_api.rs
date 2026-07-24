@@ -46,6 +46,9 @@ pub const FFI_FUNCTIONS: &[&str] = &[
     "dd_tvar_write",
     "dd_fetch",
     "dd_service_fetch",
+    "dd_ws_register",
+    "dd_ws_send",
+    "dd_ws_close",
 ];
 
 fn fail(name: &str, detail: impl std::fmt::Display) -> wasmtime::Error {
@@ -274,6 +277,31 @@ pub fn dispatch_ffi(caller: &mut Caller<'_, HostState>, name: &str, args: &[u64]
                 response_headers,
                 response_body,
             ))
+        }
+
+        // ===== Websockets =====
+        "dd_ws_register" => {
+            caller.data_mut().ws_handlers = Some(arg(args, 0));
+            Ok(TAG_UNDEFINED)
+        }
+        "dd_ws_send" => {
+            let connection = caller.data().heap.to_number(arg(args, 0)) as u64;
+            let text = string_arg(caller.data(), args, 1);
+            let delivered = caller
+                .data()
+                .context
+                .ws_connections
+                .send(connection, crate::ws::WsOutbound::Text(text));
+            Ok(crate::nanbox::encode_bool(delivered))
+        }
+        "dd_ws_close" => {
+            let connection = caller.data().heap.to_number(arg(args, 0)) as u64;
+            caller
+                .data()
+                .context
+                .ws_connections
+                .send(connection, crate::ws::WsOutbound::Close);
+            Ok(TAG_UNDEFINED)
         }
 
         // ===== Service bindings =====

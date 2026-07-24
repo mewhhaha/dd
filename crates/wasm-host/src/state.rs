@@ -74,12 +74,57 @@ impl WorkerStores {
 /// Filled in after all modules are loaded so bindings can be cyclic.
 pub type ServiceRegistry = Arc<RwLock<HashMap<String, Arc<crate::engine::WorkerModule>>>>;
 
+/// Live websocket connections of one worker: outbound senders keyed by
+/// connection id. Shared between the websocket dispatcher instance and
+/// regular fetch instances so any handler can push to any connection.
+#[derive(Default)]
+pub struct WsConnections {
+    next_id: std::sync::atomic::AtomicU64,
+    senders:
+        std::sync::Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<crate::ws::WsOutbound>>>,
+}
+
+impl WsConnections {
+    pub fn register(
+        &self,
+    ) -> (
+        u64,
+        tokio::sync::mpsc::UnboundedReceiver<crate::ws::WsOutbound>,
+    ) {
+        let id = 1 + self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.senders
+            .lock()
+            .expect("ws registry is never poisoned")
+            .insert(id, sender);
+        (id, receiver)
+    }
+
+    pub fn remove(&self, id: u64) {
+        self.senders
+            .lock()
+            .expect("ws registry is never poisoned")
+            .remove(&id);
+    }
+
+    pub fn send(&self, id: u64, outbound: crate::ws::WsOutbound) -> bool {
+        let senders = self.senders.lock().expect("ws registry is never poisoned");
+        match senders.get(&id) {
+            Some(sender) => sender.send(outbound).is_ok(),
+            None => false,
+        }
+    }
+}
+
 /// Shared by every instance of one deployed worker.
 pub struct WorkerContext {
     pub worker_name: String,
     pub stores: Option<Arc<WorkerStores>>,
     pub services: ServiceRegistry,
     pub http: reqwest::Client,
+    pub ws_connections: Arc<WsConnections>,
 }
 
 impl Default for WorkerContext {
@@ -92,6 +137,7 @@ impl Default for WorkerContext {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("static reqwest client configuration cannot fail"),
+            ws_connections: Arc::new(WsConnections::default()),
         }
     }
 }
@@ -121,6 +167,8 @@ pub struct HostState {
     pub active_atomic: Option<ActiveAtomic>,
     /// Depth of the `dd_service_fetch` chain that led to this invocation.
     pub service_depth: u32,
+    /// Handlers object installed by `dd_ws_register` ({open, message, close}).
+    pub ws_handlers: Option<u64>,
 }
 
 impl HostState {
@@ -142,6 +190,7 @@ impl HostState {
             context,
             active_atomic: None,
             service_depth: 0,
+            ws_handlers: None,
         }
     }
 }

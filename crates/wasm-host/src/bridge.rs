@@ -364,24 +364,67 @@ pub fn dispatch(caller: &mut Caller<'_, HostState>, name: &str, args: &[u64]) ->
                 class: None,
                 props: Vec::new(),
             }))),
+        // JS arrays and buffers are indexable objects: generated code reaches
+        // `arr[i]` (for-of loops included) through the object_get/set path,
+        // so these arms must handle every indexable receiver, not just plain
+        // objects — mirroring `obj[key]` in the reference glue.
         "object_set" | "object_set_dynamic" => {
             let key = string_arg(caller.data(), arg(args, 1));
             let value = arg(args, 2);
+            let byte = caller.data().heap.to_number(value) as i64 as u8;
             let handle = arg(args, 0);
-            if let JsValue::Handle(id) = decode(handle)
-                && let Some(HostValue::Object(object)) = caller.data_mut().heap.handle_mut(id)
-            {
-                object.set(&key, value);
+            if let JsValue::Handle(id) = decode(handle) {
+                match caller.data_mut().heap.handle_mut(id) {
+                    Some(HostValue::Object(object)) => object.set(&key, value),
+                    Some(HostValue::Array(items)) => {
+                        if let Ok(index) = key.parse::<usize>() {
+                            if index >= items.len() {
+                                items.resize(index + 1, TAG_UNDEFINED);
+                            }
+                            items[index] = value;
+                        }
+                    }
+                    Some(HostValue::Buffer(bytes)) => {
+                        if let Ok(index) = key.parse::<usize>()
+                            && index < bytes.len()
+                        {
+                            bytes[index] = byte;
+                        }
+                    }
+                    _ => {}
+                }
             }
             Ok(handle)
         }
         "object_get" | "object_get_dynamic" => {
             let key = string_arg(caller.data(), arg(args, 1));
             let state = caller.data();
-            if let JsValue::Handle(id) = decode(arg(args, 0))
-                && let Some(HostValue::Object(object)) = state.heap.handle(id)
-            {
-                return Ok(object.get(&key).unwrap_or(TAG_UNDEFINED));
+            if let JsValue::Handle(id) = decode(arg(args, 0)) {
+                match state.heap.handle(id) {
+                    Some(HostValue::Object(object)) => {
+                        return Ok(object.get(&key).unwrap_or(TAG_UNDEFINED));
+                    }
+                    Some(HostValue::Array(items)) => {
+                        if key == "length" {
+                            return Ok(encode_number(items.len() as f64));
+                        }
+                        if let Ok(index) = key.parse::<usize>() {
+                            return Ok(items.get(index).copied().unwrap_or(TAG_UNDEFINED));
+                        }
+                    }
+                    Some(HostValue::Buffer(bytes)) => {
+                        if key == "length" {
+                            return Ok(encode_number(bytes.len() as f64));
+                        }
+                        if let Ok(index) = key.parse::<usize>() {
+                            return Ok(bytes
+                                .get(index)
+                                .map(|b| encode_number(f64::from(*b)))
+                                .unwrap_or(TAG_UNDEFINED));
+                        }
+                    }
+                    _ => {}
+                }
             }
             Ok(TAG_UNDEFINED)
         }
