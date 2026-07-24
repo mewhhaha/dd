@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The manifest must come out byte-identical on every machine, and sort's
+# collation is locale-dependent: under en_US.UTF-8 it ignores the '/' in a
+# path, so lazy/deno_webidl/ sorts before lazy/deno_web/locks.js instead of
+# after it, and --check then fails against a manifest generated under C.
+export LC_ALL=C
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 vendor_root="$repo_root/crates/runtime/js/vendor"
 lazy_root="$vendor_root/lazy"
