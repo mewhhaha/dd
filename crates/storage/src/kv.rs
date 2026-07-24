@@ -924,7 +924,7 @@ impl KvStore {
         Self::from_database(database).await
     }
 
-    pub(crate) async fn open_database(database_url: &str) -> Result<Arc<Database>> {
+    pub async fn open_database(database_url: &str) -> Result<Arc<Database>> {
         let local_path = database_url
             .strip_prefix("file:")
             .unwrap_or(database_url)
@@ -937,7 +937,7 @@ impl KvStore {
         Ok(Arc::new(database))
     }
 
-    pub(crate) async fn from_database(database: Arc<Database>) -> Result<Self> {
+    pub async fn from_database(database: Arc<Database>) -> Result<Self> {
         migrate_kv_schema(&database).await?;
         let profile = Arc::new(KvProfile::default());
         let failed_versions = Arc::new(Mutex::new(HashSet::new()));
@@ -977,11 +977,11 @@ impl KvStore {
         self.profile.reset();
     }
 
-    pub(crate) async fn checkpoint(&self) -> Result<()> {
+    pub async fn checkpoint(&self) -> Result<()> {
         checkpoint_database(&self.database).await.map_err(kv_error)
     }
 
-    pub(crate) async fn health_check(&self) -> Result<()> {
+    pub async fn health_check(&self) -> Result<()> {
         health_check_database(&self.database)
             .await
             .map_err(kv_error)?;
@@ -999,7 +999,7 @@ impl KvStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn shares_database_owner(&self, database: &Arc<Database>) -> bool {
+    pub fn shares_database_owner(&self, database: &Arc<Database>) -> bool {
         Arc::ptr_eq(&self.database, database)
     }
 

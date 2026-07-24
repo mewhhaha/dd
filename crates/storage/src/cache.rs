@@ -698,7 +698,7 @@ impl HotCacheState {
 }
 
 impl CacheStore {
-    pub(crate) async fn from_database(
+    pub async fn from_database(
         config: CacheConfig,
         database: Arc<Database>,
         legacy_blobs: BlobStore,
@@ -1337,7 +1337,7 @@ impl CacheStore {
             .min(i64::MAX as u64) as i64
     }
 
-    pub(crate) async fn flush_pending_touches(&self) -> Result<()> {
+    pub async fn flush_pending_touches(&self) -> Result<()> {
         let result = self.hot_cache.flush_pending_touches().await;
         if result.is_err() {
             self.hot_cache
@@ -1347,21 +1347,21 @@ impl CacheStore {
         result
     }
 
-    pub(crate) fn flush_failure_count(&self) -> u64 {
+    pub fn flush_failure_count(&self) -> u64 {
         self.hot_cache.flush_failures.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn pending_touch_count(&self) -> usize {
+    pub fn pending_touch_count(&self) -> usize {
         self.hot_cache.lock_state().pending_touches.len()
     }
 
-    pub(crate) async fn checkpoint(&self) -> Result<()> {
+    pub async fn checkpoint(&self) -> Result<()> {
         checkpoint_database(&self.database)
             .await
             .map_err(cache_error)
     }
 
-    pub(crate) async fn health_check(&self) -> Result<()> {
+    pub async fn health_check(&self) -> Result<()> {
         health_check_database(&self.database)
             .await
             .map_err(cache_error)?;

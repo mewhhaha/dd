@@ -9,6 +9,7 @@ build = "build.rs"
 [dependencies]
 arc-swap.workspace = true
 common = { path = "../common" }
+storage = { path = "../storage" }
 deno_core.workspace = true
 deno_error = "=0.7.1"
 turso = { git = "https://github.com/tursodatabase/turso", rev = "f548e012cd6ef4ecc3d0f6112d69813e13c54dcb", default-features = false }

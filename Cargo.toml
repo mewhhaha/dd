@@ -5,6 +5,7 @@ members = [
   "crates/common",
   "crates/init",
   "crates/runtime",
+  "crates/storage",
   "crates/wasm-host",
 ]
 resolver = "2"

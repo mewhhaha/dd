@@ -1,18 +1,14 @@
 mod assets;
-mod blob;
-mod cache;
+
+pub(crate) use storage::{blob, cache, json, kv, memory, turso_util};
 mod control_store;
 mod dynamic_modules;
 mod engine;
-mod json;
-mod kv;
-mod memory;
 mod memory_rpc;
 mod memory_rpc_capnp;
 mod ops;
 mod service;
 mod static_assets;
-mod turso_util;
 
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use control_store::{

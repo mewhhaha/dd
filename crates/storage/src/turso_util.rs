@@ -8,7 +8,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const MAX_BUSY_RETRY_ATTEMPTS: usize = 8;
 static STORAGE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn configure_turso_connection(
+pub fn configure_turso_connection(
     conn: &Connection,
     map_error: impl FnOnce(turso::Error) -> PlatformError,
 ) -> Result<()> {
@@ -20,7 +20,7 @@ pub(crate) fn configure_turso_connection(
 ///
 /// Requiring a static SQL string keeps generated selectors and variable-sized
 /// `IN` queries from growing the cache without bound.
-pub(crate) async fn query_cached(
+pub async fn query_cached(
     conn: &Connection,
     sql: &'static str,
     params: impl IntoParams,
@@ -32,7 +32,7 @@ pub(crate) async fn query_cached(
 /// Execute using Turso's per-connection prepared-statement cache.
 ///
 /// See [`query_cached`] for why this accepts only static SQL.
-pub(crate) async fn execute_cached(
+pub async fn execute_cached(
     conn: &Connection,
     sql: &'static str,
     params: impl IntoParams,
@@ -41,7 +41,7 @@ pub(crate) async fn execute_cached(
     statement.execute(params).await
 }
 
-pub(crate) async fn ensure_storage_migration_table(conn: &Connection) -> turso::Result<()> {
+pub async fn ensure_storage_migration_table(conn: &Connection) -> turso::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dd_storage_schema_migrations (
            component TEXT NOT NULL,
@@ -55,7 +55,7 @@ pub(crate) async fn ensure_storage_migration_table(conn: &Connection) -> turso::
     Ok(())
 }
 
-pub(crate) async fn storage_schema_version(
+pub async fn storage_schema_version(
     conn: &Connection,
     component: &str,
 ) -> turso::Result<i64> {
@@ -76,7 +76,7 @@ pub(crate) async fn storage_schema_version(
     Ok(version)
 }
 
-pub(crate) async fn record_storage_schema_version(
+pub async fn record_storage_schema_version(
     conn: &Connection,
     component: &str,
     version: i64,
@@ -93,7 +93,7 @@ pub(crate) async fn record_storage_schema_version(
     Ok(())
 }
 
-pub(crate) async fn retry_turso_busy<F, Fut, T>(
+pub async fn retry_turso_busy<F, Fut, T>(
     mut execute: F,
     map_error: impl Fn(turso::Error) -> PlatformError,
 ) -> Result<T>
@@ -118,15 +118,15 @@ where
     }
 }
 
-pub(crate) fn record_storage_retry() {
+pub fn record_storage_retry() {
     STORAGE_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn storage_retry_count() -> u64 {
+pub fn storage_retry_count() -> u64 {
     STORAGE_RETRY_COUNT.load(Ordering::Relaxed)
 }
 
-pub(crate) async fn checkpoint_database(database: &turso::Database) -> turso::Result<()> {
+pub async fn checkpoint_database(database: &turso::Database) -> turso::Result<()> {
     let conn = database.connect()?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
@@ -141,7 +141,7 @@ pub(crate) async fn checkpoint_database(database: &turso::Database) -> turso::Re
     Ok(())
 }
 
-pub(crate) async fn health_check_database(database: &turso::Database) -> turso::Result<()> {
+pub async fn health_check_database(database: &turso::Database) -> turso::Result<()> {
     let conn = database.connect()?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mut rows = conn.query("SELECT 1", ()).await?;
@@ -154,18 +154,18 @@ pub(crate) async fn health_check_database(database: &turso::Database) -> turso::
     Ok(())
 }
 
-pub(crate) fn is_retryable_turso_error(error: &turso::Error) -> bool {
+pub fn is_retryable_turso_error(error: &turso::Error) -> bool {
     matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 }
 
-pub(crate) struct VersionFloor;
+pub struct VersionFloor;
 
 impl VersionFloor {
-    pub(crate) fn next_i64(counter: &AtomicU64) -> i64 {
+    pub fn next_i64(counter: &AtomicU64) -> i64 {
         counter.fetch_add(1, Ordering::SeqCst) as i64
     }
 
-    pub(crate) fn set_floor(counter: &AtomicU64, floor: u64) {
+    pub fn set_floor(counter: &AtomicU64, floor: u64) {
         let mut current = counter.load(Ordering::SeqCst);
         while current < floor {
             match counter.compare_exchange(current, floor, Ordering::SeqCst, Ordering::SeqCst) {

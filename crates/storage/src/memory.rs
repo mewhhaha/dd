@@ -23,9 +23,9 @@ const MEMORY_LAYOUT_FORMAT_VERSION: u32 = 1;
 const LEGACY_DEFAULT_HASHER_MEMORY_SHARD_HASH_VERSION: u32 = 0;
 const STABLE_SHA256_MEMORY_SHARD_HASH_VERSION: u32 = 1;
 const MEMORY_SHARD_HASH_VERSION: u32 = STABLE_SHA256_MEMORY_SHARD_HASH_VERSION;
-pub(crate) const MEMORY_ENTITY_CACHE_STRIPES: usize = 64;
-pub(crate) const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
-pub(crate) const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const MEMORY_ENTITY_CACHE_STRIPES: usize = 64;
+pub const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4_096;
+pub const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const MEMORY_SCHEMA_VERSION: i64 = 1;
 
 struct MemoryDatabaseEntry {
@@ -571,10 +571,10 @@ pub struct MemoryProfileSnapshot {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct MemoryCachePerformanceSnapshot {
-    pub(crate) snapshot_hits: u64,
-    pub(crate) snapshot_misses: u64,
-    pub(crate) snapshot_evictions: u64,
+pub struct MemoryCachePerformanceSnapshot {
+    pub snapshot_hits: u64,
+    pub snapshot_misses: u64,
+    pub snapshot_evictions: u64,
 }
 
 #[derive(Default)]

@@ -96,12 +96,12 @@ impl MemoryStore {
         self.profile.set_enabled(enabled);
     }
 
-    pub(crate) fn set_snapshot_cache_limits(&mut self, max_entries: usize, max_bytes: usize) {
+    pub fn set_snapshot_cache_limits(&mut self, max_entries: usize, max_bytes: usize) {
         self.snapshot_cache_max_entries = max_entries;
         self.snapshot_cache_max_bytes = max_bytes;
     }
 
-    pub(crate) fn cache_performance_snapshot(&self) -> MemoryCachePerformanceSnapshot {
+    pub fn cache_performance_snapshot(&self) -> MemoryCachePerformanceSnapshot {
         self.profile.cache_performance_snapshot()
     }
 
@@ -124,7 +124,7 @@ impl MemoryStore {
         self.namespace_shards
     }
 
-    pub(crate) async fn checkpoint_all_databases(&self) -> Result<usize> {
+    pub async fn checkpoint_all_databases(&self) -> Result<usize> {
         let shard_files = discover_legacy_memory_shard_files(self.root_dir.as_ref())?;
         for shard_file in &shard_files {
             let path = shard_file.path.to_string_lossy().to_string();
@@ -137,7 +137,7 @@ impl MemoryStore {
         Ok(shard_files.len())
     }
 
-    pub(crate) async fn health_check(&self) -> Result<()> {
+    pub async fn health_check(&self) -> Result<()> {
         if !self.root_dir.is_dir() {
             return Err(PlatformError::internal(
                 "memory storage directory is unavailable",
