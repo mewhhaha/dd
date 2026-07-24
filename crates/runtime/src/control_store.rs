@@ -126,8 +126,10 @@ pub struct ControlRestoreFailure {
     pub error: String,
 }
 
+// Deliberately tolerant of unknown fields: this reads records written by
+// earlier runtimes, so rejecting a field they happened to persist would
+// fail the startup import for a worker that is otherwise intact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct LegacyWorkerDeployment {
     name: String,
     source: String,
@@ -411,21 +413,32 @@ impl ControlStore {
                     path.display()
                 ))
             })?;
-            let mut value: JsonValue = serde_json::from_slice(&bytes).map_err(|error| {
-                PlatformError::internal(format!(
-                    "unrecognized persisted worker format in {}: {error}",
-                    path.display()
-                ))
-            })?;
+            // A record this server cannot read must not keep it from starting:
+            // the whole platform is otherwise held hostage by one stale file.
+            let mut value: JsonValue = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "skipping malformed persisted worker; redeploy it to restore the worker"
+                    );
+                    continue;
+                }
+            };
             migrate_top_level_public(&mut value);
             migrate_actor_bindings(&mut value);
-            let stored: LegacyWorkerDeployment =
-                serde_json::from_value(value).map_err(|error| {
-                    PlatformError::internal(format!(
-                        "unrecognized persisted worker format in {}: {error}",
-                        path.display()
-                    ))
-                })?;
+            let stored: LegacyWorkerDeployment = match serde_json::from_value(value) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "skipping unreadable persisted worker; redeploy it to restore the worker"
+                    );
+                    continue;
+                }
+            };
             deployments.push(ControlDeployment {
                 worker: stored.name,
                 deployment_id: stored.deployment_id,
@@ -1341,10 +1354,14 @@ mod tests {
         tokio::fs::create_dir_all(&workers)
             .await
             .map_err(control_error)?;
+        // Shaped like the record the wasm control plane left on the production
+        // volume: `public` hoisted to the top level, alongside a `services`
+        // key this format never had.
         let legacy = serde_json::json!({
             "name": "memory-counter",
             "source": "export default {}",
             "public": true,
+            "services": {"AUTH": "auth-worker"},
             "config": {
                 "bindings": [],
                 "cache": DeployCacheConfig::default(),
@@ -1367,6 +1384,45 @@ mod tests {
         assert_eq!(store.import_legacy_workers(&workers).await?, 1);
         let restored = store.get_deployment("wasm-era-id").await?;
         assert!(restored.config.public);
+        let _ = tokio::fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skips_unreadable_worker_and_imports_the_rest() -> Result<()> {
+        let root = temp_dir("legacy-unreadable");
+        let workers = root.join("workers");
+        tokio::fs::create_dir_all(&workers)
+            .await
+            .map_err(control_error)?;
+        let intact = serde_json::json!({
+            "name": "intact",
+            "source": "export default {}",
+            "config": {
+                "bindings": [],
+                "public": false,
+                "cache": DeployCacheConfig::default(),
+                "internal": DeployInternalConfig::default()
+            },
+            "assets": [],
+            "server_modules": [],
+            "asset_headers": null,
+            "deployment_id": "intact-id",
+            "updated_at_ms": 1,
+            "expires_at_ms": null
+        });
+        tokio::fs::write(
+            workers.join("intact.json"),
+            serde_json::to_vec(&intact).unwrap(),
+        )
+        .await
+        .map_err(control_error)?;
+        tokio::fs::write(workers.join("broken.json"), b"{ not valid json")
+            .await
+            .map_err(control_error)?;
+        let store = ControlStore::open(&root).await?;
+        assert_eq!(store.import_legacy_workers(&workers).await?, 1);
+        assert_eq!(store.get_deployment("intact-id").await?.worker, "intact");
         let _ = tokio::fs::remove_dir_all(root).await;
         Ok(())
     }
