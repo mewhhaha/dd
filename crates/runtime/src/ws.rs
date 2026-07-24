@@ -55,6 +55,7 @@ pub(crate) fn run_dispatcher(module: &WorkerModule, events: mpsc::Receiver<WsEve
 }
 
 fn dispatch_event(ready: &mut crate::engine::ReadyInstance, event: &WsEvent) -> Result<()> {
+    ready.arm_deadline(std::time::Duration::from_secs(5));
     let store = ready.store_mut();
     let handlers = store
         .data()

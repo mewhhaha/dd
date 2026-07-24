@@ -1,10 +1,10 @@
 //! Engine-level websocket tests: drive the dispatcher through the same
 //! registry and event channel the server uses, without a network in between.
 
+use runtime::{WorkerModule, WsEvent, WsOutbound};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
-use wasm_host::{WorkerModule, WsEvent, WsOutbound};
 
 fn chat_module() -> Arc<WorkerModule> {
     let path = format!("{}/fixtures/chat_worker.wasm", env!("CARGO_MANIFEST_DIR"));
@@ -125,7 +125,7 @@ fn fetch_handler_sees_connection_count_from_ws_instance_state() {
                 body: Vec::new(),
                 request_id: "t".into(),
             },
-            wasm_host::InvokeOptions::default(),
+            runtime::InvokeOptions::default(),
         )
         .expect("invoke");
     assert_eq!(output.body, b"chat:0");

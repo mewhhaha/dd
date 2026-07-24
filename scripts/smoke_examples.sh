@@ -12,7 +12,7 @@ private_port="${PRIVATE_PORT:-18181}"
 store_dir="$(mktemp -d)"
 upstream_port="${UPSTREAM_PORT:-18182}"
 
-cargo build -q -p wasm_host --bin dd_server -p cli --bin dd
+cargo build -q -p runtime --bin dd_server -p cli --bin dd
 
 ./target/debug/dd_server \
   --public-addr "127.0.0.1:$public_port" \
@@ -62,15 +62,18 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).handle_request()
+server = http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+server.handle_request()
+server.handle_request()
 PY
 upstream_pid=$!
 sleep 0.3
-check_contains proxy "$(curl_worker proxy / -X POST -d "http://127.0.0.1:$upstream_port/data")" "upstream-ok"
+check_contains proxy-promise "$(curl_worker proxy / -X POST -d "http://127.0.0.1:$upstream_port/data")" "upstream-ok"
+check_contains proxy-sync "$(curl_worker proxy /sync -X POST -d "http://127.0.0.1:$upstream_port/data")" "upstream-ok"
 wait $upstream_pid 2>/dev/null || true
 
 # Handshake-level websocket check; the full frame round trip lives in
-# crates/wasm-host/tests/server_e2e.rs (node's WebSocket cannot set Host).
+# crates/runtime/tests/server_e2e.rs (node's WebSocket cannot set Host).
 ws_status=$(curl -si --max-time 2 \
   -H "host: chat.example.com" \
   -H "connection: Upgrade" -H "upgrade: websocket" \

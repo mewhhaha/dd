@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use storage::blob::BlobStore;
 use storage::cache::{CacheConfig, CacheStore};
 use storage::kv::KvStore;
 use storage::memory::MemoryStore;
@@ -57,8 +56,7 @@ impl WorkerStores {
         let database_url = store_dir.join("kv.db").display().to_string();
         let database = KvStore::open_database(&database_url).await?;
         let kv = KvStore::from_database(Arc::clone(&database)).await?;
-        let blobs = BlobStore::for_legacy_root(store_dir.join("blobs")).await?;
-        let cache = CacheStore::from_database(CacheConfig::default(), database, blobs).await?;
+        let cache = CacheStore::from_database(CacheConfig::default(), database).await?;
         let memory = MemoryStore::new(
             store_dir.join("memory"),
             8,
@@ -145,6 +143,43 @@ impl Default for WorkerContext {
     }
 }
 
+/// A host operation (async fetch, sleep) completing off-thread. The drain
+/// loop receives these and resolves the associated promise.
+pub struct HostCompletion {
+    pub promise: u32,
+    pub outcome: Result<HostOpOutcome, String>,
+}
+
+pub enum HostOpOutcome {
+    Fetch {
+        status: u16,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    Sleep,
+}
+
+/// Channel pair carried per instance; `pending` counts operations in flight
+/// so the event loop knows whether blocking for a completion can make
+/// progress.
+pub struct HostOps {
+    pub pending: usize,
+    pub sender: std::sync::mpsc::Sender<HostCompletion>,
+    pub receiver: std::sync::mpsc::Receiver<HostCompletion>,
+}
+
+impl Default for HostOps {
+    fn default() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        HostOps {
+            pending: 0,
+            sender,
+            receiver,
+        }
+    }
+}
+
 /// One `dd_memory_atomic` in progress: the loaded tvar values for the locked
 /// key, plus which of them the command wrote.
 pub struct ActiveAtomic {
@@ -172,6 +207,7 @@ pub struct HostState {
     pub service_depth: u32,
     /// Handlers object installed by `dd_ws_register` ({open, message, close}).
     pub ws_handlers: Option<u64>,
+    pub host_ops: HostOps,
 }
 
 impl HostState {
@@ -194,6 +230,7 @@ impl HostState {
             active_atomic: None,
             service_depth: 0,
             ws_handlers: None,
+            host_ops: HostOps::default(),
         }
     }
 }

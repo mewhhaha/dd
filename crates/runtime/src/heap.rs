@@ -76,17 +76,41 @@ pub enum HostValue {
     SearchParams(Vec<(String, String)>),
 }
 
+/// Strings at or under this length are deduplicated on interning. Repeated
+/// values (method names, header names, common bodies) would otherwise append
+/// a fresh table entry per request and drive pooled instances into early
+/// recycling.
+const STRING_DEDUP_MAX_LEN: usize = 64;
+
 #[derive(Default)]
 pub struct Heap {
     strings: Vec<String>,
-    handles: HashMap<u32, HostValue>,
-    next_handle: u32,
+    dedup: HashMap<String, u32>,
+    /// Handle ids are `index + 1` — id 0 is never issued, matching the
+    /// guest-visible convention that 0 is not a valid handle.
+    handles: Vec<HostValue>,
 }
 
 impl Heap {
-    pub fn intern_string(&mut self, value: String) -> u32 {
+    /// Append unconditionally. Guest literals registered through
+    /// `rt.string_new` MUST use this: their ids are assigned by position and
+    /// the module refers to them by compile-time index.
+    pub fn append_literal(&mut self, value: String) -> u32 {
         self.strings.push(value);
         (self.strings.len() - 1) as u32
+    }
+
+    /// Intern a host-created string, deduplicating short values.
+    pub fn intern_string(&mut self, value: String) -> u32 {
+        if value.len() <= STRING_DEDUP_MAX_LEN {
+            if let Some(id) = self.dedup.get(&value) {
+                return *id;
+            }
+            let id = self.append_literal(value.clone());
+            self.dedup.insert(value, id);
+            return id;
+        }
+        self.append_literal(value)
     }
 
     pub fn string(&self, id: u32) -> Option<&str> {
@@ -104,10 +128,8 @@ impl Heap {
     }
 
     pub fn alloc(&mut self, value: HostValue) -> u32 {
-        self.next_handle += 1;
-        let id = self.next_handle;
-        self.handles.insert(id, value);
-        id
+        self.handles.push(value);
+        self.handles.len() as u32
     }
 
     pub fn alloc_bits(&mut self, value: HostValue) -> u64 {
@@ -115,11 +137,11 @@ impl Heap {
     }
 
     pub fn handle(&self, id: u32) -> Option<&HostValue> {
-        self.handles.get(&id)
+        self.handles.get((id as usize).checked_sub(1)?)
     }
 
     pub fn handle_mut(&mut self, id: u32) -> Option<&mut HostValue> {
-        self.handles.get_mut(&id)
+        self.handles.get_mut((id as usize).checked_sub(1)?)
     }
 
     /// Resolve bits to a string when they carry one (string id, or handle to

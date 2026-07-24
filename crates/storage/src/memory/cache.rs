@@ -69,13 +69,7 @@ impl MemoryStore {
         memory_key: &str,
     ) -> (usize, tokio::sync::MutexGuard<'a, MemoryEntityCacheState>) {
         let (stripe_index, stripe) = self.entity_cache_stripe(namespace, memory_key);
-        let started_at = Instant::now();
         let state = stripe.state.lock().await;
-        self.record_profile(
-            MemoryProfileMetricKind::EntityCacheLockWait,
-            started_at.elapsed().as_micros() as u64,
-            1,
-        );
         (stripe_index, state)
     }
 
@@ -110,47 +104,6 @@ impl MemoryStore {
         })
     }
 
-    async fn cached_point_read(
-        &self,
-        namespace: &str,
-        memory_key: &str,
-        item_key: &str,
-    ) -> Option<MemoryPointRead> {
-        let entry = self.cached_snapshot_entry(namespace, memory_key).await?;
-        if !entry.complete && !entry.loaded_keys.contains(item_key) {
-            return None;
-        }
-        Some(MemoryPointRead {
-            record: entry.records.get(item_key).cloned(),
-            max_version: entry.max_version,
-        })
-    }
-
-    async fn cached_keys_snapshot(
-        &self,
-        namespace: &str,
-        memory_key: &str,
-        keys: &[String],
-    ) -> Option<MemorySnapshot> {
-        let entry = self.cached_snapshot_entry(namespace, memory_key).await?;
-        if !entry.complete
-            && keys
-                .iter()
-                .any(|key| !entry.loaded_keys.contains(key.as_str()))
-        {
-            return None;
-        }
-        let mut entries = keys
-            .iter()
-            .filter_map(|key| entry.records.get(key).cloned())
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.key.cmp(&right.key));
-        Some(MemorySnapshot {
-            entries,
-            max_version: entry.max_version,
-        })
-    }
-
     async fn cached_snapshot_entry(
         &self,
         namespace: &str,
@@ -165,17 +118,12 @@ impl MemoryStore {
             .get(&Self::memory_version_key(namespace, memory_key))
             .copied();
         self.prune_snapshots_locked(shard_index, stripe_index, &mut state, now);
-        let Some(entry) = state.snapshots.get_cloned(&key, now) else {
-            self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
-            return None;
-        };
+        let entry = state.snapshots.get_cloned(&key, now)?;
         if current_version.is_some_and(|current| current > entry.max_version) {
             state.snapshots.remove(&key);
             state.memory_versions.remove(&key);
-            self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
             return None;
         }
-        self.record_profile(MemoryProfileMetricKind::StoreSnapshotCacheHit, 0, 1);
         Some(entry)
     }
 
@@ -361,18 +309,11 @@ impl MemoryStore {
         databases: &mut MemoryDatabaseCache,
         now: Instant,
     ) {
-        let evicted = databases.prune(
+        databases.prune(
             now,
             self.db_idle_ttl,
             self.database_cache_budget_for_shard(shard_index),
         );
-        if evicted > 0 {
-            self.record_profile(
-                MemoryProfileMetricKind::StoreDatabaseCacheEviction,
-                0,
-                evicted as u64,
-            );
-        }
     }
 
     fn prune_snapshots_locked(
@@ -382,7 +323,7 @@ impl MemoryStore {
         state: &mut MemoryEntityCacheState,
         now: Instant,
     ) {
-        let evicted = state.snapshots.prune(
+        state.snapshots.prune(
             now,
             self.db_idle_ttl,
             self.snapshot_cache_entry_budget_for_stripe(shard_index, stripe_index),
@@ -391,28 +332,6 @@ impl MemoryStore {
         state
             .memory_versions
             .retain(|key, _| state.snapshots.entries.contains_key(key));
-        if evicted > 0 {
-            self.record_profile(
-                MemoryProfileMetricKind::StoreSnapshotCacheEviction,
-                0,
-                evicted as u64,
-            );
-        }
-        self.record_profile(
-            MemoryProfileMetricKind::EntityCacheStripeCount,
-            0,
-            MEMORY_ENTITY_CACHE_STRIPES as u64,
-        );
-        self.record_profile(
-            MemoryProfileMetricKind::EntityCachePeakEntriesPerStripe,
-            state.snapshots.entries.len() as u64,
-            1,
-        );
-        self.record_profile(
-            MemoryProfileMetricKind::EntityCacheMaxEntriesPerStripe,
-            self.snapshot_cache_entry_budget_for_stripe(shard_index, stripe_index) as u64,
-            1,
-        );
     }
 
     fn database_cache_budget_for_shard(&self, shard_index: usize) -> usize {

@@ -46,6 +46,7 @@ pub const FFI_FUNCTIONS: &[&str] = &[
     "dd_tvar_write",
     "dd_fetch",
     "dd_service_fetch",
+    "dd_sleep",
     "dd_ws_register",
     "dd_ws_send",
     "dd_ws_close",
@@ -73,6 +74,14 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     io_runtime().block_on(future)
 }
 
+/// Run an async host operation (fetch, sleep) to completion off-thread.
+pub(crate) fn io_spawn<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    io_runtime().spawn(future);
+}
+
 fn arg(args: &[u64], index: usize) -> u64 {
     args.get(index).copied().unwrap_or(TAG_UNDEFINED)
 }
@@ -85,10 +94,13 @@ fn string_arg(state: &HostState, args: &[u64], index: usize) -> String {
 /// single-writer guarantee the memory model is built on.
 type AtomicLockTable = Mutex<HashMap<(String, String), Arc<Mutex<()>>>>;
 
-fn atomic_key_lock(namespace: &str, memory_key: &str) -> Arc<Mutex<()>> {
+fn atomic_lock_table() -> &'static AtomicLockTable {
     static LOCKS: OnceLock<AtomicLockTable> = OnceLock::new();
-    let mut table = LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn atomic_key_lock(namespace: &str, memory_key: &str) -> Arc<Mutex<()>> {
+    let mut table = atomic_lock_table()
         .lock()
         .expect("atomic lock table is never poisoned");
     Arc::clone(
@@ -96,6 +108,18 @@ fn atomic_key_lock(namespace: &str, memory_key: &str) -> Arc<Mutex<()>> {
             .entry((namespace.to_string(), memory_key.to_string()))
             .or_default(),
     )
+}
+
+/// Drop the table entry once no other holder exists. Correct because both
+/// acquisition and eviction run under the table mutex: while we hold it and
+/// see strong_count == 2 (table + our clone), nobody can clone concurrently.
+fn release_atomic_key_lock(namespace: &str, memory_key: &str, lock: Arc<Mutex<()>>) {
+    let mut table = atomic_lock_table()
+        .lock()
+        .expect("atomic lock table is never poisoned");
+    if Arc::strong_count(&lock) == 2 {
+        table.remove(&(namespace.to_string(), memory_key.to_string()));
+    }
 }
 
 pub fn dispatch_ffi(caller: &mut Caller<'_, HostState>, name: &str, args: &[u64]) -> HostResult {
@@ -278,6 +302,8 @@ pub fn dispatch_ffi(caller: &mut Caller<'_, HostState>, name: &str, args: &[u64]
                 response_body,
             ))
         }
+
+        "dd_sleep" => crate::bridge::sleep_op(caller, args),
 
         // ===== Websockets =====
         "dd_ws_register" => {
@@ -629,5 +655,6 @@ fn memory_atomic(caller: &mut Caller<'_, HostState>, args: &[u64]) -> HostResult
         .map_err(|e| fail(name, e))?;
     }
     drop(guard);
+    release_atomic_key_lock(&namespace, &memory_key, lock);
     Ok(result)
 }

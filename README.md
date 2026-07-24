@@ -18,7 +18,7 @@ cover live connections, and service bindings let workers call each other.
 
 ```bash
 npm install -g @perryts/perry     # the TypeScript -> wasm compiler
-cargo run -p wasm_host --bin dd_server
+cargo run -p runtime --bin dd_server
 ```
 
 In another shell:
@@ -94,8 +94,8 @@ See [examples/memory-counter.ts](examples/memory-counter.ts).
 - **Service bindings** (`dd_service_fetch`): call co-deployed workers by
   binding — [examples/router.ts](examples/router.ts) +
   [examples/auth.ts](examples/auth.ts)
-- **Outbound fetch** (`dd_fetch`): synchronous HTTP from workers —
-  [examples/proxy.ts](examples/proxy.ts)
+- **Outbound fetch**: native `fetch(url).then(...)` promise chains plus a
+  synchronous `dd_fetch` — [examples/proxy.ts](examples/proxy.ts)
 
 Static assets are served before worker code runs via `--assets-dir`.
 

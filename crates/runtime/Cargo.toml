@@ -1,5 +1,5 @@
 [package]
-name = "wasm_host"
+name = "runtime"
 edition.workspace = true
 license.workspace = true
 publish = false
@@ -14,7 +14,7 @@ getrandom = "0.4"
 http-body-util = "0.1"
 mime_guess = "2"
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["http1", "server", "tokio"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -24,13 +24,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use runtime::{
+    InvokeOptions, WorkerModule, WorkerOptions, WorkerRegistry, WorkerStores, WsEvent, WsOutbound,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
-use wasm_host::{
-    InvokeOptions, WorkerModule, WorkerOptions, WorkerRegistry, WorkerStores, WsEvent, WsOutbound,
-};
 
 #[derive(Parser)]
 #[command(about = "Serve Perry-compiled wasm workers")]
@@ -65,9 +65,33 @@ struct WorkerRecord {
     wasm_bytes: u64,
 }
 
+/// Deployment metadata, kept alongside the shared module registry (which
+/// `dd_service_fetch` resolves through) under one lock.
+#[derive(Default)]
+struct Deployments {
+    records: HashMap<String, WorkerRecord>,
+    /// The lone public worker, when exactly one exists — the Host-label
+    /// fallback for dev setups, cached instead of scanned per request.
+    single_public: Option<String>,
+}
+
+impl Deployments {
+    fn refresh_single_public(&mut self) {
+        let mut public = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.config.public)
+            .map(|(name, _)| name.clone());
+        self.single_public = match (public.next(), public.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        };
+    }
+}
+
 struct Server {
     workers: WorkerRegistry,
-    records: RwLock<HashMap<String, WorkerRecord>>,
+    deployments: RwLock<Deployments>,
     stores: Arc<WorkerStores>,
     workers_dir: PathBuf,
     options: InvokeOptions,
@@ -93,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = Arc::new(Server {
         workers: Arc::new(RwLock::new(HashMap::new())),
-        records: RwLock::new(HashMap::new()),
+        deployments: RwLock::new(Deployments::default()),
         stores,
         workers_dir,
         options: InvokeOptions {
@@ -230,23 +254,19 @@ async fn public_response(
 /// First Host label -> public worker; a single public worker also answers
 /// unmatched hosts so `curl localhost:8080` works in dev.
 fn resolve_public_worker(server: &Server, host: &str) -> Option<Arc<WorkerModule>> {
-    let label = host.split([':', '.']).next().unwrap_or("").to_string();
-    let records = server.records.read().expect("records lock");
-    let workers = server.workers.read().expect("workers lock");
-    if records
-        .get(&label)
+    let label = host.split([':', '.']).next().unwrap_or("");
+    let deployments = server.deployments.read().expect("deployments lock");
+    let name = if deployments
+        .records
+        .get(label)
         .is_some_and(|record| record.config.public)
     {
-        return workers.get(&label).cloned();
-    }
-    let mut public = records
-        .iter()
-        .filter(|(_, record)| record.config.public)
-        .map(|(name, _)| name);
-    match (public.next(), public.next()) {
-        (Some(only), None) => workers.get(only).cloned(),
-        _ => None,
-    }
+        label
+    } else {
+        deployments.single_public.as_deref()?
+    };
+    let workers = server.workers.read().expect("workers lock");
+    workers.get(name).cloned()
 }
 
 fn handle_private(server: Arc<Server>, request: Request<hyper::body::Incoming>) -> HandlerFuture {
@@ -328,8 +348,9 @@ async fn private_response(
             }
         }
         ("GET", "/v1/workers") => {
-            let records = server.records.read().expect("records lock");
-            let mut workers: Vec<WorkerSummary> = records
+            let deployments = server.deployments.read().expect("deployments lock");
+            let mut workers: Vec<WorkerSummary> = deployments
+                .records
                 .iter()
                 .map(|(name, record)| WorkerSummary {
                     name: name.clone(),
@@ -437,13 +458,15 @@ fn install_worker(
         .write()
         .expect("workers lock")
         .insert(name.to_string(), Arc::new(module));
-    server.records.write().expect("records lock").insert(
+    let mut deployments = server.deployments.write().expect("deployments lock");
+    deployments.records.insert(
         name.to_string(),
         WorkerRecord {
             config,
             wasm_bytes: wasm.len() as u64,
         },
     );
+    deployments.refresh_single_public();
     Ok(())
 }
 
@@ -454,7 +477,11 @@ fn remove_worker(server: &Arc<Server>, name: &str) -> common::Result<()> {
         .expect("workers lock")
         .remove(name)
         .is_some();
-    server.records.write().expect("records lock").remove(name);
+    {
+        let mut deployments = server.deployments.write().expect("deployments lock");
+        deployments.records.remove(name);
+        deployments.refresh_single_public();
+    }
     if !existed {
         return Err(PlatformError::not_found(format!(
             "no worker named {name:?}"

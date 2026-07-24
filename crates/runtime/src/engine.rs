@@ -81,11 +81,14 @@ pub(crate) struct ReadyInstance {
 
 impl ReadyInstance {
     pub(crate) fn store_mut(&mut self) -> &mut Store<HostState> {
-        // Re-arm the epoch deadline so each websocket event gets a fresh
-        // budget instead of inheriting the countdown from instance creation.
-        self.store
-            .set_epoch_deadline((5_000 / EPOCH_TICK.as_millis() + 2) as u64);
         &mut self.store
+    }
+
+    /// Give the instance a fresh execution budget; call before dispatching
+    /// each request or websocket event.
+    pub(crate) fn arm_deadline(&mut self, timeout: Duration) {
+        self.store
+            .set_epoch_deadline((timeout.as_millis() / EPOCH_TICK.as_millis() + 2) as u64);
     }
 }
 
@@ -343,20 +346,42 @@ fn settle(store: &mut Store<HostState>, bits: u64, deadline: Instant) -> Result<
             settle(store, value, deadline)
         }
         _ => Err(PlatformError::runtime(
-            "worker response promise never resolved (timers exhausted before resolution)",
+            "worker response promise never resolved (no pending timers or host operations)",
         )),
     }
 }
 
-/// Run microtasks and timers. With `waiting_for = Some(done)`, sleep for
-/// future timers and fail if `done` cannot become true before the deadline
-/// (used while a response promise is pending). With `None`, only run work
-/// that is already due and return — a worker that schedules a long timer at
-/// startup must not delay its synchronous responses.
-/// Run already-due microtasks and timers without sleeping; used after each
-/// websocket event so `.then` chains settle before the next event.
+/// Run already-due microtasks, timers, and host-op completions without
+/// blocking; used after startup and each websocket event so `.then` chains
+/// settle before the next unit of work.
 pub(crate) fn pump_microtasks(store: &mut Store<HostState>) -> Result<()> {
     drain_event_loop(store, Instant::now() + Duration::from_secs(1), None)
+}
+
+/// Resolve promises for host operations (fetch, sleep) that have completed.
+/// Non-blocking; returns how many were resolved.
+fn harvest_host_completions(state: &mut HostState) -> usize {
+    let mut resolved = 0;
+    while let Ok(completion) = state.host_ops.receiver.try_recv() {
+        apply_completion(state, completion);
+        resolved += 1;
+    }
+    resolved
+}
+
+/// Resolve one completed host operation's promise. Perry's wasm target has
+/// no promise rejection path, so failed operations resolve with `undefined`
+/// and log the cause.
+fn apply_completion(state: &mut HostState, completion: crate::state::HostCompletion) {
+    state.host_ops.pending = state.host_ops.pending.saturating_sub(1);
+    let value = match completion.outcome {
+        Ok(outcome) => crate::bridge::fetch::outcome_to_heap(state, outcome),
+        Err(message) => {
+            tracing::warn!(target: "perry_worker", "async host op failed: {message}");
+            TAG_UNDEFINED
+        }
+    };
+    resolve_promise(state, encode(JsValue::Handle(completion.promise)), value);
 }
 
 fn drain_event_loop(
@@ -381,52 +406,97 @@ fn drain_event_loop(
             }
         }
 
+        if harvest_host_completions(store.data_mut()) > 0 {
+            continue;
+        }
+
         if let Some(done) = waiting_for
             && done(store.data())
         {
             return Ok(());
         }
 
-        let next = store
+        let next_timer = store
             .data()
             .timers
             .iter()
             .min_by_key(|timer| timer.due)
             .map(|timer| (timer.id, timer.due));
-        let Some((timer_id, due)) = next else {
-            return Ok(());
-        };
+        let pending_ops = store.data().host_ops.pending;
         let now = Instant::now();
-        if waiting_for.is_none() && due > now {
-            return Ok(());
-        }
-        if due > deadline {
-            return Err(PlatformError::runtime(
-                "worker response is waiting on a timer due after the request time budget",
-            ));
-        }
-        if due > now {
-            std::thread::sleep(due - now);
+
+        // Pump mode never blocks: run what is due, leave the rest.
+        if waiting_for.is_none() {
+            match next_timer {
+                Some((timer_id, due)) if due <= now => {
+                    fire_timer(store, timer_id, deadline)?;
+                    continue;
+                }
+                _ => return Ok(()),
+            }
         }
 
-        let fired = {
-            let state = store.data_mut();
-            let Some(position) = state.timers.iter().position(|timer| timer.id == timer_id) else {
+        // Waiting mode: block until a timer is due or a host op completes.
+        match next_timer {
+            Some((timer_id, due)) if due <= now => {
+                fire_timer(store, timer_id, deadline)?;
                 continue;
-            };
-            match state.timers[position].every {
-                Some(every) => {
-                    state.timers[position].due = Instant::now() + every;
-                    state.timers[position].callback_bits
-                }
-                None => state.timers.remove(position).callback_bits,
             }
-        };
-        call_closure(&mut *store, fired, &[]).map_err(runtime_error)?;
+            Some((_, due)) if due <= deadline || pending_ops > 0 => {
+                let wake = due.min(deadline);
+                wait_for_completion(store.data_mut(), wake.saturating_duration_since(now));
+            }
+            Some(_) => {
+                return Err(PlatformError::runtime(
+                    "worker response is waiting on a timer due after the request time budget",
+                ));
+            }
+            None if pending_ops > 0 => {
+                wait_for_completion(store.data_mut(), deadline.saturating_duration_since(now));
+            }
+            None => return Ok(()),
+        }
         if Instant::now() > deadline {
             return Err(PlatformError::runtime("worker exceeded its time budget"));
         }
     }
+}
+
+/// Block on the completion channel for at most `wait`; a received completion
+/// is pushed back through the non-blocking harvest on the next loop pass.
+fn wait_for_completion(state: &mut HostState, wait: Duration) {
+    if state.host_ops.pending == 0 {
+        std::thread::sleep(wait);
+        return;
+    }
+    if let Ok(completion) = state
+        .host_ops
+        .receiver
+        .recv_timeout(wait.min(Duration::from_millis(250)))
+    {
+        apply_completion(state, completion);
+    }
+}
+
+fn fire_timer(store: &mut Store<HostState>, timer_id: u32, deadline: Instant) -> Result<()> {
+    let fired = {
+        let state = store.data_mut();
+        let Some(position) = state.timers.iter().position(|timer| timer.id == timer_id) else {
+            return Ok(());
+        };
+        match state.timers[position].every {
+            Some(every) => {
+                state.timers[position].due = Instant::now() + every;
+                state.timers[position].callback_bits
+            }
+            None => state.timers.remove(position).callback_bits,
+        }
+    };
+    call_closure(&mut *store, fired, &[]).map_err(runtime_error)?;
+    if Instant::now() > deadline {
+        return Err(PlatformError::runtime("worker exceeded its time budget"));
+    }
+    Ok(())
 }
 
 /// Resolve `downstream` with a callback's outcome, chaining through promises.
@@ -588,7 +658,7 @@ fn bind_string_new(
                 .map_err(|e| wasmtime::Error::msg(format!("string_new: bad range: {e}")))?;
             let text = String::from_utf8_lossy(&bytes).into_owned();
             tracing::trace!(target: "perry_bridge", "string_new {text:?}");
-            caller.data_mut().heap.intern_string(text);
+            caller.data_mut().heap.append_literal(text);
             Ok(())
         },
     )?;
@@ -627,16 +697,35 @@ fn bind_mem_call(
                 })?;
             let memory = guest_memory(&mut caller, "mem_call")?;
 
-            let mut raw = vec![0u8; arg_count * 8];
-            memory.read(&caller, base, &mut raw).map_err(|e| {
+            // Arguments are raw NaN-box bits in guest memory; almost every
+            // call has few, so read into a stack buffer instead of allocating.
+            let mut raw_stack = [0u8; 16 * 8];
+            let mut raw_spill = Vec::new();
+            let raw: &mut [u8] = if arg_count <= 16 {
+                &mut raw_stack[..arg_count * 8]
+            } else {
+                raw_spill.resize(arg_count * 8, 0);
+                &mut raw_spill
+            };
+            memory.read(&caller, base, raw).map_err(|e| {
                 wasmtime::Error::msg(format!("mem_call {name}: bad arg range: {e}"))
             })?;
-            let args: Vec<u64> = raw
-                .chunks_exact(8)
-                .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes")))
-                .collect();
+            let mut args_stack = [0u64; 16];
+            let mut args_spill = Vec::new();
+            let args: &[u64] =
+                if arg_count <= 16 {
+                    for (slot, chunk) in args_stack.iter_mut().zip(raw.chunks_exact(8)) {
+                        *slot = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
+                    }
+                    &args_stack[..arg_count]
+                } else {
+                    args_spill.extend(raw.chunks_exact(8).map(|chunk| {
+                        u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"))
+                    }));
+                    &args_spill
+                };
 
-            let result = dispatch(&mut caller, &name, &args)?;
+            let result = dispatch(&mut caller, &name, args)?;
 
             if returns_i32 {
                 let value = match decode(result) {

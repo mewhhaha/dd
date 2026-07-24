@@ -99,12 +99,6 @@ fn epoch_ms_i64() -> Result<i64> {
     Ok(duration.as_millis() as i64)
 }
 
-#[allow(dead_code)]
-fn duration_ms_i64(duration: Duration) -> Result<i64> {
-    i64::try_from(duration.as_millis())
-        .map_err(|_| PlatformError::bad_request("duration is too large"))
-}
-
 fn memory_error(error: impl std::fmt::Display) -> PlatformError {
     PlatformError::runtime(format!("memory store error: {error}"))
 }
@@ -115,44 +109,6 @@ fn memory_error_after_retry(error: turso::Error) -> PlatformError {
     } else {
         memory_error(error)
     }
-}
-
-fn normalize_outbox_kind_selectors(kinds: &[&str]) -> (Vec<String>, Vec<String>) {
-    let mut exact = Vec::new();
-    let mut prefixes = Vec::new();
-    for kind in kinds {
-        let kind = kind.trim();
-        if kind.is_empty() {
-            continue;
-        }
-        if let Some(prefix) = kind.strip_suffix('*') {
-            let prefix = prefix.trim();
-            if !prefix.is_empty() {
-                prefixes.push(prefix.to_string());
-            }
-        } else {
-            exact.push(kind.to_string());
-        }
-    }
-    exact.sort();
-    exact.dedup();
-    prefixes.sort();
-    prefixes.dedup();
-    (exact, prefixes)
-}
-
-fn escape_sql_like_prefix(prefix: &str) -> String {
-    let mut escaped = String::with_capacity(prefix.len());
-    for value in prefix.chars() {
-        match value {
-            '%' | '_' | '\\' => {
-                escaped.push('\\');
-                escaped.push(value);
-            }
-            _ => escaped.push(value),
-        }
-    }
-    escaped
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {

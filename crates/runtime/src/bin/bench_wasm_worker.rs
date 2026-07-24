@@ -7,17 +7,17 @@
 //! reuses warm isolates. Cold work is therefore part of every wasm request.
 //!
 //! ```bash
-//! cargo run -p wasm_host --bin bench_wasm_worker --release
+//! cargo run -p runtime --bin bench_wasm_worker --release
 //! DD_BENCH_REQUESTS=10000 DD_BENCH_CONCURRENCY=16 \
-//!   cargo run -p wasm_host --bin bench_wasm_worker --release -- --worker my.wasm
+//!   cargo run -p runtime --bin bench_wasm_worker --release -- --worker my.wasm
 //! ```
 
 use clap::Parser;
 use common::WorkerInvocation;
+use runtime::{InvokeOptions, WorkerModule};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use wasm_host::{InvokeOptions, WorkerModule};
 
 #[derive(Parser)]
 #[command(about = "Benchmark the Perry wasm worker engine")]

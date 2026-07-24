@@ -13,14 +13,14 @@ Contributor-focused notes; the root README stays product- and usage-focused.
 - `crates/common` — shared error types and the deploy/invoke protocol
 - `crates/storage` — turso-backed KV, keyed memory namespaces, response
   cache, and blob storage (no engine dependencies)
-- `crates/wasm-host` — the runtime: Perry wasm ABI host, engine, websockets,
+- `crates/runtime` — the runtime: Perry wasm ABI host, engine, websockets,
   `dd_server`, and the invoke benchmark
 - `crates/cli` — the `dd` CLI (compiles workers with Perry, deploys them)
 - `crates/init` — container entrypoint (store setup, exec)
 
 ## Local run
 
-`cargo run -p wasm_host --bin dd_server` defaults to:
+`cargo run -p runtime --bin dd_server` defaults to:
 
 - public listener: `http://0.0.0.0:8080` (Host-label routing)
 - private listener: `http://[::]:8081` (deploy/list/delete/invoke)
@@ -28,7 +28,7 @@ Contributor-focused notes; the root README stays product- and usage-focused.
 `just check` is the CI path: fmt, clippy (deny warnings), and the full test
 suite. `just smoke-examples` deploys every example through the CLI against a
 local server and exercises it. `just fixtures` regenerates the vendored
-Perry-compiled wasm fixtures in `crates/wasm-host/fixtures/` (the tests run
+Perry-compiled wasm fixtures in `crates/runtime/fixtures/` (the tests run
 against those, so CI does not need Perry).
 
 ## Runtime internals

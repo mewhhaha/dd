@@ -1,6 +1,6 @@
 # The dd wasm runtime
 
-`crates/wasm-host` is dd's runtime: workers compiled from TypeScript to
+`crates/runtime` is dd's runtime: workers compiled from TypeScript to
 WebAssembly by [Perry](https://github.com/PerryTS/perry) execute in
 wasmtime, and a native Rust host provides every runtime function the module
 imports. There is no JS engine in the loop.
@@ -9,7 +9,7 @@ imports. There is no JS engine in the loop.
 
 ```bash
 npm install -g @perryts/perry
-cargo run -p wasm_host --bin dd_server
+cargo run -p runtime --bin dd_server
 cargo run -p cli --bin dd -- deploy hello examples/hello.ts --public
 curl -H 'host: hello.example.com' http://127.0.0.1:8080/perry
 ```
@@ -55,8 +55,11 @@ declare function dd_cache_match(url: string): any;  // {status, headers, body} |
 declare function dd_cache_put(url: string, response: unknown): void;
 declare function dd_cache_delete(url: string): boolean;
 
-// Outbound HTTP (synchronous; 16 MiB response cap, 10 s timeout)
+// Outbound HTTP, synchronous variant (16 MiB response cap, 10 s timeout)
 declare function dd_fetch(url: string, options: unknown): any;
+
+// Promise-returning delay; resolves with undefined after ms
+declare function dd_sleep(ms: number): any;
 
 // Co-deployed workers
 declare function dd_service_fetch(
@@ -112,10 +115,15 @@ does the same but logs a warning.
 Upstream Perry wasm-target gaps (verified against the browser glue, which
 has the same behavior):
 
-- **No `async`/`await`.** Perry compiles top-level async function bodies to
-  JavaScript, which this host cannot run — such modules are rejected at load
-  with a clear error. `new Promise(executor)` also compiles to a no-op.
-  Write synchronous handlers.
+- **No `async`/`await` syntax.** Perry compiles top-level async function
+  bodies to JavaScript, which this host cannot run — such modules are
+  rejected at load with a clear error. `new Promise(executor)` also
+  compiles to a no-op. **Promises themselves work**: native
+  `fetch(url).then(r => r.text())` chains and `dd_sleep(ms).then(...)`
+  return real pending promises resolved by the engine's event loop, and a
+  fetch handler may return a promise. There is no rejection path — failed
+  host operations resolve with `undefined` and log a warning; `catch` is a
+  no-op chain.
 - **`JSON.stringify` of typed object literals silently returns `undefined`**
   (the `JsonStringifyFull` lowering has no wasm handler). Use `dd_json`.
 - **Passing typed objects host→guest breaks field access** (shape-field ids
@@ -141,9 +149,9 @@ Host limitations of this experiment:
 ## Benchmarks
 
 ```bash
-cargo run -p wasm_host --bin bench_wasm_worker --release
+cargo run -p runtime --bin bench_wasm_worker --release
 DD_BENCH_REQUESTS=5000 DD_BENCH_CONCURRENCY=64 \
-  cargo run -p wasm_host --bin bench_wasm_worker --release
+  cargo run -p runtime --bin bench_wasm_worker --release
 ```
 
 Reports module compile time plus invoke throughput and mean/p50/p95/p99
@@ -153,6 +161,6 @@ the engine directly, without HTTP or dispatch overhead.
 ## Fixtures
 
 Integration tests run against real Perry-compiled modules vendored in
-`crates/wasm-host/fixtures/`. Rebuild them with
+`crates/runtime/fixtures/`. Rebuild them with
 `scripts/build-perry-wasm-fixtures.sh` after Perry upgrades (each fixture's
 TypeScript source sits next to its `.wasm`).

@@ -3,7 +3,7 @@ set -euo pipefail
 
 profile="${1:-dist}"
 variant="${2:-wasm}"
-package="wasm_host"
+package="runtime"
 binary_name="dd_server"
 feature_args=()
 

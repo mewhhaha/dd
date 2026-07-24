@@ -3,20 +3,7 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
-pub const DEFAULT_PUBLIC_BIND_ADDR: &str = "0.0.0.0:8080";
-pub const DEFAULT_PRIVATE_BIND_ADDR: &str = "[::]:8081";
 pub const DEFAULT_PRIVATE_SERVER_URL: &str = "http://127.0.0.1:8081";
-
-pub fn first_non_empty_trimmed<I, S>(values: I) -> Option<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    values
-        .into_iter()
-        .map(|value| value.as_ref().trim().to_string())
-        .find(|value| !value.is_empty())
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -51,10 +38,6 @@ impl PlatformError {
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Unauthorized, message)
-    }
-
-    pub fn forbidden(message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::Forbidden, message)
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
@@ -122,8 +105,6 @@ pub struct ErrorBody {
     #[serde(default)]
     pub code: String,
     #[serde(default)]
-    pub trace_id: Option<String>,
-    #[serde(default)]
     pub retryable: bool,
 }
 
@@ -133,14 +114,8 @@ impl ErrorBody {
             ok: false,
             error: error.message.clone(),
             code: error.code().to_string(),
-            trace_id: None,
             retryable: error.retryable(),
         }
-    }
-
-    pub fn with_trace_id(mut self, trace_id: Option<String>) -> Self {
-        self.trace_id = trace_id;
-        self
     }
 }
 

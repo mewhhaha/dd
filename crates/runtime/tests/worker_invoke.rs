@@ -4,7 +4,7 @@
 //! the `perry` compiler from npm: `npm install @perryts/perry`).
 
 use common::{WorkerInvocation, WorkerOutput};
-use wasm_host::{InvokeOptions, WorkerModule};
+use runtime::{InvokeOptions, WorkerModule};
 
 fn invoke(fixture: &str, invocation: WorkerInvocation) -> common::Result<WorkerOutput> {
     let path = format!("{}/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));

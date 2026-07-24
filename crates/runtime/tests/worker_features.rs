@@ -3,10 +3,10 @@
 //! fixtures. Regenerate fixtures with `scripts/build-perry-wasm-fixtures.sh`.
 
 use common::{WorkerInvocation, WorkerOutput};
+use runtime::{InvokeOptions, WorkerModule, WorkerOptions, WorkerRegistry, WorkerStores};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, RwLock};
-use wasm_host::{InvokeOptions, WorkerModule, WorkerOptions, WorkerRegistry, WorkerStores};
 
 fn fixture_bytes(fixture: &str) -> Vec<u8> {
     let path = format!("{}/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
