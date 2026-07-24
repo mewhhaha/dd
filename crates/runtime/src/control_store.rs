@@ -402,10 +402,14 @@ impl ControlStore {
                 continue;
             }
             if !file_type.is_file() || extension != Some("json") {
-                return Err(PlatformError::internal(format!(
-                    "unrecognized persisted worker artifact {}",
-                    path.display()
-                )));
+                // The wasm runtime left compiled modules here. An entry this
+                // importer does not understand is not a reason to refuse to
+                // start, for the same reason an unreadable record is not.
+                tracing::warn!(
+                    path = %path.display(),
+                    "ignoring unrecognized entry in the legacy worker directory"
+                );
+                continue;
             }
             let bytes = tokio::fs::read(&path).await.map_err(|error| {
                 PlatformError::internal(format!(
@@ -1428,7 +1432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_future_schema_and_unknown_legacy_artifacts() -> Result<()> {
+    async fn rejects_future_schema_and_skips_unknown_legacy_artifacts() -> Result<()> {
         let root = temp_dir("future-schema");
         let store = ControlStore::open(&root).await?;
         let conn = store.connect().await?;
@@ -1458,16 +1462,11 @@ mod tests {
         tokio::fs::write(workers.join("worker.bin"), b"not a known store format")
             .await
             .map_err(control_error)?;
-        let store = ControlStore::open(&root).await?;
-        let error = store
-            .import_legacy_workers(&workers)
+        tokio::fs::write(workers.join("router.wasm"), b"\0asm")
             .await
-            .expect_err("unknown worker artifact should fail startup");
-        assert!(
-            error
-                .to_string()
-                .contains("unrecognized persisted worker artifact")
-        );
+            .map_err(control_error)?;
+        let store = ControlStore::open(&root).await?;
+        assert_eq!(store.import_legacy_workers(&workers).await?, 0);
         let _ = tokio::fs::remove_dir_all(root).await;
         Ok(())
     }
