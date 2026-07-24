@@ -417,6 +417,7 @@ impl ControlStore {
                     path.display()
                 ))
             })?;
+            migrate_top_level_public(&mut value);
             migrate_actor_bindings(&mut value);
             let stored: LegacyWorkerDeployment =
                 serde_json::from_value(value).map_err(|error| {
@@ -1118,6 +1119,22 @@ fn token_from_row(row: &Row) -> Result<ControlDeployToken> {
     })
 }
 
+// The wasm control plane persisted `public` at the top level of the worker
+// record; this format keeps it in `config`. Records written by that runtime
+// otherwise fail `deny_unknown_fields` and abort startup.
+fn migrate_top_level_public(value: &mut JsonValue) {
+    let Some(public) = value
+        .as_object_mut()
+        .and_then(|record| record.remove("public"))
+    else {
+        return;
+    };
+    let Some(config) = value.get_mut("config").and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    config.entry("public").or_insert(public);
+}
+
 fn migrate_actor_bindings(value: &mut JsonValue) {
     let Some(bindings) = value
         .get_mut("config")
@@ -1313,6 +1330,43 @@ mod tests {
             restored.config.bindings.as_slice(),
             [DeployBinding::Memory { binding }] if binding == "ROOMS"
         ));
+        let _ = tokio::fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn moves_top_level_public_flag_into_config() -> Result<()> {
+        let root = temp_dir("legacy-public");
+        let workers = root.join("workers");
+        tokio::fs::create_dir_all(&workers)
+            .await
+            .map_err(control_error)?;
+        let legacy = serde_json::json!({
+            "name": "memory-counter",
+            "source": "export default {}",
+            "public": true,
+            "config": {
+                "bindings": [],
+                "cache": DeployCacheConfig::default(),
+                "internal": DeployInternalConfig::default()
+            },
+            "assets": [],
+            "server_modules": [],
+            "asset_headers": null,
+            "deployment_id": "wasm-era-id",
+            "updated_at_ms": 1,
+            "expires_at_ms": null
+        });
+        tokio::fs::write(
+            workers.join("memory-counter.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .await
+        .map_err(control_error)?;
+        let store = ControlStore::open(&root).await?;
+        assert_eq!(store.import_legacy_workers(&workers).await?, 1);
+        let restored = store.get_deployment("wasm-era-id").await?;
+        assert!(restored.config.public);
         let _ = tokio::fs::remove_dir_all(root).await;
         Ok(())
     }
