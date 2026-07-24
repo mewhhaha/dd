@@ -17,7 +17,7 @@ RUN --mount=type=cache,id=dd-cargo-registry,target=/usr/local/cargo/registry \
   --mount=type=cache,id=dd-cargo-git,target=/usr/local/cargo/git \
   --mount=type=cache,id=dd-cargo-target,target=/workspace/target \
   cargo build --locked --profile dist \
-  -p wasm_host --bin dd_server \
+  -p runtime --bin dd_server \
   -p dd_init \
   && mkdir -p /out \
   && cp /workspace/target/dist/dd_init /workspace/target/dist/dd_server /out/
