@@ -9,3 +9,19 @@ minimumReleaseAgeExclude:
 
 overrides:
   nanoid: "3.3.11"
+  # Security floors. dd-vite reaches these through its optional peers, which
+  # pnpm resolves independently of the ranges in package.json, so
+  # `pnpm update --latest` alone cannot raise them.
+  #
+  # The @react-router/* entries must stay in lockstep with react-router: the
+  # RSC Vite plugins come from dd-vite's copy while the RSC entry is imported
+  # from the example's, and 8.3.0's default entry imports a virtual module
+  # that only 8.3.0's plugins serve. A split resolution fails the build.
+  react-router: ">=8.3.0"
+  "@react-router/dev": ">=8.3.0"
+  "@react-router/node": ">=8.3.0"
+  postcss: ">=8.5.18"
+  valibot: ">=1.4.2"
+  # vitest must match @vitest/browser, which depends on its exact version.
+  "@vitest/browser": ">=4.1.10"
+  vitest: ">=4.1.10"

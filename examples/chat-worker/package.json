@@ -10,6 +10,6 @@
     "itty-router": "^5.0.24"
   },
   "devDependencies": {
-    "tsdown": "^0.22.4"
+    "tsdown": "^0.22.14"
   }
 }
