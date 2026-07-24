@@ -92,6 +92,23 @@ Host limitations of this experiment:
   UI bridge. String indices are Unicode scalar positions (exact for BMP
   text). Regex support is literal-plus-anchors only.
 
+## Benchmarks
+
+```bash
+cargo run -p wasm_host --bin bench_wasm_worker --release
+DD_BENCH_REQUESTS=5000 DD_BENCH_CONCURRENCY=64 \
+  cargo run -p wasm_host --bin bench_wasm_worker --release
+```
+
+Reports module compile time plus invoke throughput and mean/p50/p95/p99
+latency, the same metrics as `cargo run -p runtime --bin bench --release`
+(steady-state section) for the V8 runtime. When comparing, remember the
+methodology difference: the wasm engine pays a full cold start (fresh
+instance + `_start`) on every request, while the V8 bench measures warm
+reused isolates; the wasm bench also drives the engine directly where the
+V8 bench goes through `RuntimeService` dispatch, and the workers differ
+(the wasm fixture parses the URL and builds JSON via `dd_json`).
+
 ## Fixtures
 
 Integration tests run against real Perry-compiled modules vendored in

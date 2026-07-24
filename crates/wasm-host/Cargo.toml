@@ -25,3 +25,7 @@ wasmtime.workspace = true
 [[bin]]
 name = "dd_wasm_server"
 path = "src/bin/dd_wasm_server.rs"
+
+[[bin]]
+name = "bench_wasm_worker"
+path = "src/bin/bench_wasm_worker.rs"
