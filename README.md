@@ -264,6 +264,17 @@ plugin options override that file.
 
 See [docs/development.md](docs/development.md#vite-and-vitest-worker-development).
 
+## Perry wasm runtime (experiment)
+
+`crates/wasm-host` is an experimental alternative runtime with no JS engine:
+workers are TypeScript compiled to WebAssembly by
+[Perry](https://github.com/PerryTS/perry), executed in wasmtime against a
+native Rust implementation of Perry's runtime ABI. Workers register a fetch
+handler through a small `declare function` host API and are served by
+`dd_wasm_server`. See
+[docs/perry-wasm-experiment.md](docs/perry-wasm-experiment.md) for the
+contract and current limitations.
+
 ## How to think about it
 
 If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.

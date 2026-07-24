@@ -5,6 +5,7 @@ members = [
   "crates/common",
   "crates/init",
   "crates/runtime",
+  "crates/wasm-host",
 ]
 resolver = "2"
 
@@ -32,6 +33,7 @@ opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+wasmtime = { version = "47", default-features = false, features = ["runtime", "cranelift"] }
 
 [patch.crates-io]
 deno_crypto = { path = "patched-crates/deno_crypto" }
