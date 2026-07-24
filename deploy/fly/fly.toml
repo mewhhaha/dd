@@ -42,7 +42,7 @@ kill_timeout = "30s"
     grace_period = "30s"
 
 [[mounts]]
-  source = "dd_store"
+  source = "dd_store_v2"
   destination = "/app/store"
 
 [[vm]]
