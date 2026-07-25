@@ -1,8 +1,11 @@
 name: Deploy Workers
 
+# Chained off Deploy Platform rather than CI. Both used to trigger on CI
+# completing, so workers raced the container rollout and deployed into
+# whichever build happened to still be serving.
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [Deploy Platform]
     branches: [main]
     types: [completed]
   workflow_dispatch:
@@ -14,13 +17,15 @@ concurrency:
   group: workers-production
   cancel-in-progress: false
 
+env:
+  DD_SERVER: https://dd-private-8956e096.fly.dev
+
 jobs:
   chat:
     name: Chat
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.conclusion == 'success')
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
@@ -71,4 +76,104 @@ jobs:
           --retry-delay 2
           --max-time 10
           https://chat.wdyt.chat/
+          > /dev/null
+
+  vite:
+    name: ${{ matrix.example }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    strategy:
+      # One broken example should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include:
+          # vite-effect builds two workers: the auth service is listed first
+          # because the entry worker binds to it.
+          - example: vite-effect
+            secret: DD_VITE_EFFECT_DEPLOY_TOKEN
+            configs: dist/auth/dd.deploy.json dist/vite-effect/dd.deploy.json
+          - example: vite-hono
+            secret: DD_VITE_HONO_DEPLOY_TOKEN
+            configs: dist/vite-hono/dd.deploy.json
+          - example: vite-react-router
+            secret: DD_VITE_REACT_ROUTER_DEPLOY_TOKEN
+            configs: dist/vite-react-router/dd.deploy.json
+          - example: vite-react-router-rsc
+            secret: DD_VITE_REACT_ROUTER_RSC_DEPLOY_TOKEN
+            configs: dist/vite-react-router-rsc/dd.deploy.json
+    steps:
+      # v7, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Check whether this is still the current main commit
+        id: current-commit
+        env:
+          CI_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          current_commit="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$CI_COMMIT" = "$current_commit" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping superseded commit ${CI_COMMIT}."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+      # v6, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        if: steps.current-commit.outputs.deploy == 'true'
+      # v6, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        if: steps.current-commit.outputs.deploy == 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install JS dependencies
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: pnpm install --frozen-lockfile
+      - name: Build worker bundle
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: pnpm --filter './examples/${{ matrix.example }}' build
+      # stable, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        if: steps.current-commit.outputs.deploy == 'true'
+        with:
+          toolchain: 1.94.0
+      # v2, pinned so workflow code cannot move underneath the deploy secret.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        if: steps.current-commit.outputs.deploy == 'true'
+        with:
+          shared-key: deploy-cli
+      - name: Build deployment CLI
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: cargo build --locked -p cli
+      - name: Deploy workers
+        if: steps.current-commit.outputs.deploy == 'true'
+        env:
+          DD_TOKEN: ${{ secrets[matrix.secret] }}
+          CONFIGS: ${{ matrix.configs }}
+        run: |
+          for config in $CONFIGS; do
+            echo "deploying examples/${{ matrix.example }}/${config}"
+            # The generated configs point assets_dir at ../client, which sits
+            # outside the config directory the vite build writes them into.
+            target/debug/cli --server "$DD_SERVER" \
+              deploy-config "examples/${{ matrix.example }}/${config}" \
+              --allow-outside-config-root
+          done
+      - name: Smoke worker
+        if: steps.current-commit.outputs.deploy == 'true'
+        run: >-
+          curl
+          --fail
+          --silent
+          --show-error
+          --retry 5
+          --retry-all-errors
+          --retry-delay 2
+          --max-time 10
+          https://${{ matrix.example }}.wdyt.chat/
           > /dev/null
