@@ -1,0 +1,21 @@
+{
+  "name": "@mewhhaha/dd-javy",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "dd-javy-build": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test src/*.test.js"
+  },
+  "exports": {
+    ".": "./src/build.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "vite": "^8.1.5"
+  }
+}

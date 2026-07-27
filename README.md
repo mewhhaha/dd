@@ -275,6 +275,17 @@ handler through a small `declare function` host API and are served by
 [docs/perry-wasm-experiment.md](docs/perry-wasm-experiment.md) for the
 contract and current limitations.
 
+## Javy wasm runtime (experiment)
+
+`crates/javy-host` runs bundled JavaScript workers compiled to Wasm by Javy.
+Unlike Perry, Javy embeds QuickJS, so it can execute ordinary bundled React
+code and async Promise jobs. The current milestone includes a worker Web API
+layer, a custom Javy plugin for native Wasmtime calls, and ephemeral KV and
+transactional memory bindings. It runs the repository's React Router
+storefront through SSR, cart updates, and checkout. Durable storage, outbound
+fetch, services, live streaming, and websockets remain unimplemented. See
+[docs/javy-runtime-experiment.md](docs/javy-runtime-experiment.md).
+
 ## How to think about it
 
 If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.

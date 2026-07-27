@@ -1,0 +1,16 @@
+{
+  "name": "dd-javy-react-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "dd-javy-build src/worker.tsx dist/worker.wasm"
+  },
+  "dependencies": {
+    "@mewhhaha/dd-javy": "workspace:*",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17"
+  }
+}
