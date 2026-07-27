@@ -130,6 +130,67 @@ this order:
 This is now a working stateful React SSR compatibility runtime, but it is not
 yet a replacement for `crates/runtime`.
 
+## Benchmark
+
+Measured on 2026-07-27 at commit `0ed1372` plus the benchmark harness, using a
+Ryzen 7 7800X3D, Linux 7.1.5, Rust 1.94.0, and Javy 9.0.0. Processes were
+pinned to logical CPUs 0-7. The results below are medians of five runs.
+
+The instant-response comparison excludes HTTP. Javy invokes the compiled
+module directly and includes a fresh Wasm instance plus QuickJS startup in
+every request. V8 uses the existing `RuntimeService` with prewarmed isolates,
+one in-flight request per isolate. Javy ran 5,000 requests per sample; V8 ran
+100,000 so service startup was amortized and the result represents warm
+steady state.
+
+| Runtime | Concurrency | Throughput | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Javy, fresh instance | 1 | 956 req/s | 1.033 ms | 1.086 ms | 1.466 ms |
+| V8, warm isolate | 1 | 25,076 req/s | 0.040 ms | 0.060 ms | 0.120 ms |
+| Javy, fresh instance | 8 | 4,228 req/s | 1.584 ms | 3.495 ms | 4.620 ms |
+| V8, 8 warm isolates | 8 | 82,528 req/s | 0.070 ms | 0.190 ms | 0.490 ms |
+
+At concurrency 8, warm V8 delivered 19.5 times the throughput. Javy used
+approximately 54.7 MiB peak RSS during the eight-thread benchmark versus
+247.5 MiB for eight V8 isolates, a 4.5-times smaller footprint. RSS was
+sampled from `/proc` during separate runs. The minimal release server binaries
+were 20,452,912 bytes for `dd_javy_server` and 121,516,056 bytes for
+`dd_server`; that comparison favors Javy because the latter includes the
+complete production platform.
+
+Wasmtime compilation of the 1,293,210-byte instant worker took 908 ms at p50.
+That happens once in `JavyWorker::new`, not per request, and should be moved to
+a serialized Wasmtime compilation cache.
+
+Three-run medians for the larger Javy workloads:
+
+| Worker | Wasm size | Concurrency | Throughput | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| React 19 string SSR fixture | 1,913,067 B | 1 | 376 req/s | 2.650 ms | 2.714 ms | 2.905 ms |
+| React 19 string SSR fixture | 1,913,067 B | 8 | 1,974 req/s | 3.748 ms | 6.167 ms | 7.549 ms |
+| React Router storefront SSR | 2,331,529 B | 1 | 68 req/s | 14.698 ms | 15.144 ms | 15.923 ms |
+| React Router storefront SSR | 2,331,529 B | 8 | 424 req/s | 17.463 ms | 25.645 ms | 31.245 ms |
+
+The storefront benchmark includes its route loaders, KV catalog reads, memory
+transaction, React Router, and React rendering. The stores remain the
+experimental in-process implementations.
+
+Reproduce the instant-response Javy measurement with:
+
+```bash
+DD_BENCH_REQUESTS=5000 \
+DD_BENCH_CONCURRENCY=8 \
+DD_BENCH_COMPILE_ROUNDS=3 \
+taskset -c 0-7 \
+  cargo run -p javy_host --bin bench_javy_worker --release
+```
+
+The current result says Javy is viable when footprint and isolation matter
+more than latency, but it is not a performance replacement for warm V8.
+Instance pooling and request-context reset are the first optimization to test;
+they would remove the dominant per-request startup cost while retaining the
+smaller engine.
+
 ## Regenerating fixtures
 
 ```bash

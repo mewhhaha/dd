@@ -17,6 +17,10 @@ fi
 
 JAVY_BIN="$javy" JAVY_PLUGIN="$plugin" pnpm --filter dd-javy-react-example build
 cp "$repo_root/examples/javy-react/dist/worker.wasm" "$fixtures/react_worker.wasm"
+JAVY_BIN="$javy" JAVY_PLUGIN="$plugin" \
+  node "$repo_root/packages/dd-javy/src/cli.js" \
+  "$fixtures/instant_worker.js" \
+  "$fixtures/instant_worker.wasm"
 "$javy" build "$fixtures/infinite_worker.js" \
   -o "$fixtures/infinite_worker.wasm" \
   -C "plugin=$plugin" \
