@@ -1,6 +1,7 @@
 use common::{WorkerInvocation, WorkerOutput};
 use javy_host::{InvokeOptions, JavyWorker, WorkerOptions};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn fixture_bytes(name: &str) -> Vec<u8> {
@@ -98,7 +99,7 @@ fn worker_crypto_uses_host_supplied_secure_randomness() {
 }
 
 #[test]
-fn kv_and_transactional_memory_persist_between_fresh_wasm_instances() {
+fn kv_and_transactional_memory_persist_between_requests() {
     let worker = JavyWorker::new(
         &fixture_bytes("react_worker.wasm"),
         WorkerOptions {
@@ -121,6 +122,116 @@ fn kv_and_transactional_memory_persist_between_fresh_wasm_instances() {
         second,
         serde_json::json!({ "count": 2, "previous": "first" })
     );
+}
+
+#[test]
+fn warm_instance_preserves_worker_module_state() {
+    let worker = JavyWorker::new(
+        &fixture_bytes("instant_worker.wasm"),
+        WorkerOptions {
+            pool_size: 1,
+            ..WorkerOptions::default()
+        },
+    )
+    .expect("worker");
+
+    let first: serde_json::Value =
+        serde_json::from_slice(&invoke(&worker, "http://worker.local/instance-requests").body)
+            .expect("first JSON body");
+    let second: serde_json::Value =
+        serde_json::from_slice(&invoke(&worker, "http://worker.local/instance-requests").body)
+            .expect("second JSON body");
+
+    assert_eq!(first, serde_json::json!({ "completedRequests": 1 }));
+    assert_eq!(second, serde_json::json!({ "completedRequests": 2 }));
+}
+
+#[test]
+fn instance_is_replaced_after_its_request_limit() {
+    let worker = JavyWorker::new(
+        &fixture_bytes("instant_worker.wasm"),
+        WorkerOptions {
+            pool_size: 1,
+            max_requests_per_instance: 1,
+            ..WorkerOptions::default()
+        },
+    )
+    .expect("worker");
+
+    let first: serde_json::Value =
+        serde_json::from_slice(&invoke(&worker, "http://worker.local/instance-requests").body)
+            .expect("first JSON body");
+    let second: serde_json::Value =
+        serde_json::from_slice(&invoke(&worker, "http://worker.local/instance-requests").body)
+            .expect("second JSON body");
+
+    assert_eq!(first, serde_json::json!({ "completedRequests": 1 }));
+    assert_eq!(second, serde_json::json!({ "completedRequests": 1 }));
+}
+
+#[test]
+fn concurrent_invocations_share_the_bounded_instance_pool() {
+    let worker = Arc::new(
+        JavyWorker::new(
+            &fixture_bytes("instant_worker.wasm"),
+            WorkerOptions {
+                pool_size: 2,
+                ..WorkerOptions::default()
+            },
+        )
+        .expect("worker"),
+    );
+    let threads = (0..8)
+        .map(|sequence| {
+            let worker = Arc::clone(&worker);
+            std::thread::spawn(move || {
+                let output = worker
+                    .invoke(
+                        WorkerInvocation {
+                            request_id: format!("concurrent-{sequence}"),
+                            ..get("http://worker.local/")
+                        },
+                        InvokeOptions::default(),
+                    )
+                    .expect("concurrent invocation");
+                assert_eq!(output.status, 200);
+                assert_eq!(output.body, b"ok");
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread.join().expect("invocation thread");
+    }
+}
+
+#[test]
+fn trapped_instance_is_replaced_before_the_next_request() {
+    let worker = JavyWorker::new(
+        &fixture_bytes("instant_worker.wasm"),
+        WorkerOptions {
+            pool_size: 1,
+            ..WorkerOptions::default()
+        },
+    )
+    .expect("worker");
+    let error = worker
+        .invoke(
+            get("http://worker.local/infinite"),
+            InvokeOptions {
+                timeout: Duration::from_millis(20),
+            },
+        )
+        .expect_err("infinite worker must be interrupted");
+    assert!(
+        error.to_string().contains("wasm trap: interrupt"),
+        "{error}"
+    );
+
+    let next: serde_json::Value =
+        serde_json::from_slice(&invoke(&worker, "http://worker.local/instance-requests").body)
+            .expect("replacement instance JSON body");
+    assert_eq!(next, serde_json::json!({ "completedRequests": 1 }));
 }
 
 #[test]
@@ -147,4 +258,37 @@ fn module_without_start_export_is_rejected_at_load_time() {
         panic!("empty module cannot serve requests");
     };
     assert!(error.to_string().contains("_start"), "{error}");
+}
+
+#[test]
+fn zero_sized_instance_pool_is_rejected() {
+    let Err(error) = JavyWorker::new(
+        &fixture_bytes("instant_worker.wasm"),
+        WorkerOptions {
+            pool_size: 0,
+            ..WorkerOptions::default()
+        },
+    ) else {
+        panic!("zero-sized pool must be rejected");
+    };
+
+    assert!(error.to_string().contains("pool_size"), "{error}");
+}
+
+#[test]
+fn zero_request_recycle_limit_is_rejected() {
+    let Err(error) = JavyWorker::new(
+        &fixture_bytes("instant_worker.wasm"),
+        WorkerOptions {
+            max_requests_per_instance: 0,
+            ..WorkerOptions::default()
+        },
+    ) else {
+        panic!("zero request limit must be rejected");
+    };
+
+    assert!(
+        error.to_string().contains("max_requests_per_instance"),
+        "{error}"
+    );
 }

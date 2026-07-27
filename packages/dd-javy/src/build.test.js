@@ -20,6 +20,7 @@ test("bundles a worker and compatibility runtime without host JavaScript imports
     const source = await bundleJavyWorker(entry, { minify: false });
 
     assert.match(source, /await runWorker\(/);
+    assert.match(source, /globalThis\.__ddJavyWorker/);
     assert.match(source, /class RuntimeResponse|RuntimeResponse = class/);
     assert.doesNotMatch(source, /from ["']node:/);
   } finally {

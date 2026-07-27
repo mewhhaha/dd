@@ -49,6 +49,15 @@ function in QuickJS; KV and memory operations cross that import into
 Wasmtime. Stderr is reserved for worker console output so logs cannot corrupt
 the response protocol.
 
+`JavyWorker` compiles the module once and keeps a bounded pool of complete
+Wasmtime stores, Javy/QuickJS instances, and `_start` functions. A checkout
+replaces stdin, stdout, stderr, request randomness, and the epoch deadline.
+Successful instances return to the pool; traps and protocol failures discard
+the instance. The default pool is the smaller of the machine's available
+parallelism and eight instances. Each instance is also replaced after 32
+successful requests because Javy's repeated command-bytecode evaluation
+retains QuickJS allocations.
+
 ## Current surface
 
 Working and covered by the checked-in Wasm fixtures:
@@ -68,6 +77,7 @@ Working and covered by the checked-in Wasm fixtures:
 - the repository's bundled React Router storefront, including catalog
   initialization, cart form actions, redirects, and checkout
 - static assets in `dd_javy_server`
+- bounded concurrent instance pooling with module-level worker state
 - execution deadlines, a 128 MiB Wasm memory ceiling, and bounded response
   and log output
 
@@ -103,9 +113,8 @@ order writes, and transactional cart state.
 
 ## Missing before replacement
 
-The stdin/stdout request ABI still requires a fresh Wasm instance for every
-request. Synchronous plugin host calls work, but operations that need
-suspension, streaming, or durable platform integration are not implemented:
+Synchronous plugin host calls work, but operations that need suspension,
+streaming, or durable platform integration are not implemented:
 
 - outbound `fetch`
 - durable Turso-backed KV and keyed memory
@@ -113,7 +122,6 @@ suspension, streaming, or durable platform integration are not implemented:
 - service bindings
 - websockets and transport upgrades
 - dynamic workers
-- persistent module-level state
 - live response streaming and backpressure
 - real timers
 - the full URL, Fetch, Streams, Web Crypto, and structured-clone specifications
@@ -122,47 +130,50 @@ The next runtime milestone should evolve the proven custom-plugin boundary in
 this order:
 
 1. request and response transfer without JSON byte arrays
-2. instance pooling and per-request context reset
-3. connect KV and memory calls to the existing Turso-backed stores
-4. asynchronous cache, service, and outbound HTTP calls
-5. streaming bodies, real timers, websockets, and dynamic workers
+2. connect KV and memory calls to the existing Turso-backed stores
+3. asynchronous cache, service, and outbound HTTP calls
+4. streaming bodies, real timers, websockets, and dynamic workers
 
 This is now a working stateful React SSR compatibility runtime, but it is not
 yet a replacement for `crates/runtime`.
 
 ## Benchmark
 
-Measured on 2026-07-27 at commit `0ed1372` plus the benchmark harness, using a
-Ryzen 7 7800X3D, Linux 7.1.5, Rust 1.94.0, and Javy 9.0.0. Processes were
-pinned to logical CPUs 0-7. The results below are medians of five runs.
+Measured on 2026-07-27 using a Ryzen 7 7800X3D, Linux 7.1.5, Rust 1.94.0, and
+Javy 9.0.0. The pooled and forced-fresh Javy results below are medians of three
+runs.
 
 The instant-response comparison excludes HTTP. Javy invokes the compiled
-module directly and includes a fresh Wasm instance plus QuickJS startup in
-every request. V8 uses the existing `RuntimeService` with prewarmed isolates,
-one in-flight request per isolate. Javy ran 5,000 requests per sample; V8 ran
-100,000 so service startup was amortized and the result represents warm
-steady state.
+module directly. Pooled Javy keeps at most eight instances and recycles each
+after 32 successful requests; forced-fresh Javy sets that limit to one. V8
+uses the existing `RuntimeService` with prewarmed isolates, one in-flight
+request per isolate. Javy ran 5,000 requests per sample. The V8 results are
+the earlier five-run medians over 100,000 requests.
 
 | Runtime | Concurrency | Throughput | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Javy, fresh instance | 1 | 956 req/s | 1.033 ms | 1.086 ms | 1.466 ms |
+| Javy, pooled (recycle at 32) | 1 | 1,154 req/s | 0.843 ms | 1.080 ms | 1.233 ms |
+| Javy, forced fresh | 1 | 939 req/s | 1.060 ms | 1.094 ms | 1.266 ms |
 | V8, warm isolate | 1 | 25,076 req/s | 0.040 ms | 0.060 ms | 0.120 ms |
-| Javy, fresh instance | 8 | 4,228 req/s | 1.584 ms | 3.495 ms | 4.620 ms |
+| Javy, pooled (recycle at 32) | 8 | 6,939 req/s | 1.067 ms | 1.539 ms | 1.804 ms |
+| Javy, forced fresh | 8 | 4,965 req/s | 1.450 ms | 2.112 ms | 2.268 ms |
 | V8, 8 warm isolates | 8 | 82,528 req/s | 0.070 ms | 0.190 ms | 0.490 ms |
 
-At concurrency 8, warm V8 delivered 19.5 times the throughput. Javy used
-approximately 54.7 MiB peak RSS during the eight-thread benchmark versus
-247.5 MiB for eight V8 isolates, a 4.5-times smaller footprint. RSS was
-sampled from `/proc` during separate runs. The minimal release server binaries
-were 20,452,912 bytes for `dd_javy_server` and 121,516,056 bytes for
-`dd_server`; that comparison favors Javy because the latter includes the
-complete production platform.
+Pooling improved throughput by 23% sequentially and 40% at concurrency 8.
+Warm V8 still delivered 21.7 times the sequential throughput and 11.9 times
+the throughput at concurrency 8. A separately sampled pooled run peaked at
+78.0 MiB RSS, versus 51.5 MiB in forced-fresh mode and the earlier 247.5 MiB
+measurement for eight V8 isolates. Raising the recycle limit to 256 improved
+throughput only slightly but raised peak RSS to 330 MiB; a limit of 10,000
+reached the 128 MiB per-instance ceiling after 813 requests. The conservative
+32-request default preserves the small-runtime goal.
 
-Wasmtime compilation of the 1,293,210-byte instant worker took 908 ms at p50.
+Wasmtime compilation of the 1,293,814-byte instant worker took 908 ms in the
+sampled run.
 That happens once in `JavyWorker::new`, not per request, and should be moved to
 a serialized Wasmtime compilation cache.
 
-Three-run medians for the larger Javy workloads:
+Earlier fresh-instance three-run medians for the larger Javy workloads:
 
 | Worker | Wasm size | Concurrency | Throughput | p50 | p95 | p99 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -185,11 +196,10 @@ taskset -c 0-7 \
   cargo run -p javy_host --bin bench_javy_worker --release
 ```
 
+Pass `--max-requests-per-instance 1` to reproduce the forced-fresh baseline.
 The current result says Javy is viable when footprint and isolation matter
-more than latency, but it is not a performance replacement for warm V8.
-Instance pooling and request-context reset are the first optimization to test;
-they would remove the dominant per-request startup cost while retaining the
-smaller engine.
+more than latency, but pooling alone does not make it a performance
+replacement for warm V8.
 
 ## Regenerating fixtures
 

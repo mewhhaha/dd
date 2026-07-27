@@ -36,7 +36,8 @@ export async function bundleJavyWorker(entry, options = {}) {
     [
       `import { runWorker } from ${JSON.stringify(workerRuntimePath)};`,
       `import worker from ${JSON.stringify(entryPath)};`,
-      "await runWorker(worker);",
+      "globalThis.__ddJavyWorker ??= worker;",
+      "await runWorker(globalThis.__ddJavyWorker);",
     ].join("\n"),
   );
   try {

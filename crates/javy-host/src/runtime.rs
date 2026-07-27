@@ -2,11 +2,11 @@ use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Module, OptLevel, Store, StoreLimits,
-    StoreLimitsBuilder,
+    StoreLimitsBuilder, TypedFunc,
 };
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -18,6 +18,8 @@ const MAX_HOST_CALL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WASM_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const RANDOM_BYTES_PER_INVOCATION: usize = 4 * 1024;
+const MAX_DEFAULT_POOL_SIZE: usize = 8;
+const DEFAULT_REQUESTS_PER_INSTANCE: usize = 32;
 
 fn shared_engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
@@ -53,11 +55,27 @@ impl Default for InvokeOptions {
     }
 }
 
-#[derive(Default)]
 pub struct WorkerOptions {
     pub env: HashMap<String, String>,
     pub kv_bindings: Vec<String>,
     pub memory_bindings: Vec<String>,
+    pub pool_size: usize,
+    pub max_requests_per_instance: usize,
+}
+
+impl Default for WorkerOptions {
+    fn default() -> Self {
+        let pool_size = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().min(MAX_DEFAULT_POOL_SIZE))
+            .unwrap_or(1);
+        Self {
+            env: HashMap::new(),
+            kv_bindings: Vec::new(),
+            memory_bindings: Vec::new(),
+            pool_size,
+            max_requests_per_instance: DEFAULT_REQUESTS_PER_INSTANCE,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -87,6 +105,26 @@ pub struct JavyWorker {
     module: Module,
     env: HashMap<String, String>,
     host_bindings: Arc<HostBindings>,
+    instance_pool: InstancePool,
+}
+
+struct InstancePool {
+    maximum_instances: usize,
+    maximum_requests_per_instance: usize,
+    instances: Mutex<InstancePoolState>,
+    instance_available: Condvar,
+}
+
+#[derive(Default)]
+struct InstancePoolState {
+    idle: Vec<WorkerInstance>,
+    live_instances: usize,
+}
+
+struct WorkerInstance {
+    store: Store<StoreState>,
+    start: TypedFunc<(), ()>,
+    completed_requests: usize,
 }
 
 struct HostBindings {
@@ -333,6 +371,16 @@ impl JavyWorker {
     }
 
     pub fn new(bytes: &[u8], options: WorkerOptions) -> Result<Self> {
+        if options.pool_size == 0 {
+            return Err(PlatformError::bad_request(
+                "Javy worker pool_size must be greater than zero",
+            ));
+        }
+        if options.max_requests_per_instance == 0 {
+            return Err(PlatformError::bad_request(
+                "Javy worker max_requests_per_instance must be greater than zero",
+            ));
+        }
         let module = Module::new(shared_engine(), bytes).map_err(|error| {
             PlatformError::bad_request(format!("invalid Javy worker Wasm module: {error}"))
         })?;
@@ -355,6 +403,7 @@ impl JavyWorker {
             module,
             env: options.env,
             host_bindings: Arc::new(host_bindings),
+            instance_pool: InstancePool::new(options.pool_size, options.max_requests_per_instance),
         })
     }
 
@@ -382,11 +431,104 @@ impl JavyWorker {
                 invocation.request_id
             ))
         })?;
-        let stdin = MemoryInputPipe::new(request_bytes);
+        let mut worker_instance = self
+            .instance_pool
+            .checkout(&self.module, &self.host_bindings)?;
+        let outcome = worker_instance.invoke(request_bytes, &invocation.request_id, options);
+        match outcome {
+            Ok(output) => {
+                self.instance_pool.release(worker_instance)?;
+                Ok(output)
+            }
+            Err(error) => {
+                self.instance_pool.discard(worker_instance)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl InstancePool {
+    fn new(maximum_instances: usize, maximum_requests_per_instance: usize) -> Self {
+        Self {
+            maximum_instances,
+            maximum_requests_per_instance,
+            instances: Mutex::new(InstancePoolState::default()),
+            instance_available: Condvar::new(),
+        }
+    }
+
+    fn checkout(
+        &self,
+        module: &Module,
+        host_bindings: &Arc<HostBindings>,
+    ) -> Result<WorkerInstance> {
+        loop {
+            let mut instances = self.instances.lock().map_err(|_| {
+                PlatformError::internal("Javy worker instance pool lock was poisoned")
+            })?;
+            if let Some(instance) = instances.idle.pop() {
+                return Ok(instance);
+            }
+            if instances.live_instances < self.maximum_instances {
+                instances.live_instances += 1;
+                drop(instances);
+                return match WorkerInstance::new(module, host_bindings) {
+                    Ok(instance) => Ok(instance),
+                    Err(error) => {
+                        self.remove_live_instance()?;
+                        Err(error)
+                    }
+                };
+            }
+            instances = self.instance_available.wait(instances).map_err(|_| {
+                PlatformError::internal("Javy worker instance pool lock was poisoned")
+            })?;
+            drop(instances);
+        }
+    }
+
+    fn release(&self, instance: WorkerInstance) -> Result<()> {
+        if instance.completed_requests >= self.maximum_requests_per_instance {
+            return self.discard(instance);
+        }
+        let mut instances = self
+            .instances
+            .lock()
+            .map_err(|_| PlatformError::internal("Javy worker instance pool lock was poisoned"))?;
+        instances.idle.push(instance);
+        drop(instances);
+        self.instance_available.notify_one();
+        Ok(())
+    }
+
+    fn discard(&self, _instance: WorkerInstance) -> Result<()> {
+        self.remove_live_instance()
+    }
+
+    fn remove_live_instance(&self) -> Result<()> {
+        let mut instances = self
+            .instances
+            .lock()
+            .map_err(|_| PlatformError::internal("Javy worker instance pool lock was poisoned"))?;
+        if instances.live_instances == 0 {
+            return Err(PlatformError::internal(
+                "Javy worker instance pool cannot remove an instance because its live count is zero",
+            ));
+        }
+        instances.live_instances -= 1;
+        drop(instances);
+        self.instance_available.notify_one();
+        Ok(())
+    }
+}
+
+impl WorkerInstance {
+    fn new(module: &Module, host_bindings: &Arc<HostBindings>) -> Result<Self> {
         let stdout = MemoryOutputPipe::new(MAX_RESPONSE_BYTES);
         let stderr = MemoryOutputPipe::new(MAX_LOG_BYTES);
         let wasi = WasiCtxBuilder::new()
-            .stdin(stdin)
+            .stdin(MemoryInputPipe::new(Vec::new()))
             .stdout(stdout.clone())
             .stderr(stderr.clone())
             .build_p1();
@@ -402,14 +544,11 @@ impl JavyWorker {
                 stdout,
                 stderr,
                 limits,
-                host_bindings: Arc::clone(&self.host_bindings),
+                host_bindings: Arc::clone(host_bindings),
                 host_response: Vec::new(),
             },
         );
         store.limiter(|state| &mut state.limits);
-        let deadline_ticks =
-            (options.timeout.as_millis() / EPOCH_TICK.as_millis()).max(1) as u64 + 1;
-        store.set_epoch_deadline(deadline_ticks);
 
         let mut linker = Linker::new(shared_engine());
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut StoreState| {
@@ -420,41 +559,63 @@ impl JavyWorker {
         })?;
         add_host_calls(&mut linker)?;
         let instance = linker
-            .instantiate(&mut store, &self.module)
-            .map_err(|error| {
-                execution_error(&invocation.request_id, "instantiate", error, &store)
-            })?;
+            .instantiate(&mut store, module)
+            .map_err(|error| execution_error("<instance-pool>", "instantiate", error, &store))?;
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(|error| {
-                execution_error(&invocation.request_id, "resolve _start", error, &store)
-            })?;
-        start
-            .call(&mut store, ())
-            .map_err(|error| execution_error(&invocation.request_id, "execute", error, &store))?;
+            .map_err(|error| execution_error("<instance-pool>", "resolve _start", error, &store))?;
+        Ok(Self {
+            store,
+            start,
+            completed_requests: 0,
+        })
+    }
 
-        let worker_logs = worker_stderr(&store);
-        if worker_logs != "<empty>" {
-            tracing::info!(
-                request_id = %invocation.request_id,
-                "Javy worker logs:\n{worker_logs}"
-            );
+    fn invoke(
+        &mut self,
+        request_bytes: Vec<u8>,
+        request_id: &str,
+        options: InvokeOptions,
+    ) -> Result<WorkerOutput> {
+        let stdout = MemoryOutputPipe::new(MAX_RESPONSE_BYTES);
+        let stderr = MemoryOutputPipe::new(MAX_LOG_BYTES);
+        let wasi = WasiCtxBuilder::new()
+            .stdin(MemoryInputPipe::new(request_bytes))
+            .stdout(stdout.clone())
+            .stderr(stderr.clone())
+            .build_p1();
+        {
+            let state = self.store.data_mut();
+            state.wasi = wasi;
+            state.stdout = stdout;
+            state.stderr = stderr;
+            state.host_response.clear();
         }
-        let response_bytes = store.data().stdout.contents();
+        let deadline_ticks =
+            (options.timeout.as_millis() / EPOCH_TICK.as_millis()).max(1) as u64 + 1;
+        self.store.set_epoch_deadline(deadline_ticks);
+        self.start
+            .call(&mut self.store, ())
+            .map_err(|error| execution_error(request_id, "execute", error, &self.store))?;
+        self.completed_requests += 1;
+
+        let worker_logs = worker_stderr(&self.store);
+        if worker_logs != "<empty>" {
+            tracing::info!(request_id, "Javy worker logs:\n{worker_logs}");
+        }
+        let response_bytes = self.store.data().stdout.contents();
         if response_bytes.is_empty() {
             return Err(PlatformError::runtime(format!(
-                "Javy worker returned no response for request {}; stderr: {}",
-                invocation.request_id,
-                worker_stderr(&store)
+                "Javy worker returned no response for request {request_id}; stderr: {}",
+                worker_stderr(&self.store)
             )));
         }
         serde_json::from_slice(&response_bytes).map_err(|error| {
             PlatformError::runtime(format!(
-                "Javy worker returned invalid response JSON for request {}: {error}; \
+                "Javy worker returned invalid response JSON for request {request_id}: {error}; \
                  stdout: {}; stderr: {}",
-                invocation.request_id,
                 String::from_utf8_lossy(&response_bytes),
-                worker_stderr(&store)
+                worker_stderr(&self.store)
             ))
         })
     }

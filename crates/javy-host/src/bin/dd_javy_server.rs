@@ -35,6 +35,15 @@ struct Args {
     /// Per-request execution budget in milliseconds
     #[arg(long, default_value = "5000")]
     timeout_ms: u64,
+    /// Maximum number of warm Wasmtime instances
+    #[arg(long, default_value_t = WorkerOptions::default().pool_size)]
+    pool_size: usize,
+    /// Successful requests served before a warm instance is replaced
+    #[arg(
+        long,
+        default_value_t = WorkerOptions::default().max_requests_per_instance
+    )]
+    max_requests_per_instance: usize,
 }
 
 struct Server {
@@ -61,6 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             env: parse_env(&args.env)?,
             kv_bindings: args.kv,
             memory_bindings: args.memory,
+            pool_size: args.pool_size,
+            max_requests_per_instance: args.max_requests_per_instance,
         },
     )?);
     let server = Arc::new(Server {

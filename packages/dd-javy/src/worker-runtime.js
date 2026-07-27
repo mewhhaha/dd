@@ -1149,7 +1149,12 @@ export async function runWorker(worker) {
   }
   const returned = await fetch.call(worker, request, workerEnvironment(envelope), executionContext);
   const response =
-    returned instanceof RuntimeResponse ? returned : new RuntimeResponse(returned ?? null);
+    returned instanceof RuntimeResponse ||
+    (typeof returned?.arrayBuffer === "function" &&
+      typeof returned?.status === "number" &&
+      returned?.headers != null)
+      ? returned
+      : new RuntimeResponse(returned ?? null);
   const body = new Uint8Array(await response.arrayBuffer());
   await Promise.all(pendingTasks);
   writeFileDescriptor(

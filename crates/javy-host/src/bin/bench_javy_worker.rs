@@ -1,4 +1,4 @@
-//! Measures Javy's fresh-instance request path with the same metrics emitted by
+//! Measures Javy's pooled-instance request path with the same metrics emitted by
 //! the existing Perry Wasm and V8 runtime benchmarks.
 //!
 //! ```bash
@@ -37,6 +37,15 @@ struct Args {
     /// Transactional memory binding exposed to the benchmark worker
     #[arg(long)]
     memory: Vec<String>,
+    /// Maximum number of warm Wasmtime instances
+    #[arg(long, default_value_t = WorkerOptions::default().pool_size)]
+    pool_size: usize,
+    /// Successful requests served before a warm instance is replaced; use 1 for fresh instances
+    #[arg(
+        long,
+        default_value_t = WorkerOptions::default().max_requests_per_instance
+    )]
+    max_requests_per_instance: usize,
 }
 
 struct ScenarioResult {
@@ -56,11 +65,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("cannot read {}: {error}", worker_path.display()))?;
 
     println!(
-        "bench_javy_worker worker={} worker_bytes={} requests={} concurrency={}",
+        "bench_javy_worker worker={} worker_bytes={} requests={} concurrency={} pool_size={} \
+         max_requests_per_instance={}",
         worker_path.display(),
         worker_bytes.len(),
         args.requests,
-        args.concurrency
+        args.concurrency,
+        args.pool_size,
+        args.max_requests_per_instance
     );
 
     let compile = measure_rounds(args.compile_rounds, || {
@@ -69,6 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             WorkerOptions {
                 kv_bindings: args.kv.clone(),
                 memory_bindings: args.memory.clone(),
+                pool_size: args.pool_size,
+                max_requests_per_instance: args.max_requests_per_instance,
                 ..WorkerOptions::default()
             },
         )
@@ -81,6 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         WorkerOptions {
             kv_bindings: args.kv,
             memory_bindings: args.memory,
+            pool_size: args.pool_size,
+            max_requests_per_instance: args.max_requests_per_instance,
             ..WorkerOptions::default()
         },
     )?);
