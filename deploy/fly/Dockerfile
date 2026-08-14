@@ -35,7 +35,7 @@ RUN --mount=type=cache,id=dd-cargo-registry,target=/usr/local/cargo/registry \
   && mkdir -p /out \
   && cp /workspace/target/dist/dd_init /workspace/target/dist/dd_server /out/
 
-FROM gcr.io/distroless/cc-debian12@sha256:a90cf0f046efb32466b38b0972fef3a95e7c580e392e79ff1b7ac08c15fed0bc AS runtime
+FROM gcr.io/distroless/cc-debian12@sha256:6e1871c34683dc9ee996d13084497783fd98ac0200213d0826625f4e9d4be1d0 AS runtime
 
 WORKDIR /app
 ENV BIND_PUBLIC_ADDR=0.0.0.0:8080
