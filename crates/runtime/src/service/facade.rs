@@ -3,7 +3,13 @@ use futures_util::future::join_all;
 use serde::Serialize;
 use tracing::info;
 
-const RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY: usize = 4096;
+pub(super) const RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY: usize = 4096;
+
+enum DeploymentPersistence {
+    Insert,
+    Activate,
+    Restore,
+}
 
 struct DeployWithConfigRequest {
     worker_name: String,
@@ -13,7 +19,7 @@ struct DeployWithConfigRequest {
     server_modules: Vec<DeployServerModule>,
     asset_headers: Option<String>,
     deployment_id: Option<String>,
-    persist: bool,
+    persistence: DeploymentPersistence,
     temporary: bool,
     expires_at_ms: Option<i64>,
     enforce_temporary_transition: bool,
@@ -32,7 +38,9 @@ pub struct RuntimeConfig {
     pub max_queue_wait: Duration,
     pub request_wall_timeout: Duration,
     pub max_request_body_bytes: usize,
+    pub max_buffered_request_bytes: usize,
     pub max_response_body_bytes: usize,
+    pub max_buffered_response_bytes: usize,
     pub max_isolate_heap_bytes: usize,
     pub isolate_startup_timeout: Duration,
     pub idle_ttl: Duration,
@@ -43,8 +51,6 @@ pub struct RuntimeConfig {
     pub cache_default_ttl: Duration,
     pub kv_read_cache_max_entries: usize,
     pub kv_read_cache_max_bytes: usize,
-    pub kv_read_cache_hit_ttl: Duration,
-    pub kv_read_cache_miss_ttl: Duration,
     pub v8_flags: Vec<String>,
     pub debug_code_generation: bool,
     pub kv_profile_enabled: bool,
@@ -57,7 +63,7 @@ impl Default for RuntimeConfig {
         Self {
             min_isolates: 0,
             max_global_isolates: default_global_isolate_budget(),
-            max_isolates: 8,
+            max_isolates: default_global_isolate_budget(),
             max_inflight_per_isolate: 4,
             max_queued_requests_per_worker: 1024,
             reserved_internal_queued_requests_per_worker: 64,
@@ -66,7 +72,9 @@ impl Default for RuntimeConfig {
             max_queue_wait: Duration::from_secs(30),
             request_wall_timeout: Duration::from_secs(30),
             max_request_body_bytes: 64 * 1024 * 1024,
+            max_buffered_request_bytes: 64 * 1024 * 1024,
             max_response_body_bytes: 64 * 1024 * 1024,
+            max_buffered_response_bytes: 64 * 1024 * 1024,
             max_isolate_heap_bytes: 128 * 1024 * 1024,
             isolate_startup_timeout: Duration::from_secs(5),
             idle_ttl: Duration::from_secs(30),
@@ -77,8 +85,6 @@ impl Default for RuntimeConfig {
             cache_default_ttl: Duration::from_secs(60),
             kv_read_cache_max_entries: 16_384,
             kv_read_cache_max_bytes: 16 * 1024 * 1024,
-            kv_read_cache_hit_ttl: Duration::from_secs(300),
-            kv_read_cache_miss_ttl: Duration::from_secs(30),
             v8_flags: Vec::new(),
             debug_code_generation: false,
             kv_profile_enabled: false,
@@ -98,33 +104,20 @@ fn default_global_isolate_budget() -> usize {
 #[derive(Clone, Debug)]
 pub struct RuntimeStorageConfig {
     pub store_dir: PathBuf,
-    pub database_url: String,
-    pub memory_namespace_shards: usize,
     pub memory_outbox_max_concurrent_shards: usize,
-    pub memory_db_cache_max_open: usize,
     pub memory_snapshot_cache_max_entries: usize,
     pub memory_snapshot_cache_max_bytes: usize,
-    pub memory_db_read_connections_per_database: usize,
-    pub memory_db_max_total_connections: usize,
-    pub memory_db_idle_ttl: Duration,
     pub worker_store_enabled: bool,
 }
 
 impl Default for RuntimeStorageConfig {
     fn default() -> Self {
         let store_dir = PathBuf::from("./store");
-        let database_url = format!("file:{}/dd-kv.db", store_dir.display());
         Self {
             store_dir,
-            database_url,
-            memory_namespace_shards: 16,
-            memory_outbox_max_concurrent_shards: default_memory_outbox_parallelism(16),
-            memory_db_cache_max_open: 512,
+            memory_outbox_max_concurrent_shards: default_memory_outbox_parallelism(32),
             memory_snapshot_cache_max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
             memory_snapshot_cache_max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
-            memory_db_read_connections_per_database: 2,
-            memory_db_max_total_connections: 1024,
-            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: !cfg!(test),
         }
     }
@@ -158,7 +151,6 @@ pub struct WorkerStats {
     pub spawn_count: u64,
     pub reuse_count: u64,
     pub scale_down_count: u64,
-    pub targeted_nested_lane_queued: usize,
     pub targeted_lane_queued: usize,
     pub memory_lane_queued: usize,
     pub general_lane_queued: usize,
@@ -231,13 +223,13 @@ pub struct RuntimeWorkerStatus {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuntimeAdminSnapshot {
+    pub worker_schedulers: usize,
     pub active_deployments: usize,
     pub workers: Vec<RuntimeWorkerStatus>,
     pub restore_failures: Vec<RuntimeRestoreFailure>,
     pub readiness: RuntimeReadiness,
     pub storage_retry_count: u64,
-    pub cache_flush_failure_count: u64,
-    pub cache_pending_recency_touches: usize,
+    pub state_storage: ::storage::state::StatePerformanceSnapshot,
     pub memory_snapshot_cache_hits: u64,
     pub memory_snapshot_cache_misses: u64,
     pub memory_snapshot_cache_evictions: u64,
@@ -346,7 +338,6 @@ pub struct WorkerDebugIsolate {
     pub inflight_count: usize,
     pub pending_wait_until: usize,
     pub active_websocket_sessions: usize,
-    pub active_transport_sessions: usize,
     pub pending_requests: Vec<WorkerDebugRequest>,
 }
 
@@ -360,43 +351,6 @@ pub struct WorkerDebugRequest {
     pub target_isolate_id: Option<u64>,
     pub internal_origin: bool,
     pub reply_kind: String,
-    pub host_rpc_target_id: Option<String>,
-    pub host_rpc_method: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DynamicHandleDebug {
-    pub handle: String,
-    pub id: String,
-    pub owner_worker: String,
-    pub owner_generation: u64,
-    pub binding: String,
-    pub worker_name: String,
-    pub timeout_ms: u64,
-    pub policy_tier: String,
-    pub egress_deny_count: u64,
-    pub rpc_deny_count: u64,
-    pub quota_kill_count: u64,
-    pub upgrade_deny_count: u64,
-    pub outbound_requests: u64,
-    pub inflight: usize,
-    pub max_concurrency: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct HostRpcProviderDebug {
-    pub provider_id: String,
-    pub owner_worker: String,
-    pub owner_generation: u64,
-    pub owner_isolate_id: u64,
-    pub target_id: String,
-    pub methods: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DynamicRuntimeDebugDump {
-    pub handles: Vec<DynamicHandleDebug>,
-    pub providers: Vec<HostRpcProviderDebug>,
 }
 
 #[derive(Debug)]
@@ -407,7 +361,8 @@ pub struct WorkerStreamOutput {
 }
 
 pub struct WorkerStreamBody {
-    receiver: mpsc::Receiver<Result<Bytes>>,
+    receiver: mpsc::Receiver<Bytes>,
+    completion: Option<oneshot::Receiver<Result<()>>>,
     cancel_guard: Option<InvokeCancelGuard>,
 }
 
@@ -421,9 +376,13 @@ impl std::fmt::Debug for WorkerStreamBody {
 }
 
 impl WorkerStreamBody {
-    pub(super) fn new(receiver: mpsc::Receiver<Result<Bytes>>) -> Self {
+    pub(super) fn new(
+        receiver: mpsc::Receiver<Bytes>,
+        completion: oneshot::Receiver<Result<()>>,
+    ) -> Self {
         Self {
             receiver,
+            completion: Some(completion),
             cancel_guard: None,
         }
     }
@@ -433,11 +392,17 @@ impl WorkerStreamBody {
     }
 
     pub async fn recv(&mut self) -> Option<Result<Bytes>> {
-        let next = self.receiver.recv().await;
-        if next.is_none() || matches!(next, Some(Err(_))) {
-            self.disarm_cancel_guard();
+        if let Some(chunk) = self.receiver.recv().await {
+            return Some(Ok(chunk));
         }
-        next
+        let completion = match self.completion.take() {
+            Some(completion) => completion.await.unwrap_or_else(|_| {
+                Err(PlatformError::internal("stream completion channel closed"))
+            }),
+            None => Ok(()),
+        };
+        self.disarm_cancel_guard();
+        completion.err().map(Err)
     }
 
     fn disarm_cancel_guard(&mut self) {
@@ -453,20 +418,6 @@ pub struct WebSocketOpen {
     pub session_id: String,
     pub worker_name: String,
     pub output: WorkerOutput,
-}
-
-#[derive(Debug)]
-pub struct TransportOpen {
-    pub session_id: String,
-    pub worker_name: String,
-    pub output: WorkerOutput,
-}
-
-#[derive(Debug, Clone)]
-pub struct DynamicDeployResult {
-    pub worker: String,
-    pub deployment_id: String,
-    pub env_placeholders: HashMap<String, String>,
 }
 
 pub struct PublicRouteAssetResolution {
@@ -522,7 +473,7 @@ impl RuntimeShutdownState {
         }
     }
 
-    fn start(self: &Arc<Self>, sender: mpsc::Sender<RuntimeCommand>) {
+    fn start(self: &Arc<Self>, sender: RuntimeCommandSender) {
         if self
             .started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -545,7 +496,7 @@ impl RuntimeShutdownState {
         }
     }
 
-    fn shutdown_and_join_from_worker(&self, sender: mpsc::Sender<RuntimeCommand>) {
+    fn shutdown_and_join_from_worker(&self, sender: RuntimeCommandSender) {
         let (reply_tx, reply_rx) = oneshot::channel();
         let command_result = if sender
             .blocking_send(RuntimeCommand::Shutdown { reply: reply_tx })
@@ -567,20 +518,22 @@ impl RuntimeShutdownState {
     /// spawn, so it uses `try_send` rather than Tokio's panicking
     /// `blocking_send`. The runtime manager consumes this dedicated fast lane
     /// on another OS thread.
-    fn shutdown_and_join_inline(&self, sender: mpsc::Sender<RuntimeCommand>) {
+    fn shutdown_and_join_inline(&self, sender: RuntimeCommandSender) {
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let mut command = RuntimeCommand::Shutdown { reply: reply_tx };
         loop {
             match sender.try_send(command) {
                 Ok(()) => break,
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    command = returned;
-                    thread::yield_now();
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.finish_after_runtime_thread_join(Ok(()));
-                    return;
-                }
+                Err(error) => match *error {
+                    mpsc::error::TrySendError::Full(returned) => {
+                        command = returned;
+                        thread::yield_now();
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        self.finish_after_runtime_thread_join(Ok(()));
+                        return;
+                    }
+                },
             }
         }
 
@@ -676,7 +629,7 @@ impl RuntimeShutdownState {
 /// happens while a `#[tokio::test]` runtime is winding down, when spawned
 /// Tokio work would be cancelled before it can stop the runtime thread.
 struct RuntimeServiceLifetime {
-    cancel_sender: mpsc::Sender<RuntimeCommand>,
+    cancel_sender: RuntimeCommandSender,
     shutdown: Arc<RuntimeShutdownState>,
 }
 
@@ -691,14 +644,21 @@ impl Drop for RuntimeServiceLifetime {
 
 #[derive(Clone)]
 pub struct RuntimeService {
-    sender: mpsc::Sender<RuntimeCommand>,
-    cancel_sender: mpsc::Sender<RuntimeCommand>,
+    sender: RuntimeCommandSender,
+    cancel_sender: RuntimeCancellationSender,
+    fast_sender: RuntimeCommandSender,
     asset_catalog: AssetCatalog,
     kv_store: KvStore,
-    memory_store: MemoryStore,
+    pub(super) memory_store: MemoryStore,
     cache_store: CacheStore,
+    request_body_budget: Arc<tokio::sync::Semaphore>,
+    request_body_chunk_bytes: usize,
     control_store: ControlStore,
-    pub(super) _dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
+    deployment_validator: Arc<super::deployment::DeploymentValidator>,
+    deployment_admission: Arc<tokio::sync::Semaphore>,
+    deployment_order: Arc<tokio::sync::Mutex<()>>,
+    temporary_worker_ttl: Duration,
+    pub(super) _module_registry: crate::module_registry::ModuleRegistry,
     storage: RuntimeStorageConfig,
     pub(super) shutdown: Arc<RuntimeShutdownState>,
     _lifetime: Arc<RuntimeServiceLifetime>,
@@ -721,49 +681,28 @@ impl RuntimeService {
         let RuntimeServiceConfig { runtime, storage } = config;
         validate_runtime_config(&runtime)?;
         ensure_v8_flags(&runtime.v8_flags)?;
-        if storage.memory_db_cache_max_open == 0 {
+        if storage.memory_snapshot_cache_max_entries == 0
+            || storage.memory_snapshot_cache_max_bytes == 0
+        {
             return Err(PlatformError::internal(
-                "memory_db_cache_max_open must be greater than 0",
-            ));
-        }
-        let minimum_snapshot_entries = storage
-            .memory_namespace_shards
-            .saturating_mul(MEMORY_ENTITY_CACHE_STRIPES);
-        if storage.memory_snapshot_cache_max_entries < minimum_snapshot_entries {
-            return Err(PlatformError::internal(format!(
-                "memory_snapshot_cache_max_entries must be at least {minimum_snapshot_entries} for {} namespace shards and {MEMORY_ENTITY_CACHE_STRIPES} cache stripes",
-                storage.memory_namespace_shards
-            )));
-        }
-        if storage.memory_snapshot_cache_max_bytes == 0 {
-            return Err(PlatformError::internal(
-                "memory_snapshot_cache_max_bytes must be greater than 0",
-            ));
-        }
-        if storage.memory_namespace_shards == 0 {
-            return Err(PlatformError::internal(
-                "memory_namespace_shards must be greater than 0",
+                "memory snapshot cache limits must be greater than zero",
             ));
         }
         if storage.memory_outbox_max_concurrent_shards == 0 {
             return Err(PlatformError::internal(
-                "memory_outbox_max_concurrent_shards must be greater than 0",
+                "memory_outbox_max_concurrent_shards must be greater than zero",
             ));
         }
-        if storage.memory_db_read_connections_per_database == 0 {
-            return Err(PlatformError::internal(
-                "memory_db_read_connections_per_database must be greater than 0",
-            ));
-        }
-        if storage.memory_db_max_total_connections == 0 {
-            return Err(PlatformError::internal(
-                "memory_db_max_total_connections must be greater than 0",
-            ));
-        }
-        if storage.memory_db_idle_ttl.is_zero() {
-            return Err(PlatformError::internal(
-                "memory_db_idle_ttl must be greater than 0",
-            ));
+        if storage.store_dir.join("conversion-incomplete").exists()
+            || (!storage.store_dir.join("state").exists()
+                && ["dd-kv.db", "memory", "workers", "control.db", "tokens.json"]
+                    .iter()
+                    .any(|name| storage.store_dir.join(name).exists()))
+        {
+            return Err(PlatformError::runtime(format!(
+                "store {} requires offline conversion into a new destination; use dd storage convert",
+                storage.store_dir.display()
+            )));
         }
         tokio::fs::create_dir_all(&storage.store_dir)
             .await
@@ -774,54 +713,70 @@ impl RuntimeService {
                 ))
             })?;
 
+        let state_store =
+            ::storage::state::StateStore::open(storage.store_dir.join("state")).await?;
         let control_store = ControlStore::open(&storage.store_dir).await?;
-        if storage.worker_store_enabled {
-            control_store
-                .import_legacy_workers(&storage.store_dir.join("workers"))
-                .await?;
-        }
-
         let bootstrap_snapshot = build_bootstrap_snapshot().await?;
-        // KV and cache intentionally share one Turso database owner. Each
-        // subsystem still configures its own connections for its durability
-        // class (FULL for KV, NORMAL for rebuildable cache data).
-        let storage_database = KvStore::open_database(&storage.database_url).await?;
-        let kv_store = KvStore::from_database(Arc::clone(&storage_database)).await?;
+        let kv_store = KvStore::from_state(Arc::clone(&state_store));
         kv_store.set_profile_enabled(runtime.kv_profile_enabled);
-        let mut memory_store = MemoryStore::new_with_connection_limits(
-            storage.store_dir.join("memory"),
-            storage.memory_namespace_shards,
-            storage.memory_db_cache_max_open,
-            storage.memory_db_idle_ttl,
-            storage.memory_db_read_connections_per_database,
-            storage.memory_db_max_total_connections,
-        )
-        .await?;
+        kv_store.set_read_cache_limits(
+            runtime.kv_read_cache_max_entries,
+            runtime.kv_read_cache_max_bytes,
+        );
+        let mut memory_store = MemoryStore::from_state(state_store);
         memory_store.set_snapshot_cache_limits(
             storage.memory_snapshot_cache_max_entries,
             storage.memory_snapshot_cache_max_bytes,
         );
         memory_store.set_profile_enabled(runtime.memory_profile_enabled);
-        let blob_store = BlobStore::for_legacy_root(storage.store_dir.join("blobs")).await?;
-        let cache_store = CacheStore::from_database(
+        let cache_store = CacheStore::open(
+            storage.store_dir.join("cache.db"),
             CacheConfig {
                 max_entries: runtime.cache_max_entries,
                 max_bytes: runtime.cache_max_bytes,
                 default_ttl: runtime.cache_default_ttl,
-                ..CacheConfig::default()
             },
-            storage_database,
-            blob_store,
         )
         .await?;
         let (sender, receiver) = mpsc::channel(256);
-        let (cancel_sender, cancel_receiver) = mpsc::channel(RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY);
+        let (fast_sender, cancel_receiver) = mpsc::channel(RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY);
+        let (cancel_sender, cancellation_receiver) = mpsc::unbounded_channel();
+        let admission = RuntimeAdmission::new(&runtime);
+        let routes = WorkerRoutes::default();
+        let sender = RuntimeCommandSender::new(
+            sender,
+            routes.clone(),
+            CommandLane::Request,
+            Arc::clone(&admission),
+        );
+        let fast_sender = RuntimeCommandSender::new(
+            fast_sender,
+            routes.clone(),
+            CommandLane::Internal,
+            Arc::clone(&admission),
+        );
+        let cancel_sender = RuntimeCancellationSender::new(cancel_sender, routes.clone());
         let asset_catalog = AssetCatalog::default();
-        let dynamic_modules = crate::dynamic_modules::DynamicModuleRegistry::default();
+        let module_registry = crate::module_registry::ModuleRegistry::default();
+        let deployment_validator = Arc::new(super::deployment::DeploymentValidator {
+            snapshot: bootstrap_snapshot,
+            max_heap_bytes: runtime.max_isolate_heap_bytes,
+            timeout: runtime.isolate_startup_timeout,
+            allow_code_generation: runtime.debug_code_generation,
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let temporary_worker_ttl = runtime.temporary_worker_ttl;
+        let request_body_budget = Arc::new(tokio::sync::Semaphore::new(
+            runtime.max_buffered_request_bytes,
+        ));
+        let request_body_chunk_bytes = runtime.max_buffered_request_bytes.min(64 * 1024);
         let runtime_thread = spawn_runtime_thread(RuntimeThreadStart {
+            admission,
+            routes,
             receiver,
             cancel_receiver,
-            runtime_fast_sender: cancel_sender.clone(),
+            cancellation_receiver,
+            runtime_fast_sender: fast_sender.clone(),
             asset_catalog: asset_catalog.clone(),
             bootstrap_snapshot,
             kv_store: kv_store.clone(),
@@ -830,22 +785,29 @@ impl RuntimeService {
             config: runtime,
             storage: storage.clone(),
             control_store: control_store.clone(),
-            dynamic_modules: dynamic_modules.clone(),
+            module_registry: module_registry.clone(),
         })?;
         let shutdown = Arc::new(RuntimeShutdownState::new(runtime_thread));
         let lifetime = Arc::new(RuntimeServiceLifetime {
-            cancel_sender: cancel_sender.clone(),
+            cancel_sender: fast_sender.clone(),
             shutdown: Arc::clone(&shutdown),
         });
         let service = Self {
             sender,
             cancel_sender,
+            fast_sender,
             asset_catalog,
             kv_store,
             memory_store,
             cache_store,
+            request_body_budget,
+            request_body_chunk_bytes,
             control_store,
-            _dynamic_modules: dynamic_modules,
+            deployment_validator,
+            deployment_admission: Arc::new(tokio::sync::Semaphore::new(64)),
+            deployment_order: Arc::new(tokio::sync::Mutex::new(())),
+            temporary_worker_ttl,
+            _module_registry: module_registry,
             storage,
             shutdown,
             _lifetime: lifetime,
@@ -855,6 +817,13 @@ impl RuntimeService {
             return Err(error);
         }
         Ok(service)
+    }
+
+    pub fn request_body_budget(&self) -> (Arc<tokio::sync::Semaphore>, usize) {
+        (
+            Arc::clone(&self.request_body_budget),
+            self.request_body_chunk_bytes,
+        )
     }
 
     async fn restore_workers_from_store(&self) -> Result<()> {
@@ -887,7 +856,7 @@ impl RuntimeService {
                     server_modules: stored.server_modules,
                     asset_headers: stored.asset_headers,
                     deployment_id: Some(deployment_id.clone()),
-                    persist: false,
+                    persistence: DeploymentPersistence::Restore,
                     temporary: stored.expires_at_ms.is_some(),
                     expires_at_ms: stored.expires_at_ms,
                     enforce_temporary_transition: false,
@@ -946,20 +915,36 @@ impl RuntimeService {
     }
 
     pub async fn undeploy(&self, worker_name: String) -> Result<()> {
-        if !self.control_store.deactivate_worker(&worker_name).await? {
-            return Err(PlatformError::not_found("worker not found"));
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::Undeploy {
-                worker_name,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-        reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime undeploy channel closed"))?
+        let admission = Arc::clone(&self.deployment_admission)
+            .try_acquire_owned()
+            .map_err(|_| PlatformError::overloaded("deployment queue is full (64 requests)"))?;
+        let service = self.clone();
+        tokio::spawn(async move {
+            let _admission = admission;
+            let _order = service.deployment_order.lock().await;
+            if service.storage.worker_store_enabled
+                && !service
+                    .control_store
+                    .deactivate_worker(&worker_name)
+                    .await?
+            {
+                return Err(PlatformError::not_found("worker not found"));
+            }
+            let (reply_tx, reply_rx) = oneshot::channel();
+            service
+                .sender
+                .send(RuntimeCommand::Undeploy {
+                    worker_name,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+            reply_rx
+                .await
+                .map_err(|_| PlatformError::internal("runtime undeploy channel closed"))?
+        })
+        .await
+        .map_err(|error| PlatformError::internal(format!("undeploy task failed: {error}")))?
     }
 
     pub async fn rollback(&self, worker_name: String, deployment_id: String) -> Result<String> {
@@ -978,25 +963,20 @@ impl RuntimeService {
                 "expired temporary deployment cannot be rolled back",
             ));
         }
-        let restored_id = self
-            .deploy_with_config_internal(DeployWithConfigRequest {
-                worker_name: stored.worker.clone(),
-                source: stored.source,
-                config: stored.config,
-                assets: stored.assets,
-                server_modules: stored.server_modules,
-                asset_headers: stored.asset_headers,
-                deployment_id: Some(stored.deployment_id.clone()),
-                persist: false,
-                temporary: stored.expires_at_ms.is_some(),
-                expires_at_ms: stored.expires_at_ms,
-                enforce_temporary_transition: false,
-            })
-            .await?;
-        self.control_store
-            .activate_deployment(&worker_name, &restored_id)
-            .await?;
-        Ok(restored_id)
+        self.deploy_with_config_internal(DeployWithConfigRequest {
+            worker_name: stored.worker.clone(),
+            source: stored.source,
+            config: stored.config,
+            assets: stored.assets,
+            server_modules: stored.server_modules,
+            asset_headers: stored.asset_headers,
+            deployment_id: Some(stored.deployment_id.clone()),
+            persistence: DeploymentPersistence::Activate,
+            temporary: stored.expires_at_ms.is_some(),
+            expires_at_ms: stored.expires_at_ms,
+            enforce_temporary_transition: false,
+        })
+        .await
     }
 
     pub async fn deploy(&self, worker_name: String, source: String) -> Result<String> {
@@ -1098,7 +1078,7 @@ impl RuntimeService {
             server_modules,
             asset_headers,
             deployment_id: None,
-            persist: true,
+            persistence: DeploymentPersistence::Insert,
             temporary,
             expires_at_ms: None,
             enforce_temporary_transition: true,
@@ -1110,66 +1090,115 @@ impl RuntimeService {
         &self,
         request: DeployWithConfigRequest,
     ) -> Result<String> {
-        let DeployWithConfigRequest {
-            worker_name,
-            source,
-            config,
-            assets,
-            server_modules,
-            asset_headers,
-            deployment_id,
-            persist,
-            temporary,
-            expires_at_ms,
-            enforce_temporary_transition,
-        } = request;
-        let prepared = prepare_worker_deployment(
-            worker_name,
-            source,
-            config,
-            assets,
-            server_modules,
-            asset_headers,
-        )?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::Deploy {
-                prepared,
+        let admission = Arc::clone(&self.deployment_admission)
+            .try_acquire_owned()
+            .map_err(|_| PlatformError::overloaded("deployment queue is full (64 requests)"))?;
+        let service = self.clone();
+        // Once accepted, finish persistence and publication even if the client disconnects.
+        tokio::spawn(async move {
+            let _admission = admission;
+            let _order = service.deployment_order.lock().await;
+            let DeployWithConfigRequest {
+                worker_name,
+                source,
+                config,
+                assets,
+                server_modules,
+                asset_headers,
                 deployment_id,
-                persist,
+                persistence,
                 temporary,
                 expires_at_ms,
                 enforce_temporary_transition,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime deploy channel closed"))?
-    }
-
-    pub async fn deploy_dynamic(
-        &self,
-        source: String,
-        env: HashMap<String, String>,
-        egress_allow_hosts: Vec<String>,
-    ) -> Result<DynamicDeployResult> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::DeployDynamic {
+            } = request;
+            let prepared = prepare_worker_deployment(
+                worker_name,
                 source,
-                env,
-                egress_allow_hosts,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime dynamic deploy channel closed"))?
+                config,
+                assets,
+                server_modules,
+                asset_headers,
+            )?;
+            if enforce_temporary_transition {
+                let (reply, receive) = oneshot::channel();
+                service
+                    .sender
+                    .send(RuntimeCommand::CheckDeployment {
+                        worker_name: prepared.worker_name.clone(),
+                        temporary,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+                receive
+                    .await
+                    .map_err(|_| PlatformError::internal("deployment check channel closed"))??;
+            }
+            let modules = crate::module_registry::ModuleRegistry::default();
+            let source = super::lifecycle::deployed_worker_source(
+                &modules,
+                &prepared.source,
+                &prepared.server_modules,
+            )?;
+            service
+                .deployment_validator
+                .validate(source, modules)
+                .await?;
+            let expires_at_ms = if temporary {
+                let ttl_ms = i64::try_from(service.temporary_worker_ttl.as_millis())
+                    .map_err(|_| PlatformError::internal("temporary worker ttl is too large"))?;
+                Some(match expires_at_ms {
+                    Some(expires) => expires,
+                    None => epoch_ms_i64()?.checked_add(ttl_ms).ok_or_else(|| {
+                        PlatformError::internal("temporary worker expiration overflow")
+                    })?,
+                })
+            } else {
+                None
+            };
+            let deployment_id = deployment_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            if matches!(persistence, DeploymentPersistence::Insert)
+                && service.storage.worker_store_enabled
+            {
+                service
+                    .control_store
+                    .insert_deployment(&ControlDeployment {
+                        worker: prepared.worker_name.clone(),
+                        deployment_id: deployment_id.clone(),
+                        source: prepared.source.clone(),
+                        config: prepared.config.clone(),
+                        assets: prepared.assets.clone(),
+                        server_modules: prepared.server_modules.clone(),
+                        asset_headers: prepared.asset_headers.clone(),
+                        created_at_ms: epoch_ms_i64()?,
+                        expires_at_ms,
+                        active: true,
+                    })
+                    .await?;
+            }
+            if matches!(persistence, DeploymentPersistence::Activate) {
+                service
+                    .control_store
+                    .activate_deployment(&prepared.worker_name, &deployment_id)
+                    .await?;
+            }
+            let (reply, receive) = oneshot::channel();
+            service
+                .sender
+                .send(RuntimeCommand::Deploy {
+                    prepared,
+                    deployment_id,
+                    expires_at_ms,
+                    reply,
+                })
+                .await
+                .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
+            receive
+                .await
+                .map_err(|_| PlatformError::internal("runtime deploy channel closed"))?
+        })
+        .await
+        .map_err(|error| PlatformError::internal(format!("deployment task failed: {error}")))?
     }
 
     pub async fn invoke(
@@ -1317,34 +1346,6 @@ impl RuntimeService {
         Ok(opened)
     }
 
-    pub async fn open_transport(
-        &self,
-        worker_name: String,
-        request: WorkerInvocation,
-        stream_sender: mpsc::Sender<Vec<u8>>,
-        datagram_sender: mpsc::Sender<Vec<u8>>,
-    ) -> Result<TransportOpen> {
-        let session_id = Uuid::new_v4().to_string();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::OpenTransport {
-                worker_name,
-                request,
-                session_id: session_id.clone(),
-                stream_sender,
-                datagram_sender,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        let mut opened = reply_rx
-            .await
-            .map_err(|_| PlatformError::internal("runtime open transport channel closed"))??;
-        opened.session_id = session_id;
-        Ok(opened)
-    }
-
     pub async fn websocket_send_frame(
         &self,
         worker_name: String,
@@ -1441,82 +1442,6 @@ impl RuntimeService {
         })
     }
 
-    pub async fn transport_push_stream(
-        &self,
-        worker_name: String,
-        session_id: String,
-        chunk: Vec<u8>,
-        done: bool,
-    ) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::PushTransportStream {
-                worker_name,
-                session_id,
-                chunk,
-                done,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx.await.unwrap_or_else(|_| {
-            Err(PlatformError::internal(
-                "runtime transport stream push channel closed",
-            ))
-        })
-    }
-
-    pub async fn transport_push_datagram(
-        &self,
-        worker_name: String,
-        session_id: String,
-        datagram: Vec<u8>,
-    ) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::PushTransportDatagram {
-                worker_name,
-                session_id,
-                datagram,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx.await.unwrap_or_else(|_| {
-            Err(PlatformError::internal(
-                "runtime transport datagram push channel closed",
-            ))
-        })
-    }
-
-    pub async fn transport_close(
-        &self,
-        worker_name: String,
-        session_id: String,
-        close_code: u16,
-        close_reason: String,
-    ) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(RuntimeCommand::CloseTransport {
-                worker_name,
-                session_id,
-                close_code,
-                close_reason,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| PlatformError::internal("runtime thread is not available"))?;
-
-        reply_rx.await.unwrap_or_else(|_| {
-            Err(PlatformError::internal(
-                "runtime transport close channel closed",
-            ))
-        })
-    }
-
     pub async fn stats(&self, worker_name: String) -> Option<WorkerStats> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -1558,13 +1483,13 @@ impl RuntimeService {
         let readiness = self.readiness().await;
         let memory_cache = self.memory_store.cache_performance_snapshot();
         RuntimeAdminSnapshot {
+            worker_schedulers: self.sender.worker_schedulers(),
             active_deployments,
             workers,
             restore_failures,
             readiness,
             storage_retry_count: crate::turso_util::storage_retry_count(),
-            cache_flush_failure_count: self.cache_store.flush_failure_count(),
-            cache_pending_recency_touches: self.cache_store.pending_touch_count(),
+            state_storage: self.memory_store.state_performance_snapshot(),
             memory_snapshot_cache_hits: memory_cache.snapshot_hits,
             memory_snapshot_cache_misses: memory_cache.snapshot_misses,
             memory_snapshot_cache_evictions: memory_cache.snapshot_evictions,
@@ -1595,6 +1520,11 @@ impl RuntimeService {
         let expected = worker_names.len();
         let workers = self.worker_statuses(worker_names).await;
         workers.len() == expected
+            && self
+                .memory_store
+                .state_performance_snapshot()
+                .pending_commands
+                == 0
             && workers.iter().all(|worker| {
                 let stats = &worker.stats;
                 stats.queued == 0
@@ -1674,7 +1604,6 @@ impl RuntimeService {
     }
 
     pub async fn checkpoint(&self) -> Result<RuntimeCheckpointResult> {
-        self.cache_store.flush_pending_touches().await?;
         self.control_store.checkpoint().await?;
         self.kv_store.checkpoint().await?;
         self.cache_store.checkpoint().await?;
@@ -1810,23 +1739,10 @@ impl RuntimeService {
         reply_rx.await.ok().flatten()
     }
 
-    pub async fn dynamic_debug_dump(&self) -> DynamicRuntimeDebugDump {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .sender
-            .send(RuntimeCommand::DynamicDebugDump { reply: reply_tx })
-            .await
-            .is_err()
-        {
-            return DynamicRuntimeDebugDump::default();
-        }
-        reply_rx.await.unwrap_or_default()
-    }
-
     pub async fn shutdown(&self) -> Result<()> {
         // Use the fast control lane so shutdown is not queued behind a full
         // request/deploy channel once the bounded drain deadline has elapsed.
-        self.shutdown.start(self.cancel_sender.clone());
+        self.shutdown.start(self.fast_sender.clone());
         self.shutdown.wait().await
     }
 

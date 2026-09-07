@@ -4,8 +4,17 @@ The scripts in [`configs/`](configs/) are the canonical commands for the
 workloads we intentionally test. Raw sampler output is generated under
 `benchmarks/results/` and is not committed.
 
-The checked-in performance interpretation lives in
-[`SCALING.md`](SCALING.md).
+The [consolidation comparison](COHERENCE.md) records five paired runs for seven
+workloads at 8 and 16 logical CPUs, including resource costs and individual
+threshold misses. The [scaling matrix guide](SCALING.md) describes the separate
+scaling workloads; its historical results do not establish performance of the
+current storage layout.
+
+For equivalent durable workloads across the consolidation, use the
+[state comparison build and run instructions](../docs/storage-conversion.md).
+That runner verifies prebuilt binaries against exact source snapshots, including
+working-tree patches. The general sampler below requires clean source trees for
+its commit-to-commit acceptance checks.
 
 ## Running benchmarks
 
@@ -44,9 +53,10 @@ node benchmarks/run.mjs --samples 3 \
   --out benchmarks/results/local-realworld.json
 ```
 
-The runner records git, toolchain, and OS metadata; the parsed benchmark
-environment; raw stdout and stderr for every sample; exit status or signal;
-parsed result rows; and median summaries.
+The runner records staged, unstaged and untracked changes; toolchain and build
+flags; CPU affinity and model; memory and CPU limits; filesystem devices;
+effective benchmark environment; and the benchmark script fingerprint. It also
+records raw output, exit status, individual measurements and median summaries.
 
 Compare two clean, same-host runs with the production budgets (no more than 5%
 throughput loss or 10% p99 increase):
@@ -56,6 +66,22 @@ node benchmarks/compare-commits.mjs \
   --baseline benchmarks/results/baseline.json \
   --candidate benchmarks/results/candidate.json
 ```
+
+Comparisons reject empty or duplicate rows, missing samples, dirty source trees,
+different workload settings and incompatible environments. Use the same harness
+for both source revisions so the metadata and benchmark definitions match:
+
+```bash
+DD_BENCH_SOURCE_DIR=/path/to/baseline-checkout \
+  node benchmarks/run.mjs --samples 5 --config fly-production.sh \
+  --out /tmp/dd-baseline.json
+node benchmarks/run.mjs --samples 5 --config fly-production.sh \
+  --out /tmp/dd-candidate.json
+```
+
+`DD_BENCH_SOURCE_DIR` selects the source checkout to build; the invoking
+harness supplies the benchmark scripts. The Fly profile records its selected
+CPU and defaults to the first CPU allowed by the current affinity mask.
 
 Inspect the exact plan without spawning child processes or writing a result
 file:
@@ -99,9 +125,9 @@ or a `WHOPPER_*` debug probe.
 ## Fly production profile
 
 [`fly-production.sh`](configs/fly-production.sh) pins benchmark processes to one
-CPU when `taskset` is available and uses the isolate, inflight, memory-cache,
-reader, and total-connection limits from `deploy/fly/fly.toml`. It covers the
-real HTTP server, direct and atomic memory paths, durable effects, the rate
+CPU when `taskset` is available and uses the isolate, inflight, and snapshot
+cache limits from `deploy/fly/fly.toml`. It covers the real HTTP server, memory
+transactions, durable effects, the rate
 limiter, multi-worker auth, and lifecycle cold starts under the two-isolate
 global budget.
 
@@ -128,12 +154,11 @@ Default dimensions:
 | Dimension | Values |
 | --- | --- |
 | Isolates | `1`, `2`, `4`, `8`, `16`, `32` |
-| Memory shards | `1`, `2`, `4`, `8`, `16`, `32`, `64` |
 | Key modes | `same-shard`, `cross-shard`, `skewed-hotspot` |
-| Workloads | direct write, atomic read + write, atomic write + effect |
+| Workloads | atomic write only, atomic read + write, atomic write + effect |
 
-The default matrix has `6 * 7 * 3 * 3 = 378` variants. At five samples that is
-1,890 child-process runs, so the command below requires either
+The default matrix has `6 * 3 * 3 = 54` variants. At five samples that is
+270 child-process runs, so the command below requires either
 `--allow-large-run` or a sufficiently high `--max-runs`.
 
 Run the complete matrix from a clean worktree when producing release evidence:
@@ -152,7 +177,6 @@ Override matrix dimensions for a shorter development check:
 
 ```bash
 DD_BENCH_MATRIX_ISOLATES="1 2 4 8 16" \
-DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="16" \
 DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
 DD_BENCH_MATRIX_MODES="atomic-readwrite-memory-wide" \
 node benchmarks/run.mjs --samples 1 \
@@ -165,9 +189,8 @@ Run the relative smoke regression policy on a small same-host matrix:
 
 ```bash
 DD_BENCH_MATRIX_ISOLATES="1 8" \
-DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
 DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
-DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
+DD_BENCH_MATRIX_MODES="atomic-write-only-memory-wide atomic-readwrite-memory-wide" \
 node benchmarks/run.mjs --samples 3 \
   --config scaling-atomic-memory-matrix.sh \
   --out benchmarks/results/local-memory-smoke.json
@@ -195,8 +218,8 @@ worktree before treating medians as release or main-branch evidence.
   comparable to the in-process `RuntimeService` result rows.
 - Saturated wide memory read also prestarts 16 isolates with 256 concurrency,
   but measures keyed-memory routing and hydration.
-- Legacy `scaling-memory-*` configs fix the memory shard count at 16 and compare
-  same-shard with cross-shard direct reads and writes.
+- State storage has 32 fixed shards. Scaling configs compare transactions on
+  keys in the same shard with keys spread across shards.
 - Storage-only write configs invoke `MemoryStore.apply_batch()` directly. They
   isolate storage behavior from JavaScript and runtime scheduling.
 - Atomic read/write configs read the current value and write `payload = "1"`.
@@ -211,9 +234,7 @@ worktree before treating medians as release or main-branch evidence.
 - `DD_BENCH_MODE=realworld-auth-worker-direct` is a diagnostic auth mode that
   hits the auth worker directly with KV and memory bindings, bypassing the
   frontend and service binding layer.
-- `DD_BENCH_MEMORY_NAMESPACE_SHARDS` configures both runtime storage sharding
-  and the same-shard/cross-shard key generator.
-- Direct and atomic wide-write workloads verify all distinct written keys.
+- Atomic wide-write workloads verify all distinct written keys.
 
 ## Broad runtime suite diagnostics
 

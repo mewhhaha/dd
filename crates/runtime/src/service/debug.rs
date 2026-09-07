@@ -71,14 +71,6 @@ impl WorkerPool {
                 target_isolate_id: pending.target_isolate_id,
                 internal_origin: pending.internal_origin,
                 reply_kind: pending.reply_kind.label().to_string(),
-                host_rpc_target_id: pending
-                    .host_rpc_call
-                    .as_ref()
-                    .map(|call| call.target_id.clone()),
-                host_rpc_method: pending
-                    .host_rpc_call
-                    .as_ref()
-                    .map(|call| call.method.clone()),
             })
             .collect::<Vec<_>>();
 
@@ -102,8 +94,6 @@ impl WorkerPool {
                             target_isolate_id: Some(isolate.id),
                             internal_origin: pending.internal_origin,
                             reply_kind: pending.kind.label().to_string(),
-                            host_rpc_target_id: None,
-                            host_rpc_method: None,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -114,7 +104,6 @@ impl WorkerPool {
                     inflight_count: isolate.inflight_count,
                     pending_wait_until: isolate.pending_wait_until.len(),
                     active_websocket_sessions: isolate.active_websocket_sessions,
-                    active_transport_sessions: isolate.active_transport_sessions,
                     pending_requests,
                 }
             })

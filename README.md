@@ -1,8 +1,8 @@
 # dd
 
-`dd` is single-node worker runtime in Rust with Deno-backed isolates. It is inspired by Cloudflare Workers and Durable Objects, but aimed at "run Cloudflare-like workers on one machine with disk-backed storage" rather than "managed global edge platform."
+`dd` runs JavaScript workers on one machine using Rust, Deno/V8 isolates, and durable local storage.
 
-Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. State lives on disk. For coordination, `dd` does not use Durable Objects as the public model. It uses keyed memory namespaces as durable single-writer actors: shard state by key, run `atomic(...)` commands once for that key, and commit state plus effects through durable storage.
+Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. KV stores structured values. Keyed memory provides ordered transactions that commit state and emitted effects together. Both are private to a worker and binding.
 
 Worker shape stays familiar: `fetch(request, env, ctx)` plus worker bindings. KV handles simple persistence, Cache API handles response reuse, and memory namespaces handle shardable coordination.
 
@@ -84,7 +84,7 @@ export default {
 
 ## Memory namespaces
 
-Memory namespace is the main coordination primitive. You pick a key, get the coordinator for that key, and run a synchronous `atomic(...)` command against it. Commands for one key are ordered, the callback runs once, and state plus emitted effects commit together.
+Pick an entity key and call `atomic(tx => ...)`. Transactions for that worker, binding and key are ordered across isolates and redeployments. The synchronous callback runs once in the caller's isolate and can capture local variables. Its writes and emitted effects commit together before the promise resolves. Async callbacks and returned thenables are rejected; failed callbacks commit nothing.
 
 Deploy with memory binding:
 
@@ -100,25 +100,24 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const user = url.searchParams.get("user") ?? "anonymous";
-    const memory = env.COUNTERS.get(env.COUNTERS.idFromName(user));
-    const count = memory.tvar("count", 0);
+    const memory = env.COUNTERS.get(user);
 
     if (request.method === "POST") {
-      const next = await memory.atomic(() => {
-        const value = Number(count.read()) + 1;
-        count.write(value);
+      const next = await memory.atomic((tx) => {
+        const value = Number(tx.get("count") ?? 0) + 1;
+        tx.put("count", value);
         return value;
       });
       return Response.json({ user, count: next });
     }
 
-    const current = await memory.atomic(() => Number(count.read()) || 0);
+    const current = await memory.atomic((tx) => Number(tx.get("count") ?? 0));
     return Response.json({ user, count: current });
   },
 };
 ```
 
-This is the closest thing to Durable Objects, but the model is different. You are not instantiating a long-lived object class with a special lifecycle. You are sending ordered commands to a durable keyed coordinator.
+Pass `{ idempotencyKey: "command-id" }` as the second argument to replay a committed result across retries and restarts. Reads, writes, listing and effects use the explicit transaction object; that object becomes unavailable when the callback returns. Memory identity survives worker redeployment.
 
 ## KV
 
@@ -135,17 +134,17 @@ Worker:
 
 ```js
 export default {
-  async fetch(_request, env) {
-    const current = Number((await env.MY_KV.get("hits")) ?? "0") || 0;
-    const next = current + 1;
-    await env.MY_KV.set("hits", String(next));
-
-    return new Response(`hits=${next}`, {
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+  async fetch(request, env) {
+    await env.MY_KV.put("lastVisit", { path: new URL(request.url).pathname });
+    return Response.json(await env.MY_KV.get("lastVisit"));
   },
 };
 ```
+
+`get` returns the stored structured value or `null`. `put` and `delete` resolve
+after durable commit; `list` returns an array of `{ key, value }` entries.
+Committed writes are visible across isolates. Use keyed memory transactions for
+operations that must read and update a value atomically.
 
 ## Cache API
 
@@ -187,48 +186,9 @@ export default {
 };
 ```
 
-## Dynamic workers and assets
+## Outbound HTTP and assets
 
-Workers can create other workers with `env.SANDBOX.get/list/delete`. Dynamic workers run in separate Deno isolates inside same process, so they fit buggy or semi-hostile agent code that should not share parent runtime state. That is runtime isolation and containment, not OS process, VM, or container sandboxing.
-
-Default child policy is deny-first. No outbound fetch, no host RPC, no websocket/transport upgrade, no cache access unless child opts in:
-
-```js
-const child = await env.SANDBOX.get("agent:v1", async () => ({
-  entrypoint: "worker.js",
-  modules: {
-    "worker.js": `
-      export default {
-        async fetch(request) {
-          return new Response("ok");
-        },
-      };
-    `,
-  },
-  egress_allow_hosts: ["api.openai.com"],
-  max_request_bytes: 1_048_576,
-  max_response_bytes: 2_097_152,
-  max_outbound_requests: 8,
-  max_concurrency: 8,
-  timeout: 2_500,
-}));
-```
-
-Literal loopback, private, link-local, metadata, multicast, and documentation addresses are rejected even when listed. A trusted administrator can explicitly allow a private literal for local infrastructure with the `private:` prefix, for example `private:127.0.0.1:8080`; do not expose that capability to untrusted child configuration.
-
-If child needs parent callback, opt in explicitly:
-
-```js
-const child = await env.SANDBOX.get("preview:v1", async () => ({
-  entrypoint: "worker.js",
-  modules: previewModules(),
-  allow_host_rpc: true,
-  env: { PREVIEW: new PreviewControl("preview:v1") },
-  timeout: 3_000,
-}));
-```
-
-See [examples/dynamic-namespace.js](examples/dynamic-namespace.js), [examples/preview-dynamic.js](examples/preview-dynamic.js), and [examples/llm-dynamic-exec.js](examples/llm-dynamic-exec.js).
+Static deployments declare allowed outbound origins in `config.egress_allow_hosts`, for example `["api.example.com"]`. Outbound fetch is denied by default. The runtime checks the destination and redirects; local infrastructure requires an explicit rule such as `private:127.0.0.1:8080`.
 
 Static assets can be bundled at deploy time with `--assets-dir`. Files are served before worker code runs, with root `_headers` support similar to Cloudflare static assets. See [examples/static-assets-site](examples/static-assets-site).
 
@@ -238,8 +198,8 @@ Chat app example combines memory namespace, websockets, and deploy-time assets i
 
 Workers can be tested and developed against the native runtime without starting
 `dd_server`. The dev package in [packages/dd-vite](packages/dd-vite) launches
-`dd_dev_runtime` over stdio, deploys worker source into `RuntimeService`, and
-invokes it directly from Vitest helpers or a Vite plugin.
+`dd_dev_runtime`, deploys worker source over stdio, and invokes it through
+loopback HTTP and WebSocket connections from Vitest helpers or a Vite plugin.
 
 This is the debug/dev path where `eval` and `new Function` are allowed. It is
 not a production control plane.
@@ -264,24 +224,17 @@ plugin options override that file.
 
 See [docs/development.md](docs/development.md#vite-and-vitest-worker-development).
 
-## Perry wasm runtime (experiment)
+## Runtime and storage
 
-`crates/wasm-host` is an experimental alternative runtime with no JS engine:
-workers are TypeScript compiled to WebAssembly by
-[Perry](https://github.com/PerryTS/perry), executed in wasmtime against a
-native Rust implementation of Perry's runtime ABI. Workers register a fetch
-handler through a small `declare function` host API and are served by
-`dd_wasm_server`. See
-[docs/perry-wasm-experiment.md](docs/perry-wasm-experiment.md) for the
-contract and current limitations.
+Workers have independent schedulers and share CPU, queue and stream-buffer budgets. Deployment validation runs outside request scheduling. Redeployment sends WebSockets close code `1012` and gives the previous generation a bounded period to drain.
 
-## How to think about it
+KV and memory share 32 fixed state shards. Deployment records and tokens use `control.db`; rebuildable responses use `cache.db`. Existing stores require an offline conversion into a new directory, followed by redeployment of rebuilt bundles.
 
-If you want "Cloudflare-style worker runtime on one box," `dd` is that shape.
+See [architecture and resource limits](docs/architecture.md) and [storage conversion](docs/storage-conversion.md).
 
-If you want "Durable Objects, but expressed as disk-backed keyed actors instead of object instances," memory namespaces are that shape.
-
-If you want one app process you can deploy to Fly or another VM and then load with named workers, `dd_server` is that shape.
+The [consolidation performance report](benchmarks/COHERENCE.md) records measured
+throughput, latency and resource costs, with validation limits and reproduction
+instructions.
 
 ## Fly
 

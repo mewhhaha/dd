@@ -120,7 +120,7 @@ try {
 process.exit(0);
 
 function stmCount(response, label) {
-  const raw = response.headers.get("x-dd-stm-count");
+  const raw = response.headers.get("x-memory-count");
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error(`${label} did not expose a valid dd STM count: ${raw}`);

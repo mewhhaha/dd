@@ -16,16 +16,28 @@ if (isMain()) {
   );
   const report = compareBenchmarkRows(baseline, candidate, options);
   process.stdout.write(renderReport(report));
-  process.exit(report.failures.length === 0 ? 0 : 1);
+  process.exitCode = report.failures.length === 0 ? 0 : 1;
 }
 
 export function compareBenchmarkRows(baseline, candidate, options = {}) {
   const throughputRegression =
     options.throughputRegression ?? DEFAULT_THROUGHPUT_REGRESSION;
   const p99Regression = options.p99Regression ?? DEFAULT_P99_REGRESSION;
-  const candidateByKey = new Map(candidate.map((row) => [rowKey(row), row]));
   const passes = [];
   const failures = [];
+  for (const [label, rows] of [["baseline", baseline], ["candidate", candidate]]) {
+    if (rows.length === 0) failures.push({ key: label, reason: "no benchmark rows" });
+    const seen = new Set();
+    for (const row of rows) {
+      const key = rowKey(row);
+      if (seen.has(key)) failures.push({ key, reason: `${label} contains duplicate rows` });
+      seen.add(key);
+    }
+  }
+  if (failures.length > 0) {
+    return { passes, failures, throughputRegression, p99Regression };
+  }
+  const candidateByKey = new Map(candidate.map((row) => [rowKey(row), row]));
 
   for (const baselineRow of baseline) {
     const key = rowKey(baselineRow);
@@ -34,7 +46,8 @@ export function compareBenchmarkRows(baseline, candidate, options = {}) {
       failures.push({ key, reason: "candidate row is missing" });
       continue;
     }
-    const invalidMetric = invalidMetricReason(baselineRow, candidateRow);
+    const invalidMetric = invalidMetricReason(baselineRow, candidateRow)
+      ?? incompatibleRunReason(baselineRow, candidateRow);
     if (invalidMetric) {
       failures.push({ key, reason: invalidMetric });
       candidateByKey.delete(key);
@@ -57,6 +70,61 @@ export function compareBenchmarkRows(baseline, candidate, options = {}) {
     failures.push({ key, reason: "baseline row is missing" });
   }
   return { passes, failures, throughputRegression, p99Regression };
+}
+
+function incompatibleRunReason(baseline, candidate) {
+  for (const [label, row] of [["baseline", baseline], ["candidate", candidate]]) {
+    if (!row.configName || !row.workload || !row.metadata?.git_commit) {
+      return `${label} is missing workload or commit identity`;
+    }
+  }
+  for (const field of ["requests", "concurrency", "samples", "sampleCount"]) {
+    for (const [label, row] of [["baseline", baseline], ["candidate", candidate]]) {
+      if (!Number.isInteger(row[field]) || row[field] <= 0) {
+        return `${label} ${field} must be a positive integer`;
+      }
+    }
+    if (baseline[field] !== candidate[field]) return `incompatible ${field}`;
+  }
+  if (baseline.samples !== baseline.sampleCount || candidate.samples !== candidate.sampleCount) {
+    return "incomplete workload samples";
+  }
+  for (const [label, row] of [["baseline", baseline], ["candidate", candidate]]) {
+    if (row.sampleMetrics?.length !== row.samples) return `${label} has incomplete raw samples`;
+    if (row.sampleMetrics.some((sample) => !Number.isFinite(sample.throughput_rps)
+      || sample.throughput_rps <= 0 || !Number.isFinite(sample.p99_ms) || sample.p99_ms <= 0)) {
+      return `${label} has invalid raw sample metrics`;
+    }
+  }
+  if (!baseline.scriptHash || !candidate.scriptHash) return "missing benchmark script fingerprint";
+  if (baseline.scriptHash !== candidate.scriptHash) return "incompatible benchmark script or build command";
+  for (const field of ["logical_cpus", "cpu_affinity", "cpu_model", "memory_bytes", "memory_limit", "cpu_limit", "disk", "os", "rustc", "cargo", "build"]) {
+    if (baseline.metadata?.[field] == null || candidate.metadata?.[field] == null
+      || baseline.metadata[field] === "unavailable" || candidate.metadata[field] === "unavailable") {
+      return `missing benchmark metadata: ${field}`;
+    }
+    if (canonical(baseline.metadata[field]) !== canonical(candidate.metadata[field])) {
+      return `incompatible benchmark metadata: ${field}`;
+    }
+  }
+  if (baseline.metadata.git_dirty !== false || candidate.metadata.git_dirty !== false) {
+    return "comparison requires clean benchmark sources";
+  }
+  if (!baseline.effectiveConfig || !candidate.effectiveConfig) {
+    return "missing effective configuration";
+  }
+  if (canonical(baseline.effectiveConfig) !== canonical(candidate.effectiveConfig)) {
+    return "incompatible effective configuration (including durability)";
+  }
+  return null;
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function invalidMetricReason(baselineRow, candidateRow) {
@@ -98,7 +166,6 @@ function rowKey(row) {
     row.mode ?? "",
     row.keys ?? "",
     row.isolates ?? "",
-    row.shards ?? "",
   ].join("|");
 }
 

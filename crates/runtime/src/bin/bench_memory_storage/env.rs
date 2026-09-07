@@ -49,12 +49,6 @@ pub(crate) fn env_mode() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) const MEMORY_NAMESPACE_SHARDS: usize = 16;
-
-pub(crate) fn env_memory_namespace_shards() -> usize {
-    env_usize("DD_BENCH_MEMORY_NAMESPACE_SHARDS", MEMORY_NAMESPACE_SHARDS)
-}
-
 pub(crate) fn env_duration_ms(name: &str, default: u64) -> Duration {
     Duration::from_millis(
         std::env::var(name)

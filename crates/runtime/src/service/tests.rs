@@ -18,14 +18,26 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-#[path = "tests/dynamic.rs"]
-mod dynamic;
+#[path = "tests/egress.rs"]
+mod egress;
+#[path = "tests/examples.rs"]
+mod examples;
 #[path = "tests/fixtures.rs"]
 mod fixtures;
 #[path = "tests/memory.rs"]
 mod memory;
+#[path = "tests/memory_contract.rs"]
+mod memory_contract;
+#[path = "tests/memory_list.rs"]
+mod memory_list;
+#[path = "tests/request_control.rs"]
+mod request_control;
+mod scheduling;
 #[path = "tests/sessions.rs"]
 mod sessions;
+mod shutdown;
+#[path = "tests/streaming.rs"]
+mod streaming;
 
 use self::fixtures::*;
 
@@ -45,9 +57,72 @@ async fn service_starts_with_deno_runtime_bootstrap() {
 }
 
 #[tokio::test]
-async fn service_rejects_snapshot_budgets_that_leave_empty_cache_stripes() {
+#[serial]
+async fn worker_exposes_static_bindings_and_transactional_websockets() {
+    let service = test_service(RuntimeConfig::default()).await;
+    service
+        .deploy_with_config(
+            "public-surface".to_string(),
+            r#"
+export default {
+  async fetch(_request, env) {
+    const room = env.ROOM.get(env.ROOM.idFromName("room"));
+    return Response.json({
+      fetch: typeof fetch,
+      socketAccept: await room.atomic((tx) => typeof tx.accept),
+      rpcTarget: typeof globalThis.RpcTarget,
+      webTransport: typeof globalThis.WebTransport,
+      webTransportSession: typeof globalThis.WebTransportSession,
+      kvGet: typeof env.KV.get,
+      memoryAtomic: typeof room.atomic,
+      serviceFetch: typeof env.SERVICE.fetch,
+    });
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                bindings: vec![
+                    DeployBinding::Kv {
+                        binding: "KV".to_string(),
+                    },
+                    DeployBinding::Memory {
+                        binding: "ROOM".to_string(),
+                    },
+                    DeployBinding::Service {
+                        binding: "SERVICE".to_string(),
+                        service: "public-surface".to_string(),
+                    },
+                ],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("static deployment should succeed");
+    let output = service
+        .invoke("public-surface".to_string(), test_invocation())
+        .await
+        .expect("worker surface should be observable");
+    assert_eq!(output.status, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.body).expect("JSON worker surface"),
+        serde_json::json!({
+            "fetch": "function",
+            "socketAccept": "function",
+            "rpcTarget": "undefined",
+            "webTransport": "undefined",
+            "webTransportSession": "undefined",
+            "kvGet": "function",
+            "memoryAtomic": "function",
+            "serviceFetch": "function",
+        }),
+    );
+}
+
+#[tokio::test]
+async fn service_rejects_empty_snapshot_cache_budgets() {
     let storage = RuntimeStorageConfig {
-        memory_snapshot_cache_max_entries: 1,
+        memory_snapshot_cache_max_entries: 0,
         ..RuntimeStorageConfig::default()
     };
     let result = RuntimeService::start_with_service_config(RuntimeServiceConfig {
@@ -66,7 +141,7 @@ async fn service_rejects_snapshot_budgets_that_leave_empty_cache_stripes() {
     assert!(
         error
             .to_string()
-            .contains("memory_snapshot_cache_max_entries must be at least 1024")
+            .contains("memory snapshot cache limits must be greater than zero")
     );
 }
 
@@ -1577,16 +1652,8 @@ export default {
 #[serial]
 async fn deployed_assets_restore_from_worker_store() {
     let root = PathBuf::from(format!("/tmp/dd-assets-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
 
-    let service = test_service_with_paths(
-        RuntimeConfig::default(),
-        root.clone(),
-        database_url.clone(),
-        true,
-    )
-    .await;
+    let service = test_service_with_paths(RuntimeConfig::default(), root.clone(), true).await;
     service
         .deploy_with_bundle_config(
             "assets".to_string(),
@@ -1599,8 +1666,7 @@ async fn deployed_assets_restore_from_worker_store() {
         .expect("deploy should succeed");
     drop(service);
 
-    let restored =
-        test_service_with_paths(RuntimeConfig::default(), root.clone(), database_url, true).await;
+    let restored = test_service_with_paths(RuntimeConfig::default(), root.clone(), true).await;
     let asset = restored
         .resolve_asset("assets", "GET", Some("foo.example.com"), "/a.js", &[])
         .expect("asset lookup should succeed")
@@ -1697,16 +1763,13 @@ async fn temporary_worker_redeploy_refreshes_and_normal_deploy_makes_permanent()
 #[serial]
 async fn temporary_worker_expires_and_is_not_restored_from_store() {
     let root = PathBuf::from(format!("/tmp/dd-temp-workers-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
     let config = RuntimeConfig {
         scale_tick: Duration::from_secs(1),
         temporary_worker_ttl: Duration::from_millis(250),
         ..RuntimeConfig::default()
     };
 
-    let service =
-        test_service_with_paths(config.clone(), root.clone(), database_url.clone(), true).await;
+    let service = test_service_with_paths(config.clone(), root.clone(), true).await;
     service
         .deploy_temporary_with_bundle_config(
             "preview".to_string(),
@@ -1722,7 +1785,7 @@ async fn temporary_worker_expires_and_is_not_restored_from_store() {
     drop(service);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
+    let restored = test_service_with_paths(config, root.clone(), true).await;
     assert!(restored.stats("preview".to_string()).await.is_none());
 
     let _ = tokio::fs::remove_dir_all(root).await;
@@ -2003,7 +2066,7 @@ async fn crypto_globals_work_with_deno_crypto_ops() {
 
 #[tokio::test]
 #[serial]
-async fn lazy_kv_get_batching_matches_sequential_reads_and_preserves_duplicates() {
+async fn concurrent_kv_reads_match_sequential_reads_and_preserve_duplicates() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -2019,7 +2082,7 @@ async fn lazy_kv_get_batching_matches_sequential_reads_and_preserves_duplicates(
     service
         .deploy_with_config(
             worker_name.clone(),
-            kv_batching_worker(&worker_name),
+            kv_batching_worker(),
             DeployConfig {
                 bindings: vec![DeployBinding::Kv {
                     binding: "MY_KV".to_string(),
@@ -2068,7 +2131,7 @@ async fn lazy_kv_get_batching_matches_sequential_reads_and_preserves_duplicates(
 
 #[tokio::test]
 #[serial]
-async fn lazy_kv_get_batching_decodes_mixed_values_and_rejects_whole_batch_on_failure() {
+async fn kv_reads_decode_mixed_values_and_surface_corrupt_values() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -2084,7 +2147,7 @@ async fn lazy_kv_get_batching_decodes_mixed_values_and_rejects_whole_batch_on_fa
     service
         .deploy_with_config(
             worker_name.clone(),
-            kv_batching_worker(&worker_name),
+            kv_batching_worker(),
             DeployConfig {
                 bindings: vec![DeployBinding::Kv {
                     binding: "MY_KV".to_string(),
@@ -2140,10 +2203,6 @@ async fn lazy_kv_get_batching_decodes_mixed_values_and_rejects_whole_batch_on_fa
         listed_values[0]["key"],
         Value::String("obj-list".to_string())
     );
-    assert_eq!(
-        listed_values[0]["encoding"],
-        Value::String("v8sc".to_string())
-    );
     assert_eq!(listed_values[0]["value"]["ok"], Value::Bool(true));
     assert_eq!(listed_values[0]["value"]["n"], Value::from(17));
 
@@ -2164,7 +2223,7 @@ async fn lazy_kv_get_batching_decodes_mixed_values_and_rejects_whole_batch_on_fa
 
 #[tokio::test]
 #[serial]
-async fn lazy_kv_get_batching_is_scoped_to_each_request() {
+async fn concurrent_kv_reads_preserve_each_requests_keys() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -2180,7 +2239,7 @@ async fn lazy_kv_get_batching_is_scoped_to_each_request() {
     service
         .deploy_with_config(
             worker_name.clone(),
-            kv_batching_worker(&worker_name),
+            kv_batching_worker(),
             DeployConfig {
                 bindings: vec![DeployBinding::Kv {
                     binding: "MY_KV".to_string(),
@@ -2339,124 +2398,92 @@ async fn kv_write_batching_preserves_last_write_wins() {
 
 #[tokio::test]
 #[serial]
-async fn kv_write_overlay_makes_same_request_reads_predictable() {
+async fn kv_commits_are_visible_across_isolates_and_reads_are_independent_values() {
     let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
+        min_isolates: 2,
+        max_isolates: 2,
+        max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })
     .await;
-
-    let worker_name = "kv-write-overlay".to_string();
     service
         .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
+            "kv-visibility".to_string(),
+            r#"
+const isolate = crypto.randomUUID();
+export default {
+  async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    if (path === "/write") {
+      const result = await env.STATE.put("value", { count: 42 });
+      return Response.json({ returnedUndefined: result === undefined });
+    }
+    if (path === "/delete") {
+      await env.STATE.delete("value");
+      return Response.json(await env.STATE.get("value"));
+    }
+    const value = await env.STATE.get("value");
+    if (value) value.count = 99;
+    const reread = await env.STATE.get("value");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return Response.json({ isolate, value: reread });
+  },
+};
+"#
+            .to_string(),
             DeployConfig {
                 bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
+                    binding: "STATE".to_string(),
                 }],
                 ..DeployConfig::default()
             },
         )
         .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/seed", "kv-write-overlay-seed-request"),
-        )
-        .await
-        .expect("seed should succeed");
+        .expect("deploy");
+    for result in futures_util::future::join_all(
+        (0..4).map(|_| service.invoke("kv-visibility".to_string(), test_invocation())),
+    )
+    .await
+    {
+        result.expect("warm isolate pool under concurrent demand");
+    }
+    wait_for_isolate_total(&service, "kv-visibility", 2).await;
 
-    let output = service
-        .invoke(
-            worker_name,
-            test_invocation_with_path("/write-overlay", "kv-write-overlay-request"),
-        )
-        .await
-        .expect("write overlay should succeed");
-    assert_eq!(
-        String::from_utf8(output.body).expect("body should be utf8"),
-        "9"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn kv_queued_durability_returns_explicit_version_ack() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let worker_name = "kv-queued-durability".to_string();
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/seed", "kv-queued-durability-seed"),
-        )
-        .await
-        .expect("seed should succeed");
-
-    let put = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/put-queued-version-read", "kv-queued-durability-put"),
-        )
-        .await
-        .expect("queued put should succeed");
-    let put_body: Value =
-        serde_json::from_slice(&put.body).expect("queued put response should be json");
-    assert_eq!(put_body["queued"], Value::Bool(true));
-    assert_eq!(put_body["durability"], Value::String("queued".to_string()));
-    assert!(put_body["version"].as_i64().expect("queued put version") > 0);
-    assert_eq!(put_body["value"], Value::String("13".to_string()));
-
-    let delete = service
-        .invoke(
-            worker_name,
-            test_invocation_with_path("/delete-queued-version-read", "kv-queued-durability-delete"),
-        )
-        .await
-        .expect("queued delete should succeed");
-    let delete_body: Value =
-        serde_json::from_slice(&delete.body).expect("queued delete response should be json");
-    assert_eq!(delete_body["queued"], Value::Bool(true));
-    assert_eq!(
-        delete_body["durability"],
-        Value::String("queued".to_string())
-    );
-    assert!(
-        delete_body["version"]
-            .as_i64()
-            .expect("queued delete version")
-            > 0
-    );
-    assert_eq!(delete_body["value"], Value::Null);
+    for expected in [Value::Null, serde_json::json!({ "count": 42 }), Value::Null] {
+        let (left, right) = tokio::join!(
+            service.invoke("kv-visibility".to_string(), test_invocation()),
+            service.invoke("kv-visibility".to_string(), test_invocation()),
+        );
+        let left: Value =
+            serde_json::from_slice(&left.expect("left request").body).expect("left JSON");
+        let right: Value =
+            serde_json::from_slice(&right.expect("right request").body).expect("right JSON");
+        assert_ne!(
+            left["isolate"], right["isolate"],
+            "requests must exercise both isolate caches"
+        );
+        assert_eq!(left["value"], expected);
+        assert_eq!(right["value"], expected);
+        let path = if expected.is_null() {
+            "/write"
+        } else {
+            "/delete"
+        };
+        let output = service
+            .invoke(
+                "kv-visibility".to_string(),
+                test_invocation_with_path(path, "kv-write"),
+            )
+            .await
+            .expect("mutation");
+        if path == "/write" {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.body).expect("write JSON"),
+                serde_json::json!({ "returnedUndefined": true })
+            );
+        }
+    }
+    service.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -2503,11 +2530,7 @@ async fn kv_committed_durability_awaits_canonical_write() {
         .await
         .expect("committed put should succeed");
     let put_body = String::from_utf8(put.body).expect("put body should be utf8");
-    let (put_version, put_value) = put_body
-        .split_once(':')
-        .expect("committed put should return version and value");
-    assert!(put_version.parse::<i64>().expect("put version") > 0);
-    assert_eq!(put_value, "12");
+    assert_eq!(put_body, "12");
 
     let put_object = service
         .invoke(
@@ -2521,7 +2544,6 @@ async fn kv_committed_durability_awaits_canonical_write() {
         .expect("committed object put should succeed");
     let object_body: Value =
         serde_json::from_slice(&put_object.body).expect("object response should be json");
-    assert!(object_body["version"].as_i64().expect("object version") > 0);
     assert_eq!(object_body["value"]["ok"], Value::Bool(true));
     assert_eq!(object_body["value"]["n"], Value::from(12));
 
@@ -2533,360 +2555,7 @@ async fn kv_committed_durability_awaits_canonical_write() {
         .await
         .expect("committed delete should succeed");
     let delete_body = String::from_utf8(delete.body).expect("delete body should be utf8");
-    let (delete_version, delete_value) = delete_body
-        .split_once(':')
-        .expect("committed delete should return version and value");
-    assert!(delete_version.parse::<i64>().expect("delete version") > 0);
-    assert_eq!(delete_value, "missing");
-}
-
-#[tokio::test]
-#[serial]
-async fn kv_read_cache_hits_across_requests_in_same_isolate() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        kv_profile_enabled: true,
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let worker_name = "kv-read-cache-hit".to_string();
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/seed", "kv-read-cache-hit-seed"),
-        )
-        .await
-        .expect("seed should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/__profile_reset", "kv-read-cache-hit-profile-reset"),
-        )
-        .await
-        .expect("profile reset should succeed");
-
-    let first = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read", "kv-read-cache-hit-read-1"),
-        )
-        .await
-        .expect("first read should succeed");
-    let second = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read", "kv-read-cache-hit-read-2"),
-        )
-        .await
-        .expect("second read should succeed");
-    let profile = decode_kv_profile(
-        service
-            .invoke(
-                worker_name,
-                test_invocation_with_path("/__profile", "kv-read-cache-hit-profile"),
-            )
-            .await
-            .expect("profile should succeed"),
-    );
-
-    assert_eq!(String::from_utf8(first.body).expect("utf8"), "1");
-    assert_eq!(String::from_utf8(second.body).expect("utf8"), "1");
-    assert_eq!(profile.op_get.calls, 0);
-    assert!(profile.js_cache_hit.calls >= 2);
-}
-
-#[tokio::test]
-#[serial]
-async fn kv_read_cache_caches_missing_keys_across_requests() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        kv_profile_enabled: true,
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let worker_name = "kv-read-cache-miss".to_string();
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/__profile_reset", "kv-read-cache-miss-profile-reset"),
-        )
-        .await
-        .expect("profile reset should succeed");
-
-    let first = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read-missing", "kv-read-cache-miss-read-1"),
-        )
-        .await
-        .expect("first missing read should succeed");
-    let second = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read-missing", "kv-read-cache-miss-read-2"),
-        )
-        .await
-        .expect("second missing read should succeed");
-    let profile = decode_kv_profile(
-        service
-            .invoke(
-                worker_name,
-                test_invocation_with_path("/__profile", "kv-read-cache-miss-profile"),
-            )
-            .await
-            .expect("profile should succeed"),
-    );
-
-    assert_eq!(String::from_utf8(first.body).expect("utf8"), "missing");
-    assert_eq!(String::from_utf8(second.body).expect("utf8"), "missing");
-    assert_eq!(profile.op_get.calls, 1);
-    assert!(profile.js_cache_miss.calls >= 1);
-    assert!(profile.js_cache_hit.calls >= 1);
-}
-
-#[tokio::test]
-#[serial]
-async fn kv_read_cache_expires_and_refills_after_ttl() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        kv_profile_enabled: true,
-        kv_read_cache_hit_ttl: Duration::from_millis(20),
-        kv_read_cache_miss_ttl: Duration::from_millis(20),
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let worker_name = "kv-read-cache-expiry".to_string();
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/__profile_reset", "kv-read-cache-expiry-profile-reset"),
-        )
-        .await
-        .expect("profile reset should succeed");
-
-    let first = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read-missing", "kv-read-cache-expiry-read-1"),
-        )
-        .await
-        .expect("first read should succeed");
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let second = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read-missing", "kv-read-cache-expiry-read-2"),
-        )
-        .await
-        .expect("second read should succeed");
-    let profile = decode_kv_profile(
-        service
-            .invoke(
-                worker_name,
-                test_invocation_with_path("/__profile", "kv-read-cache-expiry-profile"),
-            )
-            .await
-            .expect("profile should succeed"),
-    );
-
-    assert_eq!(String::from_utf8(first.body).expect("utf8"), "missing");
-    assert_eq!(String::from_utf8(second.body).expect("utf8"), "missing");
-    assert!(profile.op_get.calls >= 2);
-    assert!(profile.js_cache_stale.calls >= 1);
-}
-
-#[tokio::test]
-#[serial]
-async fn kv_local_cache_updates_immediately_after_put_and_delete() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let worker_name = "kv-local-cache-updates".to_string();
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/seed", "kv-local-cache-updates-seed"),
-        )
-        .await
-        .expect("seed should succeed");
-
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/write-fire-and-forget", "kv-local-cache-updates-put"),
-        )
-        .await
-        .expect("put should enqueue");
-    let read_after_put = service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/read", "kv-local-cache-updates-read-after-put"),
-        )
-        .await
-        .expect("read after put should succeed");
-
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/delete-fire-and-forget", "kv-local-cache-updates-delete"),
-        )
-        .await
-        .expect("delete should enqueue");
-    let read_after_delete = service
-        .invoke(
-            worker_name,
-            test_invocation_with_path("/read", "kv-local-cache-updates-read-after-delete"),
-        )
-        .await
-        .expect("read after delete should succeed");
-
-    assert_eq!(String::from_utf8(read_after_put.body).expect("utf8"), "7");
-    assert_eq!(
-        String::from_utf8(read_after_delete.body).expect("utf8"),
-        "missing"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn kv_unawaited_write_flushes_after_response() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let worker_name = "kv-write-fire-and-forget".to_string();
-    service
-        .deploy_with_config(
-            worker_name.clone(),
-            kv_write_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Kv {
-                    binding: "MY_KV".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/seed", "kv-write-fire-seed-request"),
-        )
-        .await
-        .expect("seed should succeed");
-
-    service
-        .invoke(
-            worker_name.clone(),
-            test_invocation_with_path("/write-fire-and-forget", "kv-write-fire-request"),
-        )
-        .await
-        .expect("fire-and-forget request should succeed");
-
-    let mut observed = None;
-    for _ in 0..20 {
-        let output = service
-            .invoke(
-                worker_name.clone(),
-                test_invocation_with_path("/read", "kv-write-fire-read-request"),
-            )
-            .await
-            .expect("read request should succeed");
-        let body = String::from_utf8(output.body).expect("read body should be utf8");
-        if body == "7" {
-            observed = Some(body);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    assert_eq!(observed.as_deref(), Some("7"));
+    assert_eq!(delete_body, "missing");
 }
 
 #[tokio::test]
@@ -3083,299 +2752,6 @@ async fn wait_until_background_work_runs_after_response() {
 
 #[tokio::test]
 #[serial]
-async fn dynamic_worker_fetch_uses_deno_fetch_with_host_policy_and_secret_replacement() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
-    let address = listener.local_addr().expect("listener should have addr");
-    let (request_tx, request_rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept should succeed");
-        let mut buffer = vec![0_u8; 8192];
-        let bytes_read = socket
-            .read(&mut buffer)
-            .await
-            .expect("server read should succeed");
-        request_tx
-            .send(String::from_utf8_lossy(&buffer[..bytes_read]).to_string())
-            .expect("request should be captured");
-        socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-                )
-                .await
-                .expect("server write should succeed");
-    });
-
-    let deployed = service
-        .deploy_dynamic(
-            dynamic_fetch_probe_worker(&format!("http://{address}/fetch-probe")),
-            HashMap::from([("API_TOKEN".to_string(), "secret-value".to_string())]),
-            vec![format!("private:{address}")],
-        )
-        .await
-        .expect("dynamic deploy should succeed");
-
-    let output = service
-        .invoke(deployed.worker, test_invocation())
-        .await
-        .expect("dynamic fetch invoke should succeed");
-    assert_eq!(output.status, 200);
-    assert_eq!(String::from_utf8(output.body).expect("utf8"), "ok");
-
-    let raw_request = request_rx.await.expect("request should arrive");
-    assert!(
-        raw_request.starts_with("GET /fetch-probe?token=secret-value HTTP/1.1\r\n"),
-        "raw request was {raw_request}"
-    );
-    assert!(
-        raw_request.contains("\r\nauthorization: Bearer secret-value\r\n"),
-        "raw request was {raw_request}"
-    );
-    assert!(
-        raw_request.contains("\r\nx-dd-secret: secret-value\r\n"),
-        "raw request was {raw_request}"
-    );
-    assert!(
-        !raw_request.contains("__DD_SECRET_"),
-        "secret placeholders leaked into outbound request: {raw_request}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn dynamic_worker_fetch_revalidates_redirect_and_strips_cross_origin_credentials() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let destination = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("destination listener should bind");
-    let destination_address = destination.local_addr().expect("destination address");
-    let (request_tx, request_rx) = tokio::sync::oneshot::channel::<String>();
-    tokio::spawn(async move {
-        let (mut socket, _) = destination.accept().await.expect("destination accept");
-        let mut buffer = vec![0_u8; 8192];
-        let bytes_read = socket.read(&mut buffer).await.expect("destination read");
-        request_tx
-            .send(String::from_utf8_lossy(&buffer[..bytes_read]).to_string())
-            .expect("request should be captured");
-        socket
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-            )
-            .await
-            .expect("destination write");
-    });
-
-    let redirect = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("redirect listener should bind");
-    let redirect_address = redirect.local_addr().expect("redirect address");
-    tokio::spawn(async move {
-        let (mut socket, _) = redirect.accept().await.expect("redirect accept");
-        let mut buffer = vec![0_u8; 4096];
-        let _ = socket.read(&mut buffer).await.expect("redirect read");
-        let response = format!(
-            "HTTP/1.1 302 Found\r\nlocation: http://{destination_address}/final\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-        );
-        socket
-            .write_all(response.as_bytes())
-            .await
-            .expect("redirect write");
-    });
-
-    let deployed = service
-        .deploy_dynamic(
-            dynamic_fetch_probe_worker(&format!("http://{redirect_address}/start")),
-            HashMap::from([("API_TOKEN".to_string(), "redirect-secret".to_string())]),
-            vec![
-                format!("private:{redirect_address}"),
-                format!("private:{destination_address}"),
-            ],
-        )
-        .await
-        .expect("dynamic deploy should succeed");
-
-    let output = service
-        .invoke(deployed.worker, test_invocation())
-        .await
-        .expect("redirected fetch should succeed");
-    assert_eq!(output.status, 200);
-    assert_eq!(String::from_utf8(output.body).expect("utf8"), "ok");
-
-    let redirected_request = request_rx.await.expect("redirected request should arrive");
-    assert!(redirected_request.starts_with("GET /final HTTP/1.1\r\n"));
-    assert!(
-        !redirected_request
-            .to_ascii_lowercase()
-            .contains("\r\nauthorization:"),
-        "cross-origin authorization leaked: {redirected_request}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn dynamic_worker_fetch_rejects_egress_hosts_outside_allowlist() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let deployed = service
-        .deploy_dynamic(
-            dynamic_fetch_probe_worker("http://127.0.0.1:9/blocked"),
-            HashMap::from([("API_TOKEN".to_string(), "secret-value".to_string())]),
-            vec!["example.com".to_string()],
-        )
-        .await
-        .expect("dynamic deploy should succeed");
-
-    let error = service
-        .invoke(deployed.worker, test_invocation())
-        .await
-        .expect_err("dynamic fetch invoke should fail");
-    let body = error.to_string();
-    assert!(
-        body.contains("egress origin is not allowed: http://127.0.0.1:9"),
-        "body was {body}"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn dynamic_worker_fetch_abort_signal_cancels_outbound_request() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
-    let address = listener.local_addr().expect("listener should have addr");
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept should succeed");
-        let mut buffer = vec![0_u8; 4096];
-        let _ = socket.read(&mut buffer).await;
-        sleep(Duration::from_millis(200)).await;
-        let _ = socket.shutdown().await;
-    });
-
-    let deployed = service
-        .deploy_dynamic(
-            dynamic_fetch_abort_worker(&format!("http://{address}/abort-probe")),
-            HashMap::new(),
-            vec![address.to_string()],
-        )
-        .await
-        .expect("dynamic deploy should succeed");
-
-    let started_at = Instant::now();
-    let output = timeout(
-        Duration::from_secs(2),
-        service.invoke(deployed.worker, test_invocation()),
-    )
-    .await
-    .expect("invoke should not hang")
-    .expect("invoke should succeed");
-    assert_eq!(output.status, 200);
-    let body = String::from_utf8(output.body).expect("utf8");
-    assert!(
-        body == "Error" || body.contains("Abort") || body.to_ascii_lowercase().contains("abort"),
-        "body was {body}"
-    );
-    assert!(
-        started_at.elapsed() < Duration::from_millis(500),
-        "abort should finish quickly"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn preview_dynamic_worker_can_proxy_module_based_children() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates: 2,
-        max_inflight_per_isolate: 2,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "preview-dynamic".to_string(),
-            preview_dynamic_worker(),
-            DeployConfig {
-                bindings: vec![DeployBinding::Dynamic {
-                    binding: "SANDBOX".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    let root = service
-        .invoke(
-            "preview-dynamic".to_string(),
-            test_invocation_with_path("/preview/pr-123", "preview-root"),
-        )
-        .await
-        .expect("preview root should succeed");
-    assert_eq!(root.status, 200);
-    let root_text = String::from_utf8(root.body).expect("utf8");
-    assert!(root_text.contains("\"preview\":\"pr-123\""));
-    assert!(root_text.contains("\"route\":\"root\""));
-
-    let health = service
-        .invoke(
-            "preview-dynamic".to_string(),
-            test_invocation_with_path("/preview/pr-123/api/health", "preview-health"),
-        )
-        .await
-        .expect("preview health should succeed");
-    assert_eq!(health.status, 200);
-    let health_text = String::from_utf8(health.body).expect("utf8");
-    assert!(health_text.contains("\"route\":\"health\""));
-}
-
-#[tokio::test]
-#[serial]
 async fn scales_up_with_backlog() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
@@ -3526,7 +2902,10 @@ async fn active_workers_share_small_global_isolate_budget() {
 
 #[test]
 fn runtime_default_global_isolate_budget_has_two_slot_floor() {
-    assert!(RuntimeConfig::default().max_global_isolates >= 2);
+    let config = RuntimeConfig::default();
+    assert!(config.max_global_isolates >= 2);
+    assert_eq!(config.max_isolates, config.max_global_isolates);
+    assert_eq!(config.min_isolates, 0);
 }
 
 #[tokio::test]
@@ -3742,6 +3121,103 @@ async fn scales_down_when_idle() {
     })
     .await
     .expect("isolates should scale down to zero");
+}
+
+#[tokio::test]
+#[serial]
+async fn looping_deployment_times_out_while_previous_generation_serves_requests() {
+    let service = test_service(RuntimeConfig {
+        isolate_startup_timeout: Duration::from_secs(1),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy("healthy".to_string(), versioned_worker("healthy", 0))
+        .await
+        .expect("initial deployment");
+    service
+        .invoke("healthy".to_string(), test_invocation())
+        .await
+        .expect("warm isolate");
+
+    let deploying_service = service.clone();
+    let deployment = tokio::spawn(async move {
+        deploying_service
+            .deploy(
+                "healthy".to_string(),
+                "for (;;) {} export default { fetch() { return new Response('unreachable'); } }"
+                    .to_string(),
+            )
+            .await
+    });
+    sleep(Duration::from_millis(100)).await;
+    let output = timeout(
+        Duration::from_millis(500),
+        service.invoke("healthy".to_string(), test_invocation()),
+    )
+    .await
+    .expect("validation must not block the scheduler")
+    .expect("healthy request");
+    assert_eq!(output.body, b"healthy");
+    let error = timeout(Duration::from_secs(3), deployment)
+        .await
+        .expect("bounded startup")
+        .expect("deployment task")
+        .expect_err("looping deployment must fail");
+    assert!(error.to_string().contains("startup exceeded"), "{error}");
+    let output = service
+        .invoke("healthy".to_string(), test_invocation())
+        .await
+        .expect("old deployment");
+    assert_eq!(output.body, b"healthy");
+    service
+        .shutdown()
+        .await
+        .expect("shutdown after terminated validation");
+}
+
+#[tokio::test]
+#[serial]
+async fn unresolved_deployment_startup_is_bounded() {
+    let service = test_service(RuntimeConfig {
+        isolate_startup_timeout: Duration::from_secs(1),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let result = timeout(Duration::from_secs(3), service.deploy("unresolved".to_string(),
+        "await new Promise(() => {}); export default { fetch() { return new Response('never'); } }".to_string()
+    )).await.expect("unresolved startup must finish");
+    assert!(result.is_err());
+    service
+        .deploy("recovery".to_string(), counter_worker())
+        .await
+        .expect("validator slot released");
+    service.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[serial]
+async fn deployment_heap_exhaustion_preserves_the_server() {
+    let service = test_service(RuntimeConfig {
+        max_isolate_heap_bytes: 32 * 1024 * 1024,
+        isolate_startup_timeout: Duration::from_secs(3),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let result = timeout(Duration::from_secs(5), service.deploy("exhausted".to_string(),
+        "const retained = []; for (;;) retained.push(new Array(100000).fill(42)); export default {};".to_string()
+    )).await.expect("heap exhaustion must terminate validation");
+    assert!(result.is_err());
+    service
+        .deploy("healthy".to_string(), versioned_worker("survived", 0))
+        .await
+        .expect("subsequent deployment");
+    let output = service
+        .invoke("healthy".to_string(), test_invocation())
+        .await
+        .expect("subsequent request");
+    assert_eq!(output.body, b"survived");
+    service.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -4303,6 +3779,7 @@ async fn async_context_store_survives_promise_boundaries_and_nested_runs() {
             "async-context".to_string(),
             async_context_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -4632,7 +4109,7 @@ async fn internal_trace_invocations_do_not_recurse() {
 
 #[tokio::test]
 #[serial]
-async fn concurrent_runtime_services_isolate_dynamic_module_graphs_and_refcounts() {
+async fn concurrent_runtime_services_isolate_module_graphs_and_refcounts() {
     let first = test_service(RuntimeConfig::default()).await;
     let second = test_service(RuntimeConfig::default()).await;
     let modules = HashMap::from([(
@@ -4641,38 +4118,38 @@ async fn concurrent_runtime_services_isolate_dynamic_module_graphs_and_refcounts
     )]);
 
     let (first_graph_id, first_entrypoint) = first
-        ._dynamic_modules
-        .register_dynamic_module_graph("worker.js", modules.clone())
+        ._module_registry
+        .register_module_graph("worker.js", modules.clone())
         .expect("first service graph should register");
     assert!(
         second
-            ._dynamic_modules
+            ._module_registry
             .source(&first_graph_id, &first_entrypoint)
             .is_none(),
         "a graph registered in one live service must not be visible to another"
     );
 
     let (second_graph_id, second_entrypoint) = second
-        ._dynamic_modules
-        .register_dynamic_module_graph("worker.js", modules)
+        ._module_registry
+        .register_module_graph("worker.js", modules)
         .expect("second service graph should register");
     assert_eq!(
         first_graph_id, second_graph_id,
         "graph ids remain content-addressed"
     );
-    assert_eq!(first._dynamic_modules.ref_count(&first_graph_id), Some(1));
-    assert_eq!(second._dynamic_modules.ref_count(&second_graph_id), Some(1));
+    assert_eq!(first._module_registry.ref_count(&first_graph_id), Some(1));
+    assert_eq!(second._module_registry.ref_count(&second_graph_id), Some(1));
 
-    first._dynamic_modules.release(&first_graph_id);
+    first._module_registry.release(&first_graph_id);
     assert!(
         first
-            ._dynamic_modules
+            ._module_registry
             .source(&first_graph_id, &first_entrypoint)
             .is_none()
     );
     assert!(
         second
-            ._dynamic_modules
+            ._module_registry
             .source(&second_graph_id, &second_entrypoint)
             .is_some(),
         "releasing one service's graph must not change another service's refcount"
@@ -4740,120 +4217,14 @@ fn asset_catalog_copy_on_write_preserves_concurrent_updates_and_redeploy_snapsho
 }
 
 #[test]
-fn dynamic_worker_config_builds_placeholders() {
-    let mut env = HashMap::new();
-    env.insert("OPENAI_API_KEY".to_string(), "sk-test-123".to_string());
-    let config = super::build_dynamic_worker_config(
-        env,
-        Vec::new(),
-        crate::ops::DynamicWorkerPolicy {
-            egress_allow_hosts: vec!["api.openai.com".to_string()],
-            ..Default::default()
-        },
-        Vec::new(),
-    )
-    .expect("dynamic config should build");
-
-    assert_eq!(config.dynamic_env.len(), 1);
-    assert_eq!(config.secret_replacements.len(), 1);
-    assert_eq!(
-        config.egress_allow_hosts,
-        vec!["api.openai.com".to_string()]
-    );
-
-    let placeholder = config
-        .env_placeholders
-        .get("OPENAI_API_KEY")
-        .expect("placeholder should be present");
-    assert!(placeholder.starts_with("__DD_SECRET_"));
-}
-
-#[test]
-fn dynamic_worker_config_rejects_invalid_host() {
-    let config = super::build_dynamic_worker_config(
-        HashMap::new(),
-        Vec::new(),
-        crate::ops::DynamicWorkerPolicy {
-            egress_allow_hosts: vec!["http://bad-host".to_string()],
-            ..Default::default()
-        },
-        Vec::new(),
-    );
-    assert!(config.is_err());
-}
-
-#[test]
-fn dynamic_worker_config_requires_state_policy_for_bindings() {
-    let config = super::build_dynamic_worker_config(
-        HashMap::new(),
-        vec![DeployBinding::Kv {
-            binding: "AUTH_DB".to_string(),
-        }],
-        crate::ops::DynamicWorkerPolicy::default(),
-        Vec::new(),
-    );
-    assert!(config.is_err());
-}
-
-#[test]
-fn dynamic_worker_config_accepts_state_bindings() {
-    let config = super::build_dynamic_worker_config(
-        HashMap::new(),
-        vec![
-            DeployBinding::Kv {
-                binding: "AUTH_DB".to_string(),
-            },
-            DeployBinding::Memory {
-                binding: "AUTH_STATE".to_string(),
-            },
-        ],
-        crate::ops::DynamicWorkerPolicy {
-            allow_state_bindings: true,
-            ..Default::default()
-        },
-        Vec::new(),
-    )
-    .expect("dynamic config should accept state bindings when the policy allows them");
-    assert_eq!(config.bindings.kv, vec!["AUTH_DB".to_string()]);
-    assert_eq!(config.bindings.memory, vec!["AUTH_STATE".to_string()]);
-}
-
-#[test]
-fn dynamic_worker_config_accepts_host_port_and_wildcard_rules() {
-    let config = super::build_dynamic_worker_config(
-        HashMap::new(),
-        Vec::new(),
-        crate::ops::DynamicWorkerPolicy {
-            egress_allow_hosts: vec![
-                "api.example.com:8443".to_string(),
-                "*.example.com".to_string(),
-                "*.example.com:9443".to_string(),
-            ],
-            ..Default::default()
-        },
-        Vec::new(),
-    )
-    .expect("dynamic config should accept host+port rules");
-
-    assert_eq!(
-        config.egress_allow_hosts,
-        vec![
-            "api.example.com:8443".to_string(),
-            "*.example.com".to_string(),
-            "*.example.com:9443".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn extract_bindings_collects_dynamic_bindings() {
+fn extract_bindings_collects_declared_bindings() {
     let bindings = super::extract_bindings(&DeployConfig {
         bindings: vec![
             DeployBinding::Kv {
                 binding: "MY_KV".to_string(),
             },
-            DeployBinding::Dynamic {
-                binding: "SANDBOX".to_string(),
+            DeployBinding::Memory {
+                binding: "STATE".to_string(),
             },
             DeployBinding::Service {
                 binding: "AUTH".to_string(),
@@ -4865,24 +4236,78 @@ fn extract_bindings_collects_dynamic_bindings() {
     .expect("bindings should parse");
 
     assert_eq!(bindings.kv, vec!["MY_KV".to_string()]);
-    assert_eq!(bindings.dynamic, vec!["SANDBOX".to_string()]);
+    assert_eq!(bindings.memory, vec!["STATE".to_string()]);
     assert_eq!(bindings.service.len(), 1);
     assert_eq!(bindings.service[0].binding, "AUTH");
     assert_eq!(bindings.service[0].service, "auth-worker");
 }
 
 #[test]
-fn extract_bindings_rejects_duplicate_dynamic_name() {
+fn extract_bindings_rejects_duplicate_service_name() {
     let result = super::extract_bindings(&DeployConfig {
         bindings: vec![
-            DeployBinding::Dynamic {
+            DeployBinding::Service {
+                service: "child".to_string(),
                 binding: "SANDBOX".to_string(),
             },
-            DeployBinding::Dynamic {
+            DeployBinding::Service {
+                service: "child".to_string(),
                 binding: "SANDBOX".to_string(),
             },
         ],
         ..DeployConfig::default()
     });
     assert!(result.is_err());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn active_restore_failure_fails_startup_and_records_diagnostic() -> common::Result<()> {
+    let root = std::env::temp_dir().join(format!("dd-restore-failure-{}", Uuid::new_v4()));
+    drop(storage::state::StateStore::open(root.join("state")).await?);
+    let control = storage::control::ControlStore::open(&root).await?;
+    let mut invalid = storage::control::ControlDeployment {
+        worker: "broken".to_string(),
+        deployment_id: Uuid::new_v4().to_string(),
+        source: String::new(),
+        config: DeployConfig::default(),
+        assets: Vec::new(),
+        server_modules: Vec::new(),
+        asset_headers: None,
+        created_at_ms: 1,
+        expires_at_ms: None,
+        active: true,
+    };
+    invalid.source = "export default { this is not valid JavaScript".to_string();
+    control.insert_deployment(&invalid).await?;
+    drop(control);
+
+    let service = crate::RuntimeService::start_with_service_config(crate::RuntimeServiceConfig {
+        runtime: crate::RuntimeConfig::default(),
+        storage: crate::RuntimeStorageConfig {
+            store_dir: root.clone(),
+            worker_store_enabled: true,
+            ..crate::RuntimeStorageConfig::default()
+        },
+    })
+    .await;
+    let error = match service {
+        Ok(service) => {
+            let _ = service.shutdown().await;
+            panic!("invalid active deployment should fail startup")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("failed to restore worker broken")
+    );
+
+    let control = storage::control::ControlStore::open(&root).await?;
+    let failures = control.restore_failures().await?;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].worker, "broken");
+    let _ = tokio::fs::remove_dir_all(root).await;
+    Ok(())
 }

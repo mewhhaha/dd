@@ -1,7 +1,7 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{
     MemoryBatchMutation, MemoryStore, RuntimeConfig, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, WorkerDebugDump, WorkerStats, stable_memory_shard_index,
+    RuntimeStorageConfig, WorkerDebugDump, WorkerStats,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,6 @@ struct Scenario {
     requests: usize,
     concurrency: usize,
     path: &'static str,
-    key_space: usize,
 }
 
 #[derive(Debug)]
@@ -73,36 +72,19 @@ struct MemoryProfileMetric {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct MemoryProfileSnapshot {
     enabled: bool,
-    js_read_only_total: MemoryProfileMetric,
+    js_read_only_commit: MemoryProfileMetric,
     js_hydrate_full: MemoryProfileMetric,
-    js_hydrate_keys: MemoryProfileMetric,
     js_txn_commit: MemoryProfileMetric,
-    js_cache_hit: MemoryProfileMetric,
-    js_cache_miss: MemoryProfileMetric,
-    js_cache_stale: MemoryProfileMetric,
-    op_read: MemoryProfileMetric,
     op_snapshot: MemoryProfileMetric,
-    op_version_if_newer: MemoryProfileMetric,
     op_apply_batch: MemoryProfileMetric,
-    store_read: MemoryProfileMetric,
-    store_snapshot: MemoryProfileMetric,
-    store_snapshot_keys: MemoryProfileMetric,
-    store_version_if_newer: MemoryProfileMetric,
-    store_apply_batch: MemoryProfileMetric,
-    store_apply_batch_validate: MemoryProfileMetric,
-    store_apply_batch_write: MemoryProfileMetric,
-    store_database_cache_hit: MemoryProfileMetric,
-    store_database_cache_miss: MemoryProfileMetric,
-    store_database_cache_eviction: MemoryProfileMetric,
     store_snapshot_cache_hit: MemoryProfileMetric,
     store_snapshot_cache_miss: MemoryProfileMetric,
     store_snapshot_cache_eviction: MemoryProfileMetric,
-    runtime_atomic_invoke_event_wait: MemoryProfileMetric,
-    runtime_atomic_queue_wait: MemoryProfileMetric,
-    runtime_atomic_dispatch_wait: MemoryProfileMetric,
-    runtime_atomic_execution: MemoryProfileMetric,
-    runtime_atomic_completion_wait: MemoryProfileMetric,
-    runtime_atomic_outbox_drain: MemoryProfileMetric,
+    runtime_socket_queue_wait: MemoryProfileMetric,
+    runtime_socket_dispatch_wait: MemoryProfileMetric,
+    runtime_socket_execution: MemoryProfileMetric,
+    runtime_socket_completion_wait: MemoryProfileMetric,
+    runtime_outbox_drain: MemoryProfileMetric,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -170,6 +152,7 @@ struct BenchCase {
     mode: &'static str,
     label: &'static str,
     source: &'static str,
+    memory_entity_prefix: &'static str,
     seed: bool,
     path: &'static str,
     key_space: KeySpaceConfig,
@@ -179,19 +162,10 @@ struct BenchCase {
 
 const BENCH_CASES: &[BenchCase] = &[
     BenchCase {
-        mode: "async-storage",
-        label: "memory-read-async-storage",
-        source: MEMORY_READ_ASYNC_STORAGE_WORKER_SOURCE,
-        seed: true,
-        path: "/read",
-        key_space: KeySpaceConfig::One,
-        verify_path: None,
-        profile: ProfileConfig::Never,
-    },
-    BenchCase {
-        mode: "async-memory",
-        label: "memory-read-async-memory",
-        source: MEMORY_READ_ASYNC_MEMORY_WORKER_SOURCE,
+        mode: "atomic-callback-only",
+        label: "memory-atomic-callback-only",
+        source: MEMORY_ATOMIC_CALLBACK_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: false,
         path: "/read",
         key_space: KeySpaceConfig::One,
@@ -199,29 +173,10 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
-        mode: "sync-memory",
-        label: "memory-read-sync-memory",
-        source: MEMORY_READ_SYNC_MEMORY_WORKER_SOURCE,
-        seed: false,
-        path: "/read",
-        key_space: KeySpaceConfig::One,
-        verify_path: None,
-        profile: ProfileConfig::Never,
-    },
-    BenchCase {
-        mode: "direct-read-memory",
-        label: "memory-direct-read-memory",
-        source: MEMORY_DIRECT_READ_WORKER_SOURCE,
-        seed: true,
-        path: "/read",
-        key_space: KeySpaceConfig::One,
-        verify_path: None,
-        profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "direct-write-memory",
-        label: "memory-direct-write-memory",
-        source: MEMORY_DIRECT_WRITE_WORKER_SOURCE,
+        mode: "atomic-write-only-memory",
+        label: "memory-atomic-write-only-memory",
+        source: MEMORY_ATOMIC_WRITE_ONLY_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: true,
         path: "/write",
         key_space: KeySpaceConfig::One,
@@ -229,9 +184,10 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
-        mode: "direct-write-memory-multikey",
-        label: "memory-direct-write-memory-multikey",
-        source: MEMORY_DIRECT_WRITE_WORKER_SOURCE,
+        mode: "atomic-write-only-memory-multikey",
+        label: "memory-atomic-write-only-memory-multikey",
+        source: MEMORY_ATOMIC_WRITE_ONLY_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: false,
         path: "/write",
         key_space: KeySpaceConfig::Env,
@@ -239,19 +195,10 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
-        mode: "direct-read-memory-multikey",
-        label: "memory-direct-read-memory-multikey",
-        source: MEMORY_DIRECT_READ_WORKER_SOURCE,
-        seed: false,
-        path: "/read",
-        key_space: KeySpaceConfig::Env,
-        verify_path: None,
-        profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "direct-read-memory-wide",
-        label: "memory-direct-read-memory-wide",
-        source: MEMORY_DIRECT_READ_WORKER_SOURCE,
+        mode: "atomic-read-memory-wide",
+        label: "memory-atomic-read-memory-wide",
+        source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: true,
         path: "/read",
         key_space: KeySpaceConfig::Wide,
@@ -259,9 +206,10 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Always,
     },
     BenchCase {
-        mode: "direct-write-memory-wide",
-        label: "memory-direct-write-memory-wide",
-        source: MEMORY_DIRECT_WRITE_WORKER_SOURCE,
+        mode: "atomic-write-only-memory-wide",
+        label: "memory-atomic-write-only-memory-wide",
+        source: MEMORY_ATOMIC_WRITE_ONLY_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: false,
         path: "/write",
         key_space: KeySpaceConfig::Wide,
@@ -272,6 +220,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "storage-write-memory-wide",
         label: "memory-storage-write-memory-wide",
         source: "",
+        memory_entity_prefix: "",
         seed: false,
         path: "/write",
         key_space: KeySpaceConfig::Wide,
@@ -279,9 +228,10 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
-        mode: "atomic-write-memory-wide",
+        mode: "atomic-write-effect-memory-wide",
         label: "memory-atomic-write-effect-memory-wide",
         source: MEMORY_ATOMIC_WRITE_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: false,
         path: "/write-effect",
         key_space: KeySpaceConfig::Wide,
@@ -292,6 +242,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "atomic-readwrite-memory-wide",
         label: "memory-atomic-readwrite-memory-wide",
         source: MEMORY_ATOMIC_WRITE_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: false,
         path: "/readwrite",
         key_space: KeySpaceConfig::Wide,
@@ -302,6 +253,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "realworld-rate-limiter",
         label: "realworld-rate-limiter-memory",
         source: REALWORLD_RATE_LIMITER_WORKER_SOURCE,
+        memory_entity_prefix: "ratelimit:",
         seed: true,
         path: "/check",
         key_space: KeySpaceConfig::Wide,
@@ -312,6 +264,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "realworld-multiworker-auth",
         label: "realworld-multiworker-auth",
         source: REALWORLD_AUTH_FRONTEND_WORKER_SOURCE,
+        memory_entity_prefix: "session:",
         seed: true,
         path: "/dashboard",
         key_space: KeySpaceConfig::Wide,
@@ -322,6 +275,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "realworld-auth-worker-direct",
         label: "realworld-auth-worker-direct",
         source: REALWORLD_AUTH_WORKER_SOURCE,
+        memory_entity_prefix: "session:",
         seed: true,
         path: "/api/session",
         key_space: KeySpaceConfig::Wide,
@@ -332,6 +286,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "atomic-read-memory",
         label: "memory-atomic-read-memory",
         source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: true,
         path: "/read",
         key_space: KeySpaceConfig::One,
@@ -342,6 +297,7 @@ const BENCH_CASES: &[BenchCase] = &[
         mode: "atomic-read-memory-multikey",
         label: "memory-atomic-read-memory-multikey",
         source: MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: false,
         path: "/read",
         key_space: KeySpaceConfig::Env,
@@ -349,39 +305,10 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Never,
     },
     BenchCase {
-        mode: "coordinated-inc",
-        label: "memory-coordinated-inc",
-        source: MEMORY_COORDINATED_INCREMENT_WORKER_SOURCE,
-        seed: true,
-        path: "/inc",
-        key_space: KeySpaceConfig::One,
-        verify_path: Some("/get"),
-        profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "coordinated-read",
-        label: "memory-coordinated-read",
-        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
-        seed: true,
-        path: "/read",
-        key_space: KeySpaceConfig::One,
-        verify_path: None,
-        profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "coordinated-read-multikey",
-        label: "memory-coordinated-read-multikey",
-        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
-        seed: true,
-        path: "/read",
-        key_space: KeySpaceConfig::Env,
-        verify_path: None,
-        profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "coordinated-write",
-        label: "memory-coordinated-write",
-        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
+        mode: "atomic-increment-memory",
+        label: "memory-atomic-increment-memory",
+        source: MEMORY_ATOMIC_INCREMENT_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: true,
         path: "/write",
         key_space: KeySpaceConfig::One,
@@ -389,34 +316,15 @@ const BENCH_CASES: &[BenchCase] = &[
         profile: ProfileConfig::Enabled,
     },
     BenchCase {
-        mode: "coordinated-write-throughput",
-        label: "memory-coordinated-write-throughput",
-        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
-        seed: true,
-        path: "/write",
-        key_space: KeySpaceConfig::One,
-        verify_path: Some("/get"),
-        profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "coordinated-write-multikey",
-        label: "memory-coordinated-write-multikey",
-        source: MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE,
+        mode: "atomic-increment-memory-multikey",
+        label: "memory-atomic-increment-memory-multikey",
+        source: MEMORY_ATOMIC_INCREMENT_WORKER_SOURCE,
+        memory_entity_prefix: "",
         seed: true,
         path: "/write",
         key_space: KeySpaceConfig::Env,
-        verify_path: Some("/sum"),
+        verify_path: Some("/sum-requests"),
         profile: ProfileConfig::Enabled,
-    },
-    BenchCase {
-        mode: "atomic-put-inc",
-        label: "memory-atomic-put-inc",
-        source: MEMORY_ATOMIC_PUT_INCREMENT_WORKER_SOURCE,
-        seed: true,
-        path: "/inc",
-        key_space: KeySpaceConfig::One,
-        verify_path: Some("/get"),
-        profile: ProfileConfig::Never,
     },
 ];
 
@@ -522,6 +430,7 @@ async fn main() -> Result<(), String> {
             service,
             label: bench_case.label,
             source: bench_case.source,
+            memory_entity_prefix: bench_case.memory_entity_prefix,
             bindings,
             profile_stats_worker,
             seed: bench_case.seed,
@@ -601,7 +510,7 @@ fn print_help() {
     println!("Usage:");
     println!("  cargo run -p runtime --bin bench_memory_storage --release");
     println!(
-        "  DD_BENCH_MODE=direct-read-memory cargo run -p runtime --bin bench_memory_storage --release"
+        "  DD_BENCH_MODE=atomic-read-memory cargo run -p runtime --bin bench_memory_storage --release"
     );
     println!();
     println!("This benchmark is configured with environment variables, not CLI flags.");
@@ -616,12 +525,8 @@ fn print_help() {
     println!("  DD_BENCH_KEY_SPACE             multikey scenario key space (default 256)");
     println!("  DD_BENCH_WIDE_KEY_SPACE        wide scenario key space (default 256)");
     println!("  DD_BENCH_MEMORY_KEY_MODE       pool, unique, same-shard, or cross-shard");
-    println!("  DD_BENCH_MEMORY_NAMESPACE_SHARDS memory namespace shards (default 16)");
-    println!("  DD_BENCH_MEMORY_DB_CACHE_MAX_OPEN open memory database budget (default 4096)");
     println!("  DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES snapshot entry budget (default 4096)");
     println!("  DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES snapshot byte budget (default 67108864)");
-    println!("  DD_BENCH_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE readers per database (default 4)");
-    println!("  DD_BENCH_MEMORY_DB_MAX_TOTAL_CONNECTIONS total memory connections (default 20480)");
     println!("  DD_BENCH_PROFILE_MEMORY        enable memory profile output");
     println!();
     println!("Modes:");
@@ -665,14 +570,14 @@ mod tests {
 
     #[test]
     fn should_run_case_matches_selected_mode_or_all() {
-        assert!(should_run_case(None, "direct-read-memory"));
+        assert!(should_run_case(None, "atomic-read-memory"));
         assert!(should_run_case(
-            Some("direct-read-memory"),
-            "direct-read-memory"
+            Some("atomic-read-memory"),
+            "atomic-read-memory"
         ));
         assert!(!should_run_case(
-            Some("direct-write-memory"),
-            "direct-read-memory"
+            Some("atomic-write-only-memory"),
+            "atomic-read-memory"
         ));
     }
 }

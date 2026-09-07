@@ -1,6 +1,5 @@
 use common::{DeployBinding, DeployConfig, PlatformError, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -476,16 +475,20 @@ async fn run_config_scenario(
         ScenarioWorker::HostFetchLocal => {
             let server = start_host_fetch_server().await?;
             let endpoint = format!("http://{}/host-fetch", server.address);
-            let deployed = service
-                .deploy_dynamic(
+            let worker_name = format!("{}-{}", config.name, scenario.name);
+            service
+                .deploy_with_config(
+                    worker_name.clone(),
                     host_fetch_worker_source(&endpoint),
-                    HashMap::new(),
-                    vec![server.address.to_string()],
+                    DeployConfig {
+                        egress_allow_hosts: vec![format!("private:{}", server.address)],
+                        ..DeployConfig::default()
+                    },
                 )
                 .await
                 .map_err(|error| error.to_string())?;
             host_fetch_server = Some(server);
-            deployed.worker
+            worker_name
         }
         ScenarioWorker::Static { source, binding } => {
             let worker_name = format!("{}-{}", config.name, scenario.name);
@@ -577,15 +580,9 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: paths.store_dir.clone(),
-            database_url: format!("file:{}", paths.db_path.display()),
-            memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
-            memory_db_cache_max_open: 4096,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
-            memory_db_read_connections_per_database: 4,
-            memory_db_max_total_connections: 4096usize.saturating_mul(5),
-            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
         },
     })
@@ -593,14 +590,12 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
 }
 
 struct BenchPaths {
-    db_path: PathBuf,
     store_dir: PathBuf,
 }
 
 fn bench_paths(tag: &str) -> BenchPaths {
-    let root = PathBuf::from(format!("/tmp/dd-fast-fetch-{tag}-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("dd-fast-fetch-{tag}-{}", Uuid::new_v4()));
     BenchPaths {
-        db_path: root.join("dd-kv.db"),
         store_dir: root.join("store"),
     }
 }
@@ -711,7 +706,7 @@ fn percentile_ms(values: &[Duration], percentile: f64) -> f64 {
 
 fn format_result(name: &str, result: ScenarioResult) -> String {
     format!(
-        "{:<16} requests={} concurrency={} throughput={:.0} req/s mean={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+        "{:<16} requests={} concurrency={} throughput={:.0} req/s mean={:.6}ms p50={:.6}ms p95={:.6}ms p99={:.6}ms",
         name,
         result.requests,
         result.concurrency,

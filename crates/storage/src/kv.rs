@@ -1,71 +1,17 @@
-use common::{PlatformError, Result};
+use crate::state::{STATE_SHARDS, StateStore, storage_error};
+use crate::turso_util::{execute_cached, query_cached};
+use common::Result;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use turso::{Builder, Connection, Database, Value, transaction::TransactionBehavior};
+use std::sync::{Arc, Mutex};
 
-use crate::turso_util::{
-    VersionFloor, checkpoint_database, configure_turso_connection, ensure_storage_migration_table,
-    execute_cached, health_check_database, is_retryable_turso_error, query_cached,
-    record_storage_retry, record_storage_schema_version, storage_schema_version,
-};
-
-const ENCODING_UTF8: &str = "utf8";
-const ENCODING_V8SC: &str = "v8sc";
-const KV_CONNECTION_LIMIT: usize = 32;
-const KV_SCHEMA_VERSION: i64 = 1;
 #[derive(Clone)]
 pub struct KvStore {
-    database: Arc<Database>,
-    connections: Arc<Mutex<Vec<Connection>>>,
-    connection_permits: Arc<Semaphore>,
-    version: Arc<AtomicU64>,
+    state: Arc<StateStore>,
     profile: Arc<KvProfile>,
-    writer: KvWriter,
-    failed_versions: Arc<Mutex<HashSet<i64>>>,
+    read_cache: Arc<Mutex<CommittedKvCache>>,
 }
-
-struct KvConnectionGuard {
-    connections: Arc<Mutex<Vec<Connection>>>,
-    _permit: OwnedSemaphorePermit,
-    conn: Option<Connection>,
-}
-
-impl std::ops::Deref for KvConnectionGuard {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn
-            .as_ref()
-            .expect("kv pooled connection must be present")
-    }
-}
-
-impl std::ops::DerefMut for KvConnectionGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.conn
-            .as_mut()
-            .expect("kv pooled connection must be present")
-    }
-}
-
-impl Drop for KvConnectionGuard {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            self.connections
-                .lock()
-                .expect("kv connection pool lock poisoned")
-                .push(conn);
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct KvValue {
     pub value: Vec<u8>,
@@ -96,24 +42,9 @@ pub enum KvUtf8Lookup {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvProfileMetricKind {
     JsRequestTotal,
-    JsBatchFlush,
     OpGet,
     OpGetManyUtf8,
     OpGetValue,
-    StoreGetUtf8,
-    StoreGetUtf8Many,
-    StoreGetValue,
-    WriteEnqueue,
-    WriteSuperseded,
-    WriteRejected,
-    WriteFlush,
-    WriteRetry,
-    WriteQueueWait,
-    JsCacheHit,
-    JsCacheMiss,
-    JsCacheStale,
-    JsCacheFill,
-    JsCacheInvalidate,
 }
 
 #[derive(Default)]
@@ -136,48 +67,18 @@ pub struct KvProfileMetricSnapshot {
 pub struct KvProfileSnapshot {
     pub enabled: bool,
     pub js_request_total: KvProfileMetricSnapshot,
-    pub js_batch_flush: KvProfileMetricSnapshot,
     pub op_get: KvProfileMetricSnapshot,
     pub op_get_many_utf8: KvProfileMetricSnapshot,
     pub op_get_value: KvProfileMetricSnapshot,
-    pub store_get_utf8: KvProfileMetricSnapshot,
-    pub store_get_utf8_many: KvProfileMetricSnapshot,
-    pub store_get_value: KvProfileMetricSnapshot,
-    pub write_enqueue: KvProfileMetricSnapshot,
-    pub write_superseded: KvProfileMetricSnapshot,
-    pub write_rejected: KvProfileMetricSnapshot,
-    pub write_flush: KvProfileMetricSnapshot,
-    pub write_retry: KvProfileMetricSnapshot,
-    pub write_queue_wait: KvProfileMetricSnapshot,
-    pub js_cache_hit: KvProfileMetricSnapshot,
-    pub js_cache_miss: KvProfileMetricSnapshot,
-    pub js_cache_stale: KvProfileMetricSnapshot,
-    pub js_cache_fill: KvProfileMetricSnapshot,
-    pub js_cache_invalidate: KvProfileMetricSnapshot,
 }
 
 #[derive(Default)]
 pub struct KvProfile {
     enabled: AtomicBool,
     js_request_total: KvProfileMetric,
-    js_batch_flush: KvProfileMetric,
     op_get: KvProfileMetric,
     op_get_many_utf8: KvProfileMetric,
     op_get_value: KvProfileMetric,
-    store_get_utf8: KvProfileMetric,
-    store_get_utf8_many: KvProfileMetric,
-    store_get_value: KvProfileMetric,
-    write_enqueue: KvProfileMetric,
-    write_superseded: KvProfileMetric,
-    write_rejected: KvProfileMetric,
-    write_flush: KvProfileMetric,
-    write_retry: KvProfileMetric,
-    write_queue_wait: KvProfileMetric,
-    js_cache_hit: KvProfileMetric,
-    js_cache_miss: KvProfileMetric,
-    js_cache_stale: KvProfileMetric,
-    js_cache_fill: KvProfileMetric,
-    js_cache_invalidate: KvProfileMetric,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -187,113 +88,80 @@ struct KvWriteKey {
     key: String,
 }
 
-#[derive(Debug, Clone)]
-struct KvScheduledMutation {
-    key: KvWriteKey,
-    value: Vec<u8>,
-    encoding: String,
-    deleted: bool,
-    version: i64,
-    enqueued_at: Instant,
-    size_bytes: usize,
+struct CachedKvValue {
+    value: Option<KvValue>,
+    ordinal: u64,
+    shard_epoch: u64,
+    bytes: usize,
 }
 
-#[derive(Default)]
-struct KvWriteWorkerState {
-    pending: HashMap<KvWriteKey, KvScheduledMutation>,
-    committed: VecDeque<KvCommittedBatch>,
-    pending_bytes: usize,
-    committed_mutations: usize,
-    committed_bytes: usize,
-    shutting_down: bool,
+struct CommittedKvCache {
+    entries: HashMap<KvWriteKey, CachedKvValue>,
+    order: BTreeMap<u64, KvWriteKey>,
+    epoch: u64,
+    next_ordinal: u64,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
 }
 
-impl KvWriteWorkerState {
-    fn committed_backlog_accepts(
-        &self,
-        mutation_count: usize,
-        byte_count: usize,
-        max_mutations: usize,
-        max_bytes: usize,
-    ) -> bool {
-        self.committed_mutations.saturating_add(mutation_count) <= max_mutations
-            && self.committed_bytes.saturating_add(byte_count) <= max_bytes
-    }
-
-    fn push_committed(&mut self, committed: KvCommittedBatch) {
-        self.committed_mutations = self
-            .committed_mutations
-            .saturating_add(committed.mutations.len());
-        self.committed_bytes = self
-            .committed_bytes
-            .saturating_add(kv_scheduled_batch_bytes(&committed.mutations));
-        self.committed.push_back(committed);
-    }
-
-    fn pop_committed(&mut self) -> Option<KvCommittedBatch> {
-        let committed = self.committed.pop_front()?;
-        self.committed_mutations = self
-            .committed_mutations
-            .saturating_sub(committed.mutations.len());
-        self.committed_bytes = self
-            .committed_bytes
-            .saturating_sub(kv_scheduled_batch_bytes(&committed.mutations));
-        Some(committed)
-    }
-
-    fn prune_pending_superseded_by(&mut self, committed: &[KvScheduledMutation]) -> u64 {
-        let mut superseded = 0u64;
-        for mutation in committed {
-            let should_remove = self
-                .pending
-                .get(&mutation.key)
-                .is_some_and(|pending| pending.version <= mutation.version);
-            if should_remove && let Some(removed) = self.pending.remove(&mutation.key) {
-                self.pending_bytes = self.pending_bytes.saturating_sub(removed.size_bytes);
-                superseded += 1;
-            }
+impl Default for CommittedKvCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            epoch: 0,
+            next_ordinal: 0,
+            bytes: 0,
+            max_entries: 16_384,
+            max_bytes: 16 * 1024 * 1024,
         }
-        superseded
     }
 }
 
-fn kv_scheduled_batch_bytes(mutations: &[KvScheduledMutation]) -> usize {
-    mutations
-        .iter()
-        .map(|mutation| mutation.size_bytes)
-        .fold(0usize, usize::saturating_add)
-}
+impl CommittedKvCache {
+    fn remove(&mut self, key: &KvWriteKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.order.remove(&entry.ordinal);
+            self.bytes -= entry.bytes;
+        }
+    }
 
-struct KvCommittedBatch {
-    mutations: Vec<KvScheduledMutation>,
-    reply: oneshot::Sender<Result<()>>,
-}
-
-enum KvWriterWork {
-    Queued(Vec<KvScheduledMutation>),
-    Committed(KvCommittedBatch),
-}
-
-struct KvWriteWorker {
-    state: Mutex<KvWriteWorkerState>,
-    wake: Condvar,
-}
-
-struct KvWriterInner {
-    writer: Arc<KvWriteWorker>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-    max_pending_keys: usize,
-    max_pending_bytes: usize,
-    flush_interval: Duration,
-    flush_threshold: usize,
-    database: Arc<Database>,
-    profile: Arc<KvProfile>,
-    failed_versions: Arc<Mutex<HashSet<i64>>>,
-}
-
-#[derive(Clone)]
-struct KvWriter {
-    inner: Arc<KvWriterInner>,
+    fn insert(&mut self, key: KvWriteKey, value: Option<KvValue>, shard_epoch: u64) {
+        self.remove(&key);
+        let bytes = key.worker_name.len()
+            + key.binding.len()
+            + key.key.len()
+            + 128
+            + value
+                .as_ref()
+                .map_or(0, |value| value.value.len() + value.encoding.len());
+        if bytes > self.max_bytes || self.max_entries == 0 {
+            return;
+        }
+        while self.entries.len() >= self.max_entries || self.bytes + bytes > self.max_bytes {
+            let oldest = self
+                .order
+                .first_key_value()
+                .expect("nonempty cache exceeds limit")
+                .1
+                .clone();
+            self.remove(&oldest);
+        }
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        self.order.insert(ordinal, key.clone());
+        self.entries.insert(
+            key,
+            CachedKvValue {
+                value,
+                ordinal,
+                shard_epoch,
+                bytes,
+            },
+        );
+        self.bytes += bytes;
+    }
 }
 
 impl KvProfileMetric {
@@ -345,9 +213,6 @@ impl KvProfile {
     }
 
     pub fn record(&self, metric: KvProfileMetricKind, duration_us: u64, items: u64) {
-        if metric == KvProfileMetricKind::WriteRetry {
-            record_storage_retry();
-        }
         if !self.enabled() {
             return;
         }
@@ -358,24 +223,9 @@ impl KvProfile {
         KvProfileSnapshot {
             enabled: self.enabled(),
             js_request_total: self.js_request_total.snapshot(),
-            js_batch_flush: self.js_batch_flush.snapshot(),
             op_get: self.op_get.snapshot(),
             op_get_many_utf8: self.op_get_many_utf8.snapshot(),
             op_get_value: self.op_get_value.snapshot(),
-            store_get_utf8: self.store_get_utf8.snapshot(),
-            store_get_utf8_many: self.store_get_utf8_many.snapshot(),
-            store_get_value: self.store_get_value.snapshot(),
-            write_enqueue: self.write_enqueue.snapshot(),
-            write_superseded: self.write_superseded.snapshot(),
-            write_rejected: self.write_rejected.snapshot(),
-            write_flush: self.write_flush.snapshot(),
-            write_retry: self.write_retry.snapshot(),
-            write_queue_wait: self.write_queue_wait.snapshot(),
-            js_cache_hit: self.js_cache_hit.snapshot(),
-            js_cache_miss: self.js_cache_miss.snapshot(),
-            js_cache_stale: self.js_cache_stale.snapshot(),
-            js_cache_fill: self.js_cache_fill.snapshot(),
-            js_cache_invalidate: self.js_cache_invalidate.snapshot(),
         }
     }
 
@@ -387,620 +237,56 @@ impl KvProfile {
 
     pub fn reset(&self) {
         self.js_request_total.reset();
-        self.js_batch_flush.reset();
         self.op_get.reset();
         self.op_get_many_utf8.reset();
         self.op_get_value.reset();
-        self.store_get_utf8.reset();
-        self.store_get_utf8_many.reset();
-        self.store_get_value.reset();
-        self.write_enqueue.reset();
-        self.write_superseded.reset();
-        self.write_rejected.reset();
-        self.write_flush.reset();
-        self.write_retry.reset();
-        self.write_queue_wait.reset();
-        self.js_cache_hit.reset();
-        self.js_cache_miss.reset();
-        self.js_cache_stale.reset();
-        self.js_cache_fill.reset();
-        self.js_cache_invalidate.reset();
     }
 
     fn metric(&self, metric: KvProfileMetricKind) -> &KvProfileMetric {
         match metric {
             KvProfileMetricKind::JsRequestTotal => &self.js_request_total,
-            KvProfileMetricKind::JsBatchFlush => &self.js_batch_flush,
             KvProfileMetricKind::OpGet => &self.op_get,
             KvProfileMetricKind::OpGetManyUtf8 => &self.op_get_many_utf8,
             KvProfileMetricKind::OpGetValue => &self.op_get_value,
-            KvProfileMetricKind::StoreGetUtf8 => &self.store_get_utf8,
-            KvProfileMetricKind::StoreGetUtf8Many => &self.store_get_utf8_many,
-            KvProfileMetricKind::StoreGetValue => &self.store_get_value,
-            KvProfileMetricKind::WriteEnqueue => &self.write_enqueue,
-            KvProfileMetricKind::WriteSuperseded => &self.write_superseded,
-            KvProfileMetricKind::WriteRejected => &self.write_rejected,
-            KvProfileMetricKind::WriteFlush => &self.write_flush,
-            KvProfileMetricKind::WriteRetry => &self.write_retry,
-            KvProfileMetricKind::WriteQueueWait => &self.write_queue_wait,
-            KvProfileMetricKind::JsCacheHit => &self.js_cache_hit,
-            KvProfileMetricKind::JsCacheMiss => &self.js_cache_miss,
-            KvProfileMetricKind::JsCacheStale => &self.js_cache_stale,
-            KvProfileMetricKind::JsCacheFill => &self.js_cache_fill,
-            KvProfileMetricKind::JsCacheInvalidate => &self.js_cache_invalidate,
-        }
-    }
-}
-
-impl KvScheduledMutation {
-    fn from_batch_mutation(
-        worker_name: &str,
-        binding: &str,
-        mutation: KvBatchMutation,
-        version: i64,
-    ) -> Result<Self> {
-        let encoding = normalize_encoding(&mutation.encoding);
-        if encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
-            return Err(PlatformError::bad_request(format!(
-                "unsupported kv encoding: {}",
-                mutation.encoding
-            )));
-        }
-        if !mutation.deleted && encoding == ENCODING_UTF8 {
-            std::str::from_utf8(&mutation.value).map_err(|error| {
-                PlatformError::bad_request(format!("invalid utf8 value: {error}"))
-            })?;
-        }
-        let size_bytes = worker_name.len()
-            + binding.len()
-            + mutation.key.len()
-            + mutation.value.len()
-            + encoding.len()
-            + 64;
-        Ok(Self {
-            key: KvWriteKey {
-                worker_name: worker_name.to_string(),
-                binding: binding.to_string(),
-                key: mutation.key,
-            },
-            value: mutation.value,
-            encoding,
-            deleted: mutation.deleted,
-            version,
-            enqueued_at: Instant::now(),
-            size_bytes,
-        })
-    }
-}
-
-impl KvWriter {
-    fn new(
-        database: Arc<Database>,
-        profile: Arc<KvProfile>,
-        failed_versions: Arc<Mutex<HashSet<i64>>>,
-    ) -> Self {
-        let writer = Arc::new(KvWriteWorker {
-            state: Mutex::new(KvWriteWorkerState::default()),
-            wake: Condvar::new(),
-        });
-        let inner = Arc::new(KvWriterInner {
-            writer,
-            handle: Mutex::new(None),
-            max_pending_keys: 4_096,
-            max_pending_bytes: 16 * 1024 * 1024,
-            flush_interval: Duration::from_millis(2),
-            flush_threshold: 128,
-            database,
-            profile,
-            failed_versions,
-        });
-        inner.spawn_writer();
-        Self { inner }
-    }
-
-    fn enqueue_batch(
-        &self,
-        next_version: impl Fn() -> i64,
-        worker_name: &str,
-        binding: &str,
-        mutations: &[KvBatchMutation],
-    ) -> Result<Vec<i64>> {
-        if mutations.is_empty() {
-            return Ok(Vec::new());
-        }
-        let started = Instant::now();
-        let mut versions = Vec::with_capacity(mutations.len());
-        let mut batch = HashMap::<KvWriteKey, KvScheduledMutation>::new();
-        for mutation in mutations.iter().cloned() {
-            let version = next_version();
-            let scheduled =
-                KvScheduledMutation::from_batch_mutation(worker_name, binding, mutation, version)?;
-            versions.push(version);
-            batch.insert(scheduled.key.clone(), scheduled);
-        }
-
-        let mut state = self
-            .inner
-            .writer
-            .state
-            .lock()
-            .expect("kv writer lock poisoned");
-        let mut pending_keys = state.pending.len();
-        let mut pending_bytes = state.pending_bytes;
-        for mutation in batch.values() {
-            match state.pending.get(&mutation.key) {
-                Some(existing) => {
-                    pending_bytes = pending_bytes
-                        .saturating_sub(existing.size_bytes)
-                        .saturating_add(mutation.size_bytes);
-                }
-                None => {
-                    pending_keys += 1;
-                    pending_bytes = pending_bytes.saturating_add(mutation.size_bytes);
-                }
-            }
-        }
-        if pending_keys > self.inner.max_pending_keys
-            || pending_bytes > self.inner.max_pending_bytes
-        {
-            self.inner.profile.record(
-                KvProfileMetricKind::WriteRejected,
-                0,
-                mutations.len() as u64,
-            );
-            return Err(PlatformError::runtime(
-                "kv write queue overloaded: enqueue rejected",
-            ));
-        }
-        let mut superseded = 0u64;
-        for mutation in batch.into_values() {
-            if let Some(existing) = state.pending.insert(mutation.key.clone(), mutation.clone()) {
-                superseded += 1;
-                state.pending_bytes = state.pending_bytes.saturating_sub(existing.size_bytes);
-            }
-            state.pending_bytes = state.pending_bytes.saturating_add(mutation.size_bytes);
-        }
-        drop(state);
-
-        self.inner.writer.wake.notify_one();
-        self.inner.profile.record(
-            KvProfileMetricKind::WriteEnqueue,
-            started.elapsed().as_micros() as u64,
-            mutations.len() as u64,
-        );
-        if superseded > 0 {
-            self.inner
-                .profile
-                .record(KvProfileMetricKind::WriteSuperseded, 0, superseded);
-        }
-        Ok(versions)
-    }
-
-    async fn commit_batch(
-        &self,
-        next_version: impl Fn() -> i64,
-        worker_name: &str,
-        binding: &str,
-        mutations: &[KvBatchMutation],
-    ) -> Result<Vec<i64>> {
-        if mutations.is_empty() {
-            return Ok(Vec::new());
-        }
-        if mutations.len() > self.inner.max_pending_keys {
-            return Err(PlatformError::runtime(
-                "kv committed write batch overloaded: too many keys",
-            ));
-        }
-
-        let mut versions = Vec::with_capacity(mutations.len());
-        let mut batch = Vec::with_capacity(mutations.len());
-        let mut batch_bytes = 0usize;
-        for mutation in mutations.iter().cloned() {
-            let version = next_version();
-            let scheduled =
-                KvScheduledMutation::from_batch_mutation(worker_name, binding, mutation, version)?;
-            batch_bytes = batch_bytes.saturating_add(scheduled.size_bytes);
-            versions.push(version);
-            batch.push(scheduled);
-        }
-        if batch_bytes > self.inner.max_pending_bytes {
-            return Err(PlatformError::runtime(
-                "kv committed write batch overloaded: too many bytes",
-            ));
-        }
-
-        let (reply, committed) = oneshot::channel();
-        {
-            let mut state = self
-                .inner
-                .writer
-                .state
-                .lock()
-                .expect("kv writer lock poisoned");
-            if state.shutting_down {
-                return Err(PlatformError::runtime("kv writer is shutting down"));
-            }
-            if !state.committed_backlog_accepts(
-                batch.len(),
-                batch_bytes,
-                self.inner.max_pending_keys,
-                self.inner.max_pending_bytes,
-            ) {
-                self.inner.profile.record(
-                    KvProfileMetricKind::WriteRejected,
-                    0,
-                    mutations.len() as u64,
-                );
-                return Err(PlatformError::runtime(
-                    "kv committed write queue overloaded: enqueue rejected",
-                ));
-            }
-            let superseded = state.prune_pending_superseded_by(&batch);
-            if superseded > 0 {
-                self.inner
-                    .profile
-                    .record(KvProfileMetricKind::WriteSuperseded, 0, superseded);
-            }
-            state.push_committed(KvCommittedBatch {
-                mutations: batch,
-                reply,
-            });
-        }
-
-        self.inner.writer.wake.notify_one();
-        match committed.await {
-            Ok(Ok(())) => Ok(versions),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(PlatformError::runtime("kv committed write worker stopped")),
-        }
-    }
-}
-
-impl KvWriterInner {
-    fn spawn_writer(self: &Arc<Self>) {
-        let mut handle_slot = self
-            .handle
-            .lock()
-            .expect("kv write scheduler handle lock poisoned");
-        debug_assert!(handle_slot.is_none());
-        let writer = Arc::clone(&self.writer);
-        let database = Arc::clone(&self.database);
-        let profile = Arc::clone(&self.profile);
-        let flush_interval = self.flush_interval;
-        let flush_threshold = self.flush_threshold;
-        let failed_versions = Arc::clone(&self.failed_versions);
-        let handle = std::thread::Builder::new()
-            .name("kv-writer".to_string())
-            .spawn(move || {
-                Self::run_writer_loop(
-                    database,
-                    profile,
-                    flush_interval,
-                    flush_threshold,
-                    failed_versions,
-                    writer,
-                )
-            })
-            .expect("kv writer thread should start");
-        *handle_slot = Some(handle);
-    }
-
-    fn run_writer_loop(
-        database: Arc<Database>,
-        profile: Arc<KvProfile>,
-        flush_interval: Duration,
-        flush_threshold: usize,
-        failed_versions: Arc<Mutex<HashSet<i64>>>,
-        writer: Arc<KvWriteWorker>,
-    ) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("kv writer runtime should build");
-        let mut writer_conn = None;
-        loop {
-            let work = {
-                let mut state = writer.state.lock().expect("kv writer lock poisoned");
-                while state.pending.is_empty() && state.committed.is_empty() && !state.shutting_down
-                {
-                    state = writer
-                        .wake
-                        .wait(state)
-                        .expect("kv writer condvar wait should succeed");
-                }
-                if let Some(committed) = state.pop_committed() {
-                    KvWriterWork::Committed(committed)
-                } else if state.shutting_down && state.pending.is_empty() {
-                    return;
-                } else if state.pending.len() < flush_threshold && !state.shutting_down {
-                    let (next_state, _) = writer
-                        .wake
-                        .wait_timeout(state, flush_interval)
-                        .expect("kv writer timed wait should succeed");
-                    state = next_state;
-                    if let Some(committed) = state.pop_committed() {
-                        KvWriterWork::Committed(committed)
-                    } else if state.pending.is_empty() && !state.shutting_down {
-                        continue;
-                    } else {
-                        let pending = std::mem::take(&mut state.pending);
-                        state.pending_bytes = 0;
-                        KvWriterWork::Queued(pending.into_values().collect::<Vec<_>>())
-                    }
-                } else {
-                    let pending = std::mem::take(&mut state.pending);
-                    state.pending_bytes = 0;
-                    KvWriterWork::Queued(pending.into_values().collect::<Vec<_>>())
-                }
-            };
-            let batch = match &work {
-                KvWriterWork::Queued(batch) => batch.as_slice(),
-                KvWriterWork::Committed(committed) => committed.mutations.as_slice(),
-            };
-            if batch.is_empty() {
-                if let KvWriterWork::Committed(committed) = work {
-                    let _ = committed.reply.send(Ok(()));
-                }
-                continue;
-            }
-            let oldest = batch
-                .iter()
-                .map(|mutation| mutation.enqueued_at)
-                .min()
-                .unwrap_or_else(Instant::now);
-            profile.record(
-                KvProfileMetricKind::WriteQueueWait,
-                oldest.elapsed().as_micros() as u64,
-                batch.len() as u64,
-            );
-            let flush_result = runtime.block_on(async {
-                if writer_conn.is_none() {
-                    let conn = database.connect().map_err(kv_error)?;
-                    configure_connection(&conn).await?;
-                    writer_conn = Some(conn);
-                }
-                Self::flush_batch(
-                    writer_conn
-                        .as_mut()
-                        .expect("kv writer connection should be initialized"),
-                    &profile,
-                    batch,
-                )
-                .await
-            });
-            match (work, flush_result) {
-                (KvWriterWork::Committed(committed), Ok(())) => {
-                    let _ = committed.reply.send(Ok(()));
-                }
-                (KvWriterWork::Committed(committed), Err(error)) => {
-                    writer_conn = None;
-                    let _ = committed.reply.send(Err(error));
-                }
-                (KvWriterWork::Queued(_), Ok(())) => {}
-                (KvWriterWork::Queued(batch), Err(_)) => {
-                    writer_conn = None;
-                    let mut failed = failed_versions
-                        .lock()
-                        .expect("kv failed versions lock poisoned");
-                    for mutation in &batch {
-                        failed.insert(mutation.version);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn flush_batch(
-        conn: &mut Connection,
-        profile: &Arc<KvProfile>,
-        batch: &[KvScheduledMutation],
-    ) -> Result<()> {
-        const MAX_ATTEMPTS: usize = 8;
-        let started = Instant::now();
-        for attempt in 0..MAX_ATTEMPTS {
-            let tx = match conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .await
-            {
-                Ok(tx) => tx,
-                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
-                    profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
-                    record_storage_retry();
-                    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
-                    continue;
-                }
-                Err(error) => return Err(kv_error_after_retry(error)),
-            };
-            let mut tx = Some(tx);
-            let now_ms = epoch_ms_i64()?;
-            let mut should_retry = false;
-            for mutation in batch {
-                let value_text = if !mutation.deleted && mutation.encoding == ENCODING_UTF8 {
-                    std::str::from_utf8(&mutation.value)
-                        .map_err(|error| {
-                            PlatformError::bad_request(format!("invalid utf8 value: {error}"))
-                        })?
-                        .to_string()
-                } else {
-                    String::new()
-                };
-                let value_blob = if mutation.deleted || mutation.encoding == ENCODING_UTF8 {
-                    None
-                } else {
-                    Some(mutation.value.clone())
-                };
-                match execute_cached(
-                    tx.as_ref()
-                        .expect("kv write transaction should be present"),
-                        "INSERT INTO worker_kv (worker_name, binding, key, value, value_blob, encoding, deleted, version, updated_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                         ON CONFLICT(worker_name, binding, key) DO UPDATE SET
-                           value = excluded.value,
-                           value_blob = excluded.value_blob,
-                           encoding = excluded.encoding,
-                           deleted = excluded.deleted,
-                           version = excluded.version,
-                           updated_at_ms = excluded.updated_at_ms
-                         WHERE excluded.version > worker_kv.version",
-                        (
-                            mutation.key.worker_name.as_str(),
-                            mutation.key.binding.as_str(),
-                            mutation.key.key.as_str(),
-                            value_text.as_str(),
-                            value_blob.as_deref(),
-                            mutation.encoding.as_str(),
-                            if mutation.deleted { 1 } else { 0 },
-                            mutation.version,
-                            now_ms,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        if let Some(tx) = tx.take() {
-                            let _ = tx.rollback().await;
-                        }
-                        if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
-                            profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
-                            tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64))
-                                .await;
-                            should_retry = true;
-                            break;
-                        }
-                        return Err(kv_error_after_retry(error));
-                    }
-                }
-            }
-            if should_retry {
-                continue;
-            }
-            if let Err(error) = tx
-                .take()
-                .expect("kv write transaction should be present")
-                .commit()
-                .await
-            {
-                if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
-                    profile.record(KvProfileMetricKind::WriteRetry, 0, 1);
-                    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
-                    continue;
-                }
-                return Err(kv_error_after_retry(error));
-            }
-            profile.record(
-                KvProfileMetricKind::WriteFlush,
-                started.elapsed().as_micros() as u64,
-                batch.len() as u64,
-            );
-            return Ok(());
-        }
-        Err(PlatformError::storage_unavailable(
-            "kv background flush failed after retries",
-        ))
-    }
-}
-
-impl Drop for KvWriterInner {
-    fn drop(&mut self) {
-        let mut state = self.writer.state.lock().expect("kv writer lock poisoned");
-        state.shutting_down = true;
-        self.writer.wake.notify_all();
-        drop(state);
-        let handle = self
-            .handle
-            .lock()
-            .expect("kv write scheduler handle lock poisoned")
-            .take();
-        if let Some(handle) = handle {
-            let _ = handle.join();
         }
     }
 }
 
 impl KvStore {
-    pub async fn from_database_url(database_url: &str) -> Result<Self> {
-        let database = Self::open_database(database_url).await?;
-        Self::from_database(database).await
+    pub fn from_state(state: Arc<StateStore>) -> Self {
+        Self {
+            state,
+            profile: Arc::new(KvProfile::default()),
+            read_cache: Arc::new(Mutex::new(CommittedKvCache::default())),
+        }
     }
 
-    pub async fn open_database(database_url: &str) -> Result<Arc<Database>> {
-        let local_path = database_url
-            .strip_prefix("file:")
-            .unwrap_or(database_url)
-            .to_string();
-        ensure_parent_dir(Path::new(&local_path))?;
-        let database = Builder::new_local(&local_path)
-            .build()
-            .await
-            .map_err(kv_error)?;
-        Ok(Arc::new(database))
+    pub fn set_read_cache_limits(&self, max_entries: usize, max_bytes: usize) {
+        let mut cache = self.read_cache.lock().expect("kv cache lock poisoned");
+        cache.entries.clear();
+        cache.order.clear();
+        cache.bytes = 0;
+        cache.epoch += 1;
+        cache.max_entries = max_entries;
+        cache.max_bytes = max_bytes;
     }
-
-    pub async fn from_database(database: Arc<Database>) -> Result<Self> {
-        migrate_kv_schema(&database).await?;
-        let profile = Arc::new(KvProfile::default());
-        let failed_versions = Arc::new(Mutex::new(HashSet::new()));
-        let store = Self {
-            database: Arc::clone(&database),
-            connections: Arc::new(Mutex::new(Vec::new())),
-            connection_permits: Arc::new(Semaphore::new(KV_CONNECTION_LIMIT)),
-            version: Arc::new(AtomicU64::new(1)),
-            profile: Arc::clone(&profile),
-            writer: KvWriter::new(database, profile, Arc::clone(&failed_versions)),
-            failed_versions,
-        };
-        store.sync_version_counter_from_db().await?;
-        Ok(store)
-    }
-
-    pub fn take_failed_write_version(&self, version: i64) -> bool {
-        self.failed_versions
-            .lock()
-            .expect("kv failed versions lock poisoned")
-            .remove(&version)
-    }
-
     pub fn set_profile_enabled(&self, enabled: bool) {
         self.profile.set_enabled(enabled);
     }
-
     pub fn record_profile(&self, metric: KvProfileMetricKind, duration_us: u64, items: u64) {
         self.profile.record(metric, duration_us, items);
     }
-
     pub fn take_profile_snapshot_and_reset(&self) -> KvProfileSnapshot {
         self.profile.take_snapshot_and_reset()
     }
-
     pub fn reset_profile(&self) {
         self.profile.reset();
     }
-
     pub async fn checkpoint(&self) -> Result<()> {
-        checkpoint_database(&self.database).await.map_err(kv_error)
+        self.state.checkpoint().await
     }
-
     pub async fn health_check(&self) -> Result<()> {
-        health_check_database(&self.database)
-            .await
-            .map_err(kv_error)?;
-        let conn = self.database.connect().map_err(kv_error)?;
-        configure_connection(&conn).await?;
-        let version = storage_schema_version(&conn, "kv")
-            .await
-            .map_err(kv_error)?;
-        if version != KV_SCHEMA_VERSION {
-            return Err(PlatformError::runtime(format!(
-                "kv error: schema version {version} is not ready; expected {KV_SCHEMA_VERSION}"
-            )));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn shares_database_owner(&self, database: &Arc<Database>) -> bool {
-        Arc::ptr_eq(&self.database, database)
+        self.state.health_check().await
     }
 
     pub async fn get(
@@ -1009,143 +295,69 @@ impl KvStore {
         binding: &str,
         key: &str,
     ) -> Result<Option<KvValue>> {
-        let started = Instant::now();
-        let conn = self.connect().await?;
-        let mut rows = query_cached(
-            &conn,
-            "SELECT value_blob, encoding, value, deleted
-                 FROM worker_kv
-                 WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
-            (worker_name, binding, key),
-        )
-        .await
-        .map_err(kv_error)?;
-        if let Some(row) = rows.next().await.map_err(kv_error)? {
-            let deleted: i64 = row.get::<i64>(3).map_err(kv_error)?;
-            if deleted != 0 {
-                return Ok(None);
+        let shard = StateStore::shard_index(worker_name, binding, key);
+        let epoch = self.state.epoch(shard);
+        let cache_key = KvWriteKey {
+            worker_name: worker_name.into(),
+            binding: binding.into(),
+            key: key.into(),
+        };
+        {
+            let mut cache = self.read_cache.lock().expect("kv cache lock poisoned");
+            if let Some(entry) = cache.entries.get(&cache_key)
+                && entry.shard_epoch == epoch
+            {
+                let value = entry.value.clone();
+                cache.insert(cache_key, value.clone(), epoch);
+                return Ok(value);
             }
-            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(0).map_err(kv_error)?;
-            let encoding: String = row.get::<String>(1).map_err(kv_error)?;
-            let legacy_value: String = row.get::<String>(2).map_err(kv_error)?;
-            let value = value_blob.unwrap_or_else(|| legacy_value.into_bytes());
-            self.record_profile(
-                KvProfileMetricKind::StoreGetValue,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            return Ok(Some(KvValue {
-                value,
-                encoding: normalize_encoding(&encoding),
-            }));
         }
-        self.record_profile(
-            KvProfileMetricKind::StoreGetValue,
-            started.elapsed().as_micros() as u64,
-            1,
-        );
-        Ok(None)
+        let conn = self.state.read(shard).await?;
+        let mut rows = query_cached(&conn, "SELECT value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND key = ?3 AND deleted = 0", (worker_name, binding, key)).await.map_err(storage_error)?;
+        let value = rows
+            .next()
+            .await
+            .map_err(storage_error)?
+            .map(|row| {
+                Ok::<_, turso::Error>(KvValue {
+                    value: row.get(0)?,
+                    encoding: row.get(1)?,
+                })
+            })
+            .transpose()
+            .map_err(storage_error)?;
+        if self.state.epoch(shard) == epoch {
+            self.read_cache
+                .lock()
+                .expect("kv cache lock poisoned")
+                .insert(cache_key, value.clone(), epoch);
+        }
+        Ok(value)
     }
-
     pub async fn get_utf8(
         &self,
         worker_name: &str,
         binding: &str,
         key: &str,
     ) -> Result<std::result::Result<String, KvUtf8Lookup>> {
-        let started = Instant::now();
-        let conn = self.connect().await?;
-        let mut rows = query_cached(
-            &conn,
-            "SELECT value, encoding, deleted
-                 FROM worker_kv
-                 WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
-            (worker_name, binding, key),
-        )
-        .await
-        .map_err(kv_error)?;
-        if let Some(row) = rows.next().await.map_err(kv_error)? {
-            let deleted: i64 = row.get::<i64>(2).map_err(kv_error)?;
-            if deleted != 0 {
-                return Ok(Err(KvUtf8Lookup::Missing));
-            }
-            let encoding: String = row.get::<String>(1).map_err(kv_error)?;
-            if normalize_encoding(&encoding) != ENCODING_UTF8 {
-                self.record_profile(
-                    KvProfileMetricKind::StoreGetUtf8,
-                    started.elapsed().as_micros() as u64,
-                    1,
-                );
-                return Ok(Err(KvUtf8Lookup::WrongEncoding));
-            }
-            let value = row.get::<String>(0).map_err(kv_error)?;
-            self.record_profile(
-                KvProfileMetricKind::StoreGetUtf8,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            return Ok(Ok(value));
+        match self.get(worker_name, binding, key).await? {
+            None => Ok(Err(KvUtf8Lookup::Missing)),
+            Some(value) if value.encoding != "utf8" => Ok(Err(KvUtf8Lookup::WrongEncoding)),
+            Some(value) => Ok(Ok(String::from_utf8(value.value).map_err(storage_error)?)),
         }
-        self.record_profile(
-            KvProfileMetricKind::StoreGetUtf8,
-            started.elapsed().as_micros() as u64,
-            1,
-        );
-        Ok(Err(KvUtf8Lookup::Missing))
     }
-
     pub async fn get_utf8_many(
         &self,
         worker_name: &str,
         binding: &str,
         keys: &[String],
     ) -> Result<Vec<std::result::Result<String, KvUtf8Lookup>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get_utf8(worker_name, binding, key).await?);
         }
-        let started = Instant::now();
-        let conn = self.connect().await?;
-        let placeholders = (0..keys.len())
-            .map(|index| format!("?{}", index + 3))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT key, value, encoding, deleted
-             FROM worker_kv
-             WHERE worker_name = ?1 AND binding = ?2 AND key IN ({placeholders})"
-        );
-        let mut params = Vec::with_capacity(keys.len() + 2);
-        params.push(Value::Text(worker_name.to_string()));
-        params.push(Value::Text(binding.to_string()));
-        params.extend(keys.iter().cloned().map(Value::Text));
-        let mut rows = conn.query(&sql, params).await.map_err(kv_error)?;
-        let mut values = std::collections::HashMap::with_capacity(keys.len());
-        while let Some(row) = rows.next().await.map_err(kv_error)? {
-            let key: String = row.get::<String>(0).map_err(kv_error)?;
-            let value: String = row.get::<String>(1).map_err(kv_error)?;
-            let encoding: String = row.get::<String>(2).map_err(kv_error)?;
-            let deleted: i64 = row.get::<i64>(3).map_err(kv_error)?;
-            values.insert(key, (value, normalize_encoding(&encoding), deleted != 0));
-        }
-        let result = keys
-            .iter()
-            .map(|key| match values.get(key) {
-                None => Err(KvUtf8Lookup::Missing),
-                Some((_, _, true)) => Err(KvUtf8Lookup::Missing),
-                Some((_, encoding, false)) if encoding != ENCODING_UTF8 => {
-                    Err(KvUtf8Lookup::WrongEncoding)
-                }
-                Some((value, _, false)) => Ok(value.clone()),
-            })
-            .collect();
-        self.record_profile(
-            KvProfileMetricKind::StoreGetUtf8Many,
-            started.elapsed().as_micros() as u64,
-            keys.len() as u64,
-        );
-        Ok(result)
+        Ok(values)
     }
-
     pub async fn put(
         &self,
         worker_name: &str,
@@ -1153,20 +365,9 @@ impl KvStore {
         key: &str,
         value: &str,
     ) -> Result<i64> {
-        self.commit_single_version(
-            worker_name,
-            binding,
-            KvBatchMutation {
-                key: key.to_string(),
-                value: value.as_bytes().to_vec(),
-                encoding: ENCODING_UTF8.to_string(),
-                deleted: false,
-            },
-            "write",
-        )
-        .await
+        self.put_value(worker_name, binding, key, value.as_bytes(), "utf8")
+            .await
     }
-
     pub async fn put_value(
         &self,
         worker_name: &str,
@@ -1175,81 +376,76 @@ impl KvStore {
         value: &[u8],
         encoding: &str,
     ) -> Result<i64> {
-        if encoding != ENCODING_UTF8 && encoding != ENCODING_V8SC {
-            return Err(PlatformError::bad_request(format!(
-                "unsupported kv encoding: {encoding}"
-            )));
-        }
-        if encoding == ENCODING_UTF8 {
-            std::str::from_utf8(value).map_err(|error| {
-                PlatformError::bad_request(format!("invalid utf8 value: {error}"))
-            })?;
-        }
-        self.commit_single_version(
+        crate::memory::validate_value(value, encoding)?;
+        self.commit(
             worker_name,
             binding,
             KvBatchMutation {
-                key: key.to_string(),
-                value: value.to_vec(),
-                encoding: encoding.to_string(),
+                key: key.into(),
+                value: value.into(),
+                encoding: encoding.into(),
                 deleted: false,
             },
-            "write",
         )
         .await
     }
-
     pub async fn delete(&self, worker_name: &str, binding: &str, key: &str) -> Result<i64> {
-        self.commit_single_version(
+        self.commit(
             worker_name,
             binding,
             KvBatchMutation {
-                key: key.to_string(),
+                key: key.into(),
                 value: Vec::new(),
-                encoding: ENCODING_UTF8.to_string(),
+                encoding: "utf8".into(),
                 deleted: true,
             },
-            "delete",
         )
         .await
     }
-
-    async fn commit_single_version(
+    async fn commit(
         &self,
         worker_name: &str,
         binding: &str,
         mutation: KvBatchMutation,
-        operation: &str,
     ) -> Result<i64> {
-        let versions = self
-            .commit_batch_versions(worker_name, binding, &[mutation])
-            .await?;
-        versions.first().copied().ok_or_else(|| {
-            PlatformError::runtime(format!("kv committed {operation} did not return a version"))
-        })
-    }
-
-    async fn commit_batch_versions(
-        &self,
-        worker_name: &str,
-        binding: &str,
-        mutations: &[KvBatchMutation],
-    ) -> Result<Vec<i64>> {
-        self.writer
-            .commit_batch(|| self.next_version(), worker_name, binding, mutations)
+        let shard = StateStore::shard_index(worker_name, binding, &mutation.key);
+        let bytes = worker_name.len()
+            + binding.len()
+            + mutation.key.len()
+            + mutation.value.len()
+            + mutation.encoding.len()
+            + 128;
+        let worker = worker_name.to_owned();
+        let binding = binding.to_owned();
+        self.state
+            .write(shard, bytes, move |conn, version| {
+                let worker = worker.clone();
+                let binding = binding.clone();
+                let mutation = mutation.clone();
+                Box::pin(async move {
+                    execute_cached(
+                        conn,
+                        "INSERT INTO worker_kv(worker,binding,key,value,encoding,deleted,version)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(worker,binding,key) DO UPDATE SET
+                     value=excluded.value,encoding=excluded.encoding,
+                     deleted=excluded.deleted,version=excluded.version",
+                        (
+                            worker,
+                            binding,
+                            mutation.key,
+                            mutation.value,
+                            mutation.encoding,
+                            i64::from(mutation.deleted),
+                            version,
+                        ),
+                    )
+                    .await?;
+                    Ok(version)
+                })
+            })
             .await
     }
-
-    pub fn enqueue_batch_versions(
-        &self,
-        worker_name: &str,
-        binding: &str,
-        mutations: &[KvBatchMutation],
-    ) -> Result<Vec<i64>> {
-        self.writer
-            .enqueue_batch(|| self.next_version(), worker_name, binding, mutations)
-    }
-
     pub async fn list(
         &self,
         worker_name: &str,
@@ -1257,841 +453,30 @@ impl KvStore {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<KvEntry>> {
-        let conn = self.connect().await?;
-        let pattern = format!("{prefix}%");
-        let mut rows = query_cached(
-            &conn,
-            "SELECT key, value_blob, encoding, value
-                 FROM worker_kv
-                 WHERE worker_name = ?1 AND binding = ?2 AND deleted = 0 AND key LIKE ?3
-                 ORDER BY key ASC
-                 LIMIT ?4",
-            (worker_name, binding, pattern, limit as i64),
-        )
-        .await
-        .map_err(kv_error)?;
-
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(kv_error)? {
-            let key: String = row.get::<String>(0).map_err(kv_error)?;
-            let value_blob: Option<Vec<u8>> = row.get::<Option<Vec<u8>>>(1).map_err(kv_error)?;
-            let encoding: String = row.get::<String>(2).map_err(kv_error)?;
-            let legacy_value: String = row.get::<String>(3).map_err(kv_error)?;
-            out.push(KvEntry {
-                key,
-                value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
-                encoding: normalize_encoding(&encoding),
-            });
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-        Ok(out)
-    }
-
-    #[cfg(test)]
-    async fn ensure_schema(&self) -> Result<()> {
-        migrate_kv_schema(&self.database).await
-    }
-
-    async fn sync_version_counter_from_db(&self) -> Result<()> {
-        let conn = self.connect().await?;
-        self.sync_version_floor_from_conn(&conn).await
-    }
-
-    async fn sync_version_floor_from_conn(&self, conn: &Connection) -> Result<()> {
-        let next = self.next_version_floor(conn).await?;
-        self.set_version_floor(next);
-        Ok(())
-    }
-
-    async fn next_version_floor(&self, conn: &Connection) -> Result<u64> {
-        let mut rows = query_cached(conn, "SELECT COALESCE(MAX(version), 0) FROM worker_kv", ())
-            .await
-            .map_err(kv_error)?;
-        let max_version = if let Some(row) = rows.next().await.map_err(kv_error)? {
-            row.get::<i64>(0).map_err(kv_error)?
-        } else {
-            0
-        };
-        Ok(max_version.saturating_add(1).max(1) as u64)
-    }
-
-    async fn connect(&self) -> Result<KvConnectionGuard> {
-        let permit = Arc::clone(&self.connection_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| PlatformError::runtime("kv connection pool is closed"))?;
-        if let Some(conn) = self
-            .connections
-            .lock()
-            .expect("kv connection pool lock poisoned")
-            .pop()
-        {
-            return Ok(KvConnectionGuard {
-                connections: Arc::clone(&self.connections),
-                _permit: permit,
-                conn: Some(conn),
-            });
-        }
-        let conn = self.database.connect().map_err(kv_error)?;
-        configure_connection(&conn).await?;
-        Ok(KvConnectionGuard {
-            connections: Arc::clone(&self.connections),
-            _permit: permit,
-            conn: Some(conn),
-        })
-    }
-
-    fn next_version(&self) -> i64 {
-        VersionFloor::next_i64(&self.version)
-    }
-
-    fn set_version_floor(&self, floor: u64) {
-        VersionFloor::set_floor(&self.version, floor);
-    }
-}
-
-async fn migrate_kv_schema(database: &Database) -> Result<()> {
-    const MAX_ATTEMPTS: usize = 8;
-
-    let mut conn = database.connect().map_err(kv_error)?;
-    configure_connection(&conn).await?;
-    conn.pragma_update("journal_mode", "'WAL'")
-        .await
-        .map_err(kv_error)?;
-    let applied_at_ms = epoch_ms_i64()?;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        let tx = match conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-        {
-            Ok(tx) => tx,
-            Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
-                sleep_kv_storage_retry(attempt).await;
-                continue;
-            }
-            Err(error) => return Err(kv_error_after_retry(error)),
-        };
-
-        match migrate_kv_schema_transaction(&tx, applied_at_ms).await {
-            Ok(()) => match tx.commit().await {
-                Ok(()) => return Ok(()),
-                Err(error) if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS => {
-                    sleep_kv_storage_retry(attempt).await;
-                }
-                Err(error) => return Err(kv_error_after_retry(error)),
-            },
-            Err(error) => {
-                let retryable = is_retryable_turso_error(&error);
-                let _ = tx.rollback().await;
-                if retryable && attempt + 1 < MAX_ATTEMPTS {
-                    sleep_kv_storage_retry(attempt).await;
-                    continue;
-                }
-                return Err(kv_error_after_retry(error));
+        let mut entries = Vec::new();
+        let pattern = format!(
+            "{}%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        for shard in 0..STATE_SHARDS {
+            let conn = self.state.read(shard).await?;
+            let mut rows = query_cached(&conn, "SELECT key, value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key LIKE ?3 ESCAPE '\\' ORDER BY key LIMIT ?4", (worker_name, binding, pattern.as_str(), i64::try_from(limit).unwrap_or(i64::MAX))).await.map_err(storage_error)?;
+            while let Some(row) = rows.next().await.map_err(storage_error)? {
+                entries.push(KvEntry {
+                    key: row.get(0).map_err(storage_error)?,
+                    value: row.get(1).map_err(storage_error)?,
+                    encoding: row.get(2).map_err(storage_error)?,
+                });
             }
         }
-    }
-
-    Err(PlatformError::storage_unavailable(
-        "kv error: schema migration failed after retries",
-    ))
-}
-
-async fn migrate_kv_schema_transaction(conn: &Connection, applied_at_ms: i64) -> turso::Result<()> {
-    ensure_storage_migration_table(conn).await?;
-    let applied_version = storage_schema_version(conn, "kv").await?;
-    if applied_version > KV_SCHEMA_VERSION {
-        return Err(turso::Error::Error(format!(
-            "unsupported kv schema version {applied_version}; maximum supported version is {KV_SCHEMA_VERSION}"
-        )));
-    }
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS worker_kv (
-          worker_name TEXT NOT NULL,
-          binding TEXT NOT NULL,
-          key TEXT NOT NULL,
-          value TEXT NOT NULL,
-          value_blob BLOB,
-          encoding TEXT NOT NULL DEFAULT 'utf8',
-          deleted INTEGER NOT NULL DEFAULT 0,
-          version INTEGER NOT NULL,
-          updated_at_ms INTEGER NOT NULL,
-          PRIMARY KEY (worker_name, binding, key)
-        )",
-        (),
-    )
-    .await?;
-    ensure_compat_columns(conn).await?;
-    conn.execute("DROP INDEX IF EXISTS idx_worker_kv_lookup", ())
-        .await?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_worker_kv_list
-         ON worker_kv(worker_name, binding, deleted, key)",
-        (),
-    )
-    .await?;
-    record_storage_schema_version(conn, "kv", KV_SCHEMA_VERSION, applied_at_ms).await?;
-    Ok(())
-}
-
-async fn sleep_kv_storage_retry(attempt: usize) {
-    record_storage_retry();
-    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
-}
-
-fn normalize_encoding(raw: &str) -> String {
-    match raw {
-        ENCODING_UTF8 => ENCODING_UTF8.to_string(),
-        ENCODING_V8SC => ENCODING_V8SC.to_string(),
-        _ => ENCODING_UTF8.to_string(),
-    }
-}
-
-fn epoch_ms_i64() -> Result<i64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| PlatformError::internal(format!("system clock error: {error}")))?;
-    Ok(duration.as_millis() as i64)
-}
-
-fn kv_error(error: impl std::fmt::Display) -> PlatformError {
-    PlatformError::runtime(format!("kv error: {error}"))
-}
-
-fn kv_error_after_retry(error: turso::Error) -> PlatformError {
-    if is_retryable_turso_error(&error) {
-        PlatformError::storage_unavailable(format!("kv error: {error}"))
-    } else {
-        kv_error(error)
-    }
-}
-
-async fn configure_connection(conn: &Connection) -> Result<()> {
-    configure_turso_connection(conn, kv_error)?;
-    conn.pragma_update("synchronous", "'FULL'")
-        .await
-        .map_err(kv_error)?;
-    Ok(())
-}
-
-async fn ensure_compat_columns(conn: &Connection) -> turso::Result<()> {
-    let mut rows = conn.query("PRAGMA table_info(worker_kv)", ()).await?;
-    let mut columns = HashSet::new();
-    while let Some(row) = rows.next().await? {
-        let name: String = row.get::<String>(1)?;
-        columns.insert(name);
-    }
-
-    if !columns.contains("value_blob") {
-        conn.execute("ALTER TABLE worker_kv ADD COLUMN value_blob BLOB", ())
-            .await?;
-    }
-    if !columns.contains("encoding") {
-        conn.execute(
-            "ALTER TABLE worker_kv ADD COLUMN encoding TEXT NOT NULL DEFAULT 'utf8'",
-            (),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(parent)
-        .map_err(|error| PlatformError::runtime(format!("kv error: {error}")))?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use uuid::Uuid;
-
-    async fn test_store(path: &Path) -> Result<KvStore> {
-        ensure_parent_dir(path)?;
-        let database = Builder::new_local(&path.to_string_lossy())
-            .build()
-            .await
-            .map_err(kv_error)?;
-        let database = Arc::new(database);
-        let profile = Arc::new(KvProfile::default());
-        let failed_versions = Arc::new(Mutex::new(HashSet::new()));
-        let store = KvStore {
-            database: Arc::clone(&database),
-            connections: Arc::new(Mutex::new(Vec::new())),
-            connection_permits: Arc::new(Semaphore::new(KV_CONNECTION_LIMIT)),
-            version: Arc::new(AtomicU64::new(1)),
-            profile: Arc::clone(&profile),
-            writer: KvWriter::new(database, profile, Arc::clone(&failed_versions)),
-            failed_versions,
-        };
-        store.ensure_schema().await?;
-        store.sync_version_counter_from_db().await?;
-        Ok(store)
-    }
-
-    fn temp_db_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("dd-kv-{name}-{}.db", Uuid::new_v4()))
-    }
-
-    fn decode_utf8(value: KvValue) -> String {
-        assert_eq!(value.encoding, ENCODING_UTF8);
-        String::from_utf8(value.value).expect("utf8")
-    }
-
-    fn utf8_mutation(key: &str, value: &str) -> KvBatchMutation {
-        KvBatchMutation {
-            key: key.to_string(),
-            value: value.as_bytes().to_vec(),
-            encoding: ENCODING_UTF8.to_string(),
-            deleted: false,
-        }
-    }
-
-    fn scheduled_mutation(key: &str, value: &str, version: i64) -> KvScheduledMutation {
-        KvScheduledMutation::from_batch_mutation(
-            "worker-a",
-            "MY_KV",
-            utf8_mutation(key, value),
-            version,
-        )
-        .expect("scheduled mutation should be valid")
-    }
-
-    fn committed_batch(mutations: Vec<KvScheduledMutation>) -> KvCommittedBatch {
-        let (reply, _rx) = oneshot::channel();
-        KvCommittedBatch { mutations, reply }
-    }
-
-    #[test]
-    fn committed_batches_prune_only_older_pending_writes_for_same_key() {
-        let older = scheduled_mutation("same", "older", 1);
-        let newer = scheduled_mutation("newer", "newer", 5);
-        let committed_same = scheduled_mutation("same", "committed", 3);
-        let committed_newer = scheduled_mutation("newer", "committed-newer", 4);
-        let untouched = scheduled_mutation("other", "other", 2);
-
-        let mut state = KvWriteWorkerState {
-            pending_bytes: older
-                .size_bytes
-                .saturating_add(newer.size_bytes)
-                .saturating_add(untouched.size_bytes),
-            ..KvWriteWorkerState::default()
-        };
-        state.pending.insert(older.key.clone(), older.clone());
-        state.pending.insert(newer.key.clone(), newer.clone());
-        state
-            .pending
-            .insert(untouched.key.clone(), untouched.clone());
-
-        let superseded = state.prune_pending_superseded_by(&[committed_same, committed_newer]);
-        assert_eq!(superseded, 1);
-        assert!(!state.pending.contains_key(&older.key));
-        assert_eq!(state.pending.get(&newer.key).map(|m| m.version), Some(5));
-        assert_eq!(
-            state.pending.get(&untouched.key).map(|m| m.version),
-            Some(2)
-        );
-        assert_eq!(
-            state.pending_bytes,
-            newer.size_bytes.saturating_add(untouched.size_bytes)
-        );
-    }
-
-    #[test]
-    fn committed_backlog_accounting_updates_on_push_and_pop() {
-        let first = scheduled_mutation("first", "a", 1);
-        let second = scheduled_mutation("second", "bb", 2);
-        let expected_bytes = kv_scheduled_batch_bytes(&[first.clone(), second.clone()]);
-        let mut state = KvWriteWorkerState::default();
-
-        assert!(state.committed_backlog_accepts(2, expected_bytes, 2, expected_bytes));
-        state.push_committed(committed_batch(vec![first.clone(), second.clone()]));
-
-        assert_eq!(state.committed_mutations, 2);
-        assert_eq!(state.committed_bytes, expected_bytes);
-        assert!(!state.committed_backlog_accepts(1, 1, 2, expected_bytes));
-
-        let popped = state.pop_committed().expect("committed batch should pop");
-        assert_eq!(popped.mutations.len(), 2);
-        assert_eq!(state.committed_mutations, 0);
-        assert_eq!(state.committed_bytes, 0);
-        assert!(state.pop_committed().is_none());
-    }
-
-    #[test]
-    fn committed_backlog_rejects_mutation_or_byte_overflow() {
-        let first = scheduled_mutation("first", "a", 1);
-        let second = scheduled_mutation("second", "bb", 2);
-        let first_bytes = kv_scheduled_batch_bytes(std::slice::from_ref(&first));
-        let second_bytes = kv_scheduled_batch_bytes(std::slice::from_ref(&second));
-        let mut state = KvWriteWorkerState::default();
-        state.push_committed(committed_batch(vec![first]));
-
-        assert!(!state.committed_backlog_accepts(1, second_bytes, 1, first_bytes + second_bytes));
-        assert!(!state.committed_backlog_accepts(1, second_bytes, 2, first_bytes));
-        assert!(state.committed_backlog_accepts(1, second_bytes, 2, first_bytes + second_bytes));
-    }
-
-    #[tokio::test]
-    async fn connection_pool_is_bounded() -> Result<()> {
-        let path = temp_db_path("connection-pool-bound");
-        let store = test_store(&path).await?;
-
-        let mut guards = Vec::new();
-        for _ in 0..KV_CONNECTION_LIMIT {
-            guards.push(store.connect().await?);
-        }
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), store.connect())
-                .await
-                .is_err(),
-            "connection request should wait once the pool limit is reached"
-        );
-
-        guards.pop();
-        tokio::time::timeout(Duration::from_secs(1), store.connect())
-            .await
-            .expect("connection should become available after a guard is dropped")?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn kv_connections_use_full_synchronous_durability() -> Result<()> {
-        let path = temp_db_path("full-synchronous");
-        let store = test_store(&path).await?;
-        let conn = store.connect().await?;
-        let mut rows = conn
-            .query("PRAGMA synchronous", ())
-            .await
-            .map_err(kv_error)?;
-        let row = rows
-            .next()
-            .await
-            .map_err(kv_error)?
-            .expect("synchronous row");
-        assert_eq!(row.get::<i64>(0).map_err(kv_error)?, 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn legacy_schema_migrates_transactionally_and_preserves_version_floor() -> Result<()> {
-        let path = temp_db_path("legacy-schema");
-        ensure_parent_dir(&path)?;
-        let database = Builder::new_local(&path.to_string_lossy())
-            .build()
-            .await
-            .map_err(kv_error)?;
-        let conn = database.connect().map_err(kv_error)?;
-        configure_connection(&conn).await?;
-        conn.execute(
-            "CREATE TABLE worker_kv (
-               worker_name TEXT NOT NULL,
-               binding TEXT NOT NULL,
-               key TEXT NOT NULL,
-               value TEXT NOT NULL,
-               deleted INTEGER NOT NULL DEFAULT 0,
-               version INTEGER NOT NULL,
-               updated_at_ms INTEGER NOT NULL,
-               PRIMARY KEY (worker_name, binding, key)
-             )",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        conn.execute(
-            "INSERT INTO worker_kv
-               (worker_name, binding, key, value, deleted, version, updated_at_ms)
-             VALUES ('worker-a', 'MY_KV', 'legacy', 'preserved', 0, 41, 1)",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        conn.execute(
-            "CREATE INDEX idx_worker_kv_lookup
-             ON worker_kv(worker_name, binding, key)",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        drop(conn);
-        drop(database);
-
-        let store = KvStore::from_database_url(&path.to_string_lossy()).await?;
-        let value = store
-            .get("worker-a", "MY_KV", "legacy")
-            .await?
-            .expect("legacy value should survive migration");
-        assert_eq!(decode_utf8(value), "preserved");
-        assert!(store.put("worker-a", "MY_KV", "next", "value").await? > 41);
-
-        let conn = store.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT MAX(version) FROM dd_storage_schema_migrations WHERE component = 'kv'",
-                (),
-            )
-            .await
-            .map_err(kv_error)?;
-        assert_eq!(
-            rows.next()
-                .await
-                .map_err(kv_error)?
-                .expect("migration version row")
-                .get::<i64>(0)
-                .map_err(kv_error)?,
-            KV_SCHEMA_VERSION
-        );
-        drop(rows);
-        let mut columns = conn
-            .query("PRAGMA table_info(worker_kv)", ())
-            .await
-            .map_err(kv_error)?;
-        let mut names = HashSet::new();
-        while let Some(row) = columns.next().await.map_err(kv_error)? {
-            names.insert(row.get::<String>(1).map_err(kv_error)?);
-        }
-        assert!(names.contains("value_blob"));
-        assert!(names.contains("encoding"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn current_schema_without_migration_metadata_is_adopted() -> Result<()> {
-        let path = temp_db_path("current-schema-adoption");
-        let store = test_store(&path).await?;
-        store
-            .put("worker-a", "MY_KV", "preserved", "current")
-            .await?;
-        drop(store);
-
-        let database = Builder::new_local(&path.to_string_lossy())
-            .build()
-            .await
-            .map_err(kv_error)?;
-        let conn = database.connect().map_err(kv_error)?;
-        conn.execute(
-            "DELETE FROM dd_storage_schema_migrations WHERE component = 'kv'",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        drop(conn);
-        drop(database);
-
-        let store = KvStore::from_database_url(&path.to_string_lossy()).await?;
-        assert_eq!(
-            decode_utf8(
-                store
-                    .get("worker-a", "MY_KV", "preserved")
-                    .await?
-                    .expect("current value should survive adoption")
-            ),
-            "current"
-        );
-        store.health_check().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn future_schema_version_is_rejected_without_mutating_data() -> Result<()> {
-        let path = temp_db_path("future-schema");
-        let store = test_store(&path).await?;
-        store
-            .put("worker-a", "MY_KV", "preserved", "future-guard")
-            .await?;
-        drop(store);
-
-        let database = Builder::new_local(&path.to_string_lossy())
-            .build()
-            .await
-            .map_err(kv_error)?;
-        let conn = database.connect().map_err(kv_error)?;
-        conn.execute(
-            "INSERT INTO dd_storage_schema_migrations (component, version, applied_at_ms)
-             VALUES ('kv', ?1, 1)",
-            (KV_SCHEMA_VERSION + 1,),
-        )
-        .await
-        .map_err(kv_error)?;
-        drop(conn);
-        drop(database);
-
-        let error = match KvStore::from_database_url(&path.to_string_lossy()).await {
-            Ok(_) => panic!("future KV schema must fail startup"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("unsupported kv schema version"));
-
-        let database = Builder::new_local(&path.to_string_lossy())
-            .build()
-            .await
-            .map_err(kv_error)?;
-        let conn = database.connect().map_err(kv_error)?;
-        let mut rows = conn
-            .query(
-                "SELECT value FROM worker_kv
-                 WHERE worker_name = 'worker-a' AND binding = 'MY_KV' AND key = 'preserved'",
-                (),
-            )
-            .await
-            .map_err(kv_error)?;
-        assert_eq!(
-            rows.next()
-                .await
-                .map_err(kv_error)?
-                .expect("preserved row")
-                .get::<String>(0)
-                .map_err(kv_error)?,
-            "future-guard"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn schema_migration_drops_redundant_lookup_index() -> Result<()> {
-        let path = temp_db_path("drop-redundant-index");
-        let store = test_store(&path).await?;
-        let conn = store.connect().await?;
-        conn.execute(
-            "CREATE INDEX idx_worker_kv_lookup ON worker_kv(worker_name, binding, key)",
-            (),
-        )
-        .await
-        .map_err(kv_error)?;
-        drop(conn);
-
-        store.ensure_schema().await?;
-
-        let conn = store.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                ("idx_worker_kv_lookup",),
-            )
-            .await
-            .map_err(kv_error)?;
-        let row = rows.next().await.map_err(kv_error)?.expect("count row");
-        assert_eq!(row.get::<i64>(0).map_err(kv_error)?, 0);
-        drop(rows);
-        drop(conn);
-
-        store.put("worker-a", "MY_KV", "key", "value").await?;
-        assert_eq!(
-            store
-                .get("worker-a", "MY_KV", "key")
-                .await?
-                .map(decode_utf8),
-            Some("value".to_string())
-        );
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_put_writes_succeed() -> Result<()> {
-        let path = temp_db_path("concurrent-set");
-        let store = test_store(&path).await?;
-
-        let mut tasks = Vec::new();
-        for idx in 0..64usize {
-            let store = store.clone();
-            tasks.push(tokio::spawn(async move {
-                store
-                    .put("worker-a", "MY_KV", "hot-key", &format!("value-{idx}"))
-                    .await
-            }));
-        }
-        for task in tasks {
-            let result = task.await.expect("task join should succeed");
-            assert!(result.is_ok(), "kv put should succeed under contention");
-        }
-
-        let value = store.get("worker-a", "MY_KV", "hot-key").await?;
-        assert!(
-            value.is_some(),
-            "hot-key should exist after concurrent writes"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn version_counter_is_restored_from_disk() -> Result<()> {
-        let path = temp_db_path("version-restore");
-        let store = test_store(&path).await?;
-        let first_version = store.put("worker-a", "MY_KV", "k", "v1").await?;
-        let second_version = store.put("worker-a", "MY_KV", "k", "v2").await?;
-        assert!(
-            second_version > first_version,
-            "versions should be monotonic before restart"
-        );
-        drop(store);
-
-        let restored = test_store(&path).await?;
-        let restored_version = restored.put("worker-a", "MY_KV", "k", "v3").await?;
-        assert!(
-            restored_version > second_version,
-            "version floor should be restored before accepting post-restart writes"
-        );
-        let value = restored.get("worker-a", "MY_KV", "k").await?;
-        assert_eq!(value.map(decode_utf8), Some("v3".to_string()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn queued_writes_flush_before_store_drop_returns() -> Result<()> {
-        let path = temp_db_path("drop-flush");
-        let store = test_store(&path).await?;
-        let mutations = (0..256)
-            .map(|idx| KvBatchMutation {
-                key: format!("k-{idx}"),
-                value: format!("v-{idx}").into_bytes(),
-                encoding: ENCODING_UTF8.to_string(),
-                deleted: false,
-            })
-            .collect::<Vec<_>>();
-        store.enqueue_batch_versions("worker-a", "MY_KV", &mutations)?;
-        drop(store);
-
-        let restored = test_store(&path).await?;
-        for idx in [0usize, 127, 255] {
-            let value = restored
-                .get("worker-a", "MY_KV", &format!("k-{idx}"))
-                .await?
-                .expect("queued write should be flushed before drop returns");
-            assert_eq!(decode_utf8(value), format!("v-{idx}"));
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_writers_from_two_store_instances_succeed() -> Result<()> {
-        let path = temp_db_path("multi-store");
-        let store_a = test_store(&path).await?;
-        let store_b = test_store(&path).await?;
-
-        let mut tasks = Vec::new();
-        for idx in 0..32usize {
-            let a = store_a.clone();
-            tasks.push(tokio::spawn(async move {
-                a.put("worker-a", "MY_KV", "same-key", &format!("a-{idx}"))
-                    .await
-            }));
-            let b = store_b.clone();
-            tasks.push(tokio::spawn(async move {
-                b.put("worker-a", "MY_KV", "same-key", &format!("b-{idx}"))
-                    .await
-            }));
-        }
-
-        for task in tasks {
-            let result = task.await.expect("task join should succeed");
-            assert!(result.is_ok(), "multi-store kv write should succeed");
-        }
-
-        let value = store_a.get("worker-a", "MY_KV", "same-key").await?;
-        assert!(
-            value.is_some(),
-            "key should be present after multi-store contention"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn put_value_roundtrips_structured_payload() -> Result<()> {
-        let path = temp_db_path("typed-roundtrip");
-        let store = test_store(&path).await?;
-        let payload = vec![1u8, 7, 9, 11];
-        store
-            .put_value("worker-a", "MY_KV", "typed", &payload, ENCODING_V8SC)
-            .await?;
-        let value = store
-            .get("worker-a", "MY_KV", "typed")
-            .await?
-            .expect("typed value should exist");
-        assert_eq!(value.encoding, ENCODING_V8SC);
-        assert_eq!(value.value, payload);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn utf8_put_uses_text_fast_path_without_blob_duplication() -> Result<()> {
-        let path = temp_db_path("utf8-fast-path");
-        let store = test_store(&path).await?;
-        store.put("worker-a", "MY_KV", "greeting", "hello").await?;
-
-        let conn = store.connect().await?;
-        let mut rows = conn
-            .query(
-                "SELECT value, value_blob, encoding FROM worker_kv WHERE worker_name = ?1 AND binding = ?2 AND key = ?3",
-                ("worker-a", "MY_KV", "greeting"),
-            )
-            .await
-            .map_err(kv_error)?;
-        let row = rows.next().await.map_err(kv_error)?.expect("row");
-        let value = row.get::<String>(0).map_err(kv_error)?;
-        let value_blob = row.get::<Option<Vec<u8>>>(1).map_err(kv_error)?;
-        let encoding = row.get::<String>(2).map_err(kv_error)?;
-        assert_eq!(value, "hello");
-        assert!(
-            value_blob.is_none(),
-            "utf8 fast path should not duplicate blob storage"
-        );
-        assert_eq!(encoding, ENCODING_UTF8);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn get_utf8_reports_wrong_encoding_for_serialized_values() -> Result<()> {
-        let path = temp_db_path("utf8-lookup-wrong-encoding");
-        let store = test_store(&path).await?;
-        store
-            .put_value("worker-a", "MY_KV", "obj", &[1, 2, 3], ENCODING_V8SC)
-            .await?;
-
-        let lookup = store.get_utf8("worker-a", "MY_KV", "obj").await?;
-        assert_eq!(lookup, Err(KvUtf8Lookup::WrongEncoding));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn get_utf8_many_preserves_order_and_encoding_state() -> Result<()> {
-        let path = temp_db_path("utf8-many");
-        let store = test_store(&path).await?;
-        store.put("worker-a", "MY_KV", "a", "one").await?;
-        store
-            .put_value("worker-a", "MY_KV", "b", &[1, 2, 3], ENCODING_V8SC)
-            .await?;
-
-        let values = store
-            .get_utf8_many(
-                "worker-a",
-                "MY_KV",
-                &[
-                    "missing".to_string(),
-                    "a".to_string(),
-                    "b".to_string(),
-                    "a".to_string(),
-                ],
-            )
-            .await?;
-        assert_eq!(
-            values,
-            vec![
-                Err(KvUtf8Lookup::Missing),
-                Ok("one".to_string()),
-                Err(KvUtf8Lookup::WrongEncoding),
-                Ok("one".to_string()),
-            ]
-        );
-        Ok(())
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        entries.truncate(limit);
+        Ok(entries)
     }
 }

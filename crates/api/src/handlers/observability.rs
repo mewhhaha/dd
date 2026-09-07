@@ -118,26 +118,51 @@ pub(super) async fn metrics_response(state: &AppState) -> ApiResult<Response<Res
         "dd_storage_retries_total",
         runtime.storage_retry_count,
     );
-    counter_help(
-        &mut body,
-        "dd_cache_recency_flush_failures_total",
-        "Failed cache recency flush attempts.",
-    );
-    metric(
-        &mut body,
-        "dd_cache_recency_flush_failures_total",
-        runtime.cache_flush_failure_count,
-    );
-    metric_help(
-        &mut body,
-        "dd_cache_pending_recency_touches",
-        "Cache recency updates waiting to be persisted.",
-    );
-    metric(
-        &mut body,
-        "dd_cache_pending_recency_touches",
-        runtime.cache_pending_recency_touches,
-    );
+    for (name, description, value) in [
+        (
+            "dd_state_committed_groups_total",
+            "Durable state transactions committed.",
+            runtime.state_storage.committed_groups,
+        ),
+        (
+            "dd_state_committed_commands_total",
+            "State commands acknowledged after commit.",
+            runtime.state_storage.committed_commands,
+        ),
+        (
+            "dd_state_rollbacks_total",
+            "State transactions rolled back after failure.",
+            runtime.state_storage.rollbacks,
+        ),
+        (
+            "dd_state_discarded_connections_total",
+            "State writer connections discarded after rollback failure.",
+            runtime.state_storage.discarded_connections,
+        ),
+        (
+            "dd_state_busy_retries_total",
+            "State writer lock conflict retries.",
+            runtime.state_storage.busy_retries,
+        ),
+    ] {
+        counter_help(&mut body, name, description);
+        metric(&mut body, name, value);
+    }
+    for (name, description, value) in [
+        (
+            "dd_state_pending_commands",
+            "State commands queued or committing.",
+            runtime.state_storage.pending_commands,
+        ),
+        (
+            "dd_state_pending_bytes",
+            "Bytes admitted for queued or committing state commands.",
+            runtime.state_storage.pending_bytes,
+        ),
+    ] {
+        metric_help(&mut body, name, description);
+        metric(&mut body, name, value);
+    }
     counter_help(
         &mut body,
         "dd_memory_snapshot_cache_hits_total",

@@ -12,7 +12,7 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 
 Worker code is semi-trusted: the runtime is designed to contain buggy or abusive workers with quotas, bounded queues, storage namespaces, and egress policy. V8 isolates are not an operating-system security boundary. Running mutually hostile tenants requires separate processes or containers and is outside the supported deployment model.
 
-The private listener is an authenticated control plane and must not be exposed directly to the public Internet. Public deployment tokens must be scoped, short-lived, and use-limited. TLS is expected to terminate at the deployment edge for HTTP/1.1 and HTTP/2; HTTP/3 uses the configured certificate directly.
+The private listener is an authenticated control plane and must not be exposed directly to the public Internet. Public deployment tokens must be scoped, short-lived, and use-limited. TLS is expected to terminate at the deployment edge for HTTP/1.1 and HTTP/2.
 
 ## Dependency policy
 

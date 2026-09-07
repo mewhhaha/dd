@@ -17,14 +17,14 @@ import {
 const generatedBlock = "scaling-summary";
 const defaultCoreIsolates = [1, 2, 4, 8, 16, 32];
 const fixedModes = [
-  "direct-write-memory-wide",
+  "atomic-write-only-memory-wide",
   "atomic-readwrite-memory-wide",
-  "atomic-write-memory-wide",
+  "atomic-write-effect-memory-wide",
 ];
 const coreModes = [
-  "direct-write-memory-wide",
+  "atomic-write-only-memory-wide",
   "atomic-readwrite-memory-wide",
-  "atomic-write-memory-wide",
+  "atomic-write-effect-memory-wide",
 ];
 
 if (isMain()) {
@@ -67,9 +67,9 @@ export async function generateScalingSummary(options) {
     "Generated from local benchmark JSON. Raw result files remain ignored; this section stores the selected rows, derived ratios, and provenance needed to reproduce the measurement.",
     "",
     renderFixedTable(fixed),
-    renderCoreTable(core, "cross-shard", "Cross-shard core scaling", options.coreShards),
+    renderCoreTable(core, "cross-shard", "Cross-shard core scaling"),
     renderCoreInterpretation(core, "cross-shard"),
-    renderCoreTable(core, "same-shard", "Same-shard control", options.coreShards),
+    renderCoreTable(core, "same-shard", "Same-shard control"),
     renderTailLatency(fixed),
     renderProvenance(selectedRows, metadata, options),
   ].join("\n");
@@ -95,9 +95,8 @@ export function selectFixedRows(rows, options) {
           mode,
           keys,
           isolates: options.fixedIsolates,
-          shards: options.fixedShards,
         },
-        `${mode} ${keys} isolates=${options.fixedIsolates} shards=${options.fixedShards}`,
+        `${mode} ${keys} isolates=${options.fixedIsolates}`,
       ),
     );
   }
@@ -116,9 +115,8 @@ export function selectCoreRows(rows, options) {
             mode,
             keys,
             isolates,
-            shards: options.coreShards,
           },
-          `${mode} ${keys} isolates=${isolates} shards=${options.coreShards}`,
+          `${mode} ${keys} isolates=${isolates}`,
         ),
       );
     }
@@ -147,15 +145,15 @@ function renderFixedTable(fixed) {
   return lines.join("\n");
 }
 
-function renderCoreTable(core, keys, title, shards) {
+function renderCoreTable(core, keys, title) {
   const lines = [
     `## ${title}`,
     "",
     keys === "cross-shard"
-      ? `This five-sample matrix slice fixes the memory shard count at ${shards}.`
+      ? "State storage uses 32 fixed shards."
       : "Adding isolates does not improve one hot shard. That is expected: ordering and transactional correctness deliberately serialize conflicting work.",
     "",
-    "| Isolates | Direct write | Atomic read + write | Atomic write + effect |",
+    "| Isolates | Atomic write only | Atomic read + write | Atomic write + effect |",
     "| ---: | ---: | ---: | ---: |",
   ];
   const isolates = coreModes.length === 0 ? [] : core[coreModes[0]][keys].map((row) => row.isolates);
@@ -173,19 +171,19 @@ function renderCoreTable(core, keys, title, shards) {
 
 function renderCoreInterpretation(core, keys) {
   const atomic = core["atomic-readwrite-memory-wide"][keys];
-  const effect = core["atomic-write-memory-wide"][keys];
-  const direct = core["direct-write-memory-wide"][keys];
+  const effect = core["atomic-write-effect-memory-wide"][keys];
+  const writeOnly = core["atomic-write-only-memory-wide"][keys];
   const oneAtomic = atomic.find((row) => row.isolates === 1);
   const sixteenAtomic = atomic.find((row) => row.isolates === 16);
   const oneEffect = effect.find((row) => row.isolates === 1);
   const sixteenEffect = effect.find((row) => row.isolates === 16);
-  const peakDirect = maxBy(direct, (row) => row.throughputRps);
+  const peakWriteOnly = maxBy(writeOnly, (row) => row.throughputRps);
   const thirtyTwoAtomic = atomic.find((row) => row.isolates === 32);
   const movement = plateauLabel(sixteenAtomic.throughputRps, thirtyTwoAtomic?.throughputRps);
   return [
     `The atomic read/write path scales by about ${formatRatio(sixteenAtomic.throughputRps, oneAtomic.throughputRps)} from one to sixteen isolates. The write/effect path scales by about ${formatRatio(sixteenEffect.throughputRps, oneEffect.throughputRps)} over the same interval. Moving from 16 to 32 isolates ${movement} for atomic read/write throughput on this machine.`,
     "",
-    `Direct writes peak at ${peakDirect.isolates} isolates in this matrix slice. They are cheap enough that storage and coordination overhead can become limiting before isolate execution does.`,
+    `Write-only transactions peak at ${peakWriteOnly.isolates} isolates in this matrix slice. They are cheap enough that storage and coordination overhead can become limiting before isolate execution does.`,
     "",
   ].join("\n");
 }
@@ -198,7 +196,7 @@ function renderTailLatency(fixed) {
     "| --- | --- | ---: | ---: |",
   ];
   for (const mode of coreModes) {
-    const label = mode === "direct-write-memory-wide" ? "Direct write" : modeLabels.get(mode);
+    const label = mode === "atomic-write-only-memory-wide" ? "Atomic write only" : modeLabels.get(mode);
     for (const row of fixed[mode]) {
       const distribution = row.keys === "cross-shard" ? "Cross-shard" : "Same-shard";
       lines.push(
@@ -233,8 +231,8 @@ function renderProvenance(rows, metadata, options) {
     `- Cargo: ${metadata.cargo}`,
     `- Requests: ${requestCounts.join(", ")}`,
     `- Concurrency: ${concurrency.join(", ")}`,
-    `- Fixed comparison: isolates=${options.fixedIsolates}, shards=${options.fixedShards}`,
-    `- Core curve: isolates=${options.coreIsolates.join(" ")}, shards=${options.coreShards}`,
+    `- Fixed comparison: isolates=${options.fixedIsolates},`,
+    `- Core curve: isolates=${options.coreIsolates.join(" ")},`,
     "",
   ].join("\n");
 }
@@ -256,8 +254,6 @@ function parseArgs(args) {
     check: false,
     allowDirty: false,
     fixedIsolates: 16,
-    fixedShards: 16,
-    coreShards: 16,
     coreIsolates: defaultCoreIsolates,
   };
   for (let index = 0; index < args.length; index += 1) {
@@ -274,10 +270,6 @@ function parseArgs(args) {
       parsed.allowDirty = true;
     } else if (arg === "--fixed-isolates") {
       parsed.fixedIsolates = positiveInteger(args[++index], arg);
-    } else if (arg === "--fixed-shards") {
-      parsed.fixedShards = positiveInteger(args[++index], arg);
-    } else if (arg === "--core-shards") {
-      parsed.coreShards = positiveInteger(args[++index], arg);
     } else if (arg === "--core-isolates") {
       parsed.coreIsolates = args[++index].split(/[,\s]+/).filter(Boolean).map((value) =>
         positiveInteger(value, "--core-isolates"),

@@ -48,10 +48,9 @@ export function createDdRequestContext(
     storefront: createStorefront(env, session.id, workerName),
     async incrementStmRequestCount() {
       const memory = env.EXAMPLE_MEMORY.get(env.EXAMPLE_MEMORY.idFromName(workerName));
-      const requests = memory.tvar("requests", 0);
-      const count = await memory.atomic(() => {
-        const next = Number(requests.read()) + 1;
-        requests.write(next);
+      const count = await memory.atomic((tx) => {
+        const next = Number(tx.get("requests") ?? 0) + 1;
+        tx.put("requests", next);
         return next;
       });
       requestContext.lastStmCount = count;

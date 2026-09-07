@@ -57,6 +57,7 @@ async function startAppServer(): Promise<AppServer> {
       cwd: exampleDir,
       env: {
         ...process.env,
+        NODE_ENV: "development",
         FORCE_COLOR: "0",
         NO_COLOR: "1",
       },

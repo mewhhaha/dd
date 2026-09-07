@@ -12,7 +12,6 @@ pub(super) fn private_route_requires_auth(path: &str) -> bool {
         || path == "/metrics"
         || path == "/v1/admin/tokens"
         || path.starts_with("/v1/admin/tokens/")
-        || path == "/v1/dynamic/deploy"
         || path == "/v1/invoke"
         || path.starts_with("/v1/invoke/")
 }
@@ -20,7 +19,6 @@ pub(super) fn private_route_requires_auth(path: &str) -> bool {
 pub(super) fn public_route_is_reserved(path: &str) -> bool {
     path_has_segment_prefix(path, "/v1/deploy")
         || path_has_segment_prefix(path, "/v1/admin")
-        || path_has_segment_prefix(path, "/v1/dynamic")
         || path_has_segment_prefix(path, "/v1/invoke")
 }
 
@@ -83,7 +81,6 @@ pub(super) fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(),
         match binding {
             DeployBinding::Kv { binding }
             | DeployBinding::Memory { binding }
-            | DeployBinding::Dynamic { binding }
             | DeployBinding::Service { binding, .. }
                 if binding.trim().is_empty() =>
             {
@@ -96,7 +93,6 @@ pub(super) fn validate_deploy_bindings(bindings: &[DeployBinding]) -> Result<(),
             }
             DeployBinding::Kv { binding }
             | DeployBinding::Memory { binding }
-            | DeployBinding::Dynamic { binding }
             | DeployBinding::Service { binding, .. } => {
                 let normalized = binding.trim().to_string();
                 validate_binding_name(&normalized)?;

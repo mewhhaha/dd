@@ -3,11 +3,10 @@ use serde::Serialize;
 use std::ops::Bound::{Excluded, Unbounded};
 pub(super) struct WorkerManager {
     pub(super) config: RuntimeConfig,
-    pub(super) storage: RuntimeStorageConfig,
     pub(super) control_store: ControlStore,
-    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
+    pub(super) module_registry: crate::module_registry::ModuleRegistry,
     pub(super) bootstrap_snapshot: &'static [u8],
-    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) runtime_fast_sender: RuntimeCommandSender,
     pub(super) kv_store: KvStore,
     pub(super) memory_store: MemoryStore,
     pub(super) memory_outbox_drain_sender: MemoryOutboxDrainSender,
@@ -18,37 +17,25 @@ pub(super) struct WorkerManager {
     pub(super) next_queue_expiry_at: Option<Instant>,
     pub(super) pre_canceled: HashMap<String, HashMap<String, Instant>>,
     pub(super) stream_registrations: HashMap<String, StreamRegistration>,
+    pub(super) response_byte_budget: Arc<tokio::sync::Semaphore>,
+    pub(super) admission: Arc<RuntimeAdmission>,
     pub(super) revalidation_keys: HashSet<String>,
     pub(super) revalidation_requests: HashMap<String, String>,
     pub(super) websocket_sessions: HashMap<String, WorkerWebSocketSession>,
     pub(super) websocket_handle_index: HashMap<String, String>,
     pub(super) websocket_open_handles: HashMap<String, HashSet<String>>,
     pub(super) open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
-    pub(super) websocket_pending_closes: HashMap<String, HashMap<String, Vec<SocketCloseEvent>>>,
     pub(super) websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
     pub(super) websocket_close_signals: HashMap<String, SocketCloseEvent>,
     pub(super) websocket_frame_waiters: HashMap<String, Vec<oneshot::Sender<Result<()>>>>,
     pub(super) websocket_pending_frame_replies: HashMap<String, Vec<WebSocketFrameReply>>,
     pub(super) websocket_open_waiters: HashMap<String, oneshot::Sender<Result<WebSocketOpen>>>,
-    pub(super) transport_sessions: HashMap<String, WorkerTransportSession>,
-    pub(super) transport_handle_index: HashMap<String, String>,
-    pub(super) transport_open_handles: HashMap<String, HashSet<String>>,
-    pub(super) transport_pending_closes: HashMap<String, HashMap<String, Vec<TransportCloseEvent>>>,
-    pub(super) transport_open_channels: HashMap<String, TransportOpenChannels>,
-    pub(super) transport_open_waiters: HashMap<String, oneshot::Sender<Result<TransportOpen>>>,
-    pub(super) dynamic_worker_handles: HashMap<String, DynamicWorkerHandle>,
-    pub(super) dynamic_worker_ids: HashMap<DynamicWorkerIdKey, HashMap<String, String>>,
-    pub(super) host_rpc_providers: HashMap<String, HostRpcProvider>,
-    pub(super) dynamic_profile: crate::ops::DynamicProfile,
-    pub(super) validated_worker_sources: HashSet<[u8; 32]>,
     pub(super) runtime_batch_depth: usize,
     pub(super) pending_dispatches: HashSet<(String, u64)>,
     pub(super) pending_cleanup_workers: HashSet<String>,
     pub(super) pending_memory_outbox_shards: HashSet<usize>,
     pub(super) scale_up_requests: VecDeque<(String, u64)>,
     pub(super) scale_up_request_members: HashSet<(String, u64)>,
-    pub(super) global_isolate_slots_used: usize,
-    pub(super) global_isolates_starting: usize,
     pub(super) internal_rescue_isolate_slots: HashSet<IsolateSlotKey>,
     pub(super) exiting_isolate_slots: HashMap<IsolateSlotKey, IsolateStartup>,
     pub(super) isolate_thread_tracker: IsolateThreadTracker,
@@ -100,17 +87,18 @@ impl Drop for IsolateThreadGuard {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct WorkerManagerInit {
+    pub(super) admission: Arc<RuntimeAdmission>,
     pub(super) bootstrap_snapshot: &'static [u8],
     pub(super) kv_store: KvStore,
     pub(super) memory_store: MemoryStore,
     pub(super) memory_outbox_drain_sender: MemoryOutboxDrainSender,
     pub(super) cache_store: CacheStore,
     pub(super) config: RuntimeConfig,
-    pub(super) storage: RuntimeStorageConfig,
     pub(super) control_store: ControlStore,
-    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
-    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) module_registry: crate::module_registry::ModuleRegistry,
+    pub(super) runtime_fast_sender: RuntimeCommandSender,
     pub(super) asset_catalog: AssetCatalog,
 }
 
@@ -154,78 +142,8 @@ pub(super) struct RuntimeManagerStats {
     pub(super) scale_up_budget_denied_count: u64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct DynamicWorkerIdKey {
-    pub(super) owner_worker: String,
-    pub(super) owner_generation: u64,
-    pub(super) binding: String,
-}
-
-#[derive(Clone)]
-pub(super) struct DynamicWorkerHandle {
-    pub(super) id: String,
-    pub(super) owner_worker: String,
-    pub(super) owner_generation: u64,
-    pub(super) binding: String,
-    pub(super) worker_name: String,
-    pub(super) worker_generation: u64,
-    pub(super) module_graph_id: Option<String>,
-    pub(super) timeout: u64,
-    pub(super) policy: ValidatedDynamicWorkerPolicy,
-    pub(super) host_rpc_provider_ids: Vec<String>,
-    pub(super) preferred_isolate_id: Option<u64>,
-    pub(super) quota_state: Arc<DynamicQuotaState>,
-}
-
-#[derive(Default)]
-pub(crate) struct DynamicQuotaState {
-    pub(crate) inflight: AtomicUsize,
-    pub(crate) outbound_requests: AtomicU64,
-    pub(crate) total_request_bytes: AtomicU64,
-    pub(crate) total_response_bytes: AtomicU64,
-    pub(crate) egress_deny_count: AtomicU64,
-    pub(crate) rpc_deny_count: AtomicU64,
-    pub(crate) quota_kill_count: AtomicU64,
-    pub(crate) upgrade_deny_count: AtomicU64,
-}
-
-pub(super) struct HostRpcProvider {
-    pub(super) owner_worker: String,
-    pub(super) owner_generation: u64,
-    pub(super) owner_isolate_id: u64,
-    pub(super) target_id: String,
-    pub(super) methods: HashSet<String>,
-}
-
-pub(super) enum TargetedHostRpcReply {
-    Dynamic {
-        reply_id: String,
-        pending_replies: crate::ops::DynamicPendingReplies,
-    },
-    Test {
-        reply_id: String,
-        replies: crate::ops::TestAsyncReplies,
-        success_value: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct DynamicTimeoutDiagnostic {
-    pub(super) stage: &'static str,
-    pub(super) owner_worker: String,
-    pub(super) owner_generation: u64,
-    pub(super) binding: String,
-    pub(super) handle: String,
-    pub(super) target_worker: String,
-    pub(super) target_isolate_id: Option<u64>,
-    pub(super) target_generation: Option<u64>,
-    pub(super) provider_id: Option<String>,
-    pub(super) provider_owner_isolate_id: Option<u64>,
-    pub(super) provider_target_id: Option<String>,
-    pub(super) timeout_ms: u64,
-}
-
 pub(super) struct WorkerWebSocketSession {
+    pub(super) namespace: String,
     pub(super) worker_name: String,
     pub(super) generation: u64,
     pub(super) owner_isolate_id: u64,
@@ -246,42 +164,39 @@ pub(super) struct WebSocketOutboundFrame {
     pub(super) payload: Vec<u8>,
 }
 
-pub(super) struct WebSocketFrameReply {
-    pub(super) output: WorkerOutput,
+pub(super) struct WebSocketFrameRequest {
+    pub(super) worker_name: String,
+    pub(super) session_id: String,
+    pub(super) frame: Vec<u8>,
+    pub(super) is_binary: bool,
+    pub(super) queue_admission: Option<QueueAdmission>,
     pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
 }
 
-pub(super) struct WorkerTransportSession {
-    pub(super) worker_name: String,
-    pub(super) generation: u64,
-    pub(super) owner_isolate_id: u64,
-    pub(super) binding: String,
-    pub(super) key: String,
-    pub(super) handle: String,
-    pub(super) stream_sender: mpsc::Sender<Vec<u8>>,
-    pub(super) datagram_sender: mpsc::Sender<Vec<u8>>,
-}
-
-pub(super) struct TransportOpenChannels {
-    pub(super) stream_sender: mpsc::Sender<Vec<u8>>,
-    pub(super) datagram_sender: mpsc::Sender<Vec<u8>>,
-}
-
-#[derive(Clone)]
-pub(super) struct TransportCloseEvent {
-    pub(super) code: u16,
-    pub(super) reason: String,
+pub(super) struct WebSocketFrameReply {
+    pub(super) output: WorkerOutput,
+    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
 }
 
 pub(super) struct StreamRegistration {
     pub(super) worker_name: String,
     pub(super) completion_token: Option<String>,
     pub(super) ready: Option<oneshot::Sender<Result<WorkerStreamOutput>>>,
-    pub(super) body_sender: mpsc::Sender<Result<Bytes>>,
-    pub(super) body_receiver: Option<mpsc::Receiver<Result<Bytes>>>,
+    pub(super) body_sender: mpsc::Sender<Bytes>,
+    pub(super) body_receiver: Option<(mpsc::Receiver<Bytes>, oneshot::Receiver<Result<()>>)>,
+    pub(super) completion: Option<oneshot::Sender<Result<()>>>,
+    pub(super) pending_send: Option<tokio::task::JoinHandle<()>>,
     pub(super) started: bool,
     pub(super) bytes_sent: usize,
     pub(super) max_bytes: usize,
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        if let Some(task) = self.pending_send.take() {
+            task.abort();
+        }
+    }
 }
 
 pub(super) struct WorkerEntry {
@@ -302,15 +217,13 @@ pub(super) struct WorkerPool {
     pub(super) internal_trace: Option<InternalTraceDestination>,
     pub(super) is_public: bool,
     pub(super) expires_at_ms: Option<i64>,
+    pub(super) retired_at: Option<Instant>,
     pub(super) snapshot: &'static [u8],
     pub(super) snapshot_preloaded: bool,
     pub(super) source: crate::ops::WorkerSource,
     pub(super) memory_bindings: Vec<String>,
-    pub(super) dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
     pub(super) deployment_config: Arc<crate::ops::WorkerDeploymentPayload>,
     pub(super) request_context: RequestExecutionContext,
-    pub(super) dynamic_child_policy: Option<ValidatedDynamicWorkerPolicy>,
-    pub(super) dynamic_quota_state: Option<Arc<DynamicQuotaState>>,
     pub(super) strict_request_isolation: bool,
     pub(super) memory_entity_leases: HashMap<String, MemoryEntityLease>,
     pub(super) memory_shard_affinity: HashMap<usize, u64>,
@@ -380,19 +293,13 @@ impl WorkerPool {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum PendingQueueLane {
-    TargetedNested,
     Targeted,
     Memory,
     General,
 }
 
 impl PendingQueueLane {
-    pub(super) const ALL: [Self; 4] = [
-        Self::TargetedNested,
-        Self::Targeted,
-        Self::Memory,
-        Self::General,
-    ];
+    pub(super) const ALL: [Self; 3] = [Self::Targeted, Self::Memory, Self::General];
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -567,40 +474,6 @@ impl MemoryShardQueue {
         }
         false
     }
-
-    fn drain_matching(
-        &mut self,
-        shard_index: usize,
-        matches: &mut impl FnMut(&PendingInvoke) -> bool,
-        drained: &mut Vec<(PendingQueueKey, PendingInvoke)>,
-    ) -> (usize, usize) {
-        let mut removals = Vec::new();
-        for (owner_key, owner) in &self.owners {
-            for (sequence, pending) in &owner.pending {
-                if matches(pending) {
-                    removals.push((owner_key.clone(), *sequence));
-                }
-            }
-        }
-        let mut removed = 0usize;
-        let mut removed_bytes = 0usize;
-        for (owner_key, sequence) in removals {
-            if let Some(pending) = self.remove(&owner_key, sequence) {
-                removed = removed.saturating_add(1);
-                removed_bytes = removed_bytes.saturating_add(pending.queued_bytes);
-                drained.push((
-                    PendingQueueKey {
-                        lane: PendingQueueLane::Memory,
-                        sequence,
-                        memory_shard_index: Some(shard_index),
-                        memory_owner_key: Some(owner_key),
-                    },
-                    pending,
-                ));
-            }
-        }
-        (removed, removed_bytes)
-    }
 }
 
 pub(super) struct PendingInvokeQueue {
@@ -609,7 +482,6 @@ pub(super) struct PendingInvokeQueue {
     by_target_isolate_id: HashMap<u64, HashSet<PendingQueueKey>>,
     by_memory_owner_key: HashMap<String, HashSet<PendingQueueKey>>,
     by_enqueued_at: BTreeMap<Instant, HashSet<PendingQueueKey>>,
-    targeted_nested: BTreeMap<u64, PendingInvoke>,
     targeted: BTreeMap<u64, PendingInvoke>,
     memory_shards: BTreeMap<usize, MemoryShardQueue>,
     memory_next_shard_cursor: Option<usize>,
@@ -627,7 +499,6 @@ impl PendingInvokeQueue {
             by_target_isolate_id: HashMap::new(),
             by_memory_owner_key: HashMap::new(),
             by_enqueued_at: BTreeMap::new(),
-            targeted_nested: BTreeMap::new(),
             targeted: BTreeMap::new(),
             memory_shards: BTreeMap::new(),
             memory_next_shard_cursor: None,
@@ -652,7 +523,6 @@ impl PendingInvokeQueue {
 
     pub(super) fn lane_depths(&self) -> PendingQueueLaneDepths {
         PendingQueueLaneDepths {
-            targeted_nested: self.targeted_nested.len(),
             targeted: self.targeted.len(),
             memory: self
                 .memory_shards
@@ -853,64 +723,6 @@ impl PendingInvokeQueue {
             .map(|enqueued_at| *enqueued_at + max_queue_wait)
     }
 
-    pub(super) fn drain_matching(
-        &mut self,
-        mut matches: impl FnMut(&PendingInvoke) -> bool,
-    ) -> Vec<PendingInvoke> {
-        let mut drained = Vec::new();
-        let (removed, removed_bytes) = Self::drain_lane_matching(
-            PendingQueueLane::TargetedNested,
-            None,
-            &mut self.targeted_nested,
-            &mut matches,
-            &mut drained,
-        );
-        self.queued = self.queued.saturating_sub(removed);
-        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
-        let (removed, removed_bytes) = Self::drain_lane_matching(
-            PendingQueueLane::Targeted,
-            None,
-            &mut self.targeted,
-            &mut matches,
-            &mut drained,
-        );
-        self.queued = self.queued.saturating_sub(removed);
-        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
-        let memory_shard_indices = self.memory_shards.keys().copied().collect::<Vec<_>>();
-        for shard_index in memory_shard_indices {
-            let remove_shard = if let Some(memory_shard) = self.memory_shards.get_mut(&shard_index)
-            {
-                let (removed, removed_bytes) =
-                    memory_shard.drain_matching(shard_index, &mut matches, &mut drained);
-                self.queued = self.queued.saturating_sub(removed);
-                self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
-                memory_shard.is_empty()
-            } else {
-                false
-            };
-            if remove_shard {
-                self.memory_shards.remove(&shard_index);
-            }
-        }
-        let (removed, removed_bytes) = Self::drain_lane_matching(
-            PendingQueueLane::General,
-            None,
-            &mut self.general,
-            &mut matches,
-            &mut drained,
-        );
-        self.queued = self.queued.saturating_sub(removed);
-        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
-        drained.sort_by_key(|(key, _)| key.sequence);
-        drained
-            .into_iter()
-            .map(|(key, pending)| {
-                self.unindex_pending(key, &pending);
-                pending
-            })
-            .collect::<Vec<_>>()
-    }
-
     pub(super) fn find_oldest_map<T>(
         &self,
         lanes: impl IntoIterator<Item = PendingQueueLane>,
@@ -919,9 +731,7 @@ impl PendingInvokeQueue {
         let mut selected = None;
         for lane in lanes {
             match lane {
-                PendingQueueLane::TargetedNested
-                | PendingQueueLane::Targeted
-                | PendingQueueLane::General => {
+                PendingQueueLane::Targeted | PendingQueueLane::General => {
                     for (sequence, pending) in self.lane(lane) {
                         let key = PendingQueueKey {
                             lane,
@@ -980,9 +790,9 @@ impl PendingInvokeQueue {
         for lane in lanes {
             let candidate = match lane {
                 PendingQueueLane::Memory => self.find_memory_round_robin_head_map(&mut map),
-                PendingQueueLane::TargetedNested
-                | PendingQueueLane::Targeted
-                | PendingQueueLane::General => self.find_lane_oldest_map(lane, &mut map),
+                PendingQueueLane::Targeted | PendingQueueLane::General => {
+                    self.find_lane_oldest_map(lane, &mut map)
+                }
             };
             let Some((key, sequence, value)) = candidate else {
                 continue;
@@ -1012,9 +822,8 @@ impl PendingInvokeQueue {
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &PendingInvoke> {
-        self.targeted_nested
+        self.targeted
             .values()
-            .chain(self.targeted.values())
             .chain(self.memory_shards.values().flat_map(MemoryShardQueue::iter))
             .chain(self.general.values())
     }
@@ -1035,11 +844,7 @@ impl PendingInvokeQueue {
     }
 
     fn lane_for(pending: &PendingInvoke) -> PendingQueueLane {
-        if pending.target_isolate_id.is_some()
-            && (pending.host_rpc_call.is_some() || pending.memory_route.is_some())
-        {
-            PendingQueueLane::TargetedNested
-        } else if pending.target_isolate_id.is_some() {
+        if pending.target_isolate_id.is_some() {
             PendingQueueLane::Targeted
         } else if pending.memory_route.is_some() {
             PendingQueueLane::Memory
@@ -1082,7 +887,6 @@ impl PendingInvokeQueue {
     ) -> Option<PendingInvoke> {
         let queued_bytes = pending.queued_bytes;
         let replaced = match key.lane {
-            PendingQueueLane::TargetedNested => self.targeted_nested.insert(key.sequence, pending),
             PendingQueueLane::Targeted => self.targeted.insert(key.sequence, pending),
             PendingQueueLane::Memory => self
                 .memory_shards
@@ -1106,7 +910,6 @@ impl PendingInvokeQueue {
 
     fn remove_pending_from_lane(&mut self, key: PendingQueueKey) -> Option<PendingInvoke> {
         let pending = match key.lane {
-            PendingQueueLane::TargetedNested => self.targeted_nested.remove(&key.sequence),
             PendingQueueLane::Targeted => self.targeted.remove(&key.sequence),
             PendingQueueLane::Memory => {
                 let shard_index = key.memory_shard_index.unwrap_or(0);
@@ -1224,7 +1027,6 @@ impl PendingInvokeQueue {
 
     fn lane(&self, lane: PendingQueueLane) -> &BTreeMap<u64, PendingInvoke> {
         match lane {
-            PendingQueueLane::TargetedNested => &self.targeted_nested,
             PendingQueueLane::Targeted => &self.targeted,
             PendingQueueLane::Memory => {
                 panic!("memory queue is sharded; iterate memory_shards instead")
@@ -1321,42 +1123,10 @@ impl PendingInvokeQueue {
             .map(|(next_shard, _)| *next_shard)
             .or_else(|| self.memory_shards.keys().next().copied());
     }
-
-    fn drain_lane_matching(
-        lane_key: PendingQueueLane,
-        memory_shard_index: Option<usize>,
-        lane: &mut BTreeMap<u64, PendingInvoke>,
-        matches: &mut impl FnMut(&PendingInvoke) -> bool,
-        drained: &mut Vec<(PendingQueueKey, PendingInvoke)>,
-    ) -> (usize, usize) {
-        let sequences = lane
-            .iter()
-            .filter_map(|(sequence, pending)| matches(pending).then_some(*sequence))
-            .collect::<Vec<_>>();
-        let mut removed = 0usize;
-        let mut removed_bytes = 0usize;
-        for sequence in sequences {
-            if let Some(pending) = lane.remove(&sequence) {
-                removed = removed.saturating_add(1);
-                removed_bytes = removed_bytes.saturating_add(pending.queued_bytes);
-                drained.push((
-                    PendingQueueKey {
-                        lane: lane_key,
-                        sequence,
-                        memory_shard_index,
-                        memory_owner_key: None,
-                    },
-                    pending,
-                ));
-            }
-        }
-        (removed, removed_bytes)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct PendingQueueLaneDepths {
-    pub(super) targeted_nested: usize,
     pub(super) targeted: usize,
     pub(super) memory: usize,
     pub(super) general: usize,
@@ -1364,12 +1134,6 @@ pub(super) struct PendingQueueLaneDepths {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-#[derive(Clone)]
-pub(super) struct DynamicRpcBinding {
-    pub(super) binding: String,
-    pub(super) provider_id: String,
 }
 
 #[derive(Default)]
@@ -1439,12 +1203,12 @@ pub(super) struct DispatchAttemptStats {
 }
 
 pub(super) struct PendingInvoke {
+    pub(super) queue_admission: Option<QueueAdmission>,
     pub(super) runtime_request_id: String,
     pub(super) request: WorkerInvocation,
     pub(super) request_body: Option<InvokeRequestBodyReceiver>,
     pub(super) memory_route: Option<MemoryRoute>,
     pub(super) memory_call: Option<MemoryExecutionCall>,
-    pub(super) host_rpc_call: Option<HostRpcExecutionCall>,
     pub(super) target_isolate_id: Option<u64>,
     pub(super) reply_kind: PendingReplyKind,
     pub(super) internal_origin: bool,
@@ -1453,14 +1217,14 @@ pub(super) struct PendingInvoke {
     pub(super) queued_bytes: usize,
 }
 
-pub(super) struct EnqueueInvokeRequest {
+pub(crate) struct EnqueueInvokeRequest {
+    pub(super) queue_admission: Option<QueueAdmission>,
     pub(super) worker_name: String,
     pub(super) runtime_request_id: String,
     pub(super) request: WorkerInvocation,
     pub(super) request_body: Option<InvokeRequestBodyReceiver>,
     pub(super) memory_route: Option<MemoryRoute>,
     pub(super) memory_call: Option<MemoryExecutionCall>,
-    pub(super) host_rpc_call: Option<HostRpcExecutionCall>,
     pub(super) target_isolate_id: Option<u64>,
     pub(super) target_generation: Option<u64>,
     pub(super) internal_origin: bool,
@@ -1473,16 +1237,10 @@ pub(super) enum PendingReplyKind {
     #[default]
     Normal,
     Stream,
-    DynamicFetch {
-        handle: String,
-    },
     WebsocketOpen {
         session_id: String,
     },
     WebsocketFrame {
-        session_id: String,
-    },
-    TransportOpen {
         session_id: String,
     },
 }
@@ -1492,10 +1250,8 @@ impl PendingReplyKind {
         match self {
             Self::Normal => "normal",
             Self::Stream => "stream",
-            Self::DynamicFetch { .. } => "dynamic-fetch",
             Self::WebsocketOpen { .. } => "websocket-open",
             Self::WebsocketFrame { .. } => "websocket-frame",
-            Self::TransportOpen { .. } => "transport-open",
         }
     }
 }
@@ -1517,7 +1273,6 @@ pub(super) struct PendingReply {
 pub(super) struct RemovedIsolate {
     pub(super) removed: bool,
     pub(super) replies: Vec<(String, oneshot::Sender<Result<WorkerOutput>>)>,
-    pub(super) was_starting: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1530,6 +1285,7 @@ pub(super) enum IsolateSlotReservation {
 pub(super) enum IsolateSpawnPolicy {
     WithinGlobalBudget,
     AllowInternalRescue,
+    InternalRescueOnly,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1576,24 +1332,6 @@ pub(super) struct TraceResultMeta {
     pub(super) error: Option<String>,
 }
 
-pub(super) struct DirectDynamicFetchRequest {
-    pub(super) worker_name: String,
-    pub(super) generation: u64,
-    pub(super) target_isolate_id: u64,
-    pub(super) runtime_request_id: String,
-    pub(super) request: WorkerInvocation,
-    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
-    pub(super) handle: String,
-}
-
-pub(super) enum DirectDynamicFetchDispatch {
-    Dispatched,
-    Fallback {
-        reply: oneshot::Sender<Result<WorkerOutput>>,
-        clear_preferred: bool,
-    },
-}
-
 pub(super) struct FinishRequest {
     pub(super) worker_name: String,
     pub(super) generation: u64,
@@ -1626,47 +1364,30 @@ pub(super) struct BuildExecuteCommand {
     pub(super) request_body: Option<InvokeRequestBodyReceiver>,
     pub(super) stream_response: bool,
     pub(super) memory_call: Option<MemoryExecutionCall>,
-    pub(super) host_rpc_call: Option<HostRpcExecutionCall>,
     pub(super) memory_route: Option<MemoryRoute>,
     pub(super) dispatched_at: Instant,
     pub(super) profile_memory_atomic: bool,
 }
 
-pub(super) struct TargetedHostRpcInvoke {
-    pub(super) worker_name: String,
-    pub(super) generation: u64,
-    pub(super) isolate_id: u64,
-    pub(super) target_id: String,
-    pub(super) method_name: String,
-    pub(super) args: Vec<u8>,
-    pub(super) reply: TargetedHostRpcReply,
-}
-
-pub(super) struct DynamicWorkerFetchStart {
-    pub(super) owner_worker: String,
-    pub(super) owner_generation: u64,
-    pub(super) binding: String,
-    pub(super) handle: String,
-    pub(super) request: WorkerInvocation,
-    pub(super) reply_id: String,
-    pub(super) pending_replies: crate::ops::DynamicPendingReplies,
-    pub(super) command_tx: mpsc::Sender<RuntimeCommand>,
-}
-
 pub(super) struct ServiceBindingFetchStart {
+    pub(super) reply_inbox: crate::ops::RequestControlInbox,
+    pub(super) queue_admission: Option<QueueAdmission>,
     pub(super) owner_worker: String,
     pub(super) owner_generation: u64,
     pub(super) binding: String,
     pub(super) target_worker: String,
     pub(super) request: WorkerInvocation,
     pub(super) reply_id: String,
-    pub(super) pending_replies: crate::ops::DynamicPendingReplies,
+    pub(super) pending_replies: crate::ops::PendingReplies,
 }
 
 pub(super) struct RuntimeThreadStart {
+    pub(super) admission: Arc<RuntimeAdmission>,
+    pub(super) routes: WorkerRoutes,
     pub(super) receiver: mpsc::Receiver<RuntimeCommand>,
     pub(super) cancel_receiver: mpsc::Receiver<RuntimeCommand>,
-    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) cancellation_receiver: mpsc::UnboundedReceiver<RuntimeCommand>,
+    pub(super) runtime_fast_sender: RuntimeCommandSender,
     pub(super) asset_catalog: AssetCatalog,
     pub(super) bootstrap_snapshot: &'static [u8],
     pub(super) kv_store: KvStore,
@@ -1675,23 +1396,23 @@ pub(super) struct RuntimeThreadStart {
     pub(super) config: RuntimeConfig,
     pub(super) storage: RuntimeStorageConfig,
     pub(super) control_store: ControlStore,
-    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
+    pub(super) module_registry: crate::module_registry::ModuleRegistry,
 }
 
 pub(super) struct IsolateThreadStart {
+    pub(super) admission: IsolateAdmission,
     pub(super) snapshot: &'static [u8],
     pub(super) snapshot_preloaded: bool,
     pub(super) source: crate::ops::WorkerSource,
-    pub(super) dynamic_modules: crate::dynamic_modules::DynamicModuleRegistry,
+    pub(super) module_registry: crate::module_registry::ModuleRegistry,
     pub(super) deployment_config: Arc<crate::ops::WorkerDeploymentPayload>,
     pub(super) allow_code_generation: bool,
     pub(super) kv_store: KvStore,
     pub(super) memory_store: MemoryStore,
     pub(super) cache_store: CacheStore,
     pub(super) open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
-    pub(super) dynamic_profile: crate::ops::DynamicProfile,
     pub(super) execution_limits: crate::ops::RuntimeExecutionLimits,
-    pub(super) runtime_fast_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) runtime_fast_sender: RuntimeCommandSender,
     pub(super) worker_name: String,
     pub(super) generation: u64,
     pub(super) isolate_id: u64,
@@ -1707,18 +1428,6 @@ pub(super) struct WebSocketSessionRegistration {
     pub(super) binding: String,
     pub(super) key: String,
     pub(super) handle: String,
-}
-
-pub(super) struct TransportSessionRegistration {
-    pub(super) worker_name: String,
-    pub(super) generation: u64,
-    pub(super) isolate_id: u64,
-    pub(super) session_id: String,
-    pub(super) binding: String,
-    pub(super) key: String,
-    pub(super) handle: String,
-    pub(super) stream_sender: mpsc::Sender<Vec<u8>>,
-    pub(super) datagram_sender: mpsc::Sender<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1759,19 +1468,34 @@ pub(super) enum DispatchSelection {
 }
 
 pub(super) struct IsolateHandle {
+    pub(super) shutdown: tokio::sync::watch::Sender<()>,
+    pub(super) slot_starting: Arc<AtomicBool>,
     pub(super) id: u64,
     pub(super) sender: mpsc::Sender<IsolateCommand>,
     pub(super) v8_handle: Arc<StdMutex<Option<deno_core::v8::IsolateHandle>>>,
-    pub(super) dynamic_control_inbox: crate::ops::DynamicControlInbox,
+    pub(super) request_control_inbox: crate::ops::RequestControlInbox,
     pub(super) startup: IsolateStartup,
     pub(super) internal_rescue: bool,
     pub(super) inflight_count: usize,
     pub(super) active_websocket_sessions: usize,
-    pub(super) active_transport_sessions: usize,
     pub(super) served_requests: u64,
     pub(super) last_used_at: Instant,
     pub(super) pending_replies: HashMap<String, PendingReply>,
     pub(super) pending_wait_until: HashMap<String, String>,
+}
+
+impl IsolateHandle {
+    pub(super) fn request_shutdown(&self) {
+        self.shutdown.send_replace(());
+        if let Some(handle) = self
+            .v8_handle
+            .lock()
+            .expect("v8 handle mutex poisoned")
+            .as_ref()
+        {
+            handle.terminate_execution();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1821,10 +1545,10 @@ mod tests {
         request_id: &str,
         target_isolate_id: Option<u64>,
         memory_route: Option<MemoryRoute>,
-        host_rpc_call: Option<HostRpcExecutionCall>,
     ) -> PendingInvoke {
         let (reply, _) = oneshot::channel();
         PendingInvoke {
+            queue_admission: None,
             runtime_request_id: request_id.to_string(),
             request: WorkerInvocation {
                 method: "GET".to_string(),
@@ -1836,7 +1560,6 @@ mod tests {
             request_body: None,
             memory_route,
             memory_call: None,
-            host_rpc_call,
             target_isolate_id,
             reply_kind: PendingReplyKind::Normal,
             internal_origin: false,
@@ -1887,10 +1610,10 @@ mod tests {
     #[test]
     fn pending_invoke_queue_tracks_internal_and_external_work() {
         let mut queue = PendingInvokeQueue::new();
-        let mut internal = pending_invoke("internal", None, None, None);
+        let mut internal = pending_invoke("internal", None, None);
         internal.internal_origin = true;
         queue.push_back(internal);
-        queue.push_back(pending_invoke("external", None, None, None));
+        queue.push_back(pending_invoke("external", None, None));
 
         assert!(queue.has_internal_request());
         assert!(queue.has_external_request());
@@ -1905,23 +1628,13 @@ mod tests {
     #[test]
     fn pending_invoke_queue_lanes_preserve_global_fifo_pop_order() {
         let mut queue = PendingInvokeQueue::new();
-        queue.push_back(pending_invoke("general", None, None, None));
+        queue.push_back(pending_invoke("general", None, None));
         queue.push_back(pending_invoke(
             "memory",
             None,
             Some(MemoryRoute::new("MEM".to_string(), "room".to_string())),
-            None,
         ));
-        queue.push_back(pending_invoke(
-            "targeted-nested",
-            Some(7),
-            None,
-            Some(HostRpcExecutionCall {
-                target_id: "provider".to_string(),
-                method: "call".to_string(),
-                args: Vec::new(),
-            }),
-        ));
+        queue.push_back(pending_invoke("targeted", Some(7), None));
 
         assert_eq!(queue.general.len(), 1);
         assert_eq!(
@@ -1932,7 +1645,7 @@ mod tests {
                 .unwrap_or_default(),
             1
         );
-        assert_eq!(queue.targeted_nested.len(), 1);
+        assert_eq!(queue.targeted.len(), 1);
         assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
@@ -1946,7 +1659,7 @@ mod tests {
         assert_queue_accounting(&queue);
         assert_eq!(
             queue.pop_front().map(|pending| pending.runtime_request_id),
-            Some("targeted-nested".to_string())
+            Some("targeted".to_string())
         );
         assert!(queue.is_empty());
         assert_queue_accounting(&queue);
@@ -1959,9 +1672,8 @@ mod tests {
             "blocked-memory",
             None,
             Some(MemoryRoute::new("MEM".to_string(), "room".to_string())),
-            None,
         ));
-        queue.push_back(pending_invoke("ready-general", None, None, None));
+        queue.push_back(pending_invoke("ready-general", None, None));
 
         let key = queue
             .find_oldest_map(
@@ -1989,15 +1701,13 @@ mod tests {
             "memory-shard-7",
             None,
             Some(memory_route_on_shard("room-a", 7)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "memory-shard-3",
             None,
             Some(memory_route_on_shard("room-b", 3)),
-            None,
         ));
-        queue.push_back(pending_invoke("general", None, None, None));
+        queue.push_back(pending_invoke("general", None, None));
 
         assert_eq!(queue.memory_shards.len(), 2);
         assert_queue_accounting(&queue);
@@ -2051,25 +1761,21 @@ mod tests {
             "owner-a-head",
             None,
             Some(memory_route_on_shard("room-a", 3)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "owner-a-tail",
             None,
             Some(memory_route_on_shard("room-a", 3)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "owner-b-head",
             None,
             Some(memory_route_on_shard("room-b", 3)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "memory-shard-7-head",
             None,
             Some(memory_route_on_shard("room-c", 7)),
-            None,
         ));
 
         let owner_b = queue
@@ -2112,19 +1818,16 @@ mod tests {
             "owner-a-1",
             None,
             Some(memory_route_on_shard("room-a", 3)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "owner-a-2",
             None,
             Some(memory_route_on_shard("room-a", 3)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "owner-b-1",
             None,
             Some(memory_route_on_shard("room-b", 3)),
-            None,
         ));
 
         let first = queue
@@ -2159,12 +1862,11 @@ mod tests {
         let mut queue = PendingInvokeQueue::new();
         let route_a = memory_route_on_shard("room-a", 3);
         let owner_a = route_a.owner_key.clone();
-        queue.push_back(pending_invoke("owner-a-1", None, Some(route_a), None));
+        queue.push_back(pending_invoke("owner-a-1", None, Some(route_a)));
         queue.push_back(pending_invoke(
             "owner-b-1",
             None,
             Some(memory_route_on_shard("room-b", 3)),
-            None,
         ));
 
         let blocked = queue
@@ -2203,7 +1905,7 @@ mod tests {
         let mut queue = PendingInvokeQueue::new();
         let route = memory_route_on_shard("room-a", 3);
         let owner_key = route.owner_key.clone();
-        queue.push_back(pending_invoke("owner-a-1", None, Some(route), None));
+        queue.push_back(pending_invoke("owner-a-1", None, Some(route)));
 
         let key = queue
             .find_fair_map([PendingQueueLane::Memory], |key, _| Some(key))
@@ -2227,19 +1929,16 @@ mod tests {
             "hot-1",
             None,
             Some(memory_route_on_shard("hot-a", 1)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "hot-2",
             None,
             Some(memory_route_on_shard("hot-b", 1)),
-            None,
         ));
         queue.push_back(pending_invoke(
             "cold-1",
             None,
             Some(memory_route_on_shard("cold-a", 2)),
-            None,
         ));
 
         let first_key = queue
@@ -2273,9 +1972,9 @@ mod tests {
     #[test]
     fn pending_invoke_queue_keys_are_stable_after_older_removals() {
         let mut queue = PendingInvokeQueue::new();
-        queue.push_back(pending_invoke("first", None, None, None));
-        queue.push_back(pending_invoke("second", None, None, None));
-        queue.push_back(pending_invoke("third", None, None, None));
+        queue.push_back(pending_invoke("first", None, None));
+        queue.push_back(pending_invoke("second", None, None));
+        queue.push_back(pending_invoke("third", None, None));
 
         let third_key = queue
             .find_oldest_map([PendingQueueLane::General], |key, pending| {
@@ -2303,14 +2002,13 @@ mod tests {
     #[test]
     fn pending_invoke_queue_removes_by_runtime_request_id_without_predicate_scan() {
         let mut queue = PendingInvokeQueue::new();
-        queue.push_back(pending_invoke("first", None, None, None));
+        queue.push_back(pending_invoke("first", None, None));
         queue.push_back(pending_invoke(
             "memory",
             None,
             Some(MemoryRoute::new("MEM".to_string(), "room".to_string())),
-            None,
         ));
-        queue.push_back(pending_invoke("last", None, None, None));
+        queue.push_back(pending_invoke("last", None, None));
 
         assert_eq!(
             queue
@@ -2336,19 +2034,13 @@ mod tests {
         let memory_route = MemoryRoute::new("MEM".to_string(), "room".to_string());
         let memory_owner_key = memory_route.owner_key.clone();
 
-        queue.push_back(pending_invoke("general", None, None, None));
-        queue.push_back(pending_invoke("targeted", Some(7), None, None));
-        queue.push_back(pending_invoke(
-            "memory",
-            None,
-            Some(memory_route.clone()),
-            None,
-        ));
+        queue.push_back(pending_invoke("general", None, None));
+        queue.push_back(pending_invoke("targeted", Some(7), None));
+        queue.push_back(pending_invoke("memory", None, Some(memory_route.clone())));
         queue.push_back(pending_invoke(
             "targeted-memory",
             Some(7),
             Some(memory_route),
-            None,
         ));
 
         assert_eq!(queue.indexed_target_count(7), 2);
@@ -2371,7 +2063,7 @@ mod tests {
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 2);
 
         let targeted_memory_key = queue
-            .find_oldest_map([PendingQueueLane::TargetedNested], |key, pending| {
+            .find_oldest_map([PendingQueueLane::Targeted], |key, pending| {
                 (pending.runtime_request_id == "targeted-memory").then_some(key)
             })
             .expect("targeted memory work should be indexed");
@@ -2384,7 +2076,7 @@ mod tests {
         assert_eq!(queue.indexed_target_count(7), 0);
         assert_eq!(queue.indexed_memory_count(&memory_owner_key), 1);
 
-        let drained = queue.drain_matching(|pending| pending.memory_route.is_some());
+        let drained = queue.pop_front().into_iter().collect::<Vec<_>>();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].runtime_request_id, "memory");
         assert_queue_accounting(&queue);
@@ -2401,10 +2093,10 @@ mod tests {
         let mut cold_route = MemoryRoute::new("MEM".to_string(), "cold".to_string());
         cold_route.shard_index = Some(3);
         let hot_owner_key = hot_route.owner_key.clone();
-        queue.push_back(pending_invoke("general", None, None, None));
-        queue.push_back(pending_invoke("hot-a", None, Some(hot_route.clone()), None));
-        queue.push_back(pending_invoke("hot-b", None, Some(hot_route), None));
-        queue.push_back(pending_invoke("cold", None, Some(cold_route), None));
+        queue.push_back(pending_invoke("general", None, None));
+        queue.push_back(pending_invoke("hot-a", None, Some(hot_route.clone())));
+        queue.push_back(pending_invoke("hot-b", None, Some(hot_route)));
+        queue.push_back(pending_invoke("cold", None, Some(cold_route)));
 
         let lane_depths = queue.lane_depths();
         assert_eq!(lane_depths.general, 1);
@@ -2446,15 +2138,14 @@ mod tests {
         let memory_route = MemoryRoute::new("MEM".to_string(), "room".to_string());
         let memory_owner_key = memory_route.owner_key.clone();
 
-        queue.push_back(pending_invoke("general", None, None, None));
-        queue.push_back(pending_invoke("targeted-a", Some(7), None, None));
+        queue.push_back(pending_invoke("general", None, None));
+        queue.push_back(pending_invoke("targeted-a", Some(7), None));
         queue.push_back(pending_invoke(
             "targeted-memory",
             Some(7),
             Some(memory_route),
-            None,
         ));
-        queue.push_back(pending_invoke("targeted-b", Some(8), None, None));
+        queue.push_back(pending_invoke("targeted-b", Some(8), None));
 
         let drained = queue.drain_target_isolate_id(7);
         let drained_ids = drained
@@ -2489,13 +2180,12 @@ mod tests {
         let mut queue = PendingInvokeQueue::new();
         let now = Instant::now();
         let max_wait = Duration::from_millis(50);
-        let mut old_targeted = pending_invoke("old-targeted", Some(7), None, None);
+        let mut old_targeted = pending_invoke("old-targeted", Some(7), None);
         old_targeted.enqueued_at = now - Duration::from_millis(75);
         let mut fresh_memory = pending_invoke(
             "fresh-memory",
             None,
             Some(MemoryRoute::new("MEM".to_string(), "room".to_string())),
-            None,
         );
         fresh_memory.enqueued_at = now - Duration::from_millis(10);
         let memory_owner_key = fresh_memory
@@ -2504,7 +2194,7 @@ mod tests {
             .expect("memory route")
             .owner_key
             .clone();
-        let mut old_general = pending_invoke("old-general", None, None, None);
+        let mut old_general = pending_invoke("old-general", None, None);
         old_general.enqueued_at = now - Duration::from_millis(55);
 
         queue.push_back(old_targeted);

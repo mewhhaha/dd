@@ -1,4 +1,6 @@
-import { createHash } from "node:crypto";
+import { request as httpRequest, STATUS_CODES } from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,11 +26,6 @@ const VITE_SOURCE_PREFIXES = ["/app/", "/src/"];
 const VITE_ANY_METHOD_BYPASS_PATHS = [
   "/__vite_rsc_findSourceMapURL", "/__vite_rsc_load_module_dev_proxy",
 ];
-const WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const MAX_DEV_WEBSOCKET_FRAME_BYTES = 8 * 1024 * 1024;
-const DD_WS_BINARY_HEADER = "x-dd-ws-binary";
-const DD_WS_CLOSE_CODE_HEADER = "x-dd-ws-close-code";
-const DD_WS_CLOSE_REASON_HEADER = "x-dd-ws-close-reason";
 
 export function viteRequestForFile(file, root) {
   const normalizedRoot = toVitePath(resolve(root));
@@ -125,8 +122,11 @@ export function toVitePath(value) {
   return String(value).replace(/\\/g, "/");
 }
 
-export async function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName) {
-  const body = await readIncomingBody(req);
+export function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName, res) {
+  const controller = new AbortController();
+  req.once("aborted", () => controller.abort());
+  res.once("close", () => controller.abort());
+  if (req.aborted || res.destroyed) controller.abort();
   const path = stripMount(originalUrl, mount);
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
@@ -142,9 +142,10 @@ export async function nodeRequestToWorkerRequest(req, originalUrl, mount, worker
   const init = {
     method: req.method ?? "GET",
     headers,
+    signal: controller.signal,
   };
-  if (body.length > 0 && !BODYLESS_METHODS.has(init.method.toUpperCase())) {
-    init.body = body;
+  if (!BODYLESS_METHODS.has(init.method.toUpperCase())) {
+    init.body = Readable.toWeb(req);
     init.duplex = "half";
   }
   return new Request(url, init);
@@ -154,59 +155,19 @@ export async function writeNodeResponse(res, response) {
   res.statusCode = response.status;
   response.headers.forEach((value, name) => {
     const lower = name.toLowerCase();
-    if (lower === "content-length" || lower === "transfer-encoding") {
+    if (lower === "content-length" || lower === "transfer-encoding" || lower === "set-cookie") {
       return;
     }
     res.setHeader(name, value);
   });
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length) res.setHeader("set-cookie", cookies);
   if (!response.body) {
     res.setHeader("content-length", "0");
     res.end();
     return;
   }
-  for await (const chunk of response.body) {
-    if (res.destroyed) {
-      return;
-    }
-    if (!res.write(Buffer.from(chunk))) {
-      if (!(await waitForNodeResponseDrain(res))) {
-        return;
-      }
-    }
-  }
-  res.end();
-}
-
-export async function waitForNodeResponseDrain(res) {
-  if (res.destroyed) {
-    return false;
-  }
-  return new Promise((resolveWait, rejectWait) => {
-    const cleanup = () => {
-      res.off("drain", onDrain);
-      res.off("close", onClose);
-      res.off("error", onError);
-    };
-    const onDrain = () => {
-      cleanup();
-      resolveWait(!res.destroyed);
-    };
-    const onClose = () => {
-      cleanup();
-      resolveWait(false);
-    };
-    const onError = (error) => {
-      cleanup();
-      if (res.destroyed) {
-        resolveWait(false);
-      } else {
-        rejectWait(error);
-      }
-    };
-    res.once("drain", onDrain);
-    res.once("close", onClose);
-    res.once("error", onError);
-  });
+  await pipeline(Readable.fromWeb(response.body), res);
 }
 
 export async function handleDdWebSocketUpgrade(req, socket, head, options) {
@@ -226,27 +187,53 @@ export async function handleDdWebSocketUpgrade(req, socket, head, options) {
       throw new Error("dd runtime is not available for websocket upgrade");
     }
     const workerName = await options.effectiveWorkerName();
-    const opened = await runtime.openWebSocket(
-      workerName,
-      nodeUpgradeToWorkerInvocation(req, originalUrl, options.mount, workerName),
-    );
-    if (Number(opened.status) !== 101) {
-      writeRawHttpResponse(socket, opened.status ?? 400, opened.headers, opened.body_base64);
-      return;
-    }
-
-    writeWebSocketHandshake(socket, req, opened.headers);
-    const bridge = new DdWebSocketBridge({
-      runtime,
-      sessionId: opened.session_id,
-      socket,
-      workerName,
+    const path = stripMount(originalUrl, options.mount);
+    const url = nodeRequestWorkerUrl(req, path, workerName);
+    const target = new URL(runtime.workerUrl(workerName));
+    target.pathname = url.pathname;
+    target.search = url.search;
+    await new Promise((resolveUpgrade, rejectUpgrade) => {
+      const upstream = httpRequest(target, {
+        method: "GET",
+        headers: { ...req.headers, "x-dd-dev-request-url": String(url) },
+      });
+      socket.once("close", () => {
+        upstream.destroy();
+        rejectUpgrade(new Error("WebSocket client disconnected during upgrade"));
+      });
+      upstream.once("error", rejectUpgrade);
+      upstream.once("upgrade", (response, upstreamSocket, upstreamHead) => {
+        socket.write("HTTP/1.1 101 Switching Protocols\r\n");
+        for (let index = 0; index < response.rawHeaders.length; index += 2) {
+          socket.write(`${response.rawHeaders[index]}: ${response.rawHeaders[index + 1]}\r\n`);
+        }
+        socket.write("\r\n");
+        if (upstreamHead.length) socket.write(upstreamHead);
+        if (head.length) upstreamSocket.write(head);
+        socket.once("error", () => upstreamSocket.destroy());
+        upstreamSocket.once("error", () => socket.destroy());
+        socket.once("close", () => upstreamSocket.destroy());
+        upstreamSocket.once("close", () => socket.destroy());
+        socket.pipe(upstreamSocket).pipe(socket);
+        socket.resume();
+        resolveUpgrade();
+      });
+      upstream.once("response", (response) => {
+        socket.write(`HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\nConnection: close\r\n`);
+        for (let index = 0; index < response.rawHeaders.length; index += 2) {
+          const name = response.rawHeaders[index];
+          if (name.toLowerCase() === "transfer-encoding" || name.toLowerCase() === "connection") continue;
+          socket.write(`${name}: ${response.rawHeaders[index + 1]}\r\n`);
+        }
+        socket.write("\r\n");
+        pipeline(response, socket).then(resolveUpgrade, rejectUpgrade);
+      });
+      upstream.end();
     });
-    bridge.start(head);
-    bridge.forwardRuntimeOutput(opened);
   } catch (error) {
     if (!socket.destroyed) {
-      writeRawHttpResponse(socket, 500, [], Buffer.from(String(error?.message ?? error)).toString("base64"));
+      const body = Buffer.from(String(error?.message ?? error));
+      socket.end(`HTTP/1.1 500 ${STATUS_CODES[500]}\r\nConnection: close\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
     }
   }
 }
@@ -274,17 +261,6 @@ export function shouldBypassDdWebSocketUpgrade(req, originalUrl, mount, viteBase
   );
 }
 
-export function nodeUpgradeToWorkerInvocation(req, originalUrl, mount, workerName) {
-  const path = stripMount(originalUrl, mount);
-  const url = nodeRequestWorkerUrl(req, path, workerName);
-  return {
-    method: req.method ?? "GET",
-    url: String(url),
-    headers: nodeRequestHeaders(req),
-    body_base64: "",
-  };
-}
-
 export function nodeRequestWorkerUrl(req, path, workerName) {
   const fallbackOrigin = `http://${workerName}.dd.local`;
   const host = headerValue(req.headers.host).trim();
@@ -300,357 +276,6 @@ export function nodeRequestWorkerUrl(req, path, workerName) {
   } catch {
     return new URL(path, fallbackOrigin);
   }
-}
-
-export function nodeRequestHeaders(req) {
-  const headers = [];
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (Array.isArray(value)) {
-      for (const entry of value) {
-        headers.push([name, entry]);
-      }
-    } else if (value !== undefined) {
-      headers.push([name, value]);
-    }
-  }
-  return headers;
-}
-
-export function writeWebSocketHandshake(socket, req, headers = []) {
-  const key = headerValue(req.headers["sec-websocket-key"]).trim();
-  if (!key) {
-    throw new Error("missing sec-websocket-key");
-  }
-  const accept = createHash("sha1").update(`${key}${WEBSOCKET_ACCEPT_GUID}`).digest("base64");
-  const lines = [
-    "HTTP/1.1 101 Switching Protocols",
-    "Upgrade: websocket",
-    "Connection: Upgrade",
-    `Sec-WebSocket-Accept: ${accept}`,
-  ];
-  for (const [name, value] of headers) {
-    if (shouldSkipWebSocketHandshakeHeader(name)) {
-      continue;
-    }
-    lines.push(`${name}: ${value}`);
-  }
-  socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-}
-
-export function shouldSkipWebSocketHandshakeHeader(name) {
-  const lower = String(name).toLowerCase();
-  return (
-    lower === "connection" ||
-    lower === "upgrade" ||
-    lower === "sec-websocket-accept" ||
-    lower === "content-length" ||
-    lower === "transfer-encoding"
-  );
-}
-
-export function writeRawHttpResponse(socket, status, headers = [], bodyBase64 = "") {
-  const body = bodyBase64 ? Buffer.from(bodyBase64, "base64") : Buffer.alloc(0);
-  const statusCode = Number(status) || 500;
-  const reason = statusReasonPhrase(statusCode);
-  const lines = [
-    `HTTP/1.1 ${statusCode} ${reason}`,
-    "Connection: close",
-    `Content-Length: ${body.length}`,
-  ];
-  for (const [name, value] of headers) {
-    const lower = String(name).toLowerCase();
-    if (lower === "connection" || lower === "content-length" || lower === "transfer-encoding") {
-      continue;
-    }
-    lines.push(`${name}: ${value}`);
-  }
-  socket.end(Buffer.concat([Buffer.from(`${lines.join("\r\n")}\r\n\r\n`), body]));
-}
-
-export function statusReasonPhrase(status) {
-  switch (status) {
-    case 400:
-      return "Bad Request";
-    case 404:
-      return "Not Found";
-    case 500:
-      return "Internal Server Error";
-    default:
-      return status >= 200 && status < 300 ? "OK" : "Error";
-  }
-}
-
-class DdWebSocketBridge {
-  constructor({ runtime, sessionId, socket, workerName }) {
-    this.runtime = runtime;
-    this.sessionId = sessionId;
-    this.socket = socket;
-    this.workerName = workerName;
-    this.buffer = Buffer.alloc(0);
-    this.closed = false;
-    this.closeSent = false;
-    this.runtimeClosed = false;
-    this.drainLoopRunning = false;
-    this.frameQueue = Promise.resolve();
-  }
-
-  start(head) {
-    this.socket.setNoDelay?.(true);
-    this.socket.on("data", (chunk) => this.consume(chunk));
-    this.socket.on("close", () => {
-      this.closed = true;
-      void this.closeRuntime(1006, "socket closed");
-    });
-    this.socket.on("error", () => {
-      this.closed = true;
-      void this.closeRuntime(1011, "socket error");
-    });
-    if (head?.length) {
-      this.consume(head);
-    }
-    this.socket.resume?.();
-    void this.runRuntimeFrameLoop();
-  }
-
-  consume(chunk) {
-    if (this.closed) {
-      return;
-    }
-    this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
-    for (;;) {
-      const parsed = parseClientWebSocketFrame(this.buffer);
-      if (!parsed) {
-        return;
-      }
-      if (parsed.error) {
-        void this.close(1002, parsed.error);
-        return;
-      }
-      this.buffer = parsed.rest;
-      this.frameQueue = this.frameQueue
-        .then(() => this.handleFrame(parsed.frame))
-        .catch((error) => this.fail(error));
-    }
-  }
-
-  async handleFrame(frame) {
-    if (this.closed) {
-      return;
-    }
-    switch (frame.opcode) {
-      case 0x1:
-      case 0x2: {
-        const output = await this.runtime.sendWebSocketFrame(
-          this.workerName,
-          this.sessionId,
-          frame.payload,
-          { binary: frame.opcode === 0x2 },
-        );
-        this.forwardRuntimeOutput(output);
-        void this.runRuntimeFrameLoop();
-        break;
-      }
-      case 0x8: {
-        const { code, reason } = parseClientClosePayload(frame.payload);
-        await this.close(code, reason);
-        break;
-      }
-      case 0x9:
-        sendServerWebSocketFrame(this.socket, 0xA, frame.payload);
-        break;
-      case 0xA:
-        break;
-      default:
-        await this.close(1003, "unsupported websocket frame");
-        break;
-    }
-  }
-
-  async runRuntimeFrameLoop() {
-    if (this.closed || this.drainLoopRunning) {
-      return;
-    }
-    this.drainLoopRunning = true;
-    try {
-      while (!this.closed) {
-        const drained = await this.drainRuntimeFrames();
-        if (this.closed || drained > 0) {
-          continue;
-        }
-        await this.runtime.waitWebSocketFrame(this.workerName, this.sessionId);
-      }
-    } catch (error) {
-      this.fail(error);
-    } finally {
-      this.drainLoopRunning = false;
-    }
-  }
-
-  async drainRuntimeFrames() {
-    let drained = 0;
-    for (let index = 0; index < 32 && !this.closed; index += 1) {
-      const result = await this.runtime.drainWebSocketFrame(this.workerName, this.sessionId);
-      if (!result.frame) {
-        break;
-      }
-      drained += 1;
-      this.forwardRuntimeOutput(result.frame);
-    }
-    return drained;
-  }
-
-  forwardRuntimeOutput(output) {
-    if (this.closed || !output) {
-      return;
-    }
-    const headers = output.headers ?? [];
-    const body = output.body_base64 ? Buffer.from(output.body_base64, "base64") : Buffer.alloc(0);
-    if (body.length > 0) {
-      const binary = headerListValue(headers, DD_WS_BINARY_HEADER) === "1";
-      sendServerWebSocketFrame(this.socket, binary ? 0x2 : 0x1, body);
-    }
-    const closeCode = headerListValue(headers, DD_WS_CLOSE_CODE_HEADER);
-    if (closeCode) {
-      const reason = headerListValue(headers, DD_WS_CLOSE_REASON_HEADER);
-      void this.close(Number(closeCode) || 1000, reason, { closeRuntime: false });
-    }
-  }
-
-  async close(code = 1000, reason = "", options = {}) {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    if (options.closeRuntime !== false) {
-      await this.closeRuntime(code, reason);
-    }
-    if (!this.closeSent && !this.socket.destroyed) {
-      this.closeSent = true;
-      sendServerWebSocketFrame(this.socket, 0x8, encodeClosePayload(code, reason));
-    }
-    this.socket.end();
-  }
-
-  async closeRuntime(code, reason) {
-    if (this.runtimeClosed) {
-      return;
-    }
-    this.runtimeClosed = true;
-    await this.runtime.closeWebSocket(this.workerName, this.sessionId, { code, reason }).catch(() => {});
-  }
-
-  fail(error) {
-    if (!this.closed) {
-      void this.close(1011, String(error?.message ?? error));
-    }
-  }
-}
-
-export function parseClientWebSocketFrame(buffer) {
-  if (buffer.length < 2) {
-    return undefined;
-  }
-  const first = buffer[0];
-  const second = buffer[1];
-  const fin = (first & 0x80) !== 0;
-  const opcode = first & 0x0f;
-  const masked = (second & 0x80) !== 0;
-  let length = second & 0x7f;
-  let offset = 2;
-  if (length === 126) {
-    if (buffer.length < offset + 2) {
-      return undefined;
-    }
-    length = buffer.readUInt16BE(offset);
-    offset += 2;
-  } else if (length === 127) {
-    if (buffer.length < offset + 8) {
-      return undefined;
-    }
-    const bigLength = buffer.readBigUInt64BE(offset);
-    if (bigLength > BigInt(MAX_DEV_WEBSOCKET_FRAME_BYTES)) {
-      return { error: "websocket frame is too large", rest: Buffer.alloc(0) };
-    }
-    length = Number(bigLength);
-    offset += 8;
-  }
-  if (length > MAX_DEV_WEBSOCKET_FRAME_BYTES) {
-    return { error: "websocket frame is too large", rest: Buffer.alloc(0) };
-  }
-  if (!masked) {
-    return { error: "client websocket frames must be masked", rest: Buffer.alloc(0) };
-  }
-  if (!fin) {
-    return { error: "fragmented websocket frames are not supported in dd vite dev", rest: Buffer.alloc(0) };
-  }
-  if (buffer.length < offset + 4 + length) {
-    return undefined;
-  }
-  const mask = buffer.subarray(offset, offset + 4);
-  offset += 4;
-  const payload = Buffer.alloc(length);
-  for (let index = 0; index < length; index += 1) {
-    payload[index] = buffer[offset + index] ^ mask[index % 4];
-  }
-  return {
-    frame: { opcode, payload },
-    rest: buffer.subarray(offset + length),
-  };
-}
-
-export function sendServerWebSocketFrame(socket, opcode, payload) {
-  if (socket.destroyed) {
-    return;
-  }
-  const body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload ?? "");
-  let header;
-  if (body.length < 126) {
-    header = Buffer.from([0x80 | opcode, body.length]);
-  } else if (body.length <= 0xffff) {
-    header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode;
-    header[1] = 126;
-    header.writeUInt16BE(body.length, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(body.length), 2);
-  }
-  socket.write(Buffer.concat([header, body]));
-}
-
-export function parseClientClosePayload(payload) {
-  if (payload.length < 2) {
-    return { code: 1000, reason: "" };
-  }
-  return {
-    code: payload.readUInt16BE(0),
-    reason: payload.subarray(2).toString("utf8"),
-  };
-}
-
-export function encodeClosePayload(code, reason) {
-  const text = Buffer.from(String(reason ?? "").slice(0, 120));
-  const payload = Buffer.alloc(2 + text.length);
-  payload.writeUInt16BE(Number(code) || 1000, 0);
-  text.copy(payload, 2);
-  return payload;
-}
-
-export function headerListValue(headers, name) {
-  const found = (headers ?? []).find(([headerName]) =>
-    String(headerName).toLowerCase() === String(name).toLowerCase()
-  );
-  return found ? String(found[1]) : "";
-}
-
-export async function readIncomingBody(req) {
-  const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
 }
 
 export function normalizeMount(value) {

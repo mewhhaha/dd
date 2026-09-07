@@ -75,11 +75,8 @@ flyctl secrets set \
   DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE=4 \
   DD_RUNTIME_MIN_ISOLATES_PER_WORKER=0 \
   DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS=1 \
-  DD_MEMORY_DB_CACHE_MAX_OPEN=256 \
   DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES=4096 \
   DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES=67108864 \
-  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE=2 \
-  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS=256 \
   --app your-dd-app
 ```
 
@@ -99,8 +96,7 @@ the server rejects smaller values instead of silently disabling part of the
 cache.
 
 The Fly production image includes WebSockets and OTLP HTTP trace propagation.
-Direct HTTP/3 and WebTransport support remain an experimental opt-in Cargo
-feature and are not linked into this image.
+TLS terminates at the Fly edge.
 
 ## 4) Deploy platform manually
 

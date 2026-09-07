@@ -1,3 +1,4 @@
+import type { DdKvNamespace, DdMemoryNamespace } from "@mewhhaha/vite-plugin-dd";
 import type { AuthenticatorTransportFuture } from "@simplewebauthn/server";
 
 export type ServiceBinding = {
@@ -11,8 +12,8 @@ export type AppEnv = {
 };
 
 export type AuthWorkerEnv = {
-  AUTH_DB: KvNamespace;
-  AUTH_STATE: MemoryNamespace;
+  AUTH_DB: DdKvNamespace;
+  AUTH_STATE: DdMemoryNamespace;
 };
 
 export type Env = AuthWorkerEnv;

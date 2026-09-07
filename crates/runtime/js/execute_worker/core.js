@@ -6,14 +6,9 @@ globalThis.__dd_execute_worker = (payload) => {
   }
   const workerName = String(deploymentConfig?.worker_name ?? "");
   const kvBindingsConfig = deploymentConfig?.kv_bindings ?? [];
-  const kvReadCacheConfig = deploymentConfig?.kv_read_cache_config;
   const memoryBindingsConfig = deploymentConfig?.memory_bindings ?? [];
-  const dynamicBindingsConfig = deploymentConfig?.dynamic_bindings ?? [];
-  const dynamicRpcBindingsConfig = deploymentConfig?.dynamic_rpc_bindings ?? [];
   const serviceBindingsConfig = deploymentConfig?.service_bindings ?? [];
-  const dynamicEnvConfig = deploymentConfig?.dynamic_env ?? [];
   const memoryCallConfig = payload?.memory_call ?? null;
-  const hostRpcCallConfig = payload?.host_rpc_call ?? null;
   const requestBodyStreamHandle = Math.max(
     0,
     Math.trunc(Number(payload?.request_body_stream_handle ?? 0) || 0),
@@ -41,11 +36,6 @@ globalThis.__dd_execute_worker = (payload) => {
   const inflightRequests = globalThis.__dd_inflight_requests ??= new Map();
   const inflightRequestsByContextHandle =
     globalThis.__dd_inflight_requests_by_context_handle ??= new Map();
-  const hostRpcTargets = globalThis.__dd_host_rpc_targets ??= new Map();
-  const RpcTarget = globalThis.RpcTarget ?? class RpcTarget {};
-  if (globalThis.RpcTarget !== RpcTarget) {
-    globalThis.RpcTarget = RpcTarget;
-  }
   const input = {
     method: String(payload?.method ?? "GET"),
     url: String(payload?.url ?? ""),
@@ -64,7 +54,6 @@ globalThis.__dd_execute_worker = (payload) => {
     });
   const controller = new AbortController();
   const asyncContext = globalThis.__dd_async_context;
-  const memoryReadSnapshotFreshTtlMs = 1_000;
   const requestContext = {
     requestId,
     controller,
@@ -77,10 +66,6 @@ globalThis.__dd_execute_worker = (payload) => {
     memoryRequestId: null,
     memoryTxnScope: null,
     socketRuntimeProvider: null,
-    transportRuntimeProvider: null,
-    kvGetBatches: new Map(),
-    kvGetResults: new Map(),
-    kvWriteOverlay: new Map(),
     cacheBypassStale,
   };
 
@@ -92,37 +77,7 @@ globalThis.__dd_execute_worker = (payload) => {
     return current;
   };
 
-  if (!globalThis.__dd_handle_websocket_wrapped) {
-    globalThis.__dd_handle_websocket_wrapped = true;
-    globalThis.__dd_original_websocket = globalThis.WebSocket;
-    globalThis.WebSocket = function WebSocket(handle) {
-      const current = currentRequestContext(false);
-      if (current?.socketRuntimeProvider) {
-        return current.socketRuntimeProvider().WebSocket(handle);
-      }
-      const originalWebSocket = globalThis.__dd_original_websocket;
-      if (typeof originalWebSocket === "function") {
-        return new originalWebSocket(handle);
-      }
-      throw new Error("handle-backed WebSocket is unavailable outside keyed memory scope");
-    };
-  }
 
-  if (!globalThis.__dd_handle_transport_wrapped) {
-    globalThis.__dd_handle_transport_wrapped = true;
-    globalThis.__dd_original_webtransport_session = globalThis.WebTransportSession;
-    globalThis.WebTransportSession = function WebTransportSession(handle) {
-      const current = currentRequestContext(false);
-      if (current?.transportRuntimeProvider) {
-        return current.transportRuntimeProvider().WebTransportSession(handle);
-      }
-      const originalWebTransportSession = globalThis.__dd_original_webtransport_session;
-      if (typeof originalWebTransportSession === "function") {
-        return new originalWebTransportSession(handle);
-      }
-      throw new Error("handle-backed WebTransportSession is unavailable outside keyed memory scope");
-    };
-  }
 
   const inflightRequest = {
     controller,
@@ -153,18 +108,6 @@ globalThis.__dd_execute_worker = (payload) => {
     return undefined;
   };
 
-  const recordKvProfile = (metric, durationMs, items = 1) => {
-    const op = Deno?.core?.ops?.op_kv_profile_record_js;
-    if (typeof op !== "function") {
-      return;
-    }
-    op(
-      String(metric),
-      Math.max(0, Math.round(Number(durationMs ?? 0) * 1000)),
-      Math.max(1, Math.trunc(Number(items ?? 1) || 1)),
-    );
-  };
-
   const recordMemoryProfile = (metric, durationMs, items = 1) => {
     const op = Deno?.core?.ops?.op_memory_profile_record_js;
     if (typeof op !== "function") {
@@ -180,7 +123,7 @@ globalThis.__dd_execute_worker = (payload) => {
   const activeRequestId = () => {
     const scoped = String(currentRequestContext().requestId ?? "").trim();
     if (!scoped) {
-      throw new Error("dynamic worker request scope is unavailable");
+      throw new Error("worker request scope is unavailable");
     }
     return scoped;
   };
@@ -258,19 +201,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
   };
 
-  const memoryTxnScopeFor = (binding, memoryKey) => {
-    const currentMemoryTxnScope = currentRequestContext(false)?.memoryTxnScope ?? null;
-    if (
-      currentMemoryTxnScope
-      && currentMemoryTxnScope.binding === binding
-      && currentMemoryTxnScope.memoryKey === memoryKey
-    ) {
-      return currentMemoryTxnScope;
-    }
-    return null;
-  };
-
-  const currentLocalHandleRuntime = (binding, memoryKey, kind) => {
+  const currentLocalSocketRuntime = (binding, memoryKey) => {
     const current = currentRequestContext(false);
     if (!current?.memoryEntry) {
       return null;
@@ -281,19 +212,16 @@ globalThis.__dd_execute_worker = (payload) => {
     ) {
       return null;
     }
-    const provider = kind === "socket"
-      ? current.socketRuntimeProvider
-      : current.transportRuntimeProvider;
-    const label = kind === "socket" ? "socket" : "transport";
+    const provider = current.socketRuntimeProvider;
     if (typeof provider !== "function") {
-      throw new Error(`memory same-lane ${label} runtime is unavailable`);
+      throw new Error(`memory same-lane socket runtime is unavailable`);
     }
     const runtime = provider();
     if (!runtime || typeof runtime.listOpenHandles !== "function") {
-      throw new Error(`memory same-lane ${label} runtime is unavailable`);
+      throw new Error(`memory same-lane socket runtime is unavailable`);
     }
     if (typeof runtime.hasOpenHandleSnapshot === "function" && !runtime.hasOpenHandleSnapshot()) {
-      throw new Error(`memory same-lane ${label} handles are not initialized`);
+      throw new Error(`memory same-lane socket handles are not initialized`);
     }
     return runtime;
   };
@@ -478,488 +406,42 @@ globalThis.__dd_execute_worker = (payload) => {
     throw new Error(`${context} unsupported encoding: ${encoding}`);
   };
 
-  const kvCacheNowMs = () => performance.now();
-
-  const estimateKvCachedValueBytes = (value, encoding) => {
-    if (value == null) {
-      return 8;
-    }
-    if (encoding === "utf8" && typeof value === "string") {
-      return value.length * 2;
-    }
-    try {
-      return JSON.stringify(value).length * 2;
-    } catch {
-      return 128;
-    }
-  };
-
-  const createKvBinding = (bindingName) => {
-    const persistentReadCache = {
-      entries: new Map(),
-      totalBytes: 0,
-    };
-
-    const deletePersistentCacheEntry = (normalizedKey, metric = "kv_cache_invalidate") => {
-      const existing = persistentReadCache.entries.get(normalizedKey);
-      if (!existing) {
-        return false;
-      }
-      persistentReadCache.entries.delete(normalizedKey);
-      persistentReadCache.totalBytes = Math.max(0, persistentReadCache.totalBytes - existing.sizeBytes);
-      recordKvProfile(metric, 0, 1);
-      return true;
-    };
-
-    const trimPersistentCache = () => {
-      while (
-        persistentReadCache.entries.size > kvReadCacheConfig.maxEntries
-        || persistentReadCache.totalBytes > kvReadCacheConfig.maxBytes
-      ) {
-        const oldestKey = persistentReadCache.entries.keys().next().value;
-        if (oldestKey === undefined) {
-          break;
-        }
-        deletePersistentCacheEntry(oldestKey);
-      }
-    };
-
-    const setPersistentCacheEntry = (
-      normalizedKey,
-      value,
-      encoding,
-      pendingWriteVersion = null,
-    ) => {
-      const existing = persistentReadCache.entries.get(normalizedKey);
-      if (existing) {
-        persistentReadCache.totalBytes = Math.max(0, persistentReadCache.totalBytes - existing.sizeBytes);
-        persistentReadCache.entries.delete(normalizedKey);
-      }
-      const missing = value == null;
-      const expiresAtMs = kvCacheNowMs()
-        + (missing ? kvReadCacheConfig.missTtlMs : kvReadCacheConfig.hitTtlMs);
-      const sizeBytes = normalizedKey.length * 2
-        + 64
-        + estimateKvCachedValueBytes(value, encoding);
-      persistentReadCache.entries.set(normalizedKey, {
-        value,
-        missing,
-        encoding,
-        pendingWriteVersion,
-        expiresAtMs,
-        sizeBytes,
-      });
-      persistentReadCache.totalBytes += sizeBytes;
-      trimPersistentCache();
-      recordKvProfile("kv_cache_fill", 0, 1);
-    };
-
-    const getPersistentCacheEntry = (normalizedKey) => {
-      const cached = persistentReadCache.entries.get(normalizedKey);
-      if (!cached) {
-        recordKvProfile("kv_cache_miss", 0, 1);
-        return { found: false, value: null };
-      }
-      if (cached.pendingWriteVersion != null) {
-        const failed = callOp(
-          "op_kv_take_failed_write_version",
-          BigInt(cached.pendingWriteVersion),
-        );
-        if (failed === true) {
-          deletePersistentCacheEntry(normalizedKey);
-          recordKvProfile("kv_cache_miss", 0, 1);
-          return { found: false, value: null };
-        }
-      }
-      if (cached.expiresAtMs <= kvCacheNowMs()) {
-        deletePersistentCacheEntry(normalizedKey, "kv_cache_stale");
-        recordKvProfile("kv_cache_miss", 0, 1);
-        return { found: false, value: null };
-      }
-      persistentReadCache.entries.delete(normalizedKey);
-      persistentReadCache.entries.set(normalizedKey, cached);
-      recordKvProfile("kv_cache_hit", 0, 1);
-      return { found: true, value: cached.missing ? null : cached.value };
-    };
-
-    const ensureKvWriteOverlay = () => {
-      const current = currentRequestContext();
-      let overlay = current.kvWriteOverlay.get(bindingName) ?? null;
-      if (!overlay) {
-        overlay = new Map();
-        current.kvWriteOverlay.set(bindingName, overlay);
-      }
-      return overlay;
-    };
-
-    const setKvOverlayValue = (normalizedKey, entry) => {
-      const current = currentRequestContext(false);
-      if (!current) {
-        return;
-      }
-      ensureKvWriteOverlay().set(normalizedKey, entry);
-      current.kvGetResults.get(bindingName)?.delete(normalizedKey);
-    };
-
-    const clearKvOverlayValue = (normalizedKey) => {
-      const current = currentRequestContext(false);
-      current?.kvWriteOverlay?.get(bindingName)?.delete(normalizedKey);
-      current?.kvGetResults?.get(bindingName)?.delete(normalizedKey);
-    };
-
-    const enqueueKvWrite = (mutation) => {
-      const result = mutation.deleted === true
-        ? callOp("op_kv_enqueue_delete", workerName, bindingName, mutation.key)
-        : mutation.encoding === "utf8"
-          ? callOp(
-            "op_kv_enqueue_put",
-            workerName,
-            bindingName,
-            mutation.key,
-            Deno.core.decode(mutation.value),
-          )
-          : callOp(
-            "op_kv_enqueue_put_value_bytes",
-            workerName,
-            bindingName,
-            mutation.key,
-            mutation.encoding,
-            mutation.value,
-          );
+  const createKvBinding = (bindingName) => Object.freeze({
+    async get(key) {
+      const result = await callOp("op_kv_get_value", bindingName, String(key));
       syncFrozenTimeNow();
-      if (result && typeof result === "object" && result.ok === false) {
-        clearKvOverlayValue(mutation.key);
-        throw new Error(String(result.error ?? "kv enqueue failed"));
-      }
-      setPersistentCacheEntry(
-        mutation.key,
-        mutation.deleted === true ? null : mutation.resolvedValue,
-        mutation.encoding,
-        Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
-      );
-      return {
-        ok: true,
-        durability: "queued",
-        queued: true,
-        version: Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
-      };
-    };
-
-    const kvWriteDurability = (options) => {
-      const durability = String(
-        options?.durability ?? options?.consistency ?? "queued",
-      ).trim().toLowerCase();
-      if (!durability || durability === "queued" || durability === "enqueue" || durability === "enqueued") {
-        return "queued";
-      }
-      if (durability === "committed" || durability === "commit") {
-        return "committed";
-      }
-      throw new Error(`unsupported kv durability: ${durability}`);
-    };
-
-    const commitKvWrite = async (mutation) => {
-      const result = mutation.deleted === true
-        ? await callOp("op_kv_delete", workerName, bindingName, mutation.key)
-        : mutation.encoding === "utf8"
-          ? await callOp(
-            "op_kv_put",
-            workerName,
-            bindingName,
-            mutation.key,
-            Deno.core.decode(mutation.value),
-          )
-          : await callOp(
-            "op_kv_put_value_bytes",
-            workerName,
-            bindingName,
-            mutation.key,
-            mutation.encoding,
-            mutation.value,
-          );
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        clearKvOverlayValue(mutation.key);
-        throw new Error(String(result.error ?? "kv committed write failed"));
-      }
-      setPersistentCacheEntry(
-        mutation.key,
-        mutation.deleted === true ? null : mutation.resolvedValue,
-        mutation.encoding,
-        null,
-      );
-      return {
-        ok: true,
-        durability: "committed",
-        committed: true,
-        version: Number.isFinite(Number(result?.version)) ? Number(result.version) : null,
-      };
-    };
-
-    const loadKvValues = async (normalizedKeys, contextLabel) => {
-      if (normalizedKeys.length === 0) {
-        return [];
-      }
-      const uniqueKeys = [];
-      const keyIndexes = new Map();
-      const normalizedToUnique = normalizedKeys.map((key) => {
-        if (!keyIndexes.has(key)) {
-          keyIndexes.set(key, uniqueKeys.length);
-          uniqueKeys.push(key);
-        }
-        return keyIndexes.get(key);
-      });
-      if (uniqueKeys.length === 1) {
-        const utf8Result = await callOp(
-          "op_kv_get",
-          workerName,
-          bindingName,
-          uniqueKeys[0],
-        );
-        syncFrozenTimeNow();
-        if (utf8Result && typeof utf8Result === "object" && utf8Result.ok === true) {
-          const value = utf8Result.found === true ? String(utf8Result.value ?? "") : null;
-          return normalizedToUnique.map(() => value);
-        }
-        if (utf8Result?.wrong_encoding !== true && utf8Result?.error) {
-          throw new Error(String(utf8Result.error || `${contextLabel} failed`));
-        }
-        const result = await callOp(
-          "op_kv_get_value",
-          workerName,
-          bindingName,
-          uniqueKeys[0],
-        );
-        syncFrozenTimeNow();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? `${contextLabel} failed`));
-        }
-        const value = result?.found === true
-          ? decodeStoredValue(String(result.encoding ?? "utf8"), result.value_handle, contextLabel)
-          : null;
-        return normalizedToUnique.map(() => value);
-      }
-      const utf8Result = await callOp(
-        "op_kv_get_many_utf8",
-        workerName,
-        bindingName,
-        uniqueKeys,
-      );
+      if (!result.ok) throw new Error(`kv get ${key}: ${result.error}`);
+      return result.found ? decodeStoredValue(result.encoding, result.value_handle, "kv get") : null;
+    },
+    async put(key, value) {
+      const normalizedKey = String(key);
+      const result = typeof value === "string"
+        ? await callOp("op_kv_put", bindingName, normalizedKey, value)
+        : await callOp("op_kv_put_value_bytes", bindingName, normalizedKey,
+          "v8sc", new Uint8Array(Deno.core.serialize(value, { forStorage: true })));
       syncFrozenTimeNow();
-      if (!utf8Result || typeof utf8Result !== "object" || utf8Result.ok === false) {
-        throw new Error(String(utf8Result?.error ?? `${contextLabel} failed`));
+      if (!result.ok) throw new Error(`kv put ${normalizedKey}: ${result.error}`);
+    },
+    async delete(key) {
+      const result = await callOp("op_kv_delete", bindingName, String(key));
+      syncFrozenTimeNow();
+      if (!result.ok) throw new Error(`kv delete ${key}: ${result.error}`);
+    },
+    async list(options = {}) {
+      const prefix = String(options.prefix ?? "");
+      const limit = options.limit ?? 100;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+        throw new Error(`kv list limit must be an integer between 1 and 1000: ${limit}`);
       }
-      const items = Array.isArray(utf8Result.values) ? utf8Result.values : [];
-      const uniqueValues = new Array(uniqueKeys.length);
-      const fallbackIndexes = [];
-      for (let index = 0; index < uniqueKeys.length; index += 1) {
-        const item = items[index];
-        if (!item || item.found !== true) {
-          uniqueValues[index] = null;
-          continue;
-        }
-        if (item.wrong_encoding === true) {
-          fallbackIndexes.push(index);
-          continue;
-        }
-        uniqueValues[index] = String(item.value ?? "");
-      }
-      if (fallbackIndexes.length === 0) {
-        return normalizedToUnique.map((index) => uniqueValues[index]);
-      }
-      const fallbackValues = await Promise.all(fallbackIndexes.map(async (index) => {
-        const result = await callOp(
-          "op_kv_get_value",
-          workerName,
-          bindingName,
-          uniqueKeys[index],
-        );
-        syncFrozenTimeNow();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? `${contextLabel} failed`));
-        }
-        if (result?.found !== true) {
-          return null;
-        }
-        return decodeStoredValue(String(result.encoding ?? "utf8"), result.value_handle, contextLabel);
+      const result = await callOp("op_kv_list", bindingName, prefix, limit);
+      syncFrozenTimeNow();
+      if (!result.ok) throw new Error(`kv list ${prefix}: ${result.error}`);
+      return result.entries.map((entry) => ({
+        key: entry.key,
+        value: decodeStoredValue(entry.encoding, entry.value_handle, "kv list"),
       }));
-      for (let index = 0; index < fallbackIndexes.length; index += 1) {
-        uniqueValues[fallbackIndexes[index]] = fallbackValues[index];
-      }
-      return normalizedToUnique.map((index) => uniqueValues[index]);
-    };
-
-    const flushPendingGetBatch = async (batch) => {
-      const started = performance.now();
-      const uniqueKeys = Array.from(batch.requestsByKey.keys());
-      try {
-        const values = await loadKvValues(uniqueKeys, "kv get");
-        for (let index = 0; index < uniqueKeys.length; index += 1) {
-          const key = uniqueKeys[index];
-          const value = values[index];
-          setPersistentCacheEntry(
-            key,
-            value,
-            value == null ? "missing" : (typeof value === "string" ? "utf8" : "v8sc"),
-            null,
-          );
-          const waiters = batch.requestsByKey.get(key) ?? [];
-          for (const waiter of waiters) {
-            waiter.resolve(value);
-          }
-        }
-      } finally {
-        recordKvProfile("js_batch_flush", performance.now() - started, uniqueKeys.length);
-      }
-    };
-
-    const queueKvGet = (normalizedKey) => {
-      const current = currentRequestContext();
-      let cachedByKey = current.kvGetResults.get(bindingName) ?? null;
-      if (!cachedByKey) {
-        cachedByKey = new Map();
-        current.kvGetResults.set(bindingName, cachedByKey);
-      }
-      const cached = cachedByKey.get(normalizedKey);
-      if (cached) {
-        return cached;
-      }
-      let pendingGetBatch = current.kvGetBatches.get(bindingName) ?? null;
-      if (!pendingGetBatch) {
-        pendingGetBatch = {
-          requestsByKey: new Map(),
-        };
-        current.kvGetBatches.set(bindingName, pendingGetBatch);
-        queueMicrotask(() => {
-          const batch = current.kvGetBatches.get(bindingName);
-          current.kvGetBatches.delete(bindingName);
-          if (!batch) {
-            return;
-          }
-          flushPendingGetBatch(batch).catch((error) => {
-            const bindingCache = current.kvGetResults.get(bindingName) ?? null;
-            for (const [key, waiters] of batch.requestsByKey.entries()) {
-              bindingCache?.delete(key);
-              for (const waiter of waiters) {
-                waiter.reject(error);
-              }
-            }
-          });
-        });
-      }
-      const sharedPromise = new Promise((resolve, reject) => {
-        pendingGetBatch.requestsByKey.set(normalizedKey, [{ resolve, reject }]);
-      });
-      cachedByKey.set(normalizedKey, sharedPromise);
-      return sharedPromise;
-    };
-
-    return Object.freeze({
-      async get(key, options = {}) {
-        const _ = options;
-        const normalizedKey = String(key);
-        const pendingWrite = currentRequestContext(false)?.kvWriteOverlay?.get(bindingName)
-          ?.get(normalizedKey);
-        if (pendingWrite) {
-          if (pendingWrite.deleted === true) {
-            return null;
-          }
-          return pendingWrite.resolvedValue;
-        }
-        const persistentCached = getPersistentCacheEntry(normalizedKey);
-        if (persistentCached.found) {
-          return persistentCached.value;
-        }
-        const cachedValue = currentRequestContext(false)?.kvGetResults?.get(bindingName)
-          ?.get(normalizedKey);
-        if (cachedValue) {
-          return await cachedValue;
-        }
-        return await queueKvGet(normalizedKey);
-      },
-      put(key, value, options = {}) {
-        const normalizedKey = String(key);
-        let mutation;
-        let resolvedValue = value;
-        if (typeof value === "string") {
-          mutation = {
-            key: normalizedKey,
-            encoding: "utf8",
-            value: toUtf8Bytes(value),
-            deleted: false,
-            resolvedValue,
-          };
-        } else {
-          let encoded;
-          try {
-            encoded = Deno.core.serialize(value, { forStorage: true });
-          } catch (error) {
-            throw new Error(`kv put serialize failed: ${String(error?.message ?? error)}`);
-          }
-          mutation = {
-            key: normalizedKey,
-            encoding: "v8sc",
-            value: new Uint8Array(encoded),
-            deleted: false,
-            resolvedValue,
-          };
-        }
-        setKvOverlayValue(normalizedKey, {
-          deleted: false,
-          resolvedValue,
-        });
-        if (kvWriteDurability(options) === "committed") {
-          return commitKvWrite(mutation);
-        }
-        return enqueueKvWrite(mutation);
-      },
-      delete(key, options = {}) {
-        const normalizedKey = String(key);
-        const mutation = {
-          key: normalizedKey,
-          encoding: "utf8",
-          value: new Uint8Array(),
-          deleted: true,
-          resolvedValue: null,
-        };
-        setKvOverlayValue(normalizedKey, {
-          deleted: true,
-          resolvedValue: null,
-        });
-        if (kvWriteDurability(options) === "committed") {
-          return commitKvWrite(mutation);
-        }
-        return enqueueKvWrite(mutation);
-      },
-      async list(options = {}) {
-        const prefix = String(options?.prefix ?? "");
-        const limitInput = Number(options?.limit ?? 100);
-        const limit = Number.isFinite(limitInput)
-          ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
-          : 100;
-        const result = await callOp(
-          "op_kv_list",
-          workerName,
-          bindingName,
-          prefix,
-          limit,
-        );
-        syncFrozenTimeNow();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? "kv list failed"));
-        }
-        const entries = Array.isArray(result?.entries) ? result.entries : [];
-        return entries.map((entry) => {
-          const encoding = String(entry?.encoding ?? "utf8");
-          return {
-            key: String(entry?.key ?? ""),
-            value: decodeStoredValue(encoding, entry?.value_handle, "kv list"),
-            encoding,
-          };
-        });
-      },
-    });
-  };
+    },
+  });
 
   const toHeaderEntries = (headersInput) => {
     if (!headersInput) {
@@ -1348,7 +830,7 @@ globalThis.__dd_execute_worker = (payload) => {
     };
   };
 
-  const normalizeDynamicFastBody = (value) => {
+  const normalizeServiceFetchBody = (value) => {
     if (value == null) {
       return new Uint8Array();
     }

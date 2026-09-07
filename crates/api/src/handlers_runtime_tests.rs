@@ -41,7 +41,6 @@ impl TestState {
         let store_dir = PathBuf::from(format!("./target/test-store-api-{}", Uuid::new_v4()));
         let storage = RuntimeStorageConfig {
             store_dir: store_dir.clone(),
-            database_url: format!("file:{}/dd-test.db", store_dir.display()),
             worker_store_enabled: true,
             ..RuntimeStorageConfig::default()
         };
@@ -51,19 +50,13 @@ impl TestState {
         })
         .await
         .expect("runtime");
-        let legacy_token_path = store_dir.join("tokens.json");
-        let deploy_tokens =
-            DeployTokenStore::from_control_store(runtime.control_store(), Some(&legacy_token_path))
-                .await
-                .expect("token store");
+        let deploy_tokens = DeployTokenStore::from_control_store(runtime.control_store());
         let state = AppState::new(
             runtime,
             deploy_tokens,
             1024 * 1024,
             public_base_domain.to_string(),
             Some("test-private-token".to_string()),
-            None,
-            None,
         );
         Self { state, store_dir }
     }
@@ -897,6 +890,7 @@ async fn private_deploy_and_invoke_succeeds() {
         name: "echo".to_string(),
         source: "export default { async fetch() { return new Response('ok'); } }".to_string(),
         config: DeployConfig {
+            egress_allow_hosts: Vec::new(),
             public: false,
             cache: Default::default(),
             bindings: vec![],
@@ -982,6 +976,7 @@ async fn public_host_invoke_routes_by_subdomain() {
             "echo".to_string(),
             "export default { async fetch() { return new Response('host-ok'); } }".to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: true,
                 cache: Default::default(),
                 bindings: vec![],
@@ -1022,6 +1017,7 @@ async fn public_router_allows_worker_paths_near_reserved_prefixes() {
             "export default { async fetch(request) { return new Response(new URL(request.url).pathname); } }"
                 .to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: true,
                 cache: Default::default(),
                 bindings: vec![],
@@ -1068,6 +1064,7 @@ async fn public_host_invoke_ignores_spoofed_forwarded_request_url() {
             "export default { async fetch(request) { return new Response(request.url); } }"
                 .to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: true,
                 cache: Default::default(),
                 bindings: vec![],
@@ -1109,6 +1106,7 @@ async fn public_host_invoke_rejects_private_worker_assets() {
             "private-worker".to_string(),
             "export default { async fetch() { return new Response('private-ok'); } }".to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 bindings: vec![],
@@ -1411,6 +1409,7 @@ async fn private_websocket_route_rejects_non_memory_upgrade() {
             "echo".to_string(),
             "export default { async fetch() { return new Response('ok'); } }".to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 bindings: vec![],
@@ -1468,6 +1467,7 @@ async fn public_websocket_route_rejects_non_memory_upgrade() {
             "echo".to_string(),
             "export default { async fetch() { return new Response('ok'); } }".to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: true,
                 cache: Default::default(),
                 bindings: vec![],

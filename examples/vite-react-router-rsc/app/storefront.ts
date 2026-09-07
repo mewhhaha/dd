@@ -1,35 +1,8 @@
-export type KvNamespace = {
-  get(key: string): Promise<unknown | null>;
-  put(key: string, value: unknown): void | Promise<void>;
-  delete(key: string): void | Promise<void>;
-  list?(options?: { prefix?: string; limit?: number }): Promise<Array<{ key: string; value: unknown }>>;
-};
-
-export type MemoryNamespace = {
-  idFromName(name: string): unknown;
-  get(id: unknown): MemoryShard;
-};
-
-type MemoryShard = {
-  atomic<T>(callback: () => T): Promise<T>;
-  apply(effects: MemoryEffect[]): Promise<void>;
-  accept(request: Request): { handle: string; response: Response };
-  tvar<T>(key: string, defaultValue: T): {
-    read(): T;
-    write(value: T): void;
-  };
-};
-
-type MemoryEffect = {
-  type: "socket.send";
-  handle: string;
-  payload: string;
-  kind?: "text";
-};
+import type { DdKvNamespace, DdMemoryNamespace, DdMemoryStub } from "@mewhhaha/vite-plugin-dd";
 
 export type StorefrontEnv = {
-  EXAMPLE_MEMORY: MemoryNamespace;
-  STORE_DB: KvNamespace;
+  EXAMPLE_MEMORY: DdMemoryNamespace;
+  STORE_DB: DdKvNamespace;
 };
 
 export type Product = {
@@ -97,7 +70,7 @@ type CartState = {
 
 type StorefrontSocketWakeEvent = {
   type?: string;
-  stub?: MemoryShard;
+  stub?: DdMemoryStub;
   handle?: string;
   data?: unknown;
 };
@@ -161,16 +134,15 @@ export function createStorefront(env: StorefrontEnv, sessionId: string, workerNa
   const memory = env.EXAMPLE_MEMORY.get(
     env.EXAMPLE_MEMORY.idFromName(`storefront-cart:${sessionId}`),
   );
-  const cartVar = memory.tvar<CartState>("cart", EMPTY_CART);
 
   async function readCart(): Promise<CartState> {
-    return await memory.atomic(() => normalizeCart(cartVar.read()));
+    return await memory.atomic((tx) => normalizeCart(tx.get<CartState>("cart") ?? EMPTY_CART));
   }
 
   async function writeCart(nextCart: CartState): Promise<CartState> {
-    return await memory.atomic(() => {
+    return await memory.atomic((tx) => {
       const normalized = normalizeCart(nextCart);
-      cartVar.write(normalized);
+      tx.put("cart", normalized);
       return normalized;
     });
   }
@@ -212,8 +184,8 @@ export function createStorefront(env: StorefrontEnv, sessionId: string, workerNa
       return await readCart();
     }
     const safeQuantity = Math.max(1, Math.min(9, Math.trunc(quantity)));
-    const nextCart = await memory.atomic(() => {
-      const current = normalizeCart(cartVar.read());
+    const nextCart = await memory.atomic((tx) => {
+      const current = normalizeCart(tx.get<CartState>("cart") ?? EMPTY_CART);
       const lines = [...current.lines];
       const line = lines.find((item) => item.slug === product.slug);
       if (line) {
@@ -222,7 +194,7 @@ export function createStorefront(env: StorefrontEnv, sessionId: string, workerNa
         lines.push({ slug: product.slug, quantity: Math.min(product.stock, safeQuantity) });
       }
       const next = normalizeCart({ lines, lastOrderId: null });
-      cartVar.write(next);
+      tx.put("cart", next);
       return next;
     });
     await broadcastStorefrontCartUpdate(env, workerName, sessionId);
@@ -308,17 +280,15 @@ export async function acceptStorefrontLiveSocket(
     });
   }
   const room = env.EXAMPLE_MEMORY.get(env.EXAMPLE_MEMORY.idFromName(`${workerName}:live`));
-  return await room.atomic(() => {
-    const handles = room.tvar<string[]>(LIVE_SOCKET_HANDLES_KEY, []);
-    const events = room.tvar<number>(LIVE_SOCKET_EVENTS_KEY, 0);
-    const { handle, response } = room.accept(request);
-    const nextEvent = Number(events.read()) + 1;
+  return await room.atomic((tx) => {
+    const { handle, response } = tx.accept(request);
+    const nextEvent = Number(tx.get<number>(LIVE_SOCKET_EVENTS_KEY) ?? 0) + 1;
     const nextHandles = [
-      ...normalizeSocketHandles(handles.read()).filter((value) => value !== handle).slice(-7),
+      ...normalizeSocketHandles(tx.get<string[]>(LIVE_SOCKET_HANDLES_KEY) ?? []).filter((value) => value !== handle).slice(-7),
       handle,
     ];
-    handles.write(nextHandles);
-    events.write(nextEvent);
+    tx.put(LIVE_SOCKET_HANDLES_KEY, nextHandles);
+    tx.put(LIVE_SOCKET_EVENTS_KEY, nextEvent);
     return response;
   });
 }
@@ -336,17 +306,15 @@ export async function acceptStorefrontCartSocket(
   }
   const session = storefrontSessionFromRequest(request);
   const room = cartSocketRoom(env, workerName, session.id);
-  return await room.atomic(() => {
-    const handles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
-    const events = room.tvar<number>(CART_SOCKET_EVENTS_KEY, 0);
-    const { handle, response } = room.accept(request);
-    const nextEvent = Number(events.read()) + 1;
+  return await room.atomic((tx) => {
+    const { handle, response } = tx.accept(request);
+    const nextEvent = Number(tx.get<number>(CART_SOCKET_EVENTS_KEY) ?? 0) + 1;
     const nextHandles = [
-      ...normalizeSocketHandles(handles.read()).filter((value) => value !== handle).slice(-7),
+      ...normalizeSocketHandles(tx.get<string[]>(CART_SOCKET_HANDLES_KEY) ?? []).filter((value) => value !== handle).slice(-7),
       handle,
     ];
-    handles.write(nextHandles);
-    events.write(nextEvent);
+    tx.put(CART_SOCKET_HANDLES_KEY, nextHandles);
+    tx.put(CART_SOCKET_EVENTS_KEY, nextEvent);
     return response;
   });
 }
@@ -357,19 +325,15 @@ export async function broadcastStorefrontCartUpdate(
   sessionId: string,
 ): Promise<void> {
   const room = cartSocketRoom(env, workerName, sessionId);
-  const effects = await room.atomic(() => {
-    const handles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
-    const events = room.tvar<number>(CART_SOCKET_EVENTS_KEY, 0);
-    const nextEvent = Number(events.read()) + 1;
-    const nextHandles = normalizeSocketHandles(handles.read()).slice(-8);
-    handles.write(nextHandles);
-    events.write(nextEvent);
-    return nextHandles.map((handle) => socketSendEffect(
-      handle,
-      cartSocketPayload(workerName, "updated", nextEvent),
-    ));
+  await room.atomic((tx) => {
+    const nextEvent = Number(tx.get<number>(CART_SOCKET_EVENTS_KEY) ?? 0) + 1;
+    const nextHandles = normalizeSocketHandles(tx.get<string[]>(CART_SOCKET_HANDLES_KEY) ?? []).slice(-8);
+    tx.put(CART_SOCKET_HANDLES_KEY, nextHandles);
+    tx.put(CART_SOCKET_EVENTS_KEY, nextEvent);
+    for (const handle of nextHandles) {
+      tx.sockets.send(handle, cartSocketPayload(workerName, "updated", nextEvent));
+    }
   });
-  await room.apply(effects);
 }
 
 export async function handleStorefrontLiveSocketWake(
@@ -382,32 +346,23 @@ export async function handleStorefrontLiveSocketWake(
     return;
   }
   if (event.type === "socketclose") {
-    await room.atomic(() => {
-      const handles = room.tvar<string[]>(LIVE_SOCKET_HANDLES_KEY, []);
-      const cartHandles = room.tvar<string[]>(CART_SOCKET_HANDLES_KEY, []);
-      handles.write(normalizeSocketHandles(handles.read()).filter((value) => value !== handle));
-      cartHandles.write(normalizeSocketHandles(cartHandles.read()).filter((value) => value !== handle));
+    await room.atomic((tx) => {
+      tx.put(LIVE_SOCKET_HANDLES_KEY, normalizeSocketHandles(tx.get<string[]>(LIVE_SOCKET_HANDLES_KEY) ?? []).filter((value) => value !== handle));
+      tx.put(CART_SOCKET_HANDLES_KEY, normalizeSocketHandles(tx.get<string[]>(CART_SOCKET_HANDLES_KEY) ?? []).filter((value) => value !== handle));
     });
     return;
   }
   if (event.type !== "socketmessage") {
     return;
   }
-  const effects = await room.atomic(() => {
-    const events = room.tvar<number>(LIVE_SOCKET_EVENTS_KEY, 0);
-    const nextEvent = Number(events.read()) + 1;
-    events.write(nextEvent);
-    return [
-      socketSendEffect(
-        handle,
-        liveSocketPayload(workerName, String(event.data ?? "message"), nextEvent),
-      ),
-    ];
+  await room.atomic((tx) => {
+    const nextEvent = Number(tx.get<number>(LIVE_SOCKET_EVENTS_KEY) ?? 0) + 1;
+    tx.put(LIVE_SOCKET_EVENTS_KEY, nextEvent);
+    tx.sockets.send(handle, liveSocketPayload(workerName, String(event.data ?? "message"), nextEvent));
   });
-  await room.apply(effects);
 }
 
-async function ensureCatalog(db: KvNamespace): Promise<void> {
+async function ensureCatalog(db: DdKvNamespace): Promise<void> {
   if ((await db.get(CATALOG_VERSION_KEY)) === CATALOG_VERSION) {
     return;
   }
@@ -418,7 +373,7 @@ async function ensureCatalog(db: KvNamespace): Promise<void> {
   await db.put(CATALOG_VERSION_KEY, CATALOG_VERSION);
 }
 
-async function loadCatalog(db: KvNamespace): Promise<Product[]> {
+async function loadCatalog(db: DdKvNamespace): Promise<Product[]> {
   await ensureCatalog(db);
   const slugs = parseStringArray(await db.get(PRODUCT_SLUGS_KEY));
   const productSlugs = slugs.length > 0 ? slugs : PRODUCTS.map((product) => product.slug);
@@ -429,11 +384,11 @@ async function loadCatalog(db: KvNamespace): Promise<Product[]> {
   return catalog.length > 0 ? catalog : PRODUCTS;
 }
 
-async function loadOrderIds(db: KvNamespace): Promise<string[]> {
+async function loadOrderIds(db: DdKvNamespace): Promise<string[]> {
   return parseStringArray(await db.get(ORDERS_INDEX_KEY));
 }
 
-async function loadRecentOrders(db: KvNamespace): Promise<StorefrontOrder[]> {
+async function loadRecentOrders(db: DdKvNamespace): Promise<StorefrontOrder[]> {
   const orderIds = (await loadOrderIds(db)).slice(0, 4);
   const orders = await Promise.all(
     orderIds.map(async (id) => parseOrder(await db.get(orderKey(id)))),
@@ -615,19 +570,10 @@ function cartSocketPayload(workerName: string, message: string, eventCount: numb
   });
 }
 
-function cartSocketRoom(env: StorefrontEnv, workerName: string, sessionId: string): MemoryShard {
+function cartSocketRoom(env: StorefrontEnv, workerName: string, sessionId: string): DdMemoryStub {
   return env.EXAMPLE_MEMORY.get(
     env.EXAMPLE_MEMORY.idFromName(`${workerName}:cart-live:${sessionId}`),
   );
-}
-
-function socketSendEffect(handle: string, payload: string): MemoryEffect {
-  return {
-    type: "socket.send",
-    handle,
-    payload,
-    kind: "text",
-  };
 }
 
 function productKey(slug: string): string {

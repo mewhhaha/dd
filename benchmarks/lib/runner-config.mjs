@@ -1,32 +1,29 @@
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
-export const repoRoot = resolve(new URL("../..", import.meta.url).pathname);
-export const configsDir = join(repoRoot, "benchmarks", "configs");
+const harnessRoot = resolve(new URL("../..", import.meta.url).pathname);
+export const repoRoot = resolve(process.env.DD_BENCH_SOURCE_DIR ?? harnessRoot);
+export const configsDir = join(harnessRoot, "benchmarks", "configs");
 export const defaultMaxRuns = 100;
 
 const knownKeyModes = new Set(["same-shard", "cross-shard", "skewed-hotspot"]);
 const knownModes = new Set([
-  "async-memory",
-  "atomic-read-memory",
-  "atomic-read-memory-multikey",
-  "direct-write-memory",
-  "direct-read-memory",
-  "direct-read-memory-multikey",
-  "direct-write-memory-multikey",
-  "atomic-readwrite-memory",
-  "atomic-write-memory",
-  "direct-write-memory-wide",
-  "direct-read-memory-wide",
-  "atomic-readwrite-memory-wide",
-  "atomic-write-memory-wide",
+  "atomic-callback-only",
+  "atomic-write-only-memory",
+  "atomic-write-only-memory-multikey",
+  "atomic-read-memory-wide",
+  "atomic-write-only-memory-wide",
   "storage-write-memory-wide",
+  "atomic-write-effect-memory-wide",
+  "atomic-readwrite-memory-wide",
   "realworld-rate-limiter",
   "realworld-multiworker-auth",
   "realworld-auth-worker-direct",
+  "atomic-read-memory",
+  "atomic-read-memory-multikey",
+  "atomic-increment-memory",
+  "atomic-increment-memory-multikey",
   "fast-fetch-instant-text",
-  "dynamic-namespace",
-  "sync-memory",
 ]);
 
 export function parseArgs(args, env = process.env) {
@@ -154,33 +151,6 @@ export function expandMatrixVariants(configEnv, processEnv = process.env) {
           DD_BENCH_MIN_ISOLATES: value,
           DD_BENCH_MAX_ISOLATES: value,
         },
-      })),
-    );
-  }
-
-  const memoryShards = uniqueList(
-    envList(
-      processEnv.DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS ??
-        configEnv.DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS,
-    ),
-  );
-  validateMarkedMatrixDimension(
-    hasMatrixMarker,
-    "DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS",
-    configEnv,
-    processEnv,
-  );
-  if (memoryShards.length > 0) {
-    validateNoConflictingOverride(
-      processEnv,
-      "DD_BENCH_MEMORY_NAMESPACE_SHARDS",
-      "DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS",
-    );
-    validatePositiveIntegerList(memoryShards, "DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS");
-    dimensions.push(
-      memoryShards.map((value) => ({
-        label: `shards=${value}`,
-        env: { DD_BENCH_MEMORY_NAMESPACE_SHARDS: value },
       })),
     );
   }

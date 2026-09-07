@@ -4,11 +4,10 @@ use common::{
     DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMetadata, DeployTokenMintRequest,
     DeployTokenMintResponse, PlatformError, Result,
 };
-use runtime::{ControlDeployToken, ControlStore};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use storage::control::{ControlDeployToken, ControlStore};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -19,30 +18,11 @@ pub struct DeployTokenStore {
 }
 
 impl DeployTokenStore {
-    pub async fn load(path: PathBuf) -> Result<Self> {
-        let file_name = path.file_name().and_then(|value| value.to_str());
-        let store_dir = if matches!(file_name, Some("tokens.json" | "deploy-tokens.json")) {
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        } else {
-            path.with_extension("control")
-        };
-        let control = ControlStore::open(store_dir).await?;
-        Self::from_control_store(control, Some(&path)).await
-    }
-
-    pub async fn from_control_store(
-        control: ControlStore,
-        legacy_path: Option<&Path>,
-    ) -> Result<Self> {
-        if let Some(path) = legacy_path {
-            control.import_legacy_tokens(path).await?;
-        }
-        Ok(Self {
+    pub fn from_control_store(control: ControlStore) -> Self {
+        Self {
             control,
             mutation: Arc::new(Mutex::new(())),
-        })
+        }
     }
 
     pub async fn mint(&self, request: DeployTokenMintRequest) -> Result<DeployTokenMintResponse> {
@@ -428,7 +408,6 @@ fn binding_name(binding: &DeployBinding) -> &str {
     match binding {
         DeployBinding::Kv { binding }
         | DeployBinding::Memory { binding }
-        | DeployBinding::Dynamic { binding }
         | DeployBinding::Service { binding, .. } => binding,
     }
 }
@@ -588,6 +567,7 @@ mod tests {
 
         let rejected = DeployRequest {
             config: DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 bindings: vec![DeployBinding::Service {
                     binding: "AUTH".to_string(),
                     service: "other-worker".to_string(),
@@ -637,8 +617,12 @@ mod tests {
             "dd-token-store-test-{}.json",
             Uuid::new_v4().simple()
         ));
-        let control_dir = path.with_extension("control");
-        let store = DeployTokenStore::load(path.clone()).await.expect("store");
+        let control_dir = path;
+        let store = DeployTokenStore::from_control_store(
+            ControlStore::open(&control_dir)
+                .await
+                .expect("control store"),
+        );
         let request = DeployTokenMintRequest {
             name: Some("My-Token-At-Home".to_string()),
             capabilities: caps_for_worker("chat"),
@@ -668,32 +652,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn imports_legacy_tokens_once_and_persists_usage_in_control_db() {
-        let root =
-            std::env::temp_dir().join(format!("dd-token-import-test-{}", Uuid::new_v4().simple()));
-        tokio::fs::create_dir_all(&root).await.expect("test dir");
-        let path = root.join("tokens.json");
-        let raw_token = "legacy-secret";
-        let capabilities = caps_for_worker("chat");
-        let legacy = serde_json::json!({
-            "version": 1,
-            "tokens": [{
-                "id": "legacy",
-                "name": "legacy",
-                "token_hash": token_hash(raw_token),
-                "created_at_unix": 1,
-                "expires_at_unix": null,
-                "max_uses": 2,
-                "uses": 0,
-                "last_used_at_unix": null,
-                "capabilities": capabilities,
-            }]
-        });
-        tokio::fs::write(&path, serde_json::to_vec(&legacy).expect("legacy json"))
+    async fn token_usage_survives_control_store_restart() {
+        let root = std::env::temp_dir().join(format!("dd-token-restart-{}", Uuid::new_v4()));
+        let store = DeployTokenStore::from_control_store(
+            ControlStore::open(&root).await.expect("control store"),
+        );
+        let minted = store
+            .mint(DeployTokenMintRequest {
+                name: Some("deploy-chat".to_string()),
+                max_uses: Some(2),
+                capabilities: caps_for_worker("chat"),
+                ..DeployTokenMintRequest::default()
+            })
             .await
-            .expect("legacy token file");
-
-        let store = DeployTokenStore::load(path.clone()).await.expect("import");
+            .expect("mint token");
         let deploy = DeployRequest {
             name: "chat".to_string(),
             source: "export default {}".to_string(),
@@ -710,35 +682,19 @@ mod tests {
             temporary: false,
         };
         store
-            .authorize_deploy(raw_token, &deploy)
+            .authorize_deploy(&minted.token, &deploy)
             .await
-            .expect("consume legacy token");
+            .expect("consume token");
         drop(store);
-
-        let restored = DeployTokenStore::load(path)
-            .await
-            .expect("restore control db");
-        let metadata = restored.get("legacy").await.expect("legacy metadata");
+        let restored = DeployTokenStore::from_control_store(
+            ControlStore::open(&root).await.expect("reopen control"),
+        );
+        let metadata = restored.get("deploy-chat").await.expect("token metadata");
         assert_eq!(metadata.token.uses, 1);
         assert!(metadata.token.last_used_at_unix.is_some());
-        let _ = tokio::fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn rejects_unrecognized_legacy_token_version() {
-        let root =
-            std::env::temp_dir().join(format!("dd-token-version-test-{}", Uuid::new_v4().simple()));
-        tokio::fs::create_dir_all(&root).await.expect("test dir");
-        let path = root.join("tokens.json");
-        tokio::fs::write(&path, br#"{"version":99,"tokens":[]}"#)
+        tokio::fs::remove_dir_all(root)
             .await
-            .expect("legacy token file");
-        let error = match DeployTokenStore::load(path).await {
-            Ok(_) => panic!("future token format should fail startup"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("format version 99"));
-        let _ = tokio::fs::remove_dir_all(root).await;
+            .expect("remove test store");
     }
 
     #[test]

@@ -28,9 +28,6 @@ export default {
     const url = new URL(request.url);
     const key = userKey(url);
     const memory = env.USER_MEMORY.get(env.USER_MEMORY.idFromName(key));
-    const count = memory.tvar("count", 0);
-    const profile = memory.var("profile");
-    const pings = memory.tvar("pings", 0);
 
     if (url.pathname === "/" && request.method === "GET") {
       return json({
@@ -50,9 +47,9 @@ export default {
       return json({
         ok: true,
         user: key,
-        value: await memory.atomic(() => {
-          const next = Number(count.read()) + 1;
-          count.write(next);
+        value: await memory.atomic((tx) => {
+          const next = Number(tx.get("count") ?? 0) + 1;
+          tx.put("count", next);
           return next;
         }),
       });
@@ -62,7 +59,7 @@ export default {
       return json({
         ok: true,
         user: key,
-        value: await memory.atomic(() => Number(count.read()) || 0),
+        value: await memory.atomic((tx) => Number(tx.get("count") ?? 0)),
       });
     }
 
@@ -73,9 +70,9 @@ export default {
         flags: new Set(["paid", "beta"]),
         prefs: new Map([["theme", "light"]]),
       };
-      const stored = await memory.atomic(() => {
-        profile.write(nextProfile);
-        return profile.read();
+      const stored = await memory.atomic((tx) => {
+        tx.put("profile", nextProfile);
+        return tx.get("profile");
       });
       return json({ ok: true, user: key, profile: stored });
     }
@@ -84,14 +81,14 @@ export default {
       return json({
         ok: true,
         user: key,
-        profile: await memory.atomic(() => profile.read()),
+        profile: await memory.atomic((tx) => tx.get("profile")),
       });
     }
 
     if (url.pathname === "/ping" && request.method === "GET") {
-      return json(await memory.atomic(() => {
-        const next = Number(pings.read()) + 1;
-        pings.write(next);
+      return json(await memory.atomic((tx) => {
+        const next = Number(tx.get("pings") ?? 0) + 1;
+        tx.put("pings", next);
         return {
           ok: true,
           namespaceId: String(memory.id),

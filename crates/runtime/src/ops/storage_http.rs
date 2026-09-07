@@ -115,10 +115,10 @@ pub(crate) struct ResponseChunkEmitResult {
 #[serde]
 pub(crate) async fn op_kv_get(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[string] key: String,
 ) -> KvGetResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let started = Instant::now();
     let store = state.borrow().borrow::<KvStore>().clone();
     let result = match store.get_utf8(&worker_name, &binding, &key).await {
@@ -163,10 +163,10 @@ pub(crate) async fn op_kv_get(
 #[serde]
 pub(crate) async fn op_kv_get_many_utf8(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[serde] keys: Vec<String>,
 ) -> KvGetManyResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let started = Instant::now();
     let store = state.borrow().borrow::<KvStore>().clone();
     let item_count = keys.len() as u64;
@@ -213,10 +213,10 @@ pub(crate) async fn op_kv_get_many_utf8(
 #[serde]
 pub(crate) async fn op_kv_get_value(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[string] key: String,
 ) -> KvGetValueResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let started = Instant::now();
     let store = state.borrow().borrow::<KvStore>().clone();
     let result = match store.get(&worker_name, &binding, &key).await {
@@ -265,12 +265,6 @@ pub(crate) fn op_kv_profile_record_js(
 ) {
     let kind = match metric.as_str() {
         "js_request_total" => KvProfileMetricKind::JsRequestTotal,
-        "js_batch_flush" => KvProfileMetricKind::JsBatchFlush,
-        "kv_cache_hit" => KvProfileMetricKind::JsCacheHit,
-        "kv_cache_miss" => KvProfileMetricKind::JsCacheMiss,
-        "kv_cache_stale" => KvProfileMetricKind::JsCacheStale,
-        "kv_cache_fill" => KvProfileMetricKind::JsCacheFill,
-        "kv_cache_invalidate" => KvProfileMetricKind::JsCacheInvalidate,
         _ => return,
     };
     let store = state.borrow::<KvStore>().clone();
@@ -294,21 +288,15 @@ pub(crate) fn op_kv_profile_reset(state: &mut OpState) {
     store.reset_profile();
 }
 
-#[deno_core::op2(fast)]
-pub(crate) fn op_kv_take_failed_write_version(state: &mut OpState, #[bigint] version: i64) -> bool {
-    let store = state.borrow::<KvStore>().clone();
-    store.take_failed_write_version(version)
-}
-
 #[deno_core::op2]
 #[serde]
 pub(crate) async fn op_kv_put(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[string] key: String,
     #[string] value: String,
 ) -> KvOpResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.put(&worker_name, &binding, &key, &value).await {
         Ok(version) => KvOpResult {
@@ -328,12 +316,12 @@ pub(crate) async fn op_kv_put(
 #[serde]
 pub(crate) async fn op_kv_put_value_bytes(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[string] key: String,
     #[string] encoding: String,
     #[buffer] value: JsBuffer,
 ) -> KvOpResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let value = Bytes::copy_from_slice(value.as_ref());
     let store = state.borrow().borrow::<KvStore>().clone();
     match store
@@ -357,10 +345,10 @@ pub(crate) async fn op_kv_put_value_bytes(
 #[serde]
 pub(crate) async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[string] key: String,
 ) -> KvOpResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
     match store.delete(&worker_name, &binding, &key).await {
         Ok(version) => KvOpResult {
@@ -378,113 +366,13 @@ pub(crate) async fn op_kv_delete(
 
 #[deno_core::op2]
 #[serde]
-pub(crate) fn op_kv_enqueue_put(
-    state: &mut OpState,
-    #[string] worker_name: String,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] value: String,
-) -> KvOpResult {
-    let store = state.borrow::<KvStore>().clone();
-    match store.enqueue_batch_versions(
-        &worker_name,
-        &binding,
-        &[KvBatchMutation {
-            key,
-            value: value.into_bytes(),
-            encoding: "utf8".to_string(),
-            deleted: false,
-        }],
-    ) {
-        Ok(versions) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: versions.first().copied(),
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(crate) fn op_kv_enqueue_put_value_bytes(
-    state: &mut OpState,
-    #[string] worker_name: String,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] encoding: String,
-    #[buffer] value: JsBuffer,
-) -> KvOpResult {
-    let value = Bytes::copy_from_slice(value.as_ref());
-    let store = state.borrow::<KvStore>().clone();
-    match store.enqueue_batch_versions(
-        &worker_name,
-        &binding,
-        &[KvBatchMutation {
-            key,
-            value: value.to_vec(),
-            encoding,
-            deleted: false,
-        }],
-    ) {
-        Ok(versions) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: versions.first().copied(),
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(crate) fn op_kv_enqueue_delete(
-    state: &mut OpState,
-    #[string] worker_name: String,
-    #[string] binding: String,
-    #[string] key: String,
-) -> KvOpResult {
-    let store = state.borrow::<KvStore>().clone();
-    match store.enqueue_batch_versions(
-        &worker_name,
-        &binding,
-        &[KvBatchMutation {
-            key,
-            value: Vec::new(),
-            encoding: "utf8".to_string(),
-            deleted: true,
-        }],
-    ) {
-        Ok(versions) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: versions.first().copied(),
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_list(
     state: Rc<RefCell<OpState>>,
-    #[string] worker_name: String,
     #[string] binding: String,
     #[string] prefix: String,
     limit: u32,
 ) -> KvListResult {
+    let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
     let clamped_limit = limit.clamp(1, 1000) as usize;
     match store
@@ -518,7 +406,6 @@ pub(crate) async fn op_kv_list(
 #[serde]
 pub(crate) async fn op_cache_match(
     state: Rc<RefCell<OpState>>,
-    request_context_handle: u32,
     #[string] cache_name: String,
     #[string] method: String,
     #[string] url: String,
@@ -537,18 +424,6 @@ pub(crate) async fn op_cache_match(
         headers,
         bypass_stale,
     };
-    if let Err(error) = ensure_cache_allowed(&state, request_context_handle) {
-        return CacheMatchResult {
-            ok: false,
-            found: false,
-            stale: false,
-            should_revalidate: false,
-            status: 0,
-            headers_handle: 0,
-            body_handle: 0,
-            error,
-        };
-    }
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.get(&request).await {
         Ok(CacheLookup::Fresh(response)) => cache_match_hit_result(&state, response, false, false),
@@ -620,7 +495,6 @@ fn cache_match_hit_result(
 #[serde]
 pub(crate) async fn op_cache_put(
     state: Rc<RefCell<OpState>>,
-    request_context_handle: u32,
     #[string] cache_name: String,
     #[string] method: String,
     #[string] url: String,
@@ -629,13 +503,6 @@ pub(crate) async fn op_cache_put(
     response_headers_handle: u32,
     response_body_handle: u32,
 ) -> KvOpResult {
-    if let Err(error) = ensure_cache_allowed(&state, request_context_handle) {
-        return KvOpResult {
-            ok: false,
-            error,
-            version: None,
-        };
-    }
     let (request_headers, response_headers, body) = {
         let mut op_state = state.borrow_mut();
         let request_headers = op_state
@@ -683,7 +550,6 @@ pub(crate) async fn op_cache_put(
 #[serde]
 pub(crate) async fn op_cache_delete(
     state: Rc<RefCell<OpState>>,
-    request_context_handle: u32,
     #[string] cache_name: String,
     #[string] method: String,
     #[string] url: String,
@@ -701,13 +567,6 @@ pub(crate) async fn op_cache_delete(
         headers,
         bypass_stale: false,
     };
-    if let Err(error) = ensure_cache_allowed(&state, request_context_handle) {
-        return CacheDeleteResult {
-            ok: false,
-            deleted: false,
-            error,
-        };
-    }
 
     let store = state.borrow().borrow::<CacheStore>().clone();
     match store.delete(&request).await {
@@ -722,27 +581,6 @@ pub(crate) async fn op_cache_delete(
             error: error.to_string(),
         },
     }
-}
-
-fn ensure_cache_allowed(
-    state: &Rc<RefCell<OpState>>,
-    request_context_handle: u32,
-) -> std::result::Result<(), String> {
-    if request_context_handle == 0 {
-        return Ok(());
-    }
-    let allowed = {
-        let state_ref = state.borrow();
-        state_ref
-            .borrow::<RequestSecretContexts>()
-            .get(request_context_handle)
-            .map(|context| context.execution.allow_cache)
-            .unwrap_or(true)
-    };
-    if allowed {
-        return Ok(());
-    }
-    Err("dynamic child policy blocks cache access".to_string())
 }
 
 fn scoped_cache_name(state: &Rc<RefCell<OpState>>, cache_name: &str) -> String {
@@ -823,73 +661,36 @@ pub(crate) async fn prepare_http_fetch_request(
         return Err("host fetch request canceled".to_string());
     }
 
-    let method_raw = replace_placeholders_text(method, execution.replacements.as_ref());
-    let method = reqwest::Method::from_bytes(method_raw.trim().to_ascii_uppercase().as_bytes())
+    let method = reqwest::Method::from_bytes(method.trim().to_ascii_uppercase().as_bytes())
         .map_err(|error| format!("invalid host fetch method: {error}"))?;
 
-    let url = replace_placeholders_text(url, execution.replacements.as_ref());
     let parsed_url =
-        reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
+        reqwest::Url::parse(url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     if !is_egress_url_allowed(&parsed_url, execution.egress_allow_hosts.as_ref()) {
-        record_egress_deny(state, &execution);
         return Err(format!(
             "egress origin is not allowed: {}",
             parsed_url.origin().ascii_serialization()
         ));
-    }
-    if let Some(quota_state) = &execution.dynamic_quota_state {
-        let next = quota_state
-            .outbound_requests
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        if execution
-            .max_outbound_requests
-            .map(|limit| next > limit)
-            .unwrap_or(false)
-        {
-            quota_state.quota_kill_count.fetch_add(1, Ordering::Relaxed);
-            state
-                .borrow()
-                .borrow::<DynamicProfile>()
-                .record_quota_kill();
-            let command_sender = state
-                .borrow()
-                .borrow::<crate::service::RuntimeFastCommandSender>()
-                .clone();
-            let _ =
-                command_sender
-                    .0
-                    .try_send(crate::service::RuntimeCommand::RetireDynamicWorker {
-                        worker_name: execution.worker_name.as_ref().to_string(),
-                        reason: "dynamic child exceeded max_outbound_requests".to_string(),
-                    });
-            return Err("dynamic child exceeded max_outbound_requests".to_string());
-        }
     }
     let resolved = resolve_egress_target(
         &parsed_url,
         execution.egress_allow_hosts.as_ref(),
         &SystemEgressDnsResolver,
     )
-    .await
-    .inspect_err(|_| record_egress_deny(state, &execution))?;
+    .await?;
 
     let headers = headers
         .into_iter()
         .filter_map(|(name, value)| {
-            let normalized_name = replace_placeholders_text(&name, execution.replacements.as_ref());
-            let normalized_value =
-                replace_placeholders_text(&value, execution.replacements.as_ref());
-            let trimmed = normalized_name.trim().to_string();
+            let trimmed = name.trim().to_string();
             if trimmed.eq_ignore_ascii_case("host")
                 || trimmed.eq_ignore_ascii_case("content-length")
             {
                 return None;
             }
-            Some((trimmed, normalized_value))
+            Some((trimmed, value))
         })
         .collect::<Vec<_>>();
-    let body = replace_placeholders_in_body(body, execution.replacements.as_ref());
     let client_rid = install_pinned_http_client(state, resolved)?;
 
     Ok((
@@ -913,30 +714,16 @@ pub(crate) async fn check_http_fetch_url(
         canceled_notify.notify_waiters();
         return Err("host fetch request canceled".to_string());
     }
-    let url = replace_placeholders_text(url, execution.replacements.as_ref());
     let parsed_url =
-        reqwest::Url::parse(&url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
+        reqwest::Url::parse(url).map_err(|error| format!("invalid host fetch URL: {error}"))?;
     let resolved = resolve_egress_target(
         &parsed_url,
         execution.egress_allow_hosts.as_ref(),
         &SystemEgressDnsResolver,
     )
-    .await
-    .inspect_err(|_| record_egress_deny(state, &execution))?;
+    .await?;
     let client_rid = install_pinned_http_client(state, resolved)?;
     Ok((parsed_url.to_string(), client_rid))
-}
-
-fn record_egress_deny(state: &Rc<RefCell<OpState>>, execution: &RequestExecutionContext) {
-    if let Some(quota_state) = &execution.dynamic_quota_state {
-        quota_state
-            .egress_deny_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    state
-        .borrow()
-        .borrow::<DynamicProfile>()
-        .record_egress_deny();
 }
 
 async fn resolve_egress_target(
@@ -1327,6 +1114,17 @@ pub(crate) fn op_emit_response_start(
     );
 }
 
+struct BufferedResponseChunk {
+    bytes: Bytes,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for BufferedResponseChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
 #[deno_core::op2]
 #[serde]
 pub(crate) async fn op_emit_response_chunk(
@@ -1334,46 +1132,71 @@ pub(crate) async fn op_emit_response_chunk(
     completion_handle: u32,
     #[buffer] chunk: JsBuffer,
 ) -> ResponseChunkEmitResult {
-    let context = {
-        let op_state = state.borrow();
-        active_request_context_for_completion(&op_state, completion_handle)
-    };
-    let Some(context) = context else {
-        return ResponseChunkEmitResult {
-            ok: false,
-            error: "request context handle is unavailable".to_string(),
+    let result = async {
+        let (context, limits, canceled, canceled_notify) = {
+            let op_state = state.borrow();
+            let context = active_request_context_for_completion(&op_state, completion_handle)
+                .ok_or_else(|| PlatformError::runtime("response request context is unavailable"))?;
+            let request = op_state.borrow::<RequestSecretContexts>()
+                .get(context.request_context_handle)
+                .ok_or_else(|| PlatformError::runtime("response request context is unavailable"))?;
+            (
+                context,
+                op_state.borrow::<RuntimeExecutionLimits>().clone(),
+                Arc::clone(&request.canceled),
+                Arc::clone(&request.canceled_notify),
+            )
         };
-    };
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::ResponseChunk {
-            request_id: context.request_id,
-            completion_token: context.completion_token,
-            chunk: Bytes::copy_from_slice(chunk.as_ref()),
-            reply: reply_tx,
-        },
-    )
-    .is_err()
-    {
-        return ResponseChunkEmitResult {
-            ok: false,
-            error: "runtime response stream is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(())) => ResponseChunkEmitResult {
+        let cancellation = canceled_notify.notified();
+        tokio::pin!(cancellation);
+        cancellation.as_mut().enable();
+        let chunk_size = limits.max_buffered_response_bytes.min(64 * 1024);
+        for bytes in chunk.as_ref().chunks(chunk_size) {
+            if canceled.load(Ordering::SeqCst) {
+                return Err(PlatformError::runtime("response request was canceled"));
+            }
+            let permit = tokio::select! {
+                biased;
+                _ = &mut cancellation => return Err(PlatformError::runtime("response request was canceled")),
+                permit = Arc::clone(&limits.response_byte_budget).acquire_many_owned(bytes.len() as u32) => {
+                    permit.map_err(|_| PlatformError::internal("response byte budget closed"))?
+                }
+            };
+            if canceled.load(Ordering::SeqCst) {
+                return Err(PlatformError::runtime("response request was canceled"));
+            }
+            let chunk = Bytes::from_owner(BufferedResponseChunk {
+                bytes: Bytes::copy_from_slice(bytes),
+                _permit: permit,
+            });
+            let (reply_tx, reply_rx) = oneshot::channel();
+            emit_isolate_event_from_rc(
+                &state,
+                IsolateEventPayload::ResponseChunk {
+                    request_id: context.request_id.clone(),
+                    completion_token: context.completion_token.clone(),
+                    chunk,
+                    reply: reply_tx,
+                },
+            ).map_err(|_| PlatformError::internal("runtime response stream is unavailable"))?;
+            tokio::select! {
+                biased;
+                _ = &mut cancellation => return Err(PlatformError::runtime("response request was canceled")),
+                result = reply_rx => {
+                    result.map_err(|_| PlatformError::internal("response stream acknowledgment channel closed"))??;
+                }
+            }
+        }
+        Ok(())
+    }.await;
+    match result {
+        Ok(()) => ResponseChunkEmitResult {
             ok: true,
             error: String::new(),
         },
-        Ok(Err(error)) => ResponseChunkEmitResult {
+        Err(error) => ResponseChunkEmitResult {
             ok: false,
             error: error.to_string(),
-        },
-        Err(_) => ResponseChunkEmitResult {
-            ok: false,
-            error: "response stream acknowledgment channel closed".to_string(),
         },
     }
 }
@@ -1399,36 +1222,6 @@ pub(crate) fn op_emit_cache_revalidate(
             headers,
         }),
     );
-}
-
-pub(crate) fn replace_placeholders_text(
-    value: &str,
-    replacements: &HashMap<String, String>,
-) -> String {
-    if replacements.is_empty() {
-        return value.to_string();
-    }
-    let mut output = value.to_string();
-    for (placeholder, secret) in replacements {
-        if placeholder.is_empty() {
-            continue;
-        }
-        output = output.replace(placeholder, secret);
-    }
-    output
-}
-
-pub(crate) fn replace_placeholders_in_body(
-    body: Vec<u8>,
-    replacements: &HashMap<String, String>,
-) -> Vec<u8> {
-    if replacements.is_empty() || body.is_empty() {
-        return body;
-    }
-    match String::from_utf8(body) {
-        Ok(value) => replace_placeholders_text(&value, replacements).into_bytes(),
-        Err(error) => error.into_bytes(),
-    }
 }
 
 pub(crate) fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[EgressAllowHost]) -> bool {

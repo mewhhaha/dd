@@ -62,9 +62,8 @@ Run the workflow manually to redeploy the current `main` commit.
 
 ## Notes
 
-- the room uses smaller transactional vars (`room_id`, `next_seq`, `messages`, `participants`, `connections`) instead of one monolithic room blob
-- `room.atomic(...)` is the retryable STM region; `room.tvar("key", default)` gives lazy defaults without persisting on read
-- the room accepts sockets transactionally with `room.accept(request)` and then uses handle-backed `new WebSocket(handle)` objects for send/close behavior
-- `room.defer(...)` is still available for arbitrary post-commit work, but ordinary websocket sends are staged automatically inside `atomic(...)`
+- the room stores `room_id`, `next_seq`, `messages`, `participants`, and `connections` as separate keys
+- `room.atomic(tx => ...)` runs a synchronous transaction with explicit `tx.get` and `tx.put` operations
+- `tx.accept(request)` accepts a socket; `tx.sockets.send` and `tx.sockets.close` commit socket effects with the room state
 - `/assets/fixi.js` and `/assets/ext-fixi-ws.js` are served by the deploy-time asset bundle, not hand-routed in worker code
 - this simplified version keeps the last 200 messages per room

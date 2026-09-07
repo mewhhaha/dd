@@ -1,3 +1,4 @@
+import type { DdKvNamespace, DdMemoryNamespace, DdMemoryStub } from "@mewhhaha/vite-plugin-dd";
 import { Context, Effect, Either, Layer, Schedule, Schema } from "effect";
 import { internalError, tooManyRequests, unauthorized, type AppError } from "./errors";
 import { sessionCookie } from "./http";
@@ -125,14 +126,13 @@ export const StorageLive = Layer.effect(Storage, Effect.gen(function* () {
     return Effect.tryPromise({
       try: async () => {
         const shard = env.AUTH_STATE.get(env.AUTH_STATE.idFromName(`rate:${label}:${clientFingerprint(request)}`));
-        return await shard.atomic(() => {
+        return await shard.atomic((tx) => {
           const now = Date.now();
-          const state = shard.tvar<RateState>("attempts", { count: 0, resetAt: now + RATE_WINDOW_MS });
-          const current = normalizeRateState(state.read(), now);
+          const current = normalizeRateState(tx.get("attempts"), now);
           if (current.count >= RATE_LIMIT && now < current.resetAt) {
             return false;
           }
-          state.write({
+          tx.put("attempts", {
             count: now >= current.resetAt ? 1 : current.count + 1,
             resetAt: now >= current.resetAt ? now + RATE_WINDOW_MS : current.resetAt,
           });
@@ -150,8 +150,8 @@ export const StorageLive = Layer.effect(Storage, Effect.gen(function* () {
       try: async () => {
         const now = Date.now();
         const shard = challengeShard(env.AUTH_STATE, request);
-        await shard.atomic(() => {
-          shard.tvar<PendingChallenge | null>("challenge", null).write({
+        await shard.atomic((tx) => {
+          tx.put("challenge", {
             ...challenge,
             createdAt: now,
             expiresAt: now + CHALLENGE_TTL_MS,
@@ -166,10 +166,9 @@ export const StorageLive = Layer.effect(Storage, Effect.gen(function* () {
     return Effect.tryPromise({
       try: async () => {
         const shard = challengeShard(env.AUTH_STATE, request);
-        return await shard.atomic(() => {
-          const state = shard.tvar<PendingChallenge | null>("challenge", null);
-          const challenge = state.read();
-          state.write(null);
+        return await shard.atomic((tx) => {
+          const challenge = tx.get<PendingChallenge>("challenge");
+          tx.delete("challenge");
           return challenge;
         });
       },
@@ -249,21 +248,21 @@ export function updateCredential(user: User, credential: PasskeyCredential): Use
   };
 }
 
-function kvGet(db: KvNamespace, key: string): Effect.Effect<unknown | null, AppError> {
+function kvGet(db: DdKvNamespace, key: string): Effect.Effect<unknown | null, AppError> {
   return retryStorage(Effect.tryPromise({
     try: () => db.get(key),
     catch: (error) => internalError(`KV get failed for ${key}: ${String(error)}`),
   }));
 }
 
-function kvPut(db: KvNamespace, key: string, value: string): Effect.Effect<void, AppError> {
+function kvPut(db: DdKvNamespace, key: string, value: string): Effect.Effect<void, AppError> {
   return retryStorage(Effect.tryPromise({
     try: () => Promise.resolve(db.put(key, value)),
     catch: (error) => internalError(`KV put failed for ${key}: ${String(error)}`),
   }));
 }
 
-function kvDelete(db: KvNamespace, key: string): Effect.Effect<void, AppError> {
+function kvDelete(db: DdKvNamespace, key: string): Effect.Effect<void, AppError> {
   return retryStorage(Effect.tryPromise({
     try: () => Promise.resolve(db.delete(key)),
     catch: (error) => internalError(`KV delete failed for ${key}: ${String(error)}`),
@@ -274,7 +273,7 @@ function retryStorage<A>(effect: Effect.Effect<A, AppError>): Effect.Effect<A, A
   return effect.pipe(Effect.retry(STORAGE_RETRY));
 }
 
-function challengeShard(memory: MemoryNamespace, request: Request): MemoryShard {
+function challengeShard(memory: DdMemoryNamespace, request: Request): DdMemoryStub {
   return memory.get(memory.idFromName(`challenge:${clientFingerprint(request)}`));
 }
 

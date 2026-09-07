@@ -1,4 +1,4 @@
-mod invocation;
+pub(crate) mod invocation;
 mod observability;
 mod routing;
 mod util;
@@ -13,10 +13,9 @@ use bytes::Bytes;
 use common::{
     DeployBinding, DeployInternalConfig, DeployRequest, DeployResponse, DeployTokenDeleteResponse,
     DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
-    DeployTokenMintResponse, DeploymentInspectResponse, DeploymentListResponse,
-    DynamicDeployRequest, DynamicDeployResponse, ErrorBody, ErrorKind, PlatformError,
-    RollbackRequest, RollbackResponse, UndeployResponse, WorkerInvocation, WorkerNameRequest,
-    WorkerOutput,
+    DeployTokenMintResponse, DeploymentInspectResponse, DeploymentListResponse, ErrorBody,
+    ErrorKind, PlatformError, RollbackRequest, RollbackResponse, UndeployResponse,
+    WorkerInvocation, WorkerNameRequest, WorkerOutput,
 };
 use futures_util::StreamExt;
 #[cfg(feature = "websocket")]
@@ -193,8 +192,6 @@ pub(crate) fn request_body_not_supported(method: &Method) -> PlatformError {
 
 #[cfg(all(test, not(feature = "websocket")))]
 use self::invocation::build_public_request_url;
-#[cfg(feature = "http3")]
-pub use self::invocation::invoke_worker_public_h3;
 #[cfg(any(feature = "websocket", test))]
 use self::invocation::parse_invoke_request_uri;
 #[cfg(test)]
@@ -206,8 +203,6 @@ pub(crate) use self::invocation::{
 pub use self::invocation::{invoke_worker_private, invoke_worker_public};
 #[cfg(test)]
 pub(crate) use self::routing::deploy_worker;
-#[cfg(feature = "http3")]
-pub use self::routing::handle_public_h3_request;
 pub use self::routing::{handle_private_request, handle_public_request};
 #[cfg(feature = "websocket")]
 use self::util::empty_body;
@@ -222,11 +217,6 @@ use self::util::{
 use self::websocket::{
     PreparedWebSocketUpgrade, invoke_worker_websocket_private, invoke_worker_websocket_public,
     is_websocket_upgrade, prepare_websocket_upgrade,
-};
-#[cfg(feature = "http3")]
-pub(crate) use self::websocket::{
-    handle_websocket_session, open_transport_session_from_parts, open_websocket_session_from_parts,
-    sanitize_websocket_handshake_headers,
 };
 #[cfg(test)]
 mod tests {
@@ -390,19 +380,6 @@ mod tests {
         let bindings = vec![DeployBinding::Memory {
             binding: String::new(),
         }];
-        assert!(validate_deploy_bindings(&bindings).is_err());
-    }
-
-    #[test]
-    fn dynamic_binding_name_collision_is_rejected() {
-        let bindings = vec![
-            DeployBinding::Kv {
-                binding: "SHARED".to_string(),
-            },
-            DeployBinding::Dynamic {
-                binding: "SHARED".to_string(),
-            },
-        ];
         assert!(validate_deploy_bindings(&bindings).is_err());
     }
 

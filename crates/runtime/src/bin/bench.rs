@@ -1,8 +1,6 @@
 use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
-use serde_json::from_slice;
 use std::fmt::Write as _;
-use std::future::Future;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -71,101 +69,6 @@ struct WebSocketBenchResult {
     roundtrip: ScenarioResult,
 }
 
-struct DynamicBenchResult {
-    cold_rounds: usize,
-    baseline_fetch: ScenarioResult,
-    hot_fetch: ScenarioResult,
-    hot_fetch_metrics: DynamicBenchMetrics,
-    hot_fetch_host_rpc: ScenarioResult,
-    hot_fetch_host_rpc_metrics: DynamicBenchMetrics,
-    cold_create_invoke: Distribution,
-    cold_create_invoke_metrics: DynamicBenchMetrics,
-}
-
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-struct DynamicBenchMetrics {
-    #[serde(default, rename = "handleCacheHit")]
-    handle_cache_hit: usize,
-    #[serde(default, rename = "handleCacheMiss")]
-    handle_cache_miss: usize,
-    #[serde(default, rename = "sourceCacheHit")]
-    source_cache_hit: usize,
-    #[serde(default, rename = "sourceCacheMiss")]
-    source_cache_miss: usize,
-    #[serde(default, rename = "warm_isolate_hit")]
-    warm_isolate_hit: usize,
-    #[serde(default, rename = "fallback_dispatch")]
-    fallback_dispatch: usize,
-    #[serde(default, rename = "async_reply_completion")]
-    async_reply_completion: usize,
-    #[serde(
-        default,
-        rename = "provider_task_callback",
-        alias = "local_host_rpc_callback"
-    )]
-    provider_task_callback: usize,
-    #[serde(default, rename = "reply_drain_batch")]
-    reply_drain_batch: usize,
-    #[serde(default, rename = "reply_drain_item")]
-    reply_drain_item: usize,
-    #[serde(default, rename = "provider_task_drain_batch")]
-    provider_task_drain_batch: usize,
-    #[serde(default, rename = "provider_task_drain_item")]
-    provider_task_drain_item: usize,
-    #[serde(default, rename = "control_drain_batch")]
-    control_drain_batch: usize,
-    #[serde(default, rename = "control_drain_item")]
-    control_drain_item: usize,
-    #[serde(default, rename = "direct_fetch_fast_path_hit")]
-    direct_fetch_fast_path_hit: usize,
-    #[serde(default, rename = "direct_fetch_fast_path_fallback")]
-    direct_fetch_fast_path_fallback: usize,
-    #[serde(default, rename = "remoteFetchHit")]
-    remote_fetch_hit: usize,
-    #[serde(default, rename = "remoteFetchFallback")]
-    remote_fetch_fallback: usize,
-    #[serde(default, rename = "fastFetchPathHit")]
-    fast_fetch_path_hit: usize,
-    #[serde(default, rename = "fastFetchPathFallback")]
-    fast_fetch_path_fallback: usize,
-    #[serde(default, rename = "normalizeFastPathHit")]
-    normalize_fast_path_hit: usize,
-    #[serde(default, rename = "normalizeSlowPathHit")]
-    normalize_slow_path_hit: usize,
-    #[serde(default, rename = "timeSyncApplied")]
-    time_sync_applied: usize,
-    #[serde(default, rename = "timeSyncSkipped")]
-    time_sync_skipped: usize,
-    #[serde(default, rename = "jsRequestNormalizeCount")]
-    js_request_normalize_count: usize,
-    #[serde(default, rename = "jsRequestNormalizeTotalMs")]
-    js_request_normalize_total_ms: f64,
-    #[serde(default, rename = "dynamicStartOpCount")]
-    dynamic_start_op_count: usize,
-    #[serde(default, rename = "dynamicStartOpTotalMs")]
-    dynamic_start_op_total_ms: f64,
-    #[serde(default, rename = "replyMaterializeCount")]
-    reply_materialize_count: usize,
-    #[serde(default, rename = "replyMaterializeTotalMs")]
-    reply_materialize_total_ms: f64,
-    #[serde(default, rename = "timeSyncCount")]
-    time_sync_count: usize,
-    #[serde(default, rename = "timeSyncTotalMs")]
-    time_sync_total_ms: f64,
-    #[serde(default, rename = "dynamicControlDrainCount")]
-    dynamic_control_drain_count: usize,
-    #[serde(default, rename = "dynamicControlDrainTotalMs")]
-    dynamic_control_drain_total_ms: f64,
-    #[serde(default, rename = "direct_fetch_dispatch_us")]
-    direct_fetch_dispatch_us: usize,
-    #[serde(default, rename = "direct_fetch_dispatch_count")]
-    direct_fetch_dispatch_count: usize,
-    #[serde(default, rename = "direct_fetch_child_execute_us")]
-    direct_fetch_child_execute_us: usize,
-    #[serde(default, rename = "direct_fetch_child_execute_count")]
-    direct_fetch_child_execute_count: usize,
-}
-
 struct Distribution {
     mean_ms: f64,
     p50_ms: f64,
@@ -188,19 +91,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
-}
-
-fn bench_progress(label: &str) {
-    let enabled = std::env::var("DD_BENCH_VERBOSE_PROGRESS")
-        .ok()
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes"
-        })
-        .unwrap_or(false);
-    if enabled {
-        println!("bench-progress    {}", label);
-    }
 }
 
 fn bench_marker(config: &str, section: &str, scenario: &str, phase: &str) {
@@ -240,27 +130,21 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  cargo run -p runtime --bin bench --release");
-    println!("  DD_BENCH_ONLY=dynamic cargo run -p runtime --bin bench --release");
     println!();
     println!("This benchmark is configured with environment variables, not CLI flags.");
     println!();
     println!("Core env:");
     println!(
-        "  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, dynamic, lifecycle, kv-writes"
+        "  DD_BENCH_ONLY                  comma-separated sections: steady-state, websocket, lifecycle, kv-writes"
     );
     println!(
         "  DD_BENCH_CONFIG                comma-separated configs: single-isolate, autoscaling-8, fly-production"
     );
     println!("  DD_BENCH_SCENARIO              comma-separated steady-state scenarios by name");
-    println!("  DD_BENCH_VERBOSE_PROGRESS      print dynamic benchmark progress markers");
     println!("  DD_BENCH_PROGRESS_MARKERS      print machine-parseable lifecycle markers");
     println!("  DD_BENCH_WS_SESSIONS           websocket sessions (default 24)");
     println!("  DD_BENCH_WS_MESSAGES_PER_SESSION websocket messages per session (default 24)");
-    println!("  DD_BENCH_DYNAMIC_REQUESTS      dynamic requests per hot scenario (default 500)");
-    println!("  DD_BENCH_DYNAMIC_CONCURRENCY   dynamic concurrency (default 64)");
-    println!("  DD_BENCH_DYNAMIC_COLD_ROUNDS   dynamic create+invoke rounds (default 50)");
     println!("  DD_BENCH_COLD_ROUNDS           lifecycle cold-start rounds (default 40)");
-    println!("  DD_BENCH_TIMEOUT_MS            dynamic stage timeout (default 15000)");
 }
 
 #[tokio::main]
@@ -490,90 +374,6 @@ export default {
             println!();
         }
 
-        if section_enabled("dynamic") {
-            println!("== dynamic: {} ==", config.name);
-            let dynamic_tag = format!("{}-dynamic", config.name);
-            let baseline_tag = format!("{}-dynamic-baseline", config.name);
-            bench_progress("dynamic service start");
-            let baseline_service = start_service(&baseline_tag, config.runtime.clone())
-                .await
-                .map_err(|error| error.to_string())?;
-            let baseline_fetch = run_dynamic_baseline_fetch(&baseline_service)
-                .await
-                .map_err(|error| error.to_string())?;
-            baseline_service
-                .shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
-            let dynamic_service = start_service(&dynamic_tag, config.runtime.clone())
-                .await
-                .map_err(|error| error.to_string())?;
-            bench_progress("dynamic service ready");
-            let dynamic = match run_dynamic_bench(&dynamic_service, baseline_fetch).await {
-                Ok(dynamic) => dynamic,
-                Err(error) => {
-                    println!(
-                        "dynamic-final      config={} status=error error={}",
-                        config.name, error
-                    );
-                    return Err(error.to_string());
-                }
-            };
-            println!(
-                "{}",
-                format_scenario_result("dynamic-baseline", &dynamic.baseline_fetch)
-            );
-            println!(
-                "{}",
-                format_scenario_result("dynamic-hot-fetch", &dynamic.hot_fetch)
-            );
-            println!(
-                "{}",
-                format_dynamic_metrics_result("dynamic-hot-fetch", &dynamic.hot_fetch_metrics,)
-            );
-            println!(
-                "{}",
-                format_scenario_result("dynamic-hot-fetch-host-rpc", &dynamic.hot_fetch_host_rpc)
-            );
-            println!(
-                "{}",
-                format_dynamic_metrics_result(
-                    "dynamic-hot-fetch-host-rpc",
-                    &dynamic.hot_fetch_host_rpc_metrics,
-                )
-            );
-            println!(
-                "{}",
-                format_distribution_result(
-                    "dynamic-create+invoke",
-                    dynamic.cold_rounds,
-                    dynamic.cold_create_invoke,
-                )
-            );
-            println!(
-                "{}",
-                format_dynamic_metrics_result(
-                    "dynamic-create+invoke",
-                    &dynamic.cold_create_invoke_metrics,
-                )
-            );
-            println!(
-                "{}",
-                format_dynamic_gap_result(
-                    &dynamic.baseline_fetch,
-                    &dynamic.hot_fetch,
-                    &dynamic.hot_fetch_host_rpc,
-                )
-            );
-            println!("dynamic-final      config={} status=ok", config.name);
-            dynamic_service
-                .shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
-            bench_marker(config.name, "dynamic", "dynamic", "shutdown-end");
-            println!();
-        }
-
         if matches!(config.name, "autoscaling-8" | "fly-production") && section_enabled("lifecycle")
         {
             println!("== lifecycle: {} ==", config.name);
@@ -697,7 +497,6 @@ fn print_benchmark_list(configs: &[BenchConfig], scenarios: &[Scenario]) {
             );
         }
         println!("section websocket config={}", config.name);
-        println!("section dynamic config={}", config.name);
         if matches!(config.name, "autoscaling-8" | "fly-production") {
             println!("section lifecycle config={}", config.name);
             println!("section kv-writes config={}", config.name);
@@ -732,19 +531,16 @@ export function openSocket(state, payload) {
 }
 
 export async function onSocketMessage(stub, event) {
-  const socket = new WebSocket(event.handle);
-  if (typeof event.data === "string") {
-    socket.send(`echo:${event.data}`);
-    return;
-  }
-
-  socket.send(event.data, "binary");
+  await stub.atomic((tx) => {
+    const payload = typeof event.data === "string" ? `echo:${event.data}` : event.data;
+    tx.sockets.send(event.handle, payload);
+  });
 }
 
 export default {
   async fetch(request, env) {
     const memory = env.BENCH_MEMORY.get(env.BENCH_MEMORY.idFromName("global"));
-    return await memory.atomic(openSocket, { request });
+    return await memory.atomic((tx) => openSocket(tx, { request }));
   },
 
   async wake(event, _env) {
@@ -755,258 +551,40 @@ export default {
 };
 "#;
 
-const DYNAMIC_BENCH_PLAIN_WORKER_SOURCE: &str = r#"
-let hotChild = null;
-
-function childConfig(label) {
-  return {
-    entrypoint: "worker.js",
-    modules: {
-      "worker.js": "let count = 0; export default { async fetch() { count += 1; return new Response(String(count)); } };",
-    },
-    env: {
-      LABEL: label,
-    },
-    timeout: 5_000,
-  };
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/__dynamic_metrics") {
-      const jsMetrics = globalThis.__dd_dynamic_metrics ?? {};
-      const rustProfile = Deno.core.ops.op_dynamic_profile_take?.() ?? null;
-      return Response.json({
-        ...jsMetrics,
-        ...(rustProfile?.snapshot ?? {}),
-      });
-    }
-
-    if (url.pathname === "/__dynamic_metrics_reset") {
-      const metrics = globalThis.__dd_dynamic_metrics ?? null;
-      if (metrics && typeof metrics === "object") {
-        for (const key of Object.keys(metrics)) {
-          metrics[key] = 0;
-        }
-      }
-      Deno.core.ops.op_dynamic_profile_reset?.();
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/hot") {
-      if (!hotChild) {
-        hotChild = await env.SANDBOX.get("bench:v1", async () => childConfig("hot"));
-      }
-      return hotChild.fetch("http://worker/");
-    }
-
-    if (url.pathname === "/hot_get") {
-      const child = await env.SANDBOX.get("bench:v1", async () => childConfig("hot"));
-      return child.fetch("http://worker/");
-    }
-
-    if (url.pathname === "/cold") {
-      const id = url.searchParams.get("id") ?? "cold";
-      const child = await env.SANDBOX.get(`bench:${id}`, async () => childConfig(id));
-      return child.fetch("http://worker/");
-    }
-
-    return new Response("not found", { status: 404 });
-  },
-};
-"#;
-
-const DYNAMIC_BENCH_BASELINE_WORKER_SOURCE: &str = r#"
-let count = 0;
-
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname === "/hot" || url.pathname === "/hot_get") {
-      count += 1;
-      return new Response(String(count));
-    }
-    return new Response("not found", { status: 404 });
-  },
-};
-"#;
-
-const DYNAMIC_BENCH_HOST_RPC_WORKER_SOURCE: &str = r#"
-let hotChild = null;
-
-class BenchApi extends RpcTarget {
-  constructor() {
-    super();
-    this.count = 0;
-  }
-
-  async bump() {
-    this.count += 1;
-    return this.count;
-  }
-}
-
-function childConfig(label) {
-  return {
-    entrypoint: "worker.js",
-    modules: {
-      "worker.js": "import { nextCounter } from './lib.js'; export default { async fetch(_request, childEnv) { const hostCount = await childEnv.API.bump(); return new Response(String(nextCounter()) + ':' + String(hostCount)); } };",
-      "./lib.js": "let counter = 0; export function nextCounter() { counter += 1; return counter; }",
-    },
-    allow_host_rpc: true,
-    env: {
-      LABEL: label,
-      API: new BenchApi(),
-    },
-    timeout: 5_000,
-  };
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/__dynamic_metrics") {
-      const jsMetrics = globalThis.__dd_dynamic_metrics ?? {};
-      const rustProfile = Deno.core.ops.op_dynamic_profile_take?.() ?? null;
-      return Response.json({
-        ...jsMetrics,
-        ...(rustProfile?.snapshot ?? {}),
-      });
-    }
-
-    if (url.pathname === "/__dynamic_metrics_reset") {
-      const metrics = globalThis.__dd_dynamic_metrics ?? null;
-      if (metrics && typeof metrics === "object") {
-        for (const key of Object.keys(metrics)) {
-          metrics[key] = 0;
-        }
-      }
-      Deno.core.ops.op_dynamic_profile_reset?.();
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/hot") {
-      if (!hotChild) {
-        hotChild = await env.SANDBOX.get("bench:v1", async () => childConfig("hot"));
-      }
-      return hotChild.fetch("http://worker/");
-    }
-
-    if (url.pathname === "/hot_get") {
-      const child = await env.SANDBOX.get("bench:v1", async () => childConfig("hot"));
-      return child.fetch("http://worker/");
-    }
-
-    if (url.pathname === "/cold") {
-      const id = url.searchParams.get("id") ?? "cold";
-      const child = await env.SANDBOX.get(`bench:${id}`, async () => childConfig(id));
-      return child.fetch("http://worker/");
-    }
-
-    return new Response("not found", { status: 404 });
-  },
-};
-"#;
-
-const DYNAMIC_BENCH_ADMIN_WORKER_SOURCE: &str = r#"
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/ensure") {
-      const id = url.searchParams.get("id") ?? "bench-admin";
-      await env.SANDBOX.get(id, async () => ({
-        entrypoint: "worker.js",
-        modules: {
-          "worker.js": "export default { async fetch() { return new Response('ok'); } };",
-        },
-        timeout: 5_000,
-      }));
-      return new Response("ok");
-    }
-
-    if (url.pathname === "/ids") {
-      return new Response(JSON.stringify((await env.SANDBOX.list()).sort()), {
-        headers: [["content-type", "application/json"]],
-      });
-    }
-
-    if (url.pathname === "/delete") {
-      const id = url.searchParams.get("id") ?? "bench-admin";
-      return new Response(String(await env.SANDBOX.delete(id)));
-    }
-
-    return new Response("not found", { status: 404 });
-  },
-};
-"#;
-
 async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<RuntimeService> {
     let paths = bench_paths(tag);
-    tokio::fs::create_dir_all(&paths.store_dir)
-        .await
-        .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    RuntimeService::start_with_service_config(runtime_service_config(
-        runtime,
-        &paths.db_path,
-        &paths.store_dir,
-        true,
-    ))
-    .await
+    start_service_with_paths(runtime, &paths.store_dir).await
 }
 
 async fn start_service_with_paths(
     runtime: RuntimeConfig,
-    db_path: &Path,
     store_dir: &Path,
 ) -> common::Result<RuntimeService> {
     tokio::fs::create_dir_all(store_dir)
         .await
         .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    RuntimeService::start_with_service_config(runtime_service_config(
-        runtime, db_path, store_dir, true,
-    ))
-    .await
-}
-
-fn runtime_service_config(
-    runtime: RuntimeConfig,
-    db_path: &Path,
-    store_dir: &Path,
-    worker_store_enabled: bool,
-) -> RuntimeServiceConfig {
-    RuntimeServiceConfig {
+    RuntimeService::start_with_service_config(RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
-            database_url: format!("file:{}", db_path.display()),
-            memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
-            memory_db_cache_max_open: 4096,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
-            memory_db_read_connections_per_database: 4,
-            memory_db_max_total_connections: 4096usize.saturating_mul(5),
-            memory_db_idle_ttl: Duration::from_secs(60),
-            worker_store_enabled,
+            worker_store_enabled: true,
         },
-    }
+    })
+    .await
 }
 
 struct BenchPaths {
     root: PathBuf,
-    db_path: PathBuf,
     store_dir: PathBuf,
 }
 
 fn bench_paths(tag: &str) -> BenchPaths {
-    let root = PathBuf::from(format!("/tmp/dd-bench-{tag}-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("dd-bench-{tag}-{}", Uuid::new_v4()));
     BenchPaths {
         root: root.clone(),
-        db_path: root.join("dd-kv.db"),
         store_dir: root.join("store"),
     }
 }
@@ -1145,14 +723,12 @@ export default {
         let paths = bench_paths("restore");
         let worker_name = format!("restore-{idx}-{}", Uuid::new_v4());
 
-        let seed =
-            start_service_with_paths(runtime.clone(), &paths.db_path, &paths.store_dir).await?;
+        let seed = start_service_with_paths(runtime.clone(), &paths.store_dir).await?;
         seed.deploy(worker_name.clone(), source.to_string()).await?;
         seed.shutdown().await?;
 
         let startup_started = Instant::now();
-        let restored =
-            start_service_with_paths(runtime.clone(), &paths.db_path, &paths.store_dir).await?;
+        let restored = start_service_with_paths(runtime.clone(), &paths.store_dir).await?;
         startup.push(startup_started.elapsed());
 
         let invoke_started = Instant::now();
@@ -1260,334 +836,6 @@ async fn run_websocket_bench(service: &RuntimeService) -> common::Result<WebSock
         open,
         roundtrip,
     })
-}
-
-async fn run_dynamic_baseline_fetch(service: &RuntimeService) -> common::Result<ScenarioResult> {
-    let requests = env_usize("DD_BENCH_DYNAMIC_REQUESTS", 500);
-    let concurrency = env_usize("DD_BENCH_DYNAMIC_CONCURRENCY", 64);
-    let baseline_worker_name = format!("dynamic-baseline-{}", Uuid::new_v4());
-    service
-        .deploy(
-            baseline_worker_name.clone(),
-            DYNAMIC_BENCH_BASELINE_WORKER_SOURCE.to_string(),
-        )
-        .await?;
-    with_timeout(
-        "dynamic-baseline stage=timed",
-        run_scenario(
-            service,
-            &baseline_worker_name,
-            Scenario {
-                name: "dynamic-baseline",
-                worker_source: DYNAMIC_BENCH_BASELINE_WORKER_SOURCE,
-                requests,
-                concurrency,
-                paths: &["/hot"],
-            },
-        ),
-    )
-    .await
-}
-
-async fn run_dynamic_bench(
-    service: &RuntimeService,
-    baseline_fetch: ScenarioResult,
-) -> common::Result<DynamicBenchResult> {
-    let requests = env_usize("DD_BENCH_DYNAMIC_REQUESTS", 500);
-    let concurrency = env_usize("DD_BENCH_DYNAMIC_CONCURRENCY", 64);
-    let cold_rounds = env_usize("DD_BENCH_DYNAMIC_COLD_ROUNDS", 50);
-    let metric_probe_requests = requests.clamp(64, 128);
-    let metric_probe_concurrency = concurrency.min(32);
-
-    bench_progress("dynamic plain deploy");
-    let plain_worker_name = format!("dynamic-plain-{}", Uuid::new_v4());
-    deploy_dynamic_bench_worker(
-        service,
-        &plain_worker_name,
-        DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
-    )
-    .await?;
-    bench_progress("dynamic plain warm");
-    with_dynamic_diagnostics(service, &plain_worker_name, async {
-        with_timeout(
-            "dynamic-hot-fetch stage=warm",
-            service.invoke(plain_worker_name.clone(), invocation("/hot", 0)),
-        )
-        .await
-        .map(|_| ())
-    })
-    .await?;
-    with_dynamic_diagnostics(
-        service,
-        &plain_worker_name,
-        reset_dynamic_bench_metrics(service, &plain_worker_name),
-    )
-    .await?;
-    bench_progress("dynamic plain metrics");
-    with_dynamic_diagnostics(service, &plain_worker_name, async {
-        with_timeout(
-            "dynamic-hot-fetch stage=metrics",
-            run_scenario(
-                service,
-                &plain_worker_name,
-                Scenario {
-                    name: "dynamic-hot-fetch-metrics",
-                    worker_source: DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
-                    requests: metric_probe_requests,
-                    concurrency: metric_probe_concurrency,
-                    paths: &["/hot_get"],
-                },
-            ),
-        )
-        .await
-        .map(|_| ())
-    })
-    .await?;
-    let hot_fetch_metrics = with_dynamic_diagnostics(
-        service,
-        &plain_worker_name,
-        fetch_dynamic_bench_metrics(service, &plain_worker_name),
-    )
-    .await?;
-    bench_progress("dynamic plain timed");
-    let hot_fetch = with_dynamic_diagnostics(
-        service,
-        &plain_worker_name,
-        with_timeout(
-            "dynamic-hot-fetch stage=timed",
-            run_scenario(
-                service,
-                &plain_worker_name,
-                Scenario {
-                    name: "dynamic-hot-fetch",
-                    worker_source: DYNAMIC_BENCH_PLAIN_WORKER_SOURCE,
-                    requests,
-                    concurrency,
-                    paths: &["/hot"],
-                },
-            ),
-        ),
-    )
-    .await?;
-
-    bench_progress("dynamic host-rpc deploy");
-    let host_rpc_worker_name = format!("dynamic-host-rpc-{}", Uuid::new_v4());
-    deploy_dynamic_bench_worker(
-        service,
-        &host_rpc_worker_name,
-        DYNAMIC_BENCH_HOST_RPC_WORKER_SOURCE,
-    )
-    .await?;
-    bench_progress("dynamic host-rpc warm");
-    with_dynamic_diagnostics(service, &host_rpc_worker_name, async {
-        with_timeout(
-            "dynamic-hot-fetch-host-rpc stage=warm",
-            service.invoke(
-                host_rpc_worker_name.clone(),
-                invocation("/hot", requests + 1),
-            ),
-        )
-        .await
-        .map(|_| ())
-    })
-    .await?;
-    reset_dynamic_bench_metrics(service, &host_rpc_worker_name).await?;
-    bench_progress("dynamic host-rpc metrics");
-    with_dynamic_diagnostics(service, &host_rpc_worker_name, async {
-        with_timeout(
-            "dynamic-hot-fetch-host-rpc stage=metrics",
-            run_scenario(
-                service,
-                &host_rpc_worker_name,
-                Scenario {
-                    name: "dynamic-hot-fetch-host-rpc-metrics",
-                    worker_source: DYNAMIC_BENCH_HOST_RPC_WORKER_SOURCE,
-                    requests: metric_probe_requests,
-                    concurrency: metric_probe_concurrency,
-                    paths: &["/hot_get"],
-                },
-            ),
-        )
-        .await
-        .map(|_| ())
-    })
-    .await?;
-    let hot_fetch_host_rpc_metrics =
-        fetch_dynamic_bench_metrics(service, &host_rpc_worker_name).await?;
-    bench_progress("dynamic host-rpc timed");
-    let hot_fetch_host_rpc = with_dynamic_diagnostics(
-        service,
-        &host_rpc_worker_name,
-        with_timeout(
-            "dynamic-hot-fetch-host-rpc stage=timed",
-            run_scenario(
-                service,
-                &host_rpc_worker_name,
-                Scenario {
-                    name: "dynamic-hot-fetch-host-rpc",
-                    worker_source: DYNAMIC_BENCH_HOST_RPC_WORKER_SOURCE,
-                    requests,
-                    concurrency,
-                    paths: &["/hot"],
-                },
-            ),
-        ),
-    )
-    .await?;
-
-    bench_progress("dynamic cold rounds");
-    let mut cold_samples = Vec::with_capacity(cold_rounds);
-    with_dynamic_diagnostics(
-        service,
-        &plain_worker_name,
-        reset_dynamic_bench_metrics(service, &plain_worker_name),
-    )
-    .await?;
-    for idx in 0..cold_rounds {
-        let started = Instant::now();
-        with_timeout(
-            &format!("dynamic-cold-create+invoke stage=request idx={idx}"),
-            service.invoke(
-                plain_worker_name.clone(),
-                invocation(
-                    &format!("/cold?id={idx}"),
-                    requests.saturating_mul(2) + idx + 2,
-                ),
-            ),
-        )
-        .await?;
-        cold_samples.push(started.elapsed());
-    }
-    let cold_create_invoke_metrics = with_dynamic_diagnostics(
-        service,
-        &plain_worker_name,
-        fetch_dynamic_bench_metrics(service, &plain_worker_name),
-    )
-    .await?;
-
-    bench_progress("dynamic admin checks");
-    run_dynamic_admin_checks(service).await?;
-
-    Ok(DynamicBenchResult {
-        cold_rounds,
-        baseline_fetch,
-        hot_fetch,
-        hot_fetch_metrics,
-        hot_fetch_host_rpc,
-        hot_fetch_host_rpc_metrics,
-        cold_create_invoke: summarize_distribution(&cold_samples),
-        cold_create_invoke_metrics,
-    })
-}
-
-async fn deploy_dynamic_bench_worker(
-    service: &RuntimeService,
-    worker_name: &str,
-    source: &str,
-) -> common::Result<()> {
-    service
-        .deploy_with_config(
-            worker_name.to_string(),
-            source.to_string(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                bindings: vec![DeployBinding::Dynamic {
-                    binding: "SANDBOX".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .map(|_| ())
-}
-
-async fn reset_dynamic_bench_metrics(
-    service: &RuntimeService,
-    worker_name: &str,
-) -> common::Result<()> {
-    service
-        .invoke(
-            worker_name.to_string(),
-            invocation("/__dynamic_metrics_reset", usize::MAX / 4),
-        )
-        .await
-        .map(|_| ())
-}
-
-async fn fetch_dynamic_bench_metrics(
-    service: &RuntimeService,
-    worker_name: &str,
-) -> common::Result<DynamicBenchMetrics> {
-    let output = service
-        .invoke(
-            worker_name.to_string(),
-            invocation("/__dynamic_metrics", usize::MAX / 3),
-        )
-        .await?;
-    from_slice(&output.body).map_err(|error| common::PlatformError::internal(error.to_string()))
-}
-
-async fn dynamic_failure_diagnostics(service: &RuntimeService, owner_worker: &str) -> String {
-    let owner_dump = service.debug_dump(owner_worker.to_string()).await;
-    let dynamic_dump = service.dynamic_debug_dump().await;
-    let mut target_workers = dynamic_dump
-        .handles
-        .iter()
-        .filter(|handle| handle.owner_worker == owner_worker)
-        .map(|handle| handle.worker_name.clone())
-        .collect::<Vec<_>>();
-    target_workers.sort();
-    target_workers.dedup();
-
-    let mut target_dumps = Vec::new();
-    for worker_name in target_workers {
-        let dump = service.debug_dump(worker_name.clone()).await;
-        target_dumps.push((worker_name, dump));
-    }
-
-    format!("owner_dump={owner_dump:?} target_dumps={target_dumps:?} dynamic_dump={dynamic_dump:?}")
-}
-
-async fn with_dynamic_diagnostics<T, F>(
-    service: &RuntimeService,
-    owner_worker: &str,
-    future: F,
-) -> common::Result<T>
-where
-    F: Future<Output = common::Result<T>>,
-{
-    match future.await {
-        Ok(value) => Ok(value),
-        Err(error) => Err(common::PlatformError::runtime(format!(
-            "{error}; {}",
-            dynamic_failure_diagnostics(service, owner_worker).await
-        ))),
-    }
-}
-
-async fn run_dynamic_admin_checks(service: &RuntimeService) -> common::Result<()> {
-    let worker_name = format!("dynamic-admin-{}", Uuid::new_v4());
-    deploy_dynamic_bench_worker(service, &worker_name, DYNAMIC_BENCH_ADMIN_WORKER_SOURCE).await?;
-    with_timeout(
-        "dynamic-admin stage=ensure",
-        service.invoke(
-            worker_name.clone(),
-            invocation("/ensure?id=bench-dynamic-admin", 0),
-        ),
-    )
-    .await?;
-    with_timeout(
-        "dynamic-admin stage=list",
-        service.invoke(worker_name.clone(), invocation("/ids", 1)),
-    )
-    .await?;
-    with_timeout(
-        "dynamic-admin stage=delete",
-        service.invoke(worker_name, invocation("/delete?id=bench-dynamic-admin", 2)),
-    )
-    .await?;
-    Ok(())
 }
 
 async fn with_timeout<T>(
@@ -1877,125 +1125,6 @@ fn format_distribution_result(name: &str, samples: usize, distribution: Distribu
         distribution.max_ms
     );
     out
-}
-
-fn format_dynamic_metrics_result(name: &str, metrics: &DynamicBenchMetrics) -> String {
-    let handle_total = metrics.handle_cache_hit + metrics.handle_cache_miss;
-    let source_total = metrics.source_cache_hit + metrics.source_cache_miss;
-    let handle_hit_rate = if handle_total == 0 {
-        0.0
-    } else {
-        (metrics.handle_cache_hit as f64 / handle_total as f64) * 100.0
-    };
-    let source_hit_rate = if source_total == 0 {
-        0.0
-    } else {
-        (metrics.source_cache_hit as f64 / source_total as f64) * 100.0
-    };
-    let normalize_mean_ms = mean_ms(
-        metrics.js_request_normalize_total_ms,
-        metrics.js_request_normalize_count,
-    );
-    let start_mean_ms = mean_ms(
-        metrics.dynamic_start_op_total_ms,
-        metrics.dynamic_start_op_count,
-    );
-    let reply_mean_ms = mean_ms(
-        metrics.reply_materialize_total_ms,
-        metrics.reply_materialize_count,
-    );
-    let time_sync_mean_ms = mean_ms(metrics.time_sync_total_ms, metrics.time_sync_count);
-    let control_drain_mean_ms = mean_ms(
-        metrics.dynamic_control_drain_total_ms,
-        metrics.dynamic_control_drain_count,
-    );
-    let dispatch_mean_ms = mean_us_to_ms(
-        metrics.direct_fetch_dispatch_us,
-        metrics.direct_fetch_dispatch_count,
-    );
-    let child_execute_mean_ms = mean_us_to_ms(
-        metrics.direct_fetch_child_execute_us,
-        metrics.direct_fetch_child_execute_count,
-    );
-
-    let mut out = String::new();
-    let _ = write!(
-        out,
-        "{:<18} handle_hit_rate={:.1}% source_hit_rate={:.1}% direct_hits={} fallback={} direct_path={} direct_path_fallback={} remote={} remote_fallback={} fetch_ops={} fetch_op_fallback={} normalize_fast={} normalize_slow={} async_replies={} provider_task={} control_batches={} control_items={} reply_batches={} reply_items={} provider_batches={} provider_items={} time_sync={}/{} normalize_mean={:.3}ms start_mean={:.3}ms dispatch_mean={:.3}ms child_mean={:.3}ms reply_mean={:.3}ms sync_mean={:.3}ms control_mean={:.3}ms",
-        format!("{name}-metrics"),
-        handle_hit_rate,
-        source_hit_rate,
-        metrics.warm_isolate_hit,
-        metrics.fallback_dispatch,
-        metrics.direct_fetch_fast_path_hit,
-        metrics.direct_fetch_fast_path_fallback,
-        metrics.remote_fetch_hit,
-        metrics.remote_fetch_fallback,
-        metrics.fast_fetch_path_hit,
-        metrics.fast_fetch_path_fallback,
-        metrics.normalize_fast_path_hit,
-        metrics.normalize_slow_path_hit,
-        metrics.async_reply_completion,
-        metrics.provider_task_callback,
-        metrics.control_drain_batch,
-        metrics.control_drain_item,
-        metrics.reply_drain_batch,
-        metrics.reply_drain_item,
-        metrics.provider_task_drain_batch,
-        metrics.provider_task_drain_item,
-        metrics.time_sync_applied,
-        metrics.time_sync_skipped,
-        normalize_mean_ms,
-        start_mean_ms,
-        dispatch_mean_ms,
-        child_execute_mean_ms,
-        reply_mean_ms,
-        time_sync_mean_ms,
-        control_drain_mean_ms,
-    );
-    out
-}
-
-fn mean_ms(total_ms: f64, count: usize) -> f64 {
-    if count == 0 {
-        0.0
-    } else {
-        total_ms / count as f64
-    }
-}
-
-fn mean_us_to_ms(total_us: usize, count: usize) -> f64 {
-    if count == 0 {
-        0.0
-    } else {
-        (total_us as f64 / count as f64) / 1000.0
-    }
-}
-
-fn format_dynamic_gap_result(
-    baseline: &ScenarioResult,
-    plain: &ScenarioResult,
-    host_rpc: &ScenarioResult,
-) -> String {
-    let plain_pct = if baseline.throughput_rps <= 0.0 {
-        0.0
-    } else {
-        (plain.throughput_rps / baseline.throughput_rps) * 100.0
-    };
-    let host_rpc_pct = if baseline.throughput_rps <= 0.0 {
-        0.0
-    } else {
-        (host_rpc.throughput_rps / baseline.throughput_rps) * 100.0
-    };
-    format!(
-        "{:<18} baseline={:.0}req/s plain={:.0}req/s ({:.1}%) host_rpc={:.0}req/s ({:.1}%)",
-        "dynamic-gap",
-        baseline.throughput_rps,
-        plain.throughput_rps,
-        plain_pct,
-        host_rpc.throughput_rps,
-        host_rpc_pct,
-    )
 }
 
 fn format_cold_start_result(result: ColdStartResult) -> String {

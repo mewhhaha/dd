@@ -18,10 +18,10 @@ export interface DdInternalConfig {
 export type DdBinding =
   | { type: "kv"; binding: string }
   | { type: "memory"; binding: string }
-  | { type: "dynamic"; binding: string }
   | { type: "service"; binding: string; service: string };
 
 export interface DdDeployConfig {
+  egress_allow_hosts?: string[];
   public?: boolean;
   cache?: DdCacheConfig;
   bindings?: DdBinding[];
@@ -50,6 +50,7 @@ export interface DdProjectConfig {
   asset_excludes?: string[];
   server_modules?: DdServerModuleConfig[];
   config?: DdDeployConfig;
+  egress_allow_hosts?: string[];
   public?: boolean;
   cache?: DdCacheConfig;
   bindings?: DdBinding[];
@@ -57,16 +58,10 @@ export interface DdProjectConfig {
 }
 
 export interface DdKvNamespace {
-  get(key: string, options?: { type?: "text" }): Promise<string | null>;
-  get<T>(key: string, options: { type: "json" }): Promise<T | null>;
-  get(key: string, options: { type: "arrayBuffer" }): Promise<ArrayBuffer | null>;
-  put(
-    key: string,
-    value: string | ArrayBuffer | ArrayBufferView,
-    options?: { durability?: "queued" | "committed" },
-  ): Promise<void>;
+  get<T = unknown>(key: string): Promise<T | null>;
+  put(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<void>;
-  list(options?: { prefix?: string; limit?: number }): Promise<{ keys: Array<{ name: string }> }>;
+  list<T = unknown>(options?: { prefix?: string; limit?: number }): Promise<Array<{ key: string; value: T }>>;
 }
 
 export interface DdCacheNamespace {
@@ -81,85 +76,43 @@ export interface DdMemoryId {
   toString(): string;
 }
 
-export interface DdMemoryVersionedValue<T> {
-  value: T;
-  version: number;
-  encoding: string;
-}
-
-export interface DdMemoryVariable<T> {
-  readonly key: string;
-  read(): T;
-  read(options: { withVersion: true }): T | DdMemoryVersionedValue<T>;
-  write(value: T): T;
-  modify(update: (value: T) => T): T;
-  delete(): boolean;
-}
-
-export interface DdMemoryListEntry<T = string> {
+export interface DdMemoryListEntry<T = unknown> {
   key: string;
   value: T;
-  version: number;
+}
+
+export interface DdMemoryTransaction {
+  readonly id: DdMemoryId;
+  get<T = unknown>(key: string): T | null;
+  put(key: string, value: unknown): void;
+  delete(key: string): boolean;
+  list<T = unknown>(options?: { prefix?: string; limit?: number }): Array<DdMemoryListEntry<T>>;
+  emit(kind: string, payload?: unknown): void;
+  accept(request: Request): { handle: string; response: Response };
+  readonly sockets: {
+    values(): string[];
+    send(handle: string, payload: string | Uint8Array): void;
+    close(handle: string, code?: number, reason?: string): void;
+  };
 }
 
 export interface DdMemoryStub {
   readonly id: DdMemoryId;
   readonly binding: string;
-  read<T = string>(key: string): Promise<T | null>;
-  write<T>(key: string, value: T): Promise<T>;
-  delete(key: string): Promise<boolean>;
-  writeMany<T>(entries: Array<readonly [string, T] | { key: string; value: T }>): Promise<number>;
-  list<T = string>(options?: { prefix?: string; limit?: number }): Promise<Array<DdMemoryListEntry<T>>>;
-  var<T = string>(key: string): DdMemoryVariable<T | null>;
-  tvar<T>(key: string, defaultValue: T): DdMemoryVariable<T>;
-  emit(kind: string, payload?: object | string | number | boolean | null): void;
-  atomic<T, Args extends readonly unknown[]>(
-    callback: (...args: Args) => T | Promise<T>,
-    ...args: Args
-  ): Promise<T>;
-  atomic<T, Args extends readonly unknown[]>(
-    options: { idempotencyKey?: string; idempotency_key?: string },
-    callback: (...args: Args) => T | Promise<T>,
-    ...args: Args
+  readonly sockets: { values(): Promise<string[]> };
+  atomic<T>(
+    callback: (tx: DdMemoryTransaction) => T & (T extends { then: (...args: never[]) => unknown } ? never : unknown),
+    options?: { idempotencyKey?: string },
   ): Promise<T>;
 }
 
 export interface DdMemoryNamespace {
   idFromName(name: string): DdMemoryId;
-  get(id: DdMemoryId): DdMemoryStub;
+  get(id: string | DdMemoryId): DdMemoryStub;
 }
 
-export interface DdDynamicWorkerConfig {
-  source?: string;
-  entrypoint?: string;
-  modules?: Record<string, string>;
-  bindings?: DdBinding[];
-  env?: Record<string, string | object>;
-  timeout?: number;
-  egress_allow_hosts?: string[];
-  allow_host_rpc?: boolean;
-  allow_websocket?: boolean;
-  allow_transport?: boolean;
-  allow_state_bindings?: boolean;
-  max_request_bytes?: number;
-  max_response_bytes?: number;
-  max_outbound_requests?: number;
-  max_concurrency?: number;
-}
 
-export interface DdDynamicWorkerNamespace {
-  get(
-    id: string,
-    factory: () => DdDynamicWorkerConfig | Promise<DdDynamicWorkerConfig>,
-  ): Promise<DdDynamicWorkerStub>;
-  list(): Promise<string[]>;
-  delete(id: string): Promise<boolean>;
-}
 
-export interface DdDynamicWorkerStub {
-  readonly worker: string;
-  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
-}
 
 export interface DdServiceBinding {
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
@@ -169,6 +122,7 @@ export interface DdRuntimeDeployResult {
   type: "deploy";
   worker: string;
   deployment_id: string;
+  url: string;
 }
 
 export interface DdRuntimeWorkerStats {
@@ -198,6 +152,7 @@ export interface DdAdminStatusResponse {
   active_deployments: number;
   restoration_failures: string[];
   runtime: {
+    worker_schedulers: number;
     active_deployments: number;
     workers: Array<DdRuntimeWorkerStats & { name: string; outbox_lag_shards: number }>;
     restore_failures: Array<{ worker: string | null; source: string; error: string }>;
@@ -211,8 +166,18 @@ export interface DdAdminStatusResponse {
       failed_components: string[];
     };
     storage_retry_count: number;
-    cache_flush_failure_count: number;
-    cache_pending_recency_touches: number;
+    state_storage: {
+      committed_groups: number;
+      committed_commands: number;
+      rollbacks: number;
+      discarded_connections: number;
+      busy_retries: number;
+      pending_commands: number;
+      pending_bytes: number;
+    };
+    memory_snapshot_cache_hits: number;
+    memory_snapshot_cache_misses: number;
+    memory_snapshot_cache_evictions: number;
   };
   trace_exporter: {
     compiled: boolean;
@@ -236,12 +201,6 @@ export interface DdApiError {
 export type DdRuntimeCommandResult =
   | DdRuntimeDeployResult
   | DdRuntimeStatsResult
-  | { type: "invoke"; status: number; headers: Array<[string, string]>; body_base64: string }
-  | { type: "websocket_open"; session_id: string; status: number; headers: Array<[string, string]>; body_base64: string }
-  | { type: "websocket_frame"; status: number; headers: Array<[string, string]>; body_base64: string }
-  | { type: "websocket_drain_frame"; frame: null | { status: number; headers: Array<[string, string]>; body_base64: string } }
-  | { type: "websocket_wait_frame" }
-  | { type: "websocket_close" }
   | { type: "shutdown" };
 
 export interface DdRuntimeOptions {
@@ -249,6 +208,7 @@ export interface DdRuntimeOptions {
   cwd?: string;
   env?: Record<string, string>;
   timeoutMs?: number;
+  closeTimeoutMs?: number;
   allowCodeGeneration?: boolean;
 }
 
@@ -272,9 +232,8 @@ export interface DdWorkerRuntimeOptions extends DdWorkerBundleOptions {
 
 export interface DdAuxiliaryWorkerOptions extends DdWorkerBundleOptions {
   name: string;
-  kind?: "dynamic" | "service";
+  kind?: "service";
   binding?: string;
-  id?: string;
   service?: string;
   viteEnvironment?: DdViteEnvironmentOptions;
   entry?: string | URL;
@@ -288,9 +247,8 @@ export interface DdAuxiliaryWorkerOptions extends DdWorkerBundleOptions {
 
 export interface DdAuxiliaryWorkerRecord {
   name: string;
-  kind: "dynamic" | "service";
+  kind: "service";
   binding: string;
-  id: string;
   service?: string;
   config: DdDeployConfig;
 }
@@ -325,6 +283,7 @@ export interface DdGeneratedDeploymentConfigOptions {
   entrypoint?: string;
   assetsDir?: string | false;
   assetExcludes?: string[];
+  serverModules?: DdServerModuleConfig[];
   staticRoutes?: DdStaticRoutesOptions | false;
 }
 
@@ -342,48 +301,16 @@ export interface DdVitePluginOptions extends DdWorkerRuntimeOptions {
 
 export class DdRuntimeClient {
   constructor(options?: DdRuntimeOptions);
+  readonly generation: number;
   deploy(name: string, source: string, config?: DdDeployConfig): Promise<DdRuntimeDeployResult>;
-  invoke(
-    name: string,
-    request: {
-      method?: string;
-      url?: string;
-      headers?: Array<[string, string]>;
-      body_base64?: string;
-      request_id?: string;
-    },
-  ): Promise<{ status: number; headers: Array<[string, string]>; body_base64: string }>;
+  workerUrl(name: string): string;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
   fetch(name: string, input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
-  openWebSocket(
-    name: string,
-    request: {
-      method?: string;
-      url?: string;
-      headers?: Array<[string, string]>;
-      body_base64?: string;
-      request_id?: string;
-    },
-  ): Promise<{ session_id: string; status: number; headers: Array<[string, string]>; body_base64: string }>;
-  sendWebSocketFrame(
-    name: string,
-    sessionId: string,
-    body: ArrayBuffer | ArrayBufferView | string,
-    options?: { binary?: boolean },
-  ): Promise<{ status: number; headers: Array<[string, string]>; body_base64: string }>;
-  drainWebSocketFrame(
-    name: string,
-    sessionId: string,
-  ): Promise<{
-    frame: null | { status: number; headers: Array<[string, string]>; body_base64: string };
-  }>;
-  closeWebSocket(
-    name: string,
-    sessionId: string,
-    options?: { code?: number; reason?: string },
-  ): Promise<{ type: "websocket_close" }>;
   stats(name: string): Promise<DdRuntimeStatsResult>;
-  request<T extends DdRuntimeCommandResult = DdRuntimeCommandResult>(command: Record<string, unknown>): Promise<T>;
+  request<T extends DdRuntimeCommandResult = DdRuntimeCommandResult>(
+    command: Record<string, unknown>,
+    options?: { timeoutMs?: number },
+  ): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -398,7 +325,6 @@ export function createWorkerTestRuntime(options?: DdWorkerRuntimeOptions): Promi
   readonly deployment: DdRuntimeDeployResult | undefined;
   deploy(): Promise<DdRuntimeDeployResult>;
   reload(): Promise<DdRuntimeDeployResult>;
-  invoke(request: Parameters<DdRuntimeClient["invoke"]>[1]): ReturnType<DdRuntimeClient["invoke"]>;
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
   stats(): Promise<DdRuntimeStatsResult>;
   close(): Promise<void>;

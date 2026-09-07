@@ -2,7 +2,6 @@ use super::*;
 use std::{cell::RefCell, rc::Rc};
 
 const RUNTIME_READY_WORK_BUDGET: usize = 256;
-const RUNTIME_EVENT_CHANNEL_CAPACITY: usize = 4096;
 const ISOLATE_COMMAND_DRAIN_BUDGET: usize = 256;
 const ISOLATE_COMMAND_CHANNEL_CAPACITY: usize = 1024;
 const ISOLATE_EVENT_QUEUE_CAPACITY: usize = 8192;
@@ -34,45 +33,6 @@ pub(super) fn select_dispatch_candidate(
     allow_memory_atomic_overflow: bool,
 ) -> Option<DispatchSelection> {
     let mut attempt_stats = DispatchAttemptStats::default();
-
-    if let Some(selection) = {
-        let isolates = &pool.isolates;
-        let isolate_indices = &pool.isolate_indices;
-        let memory_entity_leases = &pool.memory_entity_leases;
-        pool.queue
-            .find_oldest_map([PendingQueueLane::TargetedNested], |queue_key, pending| {
-                let target_isolate_id = pending
-                    .target_isolate_id
-                    .expect("targeted nested queue entries must have a target isolate");
-                if memory_atomic_route_is_active(memory_entity_leases, pending) {
-                    attempt_stats.memory_candidate_rejected_owner_lease_count = attempt_stats
-                        .memory_candidate_rejected_owner_lease_count
-                        .saturating_add(1);
-                    return None;
-                }
-                if let Some(isolate_idx) = target_isolate_idx(isolate_indices, target_isolate_id) {
-                    let isolate = &isolates[isolate_idx];
-                    if isolate.startup.is_ready()
-                        && IsolateEligibility::for_pending(pending).accepts(isolate)
-                    {
-                        Some(DispatchSelection::Dispatch(DispatchCandidate {
-                            queue_key,
-                            isolate_idx,
-                        }))
-                    } else {
-                        attempt_stats.memory_candidate_rejected_isolate_state_count = attempt_stats
-                            .memory_candidate_rejected_isolate_state_count
-                            .saturating_add(1);
-                        None
-                    }
-                } else {
-                    Some(DispatchSelection::DropStaleTarget { queue_key })
-                }
-            })
-    } {
-        pool.stats.record_dispatch_attempt(attempt_stats);
-        return Some(selection);
-    }
 
     let selection = loop {
         let candidate = {
@@ -118,7 +78,7 @@ pub(super) fn select_dispatch_candidate(
                         }
 
                         let mut isolate_idx = None;
-                        if memory_route_is_atomic(pending) {
+                        if memory_route_needs_ordering(pending) {
                             match memory_shard_affinity_outcome(
                                 isolates,
                                 isolate_indices,
@@ -159,7 +119,7 @@ pub(super) fn select_dispatch_candidate(
                                 require_wait_until_idle,
                                 eligibility,
                             );
-                            if isolate_idx.is_some() && memory_route_is_atomic(pending) {
+                            if isolate_idx.is_some() && memory_route_needs_ordering(pending) {
                                 attempt_stats.memory_least_loaded_fallback_count = attempt_stats
                                     .memory_least_loaded_fallback_count
                                     .saturating_add(1);
@@ -167,7 +127,7 @@ pub(super) fn select_dispatch_candidate(
                         }
                         if isolate_idx.is_none()
                             && allow_memory_atomic_overflow
-                            && memory_route_is_atomic(pending)
+                            && memory_route_needs_ordering(pending)
                         {
                             isolate_idx = least_loaded_isolate_any_idx(isolates, eligibility);
                             if isolate_idx.is_some() {
@@ -196,7 +156,6 @@ pub(super) fn select_dispatch_candidate(
                         target_isolate_idx(isolate_indices, target_isolate_id)
                     {
                         let isolate = &isolates[isolate_idx];
-                        debug_assert!(pending.host_rpc_call.is_none());
                         debug_assert!(pending.memory_route.is_none());
                         if isolate.startup.is_ready()
                             && IsolateEligibility::for_pending(pending).accepts(isolate)
@@ -253,17 +212,14 @@ fn memory_atomic_route_is_active(
     let Some(memory_route) = pending.memory_route.as_ref() else {
         return false;
     };
-    if !memory_route_is_atomic(pending) {
+    if !memory_route_needs_ordering(pending) {
         return false;
     }
     memory_entity_leases.contains_key(&memory_route.owner_key)
 }
 
-fn memory_route_is_atomic(pending: &PendingInvoke) -> bool {
-    matches!(
-        pending.memory_call.as_ref(),
-        Some(MemoryExecutionCall::Method { name, .. }) if name == MEMORY_ATOMIC_METHOD
-    )
+fn memory_route_needs_ordering(pending: &PendingInvoke) -> bool {
+    pending.memory_call.is_some()
 }
 
 enum MemoryAffinityOutcome {
@@ -314,15 +270,6 @@ fn target_isolate_idx(
     isolate_indices.get(&target_isolate_id).copied()
 }
 
-pub(super) fn host_rpc_method_blocked(method: &str) -> bool {
-    let method = method.trim();
-    method.is_empty()
-        || method == "constructor"
-        || method == "then"
-        || method == "fetch"
-        || method.starts_with("__dd_")
-}
-
 fn least_loaded_isolate_idx(
     isolates: &[IsolateHandle],
     max_inflight: usize,
@@ -362,7 +309,6 @@ impl WorkerPool {
             request_body,
             stream_response,
             memory_call,
-            host_rpc_call,
             memory_route,
             dispatched_at,
             profile_memory_atomic,
@@ -375,7 +321,6 @@ impl WorkerPool {
             request_body,
             stream_response,
             memory_call: Box::new(memory_call),
-            host_rpc_call,
             memory_route: Box::new(memory_route),
             dispatched_at,
             profile_memory_atomic,
@@ -449,7 +394,6 @@ impl WorkerPool {
             spawn_count: self.stats.spawn_count,
             reuse_count: self.stats.reuse_count,
             scale_down_count: self.stats.scale_down_count,
-            targeted_nested_lane_queued: lane_depths.targeted_nested,
             targeted_lane_queued: lane_depths.targeted,
             memory_lane_queued: lane_depths.memory,
             general_lane_queued: lane_depths.general,
@@ -518,17 +462,13 @@ impl WorkerPool {
         let mut activity = PoolActivity::default();
         for isolate in &self.isolates {
             let wait_until = isolate.pending_wait_until.len();
-            if isolate.inflight_count > 0
-                || wait_until > 0
-                || isolate.active_websocket_sessions > 0
-                || isolate.active_transport_sessions > 0
+            if isolate.inflight_count > 0 || wait_until > 0 || isolate.active_websocket_sessions > 0
             {
                 activity.busy += 1;
             }
             activity.inflight_total += isolate.inflight_count;
             activity.wait_until_total += wait_until;
             activity.active_websocket_total += isolate.active_websocket_sessions;
-            activity.active_transport_total += isolate.active_transport_sessions;
         }
         activity
     }
@@ -540,155 +480,25 @@ struct PoolActivity {
     inflight_total: usize,
     wait_until_total: usize,
     active_websocket_total: usize,
-    active_transport_total: usize,
 }
 
 impl PoolActivity {
     fn is_idle(&self) -> bool {
-        self.inflight_total == 0
-            && self.wait_until_total == 0
-            && self.active_websocket_total == 0
-            && self.active_transport_total == 0
+        self.inflight_total == 0 && self.wait_until_total == 0 && self.active_websocket_total == 0
     }
 }
 
 pub(super) fn spawn_runtime_thread(start: RuntimeThreadStart) -> Result<thread::JoinHandle<()>> {
-    let RuntimeThreadStart {
-        mut receiver,
-        mut cancel_receiver,
-        runtime_fast_sender,
-        asset_catalog,
-        bootstrap_snapshot,
-        kv_store,
-        memory_store,
-        cache_store,
-        config,
-        storage,
-        control_store,
-        dynamic_modules,
-    } = start;
-    let thread = thread::Builder::new()
+    thread::Builder::new()
         .name("dd-runtime".to_string())
         .spawn(move || {
             let runtime = Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("runtime thread should build");
-
-            runtime.block_on(async move {
-                let (event_tx, mut event_rx) = mpsc::channel(RUNTIME_EVENT_CHANNEL_CAPACITY);
-                let (memory_outbox_drain_sender, memory_outbox_drain_receiver) =
-                    memory_outbox_worker_channel();
-                let memory_outbox_worker = tokio::spawn(run_memory_outbox_worker(
-                    memory_store.clone(),
-                    event_tx.clone(),
-                    memory_outbox_drain_receiver,
-                    storage.memory_outbox_max_concurrent_shards,
-                ));
-                let mut manager = WorkerManager::new(WorkerManagerInit {
-                    bootstrap_snapshot,
-                    kv_store,
-                    memory_store,
-                    memory_outbox_drain_sender,
-                    cache_store,
-                    config: config.clone(),
-                    storage,
-                    control_store,
-                    dynamic_modules,
-                    runtime_fast_sender,
-                    asset_catalog,
-                });
-                let mut ticker = tokio::time::interval(config.scale_tick);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                manager.schedule_all_memory_outbox_shards(&event_tx);
-
-                loop {
-                    tokio::select! {
-                        Some(command) = receiver.recv() => {
-                            manager.begin_runtime_batch();
-                            let keep_running = manager.handle_command(command, &event_tx).await
-                                && drain_ready_runtime_work(
-                                &mut manager,
-                                &mut receiver,
-                                &mut cancel_receiver,
-                                &mut event_rx,
-                                &event_tx,
-                            )
-                                .await;
-                            manager.finish_runtime_batch(&event_tx);
-                            if !keep_running {
-                                break;
-                            }
-                        }
-                        Some(command) = cancel_receiver.recv() => {
-                            manager.begin_runtime_batch();
-                            let keep_running = manager.handle_command(command, &event_tx).await;
-                            let keep_running = keep_running
-                                && drain_ready_runtime_work(
-                                &mut manager,
-                                &mut receiver,
-                                &mut cancel_receiver,
-                                &mut event_rx,
-                                &event_tx,
-                            )
-                                .await;
-                            manager.finish_runtime_batch(&event_tx);
-                            if !keep_running {
-                                break;
-                            }
-                        }
-                        Some(event) = event_rx.recv() => {
-                            manager.begin_runtime_batch();
-                            manager.handle_event(event, &event_tx).await;
-                            let keep_running = drain_ready_runtime_work(
-                                &mut manager,
-                                &mut receiver,
-                                &mut cancel_receiver,
-                                &mut event_rx,
-                                &event_tx,
-                            )
-                            .await;
-                            manager.finish_runtime_batch(&event_tx);
-                            if !keep_running {
-                                break;
-                            }
-                        }
-                        _ = ticker.tick() => {
-                            manager.expire_temporary_workers().await;
-                            manager.expire_queued_requests();
-                            manager.expire_starting_isolates(&event_tx);
-                            manager.expire_inflight_requests(&event_tx);
-                            manager.schedule_all_memory_outbox_shards(&event_tx);
-                            manager.retry_pending_memory_outbox_drains();
-                            manager.scale_down_idle();
-                        }
-                        else => {
-                            break;
-                        }
-                    }
-                }
-
-                if let Err(error) = manager.shutdown_all().await {
-                    tracing::warn!(error = %error, "failed to flush cache recency while stopping isolates");
-                }
-                if let Err(error) = manager.cache_store.flush_pending_touches().await {
-                    tracing::warn!(error = %error, "failed to flush cache recency while stopping runtime");
-                }
-
-                // Dropping the manager closes the outbox command channel. The
-                // worker finishes any in-flight shard drains before exiting;
-                // close its event destination so no final report can block.
-                drop(manager);
-                event_rx.close();
-                drop(event_tx);
-                if let Err(error) = memory_outbox_worker.await {
-                    tracing::warn!(error = %error, "memory outbox worker failed during shutdown");
-                }
-            });
+            runtime.block_on(run_runtime_coordinator(start));
         })
-        .map_err(|error| PlatformError::internal(error.to_string()))?;
-
-    Ok(thread)
+        .map_err(|error| PlatformError::internal(error.to_string()))
 }
 
 pub(super) async fn drain_ready_runtime_work(
@@ -842,65 +652,25 @@ pub(super) fn runtime_event_from_isolate_payload(
             generation,
             payload,
         },
-        IsolateEventPayload::MemoryInvoke(payload) => RuntimeEvent::MemoryInvoke(payload),
         IsolateEventPayload::MemorySocketSend(payload) => RuntimeEvent::MemorySocketSend(payload),
         IsolateEventPayload::MemorySocketClose(payload) => RuntimeEvent::MemorySocketClose(payload),
-        IsolateEventPayload::MemorySocketConsumeClose(payload) => {
-            RuntimeEvent::MemorySocketConsumeClose {
-                worker_name: worker_name.to_string(),
-                generation,
-                payload,
-            }
-        }
-        IsolateEventPayload::MemoryTransportSendStream(payload) => {
-            RuntimeEvent::MemoryTransportSendStream(payload)
-        }
-        IsolateEventPayload::MemoryTransportSendDatagram(payload) => {
-            RuntimeEvent::MemoryTransportSendDatagram(payload)
-        }
-        IsolateEventPayload::MemoryTransportClose(payload) => {
-            RuntimeEvent::MemoryTransportClose(payload)
-        }
-        IsolateEventPayload::MemoryTransportConsumeClose(payload) => {
-            RuntimeEvent::MemoryTransportConsumeClose {
-                worker_name: worker_name.to_string(),
-                generation,
-                payload,
-            }
-        }
-        IsolateEventPayload::DynamicWorkerCreate(payload) => {
-            RuntimeEvent::DynamicWorkerCreate(payload)
-        }
-        IsolateEventPayload::DynamicWorkerLookup(payload) => {
-            RuntimeEvent::DynamicWorkerLookup(payload)
-        }
-        IsolateEventPayload::DynamicWorkerList(payload) => RuntimeEvent::DynamicWorkerList(payload),
-        IsolateEventPayload::DynamicWorkerDelete(payload) => {
-            RuntimeEvent::DynamicWorkerDelete(payload)
-        }
-        IsolateEventPayload::DynamicHostRpcInvoke(payload) => {
-            RuntimeEvent::DynamicHostRpcInvoke(payload)
-        }
         IsolateEventPayload::TestAsyncReply(payload) => RuntimeEvent::TestAsyncReply(payload),
-        IsolateEventPayload::TestNestedTargetedInvoke(payload) => {
-            RuntimeEvent::TestNestedTargetedInvoke(payload)
-        }
     }
 }
 
 pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateHandle> {
     let IsolateThreadStart {
+        admission,
         snapshot,
         snapshot_preloaded,
         source,
-        dynamic_modules,
+        module_registry,
         deployment_config,
         allow_code_generation,
         kv_store,
         memory_store,
         cache_store,
         open_handle_registry,
-        dynamic_profile,
         execution_limits,
         runtime_fast_sender,
         worker_name,
@@ -909,9 +679,11 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         event_tx,
         thread_tracker,
     } = start;
+    let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(());
+    let slot_starting = Arc::clone(&admission.starting);
     let (command_tx, mut command_rx) = mpsc::channel(ISOLATE_COMMAND_CHANNEL_CAPACITY);
-    let dynamic_control_inbox = crate::ops::DynamicControlInbox::default();
-    let thread_dynamic_control_inbox = dynamic_control_inbox.clone();
+    let request_control_inbox = crate::ops::RequestControlInbox::default();
+    let thread_request_control_inbox = request_control_inbox.clone();
     let v8_handle = Arc::new(StdMutex::new(None));
     let thread_v8_handle = Arc::clone(&v8_handle);
     let event_loop_notify = Arc::new(Notify::new());
@@ -947,186 +719,207 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
             };
 
             runtime.block_on(async move {
-                let pending_isolate_events = Rc::new(RefCell::new(VecDeque::<RuntimeEvent>::new()));
-                let mut js_runtime = match new_runtime_from_snapshot_with_heap_limit(
-                    snapshot,
-                    allow_code_generation,
-                    execution_limits.max_isolate_heap_bytes,
-                    dynamic_modules,
-                ) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                            worker_name: worker_name.clone(),
-                            generation,
-                            isolate_id,
-                            error,
-                        }).await;
-                        return;
-                    }
-                };
-
-                {
-                    let handle = js_runtime.v8_isolate().thread_safe_handle();
-                    *thread_v8_handle.lock().expect("v8 handle mutex poisoned") = Some(handle);
-                }
-
-                {
-                    let event_sender = {
-                        let pending_isolate_events = Rc::clone(&pending_isolate_events);
-                        let worker_name = worker_name.clone();
-                        IsolateEventSender(Rc::new(move |payload| {
-                            let event = runtime_event_from_isolate_payload(
-                                &worker_name,
-                                generation,
-                                isolate_id,
-                                payload,
-                            );
-                            enqueue_pending_isolate_event(&pending_isolate_events, event)
-                        }))
-                    };
-                    let op_state = js_runtime.op_state();
-                    let mut op_state = op_state.borrow_mut();
-                    op_state.put(event_sender);
-                    op_state.put(kv_store.clone());
-                    op_state.put(memory_store.clone());
-                    op_state.put(cache_store.clone());
-                    op_state.put(crate::ops::WorkerCacheNamespace(worker_name.clone()));
-                    op_state.put(open_handle_registry.clone());
-                    op_state.put(crate::ops::HttpPreparedBodies::default());
-                    op_state.put(crate::ops::HttpPreparedHeaders::default());
-                    op_state.put(crate::ops::RequestInvocationHandles::default());
-                    op_state.put(crate::ops::WorkerDeploymentHandles::default());
-                    op_state.put(RequestBodyStreams::default());
-                    op_state.put(crate::ops::MemoryCommandHandles::default());
-                    op_state.put(crate::ops::MemoryByteHandles::default());
-                    op_state.put(crate::ops::MemoryBatchHandles::default());
-                    op_state.put(crate::ops::MemoryRequestScopes::default());
-                    op_state.put(crate::ops::ActiveRequestContextHandles::default());
-                    op_state.put(crate::ops::RequestSecretContexts::default());
-                    op_state.put(execution_limits.clone());
-                    op_state.put(crate::ops::DynamicPendingReplies::default());
-                    op_state.put(crate::ops::TestAsyncReplies::default());
-                    op_state.put(thread_dynamic_control_inbox.clone());
-                    op_state.put(RuntimeFastCommandSender(runtime_fast_sender.clone()));
-                    op_state.put(dynamic_profile.clone());
-                }
-                if !snapshot_preloaded
-                    && let Err(error) =
-                        crate::engine::load_worker_source(&mut js_runtime, &source).await
-                    {
-                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                            worker_name: worker_name.clone(),
-                            generation,
-                            isolate_id,
-                            error,
-                        }).await;
-                        return;
-                    }
-                if let Err(error) = cache_runtime_entrypoints(&mut js_runtime) {
-                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                        worker_name: worker_name.clone(),
-                        generation,
-                        isolate_id,
-                        error,
-                    }).await;
-                    return;
-                }
-                if let Err(error) =
-                    install_worker_deployment_config(&mut js_runtime, (*deployment_config).clone())
-                {
-                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                        worker_name: worker_name.clone(),
-                        generation,
-                        isolate_id,
-                        error,
-                    }).await;
-                    return;
-                }
-                let _ = event_tx.send(RuntimeEvent::IsolateReady {
-                    worker_name: worker_name.clone(),
-                    generation,
-                    isolate_id,
-                }).await;
-
-                loop {
-                    let mut made_progress = false;
-                    let mut drained_commands = 0usize;
-
-                    while drained_commands < ISOLATE_COMMAND_DRAIN_BUDGET {
-                        match command_rx.try_recv() {
-                            Ok(command) => {
-                                made_progress = true;
-                                drained_commands = drained_commands.saturating_add(1);
-                                if !handle_isolate_command_or_fail(
-                                    &mut js_runtime,
-                                    &event_tx,
-                                    &worker_name,
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {},
+                    _ = async move {
+                        let pending_isolate_events = Rc::new(RefCell::new(VecDeque::<RuntimeEvent>::new()));
+                        let mut js_runtime = match new_runtime_from_snapshot_with_heap_limit(
+                            snapshot,
+                            allow_code_generation,
+                            execution_limits.max_isolate_heap_bytes,
+                            module_registry,
+                        ) {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                    worker_name: worker_name.clone(),
                                     generation,
                                     isolate_id,
-                                    command,
-                                )
-                                .await
-                                {
-                                    return;
-                                }
-                                if !flush_pending_isolate_events(
-                                    &pending_isolate_events,
-                                    &event_tx,
-                                )
-                                .await
-                                {
-                                    return;
-                                }
+                                    error,
+                                }).await;
+                                return;
                             }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => return,
-                        }
-                    }
+                        };
 
-                    if let Err(error) = pump_event_loop_once(&mut js_runtime, &event_loop_waker) {
-                        let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                        {
+                            let handle = js_runtime.v8_isolate().thread_safe_handle();
+                            *thread_v8_handle.lock().expect("v8 handle mutex poisoned") = Some(handle);
+                        }
+
+                        {
+                            let event_sender = {
+                                let pending_isolate_events = Rc::clone(&pending_isolate_events);
+                                let worker_name = worker_name.clone();
+                                let event_loop_notify = Arc::clone(&event_loop_notify);
+                                IsolateEventSender(Rc::new(move |payload| {
+                                    let event = runtime_event_from_isolate_payload(
+                                        &worker_name,
+                                        generation,
+                                        isolate_id,
+                                        payload,
+                                    );
+                                    let accepted = enqueue_pending_isolate_event(&pending_isolate_events, event);
+                                    if accepted {
+                                        // Async ops can emit after the main loop has finished polling V8.
+                                        event_loop_notify.notify_one();
+                                    }
+                                    accepted
+                                }))
+                            };
+                            let op_state = js_runtime.op_state();
+                            let mut op_state = op_state.borrow_mut();
+                            op_state.put(event_sender);
+                            op_state.put(kv_store.clone());
+                            op_state.put(memory_store.clone());
+                            op_state.put(cache_store.clone());
+                            op_state.put(crate::ops::WorkerCacheNamespace(worker_name.clone()));
+                            op_state.put(open_handle_registry.clone());
+                            op_state.put(crate::ops::HttpPreparedBodies::default());
+                            op_state.put(crate::ops::HttpPreparedHeaders::default());
+                            op_state.put(crate::ops::RequestInvocationHandles::default());
+                            op_state.put(crate::ops::WorkerDeploymentHandles::default());
+                            op_state.put(RequestBodyStreams::default());
+                            op_state.put(crate::ops::MemoryCommandHandles::default());
+                            op_state.put(crate::ops::MemoryByteHandles::default());
+                            op_state.put(crate::ops::MemoryBatchHandles::default());
+                            op_state.put(crate::ops::MemoryRequestScopes::default());
+                            op_state.put(crate::ops::ActiveRequestContextHandles::default());
+                            op_state.put(crate::ops::RequestSecretContexts::default());
+                            op_state.put(execution_limits.clone());
+                            op_state.put(crate::ops::PendingReplies::default());
+                            op_state.put(crate::ops::TestAsyncReplies::default());
+                            op_state.put(thread_request_control_inbox.clone());
+                            op_state.put(RuntimeFastCommandSender(runtime_fast_sender.clone()));
+                        }
+                        if !snapshot_preloaded
+                            && let Err(error) =
+                                crate::engine::load_worker_source(&mut js_runtime, &source).await
+                            {
+                                let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                    worker_name: worker_name.clone(),
+                                    generation,
+                                    isolate_id,
+                                    error,
+                                }).await;
+                                return;
+                            }
+                        if let Err(error) = cache_runtime_entrypoints(&mut js_runtime) {
+                            let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                worker_name: worker_name.clone(),
+                                generation,
+                                isolate_id,
+                                error,
+                            }).await;
+                            return;
+                        }
+                        if let Err(error) =
+                            install_worker_deployment_config(&mut js_runtime, (*deployment_config).clone())
+                        {
+                            let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                worker_name: worker_name.clone(),
+                                generation,
+                                isolate_id,
+                                error,
+                            }).await;
+                            return;
+                        }
+                        let _ = event_tx.send(RuntimeEvent::IsolateReady {
                             worker_name: worker_name.clone(),
                             generation,
                             isolate_id,
-                            error,
                         }).await;
-                        break;
-                    }
-                    if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
-                        return;
-                    }
 
-                    if made_progress {
-                        continue;
-                    }
+                        loop {
+                            let mut made_progress = false;
+                            let mut drained_commands = 0usize;
+                            if !thread_request_control_inbox.is_empty() {
+                                if !handle_isolate_command_or_fail(
+                                    &mut js_runtime, &event_tx, &worker_name, generation,
+                                    isolate_id, IsolateCommand::DrainRequestControl,
+                                ).await { return; }
+                                made_progress = true;
+                            }
 
-                    tokio::select! {
-                        command = command_rx.recv() => {
-                            let Some(command) = command else {
-                                return;
-                            };
-                            if !handle_isolate_command_or_fail(
-                                &mut js_runtime,
-                                &event_tx,
-                                &worker_name,
-                                generation,
-                                isolate_id,
-                                command,
-                            )
-                            .await
-                            {
-                                return;
+
+                            while drained_commands < ISOLATE_COMMAND_DRAIN_BUDGET {
+                                match command_rx.try_recv() {
+                                    Ok(command) => {
+                                        made_progress = true;
+                                        drained_commands = drained_commands.saturating_add(1);
+                                        if !handle_isolate_command_or_fail(
+                                            &mut js_runtime,
+                                            &event_tx,
+                                            &worker_name,
+                                            generation,
+                                            isolate_id,
+                                            command,
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        if !flush_pending_isolate_events(
+                                            &pending_isolate_events,
+                                            &event_tx,
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(TryRecvError::Empty) => break,
+                                    Err(TryRecvError::Disconnected) => return,
+                                }
+                            }
+
+                            if let Err(error) = pump_event_loop_once(&mut js_runtime, &event_loop_waker) {
+                                let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                    worker_name: worker_name.clone(),
+                                    generation,
+                                    isolate_id,
+                                    error,
+                                }).await;
+                                break;
                             }
                             if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
                                 return;
                             }
+
+                            if made_progress {
+                                continue;
+                            }
+
+                            tokio::select! {
+                                command = command_rx.recv() => {
+                                    let Some(command) = command else {
+                                        return;
+                                    };
+                                    if !handle_isolate_command_or_fail(
+                                        &mut js_runtime,
+                                        &event_tx,
+                                        &worker_name,
+                                        generation,
+                                        isolate_id,
+                                        command,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    if !flush_pending_isolate_events(&pending_isolate_events, &event_tx).await {
+                                        return;
+                                    }
+                                }
+                                _ = event_loop_notify.notified() => {}
+                                _ = thread_request_control_inbox.ready.notified() => {}
+                            }
                         }
-                        _ = event_loop_notify.notified() => {}
-                    }
+                    } => {},
                 }
             });
             drop(thread_guard);
+            drop(admission);
             let _ = exit_event_tx.blocking_send(RuntimeEvent::IsolateExited {
                 worker_name: exit_worker_name,
                 generation,
@@ -1136,17 +929,18 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         .map_err(|error| PlatformError::internal(error.to_string()))?;
 
     Ok(IsolateHandle {
+        shutdown,
+        slot_starting,
         id: isolate_id,
         sender: command_tx,
         v8_handle,
-        dynamic_control_inbox,
+        request_control_inbox,
         startup: IsolateStartup::Starting {
             started_at: Instant::now(),
         },
         internal_rescue: false,
         inflight_count: 0,
         active_websocket_sessions: 0,
-        active_transport_sessions: 0,
         served_requests: 0,
         last_used_at: Instant::now(),
         pending_replies: HashMap::new(),
@@ -1171,7 +965,6 @@ pub(super) async fn handle_isolate_command(
             request_body,
             stream_response,
             memory_call,
-            host_rpc_call,
             memory_route,
             dispatched_at,
             profile_memory_atomic,
@@ -1183,7 +976,7 @@ pub(super) async fn handle_isolate_command(
                     .borrow::<MemoryStore>()
                     .clone();
                 store.record_profile(
-                    MemoryProfileMetricKind::RuntimeAtomicDispatchWait,
+                    MemoryProfileMetricKind::RuntimeSocketDispatchWait,
                     duration_us(dispatched_at.elapsed()),
                     1,
                 );
@@ -1252,7 +1045,6 @@ pub(super) async fn handle_isolate_command(
                         request_body_stream_handle,
                         stream_response,
                         memory_call: memory_call.as_ref(),
-                        host_rpc_call: host_rpc_call.as_ref(),
                         request,
                     },
                 ) {
@@ -1326,50 +1118,15 @@ pub(super) async fn handle_isolate_command(
             }
             Ok(true)
         }
-        IsolateCommand::DrainDynamicControl => {
-            drain_dynamic_control_queue(js_runtime)?;
+        IsolateCommand::DrainRequestControl => {
+            drain_request_control_queue(js_runtime)?;
             {
                 let op_state = js_runtime.op_state();
                 op_state.borrow().waker.wake();
             }
             Ok(true)
         }
-        IsolateCommand::Shutdown => {
-            if let Err(error) = flush_isolate_cache(js_runtime).await {
-                tracing::warn!(
-                    worker = %worker_name,
-                    generation,
-                    isolate_id,
-                    error = %error,
-                    "failed to flush cache recency before isolate retirement"
-                );
-            }
-            Ok(false)
-        }
-        IsolateCommand::ShutdownAndFlushCache { reply } => {
-            let result = flush_isolate_cache(js_runtime).await;
-            if let Err(error) = &result {
-                tracing::warn!(
-                    worker = %worker_name,
-                    generation,
-                    isolate_id,
-                    error = %error,
-                    "failed to flush cache recency before isolate shutdown"
-                );
-            }
-            let _ = reply.send(result);
-            Ok(false)
-        }
     }
-}
-
-async fn flush_isolate_cache(js_runtime: &mut deno_core::JsRuntime) -> Result<()> {
-    let cache_store = js_runtime
-        .op_state()
-        .borrow()
-        .borrow::<CacheStore>()
-        .clone();
-    cache_store.flush_pending_touches().await
 }
 
 async fn handle_isolate_command_or_fail(

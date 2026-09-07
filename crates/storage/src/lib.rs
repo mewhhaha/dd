@@ -1,11 +1,11 @@
-//! Disk-backed storage for dd workers: KV, keyed memory namespaces, the
-//! worker response cache, and blob storage — all on turso. Deliberately free
-//! of any JS-engine dependency so both the V8 runtime and the Perry wasm
-//! host can share it.
+//! Turso-backed durable worker state, deployment records and response caching.
 
-pub mod blob;
 pub mod cache;
+pub mod control;
 pub mod json;
 pub mod kv;
 pub mod memory;
 pub mod turso_util;
+
+pub mod convert;
+pub mod state;

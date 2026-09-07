@@ -19,6 +19,7 @@ async fn memory_same_key_atomic_commands_are_serialized() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -95,6 +96,7 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -147,7 +149,7 @@ async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
 
 #[tokio::test]
 #[serial]
-async fn memory_exported_atomic_commands_progress_when_regular_isolates_are_saturated() {
+async fn memory_callbacks_progress_when_all_caller_isolates_are_busy() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
@@ -166,6 +168,7 @@ async fn memory_exported_atomic_commands_progress_when_regular_isolates_are_satu
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -184,8 +187,8 @@ async fn memory_exported_atomic_commands_progress_when_regular_isolates_are_satu
             svc.invoke(
                 "memory".to_string(),
                 test_invocation_with_path(
-                    &format!("/inc-cas?key=exported-{idx}"),
-                    &format!("exported-atomic-{idx}"),
+                    &format!("/inc-cas?key=callback-{idx}"),
+                    &format!("callback-{idx}"),
                 ),
             )
             .await
@@ -199,22 +202,22 @@ async fn memory_exported_atomic_commands_progress_when_regular_isolates_are_satu
         }
     })
     .await
-    .expect("exported atomic invokes should not wait on saturated caller isolates");
+    .expect("memory callback invokes should not wait on saturated caller isolates");
 
     let stats = service
         .stats("memory".to_string())
         .await
         .expect("memory worker stats should exist");
     assert!(stats.global_isolates_total <= 4);
-    assert!((1..=2).contains(&stats.global_internal_rescue_isolates));
+    assert_eq!(stats.global_internal_rescue_isolates, 0);
 
     for idx in 0..8 {
         let output = service
             .invoke(
                 "memory".to_string(),
                 test_invocation_with_path(
-                    &format!("/get?key=exported-{idx}"),
-                    &format!("exported-atomic-get-{idx}"),
+                    &format!("/get?key=callback-{idx}"),
+                    &format!("callback-get-{idx}"),
                 ),
             )
             .await
@@ -242,6 +245,7 @@ async fn memory_atomic_callback_executes_once_for_cold_read() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -286,6 +290,7 @@ async fn memory_atomic_rejects_unsupported_storage_options() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -323,58 +328,6 @@ async fn memory_atomic_rejects_unsupported_storage_options() {
 
 #[tokio::test]
 #[serial]
-async fn memory_direct_operations_reject_unsupported_storage_options() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "memory".to_string(),
-            memory_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MY_MEMORY".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    for operation in ["get", "set", "delete"] {
-        let output = service
-            .invoke(
-                "memory".to_string(),
-                test_invocation_with_path(
-                    &format!(
-                        "/direct-unsupported-option?key=user-direct-option-{operation}&operation={operation}"
-                    ),
-                    &format!("direct-unsupported-option-{operation}"),
-                ),
-            )
-            .await
-            .expect("invoke should succeed");
-        assert_eq!(output.status, 418);
-        let body = String::from_utf8(output.body).expect("body should be utf8");
-        assert!(
-            body.contains(&format!("memory {operation} options are unsupported")),
-            "body was {body}"
-        );
-    }
-}
-
-#[tokio::test]
-#[serial]
 async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -392,6 +345,7 @@ async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -416,7 +370,7 @@ async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
     assert_eq!(output.status, 200);
     assert_eq!(
         String::from_utf8(output.body).expect("body should be utf8"),
-        "alpha:1:-1,beta:2:-1"
+        "alpha:1:undefined,beta:2:undefined"
     );
 }
 
@@ -439,6 +393,7 @@ async fn memory_atomic_idempotency_key_replays_committed_result() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -495,8 +450,6 @@ async fn memory_atomic_idempotency_key_replays_committed_result() {
 #[serial]
 async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
     let root = PathBuf::from(format!("/tmp/dd-memory-idempotent-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
     let config = RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -507,13 +460,13 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
         ..RuntimeConfig::default()
     };
 
-    let service =
-        test_service_with_paths(config.clone(), root.clone(), database_url.clone(), true).await;
+    let service = test_service_with_paths(config.clone(), root.clone(), true).await;
     service
         .deploy_with_config(
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -537,8 +490,9 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
         .expect("first invoke should succeed");
     assert_eq!(first.status, 200);
     service.shutdown().await.expect("service should shut down");
+    drop(service);
 
-    let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
+    let restored = test_service_with_paths(config, root.clone(), true).await;
     let replay = restored
         .invoke(
             "memory".to_string(),
@@ -596,6 +550,7 @@ async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -679,6 +634,7 @@ async fn memory_atomic_idempotency_key_replays_read_only_result() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -738,8 +694,6 @@ async fn memory_atomic_idempotency_key_replays_read_only_result() {
 #[serial]
 async fn memory_atomic_can_emit_durable_effect_records() {
     let root = PathBuf::from(format!("/tmp/dd-memory-outbox-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
     let service = test_service_with_paths(
         RuntimeConfig {
             min_isolates: 1,
@@ -751,7 +705,6 @@ async fn memory_atomic_can_emit_durable_effect_records() {
             ..RuntimeConfig::default()
         },
         root.clone(),
-        database_url,
         false,
     )
     .await;
@@ -761,6 +714,7 @@ async fn memory_atomic_can_emit_durable_effect_records() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -794,14 +748,11 @@ async fn memory_atomic_can_emit_durable_effect_records() {
         .expect("get should succeed");
     assert_eq!(String::from_utf8(current.body).expect("utf8"), "1");
 
-    let memory_store =
-        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
-            .await
-            .expect("memory store should open");
+    let memory_store = service.memory_store.clone();
     let outbox = timeout(Duration::from_secs(2), async {
         loop {
             let outbox = memory_store
-                .outbox_records("MY_MEMORY", "user-effect")
+                .outbox_records("6:memoryMY_MEMORY", "user-effect")
                 .await
                 .expect("outbox records should load");
             if outbox.len() == 2 && outbox.iter().all(|record| record.status == "delivered") {
@@ -824,10 +775,8 @@ async fn memory_atomic_can_emit_durable_effect_records() {
 
 #[tokio::test]
 #[serial]
-async fn memory_profile_reports_atomic_scheduler_breakdown() {
+async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
     let root = PathBuf::from(format!("/tmp/dd-memory-profile-atomic-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
     let service = test_service_with_paths(
         RuntimeConfig {
             min_isolates: 1,
@@ -840,7 +789,6 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
             ..RuntimeConfig::default()
         },
         root.clone(),
-        database_url,
         false,
     )
     .await;
@@ -850,6 +798,7 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -878,14 +827,11 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
         .expect("emit invoke should succeed");
     assert_eq!(output.status, 200);
 
-    let memory_store =
-        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
-            .await
-            .expect("memory store should open");
+    let memory_store = service.memory_store.clone();
     timeout(Duration::from_secs(2), async {
         loop {
             let outbox = memory_store
-                .outbox_records("MY_MEMORY", "profile-effect")
+                .outbox_records("6:memoryMY_MEMORY", "profile-effect")
                 .await
                 .expect("outbox records should load");
             if outbox.len() == 2 && outbox.iter().all(|record| record.status == "delivered") {
@@ -910,12 +856,10 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
     .expect("profile should parse");
     let snapshot = &profile["snapshot"];
     for metric in [
-        "runtime_atomic_invoke_event_wait",
-        "runtime_atomic_queue_wait",
-        "runtime_atomic_dispatch_wait",
-        "runtime_atomic_execution",
-        "runtime_atomic_completion_wait",
-        "runtime_atomic_outbox_drain",
+        "js_hydrate_full",
+        "js_txn_commit",
+        "op_apply_batch",
+        "runtime_outbox_drain",
     ] {
         assert!(
             snapshot[metric]["calls"].as_u64().unwrap_or_default() >= 1,
@@ -923,7 +867,7 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
         );
     }
     assert!(
-        snapshot["runtime_atomic_outbox_drain"]["total_items"]
+        snapshot["runtime_outbox_drain"]["total_items"]
             .as_u64()
             .unwrap_or_default()
             >= 2
@@ -936,12 +880,10 @@ async fn memory_profile_reports_atomic_scheduler_breakdown() {
 #[serial]
 async fn memory_outbox_pending_effects_drain_after_service_start() {
     let root = PathBuf::from(format!("/tmp/dd-memory-outbox-startup-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
-    let seed_store =
-        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
-            .await
-            .expect("memory store should open");
+    let state = storage::state::StateStore::open(root.join("state"))
+        .await
+        .expect("state opens");
+    let seed_store = crate::memory::MemoryStore::from_state(state);
     let effects = (0..70)
         .map(|index| crate::memory::MemoryOutboxEffectWrite {
             kind: "audit.startup".to_string(),
@@ -949,11 +891,18 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
         })
         .collect::<Vec<_>>();
     seed_store
-        .apply_batch("MY_MEMORY", "startup-effect", &[], None, &effects, None)
+        .apply_batch(
+            "6:memoryMY_MEMORY",
+            "startup-effect",
+            storage::memory::MemoryCommit {
+                outbox_effects: &effects,
+                ..Default::default()
+            },
+        )
         .await
         .expect("outbox seed should commit");
     let seeded = seed_store
-        .outbox_records("MY_MEMORY", "startup-effect")
+        .outbox_records("6:memoryMY_MEMORY", "startup-effect")
         .await
         .expect("seeded outbox should load");
     assert_eq!(seeded.len(), effects.len());
@@ -971,19 +920,15 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
             ..RuntimeConfig::default()
         },
         root.clone(),
-        database_url,
         false,
     )
     .await;
 
-    let check_store =
-        crate::memory::MemoryStore::new(root.join("memory"), 16, 4096, Duration::from_secs(60))
-            .await
-            .expect("memory store should reopen");
+    let check_store = service.memory_store.clone();
     timeout(Duration::from_secs(2), async {
         loop {
             let records = check_store
-                .outbox_records("MY_MEMORY", "startup-effect")
+                .outbox_records("6:memoryMY_MEMORY", "startup-effect")
                 .await
                 .expect("outbox should load");
             if records.iter().all(|record| record.status == "delivered") {
@@ -1018,6 +963,7 @@ async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() 
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1097,6 +1043,7 @@ async fn memory_storage_structured_value_roundtrip_works() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1141,7 +1088,7 @@ async fn memory_storage_structured_value_roundtrip_works() {
 
 #[tokio::test]
 #[serial]
-async fn memory_direct_write_visibility_roundtrip_works() {
+async fn memory_committed_writes_are_visible_to_later_transactions() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1158,6 +1105,7 @@ async fn memory_direct_write_visibility_roundtrip_works() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1172,45 +1120,45 @@ async fn memory_direct_write_visibility_roundtrip_works() {
     let set = service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/direct-set?key=user-direct-1", "direct-set"),
+            test_invocation_with_path("/put?key=user-transaction-1", "transaction-set"),
         )
         .await
-        .expect("direct set should succeed");
+        .expect("transaction put should succeed");
     assert_eq!(set.status, 200);
 
     let after_set = service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/direct-get?key=user-direct-1", "direct-get-set"),
+            test_invocation_with_path("/get?key=user-transaction-1", "transaction-get-set"),
         )
         .await
-        .expect("direct get after set should succeed");
+        .expect("transaction get after set should succeed");
     assert_eq!(after_set.status, 200);
     assert_eq!(String::from_utf8(after_set.body).expect("utf8"), "5");
 
     let delete = service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/direct-delete?key=user-direct-1", "direct-delete"),
+            test_invocation_with_path("/delete?key=user-transaction-1", "transaction-delete"),
         )
         .await
-        .expect("direct delete should succeed");
+        .expect("transaction delete should succeed");
     assert_eq!(delete.status, 200);
 
     let after_delete = service
         .invoke(
             "memory".to_string(),
-            test_invocation_with_path("/direct-get?key=user-direct-1", "direct-get-delete"),
+            test_invocation_with_path("/get?key=user-transaction-1", "transaction-get-delete"),
         )
         .await
-        .expect("direct get after delete should succeed");
+        .expect("transaction get after delete should succeed");
     assert_eq!(after_delete.status, 200);
     assert_eq!(String::from_utf8(after_delete.body).expect("utf8"), "0");
 }
 
 #[tokio::test]
 #[serial]
-async fn memory_direct_writes_preserve_distinct_memory_updates() {
+async fn memory_writes_preserve_updates_to_distinct_entities() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1227,6 +1175,7 @@ async fn memory_direct_writes_preserve_distinct_memory_updates() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1239,19 +1188,19 @@ async fn memory_direct_writes_preserve_distinct_memory_updates() {
         .expect("deploy should succeed");
 
     let keys = (0..5)
-        .map(|idx| format!("user-direct-distinct-{idx}"))
+        .map(|idx| format!("user-transaction-distinct-{idx}"))
         .collect::<Vec<_>>();
     for key in &keys {
         let set = service
             .invoke(
                 "memory".to_string(),
                 test_invocation_with_path(
-                    &format!("/direct-set?key={key}"),
-                    &format!("direct-set-{key}"),
+                    &format!("/put?key={key}"),
+                    &format!("transaction-set-{key}"),
                 ),
             )
             .await
-            .expect("direct set should succeed");
+            .expect("transaction put should succeed");
         assert_eq!(set.status, 200);
     }
 
@@ -1264,17 +1213,17 @@ async fn memory_direct_writes_preserve_distinct_memory_updates() {
                 .invoke(
                     "memory".to_string(),
                     test_invocation_with_path(
-                        &format!("/direct-get?key={key}"),
-                        &format!("direct-get-{key}"),
+                        &format!("/get?key={key}"),
+                        &format!("transaction-get-{key}"),
                     ),
                 )
                 .await
-                .expect("direct get should succeed");
+                .expect("transaction get should succeed");
             assert_eq!(output.status, 200);
             observed_total += String::from_utf8(output.body)
                 .expect("utf8")
                 .parse::<usize>()
-                .expect("direct value should parse");
+                .expect("transaction value should parse");
         }
         if observed_total == keys.len() * 5 {
             break;
@@ -1308,6 +1257,7 @@ async fn memory_coordinated_set_write_uses_owner_validated_batch_path() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1386,6 +1336,7 @@ async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1456,8 +1407,6 @@ async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
 #[serial]
 async fn memory_owner_epoch_survives_runtime_restart() {
     let root = PathBuf::from(format!("/tmp/dd-memory-owner-epoch-{}", Uuid::new_v4()));
-    let db_path = root.join("dd-test.db");
-    let database_url = format!("file:{}", db_path.display());
     let config = RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1468,13 +1417,13 @@ async fn memory_owner_epoch_survives_runtime_restart() {
         ..RuntimeConfig::default()
     };
 
-    let service =
-        test_service_with_paths(config.clone(), root.clone(), database_url.clone(), true).await;
+    let service = test_service_with_paths(config.clone(), root.clone(), true).await;
     service
         .deploy_with_config(
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1499,8 +1448,9 @@ async fn memory_owner_epoch_survives_runtime_restart() {
     assert_eq!(first.status, 200);
     assert_eq!(String::from_utf8(first.body).expect("utf8"), "7");
     service.shutdown().await.expect("service should shut down");
+    drop(service);
 
-    let restored = test_service_with_paths(config, root.clone(), database_url, true).await;
+    let restored = test_service_with_paths(config, root.clone(), true).await;
     let second = restored
         .invoke(
             "memory".to_string(),
@@ -1531,89 +1481,6 @@ async fn memory_owner_epoch_survives_runtime_restart() {
 
 #[tokio::test]
 #[serial]
-async fn memory_direct_read_uses_point_read_lane() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        memory_profile_enabled: true,
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "memory".to_string(),
-            memory_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MY_MEMORY".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    service
-        .invoke(
-            "memory".to_string(),
-            test_invocation_with_path("/__profile_reset", "memory-direct-profile-reset"),
-        )
-        .await
-        .expect("profile reset should succeed");
-
-    let read = service
-        .invoke(
-            "memory".to_string(),
-            test_invocation_with_path(
-                "/direct-get?key=user-direct-fast-read",
-                "memory-direct-read",
-            ),
-        )
-        .await
-        .expect("direct read should succeed");
-    assert_eq!(read.status, 200);
-    assert_eq!(String::from_utf8(read.body).expect("utf8"), "0");
-
-    let output = service
-        .invoke(
-            "memory".to_string(),
-            test_invocation_with_path("/__profile", "memory-direct-profile"),
-        )
-        .await
-        .expect("profile should succeed");
-    let profile: Value = crate::json::from_string(
-        String::from_utf8(output.body).expect("profile body should be utf8"),
-    )
-    .expect("profile should parse");
-    assert!(
-        profile["snapshot"]["op_read"]["calls"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1
-    );
-    assert_eq!(
-        profile["snapshot"]["op_snapshot"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
-    assert_eq!(
-        profile["snapshot"]["op_version_if_newer"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
-}
-
-#[tokio::test]
-#[serial]
 async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -1632,6 +1499,7 @@ async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
             "memory".to_string(),
             memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1713,6 +1581,7 @@ async fn memory_multiple_atomic_reads_in_one_request_complete() {
             "memory-multi-read".to_string(),
             memory_multi_atomic_read_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1749,7 +1618,7 @@ async fn memory_multiple_atomic_reads_in_one_request_complete() {
 
 #[tokio::test]
 #[serial]
-async fn memory_multikey_direct_reads_complete_after_warmup() {
+async fn memory_multikey_transactions_complete_after_warmup() {
     let service = test_service(RuntimeConfig {
         min_isolates: 4,
         max_isolates: 4,
@@ -1766,81 +1635,7 @@ async fn memory_multikey_direct_reads_complete_after_warmup() {
             "memory-multi-key".to_string(),
             memory_multi_key_storage_worker(),
             DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MY_MEMORY".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    service
-        .invoke(
-            "memory-multi-key".to_string(),
-            test_invocation_with_path("/seed-all?keys=8", "multi-key-direct-seed"),
-        )
-        .await
-        .expect("seed should succeed");
-
-    let warmed = service
-        .invoke(
-            "memory-multi-key".to_string(),
-            test_invocation_with_path("/direct-sum?keys=8", "multi-key-direct-warm"),
-        )
-        .await
-        .expect("warm direct sum should succeed");
-    assert_eq!(String::from_utf8(warmed.body).expect("utf8"), "8");
-
-    let mut tasks = Vec::new();
-    for idx in 0..4 {
-        let service = service.clone();
-        tasks.push(tokio::spawn(async move {
-            timeout(
-                Duration::from_secs(2),
-                service.invoke(
-                    "memory-multi-key".to_string(),
-                    test_invocation_with_path(
-                        "/direct-sum?keys=8",
-                        &format!("multi-key-direct-{idx}"),
-                    ),
-                ),
-            )
-            .await
-        }));
-    }
-    for task in tasks {
-        let output = task
-            .await
-            .expect("join")
-            .expect("direct sum should not hang")
-            .expect("direct sum invoke should succeed");
-        assert_eq!(output.status, 200);
-        assert_eq!(String::from_utf8(output.body).expect("utf8"), "8");
-    }
-}
-
-#[tokio::test]
-#[serial]
-async fn memory_multikey_coordinated_reads_complete_after_warmup() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 4,
-        max_isolates: 4,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "memory-multi-key".to_string(),
-            memory_multi_key_storage_worker(),
-            DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1899,7 +1694,7 @@ async fn memory_multikey_coordinated_reads_complete_after_warmup() {
 
 #[tokio::test]
 #[serial]
-async fn memory_coordinated_benchmark_worker_returns_correct_total() {
+async fn memory_benchmark_worker_returns_correct_total() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
         max_isolates: 2,
@@ -1916,6 +1711,7 @@ async fn memory_coordinated_benchmark_worker_returns_correct_total() {
             "memory-multi-key".to_string(),
             memory_multi_key_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1962,73 +1758,6 @@ async fn memory_coordinated_benchmark_worker_returns_correct_total() {
 
 #[tokio::test]
 #[serial]
-async fn memory_direct_writes_complete_past_repeated_worker_threshold() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "memory-direct-write-threshold".to_string(),
-            memory_multi_key_storage_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MY_MEMORY".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    for idx in 0..64 {
-        let path = format!("/direct-write?key=bench-direct&value={}", idx + 1);
-        let result = timeout(
-            Duration::from_secs(10),
-            service.invoke(
-                "memory-direct-write-threshold".to_string(),
-                test_invocation_with_path(&path, &format!("direct-write-threshold-{idx}")),
-            ),
-        )
-        .await;
-        let output = match result {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => panic!("direct write {idx} failed: {error}"),
-            Err(_) => {
-                let dump = service
-                    .debug_dump("memory-direct-write-threshold".to_string())
-                    .await;
-                panic!("direct write {idx} should not hang; debug dump: {dump:?}");
-            }
-        };
-        assert_eq!(output.status, 200);
-    }
-
-    let total = timeout(
-        Duration::from_secs(10),
-        service.invoke(
-            "memory-direct-write-threshold".to_string(),
-            test_invocation_with_path("/get?key=bench-direct", "direct-write-threshold-total"),
-        ),
-    )
-    .await
-    .expect("direct write total should not hang")
-    .expect("direct write total should succeed");
-    assert_eq!(total.status, 200);
-    assert_eq!(String::from_utf8(total.body).expect("utf8"), "64");
-}
-
-#[tokio::test]
-#[serial]
 async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -2046,6 +1775,7 @@ async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
             "memory-atomic-write-threshold".to_string(),
             memory_multi_key_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2102,32 +1832,11 @@ async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
     .expect("atomic write total should succeed");
     assert_eq!(total.status, 200);
     assert_eq!(String::from_utf8(total.body).expect("utf8"), "65");
-
-    let stats = service
-        .stats("memory-atomic-write-threshold".to_string())
-        .await
-        .expect("stats should exist");
-    assert!(stats.memory_candidate_heads_inspected_count >= 64);
-    let dispatch_route_count = stats
-        .memory_affinity_hit_count
-        .saturating_add(stats.memory_least_loaded_fallback_count)
-        .saturating_add(stats.memory_atomic_overflow_dispatch_count);
-    assert!(dispatch_route_count > 0);
-    assert!(stats.memory_affinity_hit_count > 0 || stats.memory_affinity_miss_no_mapping_count > 0);
-    let dump = service
-        .debug_dump("memory-atomic-write-threshold".to_string())
-        .await
-        .expect("debug dump should exist");
-    assert_eq!(
-        dump.memory_scheduler.candidate_heads_inspected_count,
-        stats.memory_candidate_heads_inspected_count
-    );
-    assert!(!format!("{:?}", dump.memory_scheduler).contains("bench-0"));
 }
 
 #[tokio::test]
 #[serial]
-async fn memory_constructor_reads_hydrated_storage_snapshot_synchronously() {
+async fn memory_transaction_reads_snapshot_after_isolate_restart() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates: 1,
@@ -2141,9 +1850,10 @@ async fn memory_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     service
         .deploy_with_config(
-            "memory-ctor".to_string(),
-            memory_constructor_storage_worker(),
+            "memory-snapshot".to_string(),
+            memory_snapshot_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2157,35 +1867,26 @@ async fn memory_constructor_reads_hydrated_storage_snapshot_synchronously() {
 
     let seeded = service
         .invoke(
-            "memory-ctor".to_string(),
-            test_invocation_with_path("/seed", "ctor-seed"),
+            "memory-snapshot".to_string(),
+            test_invocation_with_path("/seed", "snapshot-seed"),
         )
         .await
         .expect("seed invoke should succeed");
     assert_eq!(seeded.status, 200);
 
-    let warm_ctor = service
+    let warm_snapshot = service
         .invoke(
-            "memory-ctor".to_string(),
-            test_invocation_with_path("/constructor-value", "ctor-warm"),
+            "memory-snapshot".to_string(),
+            test_invocation_with_path("/get", "snapshot-warm"),
         )
         .await
-        .expect("warm constructor value should succeed");
-    assert_eq!(String::from_utf8(warm_ctor.body).expect("utf8"), "7");
-
-    let warm_direct = service
-        .invoke(
-            "memory-ctor".to_string(),
-            test_invocation_with_path("/direct-value", "ctor-direct-warm"),
-        )
-        .await
-        .expect("warm direct value should succeed");
-    assert_eq!(String::from_utf8(warm_direct.body).expect("utf8"), "7");
+        .expect("warm snapshot value should succeed");
+    assert_eq!(String::from_utf8(warm_snapshot.body).expect("utf8"), "7");
 
     timeout(Duration::from_secs(3), async {
         loop {
             let stats = service
-                .stats("memory-ctor".to_string())
+                .stats("memory-snapshot".to_string())
                 .await
                 .expect("stats");
             if stats.isolates_total == 0 {
@@ -2197,32 +1898,14 @@ async fn memory_constructor_reads_hydrated_storage_snapshot_synchronously() {
     .await
     .expect("memory pool should scale down to zero");
 
-    let cold_ctor = service
+    let cold_snapshot = service
         .invoke(
-            "memory-ctor".to_string(),
-            test_invocation_with_path("/constructor-value", "ctor-cold"),
+            "memory-snapshot".to_string(),
+            test_invocation_with_path("/get", "snapshot-cold"),
         )
         .await
-        .expect("cold constructor value should succeed");
-    assert_eq!(String::from_utf8(cold_ctor.body).expect("utf8"), "7");
-
-    let cold_direct = service
-        .invoke(
-            "memory-ctor".to_string(),
-            test_invocation_with_path("/direct-value", "ctor-direct-cold"),
-        )
-        .await
-        .expect("cold direct value should succeed");
-    assert_eq!(String::from_utf8(cold_direct.body).expect("utf8"), "7");
-
-    let current = service
-        .invoke(
-            "memory-ctor".to_string(),
-            test_invocation_with_path("/current-value", "ctor-current"),
-        )
-        .await
-        .expect("current value should succeed");
-    assert_eq!(String::from_utf8(current.body).expect("utf8"), "7");
+        .expect("cold snapshot value should succeed");
+    assert_eq!(String::from_utf8(cold_snapshot.body).expect("utf8"), "7");
 }
 
 #[tokio::test]
@@ -2244,6 +1927,7 @@ async fn hosted_memory_factories_share_state_and_module_globals() {
             "hosted-memory".to_string(),
             hosted_memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2323,6 +2007,7 @@ async fn hosted_memory_allows_inline_closures() {
             "hosted-memory".to_string(),
             hosted_memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2363,6 +2048,7 @@ async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
             "hosted-memory".to_string(),
             hosted_memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2436,6 +2122,7 @@ async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_
             "hosted-memory".to_string(),
             hosted_memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2521,6 +2208,7 @@ async fn hosted_memory_coordinated_snapshot_read_executes_once() {
             "hosted-memory".to_string(),
             hosted_memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2577,7 +2265,7 @@ async fn hosted_memory_coordinated_snapshot_read_executes_once() {
 
 #[tokio::test]
 #[serial]
-async fn hosted_memory_tvar_default_is_lazy_until_written() {
+async fn hosted_memory_missing_value_default_is_lazy_until_written() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -2594,6 +2282,7 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
             "hosted-memory".to_string(),
             hosted_memory_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -2609,8 +2298,8 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/atomic/tvar-default/read?key=user-1",
-                "hosted-memory-tvar-default-read",
+                "/atomic/default/read?key=user-1",
+                "hosted-memory-missing-value-default-read",
             ),
         )
         .await
@@ -2621,8 +2310,8 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/atomic/tvar-default/raw?key=user-1",
-                "hosted-memory-tvar-default-raw-before-write",
+                "/atomic/default/raw?key=user-1",
+                "hosted-memory-missing-value-default-raw-before-write",
             ),
         )
         .await
@@ -2636,8 +2325,8 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/atomic/tvar-default/write?key=user-1",
-                "hosted-memory-tvar-default-write",
+                "/atomic/default/write?key=user-1",
+                "hosted-memory-missing-value-default-write",
             ),
         )
         .await
@@ -2648,11 +2337,62 @@ async fn hosted_memory_tvar_default_is_lazy_until_written() {
         .invoke(
             "hosted-memory".to_string(),
             test_invocation_with_path(
-                "/atomic/tvar-default/raw?key=user-1",
-                "hosted-memory-tvar-default-raw-after-write",
+                "/atomic/default/raw?key=user-1",
+                "hosted-memory-missing-value-default-raw-after-write",
             ),
         )
         .await
         .expect("raw read after write should succeed");
     assert_eq!(String::from_utf8(raw_after_write.body).expect("utf8"), "8");
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_bindings_are_private_to_workers_across_redeployment() {
+    let service = test_service(RuntimeConfig::default()).await;
+    let source = r#"
+export default {
+  async fetch(request, env) {
+    const memory = env.STATE.get("same-entity");
+    const next = await memory.atomic((tx) => {
+      const next = Number(tx.get("count") ?? 0) + 1;
+      tx.put("count", next);
+      return next;
+    });
+    return Response.json(next);
+  }
+};
+"#;
+    let config = DeployConfig {
+        bindings: vec![DeployBinding::Memory {
+            binding: "STATE".to_string(),
+        }],
+        ..DeployConfig::default()
+    };
+    for worker in ["alpha", "beta"] {
+        service
+            .deploy_with_config(worker.to_string(), source.to_string(), config.clone())
+            .await
+            .expect("worker deploys");
+    }
+    for (worker, expected) in [("alpha", 1), ("alpha", 2), ("beta", 1)] {
+        let response = service
+            .invoke(worker.to_string(), test_invocation())
+            .await
+            .expect("increment commits");
+        assert_eq!(
+            response.body,
+            expected.to_string().as_bytes(),
+            "worker {worker} has its own counter"
+        );
+    }
+    service
+        .deploy_with_config("alpha".to_string(), source.to_string(), config)
+        .await
+        .expect("worker redeploys");
+    let response = service
+        .invoke("alpha".to_string(), test_invocation())
+        .await
+        .expect("increment commits after redeploy");
+    assert_eq!(response.body, b"3");
 }

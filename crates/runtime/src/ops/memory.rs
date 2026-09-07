@@ -1,157 +1,69 @@
 use super::*;
 
-static MEMORY_INVOKE_REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
-
 #[deno_core::op2]
 #[serde]
-pub(super) async fn op_memory_invoke_method(
+pub(super) async fn op_memory_lease_acquire(
     state: Rc<RefCell<OpState>>,
-    caller_request_context_handle: u32,
-    #[string] worker_name: String,
+    request_context_handle: u32,
     #[string] binding: String,
     #[string] key: String,
-    #[string] method_name: String,
-    prefer_caller_isolate: bool,
-    #[buffer] args: JsBuffer,
-) -> MemoryInvokeMethodResult {
-    let args = args.as_ref().to_vec();
-    if caller_request_context_handle == 0
-        || worker_name.trim().is_empty()
-        || binding.trim().is_empty()
-        || key.trim().is_empty()
-        || method_name.trim().is_empty()
-    {
-        return MemoryInvokeMethodResult {
-            ok: false,
-            value_handle: 0,
-            error: "memory method invoke requires caller_request_context_handle, worker_name, binding, key, method_name"
-                .to_string(),
-        };
-    }
-    let caller_request_id = {
-        let op_state = state.borrow();
-        match op_state
-            .borrow::<ActiveRequestContextHandles>()
-            .get_handle(caller_request_context_handle)
-        {
-            Some(context) => context.request_id.clone(),
-            None => {
-                return MemoryInvokeMethodResult {
-                    ok: false,
-                    value_handle: 0,
-                    error: "memory method invoke request context is unavailable".to_string(),
-                };
-            }
+) -> MemoryLeaseResult {
+    let result = async {
+        if binding.is_empty() || key.is_empty() || binding.len() + key.len() > 1024 {
+            return Err(PlatformError::bad_request(format!(
+                "memory lease requires binding and key within 1024 bytes; got {} and {} bytes",
+                binding.len(), key.len()
+            )));
         }
-    };
-    let (caller_worker_name, caller_generation, caller_isolate_id) =
-        match memory_invoke_owner_for_request(&state, caller_request_context_handle) {
-            Ok(value) => value,
-            Err(error) => {
-                return MemoryInvokeMethodResult {
-                    ok: false,
-                    value_handle: 0,
-                    error: error.to_string(),
-                };
-            }
+        let (store, namespace, canceled, canceled_notify) = {
+            let op_state = state.borrow();
+            let request = op_state.borrow::<RequestSecretContexts>().get(request_context_handle)
+                .ok_or_else(|| PlatformError::runtime("memory lease request is unavailable"))?;
+            let worker = &op_state.borrow::<WorkerCacheNamespace>().0;
+            (
+                op_state.borrow::<MemoryStore>().clone(),
+                crate::memory::worker_namespace(worker, &binding),
+                Arc::clone(&request.canceled),
+                Arc::clone(&request.canceled_notify),
+            )
         };
-    let request_id = format!(
-        "{}:memory-run:{}",
-        caller_request_id,
-        MEMORY_INVOKE_REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let request_frame = match encode_memory_invoke_request(&MemoryInvokeRequest {
-        worker_name,
-        binding,
-        key,
-        call: MemoryInvokeCall::Method {
-            name: method_name,
-            args,
-            request_id,
-        },
-    }) {
-        Ok(frame) => frame,
-        Err(error) => {
-            return MemoryInvokeMethodResult {
-                ok: false,
-                value_handle: 0,
-                error: format!("memory method invoke encode failed: {error}"),
-            };
+        let cancellation = canceled_notify.notified();
+        tokio::pin!(cancellation);
+        cancellation.as_mut().enable();
+        if canceled.load(Ordering::SeqCst) {
+            return Err(PlatformError::runtime("memory lease request was canceled"));
         }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemoryInvoke(MemoryInvokeEvent {
-            request_frame,
-            created_at: Instant::now(),
-            caller_worker_name,
-            caller_generation,
-            caller_isolate_id,
-            prefer_caller_isolate,
-            reply: reply_tx,
-        }),
-    )
-    .is_err()
-    {
-        return MemoryInvokeMethodResult {
-            ok: false,
-            value_handle: 0,
-            error: "memory method runtime is unavailable".to_string(),
+        let lease = tokio::select! {
+            biased;
+            _ = &mut cancellation => return Err(PlatformError::runtime("memory lease request was canceled")),
+            result = store.acquire_lease(&namespace, &key) => result?,
         };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(frame)) => match decode_memory_invoke_response(&frame) {
-            Ok(MemoryInvokeResponse::Method { value }) => {
-                match memory_output_bytes_insert(
-                    &mut state.borrow_mut(),
-                    caller_request_context_handle,
-                    value,
-                ) {
-                    Ok(value_handle) => MemoryInvokeMethodResult {
-                        ok: true,
-                        value_handle,
-                        error: String::new(),
-                    },
-                    Err(error) => MemoryInvokeMethodResult {
-                        ok: false,
-                        value_handle: 0,
-                        error: error.to_string(),
-                    },
-                }
-            }
-            Ok(MemoryInvokeResponse::Error(error)) => MemoryInvokeMethodResult {
-                ok: false,
-                value_handle: 0,
-                error,
-            },
-            Ok(MemoryInvokeResponse::Fetch(_)) => MemoryInvokeMethodResult {
-                ok: false,
-                value_handle: 0,
-                error: "memory method invoke received fetch response".to_string(),
-            },
-            Err(error) => MemoryInvokeMethodResult {
-                ok: false,
-                value_handle: 0,
-                error: format!("memory method invoke decode failed: {error}"),
-            },
+        let mut op_state = state.borrow_mut();
+        if canceled.load(Ordering::SeqCst) {
+            return Err(PlatformError::runtime("memory lease request was canceled"));
+        }
+        Ok(op_state.borrow_mut::<MemoryRequestScopes>().insert(MemoryRequestScope {
+            namespace: binding,
+            memory_key: key,
+            owner_epoch: lease.owner_epoch(),
+            request_context_handle,
+            lease: Some(lease),
+        }))
+    }.await;
+    match result {
+        Ok(handle) => MemoryLeaseResult {
+            handle,
+            error: String::new(),
         },
-        Ok(Err(error)) => MemoryInvokeMethodResult {
-            ok: false,
-            value_handle: 0,
+        Err(error) => MemoryLeaseResult {
+            handle: 0,
             error: error.to_string(),
-        },
-        Err(_) => MemoryInvokeMethodResult {
-            ok: false,
-            value_handle: 0,
-            error: "memory method invoke response channel closed".to_string(),
         },
     }
 }
 
 struct ResolvedMemoryScope {
+    lease: Option<Arc<crate::memory::MemoryLease>>,
     namespace: String,
     memory_key: String,
     owner_epoch: i64,
@@ -462,11 +374,19 @@ pub(super) fn op_memory_batch_begin(
                 };
             }
         };
+    if scope.lease.is_none() {
+        return MemoryBatchBeginResult {
+            ok: false,
+            handle: 0,
+            error: format!("memory batch for {binding}/{key} requires an active transaction lease"),
+        };
+    }
     let batch = MemoryBatchHandle {
         request_context_handle,
         namespace: scope.namespace,
         memory_key: scope.memory_key,
         owner_epoch: scope.owner_epoch,
+        _lease: scope.lease,
         command_handle,
         staged_bytes: 0,
         accepted: false,
@@ -809,12 +729,18 @@ fn memory_scope_for_payload_with_epoch(
 ) -> Result<ResolvedMemoryScope> {
     let binding = binding.trim();
     let key = key.trim();
+    let worker = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let request_scope = if memory_scope_handle > 0 {
         let op_state = state.borrow();
-        op_state
-            .borrow::<MemoryRequestScopes>()
-            .get(memory_scope_handle)
-            .cloned()
+        Some(
+            op_state
+                .borrow::<MemoryRequestScopes>()
+                .get(memory_scope_handle)
+                .cloned()
+                .ok_or_else(|| {
+                    PlatformError::runtime(format!("memory scope {memory_scope_handle} is closed"))
+                })?,
+        )
     } else {
         None
     };
@@ -827,14 +753,16 @@ fn memory_scope_for_payload_with_epoch(
             ));
         }
         return Ok(ResolvedMemoryScope {
-            namespace: scope.namespace,
+            lease: scope.lease,
+            namespace: crate::memory::worker_namespace(&worker, &scope.namespace),
             memory_key: scope.memory_key,
             owner_epoch: scope.owner_epoch,
         });
     }
     if !binding.is_empty() && !key.is_empty() {
         return Ok(ResolvedMemoryScope {
-            namespace: binding.to_string(),
+            lease: None,
+            namespace: crate::memory::worker_namespace(&worker, binding),
             memory_key: key.to_string(),
             owner_epoch: 0,
         });
@@ -846,84 +774,12 @@ fn memory_scope_for_payload_with_epoch(
 
 #[deno_core::op2]
 #[serde]
-pub(super) async fn op_memory_state_get(
-    state: Rc<RefCell<OpState>>,
-    request_context_handle: u32,
-    memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] item_key: String,
-) -> MemoryStateGetResult {
-    let started = Instant::now();
-    let (namespace, memory_key) =
-        match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return MemoryStateGetResult {
-                    ok: false,
-                    record: None,
-                    max_version: -1,
-                    error: error.to_string(),
-                };
-            }
-        };
-    let store = state.borrow().borrow::<MemoryStore>().clone();
-    let read_result = store.point_read(&namespace, &memory_key, &item_key).await;
-    match read_result {
-        Ok(point) => {
-            store.record_profile(
-                MemoryProfileMetricKind::OpRead,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            let record = match point
-                .record
-                .map(|entry| {
-                    memory_snapshot_entry(&mut state.borrow_mut(), request_context_handle, entry)
-                })
-                .transpose()
-            {
-                Ok(record) => record,
-                Err(error) => {
-                    return MemoryStateGetResult {
-                        ok: false,
-                        record: None,
-                        max_version: -1,
-                        error: error.to_string(),
-                    };
-                }
-            };
-            MemoryStateGetResult {
-                ok: true,
-                record: record.map(|entry| MemoryStateGetEntry {
-                    key: entry.key,
-                    value_handle: entry.value_handle,
-                    encoding: entry.encoding,
-                    version: entry.version,
-                    deleted: entry.deleted,
-                }),
-                max_version: point.max_version,
-                error: String::new(),
-            }
-        }
-        Err(error) => MemoryStateGetResult {
-            ok: false,
-            record: None,
-            max_version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_state_snapshot(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     memory_scope_handle: u32,
     #[string] binding: String,
     #[string] key: String,
-    #[serde] keys: Vec<String>,
 ) -> MemoryStateSnapshotResult {
     let started = Instant::now();
     let (namespace, memory_key) =
@@ -939,23 +795,12 @@ pub(super) async fn op_memory_state_snapshot(
             }
         };
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    let keys = keys
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let profile_items = keys.len().max(1) as u64;
-    let snapshot_result = if keys.is_empty() {
-        store.snapshot(&namespace, &memory_key).await
-    } else {
-        store.snapshot_keys(&namespace, &memory_key, &keys).await
-    };
-    match snapshot_result {
+    match store.snapshot(&namespace, &memory_key).await {
         Ok(snapshot) => {
             store.record_profile(
                 MemoryProfileMetricKind::OpSnapshot,
                 started.elapsed().as_micros() as u64,
-                profile_items,
+                1,
             );
             let entries = match snapshot
                 .entries
@@ -991,69 +836,6 @@ pub(super) async fn op_memory_state_snapshot(
     }
 }
 
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_state_version_if_newer(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
-    known_version: f64,
-) -> MemoryStateVersionIfNewerResult {
-    let started = Instant::now();
-    let (namespace, memory_key) =
-        match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return MemoryStateVersionIfNewerResult {
-                    ok: false,
-                    stale: false,
-                    max_version: -1,
-                    error: error.to_string(),
-                };
-            }
-        };
-    let store = state.borrow().borrow::<MemoryStore>().clone();
-    let known_version = known_version.trunc() as i64;
-    match store
-        .version_if_newer(&namespace, &memory_key, known_version)
-        .await
-    {
-        Ok(Some(max_version)) => {
-            store.record_profile(
-                MemoryProfileMetricKind::OpVersionIfNewer,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            MemoryStateVersionIfNewerResult {
-                ok: true,
-                stale: true,
-                max_version,
-                error: String::new(),
-            }
-        }
-        Ok(None) => {
-            store.record_profile(
-                MemoryProfileMetricKind::OpVersionIfNewer,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            MemoryStateVersionIfNewerResult {
-                ok: true,
-                stale: false,
-                max_version: known_version,
-                error: String::new(),
-            }
-        }
-        Err(error) => MemoryStateVersionIfNewerResult {
-            ok: false,
-            stale: false,
-            max_version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
 #[deno_core::op2(fast)]
 pub(super) fn op_memory_profile_record_js(
     state: &mut OpState,
@@ -1062,13 +844,9 @@ pub(super) fn op_memory_profile_record_js(
     items: u32,
 ) {
     let kind = match metric.as_str() {
-        "js_read_only_total" => MemoryProfileMetricKind::JsReadOnlyTotal,
+        "js_read_only_commit" => MemoryProfileMetricKind::JsReadOnlyCommit,
         "js_hydrate_full" => MemoryProfileMetricKind::JsHydrateFull,
-        "js_hydrate_keys" => MemoryProfileMetricKind::JsHydrateKeys,
         "js_txn_commit" => MemoryProfileMetricKind::JsTxnCommit,
-        "memory_cache_hit" => MemoryProfileMetricKind::JsCacheHit,
-        "memory_cache_miss" => MemoryProfileMetricKind::JsCacheMiss,
-        "memory_cache_stale" => MemoryProfileMetricKind::JsCacheStale,
         _ => return,
     };
     let store = state.borrow::<MemoryStore>().clone();
@@ -1141,196 +919,6 @@ fn close_memory_command_for_committed_batch(
             .borrow_mut()
             .borrow_mut::<MemoryCommandHandles>()
             .remove(batch.command_handle);
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_direct_apply(
-    state: Rc<RefCell<OpState>>,
-    request_context_handle: u32,
-    memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
-    #[serde] mutations: Vec<MemoryDirectMutationInput>,
-) -> MemoryStateApplyBatchResult {
-    let started = std::time::Instant::now();
-    let (namespace, memory_key) =
-        match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return MemoryStateApplyBatchResult {
-                    ok: false,
-                    applied: false,
-                    read_only: false,
-                    max_version: -1,
-                    mutation_count: 0,
-                    effect_count: 0,
-                    accepted: false,
-                    output_gate_required: false,
-                    mutations: Vec::new(),
-                    error: error.to_string(),
-                };
-            }
-        };
-    if request_context_handle == 0 {
-        return MemoryStateApplyBatchResult {
-            ok: false,
-            applied: false,
-            read_only: false,
-            max_version: -1,
-            mutation_count: 0,
-            effect_count: 0,
-            accepted: false,
-            output_gate_required: false,
-            mutations: Vec::new(),
-            error: "memory direct apply requires request_context_handle".to_string(),
-        };
-    }
-
-    let mut batch = MemoryBatchHandle {
-        request_context_handle,
-        namespace: namespace.clone(),
-        memory_key: memory_key.clone(),
-        owner_epoch: 0,
-        command_handle: 0,
-        staged_bytes: 0,
-        accepted: false,
-        command_result: None,
-        mutations: Vec::new(),
-        effects: Vec::new(),
-    };
-    for mutation in mutations {
-        let value = if mutation.value_handle == 0 {
-            Bytes::new()
-        } else {
-            match memory_bytes_for_handle_state(
-                &mut state.borrow_mut(),
-                request_context_handle,
-                mutation.value_handle,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    return MemoryStateApplyBatchResult {
-                        ok: false,
-                        applied: false,
-                        read_only: false,
-                        max_version: -1,
-                        mutation_count: batch.mutations.len(),
-                        effect_count: 0,
-                        accepted: false,
-                        output_gate_required: false,
-                        mutations: Vec::new(),
-                        error: error.to_string(),
-                    };
-                }
-            }
-        };
-        if let Err(error) = stage_memory_batch_mutation(
-            &mut batch,
-            MemoryBatchMutation {
-                key: mutation.key,
-                value: value.to_vec(),
-                encoding: mutation.encoding,
-                deleted: mutation.deleted,
-            },
-        ) {
-            return MemoryStateApplyBatchResult {
-                ok: false,
-                applied: false,
-                read_only: false,
-                max_version: -1,
-                mutation_count: batch.mutations.len(),
-                effect_count: 0,
-                accepted: false,
-                output_gate_required: false,
-                mutations: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    }
-
-    let mutation_count = batch.mutations.len();
-    if mutation_count == 0 {
-        return MemoryStateApplyBatchResult {
-            ok: true,
-            applied: false,
-            read_only: true,
-            max_version: -1,
-            mutation_count: 0,
-            effect_count: 0,
-            accepted: false,
-            output_gate_required: false,
-            mutations: Vec::new(),
-            error: String::new(),
-        };
-    }
-
-    let store = state.borrow().borrow::<MemoryStore>().clone();
-    let apply_result = store
-        .apply_batch(&namespace, &memory_key, &batch.mutations, None, &[], None)
-        .await;
-    match apply_result {
-        Ok(result) => {
-            store.record_profile(
-                MemoryProfileMetricKind::OpApplyBatch,
-                started.elapsed().as_micros() as u64,
-                mutation_count as u64 + 1,
-            );
-            let mutations = match batch
-                .mutations
-                .iter()
-                .map(|mutation| {
-                    memory_batch_mutation_entry(
-                        &mut state.borrow_mut(),
-                        request_context_handle,
-                        mutation,
-                        result.max_version,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(mutations) => mutations,
-                Err(error) => {
-                    return MemoryStateApplyBatchResult {
-                        ok: false,
-                        applied: false,
-                        read_only: false,
-                        max_version: -1,
-                        mutation_count,
-                        effect_count: 0,
-                        accepted: false,
-                        output_gate_required: false,
-                        mutations: Vec::new(),
-                        error: error.to_string(),
-                    };
-                }
-            };
-            MemoryStateApplyBatchResult {
-                ok: true,
-                applied: true,
-                read_only: false,
-                max_version: result.max_version,
-                mutation_count,
-                effect_count: 0,
-                accepted: false,
-                output_gate_required: false,
-                mutations,
-                error: String::new(),
-            }
-        }
-        Err(error) => MemoryStateApplyBatchResult {
-            ok: false,
-            applied: false,
-            read_only: false,
-            max_version: -1,
-            mutation_count,
-            effect_count: 0,
-            accepted: false,
-            output_gate_required: false,
-            mutations: Vec::new(),
-            error: error.to_string(),
-        },
     }
 }
 
@@ -1414,10 +1002,13 @@ pub(super) async fn op_memory_batch_apply(
         .apply_batch(
             &batch.namespace,
             &batch.memory_key,
-            &batch.mutations,
-            command_result.as_ref(),
-            &batch.effects,
-            Some(owner_epoch),
+            storage::memory::MemoryCommit {
+                mutations: &batch.mutations,
+                command_result: command_result.as_ref(),
+                outbox_effects: &batch.effects,
+                owner_epoch: Some(owner_epoch),
+                lease: batch._lease.clone(),
+            },
         )
         .await;
     match apply_result {
@@ -1777,379 +1368,13 @@ pub(super) async fn op_memory_socket_list(
     }
 }
 
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_socket_consume_close(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
-) -> MemorySocketConsumeCloseResult {
-    if handle.trim().is_empty() {
-        return MemorySocketConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: "memory socket consumeClose requires handle".to_string(),
-        };
-    }
-
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketConsumeCloseResult {
-                ok: false,
-                events: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemorySocketConsumeClose(MemorySocketConsumeCloseEvent {
-            reply: reply_tx,
-            binding,
-            key,
-            handle,
-        }),
-    )
-    .is_err()
-    {
-        return MemorySocketConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: "memory socket consumeClose runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(events)) => MemorySocketConsumeCloseResult {
-            ok: true,
-            events: events
-                .into_iter()
-                .map(|event| MemorySocketReplayClose {
-                    code: event.code,
-                    reason: event.reason,
-                })
-                .collect(),
-            error: String::new(),
-        },
-        Ok(Err(error)) => MemorySocketConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => MemorySocketConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: "memory socket consumeClose response channel closed".to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_transport_send_stream(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
-    #[buffer] chunk: JsBuffer,
-) -> MemoryTransportSendResult {
-    let chunk = chunk.as_ref().to_vec();
-    if handle.trim().is_empty() {
-        return MemoryTransportSendResult {
-            ok: false,
-            error: "memory transport sendStream requires handle".to_string(),
-        };
-    }
-
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportSendResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemoryTransportSendStream(MemoryTransportSendStreamEvent {
-            reply: reply_tx,
-            handle,
-            binding,
-            key,
-            chunk,
-        }),
-    )
-    .is_err()
-    {
-        return MemoryTransportSendResult {
-            ok: false,
-            error: "memory transport sendStream runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(())) => MemoryTransportSendResult {
-            ok: true,
-            error: String::new(),
-        },
-        Ok(Err(error)) => MemoryTransportSendResult {
-            ok: false,
-            error: error.to_string(),
-        },
-        Err(_) => MemoryTransportSendResult {
-            ok: false,
-            error: "memory transport sendStream response channel closed".to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_transport_send_datagram(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
-    #[buffer] datagram: JsBuffer,
-) -> MemoryTransportSendResult {
-    let datagram = datagram.as_ref().to_vec();
-    if handle.trim().is_empty() {
-        return MemoryTransportSendResult {
-            ok: false,
-            error: "memory transport sendDatagram requires handle".to_string(),
-        };
-    }
-
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportSendResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemoryTransportSendDatagram(MemoryTransportSendDatagramEvent {
-            reply: reply_tx,
-            handle,
-            binding,
-            key,
-            datagram,
-        }),
-    )
-    .is_err()
-    {
-        return MemoryTransportSendResult {
-            ok: false,
-            error: "memory transport sendDatagram runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(())) => MemoryTransportSendResult {
-            ok: true,
-            error: String::new(),
-        },
-        Ok(Err(error)) => MemoryTransportSendResult {
-            ok: false,
-            error: error.to_string(),
-        },
-        Err(_) => MemoryTransportSendResult {
-            ok: false,
-            error: "memory transport sendDatagram response channel closed".to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_transport_close(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
-    code: u16,
-    #[string] reason: String,
-) -> MemoryTransportCloseResult {
-    if handle.trim().is_empty() {
-        return MemoryTransportCloseResult {
-            ok: false,
-            error: "memory transport close requires handle".to_string(),
-        };
-    }
-
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportCloseResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemoryTransportClose(MemoryTransportCloseEvent {
-            reply: reply_tx,
-            handle,
-            binding,
-            key,
-            code,
-            reason,
-        }),
-    )
-    .is_err()
-    {
-        return MemoryTransportCloseResult {
-            ok: false,
-            error: "memory transport close runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(())) => MemoryTransportCloseResult {
-            ok: true,
-            error: String::new(),
-        },
-        Ok(Err(error)) => MemoryTransportCloseResult {
-            ok: false,
-            error: error.to_string(),
-        },
-        Err(_) => MemoryTransportCloseResult {
-            ok: false,
-            error: "memory transport close response channel closed".to_string(),
-        },
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_transport_list(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
-) -> MemoryTransportListResult {
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportListResult {
-                ok: false,
-                handles: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let registry = state.borrow().borrow::<MemoryOpenHandleRegistry>().clone();
-    MemoryTransportListResult {
-        ok: true,
-        handles: registry.list_transport_handles(&binding, &key),
-        error: String::new(),
-    }
-}
-
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_transport_consume_close(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
-) -> MemoryTransportConsumeCloseResult {
-    if handle.trim().is_empty() {
-        return MemoryTransportConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: "memory transport consumeClose requires handle".to_string(),
-        };
-    }
-
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemoryTransportConsumeCloseResult {
-                ok: false,
-                events: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemoryTransportConsumeClose(MemoryTransportConsumeCloseEvent {
-            reply: reply_tx,
-            binding,
-            key,
-            handle,
-        }),
-    )
-    .is_err()
-    {
-        return MemoryTransportConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: "memory transport consumeClose runtime is unavailable".to_string(),
-        };
-    }
-
-    match reply_rx.await {
-        Ok(Ok(events)) => MemoryTransportConsumeCloseResult {
-            ok: true,
-            events: events
-                .into_iter()
-                .map(|event| MemoryTransportReplayClose {
-                    code: event.code,
-                    reason: event.reason,
-                })
-                .collect(),
-            error: String::new(),
-        },
-        Ok(Err(error)) => MemoryTransportConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: error.to_string(),
-        },
-        Err(_) => MemoryTransportConsumeCloseResult {
-            ok: false,
-            events: Vec::new(),
-            error: "memory transport consumeClose response channel closed".to_string(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn empty_batch(owner_epoch: i64) -> MemoryBatchHandle {
         MemoryBatchHandle {
+            _lease: None,
             request_context_handle: 1,
             namespace: "ns".to_string(),
             memory_key: "entity".to_string(),

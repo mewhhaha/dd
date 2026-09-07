@@ -22,9 +22,9 @@ function cloneAuxiliaryConfig(value) {
 }
 
 function normalizeAuxiliaryWorkerKind(value) {
-  if (value == null) return "dynamic";
+  if (value == null) return "service";
   const kind = String(value).trim().toLowerCase();
-  if (kind !== "dynamic" && kind !== "service") {
+  if (kind !== "service") {
     throw new Error(`ddVitePlugin auxiliary worker kind is invalid: ${kind}`);
   }
   return kind;
@@ -45,7 +45,7 @@ function normalizeAuxiliaryWorkers(value) {
     if (seen.has(name)) throw new Error(`duplicate ddVitePlugin auxiliary worker name: ${name}`);
     seen.add(name);
     const kind = normalizeAuxiliaryWorkerKind(entry?.kind);
-    return { ...entry, kind, name, binding: nonEmptyString(entry?.binding) ?? auxiliaryBindingName(name), id: nonEmptyString(entry?.id) ?? name, service: kind === "service" ? nonEmptyString(entry?.service) ?? nonEmptyString(entry?.workerName) ?? name : undefined, deployment: entry?.deployment && typeof entry.deployment === "object" ? cloneAuxiliaryConfig(entry.deployment) : undefined };
+    return { ...entry, kind, name, binding: nonEmptyString(entry?.binding) ?? auxiliaryBindingName(name), service: nonEmptyString(entry?.service) ?? nonEmptyString(entry?.workerName) ?? name, deployment: entry?.deployment && typeof entry.deployment === "object" ? cloneAuxiliaryConfig(entry.deployment) : undefined };
   });
 }
 
@@ -54,9 +54,9 @@ function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
   const runtimeConfig = cloneAuxiliaryConfig(config);
   const bindings = Array.isArray(runtimeConfig.bindings) ? [...runtimeConfig.bindings] : [];
   for (const worker of auxiliaryWorkers) {
-    const type = worker.kind === "service" ? "service" : "dynamic";
+    const type = "service";
     if (!bindings.some((binding) => String(binding?.type ?? "").toLowerCase() === type && binding?.binding === worker.binding)) {
-      bindings.push(type === "service" ? { type, binding: worker.binding, service: worker.service } : { type, binding: worker.binding });
+      bindings.push({ type, binding: worker.binding, service: worker.service });
     }
   }
   runtimeConfig.bindings = bindings;
@@ -171,7 +171,6 @@ export function workerEnvBindings(worker) {
     const type = {
       kv: "DdKvNamespace",
       memory: "DdMemoryNamespace",
-      dynamic: "DdDynamicWorkerNamespace",
       service: "DdServiceBinding",
     }[String(binding?.type ?? "").toLowerCase()];
     if (!type) {
@@ -317,7 +316,7 @@ export async function buildGeneratedDeploymentConfig({
 }) {
   const deployment = { schema_version: CONFIG_SCHEMA_VERSION };
   const runtimeConfig = withAuxiliaryRuntimeBindings(
-    options.config ?? base.config ?? topLevelRuntimeConfig(base) ?? { public: true },
+    options.config ?? base.config ?? topLevelRuntimeConfig(base) ?? {},
     normalizeAuxiliaryWorkers(options.auxiliaryWorkers),
   );
 
@@ -365,9 +364,9 @@ export function buildAuxiliaryServiceDeploymentConfig({
 }) {
   const deployment = {
     schema_version: CONFIG_SCHEMA_VERSION,
-    name: worker.kind === "service" ? worker.service : worker.runtimeName,
+    name: worker.service,
     entrypoint: workerFile,
-    config: worker.kind === "service" ? auxiliaryWorkerServiceConfig(worker) : cloneJson(worker.config),
+    config: auxiliaryWorkerServiceConfig(worker),
   };
   const baseUrl = nonEmptyString(base.base_url) ?? nonEmptyString(base.baseUrl);
   if (baseUrl) {
@@ -458,12 +457,13 @@ export function validateDdConfig(value, path = DEFAULT_SOURCE_CONFIG_FILE) {
     "cache",
     "bindings",
     "internal",
+    "egress_allow_hosts",
   ]), path);
   if (value.config !== undefined) {
     validateRuntimeConfig(value.config, `${path}.config`);
   }
   const topLevelRuntime = {};
-  for (const key of ["public", "cache", "bindings", "internal"]) {
+  for (const key of ["public", "cache", "bindings", "internal", "egress_allow_hosts"]) {
     if (Object.hasOwn(value, key)) {
       topLevelRuntime[key] = value[key];
     }
@@ -483,18 +483,46 @@ export function validateDdConfig(value, path = DEFAULT_SOURCE_CONFIG_FILE) {
   }
 }
 
+export function normalizeRuntimeConfig(value = {}, path = "runtime") {
+  validateRuntimeConfig(value, path);
+  return {
+    egress_allow_hosts: value.egress_allow_hosts ?? [],
+    public: value.public ?? false,
+    cache: { enabled: value.cache?.enabled ?? false },
+    bindings: value.bindings ?? [],
+    internal: {
+      trace: value.internal?.trace == null ? null : {
+        worker: value.internal.trace.worker,
+        path: value.internal.trace.path ?? "/ingest",
+      },
+    },
+  };
+}
+
 export function validateRuntimeConfig(value, path) {
   assertConfigObject(value, path);
-  rejectUnknownConfigFields(value, new Set(["public", "cache", "bindings", "internal"]), path);
+  rejectUnknownConfigFields(value, new Set(["public", "cache", "bindings", "internal", "egress_allow_hosts"]), path);
+  if (value.public !== undefined && typeof value.public !== "boolean") {
+    throw new Error(`Invalid dd config ${path}: public must be a boolean`);
+  }
+  if (value.egress_allow_hosts !== undefined && (!Array.isArray(value.egress_allow_hosts) || value.egress_allow_hosts.some((host) => typeof host !== "string" || !host.trim()))) {
+    throw new Error(`Invalid dd config ${path}: egress_allow_hosts must be an array of non-empty strings`);
+  }
   if (value.cache !== undefined) {
     assertConfigObject(value.cache, `${path}.cache`);
     rejectUnknownConfigFields(value.cache, new Set(["enabled"]), `${path}.cache`);
+    if (value.cache.enabled !== undefined && typeof value.cache.enabled !== "boolean") {
+      throw new Error(`Invalid dd config ${path}.cache: enabled must be a boolean`);
+    }
   }
   if (value.internal !== undefined) {
     assertConfigObject(value.internal, `${path}.internal`);
     rejectUnknownConfigFields(value.internal, new Set(["trace"]), `${path}.internal`);
     if (value.internal.trace != null) {
       assertConfigObject(value.internal.trace, `${path}.internal.trace`);
+      if (typeof value.internal.trace.worker !== "string" || (value.internal.trace.path !== undefined && typeof value.internal.trace.path !== "string")) {
+        throw new Error(`Invalid dd config ${path}.internal.trace: worker and path must be strings`);
+      }
       rejectUnknownConfigFields(
         value.internal.trace,
         new Set(["worker", "path"]),
@@ -513,7 +541,10 @@ export function validateRuntimeConfig(value, path) {
         ? new Set(["type", "binding", "service"])
         : new Set(["type", "binding"]);
       rejectUnknownConfigFields(binding, fields, label);
-      if (!["kv", "memory", "dynamic", "service"].includes(binding.type)) {
+      if (typeof binding.binding !== "string" || (binding.type === "service" && typeof binding.service !== "string")) {
+        throw new Error(`Invalid dd config ${label}: binding and service names must be strings`);
+      }
+      if (!["kv", "memory", "service"].includes(binding.type)) {
         throw new Error(`Invalid dd config ${label}: unsupported binding type ${binding.type}`);
       }
     });
@@ -559,7 +590,7 @@ export function isMissingFileError(error) {
 export function topLevelRuntimeConfig(config) {
   const runtimeConfig = {};
   let found = false;
-  for (const key of ["public", "cache", "bindings", "internal"]) {
+  for (const key of ["public", "cache", "bindings", "internal", "egress_allow_hosts"]) {
     if (Object.hasOwn(config, key)) {
       runtimeConfig[key] = config[key];
       found = true;

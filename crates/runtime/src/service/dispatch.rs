@@ -50,6 +50,9 @@ impl WorkerManager {
     }
 
     pub(super) fn account_dequeued_pending(&mut self, pending: &PendingInvoke) {
+        if let Some(admission) = &pending.queue_admission {
+            admission.release();
+        }
         self.queue_counters.requests = self.queue_counters.requests.saturating_sub(1);
         self.queue_counters.bytes = self
             .queue_counters
@@ -81,6 +84,7 @@ impl WorkerManager {
         ready: oneshot::Sender<Result<WorkerStreamOutput>>,
     ) {
         let (body_sender, body_receiver) = mpsc::channel(RESPONSE_STREAM_CHANNEL_CAPACITY);
+        let (completion, completed) = oneshot::channel();
         self.stream_registrations.insert(
             runtime_request_id,
             StreamRegistration {
@@ -88,7 +92,9 @@ impl WorkerManager {
                 completion_token: None,
                 ready: Some(ready),
                 body_sender,
-                body_receiver: Some(body_receiver),
+                body_receiver: Some((body_receiver, completed)),
+                completion: Some(completion),
+                pending_send: None,
                 started: false,
                 bytes_sent: 0,
                 max_bytes: self.config.max_response_body_bytes,
@@ -102,13 +108,13 @@ impl WorkerManager {
         event_tx: &RuntimeEventSender,
     ) {
         let EnqueueInvokeRequest {
+            mut queue_admission,
             worker_name,
             runtime_request_id,
             request,
             request_body,
             mut memory_route,
             memory_call,
-            host_rpc_call,
             target_isolate_id,
             target_generation,
             internal_origin,
@@ -140,7 +146,12 @@ impl WorkerManager {
             self.fail_stream_registration(&worker_name, &runtime_request_id, error);
             return;
         }
-        let queued_bytes = estimate_pending_invoke_bytes(&request, request_body.is_some());
+        let queued_bytes = estimate_pending_invoke_bytes(&request, request_body.is_some())
+            .saturating_add(
+                memory_call
+                    .as_ref()
+                    .map_or(0, MemoryExecutionCall::queued_bytes),
+            );
         let Some(entry) = self.workers.get(&worker_name) else {
             let error = PlatformError::not_found("Worker not found");
             let _ = reply.send(Err(error.clone()));
@@ -158,8 +169,28 @@ impl WorkerManager {
         let admission_error = entry
             .pools
             .get(&generation)
-            .and_then(|pool| self.queue_admission_error(pool, queued_bytes, internal_origin));
+            .and_then(|pool| self.queue_admission_error(pool, internal_origin));
         if let Some(error) = admission_error {
+            self.reject_not_queued_invoke(
+                &worker_name,
+                &runtime_request_id,
+                reply,
+                &reply_kind,
+                error,
+            );
+            return;
+        }
+
+        let admission = match queue_admission.as_mut() {
+            Some(admission) => admission.resize(queued_bytes),
+            None => self
+                .admission
+                .reserve_queue(queued_bytes, internal_origin)
+                .map(|admission| {
+                    queue_admission = Some(admission);
+                }),
+        };
+        if let Err(error) = admission {
             self.reject_not_queued_invoke(
                 &worker_name,
                 &runtime_request_id,
@@ -173,10 +204,10 @@ impl WorkerManager {
         if let Some(route) = memory_route.as_mut()
             && route.shard_index.is_none()
         {
-            route.shard_index = Some(
-                self.memory_store
-                    .shard_index_for_key(&route.binding, &route.key),
-            );
+            route.shard_index = Some(self.memory_store.shard_index_for_key(
+                &crate::memory::worker_namespace(&worker_name, &route.binding),
+                &route.key,
+            ));
         }
         if let Some(pool) = self.get_pool_mut(&worker_name, generation) {
             if let Some(route) = &memory_route
@@ -195,12 +226,12 @@ impl WorkerManager {
             }
             let enqueued_at = Instant::now();
             pool.queue.push_back(PendingInvoke {
+                queue_admission,
                 runtime_request_id,
                 request,
                 request_body,
                 memory_route,
                 memory_call,
-                host_rpc_call,
                 target_isolate_id,
                 internal_origin,
                 reply,
@@ -224,7 +255,6 @@ impl WorkerManager {
     pub(super) fn queue_admission_error(
         &self,
         pool: &WorkerPool,
-        queued_bytes: usize,
         internal_origin: bool,
     ) -> Option<PlatformError> {
         let per_worker_limit = self.config.max_queued_requests_per_worker
@@ -236,27 +266,6 @@ impl WorkerManager {
         if pool.queue.len() >= per_worker_limit {
             return Some(PlatformError::overloaded(format!(
                 "worker queue is full (max {per_worker_limit} queued requests)"
-            )));
-        }
-
-        let global_limit = self.config.max_global_queued_requests
-            + if internal_origin {
-                self.config.reserved_internal_queued_requests_per_worker
-            } else {
-                0
-            };
-        if self.queue_counters.requests >= global_limit {
-            return Some(PlatformError::overloaded(format!(
-                "runtime queue is full (max {global_limit} queued requests)"
-            )));
-        }
-
-        if self.queue_counters.bytes.saturating_add(queued_bytes)
-            > self.config.max_global_queued_bytes
-        {
-            return Some(PlatformError::overloaded(format!(
-                "runtime queue byte budget is full (max {} bytes)",
-                self.config.max_global_queued_bytes
             )));
         }
 
@@ -277,15 +286,8 @@ impl WorkerManager {
                     let _ = waiter.send(Err(error.clone()));
                 }
             }
-            PendingReplyKind::TransportOpen { session_id } => {
-                if let Some(waiter) = self.transport_open_waiters.remove(session_id) {
-                    let _ = waiter.send(Err(error.clone()));
-                }
-                self.transport_open_channels.remove(session_id);
-            }
             PendingReplyKind::Normal
             | PendingReplyKind::Stream
-            | PendingReplyKind::DynamicFetch { .. }
             | PendingReplyKind::WebsocketFrame { .. } => {}
         }
         self.fail_stream_registration(worker_name, runtime_request_id, error.clone());
@@ -474,249 +476,6 @@ impl WorkerManager {
         self.reject_not_queued_invoke(worker_name, &runtime_request_id, reply, &reply_kind, error);
     }
 
-    pub(crate) fn try_dispatch_direct_dynamic_fetch(
-        &mut self,
-        dispatch: DirectDynamicFetchRequest,
-    ) -> DirectDynamicFetchDispatch {
-        let DirectDynamicFetchRequest {
-            worker_name,
-            generation,
-            target_isolate_id,
-            runtime_request_id,
-            request,
-            reply,
-            handle,
-        } = dispatch;
-        if request.body.len() > self.config.max_request_body_bytes {
-            let _ = reply.send(Err(PlatformError::bad_request(format!(
-                "request body exceeded max_request_body_bytes ({} bytes)",
-                self.config.max_request_body_bytes
-            ))));
-            return DirectDynamicFetchDispatch::Dispatched;
-        }
-        let config_max_inflight = self.config.max_inflight_per_isolate;
-        let dispatch_result = {
-            let Some(pool) = self.get_pool_mut(&worker_name, generation) else {
-                return DirectDynamicFetchDispatch::Fallback {
-                    reply,
-                    clear_preferred: true,
-                };
-            };
-            let max_inflight = if pool.strict_request_isolation {
-                1
-            } else {
-                config_max_inflight
-            };
-            let Some(isolate_idx) = pool.isolate_idx(target_isolate_id) else {
-                return DirectDynamicFetchDispatch::Fallback {
-                    reply,
-                    clear_preferred: true,
-                };
-            };
-            let isolate_busy = pool.isolates[isolate_idx].inflight_count >= max_inflight
-                || (pool.strict_request_isolation
-                    && !pool.isolates[isolate_idx].pending_wait_until.is_empty());
-            if isolate_busy {
-                return DirectDynamicFetchDispatch::Fallback {
-                    reply,
-                    clear_preferred: false,
-                };
-            }
-
-            let counted_reuse = pool.isolates[isolate_idx].served_requests > 0;
-            if counted_reuse {
-                pool.stats.reuse_count += 1;
-            }
-
-            let completion_token = next_runtime_token("done");
-            let dispatched_at = Instant::now();
-            let completion_meta = Some(PendingReplyMeta {
-                method: request.method.clone(),
-                url: request.url.clone(),
-                traceparent: None,
-                user_request_id: request.request_id.clone(),
-            });
-            let command = pool.build_execute_command(BuildExecuteCommand {
-                runtime_request_id: runtime_request_id.clone(),
-                completion_token: completion_token.clone(),
-                request,
-                request_body: None,
-                stream_response: false,
-                memory_call: None,
-                host_rpc_call: None,
-                memory_route: None,
-                dispatched_at,
-                profile_memory_atomic: false,
-            });
-
-            let isolate = &mut pool.isolates[isolate_idx];
-            isolate.served_requests += 1;
-            isolate.inflight_count += 1;
-            isolate.pending_replies.insert(
-                runtime_request_id.clone(),
-                PendingReply {
-                    completion_token,
-                    canceled: false,
-                    memory_key: None,
-                    active_memory_lease: None,
-                    memory_outbox_shard: None,
-                    internal_origin: true,
-                    reply,
-                    completion_meta,
-                    kind: PendingReplyKind::DynamicFetch { handle },
-                    dispatched_at,
-                },
-            );
-
-            if isolate.sender.try_send(command).is_ok() {
-                return DirectDynamicFetchDispatch::Dispatched;
-            }
-
-            let pending_reply = isolate
-                .pending_replies
-                .remove(&runtime_request_id)
-                .expect("direct dynamic fetch pending reply should exist");
-            isolate.inflight_count = isolate.inflight_count.saturating_sub(1);
-            isolate.served_requests = isolate.served_requests.saturating_sub(1);
-            let restored_reply = pending_reply.reply;
-            if counted_reuse {
-                pool.stats.reuse_count = pool.stats.reuse_count.saturating_sub(1);
-            }
-            (isolate_idx, restored_reply)
-        };
-        let (isolate_idx, restored_reply) = dispatch_result;
-        let failed = self.remove_isolate(&worker_name, generation, isolate_idx);
-        for (request_id, reply) in failed.replies {
-            if request_id != runtime_request_id {
-                let _ = reply.send(Err(PlatformError::internal("isolate is unavailable")));
-            }
-        }
-        DirectDynamicFetchDispatch::Fallback {
-            reply: restored_reply,
-            clear_preferred: true,
-        }
-    }
-
-    pub(crate) fn enqueue_memory_invoke(
-        &mut self,
-        payload: MemoryInvokeEvent,
-        event_tx: &RuntimeEventSender,
-    ) {
-        let decoded = match decode_memory_invoke_request(&payload.request_frame) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                let _ = payload.reply.send(Err(error));
-                return;
-            }
-        };
-        let (request, memory_call, prefer_caller_isolate) = match decoded.call {
-            MemoryInvokeCall::Method {
-                name,
-                args,
-                request_id,
-            } => (
-                WorkerInvocation {
-                    method: "MEMORY-RPC".to_string(),
-                    url: format!("http://memory/__dd_rpc/{}", name),
-                    headers: Vec::new(),
-                    body: args.clone(),
-                    request_id,
-                },
-                MemoryExecutionCall::Method {
-                    binding: decoded.binding.clone(),
-                    key: decoded.key.clone(),
-                    name: name.clone(),
-                    args,
-                },
-                name == MEMORY_ATOMIC_METHOD && payload.prefer_caller_isolate,
-            ),
-            MemoryInvokeCall::Fetch(_) => {
-                let _ = payload.reply.send(Err(PlatformError::bad_request(
-                    "memory fetch invoke is no longer supported; use fetch + wake + stub.atomic",
-                )));
-                return;
-            }
-        };
-        let runtime_request_id = Uuid::new_v4().to_string();
-        let route = MemoryRoute::new(
-            decoded.binding.trim().to_string(),
-            decoded.key.trim().to_string(),
-        );
-        if route.binding.is_empty() || route.key.is_empty() {
-            let _ = payload.reply.send(Err(PlatformError::bad_request(
-                "memory binding/key must not be empty",
-            )));
-            return;
-        }
-        if matches!(
-            &memory_call,
-            MemoryExecutionCall::Method { name, .. } if name == MEMORY_ATOMIC_METHOD
-        ) {
-            self.memory_store.record_profile(
-                MemoryProfileMetricKind::RuntimeAtomicInvokeEventWait,
-                duration_us(payload.created_at.elapsed()),
-                1,
-            );
-        }
-        let mut target_generation = None;
-        let mut target_isolate_id = None;
-        if payload.caller_worker_name == decoded.worker_name
-            && let Some(pool) = self
-                .workers
-                .get(&decoded.worker_name)
-                .and_then(|entry| entry.pools.get(&payload.caller_generation))
-        {
-            target_generation = Some(payload.caller_generation);
-            if prefer_caller_isolate
-                && pool
-                    .isolates
-                    .iter()
-                    .any(|isolate| isolate.id == payload.caller_isolate_id)
-            {
-                target_isolate_id = Some(payload.caller_isolate_id);
-            }
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue_invoke(
-            EnqueueInvokeRequest {
-                worker_name: decoded.worker_name,
-                runtime_request_id,
-                request,
-                request_body: None,
-                memory_route: Some(route),
-                memory_call: Some(memory_call),
-                host_rpc_call: None,
-                target_isolate_id,
-                target_generation,
-                internal_origin: true,
-                reply: reply_tx,
-                reply_kind: PendingReplyKind::Normal,
-            },
-            event_tx,
-        );
-        tokio::spawn(async move {
-            let result = match reply_rx.await {
-                Ok(Ok(output)) => encode_memory_invoke_response(&MemoryInvokeResponse::Method {
-                    value: output.body,
-                }),
-                Ok(Err(error)) => {
-                    encode_memory_invoke_response(&MemoryInvokeResponse::Error(error.to_string()))
-                }
-                Err(_) => encode_memory_invoke_response(&MemoryInvokeResponse::Error(
-                    "memory invoke response channel closed".to_string(),
-                )),
-            };
-            match result {
-                Ok(frame) => {
-                    let _ = payload.reply.send(Ok(frame));
-                }
-                Err(error) => {
-                    let _ = payload.reply.send(Err(error));
-                }
-            }
-        });
-    }
-
     pub(crate) fn cancel_invoke(
         &mut self,
         worker_name: String,
@@ -899,7 +658,13 @@ impl WorkerManager {
                 let spawn_needed = selection.is_none()
                     && (internal_request_needs_capacity || external_request_needs_capacity)
                     && !pool.has_starting_isolate()
-                    && pool.isolates.len() < max_isolates;
+                    && (pool
+                        .isolates
+                        .iter()
+                        .filter(|isolate| !isolate.internal_rescue)
+                        .count()
+                        < max_isolates
+                        || internal_request_needs_capacity);
                 (selection, spawn_needed)
             };
 
@@ -942,12 +707,9 @@ impl WorkerManager {
                 .memory_route
                 .as_ref()
                 .map(|route| route.owner_key.clone());
-            let active_memory_entity = pending_memory_key.as_ref().filter(|_| {
-                matches!(
-                    pending_invoke.memory_call.as_ref(),
-                    Some(MemoryExecutionCall::Method { name, .. }) if name == MEMORY_ATOMIC_METHOD
-                )
-            });
+            let active_memory_entity = pending_memory_key
+                .as_ref()
+                .filter(|_| pending_invoke.memory_call.is_some());
             let profile_memory_atomic = active_memory_entity.is_some();
             let memory_outbox_shard = pending_invoke
                 .memory_route
@@ -955,7 +717,7 @@ impl WorkerManager {
                 .and_then(|route| route.shard_index);
             if profile_memory_atomic {
                 self.memory_store.record_profile(
-                    MemoryProfileMetricKind::RuntimeAtomicQueueWait,
+                    MemoryProfileMetricKind::RuntimeSocketQueueWait,
                     duration_us(pending_invoke.enqueued_at.elapsed()),
                     1,
                 );
@@ -1048,7 +810,6 @@ impl WorkerManager {
                     request_body: pending_invoke.request_body,
                     stream_response,
                     memory_call: pending_invoke.memory_call,
-                    host_rpc_call: pending_invoke.host_rpc_call,
                     memory_route,
                     dispatched_at,
                     profile_memory_atomic,
@@ -1126,7 +887,7 @@ impl WorkerManager {
                 )
             })
             .ok_or_else(|| PlatformError::not_found("Worker not found"))?;
-        let Some(reservation) = self.try_reserve_global_isolate_slot(spawn_policy) else {
+        let Some(admission) = self.admission.reserve_isolate(&self.config, spawn_policy) else {
             self.stats.scale_up_budget_denied_count =
                 self.stats.scale_up_budget_denied_count.saturating_add(1);
             return Err(PlatformError::overloaded(format!(
@@ -1134,30 +895,32 @@ impl WorkerManager {
                 self.config.max_global_isolates
             )));
         };
+        let reservation = admission.reservation;
         let allow_code_generation = self.config.debug_code_generation;
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
         let memory_store = self.memory_store.clone();
         let cache_store = self.cache_store.clone();
-        let dynamic_profile = self.dynamic_profile.clone();
         let open_handle_registry = self.open_handle_registry.clone();
         let execution_limits = crate::ops::RuntimeExecutionLimits {
             max_request_body_bytes: self.config.max_request_body_bytes,
             max_isolate_heap_bytes: self.config.max_isolate_heap_bytes,
+            max_buffered_response_bytes: self.config.max_buffered_response_bytes,
+            response_byte_budget: Arc::clone(&self.response_byte_budget),
         };
         let mut isolate = match spawn_isolate_thread(IsolateThreadStart {
+            admission,
             snapshot,
             snapshot_preloaded,
             source,
-            dynamic_modules: self.dynamic_modules.clone(),
+            module_registry: self.module_registry.clone(),
             deployment_config,
             allow_code_generation,
             kv_store,
             memory_store,
             cache_store,
             open_handle_registry,
-            dynamic_profile,
             execution_limits,
             runtime_fast_sender: self.runtime_fast_sender.clone(),
             worker_name: worker_name.to_string(),
@@ -1168,7 +931,6 @@ impl WorkerManager {
         }) {
             Ok(isolate) => isolate,
             Err(error) => {
-                self.release_global_isolate_slot_for_startup_failure();
                 return Err(error);
             }
         };
@@ -1183,7 +945,7 @@ impl WorkerManager {
             pool.log_stats("spawn");
             Ok(())
         } else {
-            let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+            isolate.request_shutdown();
             self.track_exiting_isolate_slot(worker_name, generation, isolate.id, isolate.startup);
             Err(PlatformError::internal("worker pool missing"))
         }
@@ -1223,15 +985,31 @@ impl WorkerManager {
                     .regular_isolate_slots_used()
                     .saturating_sub(exiting_regular_slots);
                 if live_slots >= self.config.max_global_isolates {
-                    self.retire_lru_idle_isolate_for_budget(&worker_name, generation);
+                    self.admission
+                        .reclaim_idle
+                        .send_replace(Some((worker_name.clone(), generation)));
                 }
                 continue;
             }
-            let spawn_policy = if allow_internal_rescue {
-                IsolateSpawnPolicy::AllowInternalRescue
-            } else {
-                IsolateSpawnPolicy::WithinGlobalBudget
-            };
+            let worker_regular_slots = self
+                .workers
+                .get(&worker_name)
+                .and_then(|entry| entry.pools.get(&generation))
+                .map(|pool| {
+                    pool.isolates
+                        .iter()
+                        .filter(|isolate| !isolate.internal_rescue)
+                        .count()
+                })
+                .unwrap_or_default();
+            let spawn_policy =
+                if allow_internal_rescue && worker_regular_slots >= self.config.max_isolates {
+                    IsolateSpawnPolicy::InternalRescueOnly
+                } else if allow_internal_rescue {
+                    IsolateSpawnPolicy::AllowInternalRescue
+                } else {
+                    IsolateSpawnPolicy::WithinGlobalBudget
+                };
             match self.spawn_isolate(&worker_name, generation, event_tx.clone(), spawn_policy) {
                 Ok(()) => {
                     self.dispatch_pool(&worker_name, generation, event_tx);
@@ -1280,11 +1058,17 @@ impl WorkerManager {
         !pool.queue.is_empty()
             && (internal_request_needs_capacity || external_request_needs_capacity)
             && !pool.has_starting_isolate()
-            && pool.isolates.len() < max_isolates
+            && (pool
+                .isolates
+                .iter()
+                .filter(|isolate| !isolate.internal_rescue)
+                .count()
+                < max_isolates
+                || internal_request_needs_capacity)
     }
 
     fn internal_rescue_available_for_pool(&self, worker_name: &str, generation: u64) -> bool {
-        self.internal_rescue_isolate_slots.len() < self.internal_rescue_isolate_limit()
+        self.admission.snapshot().rescue < self.config.max_global_isolates
             && self
                 .workers
                 .get(worker_name)
@@ -1292,48 +1076,16 @@ impl WorkerManager {
                 .is_some_and(|pool| pool.queue.has_internal_request())
     }
 
-    fn internal_rescue_isolate_limit(&self) -> usize {
-        self.config.max_global_isolates.max(1)
-    }
-
     pub(super) fn regular_isolate_slots_used(&self) -> usize {
-        self.global_isolate_slots_used
-            .saturating_sub(self.internal_rescue_isolate_slots.len())
-    }
-
-    fn try_reserve_global_isolate_slot(
-        &mut self,
-        spawn_policy: IsolateSpawnPolicy,
-    ) -> Option<IsolateSlotReservation> {
-        let reservation = if self.regular_isolate_slots_used() < self.config.max_global_isolates {
-            IsolateSlotReservation::Regular
-        } else if matches!(spawn_policy, IsolateSpawnPolicy::AllowInternalRescue)
-            && self.internal_rescue_isolate_slots.len() < self.internal_rescue_isolate_limit()
-        {
-            IsolateSlotReservation::InternalRescue
-        } else {
-            return None;
-        };
-        self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_add(1);
-        self.global_isolates_starting = self.global_isolates_starting.saturating_add(1);
-        Some(reservation)
-    }
-
-    fn release_global_isolate_slot_for_startup_failure(&mut self) {
-        self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_sub(1);
-        self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
+        self.admission.snapshot().regular
     }
 
     pub(crate) fn global_isolate_slot_released(
         &mut self,
         key: &IsolateSlotKey,
-        startup: IsolateStartup,
+        _startup: IsolateStartup,
     ) {
         self.internal_rescue_isolate_slots.remove(key);
-        self.global_isolate_slots_used = self.global_isolate_slots_used.saturating_sub(1);
-        if startup.is_starting() {
-            self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
-        }
     }
 
     pub(crate) async fn finish_request(
@@ -1444,14 +1196,14 @@ impl WorkerManager {
         }
         if let Some(execution_duration) = atomic_execution_duration {
             self.memory_store.record_profile(
-                MemoryProfileMetricKind::RuntimeAtomicExecution,
+                MemoryProfileMetricKind::RuntimeSocketExecution,
                 duration_us(execution_duration),
                 1,
             );
         }
         if let Some(completion_wait) = atomic_completion_wait {
             self.memory_store.record_profile(
-                MemoryProfileMetricKind::RuntimeAtomicCompletionWait,
+                MemoryProfileMetricKind::RuntimeSocketCompletionWait,
                 duration_us(completion_wait),
                 1,
             );
@@ -1536,22 +1288,6 @@ impl WorkerManager {
                             let _ = reply.send(result);
                         }
                     }
-                    PendingReplyKind::DynamicFetch { handle } => {
-                        if let Some(entry) = self.dynamic_worker_handles.get_mut(&handle) {
-                            match &result {
-                                Ok(_) => {
-                                    entry.preferred_isolate_id = Some(isolate_id);
-                                }
-                                Err(_) if entry.preferred_isolate_id == Some(isolate_id) => {
-                                    entry.preferred_isolate_id = None;
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                        if let Some(reply) = reply {
-                            let _ = reply.send(result);
-                        }
-                    }
                     PendingReplyKind::WebsocketOpen { session_id } => {
                         self.complete_websocket_open(
                             worker_name,
@@ -1567,15 +1303,6 @@ impl WorkerManager {
                             reply,
                             result,
                             memory_outbox_shard.is_some(),
-                        );
-                    }
-                    PendingReplyKind::TransportOpen { session_id } => {
-                        self.complete_transport_open(
-                            worker_name,
-                            generation,
-                            isolate_id,
-                            session_id,
-                            result,
                         );
                     }
                 }
@@ -1596,22 +1323,19 @@ impl WorkerManager {
             }
             if let (Some(trace_destination), Some(trace_result)) = (trace_destination, trace_result)
             {
-                self.enqueue_trace_forward(
-                    TraceForwardRequest {
-                        worker_name: worker_name.to_string(),
-                        generation,
-                        request_method,
-                        request_url,
-                        runtime_request_id: request_id.to_string(),
-                        user_request_id,
-                        result: trace_result,
-                        execution_ms: execution_ms.unwrap_or_default(),
-                        wait_until_count,
-                        internal_origin,
-                        trace_destination: Some(trace_destination),
-                    },
-                    event_tx,
-                );
+                self.enqueue_trace_forward(TraceForwardRequest {
+                    worker_name: worker_name.to_string(),
+                    generation,
+                    request_method,
+                    request_url,
+                    runtime_request_id: request_id.to_string(),
+                    user_request_id,
+                    result: trace_result,
+                    execution_ms: execution_ms.unwrap_or_default(),
+                    wait_until_count,
+                    internal_origin,
+                    trace_destination: Some(trace_destination),
+                });
             }
             if let Some(stream_result) = stream_result {
                 self.complete_stream_registration(
@@ -1619,19 +1343,14 @@ impl WorkerManager {
                     request_id,
                     completion_token,
                     stream_result,
-                )
-                .await;
+                );
             }
         }
         .instrument(complete_span.unwrap_or_else(tracing::Span::none))
         .await;
     }
 
-    pub(crate) fn enqueue_trace_forward(
-        &mut self,
-        forward: TraceForwardRequest,
-        event_tx: &RuntimeEventSender,
-    ) {
+    pub(crate) fn enqueue_trace_forward(&mut self, forward: TraceForwardRequest) {
         let TraceForwardRequest {
             worker_name,
             generation,
@@ -1716,23 +1435,27 @@ impl WorkerManager {
             request_id: Uuid::new_v4().to_string(),
         };
         let (reply, reply_rx) = oneshot::channel();
-        self.enqueue_invoke(
-            EnqueueInvokeRequest {
+        if let Err(error) = self
+            .runtime_fast_sender
+            .try_send(RuntimeCommand::InvokeInternal(EnqueueInvokeRequest {
+                queue_admission: None,
                 worker_name: trace_destination.worker,
                 runtime_request_id: Uuid::new_v4().to_string(),
                 request: trace_request,
                 request_body: None,
                 memory_route: None,
                 memory_call: None,
-                host_rpc_call: None,
                 target_isolate_id: None,
                 target_generation: None,
                 internal_origin: true,
                 reply,
                 reply_kind: PendingReplyKind::Normal,
-            },
-            event_tx,
-        );
+            }))
+        {
+            error.into_inner().reject(PlatformError::overloaded(
+                "trace worker command queue is full",
+            ));
+        }
         let request_id_for_warning = runtime_request_id.to_string();
         tokio::spawn(async move {
             match reply_rx.await {

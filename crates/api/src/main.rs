@@ -20,7 +20,6 @@ use opentelemetry_sdk::trace::SdkTracerProvider as OTelTracerProvider;
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -29,7 +28,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[command(name = "dd_server")]
 #[command(about = "Single-node dd worker runtime server")]
 #[command(
-    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_TOKEN_STORE_PATH\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  PUBLIC_TLS_CERT_PATH\n  PUBLIC_TLS_KEY_PATH\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_OTEL_COLLECTOR_VERIFIED\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS\n  DD_MEMORY_DB_CACHE_MAX_OPEN\n  DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES\n  DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES\n  DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE\n  DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
+    after_help = "Config defaults come from env or built-in defaults.\n\nKey env vars:\n  BIND_PUBLIC_ADDR\n  BIND_PRIVATE_ADDR\n  PUBLIC_BASE_DOMAIN\n  DD_PRIVATE_TOKEN\n  PRIVATE_BEARER_TOKEN\n  DD_ALLOW_INSECURE_PRIVATE_LOOPBACK\n  ALLOW_INSECURE_PRIVATE_LOOPBACK\n  OTEL_EXPORTER_OTLP_ENDPOINT\n  DD_OTEL_ENDPOINT\n  DD_OTEL_COLLECTOR_VERIFIED\n  DD_RUNTIME_MAX_GLOBAL_ISOLATES\n  DD_RUNTIME_MAX_ISOLATES_PER_WORKER\n  DD_RUNTIME_MAX_INFLIGHT_PER_ISOLATE\n  DD_RUNTIME_MIN_ISOLATES_PER_WORKER\n  DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS\n  DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES\n  DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES"
 )]
 struct Cli {
     #[arg(long, env = "BIND_PUBLIC_ADDR", default_value = DEFAULT_PUBLIC_BIND_ADDR)]
@@ -57,15 +56,6 @@ struct Cli {
     #[arg(long, env = "ALLOW_INSECURE_PRIVATE_LOOPBACK", default_value_t = false)]
     allow_insecure_private_loopback: bool,
 
-    #[arg(long, env = "PUBLIC_TLS_CERT_PATH")]
-    public_tls_cert_path: Option<PathBuf>,
-
-    #[arg(long, env = "PUBLIC_TLS_KEY_PATH")]
-    public_tls_key_path: Option<PathBuf>,
-
-    #[arg(long, env = "DD_TOKEN_STORE_PATH")]
-    token_store_path: Option<PathBuf>,
-
     #[arg(
         long = "runtime-max-global-isolates",
         env = "DD_RUNTIME_MAX_GLOBAL_ISOLATES"
@@ -85,6 +75,18 @@ struct Cli {
     runtime_max_inflight_per_isolate: Option<usize>,
 
     #[arg(
+        long = "runtime-max-buffered-response-bytes",
+        env = "DD_RUNTIME_MAX_BUFFERED_RESPONSE_BYTES"
+    )]
+    runtime_max_buffered_response_bytes: Option<usize>,
+
+    #[arg(
+        long = "runtime-max-buffered-request-bytes",
+        env = "DD_RUNTIME_MAX_BUFFERED_REQUEST_BYTES"
+    )]
+    runtime_max_buffered_request_bytes: Option<usize>,
+
+    #[arg(
         long = "runtime-min-isolates-per-worker",
         env = "DD_RUNTIME_MIN_ISOLATES_PER_WORKER"
     )]
@@ -95,9 +97,6 @@ struct Cli {
         env = "DD_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS"
     )]
     memory_outbox_max_concurrent_shards: Option<usize>,
-
-    #[arg(long = "memory-db-cache-max-open", env = "DD_MEMORY_DB_CACHE_MAX_OPEN")]
-    memory_db_cache_max_open: Option<usize>,
 
     #[arg(
         long = "memory-snapshot-cache-max-entries",
@@ -110,18 +109,6 @@ struct Cli {
         env = "DD_MEMORY_SNAPSHOT_CACHE_MAX_BYTES"
     )]
     memory_snapshot_cache_max_bytes: Option<usize>,
-
-    #[arg(
-        long = "memory-db-read-connections-per-database",
-        env = "DD_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE"
-    )]
-    memory_db_read_connections_per_database: Option<usize>,
-
-    #[arg(
-        long = "memory-db-max-total-connections",
-        env = "DD_MEMORY_DB_MAX_TOTAL_CONNECTIONS"
-    )]
-    memory_db_max_total_connections: Option<usize>,
 }
 
 #[tokio::main]
@@ -149,11 +136,6 @@ async fn main() -> Result<()> {
         public_base_domain: cli.public_base_domain,
         private_bearer_token,
         allow_insecure_private_loopback,
-        public_tls_cert_path: cli.public_tls_cert_path,
-        public_tls_key_path: cli.public_tls_key_path,
-        token_store_path: cli
-            .token_store_path
-            .or_else(|| env::var_os("DD_DEPLOY_TOKEN_STORE_PATH").map(PathBuf::from)),
         ..ServerConfig::default()
     };
     if let Some(value) = cli.runtime_max_global_isolates {
@@ -165,6 +147,12 @@ async fn main() -> Result<()> {
     if let Some(value) = cli.runtime_max_inflight_per_isolate {
         server_config.runtime.runtime.max_inflight_per_isolate = value;
     }
+    if let Some(value) = cli.runtime_max_buffered_response_bytes {
+        server_config.runtime.runtime.max_buffered_response_bytes = value;
+    }
+    if let Some(value) = cli.runtime_max_buffered_request_bytes {
+        server_config.runtime.runtime.max_buffered_request_bytes = value;
+    }
     if let Some(value) = cli.runtime_min_isolates_per_worker {
         server_config.runtime.runtime.min_isolates = value;
     }
@@ -173,9 +161,6 @@ async fn main() -> Result<()> {
             .runtime
             .storage
             .memory_outbox_max_concurrent_shards = value;
-    }
-    if let Some(value) = cli.memory_db_cache_max_open {
-        server_config.runtime.storage.memory_db_cache_max_open = value;
     }
     if let Some(value) = cli.memory_snapshot_cache_max_entries {
         server_config
@@ -188,18 +173,6 @@ async fn main() -> Result<()> {
             .runtime
             .storage
             .memory_snapshot_cache_max_bytes = value;
-    }
-    if let Some(value) = cli.memory_db_read_connections_per_database {
-        server_config
-            .runtime
-            .storage
-            .memory_db_read_connections_per_database = value;
-    }
-    if let Some(value) = cli.memory_db_max_total_connections {
-        server_config
-            .runtime
-            .storage
-            .memory_db_max_total_connections = value;
     }
 
     let result = dd_server::run(server_config).await;
@@ -386,16 +359,10 @@ mod tests {
             "1",
             "--memory-outbox-max-concurrent-shards",
             "4",
-            "--memory-db-cache-max-open",
-            "16",
             "--memory-snapshot-cache-max-entries",
             "2048",
             "--memory-snapshot-cache-max-bytes",
             "33554432",
-            "--memory-db-read-connections-per-database",
-            "2",
-            "--memory-db-max-total-connections",
-            "32",
         ])
         .expect("runtime flags should parse");
 
@@ -404,11 +371,8 @@ mod tests {
         assert_eq!(cli.runtime_max_inflight_per_isolate, Some(3));
         assert_eq!(cli.runtime_min_isolates_per_worker, Some(1));
         assert_eq!(cli.memory_outbox_max_concurrent_shards, Some(4));
-        assert_eq!(cli.memory_db_cache_max_open, Some(16));
         assert_eq!(cli.memory_snapshot_cache_max_entries, Some(2048));
         assert_eq!(cli.memory_snapshot_cache_max_bytes, Some(33_554_432));
-        assert_eq!(cli.memory_db_read_connections_per_database, Some(2));
-        assert_eq!(cli.memory_db_max_total_connections, Some(32));
     }
 
     #[cfg(feature = "otel")]

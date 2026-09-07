@@ -14,7 +14,7 @@ function withDdHeaders(response: Response, context: DdRequestContext): Response 
   }
   const headers = new Headers(response.headers);
   if (context.lastStmCount !== undefined) {
-    headers.set("x-dd-stm-count", String(context.lastStmCount));
+    headers.set("x-memory-count", String(context.lastStmCount));
   }
   if (context.sessionCookie) {
     headers.append("set-cookie", context.sessionCookie);

@@ -42,7 +42,7 @@ if [ ! -d "$package_dir" ]; then
   exit 1
 fi
 
-cargo_args=(build --profile "$profile" -p runtime --bin dd_dev_runtime)
+cargo_args=(build --profile "$profile" -p dd_server --no-default-features --features websocket --bin dd_dev_runtime)
 if [ -n "$target" ]; then
   cargo_args+=(--target "$target")
 elif [ "$(rustc -vV | awk '/host:/ { print $2 }')" != "$default_target" ]; then

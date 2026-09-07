@@ -2,53 +2,26 @@ use super::dispatch::estimate_pending_invoke_bytes;
 use super::*;
 
 impl WorkerManager {
-    pub(crate) async fn deploy(
+    pub(crate) fn deploy(
         &mut self,
         prepared: PreparedWorkerDeployment,
-        deployment_id: Option<String>,
-        persist: bool,
-        temporary: bool,
+        deployment_id: String,
         expires_at_ms: Option<i64>,
-        enforce_temporary_transition: bool,
     ) -> Result<String> {
         let PreparedWorkerDeployment {
             worker_name,
             source,
             config,
-            assets,
             server_modules,
-            asset_headers,
             compiled_assets,
             bindings,
+            ..
         } = prepared;
-        if temporary
-            && enforce_temporary_transition
-            && self.current_worker_is_permanent(&worker_name)
-        {
-            return Err(PlatformError::conflict(
-                "cannot deploy a permanent worker as temporary; redeploy without --temporary or use a new worker name",
-            ));
-        }
         let worker_source =
-            deployed_worker_source(&self.dynamic_modules, &source, &server_modules)?;
-        if let Err(error) = self.validate_worker_cached(&worker_source).await {
-            release_worker_source_modules(&self.dynamic_modules, &worker_source);
-            return Err(error);
-        }
-        // Start a newly requested temporary lifetime only after validation. Validation can
-        // involve a cold V8 startup, so charging it against a short preview lifetime can
-        // make a successful deployment expire before it ever becomes observable.
-        let expires_at_ms = if temporary {
-            Some(expires_at_ms.unwrap_or(self.temporary_worker_expires_at_ms()?))
-        } else {
-            None
-        };
-        // Keep deployed workers on the bootstrap snapshot. Distinct user-code snapshots
-        // can abort V8 when multiple complex workers are instantiated in one process.
+            deployed_worker_source(&self.module_registry, &source, &server_modules)?;
         let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
         let generation = self.next_generation;
         self.next_generation += 1;
-        let deployment_id = deployment_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let service_bindings = bindings
             .service
             .iter()
@@ -60,51 +33,15 @@ impl WorkerManager {
         let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
             worker_name: worker_name.clone(),
             kv_bindings: bindings.kv.clone(),
-            kv_read_cache_config: crate::ops::WorkerKvReadCacheConfigPayload {
-                max_entries: self.config.kv_read_cache_max_entries,
-                max_bytes: self.config.kv_read_cache_max_bytes,
-                hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
-                miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
-            },
             memory_bindings: bindings.memory.clone(),
-            dynamic_bindings: bindings.dynamic.clone(),
-            dynamic_rpc_bindings: Vec::new(),
             service_bindings: service_bindings.clone(),
-            dynamic_env: Vec::new(),
         });
         let request_context = RequestExecutionContext::new(RequestExecutionContextInit {
             worker_name: worker_name.clone(),
             generation,
-            dynamic_bindings: bindings.dynamic.clone(),
-            dynamic_rpc_bindings: Vec::new(),
             service_bindings,
-            replacements: Vec::new(),
-            egress_allow_hosts: Vec::new(),
-            allow_cache: true,
-            max_outbound_requests: None,
-            dynamic_quota_state: None,
+            egress_allow_hosts: config.egress_allow_hosts.clone(),
         });
-        if persist
-            && self.storage.worker_store_enabled
-            && let Err(error) = self
-                .control_store
-                .insert_deployment(&ControlDeployment {
-                    worker: worker_name.clone(),
-                    deployment_id: deployment_id.clone(),
-                    source: source.clone(),
-                    config: config.clone(),
-                    assets: assets.clone(),
-                    server_modules: server_modules.clone(),
-                    asset_headers: asset_headers.clone(),
-                    created_at_ms: epoch_ms_i64()?,
-                    expires_at_ms,
-                    active: true,
-                })
-                .await
-        {
-            release_worker_source_modules(&self.dynamic_modules, &worker_source);
-            return Err(error);
-        }
         let asset_catalog_entry = AssetCatalogEntry {
             worker_name: worker_name.clone(),
             generation,
@@ -125,15 +62,13 @@ impl WorkerManager {
                 }),
                 is_public: config.public,
                 expires_at_ms,
+                retired_at: None,
                 snapshot,
                 snapshot_preloaded,
                 source: worker_source,
                 memory_bindings: bindings.memory,
-                dynamic_rpc_bindings: Vec::new(),
                 deployment_config,
                 request_context,
-                dynamic_child_policy: None,
-                dynamic_quota_state: None,
                 strict_request_isolation: false,
                 memory_entity_leases: HashMap::new(),
                 memory_shard_affinity: HashMap::new(),
@@ -151,10 +86,32 @@ impl WorkerManager {
                 current_generation: generation,
                 pools: HashMap::new(),
             });
+        if let Some(previous) = entry.pools.get_mut(&entry.current_generation) {
+            previous.retired_at = Some(Instant::now());
+        }
         entry.current_generation = generation;
         entry.pools.insert(generation, pool);
         self.asset_catalog
             .insert(worker_name.clone(), asset_catalog_entry);
+        let retiring_sessions = self
+            .websocket_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.worker_name == worker_name && session.generation != generation
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in retiring_sessions {
+            self.websocket_close_signals.insert(
+                session_id.clone(),
+                SocketCloseEvent {
+                    code: 1012,
+                    reason: "worker redeployed".to_string(),
+                },
+            );
+            self.flush_pending_websocket_frame_replies(&session_id);
+            self.notify_websocket_frame_waiters(&session_id);
+        }
         self.cleanup_drained_generations_for(&worker_name);
         info!(
             worker = %worker_name,
@@ -167,23 +124,14 @@ impl WorkerManager {
         Ok(deployment_id)
     }
 
-    fn current_worker_is_permanent(&self, worker_name: &str) -> bool {
+    pub(super) fn current_worker_is_permanent(&self, worker_name: &str) -> bool {
         self.workers
             .get(worker_name)
             .and_then(|entry| entry.pools.get(&entry.current_generation))
             .is_some_and(|pool| pool.expires_at_ms.is_none())
     }
 
-    fn temporary_worker_expires_at_ms(&self) -> Result<i64> {
-        let now_ms = epoch_ms_i64()?;
-        let ttl_ms = i64::try_from(self.config.temporary_worker_ttl.as_millis())
-            .map_err(|_| PlatformError::internal("temporary worker ttl is too large"))?;
-        now_ms
-            .checked_add(ttl_ms)
-            .ok_or_else(|| PlatformError::internal("temporary worker expiration overflow"))
-    }
-
-    pub(crate) async fn expire_temporary_workers(&mut self) {
+    pub(crate) fn expire_temporary_workers(&mut self) {
         let now_ms = match epoch_ms_i64() {
             Ok(now_ms) => now_ms,
             Err(error) => {
@@ -197,168 +145,27 @@ impl WorkerManager {
             .filter_map(|(worker_name, entry)| {
                 let pool = entry.pools.get(&entry.current_generation)?;
                 let expires_at_ms = pool.expires_at_ms?;
-                (expires_at_ms <= now_ms).then(|| worker_name.clone())
+                (expires_at_ms <= now_ms).then(|| (worker_name.clone(), pool.deployment_id.clone()))
             })
             .collect::<Vec<_>>();
 
-        for worker_name in expired {
+        for (worker_name, deployment_id) in expired {
             self.retire_worker_completely_with_error(
                 &worker_name,
                 PlatformError::not_found("temporary worker expired"),
             );
-            if let Err(error) = self.control_store.deactivate_worker(&worker_name).await {
-                warn!(
-                    worker = %worker_name,
-                    error = %error,
-                    "failed to remove expired worker deployment from local store"
-                );
-            }
             info!(worker = %worker_name, "expired temporary worker");
-        }
-    }
-
-    pub(crate) async fn deploy_dynamic(
-        &mut self,
-        source: String,
-        env: HashMap<String, String>,
-        egress_allow_hosts: Vec<String>,
-        dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
-    ) -> Result<DynamicDeployResult> {
-        self.deploy_dynamic_internal(
-            crate::ops::WorkerSource::inline(source),
-            env,
-            Vec::new(),
-            full_dynamic_internal_policy(egress_allow_hosts),
-            dynamic_rpc_bindings,
-            true,
-        )
-        .await
-    }
-
-    pub(crate) async fn deploy_dynamic_internal(
-        &mut self,
-        source: crate::ops::WorkerSource,
-        env: HashMap<String, String>,
-        bindings: Vec<DeployBinding>,
-        policy: ValidatedDynamicWorkerPolicy,
-        dynamic_rpc_bindings: Vec<DynamicRpcBinding>,
-        validate_source: bool,
-    ) -> Result<DynamicDeployResult> {
-        let worker_name = format!("dyn-{}", Uuid::new_v4().simple());
-        let dynamic_config = build_dynamic_worker_config(
-            env,
-            bindings,
-            crate::ops::DynamicWorkerPolicy {
-                egress_allow_hosts: policy.egress_allow_hosts.clone(),
-                allow_host_rpc: policy.allow_host_rpc,
-                allow_websocket: policy.allow_websocket,
-                allow_transport: policy.allow_transport,
-                allow_state_bindings: policy.allow_state_bindings,
-                max_request_bytes: policy.max_request_bytes as u64,
-                max_response_bytes: policy.max_response_bytes as u64,
-                max_outbound_requests: policy.max_outbound_requests,
-                max_concurrency: policy.max_concurrency as u64,
-            },
-            dynamic_rpc_bindings,
-        )?;
-        if validate_source {
-            self.validate_worker_cached(&source).await?;
-        }
-        let generation = self.next_generation;
-        self.next_generation += 1;
-        let deployment_id = Uuid::new_v4().to_string();
-        let dynamic_rpc_binding_names = dynamic_config
-            .dynamic_rpc_bindings
-            .iter()
-            .map(|binding| binding.binding.clone())
-            .collect::<Vec<_>>();
-        let service_bindings = dynamic_config
-            .bindings
-            .service
-            .iter()
-            .map(|binding| crate::ops::WorkerServiceBindingPayload {
-                binding: binding.binding.clone(),
-                service: binding.service.clone(),
-            })
-            .collect::<Vec<_>>();
-        let dynamic_quota_state = Arc::new(DynamicQuotaState::default());
-        let request_context = RequestExecutionContext::new(RequestExecutionContextInit {
-            worker_name: worker_name.clone(),
-            generation,
-            dynamic_bindings: dynamic_config.bindings.dynamic.clone(),
-            dynamic_rpc_bindings: dynamic_rpc_binding_names.clone(),
-            service_bindings: service_bindings.clone(),
-            replacements: dynamic_config.secret_replacements,
-            egress_allow_hosts: dynamic_config.egress_allow_hosts,
-            allow_cache: dynamic_config.policy.allow_state_bindings,
-            max_outbound_requests: Some(dynamic_config.policy.max_outbound_requests),
-            dynamic_quota_state: Some(Arc::clone(&dynamic_quota_state)),
-        });
-        let (snapshot, snapshot_preloaded) = (self.bootstrap_snapshot, false);
-        let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
-            worker_name: worker_name.clone(),
-            kv_bindings: dynamic_config.bindings.kv.clone(),
-            kv_read_cache_config: crate::ops::WorkerKvReadCacheConfigPayload {
-                max_entries: self.config.kv_read_cache_max_entries,
-                max_bytes: self.config.kv_read_cache_max_bytes,
-                hit_ttl_ms: self.config.kv_read_cache_hit_ttl.as_millis() as u64,
-                miss_ttl_ms: self.config.kv_read_cache_miss_ttl.as_millis() as u64,
-            },
-            memory_bindings: dynamic_config.bindings.memory.clone(),
-            dynamic_bindings: dynamic_config.bindings.dynamic.clone(),
-            dynamic_rpc_bindings: dynamic_rpc_binding_names,
-            service_bindings,
-            dynamic_env: dynamic_config.dynamic_env.clone(),
-        });
-
-        let pool = WorkerPool {
-            worker_name: worker_name.clone(),
-            generation,
-            deployment_id: deployment_id.clone(),
-            internal_trace: None,
-            is_public: false,
-            expires_at_ms: None,
-            snapshot,
-            snapshot_preloaded,
-            source,
-            memory_bindings: dynamic_config.bindings.memory.clone(),
-            dynamic_rpc_bindings: dynamic_config.dynamic_rpc_bindings.clone(),
-            deployment_config,
-            request_context,
-            dynamic_child_policy: Some(dynamic_config.policy.clone()),
-            dynamic_quota_state: Some(dynamic_quota_state),
-            strict_request_isolation: false,
-            memory_entity_leases: HashMap::new(),
-            memory_shard_affinity: HashMap::new(),
-            queue: PendingInvokeQueue::new(),
-            isolates: Vec::new(),
-            isolate_indices: HashMap::new(),
-            stats: PoolStats::default(),
-            queue_warn_level: 0,
-        };
-
-        let entry = self
-            .workers
-            .entry(worker_name.clone())
-            .or_insert_with(|| WorkerEntry {
-                current_generation: generation,
-                pools: HashMap::new(),
+            let control_store = self.control_store.clone();
+            tokio::spawn(async move {
+                if let Err(error) = control_store
+                    .deactivate_deployment(&worker_name, &deployment_id)
+                    .await
+                {
+                    warn!(worker = %worker_name, deployment_id, error = %error,
+                        "failed to remove expired deployment from local store");
+                }
             });
-        entry.current_generation = generation;
-        entry.pools.insert(generation, pool);
-        self.cleanup_drained_generations_for(&worker_name);
-        info!(
-            worker = %worker_name,
-            generation,
-            deployment_id = %deployment_id,
-            "deployed dynamic worker"
-        );
-
-        Ok(DynamicDeployResult {
-            worker: worker_name,
-            deployment_id,
-            env_placeholders: dynamic_config.env_placeholders,
-        })
+        }
     }
 
     pub(crate) fn fail_isolate(
@@ -375,13 +182,6 @@ impl WorkerManager {
         for (request_id, reply) in failed.replies {
             self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
-        }
-        if failed.was_starting {
-            self.reject_queued_dynamic_invokes_for_generation(
-                worker_name,
-                generation,
-                error.clone(),
-            );
         }
         self.fail_all_streams_for_worker(worker_name, error);
     }
@@ -437,13 +237,6 @@ impl WorkerManager {
             self.clear_revalidation_for_request(&request_id);
             let _ = reply.send(Err(error.clone()));
         }
-        if removed.was_starting {
-            self.reject_queued_dynamic_invokes_for_generation(
-                worker_name,
-                generation,
-                error.clone(),
-            );
-        }
         self.fail_all_streams_for_worker(worker_name, error);
     }
 
@@ -453,7 +246,7 @@ impl WorkerManager {
         generation: u64,
         isolate_id: u64,
     ) {
-        let was_starting;
+        let slot_starting;
         {
             let Some(pool) = self.get_pool_mut(worker_name, generation) else {
                 return;
@@ -465,14 +258,12 @@ impl WorkerManager {
             else {
                 return;
             };
-            was_starting = isolate.startup.is_starting();
+            slot_starting = Arc::clone(&isolate.slot_starting);
             isolate.startup = IsolateStartup::Ready;
             isolate.last_used_at = Instant::now();
             pool.log_stats("ready");
         }
-        if was_starting {
-            self.global_isolates_starting = self.global_isolates_starting.saturating_sub(1);
-        }
+        self.admission.isolate_ready(&slot_starting);
     }
 
     pub(crate) fn finish_wait_until(
@@ -519,11 +310,11 @@ impl WorkerManager {
         }
         registration.started = true;
         if let Some(ready) = registration.ready.take() {
-            if let Some(body) = registration.body_receiver.take() {
+            if let Some((body, completion)) = registration.body_receiver.take() {
                 let _ = ready.send(Ok(WorkerStreamOutput {
                     status,
                     headers,
-                    body: WorkerStreamBody::new(body),
+                    body: WorkerStreamBody::new(body, completion),
                 }));
             } else {
                 let _ = ready.send(Err(PlatformError::internal("stream body receiver missing")));
@@ -531,7 +322,7 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) async fn handle_response_chunk(
+    pub(crate) fn handle_response_chunk(
         &mut self,
         worker_name: &str,
         request_id: &str,
@@ -581,11 +372,25 @@ impl WorkerManager {
             }
         };
 
-        match sender.send(Ok(chunk)).await {
+        match sender.try_send(chunk) {
             Ok(()) => {
                 let _ = reply.send(Ok(()));
             }
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(chunk)) => {
+                // The producer waits for this acknowledgment before emitting another chunk.
+                let task = tokio::spawn(async move {
+                    let result = sender
+                        .send(chunk)
+                        .await
+                        .map_err(|_| PlatformError::internal("stream response receiver closed"));
+                    let _ = reply.send(result);
+                });
+                self.stream_registrations
+                    .get_mut(request_id)
+                    .expect("validated stream registration must exist")
+                    .pending_send = Some(task);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 let error = PlatformError::internal("stream response receiver closed");
                 self.fail_stream_registration(worker_name, request_id, error.clone());
                 self.cancel_invoke(worker_name.to_string(), request_id.to_string(), event_tx);
@@ -668,7 +473,7 @@ impl WorkerManager {
             .workers
             .get(worker_name)
             .and_then(|entry| entry.pools.get(&generation))
-            .and_then(|pool| self.queue_admission_error(pool, queued_bytes, false));
+            .and_then(|pool| self.queue_admission_error(pool, false));
         if let Some(error) = admission_error {
             self.revalidation_keys.remove(&key);
             warn!(
@@ -679,14 +484,22 @@ impl WorkerManager {
             );
             return;
         }
+        let queue_admission = match self.admission.reserve_queue(queued_bytes, false) {
+            Ok(admission) => Some(admission),
+            Err(error) => {
+                self.revalidation_keys.remove(&key);
+                warn!(error = %error, "cache revalidation queue is overloaded");
+                return;
+            }
+        };
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             pool.queue.push_back(PendingInvoke {
+                queue_admission,
                 runtime_request_id: runtime_request_id.clone(),
                 request: invocation,
                 request_body: None,
                 memory_route: None,
                 memory_call: None,
-                host_rpc_call: None,
                 target_isolate_id: None,
                 internal_origin: false,
                 reply,
@@ -728,10 +541,12 @@ impl WorkerManager {
             let _ = ready.send(Err(error));
             return;
         }
-        let _ = registration.body_sender.try_send(Err(error));
+        if let Some(completion) = registration.completion.take() {
+            let _ = completion.send(Err(error));
+        }
     }
 
-    pub(crate) async fn complete_stream_registration(
+    pub(crate) fn complete_stream_registration(
         &mut self,
         worker_name: &str,
         request_id: &str,
@@ -752,52 +567,22 @@ impl WorkerManager {
             return;
         }
 
-        match result {
-            Ok(output) => {
-                let WorkerOutput {
-                    status,
-                    headers,
-                    body: output_body,
-                } = output;
-                if !registration.started {
-                    if let Some(ready) = registration.ready.take() {
-                        if let Some(body) = registration.body_receiver.take() {
-                            let _ = ready.send(Ok(WorkerStreamOutput {
-                                status,
-                                headers,
-                                body: WorkerStreamBody::new(body),
-                            }));
-                        } else {
-                            let _ = ready
-                                .send(Err(PlatformError::internal("stream body receiver missing")));
-                        }
-                    }
-                    if !output_body.is_empty() {
-                        let next_bytes = registration.bytes_sent.saturating_add(output_body.len());
-                        if next_bytes > registration.max_bytes {
-                            let _ = registration
-                                .body_sender
-                                .send(Err(PlatformError::runtime(format!(
-                                    "response body exceeded max_response_body_bytes ({} bytes)",
-                                    registration.max_bytes
-                                ))))
-                                .await;
-                        } else {
-                            let _ = registration
-                                .body_sender
-                                .send(Ok(Bytes::from(output_body)))
-                                .await;
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                if let Some(ready) = registration.ready.take() {
-                    let _ = ready.send(Err(error));
-                } else {
-                    let _ = registration.body_sender.send(Err(error)).await;
-                }
-            }
+        let completion_result = match result {
+            Ok(_) if registration.started => Ok(()),
+            Ok(_) => Err(PlatformError::internal(format!(
+                "worker {worker_name} completed streamed request {request_id} without response headers"
+            ))),
+            Err(error) => Err(error),
+        };
+        if let Some(ready) = registration.ready.take() {
+            let error = completion_result
+                .as_ref()
+                .expect_err("unstarted stream must fail")
+                .clone();
+            let _ = ready.send(Err(error));
+        }
+        if let Some(completion) = registration.completion.take() {
+            let _ = completion.send(completion_result);
         }
     }
 
@@ -814,13 +599,6 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) fn retire_worker_completely(&mut self, worker_name: &str) {
-        self.retire_worker_completely_with_error(
-            worker_name,
-            PlatformError::internal("dynamic worker was deleted"),
-        );
-    }
-
     pub(crate) fn retire_worker_completely_with_error(
         &mut self,
         worker_name: &str,
@@ -831,13 +609,13 @@ impl WorkerManager {
         self.reap_owned_sessions(worker_name, None, None);
         if let Some(mut entry) = self.workers.remove(worker_name) {
             for (_, mut pool) in entry.pools.drain() {
-                release_worker_source_modules(&self.dynamic_modules, &pool.source);
+                release_worker_source_modules(&self.module_registry, &pool.source);
                 self.account_removed_pool_queue(&pool);
                 while let Some(pending) = pool.queue.pop_front() {
                     self.reject_pending_invoke(worker_name, pending, error.clone());
                 }
                 for isolate in pool.isolates {
-                    let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                    isolate.request_shutdown();
                     self.track_exiting_isolate_slot(
                         worker_name,
                         pool.generation,
@@ -855,16 +633,6 @@ impl WorkerManager {
             self.clear_revalidation_for_request(&request_id);
         }
         self.fail_all_streams_for_worker(worker_name, error);
-        self.dynamic_worker_handles
-            .retain(|_, handle| handle.worker_name != worker_name);
-        let existing_handles: HashSet<String> =
-            self.dynamic_worker_handles.keys().cloned().collect();
-        self.dynamic_worker_ids.retain(|_, by_id| {
-            by_id.retain(|_, handle| existing_handles.contains(handle));
-            !by_id.is_empty()
-        });
-        self.host_rpc_providers
-            .retain(|_, provider| provider.owner_worker != worker_name);
     }
 
     pub(crate) fn remove_isolate(
@@ -874,9 +642,7 @@ impl WorkerManager {
         isolate_idx: usize,
     ) -> RemovedIsolate {
         let mut websocket_open_session_ids = Vec::new();
-        let mut transport_open_session_ids = Vec::new();
         let mut replies = Vec::new();
-        let mut was_starting = false;
         let mut removed_isolate_id = None;
         let mut stale_targeted_pending = Vec::new();
         let mut stale_targeted_count = 0usize;
@@ -885,12 +651,11 @@ impl WorkerManager {
         let mut removed_slot = None;
         if let Some(pool) = self.get_pool_mut(worker_name, generation) {
             if let Some(isolate) = pool.isolates.get_mut(isolate_idx) {
-                was_starting = isolate.startup.is_starting();
                 removed_slot = Some((isolate.id, isolate.startup));
                 isolate.startup = IsolateStartup::Retiring;
             }
             if let Some(isolate) = pool.swap_remove_isolate(isolate_idx) {
-                let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                isolate.request_shutdown();
                 removed_isolate_id = Some(isolate.id);
                 pool.memory_shard_affinity
                     .retain(|_, owner_isolate_id| *owner_isolate_id != isolate.id);
@@ -909,12 +674,8 @@ impl WorkerManager {
                         PendingReplyKind::WebsocketOpen { session_id } => {
                             websocket_open_session_ids.push(session_id.clone());
                         }
-                        PendingReplyKind::TransportOpen { session_id } => {
-                            transport_open_session_ids.push(session_id.clone());
-                        }
                         PendingReplyKind::Normal
                         | PendingReplyKind::Stream
-                        | PendingReplyKind::DynamicFetch { .. }
                         | PendingReplyKind::WebsocketFrame { .. } => {}
                     }
                     replies.push((request_id, pending.reply));
@@ -941,17 +702,10 @@ impl WorkerManager {
                 let _ = waiter.send(Err(PlatformError::internal("isolate is unavailable")));
             }
         }
-        for session_id in transport_open_session_ids {
-            if let Some(waiter) = self.transport_open_waiters.remove(&session_id) {
-                let _ = waiter.send(Err(PlatformError::internal("isolate is unavailable")));
-            }
-            self.transport_open_channels.remove(&session_id);
-        }
         if removed {
             RemovedIsolate {
                 removed: true,
                 replies,
-                was_starting,
             }
         } else {
             RemovedIsolate::default()
@@ -975,33 +729,6 @@ impl WorkerManager {
         RemovedIsolate::default()
     }
 
-    pub(crate) fn reject_queued_dynamic_invokes_for_generation(
-        &mut self,
-        worker_name: &str,
-        generation: u64,
-        error: PlatformError,
-    ) {
-        let mut rejected = Vec::new();
-        let mut rejected_count = 0usize;
-        let mut rejected_bytes = 0usize;
-        if let Some(pool) = self.get_pool_mut(worker_name, generation) {
-            for pending in pool.queue.drain_matching(|pending| {
-                matches!(pending.reply_kind, PendingReplyKind::DynamicFetch { .. })
-            }) {
-                rejected_count = rejected_count.saturating_add(1);
-                rejected_bytes = rejected_bytes.saturating_add(pending.queued_bytes);
-                rejected.push(pending);
-            }
-        }
-        if rejected.is_empty() {
-            return;
-        }
-        self.account_dequeued_many(rejected_count, rejected_bytes);
-        for pending in rejected {
-            self.reject_pending_invoke(worker_name, pending, error.clone());
-        }
-    }
-
     pub(crate) fn scale_down_idle(&mut self) {
         let now = Instant::now();
         let worker_names: Vec<String> = self.workers.keys().cloned().collect();
@@ -1018,27 +745,19 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) fn retire_lru_idle_isolate_for_budget(
-        &mut self,
-        requesting_worker_name: &str,
-        requesting_generation: u64,
-    ) -> bool {
-        let candidate = self
-            .workers
+    pub(super) fn oldest_idle_isolate(&self) -> Option<(Instant, String, u64, u64)> {
+        self.workers
             .iter()
             .flat_map(|(worker_name, entry)| {
                 entry.pools.iter().flat_map(move |(generation, pool)| {
                     pool.isolates.iter().filter_map(move |isolate| {
-                        if (worker_name == requesting_worker_name
-                            && *generation == requesting_generation)
-                            || !pool.queue.is_empty()
+                        if !pool.queue.is_empty()
                             || !isolate.startup.is_ready()
                             || isolate.inflight_count != 0
                             || !isolate.pending_replies.is_empty()
                             || !isolate.pending_wait_until.is_empty()
                             || isolate.active_websocket_sessions != 0
-                            || isolate.active_transport_sessions != 0
-                            || !isolate.dynamic_control_inbox.is_empty()
+                            || !isolate.request_control_inbox.is_empty()
                         {
                             return None;
                         }
@@ -1057,8 +776,24 @@ impl WorkerManager {
                     .then_with(|| left.1.cmp(&right.1))
                     .then_with(|| left.2.cmp(&right.2))
                     .then_with(|| left.3.cmp(&right.3))
-            });
+            })
+    }
 
+    pub(crate) fn retire_lru_idle_isolate_for_budget(
+        &mut self,
+        requesting_worker_name: &str,
+        requesting_generation: u64,
+    ) -> bool {
+        if self.regular_isolate_slots_used() < self.config.max_global_isolates {
+            return false;
+        }
+        let candidate = self.oldest_idle_isolate();
+        if !candidate
+            .as_ref()
+            .is_some_and(|candidate| self.admission.claim_idle_isolate(candidate))
+        {
+            return false;
+        }
         let Some((_last_used_at, worker_name, generation, isolate_id)) = candidate else {
             return false;
         };
@@ -1112,7 +847,6 @@ impl WorkerManager {
                     .filter(|(_, isolate)| isolate.inflight_count == 0)
                     .filter(|(_, isolate)| isolate.pending_wait_until.is_empty())
                     .filter(|(_, isolate)| isolate.active_websocket_sessions == 0)
-                    .filter(|(_, isolate)| isolate.active_transport_sessions == 0)
                     .filter(|(_, isolate)| now.duration_since(isolate.last_used_at) >= idle_ttl)
                     .min_by_key(|(_, isolate)| {
                         (
@@ -1140,7 +874,7 @@ impl WorkerManager {
         }
 
         for isolate in removed {
-            let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+            isolate.request_shutdown();
             for (request_id, pending) in isolate.pending_replies {
                 self.clear_revalidation_for_request(&request_id);
                 let _ = pending
@@ -1156,16 +890,28 @@ impl WorkerManager {
             return;
         }
         let mut clear_request_ids = Vec::new();
-        let mut retired_generations = HashSet::new();
         let mut exiting_slots = Vec::new();
+        let retirement_limit = self.config.request_wall_timeout;
+        let retirement_expired = self
+            .workers
+            .get(worker_name)
+            .map(|entry| {
+                entry
+                    .pools
+                    .iter()
+                    .filter(|(_, pool)| {
+                        pool.retired_at
+                            .is_some_and(|retired_at| retired_at.elapsed() >= retirement_limit)
+                    })
+                    .map(|(generation, _)| *generation)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        for generation in &retirement_expired {
+            self.reap_owned_sessions(worker_name, Some(*generation), None);
+        }
         let live_websocket_generations: HashSet<u64> = self
             .websocket_sessions
-            .values()
-            .filter(|session| session.worker_name == worker_name)
-            .map(|session| session.generation)
-            .collect();
-        let live_transport_generations: HashSet<u64> = self
-            .transport_sessions
             .values()
             .filter(|session| session.worker_name == worker_name)
             .map(|session| session.generation)
@@ -1180,27 +926,37 @@ impl WorkerManager {
                 .iter()
                 .filter(|(generation, pool)| {
                     **generation != current_generation
-                        && pool.is_drained()
-                        && !live_websocket_generations.contains(generation)
-                        && !live_transport_generations.contains(generation)
+                        && ((pool.is_drained() && !live_websocket_generations.contains(generation))
+                            || retirement_expired.contains(generation))
                 })
                 .map(|(generation, _)| *generation)
                 .collect::<Vec<_>>()
         };
 
         for generation in drained {
-            if let Some(pool) = self
+            if let Some(mut pool) = self
                 .workers
                 .get_mut(worker_name)
                 .and_then(|entry| entry.pools.remove(&generation))
             {
-                release_worker_source_modules(&self.dynamic_modules, &pool.source);
+                release_worker_source_modules(&self.module_registry, &pool.source);
                 self.account_removed_pool_queue(&pool);
-                retired_generations.insert(generation);
+                while let Some(pending) = pool.queue.pop_front() {
+                    self.reject_pending_invoke(worker_name, pending, PlatformError::runtime(
+                        format!("worker {worker_name} generation {generation} exceeded its retirement deadline"),
+                    ));
+                }
                 for isolate in pool.isolates {
-                    let _ = isolate.sender.try_send(IsolateCommand::Shutdown);
+                    isolate.request_shutdown();
                     exiting_slots.push((generation, isolate.id, isolate.startup));
                     for (request_id, pending) in isolate.pending_replies {
+                        self.fail_stream_registration(
+                            worker_name,
+                            &request_id,
+                            PlatformError::runtime(format!(
+                                "worker {worker_name} generation {generation} retired"
+                            )),
+                        );
                         clear_request_ids.push(request_id);
                         let _ = pending
                             .reply
@@ -1216,31 +972,10 @@ impl WorkerManager {
         for (generation, isolate_id, startup) in exiting_slots {
             self.track_exiting_isolate_slot(worker_name, generation, isolate_id, startup);
         }
-        if retired_generations.is_empty() {
-            return;
-        }
-        self.dynamic_worker_handles.retain(|_, handle| {
-            !(handle.owner_worker == worker_name
-                && retired_generations.contains(&handle.owner_generation))
-        });
-        let existing_handles: HashSet<String> =
-            self.dynamic_worker_handles.keys().cloned().collect();
-        self.dynamic_worker_ids.retain(|key, by_id| {
-            if key.owner_worker == worker_name
-                && retired_generations.contains(&key.owner_generation)
-            {
-                return false;
-            }
-            by_id.retain(|_, handle| existing_handles.contains(handle));
-            !by_id.is_empty()
-        });
-        self.host_rpc_providers.retain(|_, provider| {
-            !(provider.owner_worker == worker_name
-                && retired_generations.contains(&provider.owner_generation))
-        });
     }
 
     pub(crate) fn worker_stats(&self, worker_name: &str) -> Option<WorkerStats> {
+        let admission = self.admission.snapshot();
         let entry = self.workers.get(worker_name)?;
         let pool = entry.pools.get(&entry.current_generation)?;
         let mut stats = pool.stats_snapshot();
@@ -1251,13 +986,13 @@ impl WorkerManager {
             self.stats.ready_work_budget_exhausted_count;
         stats.runtime_max_ready_work_batch_size = self.stats.max_ready_work_batch_size;
         stats.global_isolate_budget = self.config.max_global_isolates;
-        stats.global_isolates_total = self.global_isolate_slots_used;
-        stats.global_isolates_starting = self.global_isolates_starting;
-        stats.global_internal_rescue_isolates = self.internal_rescue_isolate_slots.len();
+        stats.global_isolates_total = admission.regular + admission.rescue;
+        stats.global_isolates_starting = admission.starting;
+        stats.global_internal_rescue_isolates = admission.rescue;
         stats.global_isolate_slots_available = self
             .config
             .max_global_isolates
-            .saturating_sub(self.regular_isolate_slots_used());
+            .saturating_sub(admission.regular);
         stats.scale_up_waiting_pools = self.scale_up_request_members.len();
         stats.scale_up_budget_denied_count = self.stats.scale_up_budget_denied_count;
         stats.memory_outbox_claim_batch_count = self.stats.memory_outbox_claim_batch_count;
@@ -1285,6 +1020,7 @@ impl WorkerManager {
     }
 
     pub(crate) fn worker_debug_dump(&self, worker_name: &str) -> Option<WorkerDebugDump> {
+        let admission = self.admission.snapshot();
         let entry = self.workers.get(worker_name)?;
         let pool = entry.pools.get(&entry.current_generation)?;
         let mut dump = pool.debug_dump();
@@ -1297,14 +1033,13 @@ impl WorkerManager {
         dump.memory_scheduler.runtime_max_ready_work_batch_size =
             self.stats.max_ready_work_batch_size;
         dump.memory_scheduler.global_isolate_budget = self.config.max_global_isolates;
-        dump.memory_scheduler.global_isolates_total = self.global_isolate_slots_used;
-        dump.memory_scheduler.global_isolates_starting = self.global_isolates_starting;
-        dump.memory_scheduler.global_internal_rescue_isolates =
-            self.internal_rescue_isolate_slots.len();
+        dump.memory_scheduler.global_isolates_total = admission.regular + admission.rescue;
+        dump.memory_scheduler.global_isolates_starting = admission.starting;
+        dump.memory_scheduler.global_internal_rescue_isolates = admission.rescue;
         dump.memory_scheduler.global_isolate_slots_available = self
             .config
             .max_global_isolates
-            .saturating_sub(self.regular_isolate_slots_used());
+            .saturating_sub(admission.regular);
         dump.memory_scheduler.scale_up_waiting_pools = self.scale_up_request_members.len();
         dump.memory_scheduler.scale_up_budget_denied_count =
             self.stats.scale_up_budget_denied_count;
@@ -1331,132 +1066,32 @@ impl WorkerManager {
         dump.memory_outbox.shard_requeue_count = self.stats.memory_outbox_shard_requeue_count;
         Some(dump)
     }
-
-    pub(crate) fn dynamic_debug_dump(&self) -> DynamicRuntimeDebugDump {
-        let mut handles = self
-            .dynamic_worker_handles
-            .iter()
-            .map(|(handle, entry)| DynamicHandleDebug {
-                handle: handle.clone(),
-                id: entry.id.clone(),
-                owner_worker: entry.owner_worker.clone(),
-                owner_generation: entry.owner_generation,
-                binding: entry.binding.clone(),
-                worker_name: entry.worker_name.clone(),
-                timeout_ms: entry.timeout,
-                policy_tier: entry.policy.tier.as_str().to_string(),
-                egress_deny_count: entry.quota_state.egress_deny_count.load(Ordering::Relaxed),
-                rpc_deny_count: entry.quota_state.rpc_deny_count.load(Ordering::Relaxed),
-                quota_kill_count: entry.quota_state.quota_kill_count.load(Ordering::Relaxed),
-                upgrade_deny_count: entry.quota_state.upgrade_deny_count.load(Ordering::Relaxed),
-                outbound_requests: entry.quota_state.outbound_requests.load(Ordering::Relaxed),
-                inflight: entry.quota_state.inflight.load(Ordering::Relaxed),
-                max_concurrency: entry.policy.max_concurrency,
-            })
-            .collect::<Vec<_>>();
-        handles.sort_by(|left, right| left.handle.cmp(&right.handle));
-
-        let mut providers = self
-            .host_rpc_providers
-            .iter()
-            .map(|(provider_id, provider)| {
-                let mut methods = provider.methods.iter().cloned().collect::<Vec<_>>();
-                methods.sort();
-                HostRpcProviderDebug {
-                    provider_id: provider_id.clone(),
-                    owner_worker: provider.owner_worker.clone(),
-                    owner_generation: provider.owner_generation,
-                    owner_isolate_id: provider.owner_isolate_id,
-                    target_id: provider.target_id.clone(),
-                    methods,
-                }
-            })
-            .collect::<Vec<_>>();
-        providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
-
-        DynamicRuntimeDebugDump { handles, providers }
-    }
-
-    pub(crate) fn log_dynamic_timeout_diagnostic(&self, diagnostic: DynamicTimeoutDiagnostic) {
-        let owner_dump = self.worker_debug_dump(&diagnostic.owner_worker);
-        let target_dump = self.worker_debug_dump(&diagnostic.target_worker);
-        let handle_summary = self
-            .dynamic_worker_handles
-            .get(&diagnostic.handle)
-            .map(|handle| {
-                (
-                    handle.owner_worker.clone(),
-                    handle.owner_generation,
-                    handle.binding.clone(),
-                    handle.worker_name.clone(),
-                    handle.timeout,
-                )
-            });
-        let mut provider_summaries = self
-            .host_rpc_providers
-            .iter()
-            .filter(|(_, provider)| {
-                provider.owner_worker == diagnostic.owner_worker
-                    && provider.owner_generation == diagnostic.owner_generation
-            })
-            .map(|(provider_id, provider)| {
-                let mut methods = provider.methods.iter().cloned().collect::<Vec<_>>();
-                methods.sort();
-                (
-                    provider_id.clone(),
-                    provider.owner_isolate_id,
-                    provider.target_id.clone(),
-                    methods,
-                )
-            })
-            .collect::<Vec<_>>();
-        provider_summaries.sort_by(|left, right| left.0.cmp(&right.0));
-        warn!(
-            stage = diagnostic.stage,
-            owner_worker = %diagnostic.owner_worker,
-            owner_generation = diagnostic.owner_generation,
-            binding = %diagnostic.binding,
-            handle = %diagnostic.handle,
-            target_worker = %diagnostic.target_worker,
-            target_isolate_id = diagnostic.target_isolate_id,
-            target_generation = diagnostic.target_generation,
-            provider_id = ?diagnostic.provider_id,
-            provider_owner_isolate_id = diagnostic.provider_owner_isolate_id,
-            provider_target_id = ?diagnostic.provider_target_id,
-            timeout_ms = diagnostic.timeout_ms,
-            handle_summary = ?handle_summary,
-            host_rpc_providers = ?provider_summaries,
-            owner_dump = ?owner_dump,
-            target_dump = ?target_dump,
-            "dynamic invoke timeout diagnostic"
-        );
-    }
 }
 
-fn deployed_worker_source(
-    dynamic_modules: &crate::dynamic_modules::DynamicModuleRegistry,
+pub(super) fn deployed_worker_source(
+    module_registry: &crate::module_registry::ModuleRegistry,
     source: &str,
     server_modules: &[DeployServerModule],
 ) -> Result<crate::ops::WorkerSource> {
     if server_modules.is_empty() {
         return Ok(crate::ops::WorkerSource::inline(source.to_string()));
     }
-    let (graph_id, entrypoint) = dynamic_modules.register_server_module_graph(
+    let (graph_id, entrypoint) = module_registry.register_server_module_graph(
         "worker.js",
         source.to_string(),
         server_modules.to_vec(),
     )?;
-    Ok(crate::ops::WorkerSource::DynamicModule {
+    Ok(crate::ops::WorkerSource::Module {
         graph_id,
         entrypoint,
     })
 }
 
 fn release_worker_source_modules(
-    dynamic_modules: &crate::dynamic_modules::DynamicModuleRegistry,
+    module_registry: &crate::module_registry::ModuleRegistry,
     source: &crate::ops::WorkerSource,
 ) {
-    if let crate::ops::WorkerSource::DynamicModule { graph_id, .. } = source {
-        dynamic_modules.release(graph_id);
+    if let crate::ops::WorkerSource::Module { graph_id, .. } = source {
+        module_registry.release(graph_id);
     }
 }

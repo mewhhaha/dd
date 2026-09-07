@@ -8,9 +8,9 @@ There is no `index.html`; the worker is the app entrypoint, and the Vite build
 input is a small TypeScript client module only to exercise fingerprinted asset
 output.
 
-The worker also binds `EXAMPLE_MEMORY` and increments an STM-backed request
+The worker also binds `EXAMPLE_MEMORY` and increments an transactional request
 counter with `memory.atomic(...)`. App responses expose the current value in
-`x-dd-stm-count`, and the smoke test requires that value to advance.
+`x-memory-count`, and the smoke test requires that value to advance.
 
 Storefront mutations use `fixi-js` attributes on normal HTML forms. Without
 JavaScript they still submit and redirect as plain forms; with fixi loaded from

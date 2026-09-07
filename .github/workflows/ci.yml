@@ -40,24 +40,8 @@ jobs:
           toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
-
-  http3:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Verify default server excludes direct HTTP/3
-        run: |
-          default_tree="$(cargo tree --locked -p dd_server -e normal --prefix none)"
-          if grep -q '^tokio-quiche v' <<<"$default_tree"; then
-            echo 'default dd_server dependency graph unexpectedly contains tokio-quiche' >&2
-            exit 1
-          fi
-      - name: Test experimental HTTP/3 and WebTransport
-        run: cargo test --locked -p dd_server --no-default-features --features http3,websocket --test public_h3_websocket_blackbox
+      - run: cargo build --locked -p dd_server --bin dd_server
+      - run: python3 scripts/verify-durable-state.py
 
   javascript:
     runs-on: ubuntu-latest
@@ -98,7 +82,8 @@ jobs:
         with:
           toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked -p runtime --bin dd_dev_runtime
+      - run: cargo build --locked -p dd_server --no-default-features --features websocket --bin dd_dev_runtime
+      - run: node scripts/check-dd-dev-transport.mjs
       - run: pnpm smoke:vite-examples
       - run: pnpm --filter './examples/vite-react-router' exec playwright install --with-deps chromium
       - run: pnpm browser:vite-examples

@@ -107,29 +107,18 @@ function roomNamespace(env, roomId) {
   return env.CHAT_ROOM.get(id);
 }
 
-function roomMemory(room) {
+function roomSnapshot(tx, roomId = "") {
   return {
-    roomId: room.tvar("room_id", String(room.id)),
-    nextSeq: room.tvar("next_seq", 0),
-    messages: room.tvar("messages", []),
-    participants: room.tvar("participants", {}),
-    connections: room.tvar("connections", {}),
+    roomId: tx.get("room_id") ?? roomId,
+    nextSeq: Number(tx.get("next_seq") ?? 0),
+    messages: tx.get("messages") ?? [],
+    participants: tx.get("participants") ?? {},
+    connections: tx.get("connections") ?? {},
   };
 }
 
-function roomSnapshot(room) {
-  const mem = roomMemory(room);
-  return {
-    roomId: String(mem.roomId.read()),
-    nextSeq: Number(mem.nextSeq.read() ?? 0) || 0,
-    messages: mem.messages.read(),
-    participants: mem.participants.read(),
-    connections: mem.connections.read(),
-  };
-}
-
-function roomStateResponse(room) {
-  const snapshot = roomSnapshot(room);
+function roomStateResponse(tx, roomId) {
+  const snapshot = roomSnapshot(tx, roomId);
   return {
     roomId: snapshot.roomId,
     messages: snapshot.messages,
@@ -148,14 +137,8 @@ function roomSnapshotPayload(room) {
   ]);
 }
 
-async function sendRoomSnapshot(room, handle, snapshot = null) {
-  const current = snapshot ?? await room.atomic(() => roomSnapshot(room));
-  const socket = new WebSocket(handle);
-  socket.send(roomSnapshotPayload(current), "text");
-}
-
-function modifyRoom(room, updater) {
-  const current = roomSnapshot(room);
+function modifyRoom(tx, updater) {
+  const current = roomSnapshot(tx);
   const next = updater({
     roomId: current.roomId,
     nextSeq: current.nextSeq,
@@ -164,16 +147,15 @@ function modifyRoom(room, updater) {
     connections: structuredClone(current.connections),
   });
   const snapshot = next ?? current;
-  const mem = roomMemory(room);
-  mem.roomId.write(snapshot.roomId);
-  mem.nextSeq.write(snapshot.nextSeq);
-  mem.messages.write(snapshot.messages);
-  mem.participants.write(snapshot.participants);
-  mem.connections.write(snapshot.connections);
+  tx.put("room_id", snapshot.roomId);
+  tx.put("next_seq", snapshot.nextSeq);
+  tx.put("messages", snapshot.messages);
+  tx.put("participants", snapshot.participants);
+  tx.put("connections", snapshot.connections);
   return snapshot;
 }
 
-function deferRoomEvents(room, events) {
+function deferRoomEvents(tx, events) {
   for (const event of events) {
     if (!event || typeof event !== "object") {
       continue;
@@ -181,8 +163,7 @@ function deferRoomEvents(room, events) {
     switch (event.type) {
       case "session_replaced": {
         for (const handle of event.handles ?? []) {
-          const socket = new WebSocket(handle);
-          socket.close(1001, "replaced");
+          tx.sockets.close(handle, 1001, "replaced");
         }
         break;
       }
@@ -195,15 +176,13 @@ function deferRoomEvents(room, events) {
           ),
         );
         for (const handle of event.handles ?? []) {
-          const socket = new WebSocket(handle);
-          socket.send(payload, "text");
+          tx.sockets.send(handle, payload);
         }
         break;
       }
       case "room_snapshot": {
         const payload = roomSnapshotPayload(event.room);
-        const socket = new WebSocket(event.handle);
-        socket.send(payload, "text");
+        tx.sockets.send(event.handle, payload);
         break;
       }
       case "message_posted": {
@@ -211,8 +190,7 @@ function deferRoomEvents(room, events) {
           fixiSwap("#messages", "beforeend", renderMessageItem(event.message)),
         );
         for (const handle of event.handles ?? []) {
-          const socket = new WebSocket(handle);
-          socket.send(payload, "text");
+          tx.sockets.send(handle, payload);
         }
         break;
       }
@@ -222,13 +200,13 @@ function deferRoomEvents(room, events) {
   }
 }
 
-function roomProcess(room) {
+function roomProcess(tx) {
   return {
     openSocket(payload) {
-      const { handle, response } = room.accept(payload.request);
+      const { handle, response } = tx.accept(payload.request);
       let nextRoom = null;
       let replacedHandles = [];
-      modifyRoom(room, (snapshot) => {
+      modifyRoom(tx, (snapshot) => {
         snapshot.roomId = payload.roomId;
         replacedHandles = roomConnectionHandles(snapshot).filter(
           (existingHandle) => (
@@ -248,7 +226,7 @@ function roomProcess(room) {
         nextRoom = structuredClone(snapshot);
         return snapshot;
       });
-      deferRoomEvents(room, [
+      deferRoomEvents(tx, [
         {
           type: "participants_changed",
           handles: roomConnectionHandles(nextRoom).filter((existingHandle) => existingHandle !== handle),
@@ -259,13 +237,13 @@ function roomProcess(room) {
     },
 
     clientReady(handle) {
-      const snapshot = roomSnapshot(room);
-      deferRoomEvents(room, [{ type: "room_snapshot", handle, room: snapshot }]);
+      const snapshot = roomSnapshot(tx);
+      deferRoomEvents(tx, [{ type: "room_snapshot", handle, room: snapshot }]);
       return true;
     },
 
     postMessage(handle, text) {
-      const snapshot = roomSnapshot(room);
+      const snapshot = roomSnapshot(tx);
       const participantId = snapshot.connections[handle];
       if (!participantId) {
         return false;
@@ -280,7 +258,7 @@ function roomProcess(room) {
       }
       let nextMessage = null;
       let handles = [];
-      modifyRoom(room, (next) => {
+      modifyRoom(tx, (next) => {
         nextMessage = {
           seq: next.nextSeq + 1,
           participantId,
@@ -296,14 +274,14 @@ function roomProcess(room) {
         handles = roomConnectionHandles(next);
         return next;
       });
-      deferRoomEvents(room, [{ type: "message_posted", handles, message: nextMessage }]);
+      deferRoomEvents(tx, [{ type: "message_posted", handles, message: nextMessage }]);
       return true;
     },
 
     disconnect(handle) {
       let nextRoom = null;
       let removed = false;
-      modifyRoom(room, (snapshot) => {
+      modifyRoom(tx, (snapshot) => {
         if (!snapshot.connections[handle]) {
           return snapshot;
         }
@@ -315,7 +293,7 @@ function roomProcess(room) {
       if (!removed) {
         return false;
       }
-      deferRoomEvents(room, [{
+      deferRoomEvents(tx, [{
         type: "participants_changed",
         handles: roomConnectionHandles(nextRoom),
         room: nextRoom,
@@ -499,7 +477,7 @@ export default {
           return json({ ok: false, error: "missing room, username, or participant id" }, 400);
         }
         const room = roomNamespace(env, roomId);
-        return await room.atomic(() => roomProcess(room).openSocket({
+        return await room.atomic((tx) => roomProcess(tx).openSocket({
           request,
           roomId,
           username,
@@ -508,7 +486,7 @@ export default {
       }
       if (action === "state") {
         const room = roomNamespace(env, roomId);
-        return json({ ok: true, ...(await room.atomic(() => roomStateResponse(room))) });
+        return json({ ok: true, ...(await room.atomic((tx) => roomStateResponse(tx, roomId))) });
       }
       const username = normalizeUsername(url.searchParams.get("username"));
       const participantId = normalizeParticipantId(url.searchParams.get("participant"));
@@ -533,12 +511,11 @@ export default {
         return;
       }
       if (String(payload.type ?? "") === "ready") {
-        const snapshot = await stub.atomic(() => roomSnapshot(stub));
-        await sendRoomSnapshot(stub, event.handle, snapshot);
+        await stub.atomic((tx) => roomProcess(tx).clientReady(event.handle));
         return;
       }
-      await stub.atomic(() => {
-        const process = roomProcess(stub);
+      await stub.atomic((tx) => {
+        const process = roomProcess(tx);
         switch (String(payload.type ?? "")) {
           case "message":
             return process.postMessage(event.handle, payload.text);
@@ -549,7 +526,7 @@ export default {
       return;
     }
     if (event.type === "socketclose") {
-      await stub.atomic(() => roomProcess(stub).disconnect(event.handle));
+      await stub.atomic((tx) => roomProcess(tx).disconnect(event.handle));
     }
   },
 };

@@ -1,21 +1,14 @@
 use super::*;
 
 pub(crate) async fn test_service(config: RuntimeConfig) -> RuntimeService {
-    let db_path = format!("/tmp/dd-test-{}.db", Uuid::new_v4());
     let store_dir = format!("/tmp/dd-store-{}", Uuid::new_v4());
     RuntimeService::start_with_service_config(RuntimeServiceConfig {
         runtime: config,
         storage: RuntimeStorageConfig {
             store_dir: PathBuf::from(&store_dir),
-            database_url: format!("file:{db_path}"),
-            memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
-            memory_db_cache_max_open: 4096,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
-            memory_db_read_connections_per_database: 4,
-            memory_db_max_total_connections: 4096usize.saturating_mul(5),
-            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: false,
         },
     })
@@ -26,65 +19,20 @@ pub(crate) async fn test_service(config: RuntimeConfig) -> RuntimeService {
 pub(crate) async fn test_service_with_paths(
     config: RuntimeConfig,
     store_dir: PathBuf,
-    database_url: String,
     worker_store_enabled: bool,
 ) -> RuntimeService {
     RuntimeService::start_with_service_config(RuntimeServiceConfig {
         runtime: config,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
-            database_url,
-            memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
-            memory_db_cache_max_open: 4096,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
-            memory_db_read_connections_per_database: 4,
-            memory_db_max_total_connections: 4096usize.saturating_mul(5),
-            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled,
         },
     })
     .await
     .expect("service should start")
-}
-
-pub(crate) fn dynamic_single_isolate_config() -> RuntimeConfig {
-    RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    }
-}
-
-pub(crate) fn dynamic_autoscaling_config() -> RuntimeConfig {
-    RuntimeConfig {
-        min_isolates: 0,
-        max_global_isolates: 128,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    }
-}
-
-pub(crate) fn dynamic_bench_autoscaling_config() -> RuntimeConfig {
-    RuntimeConfig {
-        min_isolates: 0,
-        max_global_isolates: 128,
-        max_isolates: 8,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    }
 }
 
 pub(crate) async fn invoke_with_timeout_and_dump(
@@ -103,8 +51,7 @@ pub(crate) async fn invoke_with_timeout_and_dump(
         Ok(Err(error)) => panic!("{stage} failed: {error}"),
         Err(_) => {
             let dump = service.debug_dump(worker_name.to_string()).await;
-            let dynamic_dump = service.dynamic_debug_dump().await;
-            panic!("{stage} timed out; debug dump: {dump:?}; dynamic dump: {dynamic_dump:?}");
+            panic!("{stage} timed out; debug dump: {dump:?}");
         }
     }
 }

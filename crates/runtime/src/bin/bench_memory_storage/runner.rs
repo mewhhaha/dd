@@ -4,6 +4,7 @@ pub(crate) struct BenchRun<'a> {
     pub(crate) service: &'a RuntimeService,
     pub(crate) label: &'a str,
     pub(crate) source: &'a str,
+    pub(crate) memory_entity_prefix: &'a str,
     pub(crate) bindings: Vec<DeployBinding>,
     pub(crate) profile_stats_worker: Option<String>,
     pub(crate) seed: bool,
@@ -25,6 +26,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
         service,
         label,
         source,
+        memory_entity_prefix,
         bindings,
         profile_stats_worker,
         seed,
@@ -37,6 +39,20 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
     let requests = env_usize("DD_BENCH_REQUESTS", 1_000);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 1);
     let worker_name = format!("{label}-{}", Uuid::new_v4());
+    let memory_worker = profile_stats_worker.as_deref().unwrap_or(&worker_name);
+    let memory_binding = bindings
+        .iter()
+        .find_map(|binding| match binding {
+            DeployBinding::Memory { binding } => Some(binding.as_str()),
+            _ => None,
+        })
+        .unwrap_or("AUTH_STATE");
+    let memory_keys = Arc::new(MemoryKeySet::from_env(
+        memory_worker,
+        memory_binding,
+        memory_entity_prefix,
+        key_space,
+    ));
     let started_at = Instant::now();
     let watchdog_state = Arc::new(BenchWatchdogState::new());
     let watchdog_task = spawn_watchdog(
@@ -89,7 +105,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
             service,
             &worker_name,
             requests,
-            key_space,
+            &memory_keys,
             options.request_timeout,
         )
         .await;
@@ -123,7 +139,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
         set_watchdog_phase(&watchdog_state, started_at, BenchPhase::Profile);
         let profile_reset_started = Instant::now();
         let profile_reset_result = service
-            .invoke(worker_name.clone(), invocation("/__profile_reset", 0, 1))
+            .invoke(worker_name.clone(), invocation("/__profile_reset", 0))
             .await;
         timings.profile += profile_reset_started.elapsed();
         if let Err(error) = profile_reset_result {
@@ -152,8 +168,8 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
             requests,
             concurrency,
             path,
-            key_space,
         },
+        Arc::clone(&memory_keys),
         options,
         Arc::clone(&watchdog_state),
         started_at,
@@ -192,7 +208,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
     if let Some(verify_path) = verify_path {
         set_watchdog_phase(&watchdog_state, started_at, BenchPhase::Verify);
         let expected = if verify_path == "/sum" || verify_path == "/sum-read" {
-            MemoryKeySet::from_env(key_space)
+            memory_keys
                 .distinct_for_requests(requests)
                 .len()
                 .to_string()
@@ -210,7 +226,7 @@ pub(crate) async fn run_and_print(run: BenchRun<'_>) -> Result<(), String> {
                 service,
                 &worker_name,
                 requests,
-                key_space,
+                &memory_keys,
                 verify_path,
                 &expected,
                 options.request_timeout,
@@ -355,14 +371,10 @@ pub(crate) async fn run_storage_write_and_print(run: StorageBenchRun<'_>) -> Res
     let requests = env_usize("DD_BENCH_REQUESTS", 1_000);
     let concurrency = env_usize("DD_BENCH_CONCURRENCY", 1);
     let paths = bench_paths("memory-storage-only");
-    let store = MemoryStore::new(
-        paths.store_dir.join("memory"),
-        env_memory_namespace_shards(),
-        4096,
-        Duration::from_secs(60),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let state = storage::state::StateStore::open(paths.store_dir.join("state"))
+        .await
+        .map_err(|error| error.to_string())?;
+    let store = MemoryStore::from_state(state);
     let started_at = Instant::now();
     let watchdog_state = Arc::new(BenchWatchdogState::new());
     let watchdog_task = spawn_watchdog(
@@ -372,7 +384,12 @@ pub(crate) async fn run_storage_write_and_print(run: StorageBenchRun<'_>) -> Res
         *options,
         Arc::clone(&watchdog_state),
     );
-    let memory_keys = Arc::new(MemoryKeySet::from_env(key_space));
+    let memory_keys = Arc::new(MemoryKeySet::from_env(
+        "storage-benchmark",
+        "BENCH_MEMORY",
+        "",
+        key_space,
+    ));
     set_watchdog_phase(&watchdog_state, started_at, BenchPhase::Invoke);
     let result = run_storage_write_scenario(
         store.clone(),
@@ -477,17 +494,17 @@ async fn run_storage_write_scenario(
                 timeout(
                     request_timeout,
                     store.apply_batch(
-                        "BENCH_MEMORY",
+                        &memory_keys.namespace,
                         &memory_key,
-                        &[MemoryBatchMutation {
-                            key: "payload".to_string(),
-                            value: b"1".to_vec(),
-                            encoding: "utf8".to_string(),
-                            deleted: false,
-                        }],
-                        None,
-                        &[],
-                        None,
+                        storage::memory::MemoryCommit {
+                            mutations: &[MemoryBatchMutation {
+                                key: "payload".to_string(),
+                                value: b"1".to_vec(),
+                                encoding: "utf8".to_string(),
+                                deleted: false,
+                            }],
+                            ..Default::default()
+                        },
                     ),
                 )
                 .await
@@ -550,7 +567,7 @@ async fn verify_storage_distinct_memory_sum(
     for memory_key in memory_keys.distinct_for_requests(requests) {
         let point = timeout(
             request_timeout,
-            store.point_read("BENCH_MEMORY", &memory_key, "payload"),
+            store.point_read(&memory_keys.namespace, &memory_key, "payload"),
         )
         .await
         .map_err(|_| {
@@ -574,7 +591,7 @@ async fn verify_expected_value(
     service: &RuntimeService,
     worker_name: &str,
     requests: usize,
-    key_space: usize,
+    memory_keys: &MemoryKeySet,
     verify_path: &str,
     expected: &str,
     request_timeout: Duration,
@@ -589,7 +606,7 @@ async fn verify_expected_value(
                 service,
                 worker_name,
                 requests,
-                key_space,
+                memory_keys,
                 verify_path,
                 request_timeout,
             )
@@ -599,7 +616,7 @@ async fn verify_expected_value(
                 request_timeout,
                 service.invoke(
                     worker_name.to_string(),
-                    invocation(verify_path, requests + 1, 1),
+                    invocation(verify_path, requests + 1),
                 ),
             )
             .await
@@ -627,13 +644,13 @@ async fn seed_benchmark_state(
     service: &RuntimeService,
     worker_name: &str,
     requests: usize,
-    key_space: usize,
+    memory_keys: &MemoryKeySet,
     request_timeout: Duration,
 ) -> Result<(), String> {
-    if key_space <= 1 {
+    if !memory_keys.is_multi_key() {
         timeout(
             request_timeout,
-            service.invoke(worker_name.to_string(), invocation("/seed", 0, 1)),
+            service.invoke(worker_name.to_string(), invocation("/seed", 0)),
         )
         .await
         .map_err(|_| {
@@ -646,7 +663,6 @@ async fn seed_benchmark_state(
         return Ok(());
     }
 
-    let memory_keys = MemoryKeySet::from_env(key_space);
     for (offset, memory_key) in memory_keys
         .distinct_for_requests(requests)
         .into_iter()
@@ -682,7 +698,7 @@ async fn verify_distinct_memory_sum(
     service: &RuntimeService,
     worker_name: &str,
     requests: usize,
-    key_space: usize,
+    memory_keys: &MemoryKeySet,
     path: &str,
     request_timeout: Duration,
 ) -> Result<String, String> {
@@ -691,7 +707,6 @@ async fn verify_distinct_memory_sum(
     } else {
         "/get"
     };
-    let memory_keys = MemoryKeySet::from_env(key_space);
     let mut total = 0usize;
     for (offset, memory_key) in memory_keys
         .distinct_for_requests(requests)
@@ -734,6 +749,7 @@ pub(crate) async fn run_scenario(
     service: &RuntimeService,
     worker_name: &str,
     scenario: Scenario,
+    memory_keys: Arc<MemoryKeySet>,
     options: &BenchOptions,
     watchdog_state: Arc<BenchWatchdogState>,
     started_at: Instant,
@@ -744,7 +760,6 @@ pub(crate) async fn run_scenario(
     )));
     let scenario_started_at = Instant::now();
     let mut tasks = Vec::with_capacity(scenario.concurrency);
-    let memory_keys = Arc::new(MemoryKeySet::from_env(scenario.key_space));
 
     for _ in 0..scenario.concurrency {
         let service = service.clone();
@@ -834,9 +849,14 @@ fn percentile_ms(latencies: &[Duration], quantile: f64) -> f64 {
     latencies[index].as_secs_f64() * 1000.0
 }
 
-pub(crate) fn invocation(path: &str, idx: usize, key_space: usize) -> WorkerInvocation {
-    let memory_keys = MemoryKeySet::from_env(key_space);
-    invocation_with_memory_keys(path, idx, &memory_keys)
+pub(crate) fn invocation(path: &str, idx: usize) -> WorkerInvocation {
+    WorkerInvocation {
+        method: "GET".to_string(),
+        url: format!("http://worker{path}"),
+        headers: Vec::new(),
+        body: Vec::new(),
+        request_id: format!("bench-memory-{idx}"),
+    }
 }
 
 fn invocation_with_memory_keys(
@@ -860,22 +880,28 @@ fn invocation_with_memory_keys(
     }
 }
 
-struct MemoryKeySet {
+pub(crate) struct MemoryKeySet {
+    namespace: String,
     key_space: usize,
     mode: MemoryKeyMode,
     keys: Vec<String>,
 }
 
 impl MemoryKeySet {
-    fn from_env(key_space: usize) -> Self {
+    pub(crate) fn from_env(
+        worker: &str,
+        binding: &str,
+        entity_prefix: &str,
+        key_space: usize,
+    ) -> Self {
         let mode = MemoryKeyMode::from_env();
-        let namespace_shards = env_memory_namespace_shards();
         let keys = if key_space <= 1 || mode == MemoryKeyMode::Unique {
             Vec::new()
         } else {
-            build_memory_keys(key_space, mode, namespace_shards)
+            build_memory_keys(worker, binding, entity_prefix, key_space, mode)
         };
         Self {
+            namespace: storage::memory::worker_namespace(worker, binding),
             key_space,
             mode,
             keys,
@@ -909,103 +935,75 @@ impl MemoryKeySet {
     }
 }
 
-fn memory_shard(memory_key: &str, namespace_shards: usize) -> usize {
-    stable_memory_shard_index(memory_key, namespace_shards)
-}
-
 fn build_memory_keys(
+    worker: &str,
+    binding: &str,
+    entity_prefix: &str,
     key_space: usize,
     mode: MemoryKeyMode,
-    namespace_shards: usize,
 ) -> Vec<String> {
-    match mode {
-        MemoryKeyMode::Pool => (0..key_space)
-            .map(|memory_slot| format!("bench-{memory_slot}"))
-            .collect(),
-        MemoryKeyMode::Unique => Vec::new(),
-        MemoryKeyMode::SameShard => {
-            let shard = memory_shard("bench-direct-same-shard-anchor", namespace_shards);
-            memory_keys_for_single_shard(
-                key_space,
-                shard,
-                namespace_shards,
-                "bench-direct-sameshard",
-            )
-        }
-        MemoryKeyMode::CrossShard => {
-            memory_keys_across_shards(key_space, namespace_shards, "bench-direct-cross-shard")
-        }
-        MemoryKeyMode::SkewedHotspot => memory_keys_skewed_hotspot(key_space, namespace_shards),
+    use storage::state::{STATE_SHARDS, StateStore};
+    if mode == MemoryKeyMode::Pool {
+        return (0..key_space).map(|slot| format!("bench-{slot}")).collect();
     }
-}
-
-fn memory_keys_for_single_shard(
-    key_space: usize,
-    target_shard: usize,
-    namespace_shards: usize,
-    prefix: &str,
-) -> Vec<String> {
-    if namespace_shards <= 1 {
-        return (0..key_space)
-            .map(|occurrence| format!("{prefix}-{occurrence}"))
-            .collect();
+    if mode == MemoryKeyMode::Unique {
+        return Vec::new();
     }
+    let hot_shard =
+        StateStore::shard_index(worker, binding, &format!("{entity_prefix}bench-hot-anchor"));
+    let hot_keys = key_space.saturating_mul(4) / 5;
     let mut keys = Vec::with_capacity(key_space);
     let mut sequence = 0usize;
-    while keys.len() < key_space {
-        let candidate = format!("{prefix}-{sequence}");
-        if memory_shard(&candidate, namespace_shards) == target_shard {
-            keys.push(candidate);
+    for slot in 0..key_space {
+        let target = match mode {
+            MemoryKeyMode::SameShard => hot_shard,
+            MemoryKeyMode::CrossShard => slot % STATE_SHARDS,
+            MemoryKeyMode::SkewedHotspot if slot < hot_keys => hot_shard,
+            MemoryKeyMode::SkewedHotspot => (slot - hot_keys) % STATE_SHARDS,
+            MemoryKeyMode::Pool | MemoryKeyMode::Unique => {
+                unreachable!("unconstrained key modes returned")
+            }
+        };
+        loop {
+            let candidate = format!("bench-shard-{sequence}");
+            sequence += 1;
+            if StateStore::shard_index(worker, binding, &format!("{entity_prefix}{candidate}"))
+                == target
+            {
+                keys.push(candidate);
+                break;
+            }
         }
-        sequence += 1;
     }
     keys
 }
 
-fn memory_keys_across_shards(
-    key_space: usize,
-    namespace_shards: usize,
-    prefix: &str,
-) -> Vec<String> {
-    if namespace_shards <= 1 {
-        return (0..key_space)
-            .map(|occurrence| format!("{prefix}-{occurrence}"))
-            .collect();
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::state::{STATE_SHARDS, StateStore};
 
-    let mut keys = vec![String::new(); key_space];
-    let mut seen_by_shard = vec![0usize; namespace_shards];
-    let mut filled = 0usize;
-    let mut sequence = 0usize;
-    while filled < key_space {
-        let candidate = format!("{prefix}-{sequence}");
-        let shard = memory_shard(&candidate, namespace_shards);
-        let occurrence = seen_by_shard[shard];
-        seen_by_shard[shard] += 1;
-        let memory_slot = shard + occurrence * namespace_shards;
-        if memory_slot < key_space {
-            keys[memory_slot] = candidate;
-            filled += 1;
+    #[test]
+    fn constrained_keys_follow_the_actual_worker_binding_routing() {
+        for (worker, binding) in [
+            ("worker-a", "BENCH_MEMORY"),
+            ("auth-worker-b", "AUTH_STATE"),
+        ] {
+            let same = build_memory_keys(worker, binding, "session:", 64, MemoryKeyMode::SameShard);
+            let target = StateStore::shard_index(worker, binding, &format!("session:{}", same[0]));
+            assert!(same.iter().all(|key| StateStore::shard_index(
+                worker,
+                binding,
+                &format!("session:{key}")
+            ) == target));
+            let cross =
+                build_memory_keys(worker, binding, "session:", 64, MemoryKeyMode::CrossShard);
+            for (slot, key) in cross.iter().enumerate() {
+                assert_eq!(
+                    StateStore::shard_index(worker, binding, &format!("session:{key}")),
+                    slot % STATE_SHARDS
+                );
+            }
         }
-        sequence += 1;
     }
-    keys
-}
-
-fn memory_keys_skewed_hotspot(key_space: usize, namespace_shards: usize) -> Vec<String> {
-    let hot_key_space = ((key_space.saturating_mul(4)) / 5).clamp(1, key_space);
-    let cold_key_space = key_space.saturating_sub(hot_key_space);
-    let hot_shard = memory_shard("bench-skewed-hotspot-anchor", namespace_shards);
-    let mut keys = memory_keys_for_single_shard(
-        hot_key_space,
-        hot_shard,
-        namespace_shards,
-        "bench-skewed-hot",
-    );
-    keys.extend(memory_keys_across_shards(
-        cold_key_space,
-        namespace_shards,
-        "bench-skewed-cold",
-    ));
-    keys
 }

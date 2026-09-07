@@ -2,10 +2,10 @@ import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 
 export const modeLabels = new Map([
-  ["storage-write-memory-wide", "Storage-only direct write"],
-  ["direct-write-memory-wide", "Runtime direct write"],
+  ["storage-write-memory-wide", "Storage batch write"],
+  ["atomic-write-only-memory-wide", "Atomic write only"],
   ["atomic-readwrite-memory-wide", "Atomic read + write"],
-  ["atomic-write-memory-wide", "Atomic write + durable effect"],
+  ["atomic-write-effect-memory-wide", "Atomic write + durable effect"],
 ]);
 
 export async function loadBenchmarkResult(path) {
@@ -27,6 +27,8 @@ export function normalizeBenchmarkResult(run, sourcePath, { allowDirty = false }
         startedAt: run.started_at,
         metadata: run.metadata,
         sampleCount: run.sample_count,
+        effectiveConfig: config.env,
+        scriptHash: config.script_sha256,
         configName: config.name,
         workload: summary.workload,
         mode: variant.mode ?? env.DD_BENCH_MODE,
@@ -34,7 +36,6 @@ export function normalizeBenchmarkResult(run, sourcePath, { allowDirty = false }
         isolates: numberField(variant.isolates ?? env.DD_BENCH_MAX_ISOLATES ?? summary.isolate_max),
         isolateMin: numberField(env.DD_BENCH_MIN_ISOLATES ?? summary.isolate_min),
         isolateMax: numberField(env.DD_BENCH_MAX_ISOLATES ?? summary.isolate_max),
-        shards: numberField(variant.shards ?? env.DD_BENCH_MEMORY_NAMESPACE_SHARDS),
         requests: finiteNumber(summary.requests, "requests"),
         concurrency: finiteNumber(summary.concurrency, "concurrency"),
         samples: finiteNumber(summary.samples, "samples"),
@@ -131,7 +132,7 @@ function validateRun(run, sourcePath, allowDirty) {
   if (!Array.isArray(run.configs) || run.configs.length === 0) {
     throw new Error(`${sourcePath}: expected non-empty configs`);
   }
-  if (run.complete === false) {
+  if (run.complete !== true) {
     throw new Error(`${sourcePath}: benchmark result is incomplete`);
   }
   if (!run.metadata?.git_commit) {
@@ -176,6 +177,9 @@ function validateSummary(summary, configName) {
 }
 
 function finiteNumber(value, name) {
+  if (value == null || value === "" || typeof value === "boolean") {
+    throw new Error(`${name} must be finite`);
+  }
   const number = Number(value);
   if (!Number.isFinite(number)) {
     throw new Error(`${name} must be finite`);

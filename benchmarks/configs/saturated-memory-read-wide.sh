@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DD_BENCH_MODE=direct-read-memory-wide \
+DD_BENCH_MODE=atomic-read-memory-wide \
 DD_BENCH_REQUESTS=20000 \
 DD_BENCH_CONCURRENCY=256 \
 DD_BENCH_MIN_ISOLATES=16 \

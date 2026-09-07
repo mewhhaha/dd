@@ -1,3 +1,5 @@
+mod storage;
+
 use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use common::{
@@ -6,12 +8,11 @@ use common::{
     DeployServerModuleKind, DeployTokenCapabilities, DeployTokenDeleteResponse,
     DeployTokenGetResponse, DeployTokenListResponse, DeployTokenMintRequest,
     DeployTokenMintResponse, DeployTraceDestination, DeploymentInspectResponse,
-    DeploymentListResponse, DynamicDeployRequest, DynamicDeployResponse, ErrorBody,
-    RollbackRequest, RollbackResponse, UndeployResponse, WorkerNameRequest,
-    first_non_empty_trimmed,
+    DeploymentListResponse, ErrorBody, RollbackRequest, RollbackResponse, UndeployResponse,
+    WorkerNameRequest, first_non_empty_trimmed,
 };
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Storage(storage::StorageCmd),
     Deploy(DeployCmd),
     #[command(hide = true)]
     PackageDeploy(DeployCmd),
@@ -58,7 +60,6 @@ enum Command {
     InspectDeployment(DeploymentIdCmd),
     Undeploy(WorkerCmd),
     Rollback(RollbackCmd),
-    DynamicDeploy(DynamicDeployCmd),
     Invoke(InvokeCmd),
 }
 
@@ -104,9 +105,6 @@ struct DeployCmd {
 
     #[arg(long = "memory-binding")]
     memory_bindings: Vec<String>,
-
-    #[arg(long = "dynamic-binding")]
-    dynamic_bindings: Vec<String>,
 
     #[arg(long = "service-binding")]
     service_bindings: Vec<String>,
@@ -185,9 +183,6 @@ struct MintDeployTokenCmd {
     #[arg(long = "memory-binding")]
     memory_bindings: Vec<String>,
 
-    #[arg(long = "dynamic-binding")]
-    dynamic_bindings: Vec<String>,
-
     #[arg(long = "service-binding")]
     service_bindings: Vec<String>,
 
@@ -244,6 +239,8 @@ struct DeployFileConfig {
     bindings: Option<Vec<DeployBinding>>,
     #[serde(default)]
     internal: Option<DeployInternalConfig>,
+    #[serde(default)]
+    egress_allow_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,20 +278,13 @@ struct InvokeCmd {
     body_file: Option<String>,
 }
 
-#[derive(Args)]
-struct DynamicDeployCmd {
-    file: String,
-
-    #[arg(long = "env")]
-    env_vars: Vec<String>,
-
-    #[arg(long = "allow-host")]
-    allow_hosts: Vec<String>,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let cli = Cli::parse();
+    let cli = match cli.command {
+        Command::Storage(command) => return storage::run(command).await,
+        _ => cli,
+    };
     let cli_config = load_cli_config(&cli.command)?;
     let server = resolve_server(cli.server.as_deref(), &cli_config)?;
     let client = reqwest::Client::new();
@@ -302,6 +292,7 @@ async fn main() -> Result<(), String> {
     let deploy_bearer_token = deploy_bearer_token(&server).or_else(|| private_bearer_token.clone());
 
     match cli.command {
+        Command::Storage(_) => unreachable!("storage commands return before network setup"),
         Command::Deploy(command) => {
             deploy(&client, &server, deploy_bearer_token.as_deref(), command).await?
         }
@@ -340,9 +331,6 @@ async fn main() -> Result<(), String> {
         }
         Command::Rollback(command) => {
             rollback(&client, &server, private_bearer_token.as_deref(), command).await?
-        }
-        Command::DynamicDeploy(command) => {
-            dynamic_deploy(&client, &server, private_bearer_token.as_deref(), command).await?
         }
         Command::Invoke(command) => {
             invoke(&client, &server, private_bearer_token.as_deref(), command).await?
@@ -632,14 +620,6 @@ fn build_deploy_token_mint_request(
     );
     bindings.extend(
         command
-            .dynamic_bindings
-            .into_iter()
-            .map(|binding| DeployBinding::Dynamic {
-                binding: binding.trim().to_string(),
-            }),
-    );
-    bindings.extend(
-        command
             .service_bindings
             .into_iter()
             .map(parse_service_binding)
@@ -688,20 +668,13 @@ async fn build_deploy_request(command: DeployCmd) -> Result<DeployRequest, Strin
     );
     bindings.extend(
         command
-            .dynamic_bindings
-            .into_iter()
-            .map(|binding| DeployBinding::Dynamic {
-                binding: binding.trim().to_string(),
-            }),
-    );
-    bindings.extend(
-        command
             .service_bindings
             .into_iter()
             .map(parse_service_binding)
             .collect::<Result<Vec<_>, _>>()?,
     );
     let config = DeployConfig {
+        egress_allow_hosts: Vec::new(),
         public: command.public,
         cache: DeployCacheConfig {
             enabled: command.cache,
@@ -795,6 +768,9 @@ async fn build_deploy_request_from_config_file(
         command.allow_outside_config_root,
     )?;
     let mut config = deploy_file.config.unwrap_or_default();
+    if let Some(hosts) = deploy_file.egress_allow_hosts {
+        config.egress_allow_hosts = hosts;
+    }
     if let Some(public) = deploy_file.public {
         config.public = public;
     }
@@ -817,34 +793,6 @@ async fn build_deploy_request_from_config_file(
         asset_headers,
         temporary: command.temporary || deploy_file.temporary,
     })
-}
-
-async fn dynamic_deploy(
-    client: &reqwest::Client,
-    server: &str,
-    private_bearer_token: Option<&str>,
-    command: DynamicDeployCmd,
-) -> Result<(), String> {
-    let source = tokio::fs::read_to_string(&command.file)
-        .await
-        .map_err(|error| format!("failed to read {}: {error}", command.file))?;
-    let env = parse_env_vars(&command.env_vars)?;
-    let response = with_bearer_auth(
-        client.post(api_url(server, "/v1/dynamic/deploy")),
-        private_bearer_token,
-    )
-    .json(&DynamicDeployRequest {
-        source,
-        env,
-        egress_allow_hosts: command.allow_hosts,
-    })
-    .send()
-    .await
-    .map_err(|error| error.to_string())?;
-
-    let deployed: DynamicDeployResponse = decode_json(response).await?;
-    println!("{}", to_json_string(&deployed)?);
-    Ok(())
 }
 
 fn parse_memory_binding(value: String) -> Result<DeployBinding, String> {
@@ -886,22 +834,6 @@ fn parse_service_binding(value: String) -> Result<DeployBinding, String> {
         binding: binding.to_string(),
         service: service.to_string(),
     })
-}
-
-fn parse_env_vars(values: &[String]) -> Result<HashMap<String, String>, String> {
-    let mut out = HashMap::new();
-    for value in values {
-        let trimmed = value.trim();
-        let Some((name, secret)) = trimmed.split_once('=') else {
-            return Err(format!("invalid env value {trimmed:?}, expected KEY=VALUE"));
-        };
-        let key = name.trim();
-        if key.is_empty() {
-            return Err("env key must not be empty".to_string());
-        }
-        out.insert(key.to_string(), secret.to_string());
-    }
-    Ok(out)
 }
 
 async fn invoke(
@@ -1107,6 +1039,7 @@ fn validate_config_document(bytes: &[u8]) -> Result<(), String> {
         "cache",
         "bindings",
         "internal",
+        "egress_allow_hosts",
     ];
 
     let value: serde_json::Value =
@@ -1661,6 +1594,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_config_file_matches_shared_runtime_contract() {
+        let root = temp_dir("runtime-contract");
+        fs::create_dir_all(&root).expect("create config root");
+        fs::write(root.join("worker.js"), "export default { fetch() {} };").expect("write worker");
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../../fixtures/config/deploy-config.json"))
+                .expect("shared runtime contract");
+        for scenario in cases {
+            let config = serde_json::json!({
+                "schema_version": 1,
+                "name": "runtime-contract",
+                "entrypoint": "worker.js",
+                "config": scenario["input"],
+            });
+            fs::write(
+                root.join("dd.deploy.json"),
+                serde_json::to_vec(&config).expect("encode deployment config"),
+            )
+            .expect("write deployment config");
+            let result = build_deploy_request_from_config_file(DeployConfigFileCmd {
+                config_file: root.join("dd.deploy.json").display().to_string(),
+                temporary: false,
+                allow_outside_config_root: false,
+            })
+            .await;
+            if scenario["reject"] == true {
+                assert!(result.is_err(), "{} must be rejected", scenario["name"]);
+            } else {
+                let request = result.expect("supported runtime config should package");
+                assert_eq!(
+                    serde_json::to_value(request.config).expect("normalized runtime config"),
+                    scenario["expected"],
+                    "{}",
+                    scenario["name"],
+                );
+            }
+        }
+        fs::remove_dir_all(root).expect("remove config root");
+    }
+
+    #[tokio::test]
     async fn package_deploy_config_uses_bundled_entrypoint_and_excludes_artifacts() {
         let root = temp_dir("deploy-config");
         fs::create_dir_all(root.join("assets")).expect("create assets");
@@ -1684,6 +1658,7 @@ mod tests {
               ],
               "config": {
                 "public": true,
+                "egress_allow_hosts": ["api.example.com"],
                 "bindings": [{ "type": "memory", "binding": "ROOM" }]
               }
             }"#,
@@ -1701,6 +1676,7 @@ mod tests {
         assert_eq!(request.name, "built-worker");
         assert!(request.source.contains("export default"));
         assert!(request.config.public);
+        assert_eq!(request.config.egress_allow_hosts, vec!["api.example.com"]);
         assert!(request.temporary);
         assert_eq!(request.config.bindings.len(), 1);
         let asset_paths = request
@@ -1941,7 +1917,6 @@ mod tests {
             allow_private: false,
             kv_bindings: vec!["CACHE".to_string()],
             memory_bindings: vec!["ROOM".to_string()],
-            dynamic_bindings: Vec::new(),
             service_bindings: vec!["AUTH=auth-worker".to_string()],
             allow_any_bindings: false,
             allow_internal_trace: false,

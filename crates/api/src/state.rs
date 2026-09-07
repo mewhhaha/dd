@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -143,8 +142,6 @@ pub struct AppState {
     pub invoke_max_body_bytes: usize,
     pub public_base_domain: String,
     pub private_bearer_token: Option<String>,
-    pub public_tls_cert_path: Option<PathBuf>,
-    pub public_tls_key_path: Option<PathBuf>,
     pub websocket_sessions: Arc<Mutex<HashMap<String, WebSocketSession>>>,
     pub operations: OperationalState,
 }
@@ -156,8 +153,6 @@ impl AppState {
         invoke_max_body_bytes: usize,
         public_base_domain: String,
         private_bearer_token: Option<String>,
-        public_tls_cert_path: Option<PathBuf>,
-        public_tls_key_path: Option<PathBuf>,
     ) -> Self {
         Self {
             runtime,
@@ -166,8 +161,6 @@ impl AppState {
             invoke_max_body_bytes,
             public_base_domain: public_base_domain.trim().to_ascii_lowercase(),
             private_bearer_token,
-            public_tls_cert_path,
-            public_tls_key_path,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),
             operations: OperationalState::default(),
         }

@@ -3,40 +3,22 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MEMORY_RPC_SCHEMA_PATH: &str = "schema/memory_rpc.capnp";
-const CHECKED_IN_MEMORY_RPC_PATH: &str = "src/generated/memory_rpc_capnp.rs";
-const MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX: &str = "// dd-memory-rpc-schema-fingerprint: ";
 const DENO_VENDOR_MANIFEST_PATH: &str = "js/vendor/manifest.txt";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed={DENO_VENDOR_MANIFEST_PATH}");
-    println!("cargo:rerun-if-changed={MEMORY_RPC_SCHEMA_PATH}");
-    println!("cargo:rerun-if-changed={CHECKED_IN_MEMORY_RPC_PATH}");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/init.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/http_client.js");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry.ts");
     println!("cargo:rerun-if-changed=js/compat/dd_deno_runtime/telemetry_util.ts");
     println!("cargo:rerun-if-changed=../../patched-crates/deno_crypto/00_crypto.js");
 
-    validate_checked_in_memory_rpc();
     validate_vendored_deno_sources();
 
     generate_execute_worker_bundle();
     generate_deno_js_extension();
-}
-
-fn validate_checked_in_memory_rpc() {
-    let schema_fingerprint = current_memory_rpc_schema_fingerprint();
-    let generated = fs::read_to_string(CHECKED_IN_MEMORY_RPC_PATH)
-        .unwrap_or_else(|error| panic!("failed to read {CHECKED_IN_MEMORY_RPC_PATH}: {error}"));
-    if generated_memory_rpc_fingerprint(&generated).as_deref() != Some(schema_fingerprint.as_str())
-    {
-        panic!(
-            "checked-in memory RPC bindings at {CHECKED_IN_MEMORY_RPC_PATH} do not match {MEMORY_RPC_SCHEMA_PATH}; regenerate them with `capnp` installed"
-        );
-    }
 }
 
 fn generate_deno_js_extension() {
@@ -299,9 +281,9 @@ fn generate_execute_worker_bundle() {
     let units = [
         "js/execute_worker/core.js",
         "js/execute_worker/fetch_cache.js",
-        "js/execute_worker/sockets_transport.js",
+        "js/execute_worker/sockets.js",
         "js/execute_worker/memory.js",
-        "js/execute_worker/dynamic.js",
+        "js/execute_worker/bindings.js",
     ];
 
     let mut generated = String::new();
@@ -325,29 +307,4 @@ fn generate_execute_worker_bundle() {
 
     fs::write(&output_path, generated)
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", output_path.display()));
-}
-
-fn generated_memory_rpc_fingerprint(source: &str) -> Option<String> {
-    source
-        .lines()
-        .find_map(|line| line.strip_prefix(MEMORY_RPC_SCHEMA_FINGERPRINT_PREFIX))
-        .map(|value| value.trim().to_string())
-}
-
-fn current_memory_rpc_schema_fingerprint() -> String {
-    let schema = fs::read(MEMORY_RPC_SCHEMA_PATH)
-        .unwrap_or_else(|error| panic!("failed to read {MEMORY_RPC_SCHEMA_PATH}: {error}"));
-    format!("{:016x}", stable_fnv1a64(&schema))
-}
-
-fn stable_fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }

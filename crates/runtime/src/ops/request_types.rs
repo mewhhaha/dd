@@ -129,26 +129,14 @@ impl WorkerDeploymentHandles {
 pub(crate) struct WorkerDeploymentPayload {
     pub(crate) worker_name: String,
     pub(crate) kv_bindings: Vec<String>,
-    pub(crate) kv_read_cache_config: WorkerKvReadCacheConfigPayload,
     pub(crate) memory_bindings: Vec<String>,
-    pub(crate) dynamic_bindings: Vec<String>,
-    pub(crate) dynamic_rpc_bindings: Vec<String>,
     pub(crate) service_bindings: Vec<WorkerServiceBindingPayload>,
-    pub(crate) dynamic_env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct WorkerServiceBindingPayload {
     pub(crate) binding: String,
     pub(crate) service: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct WorkerKvReadCacheConfigPayload {
-    pub(crate) max_entries: usize,
-    pub(crate) max_bytes: usize,
-    pub(crate) hit_ttl_ms: u64,
-    pub(crate) miss_ttl_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +146,6 @@ pub(crate) struct WorkerRequestPayload {
     pub(crate) completion_handle: u32,
     pub(crate) memory_request_scope_handle: u32,
     pub(crate) memory_call: Option<MemoryExecutionCall>,
-    pub(crate) host_rpc_call: Option<HostRpcExecutionCall>,
     pub(crate) request_body_stream_handle: u32,
     pub(crate) request_headers_handle: u32,
     pub(crate) request_body_handle: u32,
@@ -175,7 +162,6 @@ pub(crate) struct WorkerRequestDescriptorPayload {
     pub(crate) completion_handle: u32,
     pub(crate) memory_request_scope_handle: u32,
     pub(crate) memory_call: Option<MemoryExecutionCall>,
-    pub(crate) host_rpc_call: Option<HostRpcExecutionCall>,
     pub(crate) request_body_stream_handle: u32,
     pub(crate) request_headers_handle: u32,
     pub(crate) request_body_handle: u32,
@@ -193,7 +179,6 @@ impl WorkerRequestDescriptorPayload {
             completion_handle: payload.completion_handle,
             memory_request_scope_handle: payload.memory_request_scope_handle,
             memory_call: payload.memory_call.clone(),
-            host_rpc_call: payload.host_rpc_call.clone(),
             request_body_stream_handle: payload.request_body_stream_handle,
             request_headers_handle: payload.request_headers_handle,
             request_body_handle: payload.request_body_handle,
@@ -242,6 +227,8 @@ impl MemoryRequestScopes {
 
 #[derive(Clone)]
 pub(crate) struct MemoryRequestScope {
+    pub(crate) request_context_handle: u32,
+    pub(crate) lease: Option<Arc<crate::memory::MemoryLease>>,
     pub(crate) namespace: String,
     pub(crate) memory_key: String,
     pub(crate) owner_epoch: i64,
@@ -392,14 +379,8 @@ impl RequestSecretContexts {
 pub(crate) struct RequestExecutionContext {
     pub(crate) worker_name: Arc<str>,
     pub(crate) generation: u64,
-    pub(crate) dynamic_bindings: Arc<HashSet<String>>,
-    pub(crate) dynamic_rpc_bindings: Arc<HashSet<String>>,
     pub(crate) service_bindings: Arc<HashMap<String, String>>,
-    pub(crate) replacements: Arc<HashMap<String, String>>,
     pub(crate) egress_allow_hosts: Arc<Vec<EgressAllowHost>>,
-    pub(crate) allow_cache: bool,
-    pub(crate) max_outbound_requests: Option<u64>,
-    pub(crate) dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
 }
 
 impl Default for RequestExecutionContext {
@@ -407,14 +388,8 @@ impl Default for RequestExecutionContext {
         Self {
             worker_name: Arc::<str>::from(""),
             generation: 0,
-            dynamic_bindings: Arc::new(HashSet::new()),
-            dynamic_rpc_bindings: Arc::new(HashSet::new()),
             service_bindings: Arc::new(HashMap::new()),
-            replacements: Arc::new(HashMap::new()),
             egress_allow_hosts: Arc::new(Vec::new()),
-            allow_cache: true,
-            max_outbound_requests: None,
-            dynamic_quota_state: None,
         }
     }
 }
@@ -508,7 +483,6 @@ mod tests {
             completion_handle: 0,
             memory_request_scope_handle: 0,
             memory_call: None,
-            host_rpc_call: None,
             request_body_stream_handle: 0,
             request_headers_handle: 7,
             request_body_handle: 9,
@@ -527,7 +501,6 @@ mod tests {
         assert_eq!(descriptor.request_body_handle, 9);
         assert_eq!(descriptor.input_request_id, "user-1");
         assert!(descriptor.memory_call.is_none());
-        assert!(descriptor.host_rpc_call.is_none());
         let descriptor_value =
             serde_json::to_value(&descriptor).expect("descriptor should serialize");
         assert!(
@@ -582,25 +555,9 @@ impl RequestExecutionContext {
         let RequestExecutionContextInit {
             worker_name,
             generation,
-            dynamic_bindings,
-            dynamic_rpc_bindings,
             service_bindings,
-            replacements,
             egress_allow_hosts,
-            allow_cache,
-            max_outbound_requests,
-            dynamic_quota_state,
         } = init;
-        let dynamic_bindings = dynamic_bindings
-            .into_iter()
-            .map(|binding| binding.trim().to_string())
-            .filter(|binding| !binding.is_empty())
-            .collect();
-        let dynamic_rpc_bindings = dynamic_rpc_bindings
-            .into_iter()
-            .map(|binding| binding.trim().to_string())
-            .filter(|binding| !binding.is_empty())
-            .collect();
         let service_bindings = service_bindings
             .into_iter()
             .filter_map(|binding| {
@@ -612,16 +569,6 @@ impl RequestExecutionContext {
                 Some((env_name, service))
             })
             .collect();
-        let replacements = replacements
-            .into_iter()
-            .filter_map(|(placeholder, value)| {
-                let key = placeholder.trim().to_string();
-                if key.is_empty() {
-                    return None;
-                }
-                Some((key, value))
-            })
-            .collect();
         let egress_allow_hosts = egress_allow_hosts
             .into_iter()
             .filter_map(|host| parse_egress_allow_host(&host))
@@ -630,14 +577,8 @@ impl RequestExecutionContext {
         Self {
             worker_name: Arc::<str>::from(worker_name),
             generation,
-            dynamic_bindings: Arc::new(dynamic_bindings),
-            dynamic_rpc_bindings: Arc::new(dynamic_rpc_bindings),
             service_bindings: Arc::new(service_bindings),
-            replacements: Arc::new(replacements),
             egress_allow_hosts: Arc::new(egress_allow_hosts),
-            allow_cache,
-            max_outbound_requests,
-            dynamic_quota_state,
         }
     }
 }
@@ -645,14 +586,8 @@ impl RequestExecutionContext {
 pub(crate) struct RequestExecutionContextInit {
     pub(crate) worker_name: String,
     pub(crate) generation: u64,
-    pub(crate) dynamic_bindings: Vec<String>,
-    pub(crate) dynamic_rpc_bindings: Vec<String>,
     pub(crate) service_bindings: Vec<WorkerServiceBindingPayload>,
-    pub(crate) replacements: Vec<(String, String)>,
     pub(crate) egress_allow_hosts: Vec<String>,
-    pub(crate) allow_cache: bool,
-    pub(crate) max_outbound_requests: Option<u64>,
-    pub(crate) dynamic_quota_state: Option<Arc<crate::service::DynamicQuotaState>>,
 }
 
 pub(crate) struct RequestSecretContext {

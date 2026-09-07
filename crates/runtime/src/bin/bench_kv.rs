@@ -45,32 +45,15 @@ struct BenchConfig {
 struct KvProfileMetric {
     calls: u64,
     total_us: u64,
-    total_items: u64,
-    max_us: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KvProfileSnapshot {
     enabled: bool,
     js_request_total: KvProfileMetric,
-    js_batch_flush: KvProfileMetric,
     op_get: KvProfileMetric,
     op_get_many_utf8: KvProfileMetric,
     op_get_value: KvProfileMetric,
-    store_get_utf8: KvProfileMetric,
-    store_get_utf8_many: KvProfileMetric,
-    store_get_value: KvProfileMetric,
-    write_enqueue: KvProfileMetric,
-    write_superseded: KvProfileMetric,
-    write_rejected: KvProfileMetric,
-    write_flush: KvProfileMetric,
-    write_retry: KvProfileMetric,
-    write_queue_wait: KvProfileMetric,
-    js_cache_hit: KvProfileMetric,
-    js_cache_miss: KvProfileMetric,
-    js_cache_stale: KvProfileMetric,
-    js_cache_fill: KvProfileMetric,
-    js_cache_invalidate: KvProfileMetric,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -425,15 +408,9 @@ async fn run_config_scenario(
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
-            database_url: format!("file:{}", root.join("dd-kv.db").display()),
-            memory_namespace_shards: 16,
             memory_outbox_max_concurrent_shards: 8,
-            memory_db_cache_max_open: 4096,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
-            memory_db_read_connections_per_database: 4,
-            memory_db_max_total_connections: 4096usize.saturating_mul(5),
-            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
         },
     })
@@ -521,36 +498,11 @@ fn print_profile(profile: &KvProfileSnapshot) {
         return;
     }
     println!(
-        "profile       js_request={:.2}ms js_batch={:.2}ms (keys {:.1}) op_get={:.2}ms op_many={:.2}ms op_value={:.2}ms store_get={:.2}ms store_many={:.2}ms store_value={:.2}ms max_batch={:.2}ms",
+        "profile js_request={:.2}ms op_get={:.2}ms op_many={:.2}ms op_value={:.2}ms",
         metric_mean_ms(&profile.js_request_total),
-        metric_mean_ms(&profile.js_batch_flush),
-        metric_mean_items(&profile.js_batch_flush),
         metric_mean_ms(&profile.op_get),
         metric_mean_ms(&profile.op_get_many_utf8),
         metric_mean_ms(&profile.op_get_value),
-        metric_mean_ms(&profile.store_get_utf8),
-        metric_mean_ms(&profile.store_get_utf8_many),
-        metric_mean_ms(&profile.store_get_value),
-        profile.js_batch_flush.max_us as f64 / 1000.0,
-    );
-    println!(
-        "profile-write enqueue={:.2}ms superseded={:.1} rejected={:.1} flush={:.2}ms retries={:.1} wait={:.2}ms batch={:.1}",
-        metric_mean_ms(&profile.write_enqueue),
-        metric_mean_items(&profile.write_superseded),
-        metric_mean_items(&profile.write_rejected),
-        metric_mean_ms(&profile.write_flush),
-        metric_mean_items(&profile.write_retry),
-        metric_mean_ms(&profile.write_queue_wait),
-        metric_mean_items(&profile.write_flush),
-    );
-    println!(
-        "profile-cache hit={} miss={} stale={} fill={} invalidate={} hit_ratio={:.1}%",
-        profile.js_cache_hit.calls,
-        profile.js_cache_miss.calls,
-        profile.js_cache_stale.calls,
-        profile.js_cache_fill.calls,
-        profile.js_cache_invalidate.calls,
-        cache_hit_ratio(profile),
     );
 }
 
@@ -578,24 +530,6 @@ fn metric_mean_ms(metric: &KvProfileMetric) -> f64 {
         return 0.0;
     }
     (metric.total_us as f64 / metric.calls as f64) / 1000.0
-}
-
-fn metric_mean_items(metric: &KvProfileMetric) -> f64 {
-    if metric.calls == 0 {
-        return 0.0;
-    }
-    metric.total_items as f64 / metric.calls as f64
-}
-
-fn cache_hit_ratio(profile: &KvProfileSnapshot) -> f64 {
-    let hits = profile.js_cache_hit.calls as f64;
-    let misses = profile.js_cache_miss.calls as f64;
-    let stale = profile.js_cache_stale.calls as f64;
-    let total = hits + misses + stale;
-    if total == 0.0 {
-        return 0.0;
-    }
-    (hits / total) * 100.0
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

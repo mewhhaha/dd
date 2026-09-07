@@ -396,15 +396,6 @@ function activeRuntimeRequestId() {
     : "";
 }
 
-function activeRuntimeRequestContextHandle() {
-  return typeof globalThis.__dd_get_runtime_request_context_handle === "function"
-    ? Math.max(
-      0,
-      Math.trunc(Number(globalThis.__dd_get_runtime_request_context_handle() ?? 0) || 0),
-    )
-    : 0;
-}
-
 function activeCacheBypassStale() {
   return typeof globalThis.__dd_get_cache_bypass_stale === "function"
     ? Boolean(globalThis.__dd_get_cache_bypass_stale())
@@ -426,7 +417,6 @@ class Cache {
     );
     const result = await runtimeOp(
       "op_cache_match",
-      activeRuntimeRequestContextHandle(),
       this.name,
       normalizedRequest.method,
       normalizedRequest.url,
@@ -490,7 +480,6 @@ class Cache {
     );
     const result = await runtimeOp(
       "op_cache_put",
-      activeRuntimeRequestContextHandle(),
       this.name,
       normalizedRequest.method,
       normalizedRequest.url,
@@ -514,7 +503,6 @@ class Cache {
     );
     const result = await runtimeOp(
       "op_cache_delete",
-      activeRuntimeRequestContextHandle(),
       this.name,
       normalizedRequest.method,
       normalizedRequest.url,
@@ -580,7 +568,6 @@ define("WritableStream", RuntimeWritableStream);
 define("TransformStream", RuntimeTransformStream);
 define("Cache", Cache);
 define("CacheStorage", CacheStorage);
-define("RpcTarget", class RpcTarget {});
 define("ReadableStream", RuntimeReadableStream);
 if (typeof denoFetch === "function") {
   define("fetch", denoFetch);

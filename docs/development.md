@@ -5,7 +5,6 @@ Contributor-focused notes moved here so the root README can stay product- and us
 ## Prerequisites
 
 - Rust toolchain
-- `capnp` only when regenerating checked-in memory RPC bindings after schema changes
 
 ## Local run
 
@@ -50,10 +49,6 @@ cargo run -p cli -- auth status
 cargo run -p cli -- auth logout
 ```
 
-Normal builds do not scrape old `target/` artifacts for RPC bindings. Checked-in generated bindings live at [crates/runtime/src/generated/memory_rpc_capnp.rs](../crates/runtime/src/generated/memory_rpc_capnp.rs) and are fingerprint-checked against [crates/runtime/schema/memory_rpc.capnp](../crates/runtime/schema/memory_rpc.capnp) during build.
-
-If you change the schema, regenerate the checked-in bindings on a machine with `capnp` installed, then commit both files together.
-
 Deno extension modules and the snapshot-ready Cargo-package forms are checked
 in under `crates/runtime/js/vendor` and hash-checked during the runtime build.
 After updating the locked Deno crates, run `just refresh-deno-sources` and commit
@@ -70,8 +65,8 @@ export DD_OTEL_COLLECTOR_VERIFIED=true
 
 Shipped server artifacts use the `dist` Cargo profile rather than the ordinary
 developer release profile. Default and Fly production builds include WebSocket
-and OTEL support. Direct HTTP/3 and WebTransport are experimental opt-in
-features; the lean server disables all optional server features.
+and OTEL support. The lean server disables optional server features.
+TLS terminates at the deployment edge.
 
 ```bash
 just server-full
@@ -83,7 +78,6 @@ Those commands write stable artifacts at `target/dist/dd_server-full` and
 
 ```bash
 cargo build --locked --profile dist -p dd_server --no-default-features --features websocket,otel
-cargo build --locked --profile dist -p dd_server --no-default-features --features http3,websocket,otel
 cargo build --locked --profile dist -p dd_server --no-default-features
 ```
 
@@ -99,22 +93,23 @@ optional `cargo bloat`/`bloaty` output when those tools are installed.
 
 ## Vite and Vitest worker development
 
-The repo includes a dev-only stdio runtime bridge and a source-only Vite package:
+The repo includes a native dev runtime and a source-only Vite package:
 
-- [crates/runtime/src/bin/dd_dev_runtime.rs](../crates/runtime/src/bin/dd_dev_runtime.rs)
+- [crates/api/src/bin/dd_dev_runtime.rs](../crates/api/src/bin/dd_dev_runtime.rs)
 - [packages/dd-vite](../packages/dd-vite)
 - [packages/dd-runtime](../packages/dd-runtime)
 
-This path does not start `dd_server` or a separate private control-plane server.
-The JS helper launches `dd_dev_runtime`, then sends JSON commands over stdio to
-deploy and invoke workers through `RuntimeService` directly.
+The JS helper launches `dd_dev_runtime` and sends deployment and control commands
+over stdio. Each worker receives a loopback HTTP listener sharing the production
+streaming and WebSocket transport. Requests preserve their original URLs and stream
+bodies in both directions; disconnects cancel the native invocation.
 
 `@mewhhaha/vite-plugin-dd` can use the optional `@mewhhaha/dd` wrapper package. That wrapper has
 platform-specific optional dependencies such as `@mewhhaha/dd-linux-x64`,
 `@mewhhaha/dd-linux-arm64`, `@mewhhaha/dd-darwin-arm64`, and
 `@mewhhaha/dd-win32-x64`, so package managers install only the runtime binary for
 the current `os` and `cpu`. In this source checkout, the JS client still falls
-back to `cargo run -p runtime --bin dd_dev_runtime` when no packaged binary is
+back to `cargo run -p dd_server --no-default-features --features websocket --bin dd_dev_runtime` when no packaged binary is
 installed.
 
 Vitest example:
@@ -307,7 +302,7 @@ For faster startup outside this source checkout, build the bridge once and point
 the JS client at it:
 
 ```bash
-cargo build -p runtime --bin dd_dev_runtime
+cargo build -p dd_server --no-default-features --features websocket --bin dd_dev_runtime
 export DD_DEV_RUNTIME_BIN="$PWD/target/debug/dd_dev_runtime"
 ```
 
@@ -356,7 +351,6 @@ curl -X POST http://127.0.0.1:8081/v1/deploy \
     "public": true,
     "bindings": [
       { "type": "kv", "binding": "MY_KV" },
-      { "type": "dynamic", "binding": "SANDBOX" },
       { "type": "service", "binding": "AUTH", "service": "auth-worker" }
     ]
   }

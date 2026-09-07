@@ -9,14 +9,12 @@
       "left": {
         "mode": "atomic-readwrite-memory-wide",
         "keys": "cross-shard",
-        "isolates": 8,
-        "shards": 8
+        "isolates": 8
       },
       "right": {
         "mode": "atomic-readwrite-memory-wide",
         "keys": "same-shard",
-        "isolates": 8,
-        "shards": 8
+        "isolates": 8
       },
       "value": 1.5,
       "min_samples": 3,
@@ -29,14 +27,12 @@
       "left": {
         "mode": "atomic-readwrite-memory-wide",
         "keys": "cross-shard",
-        "isolates": 8,
-        "shards": 8
+        "isolates": 8
       },
       "right": {
         "mode": "atomic-readwrite-memory-wide",
         "keys": "cross-shard",
-        "isolates": 1,
-        "shards": 8
+        "isolates": 1
       },
       "value": 1.5,
       "min_logical_cpus": 4,
@@ -44,14 +40,13 @@
       "max_cv": 0.35
     },
     {
-      "name": "direct write cross-shard smoke floor",
+      "name": "write-only transaction cross-shard smoke floor",
       "metric": "throughput_rps",
       "operator": "baseline",
       "selector": {
-        "mode": "direct-write-memory-wide",
+        "mode": "atomic-write-only-memory-wide",
         "keys": "cross-shard",
-        "isolates": 8,
-        "shards": 8
+        "isolates": 8
       },
       "baseline": 1000,
       "warning": 0.5,

@@ -1,239 +1,206 @@
+pub(crate) fn namespace_owner(namespace: &str) -> Result<(&str, &str)> {
+    let invalid =
+        || PlatformError::bad_request(format!("invalid qualified memory namespace {namespace:?}"));
+    let (length, qualified) = namespace.split_once(':').ok_or_else(invalid)?;
+    let length = length.parse::<usize>().map_err(|_| invalid())?;
+    if length == 0 || length >= qualified.len() || !qualified.is_char_boundary(length) {
+        return Err(invalid());
+    }
+    Ok(qualified.split_at(length))
+}
+
+pub(crate) fn validate_value(value: &[u8], encoding: &str) -> Result<()> {
+    match encoding {
+        "utf8" => {
+            std::str::from_utf8(value).map_err(|error| {
+                PlatformError::bad_request(format!("invalid utf8 state value: {error}"))
+            })?;
+            Ok(())
+        }
+        "v8sc" => Ok(()),
+        _ => Err(PlatformError::bad_request(format!(
+            "unsupported state encoding {encoding:?}"
+        ))),
+    }
+}
+
+fn epoch_ms() -> Result<i64> {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(storage_error)?
+            .as_millis(),
+    )
+    .map_err(storage_error)
+}
+
 impl MemoryStore {
-    pub async fn new(
-        root_dir: PathBuf,
-        namespace_shards: usize,
-        db_cache_max_open: usize,
-        db_idle_ttl: Duration,
-    ) -> Result<Self> {
-        Self::new_with_connection_limits(
-            root_dir,
-            namespace_shards,
-            db_cache_max_open,
-            db_idle_ttl,
-            4,
-            db_cache_max_open.saturating_mul(5).max(1),
-        )
-        .await
-    }
-
-    pub async fn new_with_connection_limits(
-        root_dir: PathBuf,
-        namespace_shards: usize,
-        db_cache_max_open: usize,
-        db_idle_ttl: Duration,
-        db_read_connections_per_database: usize,
-        db_max_total_connections: usize,
-    ) -> Result<Self> {
-        std::fs::create_dir_all(&root_dir).map_err(memory_error)?;
-        if namespace_shards == 0 {
-            return Err(PlatformError::internal(
-                "memory_namespace_shards must be greater than 0",
-            ));
-        }
-        if db_cache_max_open == 0 {
-            return Err(PlatformError::internal(
-                "memory_db_cache_max_open must be greater than 0",
-            ));
-        }
-        if db_idle_ttl.is_zero() {
-            return Err(PlatformError::internal(
-                "memory_db_idle_ttl must be greater than 0",
-            ));
-        }
-        if db_read_connections_per_database == 0 {
-            return Err(PlatformError::internal(
-                "memory_db_read_connections_per_database must be greater than 0",
-            ));
-        }
-        if db_max_total_connections == 0 {
-            return Err(PlatformError::internal(
-                "memory_db_max_total_connections must be greater than 0",
-            ));
-        }
-        let layout = load_or_adopt_memory_layout(&root_dir, namespace_shards).await?;
-        if layout.namespace_shards != namespace_shards {
-            return Err(memory_layout_mismatch_error(
-                &root_dir,
-                namespace_shards,
-                layout.namespace_shards,
-            ));
-        }
-        migrate_existing_memory_databases(&root_dir).await?;
-        let floors = detect_memory_floors(&root_dir, namespace_shards).await?;
-        let shards = floors
-            .version_floors
-            .iter()
-            .copied()
-            .map(MemoryShard::new)
-            .collect::<Vec<_>>();
-        let store = Self {
-            root_dir: Arc::new(root_dir),
-            shards: Arc::from(shards),
-            db_cache_max_open,
-            db_idle_ttl,
-            db_read_connections_per_database,
-            db_connection_permits: Arc::new(Semaphore::new(db_max_total_connections)),
-            db_live_connections: Arc::new(AtomicUsize::new(0)),
-            db_peak_connections: Arc::new(AtomicUsize::new(0)),
-            namespace_shards,
-            shard_hash_version: layout.shard_hash_version,
-            namespace_shard_hash_versions: Arc::new(layout.namespace_shard_hash_versions),
-            namespace_key_shard_overrides: Arc::new(layout.namespace_key_shard_overrides),
-            snapshot_cache_max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES
-                .max(namespace_shards.saturating_mul(MEMORY_ENTITY_CACHE_STRIPES)),
-            snapshot_cache_max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
-            owner_epoch_floor: Arc::new(AtomicU64::new(floors.owner_epoch_floor.max(1))),
+    pub fn from_state(state: Arc<StateStore>) -> Self {
+        Self {
+            state,
             profile: Arc::new(MemoryProfile::default()),
-        };
-        Ok(store)
+            snapshots: Arc::new(Mutex::new(SnapshotCache {
+                entries: HashMap::new(),
+                order: BTreeMap::new(),
+                next_ordinal: 0,
+                bytes: 0,
+                max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
+                max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
+            })),
+        }
     }
-
+    pub fn state_performance_snapshot(&self) -> crate::state::StatePerformanceSnapshot {
+        self.state.performance_snapshot()
+    }
     pub fn owner_epoch_floor(&self) -> u64 {
-        self.owner_epoch_floor.load(Ordering::Relaxed)
+        self.state.owner_epoch_floor()
     }
-
+    pub fn next_owner_epoch(&self) -> Result<i64> {
+        self.state.next_owner_epoch()
+    }
+    pub async fn acquire_lease(
+        &self,
+        namespace: &str,
+        entity: &str,
+    ) -> Result<Arc<crate::state::MemoryLease>> {
+        namespace_owner(namespace)?;
+        self.state.acquire_lease(namespace, entity).await
+    }
     pub fn set_profile_enabled(&self, enabled: bool) {
         self.profile.set_enabled(enabled);
     }
-
     pub fn set_snapshot_cache_limits(&mut self, max_entries: usize, max_bytes: usize) {
-        self.snapshot_cache_max_entries = max_entries;
-        self.snapshot_cache_max_bytes = max_bytes;
+        let mut cache = self
+            .snapshots
+            .lock()
+            .expect("memory snapshots lock poisoned");
+        cache.entries.clear();
+        cache.order.clear();
+        cache.next_ordinal = 0;
+        cache.bytes = 0;
+        cache.max_entries = max_entries;
+        cache.max_bytes = max_bytes;
     }
-
     pub fn cache_performance_snapshot(&self) -> MemoryCachePerformanceSnapshot {
         self.profile.cache_performance_snapshot()
     }
-
     pub fn record_profile(&self, metric: MemoryProfileMetricKind, duration_us: u64, items: u64) {
-        if metric == MemoryProfileMetricKind::StoreWriterBusyRetry {
-            record_storage_retry();
-        }
         self.profile.record(metric, duration_us, items);
     }
-
     pub fn take_profile_snapshot_and_reset(&self) -> MemoryProfileSnapshot {
         self.profile.take_snapshot_and_reset()
     }
-
     pub fn reset_profile(&self) {
         self.profile.reset();
     }
-
     pub fn namespace_shards(&self) -> usize {
-        self.namespace_shards
+        STATE_SHARDS
     }
-
     pub async fn checkpoint_all_databases(&self) -> Result<usize> {
-        let shard_files = discover_legacy_memory_shard_files(self.root_dir.as_ref())?;
-        for shard_file in &shard_files {
-            let path = shard_file.path.to_string_lossy().to_string();
-            let database = Builder::new_local(&path)
-                .build()
-                .await
-                .map_err(memory_error)?;
-            checkpoint_database(&database).await.map_err(memory_error)?;
-        }
-        Ok(shard_files.len())
+        self.state.checkpoint().await?;
+        Ok(STATE_SHARDS)
     }
-
     pub async fn health_check(&self) -> Result<()> {
-        if !self.root_dir.is_dir() {
-            return Err(PlatformError::internal(
-                "memory storage directory is unavailable",
-            ));
-        }
-        let mut databases = Vec::new();
-        for shard in self.shards.iter() {
-            let entries = shard.databases.lock().await;
-            databases.extend(entries.entries.values().filter_map(|entry| {
-                entry
-                    .slot
-                    .handle
-                    .get()
-                    .map(|handle| Arc::clone(&handle.database))
-            }));
-        }
-        for database in &databases {
-            health_check_database(database)
-                .await
-                .map_err(memory_error)?;
-            let conn = database.connect().map_err(memory_error)?;
-            configure_connection(&conn).await?;
-            let version = storage_schema_version(&conn, "memory")
-                .await
-                .map_err(memory_error)?;
-            if version != MEMORY_SCHEMA_VERSION {
-                return Err(PlatformError::runtime(format!(
-                    "memory store error: schema version {version} is not ready; expected {MEMORY_SCHEMA_VERSION}"
-                )));
-            }
-        }
-        Ok(())
+        self.state.health_check().await
     }
-
     pub fn shard_index_for_key(&self, namespace: &str, memory_key: &str) -> usize {
-        self.shard_index(namespace, memory_key)
+        let (worker, binding) = namespace_owner(namespace).expect("qualified memory namespace");
+        StateStore::shard_index(worker, binding, memory_key)
     }
 
     pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<MemorySnapshot> {
-        let started = Instant::now();
-        if let Some(snapshot) = self.cached_full_snapshot(namespace, memory_key).await {
-            self.observe_version(namespace, memory_key, snapshot.max_version);
-            self.observe_memory_version(namespace, memory_key, snapshot.max_version)
-                .await;
-            self.record_profile(
-                MemoryProfileMetricKind::StoreSnapshot,
-                started.elapsed().as_micros() as u64,
-                snapshot.entries.len() as u64,
-            );
-            return Ok(snapshot);
+        let (worker, binding) = namespace_owner(namespace)?;
+        let shard = StateStore::shard_index(worker, binding, memory_key);
+        let epoch = self.state.epoch(shard);
+        let cache_key = (namespace.to_owned(), memory_key.to_owned());
+        {
+            let mut cache = self
+                .snapshots
+                .lock()
+                .expect("memory snapshots lock poisoned");
+            if let Some(cached) = cache.entries.get(&cache_key)
+                && cached.shard_epoch == epoch
+            {
+                let snapshot = cached.snapshot.clone();
+                let previous_ordinal = cached.ordinal;
+                let ordinal = cache.next_ordinal;
+                cache.next_ordinal += 1;
+                cache.order.remove(&previous_ordinal);
+                cache.order.insert(ordinal, cache_key.clone());
+                cache
+                    .entries
+                    .get_mut(&cache_key)
+                    .expect("cached snapshot")
+                    .ordinal = ordinal;
+                self.profile
+                    .record(MemoryProfileMetricKind::StoreSnapshotCacheHit, 0, 1);
+                return Ok(snapshot);
+            }
         }
-        let conn = self.connect(namespace, memory_key).await?;
-        let mut rows = query_cached(
-            &conn,
-            "SELECT item_key, value_blob, encoding, value, version, deleted
-                 FROM memory_state
-                 WHERE entity_key = ?1
-                 ORDER BY item_key ASC",
-            (memory_key,),
-        )
-        .await
-        .map_err(memory_error)?;
-
-        let mut entries = Vec::new();
-        let mut max_version = -1i64;
-        while let Some(row) = rows.next().await.map_err(memory_error)? {
-            let key: String = row.get::<String>(0).map_err(memory_error)?;
-            let value_blob: Option<Vec<u8>> =
-                row.get::<Option<Vec<u8>>>(1).map_err(memory_error)?;
-            let encoding: String = row.get::<String>(2).map_err(memory_error)?;
-            let legacy_value: String = row.get::<String>(3).map_err(memory_error)?;
-            let version: i64 = row.get::<i64>(4).map_err(memory_error)?;
-            let deleted: i64 = row.get::<i64>(5).map_err(memory_error)?;
-            max_version = max_version.max(version);
-            entries.push(MemorySnapshotEntry {
-                key,
-                value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
-                encoding: normalize_encoding(&encoding),
-                version,
-                deleted: deleted != 0,
-            });
-        }
-        self.observe_version(namespace, memory_key, max_version);
-        self.observe_memory_version(namespace, memory_key, max_version)
-            .await;
-        let snapshot = MemorySnapshot {
-            entries,
-            max_version,
+        self.profile
+            .record(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
+        let conn = self.state.read(shard).await?;
+        let mut rows = query_cached(&conn, "SELECT m.max_version, s.item_key, s.value, s.encoding, s.version, s.deleted
+                 FROM memory_meta m LEFT JOIN memory_state s ON s.worker=m.worker AND s.binding=m.binding AND s.entity_key=m.entity_key
+                 WHERE m.worker=?1 AND m.binding=?2 AND m.entity_key=?3 ORDER BY s.item_key", (worker, binding, memory_key)).await.map_err(storage_error)?;
+        let mut snapshot = MemorySnapshot {
+            entries: Vec::new(),
+            max_version: -1,
         };
-        self.put_full_snapshot(namespace, memory_key, &snapshot)
-            .await;
-        self.record_profile(
-            MemoryProfileMetricKind::StoreSnapshot,
-            started.elapsed().as_micros() as u64,
-            snapshot.entries.len() as u64,
-        );
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            snapshot.max_version = row.get(0).map_err(storage_error)?;
+            if let Some(key) = row.get::<Option<String>>(1).map_err(storage_error)? {
+                snapshot.entries.push(MemorySnapshotEntry {
+                    key,
+                    value: row.get(2).map_err(storage_error)?,
+                    encoding: row.get(3).map_err(storage_error)?,
+                    version: row.get(4).map_err(storage_error)?,
+                    deleted: row.get::<i64>(5).map_err(storage_error)? != 0,
+                });
+            }
+        }
+        let bytes = namespace.len()
+            + memory_key.len()
+            + 128
+            + snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.key.len() + entry.value.len() + entry.encoding.len() + 96)
+                .sum::<usize>();
+        let mut cache = self
+            .snapshots
+            .lock()
+            .expect("memory snapshots lock poisoned");
+        if self.state.epoch(shard) == epoch && bytes <= cache.max_bytes && cache.max_entries > 0 {
+            if let Some(previous) = cache.entries.remove(&cache_key) {
+                cache.bytes -= previous.bytes;
+                cache.order.remove(&previous.ordinal);
+            }
+            while cache.entries.len() >= cache.max_entries || cache.bytes + bytes > cache.max_bytes
+            {
+                let (_, oldest) = cache.order.pop_first().expect("nonempty snapshot cache");
+                let evicted = cache
+                    .entries
+                    .remove(&oldest)
+                    .expect("snapshot eviction key");
+                cache.bytes -= evicted.bytes;
+                self.profile
+                    .record(MemoryProfileMetricKind::StoreSnapshotCacheEviction, 0, 1);
+            }
+            cache.bytes += bytes;
+            let ordinal = cache.next_ordinal;
+            cache.next_ordinal += 1;
+            cache.order.insert(ordinal, cache_key.clone());
+            cache.entries.insert(
+                cache_key,
+                CachedSnapshot {
+                    shard_epoch: epoch,
+                    snapshot: snapshot.clone(),
+                    bytes,
+                    ordinal,
+                },
+            );
+        }
         Ok(snapshot)
     }
 
@@ -241,194 +208,80 @@ impl MemoryStore {
         &self,
         namespace: &str,
         memory_key: &str,
-        item_key: &str,
+        key: &str,
     ) -> Result<MemoryPointRead> {
-        let started = Instant::now();
-        let item_key = item_key.trim();
-        if item_key.is_empty() {
-            return Err(PlatformError::runtime("memory item key must not be empty"));
-        }
-        if let Some(point) = self
-            .cached_point_read(namespace, memory_key, item_key)
-            .await
-        {
-            self.observe_version(namespace, memory_key, point.max_version);
-            self.observe_memory_version(namespace, memory_key, point.max_version)
-                .await;
-            self.record_profile(
-                MemoryProfileMetricKind::StoreRead,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            return Ok(point);
-        }
-
-        let conn = self.connect(namespace, memory_key).await?;
-        let record = self.record_for_key(&conn, memory_key, item_key).await?;
-        let max_version = self
-            .max_version_for_memory(&conn, memory_key)
-            .await?
-            .unwrap_or(-1);
-        self.observe_version(namespace, memory_key, max_version);
-        self.observe_memory_version(namespace, memory_key, max_version)
-            .await;
-        self.put_partial_snapshot(
-            namespace,
-            memory_key,
-            max_version,
-            record.clone().into_iter().collect::<Vec<_>>(),
-            std::iter::once(item_key.to_string()),
-            false,
-        )
-        .await;
-        self.record_profile(
-            MemoryProfileMetricKind::StoreRead,
-            started.elapsed().as_micros() as u64,
-            1,
-        );
+        let (worker, binding) = namespace_owner(namespace)?;
+        let conn = self
+            .state
+            .read(StateStore::shard_index(worker, binding, memory_key))
+            .await?;
+        let mut rows = query_cached(&conn, "SELECT m.max_version, s.item_key, s.value, s.encoding, s.version, s.deleted
+                 FROM memory_meta m LEFT JOIN memory_state s ON s.worker=m.worker AND s.binding=m.binding AND s.entity_key=m.entity_key AND s.item_key=?4
+                 WHERE m.worker=?1 AND m.binding=?2 AND m.entity_key=?3", (worker, binding, memory_key, key)).await.map_err(storage_error)?;
+        let Some(row) = rows.next().await.map_err(storage_error)? else {
+            return Ok(MemoryPointRead {
+                record: None,
+                max_version: -1,
+            });
+        };
+        let max_version = row.get(0).map_err(storage_error)?;
+        let record = row
+            .get::<Option<String>>(1)
+            .map_err(storage_error)?
+            .map(|key| {
+                Ok::<_, turso::Error>(MemorySnapshotEntry {
+                    key,
+                    value: row.get(2)?,
+                    encoding: row.get(3)?,
+                    version: row.get(4)?,
+                    deleted: row.get::<i64>(5)? != 0,
+                })
+            })
+            .transpose()
+            .map_err(storage_error)?;
         Ok(MemoryPointRead {
             record,
             max_version,
         })
     }
-
     pub async fn snapshot_keys(
         &self,
         namespace: &str,
         memory_key: &str,
         keys: &[String],
     ) -> Result<MemorySnapshot> {
-        if keys.is_empty() {
-            return self.snapshot(namespace, memory_key).await;
+        let mut snapshot = self.snapshot(namespace, memory_key).await?;
+        if !keys.is_empty() {
+            snapshot.entries.retain(|entry| keys.contains(&entry.key));
         }
-        let started = Instant::now();
-        let filtered_keys = keys
-            .iter()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-            .collect::<Vec<_>>();
-        if filtered_keys.is_empty() {
-            let conn = self.connect(namespace, memory_key).await?;
-            let max_version = self
-                .max_version_for_memory(&conn, memory_key)
-                .await?
-                .unwrap_or(-1);
-            self.observe_version(namespace, memory_key, max_version);
-            return Ok(MemorySnapshot {
-                entries: Vec::new(),
-                max_version,
-            });
-        }
-        if let Some(snapshot) = self
-            .cached_keys_snapshot(namespace, memory_key, &filtered_keys)
-            .await
-        {
-            self.record_profile(
-                MemoryProfileMetricKind::StoreSnapshotKeys,
-                started.elapsed().as_micros() as u64,
-                filtered_keys.len() as u64,
-            );
-            return Ok(snapshot);
-        }
-        let conn = self.connect(namespace, memory_key).await?;
-        let placeholders = (0..filtered_keys.len())
-            .map(|index| format!("?{}", index + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT item_key, value_blob, encoding, value, version, deleted
-             FROM memory_state
-             WHERE entity_key = ?1 AND item_key IN ({placeholders})
-             ORDER BY item_key ASC"
-        );
-        let mut params = Vec::with_capacity(filtered_keys.len() + 1);
-        params.push(Value::Text(memory_key.to_string()));
-        params.extend(
-            filtered_keys
-                .iter()
-                .map(|key| Value::Text((*key).to_string())),
-        );
-        let mut entries = Vec::new();
-        let mut rows = conn.query(&sql, params).await.map_err(memory_error)?;
-        while let Some(row) = rows.next().await.map_err(memory_error)? {
-            let key: String = row.get::<String>(0).map_err(memory_error)?;
-            let value_blob: Option<Vec<u8>> =
-                row.get::<Option<Vec<u8>>>(1).map_err(memory_error)?;
-            let encoding: String = row.get::<String>(2).map_err(memory_error)?;
-            let legacy_value: String = row.get::<String>(3).map_err(memory_error)?;
-            let version: i64 = row.get::<i64>(4).map_err(memory_error)?;
-            let deleted: i64 = row.get::<i64>(5).map_err(memory_error)?;
-            entries.push(MemorySnapshotEntry {
-                key,
-                value: value_blob.unwrap_or_else(|| legacy_value.into_bytes()),
-                encoding: normalize_encoding(&encoding),
-                version,
-                deleted: deleted != 0,
-            });
-        }
-        let max_version = self
-            .max_version_for_memory(&conn, memory_key)
-            .await?
-            .unwrap_or(-1);
-        self.observe_version(namespace, memory_key, max_version);
-        self.observe_memory_version(namespace, memory_key, max_version)
-            .await;
-        self.put_partial_snapshot(
-            namespace,
-            memory_key,
-            max_version,
-            entries.clone(),
-            filtered_keys.iter().cloned(),
-            false,
-        )
-        .await;
-        self.record_profile(
-            MemoryProfileMetricKind::StoreSnapshotKeys,
-            started.elapsed().as_micros() as u64,
-            filtered_keys.len() as u64,
-        );
-        Ok(MemorySnapshot {
-            entries,
-            max_version,
-        })
+        Ok(snapshot)
     }
-
     pub async fn version_if_newer(
         &self,
         namespace: &str,
         memory_key: &str,
         known_version: i64,
     ) -> Result<Option<i64>> {
-        let started = Instant::now();
-        let memory_key = memory_key.trim();
-        if memory_key.is_empty() {
-            return Err(PlatformError::runtime("memory key must not be empty"));
-        }
-        let version_key = Self::memory_version_key(namespace, memory_key);
-        let cached_version = {
-            let (_, state) = self.lock_entity_cache_stripe(namespace, memory_key).await;
-            state.memory_versions.get(&version_key).copied()
-        };
-        if let Some(current) = cached_version {
-            self.record_profile(
-                MemoryProfileMetricKind::StoreVersionIfNewer,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            return Ok((current > known_version).then_some(current));
-        }
-        let conn = self.connect(namespace, memory_key).await?;
-        let current = self
-            .max_version_for_memory(&conn, memory_key)
-            .await?
+        let (worker, binding) = namespace_owner(namespace)?;
+        let conn = self
+            .state
+            .read(StateStore::shard_index(worker, binding, memory_key))
+            .await?;
+        let mut rows = query_cached(
+            &conn,
+            "SELECT max_version FROM memory_meta WHERE worker=?1 AND binding=?2 AND entity_key=?3",
+            (worker, binding, memory_key),
+        )
+        .await
+        .map_err(storage_error)?;
+        let current = rows
+            .next()
+            .await
+            .map_err(storage_error)?
+            .map(|row| row.get::<i64>(0))
+            .transpose()
+            .map_err(storage_error)?
             .unwrap_or(-1);
-        self.observe_memory_version(namespace, memory_key, current)
-            .await;
-        self.record_profile(
-            MemoryProfileMetricKind::StoreVersionIfNewer,
-            started.elapsed().as_micros() as u64,
-            1,
-        );
         Ok((current > known_version).then_some(current))
     }
 
@@ -436,212 +289,157 @@ impl MemoryStore {
         &self,
         namespace: &str,
         memory_key: &str,
-        mutations: &[MemoryBatchMutation],
-        command_result: Option<&MemoryCommandResultWrite>,
-        outbox_effects: &[MemoryOutboxEffectWrite],
-        owner_epoch: Option<i64>,
+        commit: MemoryCommit<'_>,
     ) -> Result<MemoryBatchApplyResult> {
-        let started = Instant::now();
-        if mutations.is_empty() && command_result.is_none() && outbox_effects.is_empty() {
-            let conn = self.connect(namespace, memory_key).await?;
-            let max_version = self
-                .max_version_for_memory(&conn, memory_key)
-                .await?
-                .unwrap_or(-1);
-            self.observe_version(namespace, memory_key, max_version);
-            self.record_profile(
-                MemoryProfileMetricKind::StoreApplyBatch,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            return Ok(MemoryBatchApplyResult { max_version });
+        let MemoryCommit {
+            mutations,
+            command_result,
+            outbox_effects,
+            owner_epoch,
+            lease,
+        } = commit;
+        let (worker, binding) = namespace_owner(namespace)?;
+        if memory_key.is_empty() {
+            return Err(PlatformError::bad_request("memory entity key is empty"));
         }
-
         for mutation in mutations {
-            if mutation.key.trim().is_empty() {
-                return Err(PlatformError::bad_request(
-                    "memory batch mutation key must not be empty",
-                ));
+            if mutation.key.is_empty() {
+                return Err(PlatformError::bad_request("memory mutation key is empty"));
             }
-            if !mutation.deleted
-                && mutation.encoding != ENCODING_UTF8
-                && mutation.encoding != ENCODING_V8SC
-            {
-                return Err(PlatformError::bad_request(format!(
-                    "unsupported memory storage encoding: {}",
-                    mutation.encoding
-                )));
-            }
+            validate_value(&mutation.value, &mutation.encoding)?;
         }
-
-        if let Some(command_result) = command_result {
-            if command_result.idempotency_key.trim().is_empty() {
-                return Err(PlatformError::bad_request(
-                    "memory command idempotency key must not be empty",
-                ));
-            }
-            if command_result.idempotency_key.len() > 512 {
-                return Err(PlatformError::bad_request(
-                    "memory command idempotency key must be at most 512 characters",
-                ));
-            }
+        if let Some(command) = command_result
+            && (command.idempotency_key.is_empty() || command.idempotency_key.len() > 512)
+        {
+            return Err(PlatformError::bad_request(format!(
+                "memory idempotency key length {} is outside 1..=512",
+                command.idempotency_key.len()
+            )));
         }
         for effect in outbox_effects {
-            if effect.kind.trim().is_empty() {
+            if effect.kind.is_empty() {
                 return Err(PlatformError::bad_request(
-                    "memory outbox effect kind must not be empty",
+                    "memory outbox effect kind is empty",
                 ));
             }
         }
-
-        let mut conn = self.writer_connection(namespace, memory_key).await?;
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match conn.execute("BEGIN IMMEDIATE", ()).await {
-                Ok(_) => {}
-                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                    self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
-                    continue;
-                }
-                Err(error) => {
-                    conn.discard();
-                    return Err(memory_error_after_retry(error));
-                }
-            }
-
-            let outcome: MemoryTransactionResult<MemoryBatchCommitOutcome> = async {
-                let validate_started = Instant::now();
-                let (current, current_owner_epoch) =
-                    self.memory_meta_for_commit(&conn, memory_key).await?;
-                let current = current.unwrap_or(-1);
-                validate_owner_epoch(current_owner_epoch, owner_epoch)?;
-                self.record_profile(
-                    MemoryProfileMetricKind::StoreApplyBatchValidate,
-                    validate_started.elapsed().as_micros() as u64,
-                    1,
-                );
-
-                let write_started = Instant::now();
-                let commit_version = if !mutations.is_empty() || !outbox_effects.is_empty() {
-                    Some(self.reserve_version_after(namespace, memory_key, current))
-                } else {
-                    None
-                };
-
-                for mutation in mutations {
-                    let version =
-                        commit_version.expect("mutation commits must reserve a canonical version");
-                    upsert_memory_state_row(
-                        &conn,
-                        memory_key,
-                        mutation.key.as_str(),
-                        mutation.value.as_slice(),
-                        mutation.encoding.as_str(),
-                        mutation.deleted,
-                        version,
-                    )
-                    .await?;
-                }
-
-                let max_version = if let Some(version) = commit_version {
-                    version
-                } else {
-                    current
-                };
-                if !mutations.is_empty() || !outbox_effects.is_empty() {
-                    upsert_memory_meta_row(&conn, memory_key, max_version, owner_epoch).await?;
-                }
-                for (effect_ordinal, effect) in outbox_effects.iter().enumerate() {
-                    insert_memory_outbox_row(
-                        &conn,
-                        memory_key,
-                        effect,
-                        max_version,
-                        effect_ordinal,
-                    )
-                    .await?;
-                }
-                if let Some(command_result) = command_result {
-                    insert_memory_command_result_row(
-                        &conn,
-                        memory_key,
-                        command_result.idempotency_key.trim(),
-                        &command_result.result,
-                        max_version,
-                    )
-                    .await?;
-                }
-                let cache_mutations = mutations.to_vec();
-                self.record_profile(
-                    MemoryProfileMetricKind::StoreApplyBatchWrite,
-                    write_started.elapsed().as_micros() as u64,
-                    mutations.len() as u64 + 1,
-                );
-                Ok(MemoryBatchCommitOutcome {
-                    result: MemoryBatchApplyResult { max_version },
-                    cache_mutations,
-                })
-            }
-            .await;
-
-            match outcome {
-                Ok(outcome) => {
-                    let result = outcome.result;
-                    match conn.execute("COMMIT", ()).await {
-                        Ok(_) => {}
-                        Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                            let _ = conn.execute("ROLLBACK", ()).await;
-                            self.record_profile(
-                                MemoryProfileMetricKind::StoreWriterBusyRetry,
-                                0,
-                                1,
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                5 * attempt as u64,
-                            ))
-                            .await;
-                            continue;
-                        }
-                        Err(error) => {
-                            let _ = conn.execute("ROLLBACK", ()).await;
-                            conn.discard();
-                            return Err(memory_error_after_retry(error));
-                        }
-                    }
-                    self.observe_version(namespace, memory_key, result.max_version);
-                    self.observe_memory_version(namespace, memory_key, result.max_version)
-                        .await;
-                    if !outcome.cache_mutations.is_empty() {
-                        self.update_cached_snapshot_after_commit(
-                            namespace,
-                            memory_key,
-                            result.max_version,
-                            &outcome.cache_mutations,
-                        )
-                        .await;
-                    }
-                    self.record_profile(
-                        MemoryProfileMetricKind::StoreApplyBatch,
-                        started.elapsed().as_micros() as u64,
-                        mutations.len() as u64 + 1,
-                    );
-                    return Ok(result);
-                }
-                Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    if error.is_retryable() && attempt < 8 {
-                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
-                            .await;
-                        continue;
-                    }
-                    conn.discard();
-                    return Err(error.into());
-                }
-            }
+        if mutations.is_empty() && command_result.is_none() && outbox_effects.is_empty() {
+            return Ok(MemoryBatchApplyResult {
+                max_version: self
+                    .version_if_newer(namespace, memory_key, -1)
+                    .await?
+                    .unwrap_or(-1),
+            });
         }
+        let bytes = namespace.len()
+            + memory_key.len()
+            + 256
+            + mutations
+                .iter()
+                .map(|mutation| {
+                    mutation.key.len() + mutation.value.len() + mutation.encoding.len() + 96
+                })
+                .sum::<usize>()
+            + command_result.map_or(0, |command| {
+                command.idempotency_key.len() + command.result.len() + 96
+            })
+            + outbox_effects
+                .iter()
+                .map(|effect| effect.kind.len() + effect.payload.len() + 96)
+                .sum::<usize>();
+        let shard = StateStore::shard_index(worker, binding, memory_key);
+        let worker = worker.to_owned();
+        let binding = binding.to_owned();
+        let entity = memory_key.to_owned();
+        let mutations = mutations.to_vec();
+        let command_result = command_result.cloned();
+        let effects = outbox_effects.to_vec();
+        let now = epoch_ms()?;
+        self.state
+            .write(shard, bytes, move |conn, version| {
+                let worker = worker.clone();
+                let binding = binding.clone();
+                let entity = entity.clone();
+                let mutations = mutations.clone();
+                let command_result = command_result.clone();
+                let effects = effects.clone();
+                let lease = lease.clone();
+                Box::pin(async move {
+                    let _lease = lease;
+                    let mut rows = query_cached(
+                        conn,
+                        "SELECT max_version, owner_epoch FROM memory_meta
+                         WHERE worker=?1 AND binding=?2 AND entity_key=?3",
+                        (worker.as_str(), binding.as_str(), entity.as_str()),
+                    ).await?;
+                    let (current, previous_owner) = rows.next().await?
+                        .map(|row| Ok::<_, turso::Error>((row.get::<i64>(0)?, row.get::<i64>(1)?)))
+                        .transpose()?.unwrap_or((-1, 0));
+                    drop(rows);
+                    if let Some(owner) = owner_epoch
+                        && owner < previous_owner {
+                            return Err(PlatformError::runtime(format!(
+                                "stale memory owner epoch {owner}; current owner epoch {previous_owner} for {worker}/{binding}/{entity}"
+                            )).into());
+                        }
+                    let revision = if mutations.is_empty() && effects.is_empty() {
+                        current
+                    } else {
+                        version
+                    };
+                    for mutation in mutations {
+                        execute_cached(
+                            conn,
+                            "INSERT INTO memory_state(worker,binding,entity_key,item_key,value,encoding,deleted,version)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                             ON CONFLICT(worker,binding,entity_key,item_key) DO UPDATE SET
+                             value=excluded.value,encoding=excluded.encoding,
+                             deleted=excluded.deleted,version=excluded.version",
+                            (worker.as_str(), binding.as_str(), entity.as_str(), mutation.key,
+                             mutation.value, mutation.encoding, i64::from(mutation.deleted), revision),
+                        ).await?;
+                    }
+                    execute_cached(
+                        conn,
+                        "INSERT INTO memory_meta(worker,binding,entity_key,max_version,owner_epoch)
+                         VALUES (?1,?2,?3,?4,?5)
+                         ON CONFLICT(worker,binding,entity_key) DO UPDATE SET
+                         max_version=excluded.max_version,owner_epoch=excluded.owner_epoch",
+                        (worker.as_str(), binding.as_str(), entity.as_str(), revision,
+                         owner_epoch.unwrap_or(previous_owner)),
+                    ).await?;
+                    for (ordinal, effect) in effects.into_iter().enumerate() {
+                        use sha2::{Digest, Sha256};
+                        let mut hash = Sha256::new();
+                        for component in [&worker, &binding, &entity] {
+                            hash.update((component.len() as u64).to_be_bytes());
+                            hash.update(component.as_bytes());
+                        }
+                        hash.update(version.to_be_bytes());
+                        hash.update((ordinal as u64).to_be_bytes());
+                        let digest = hash.finalize().iter()
+                            .map(|byte| format!("{byte:02x}")).collect::<String>();
+                        let effect_id = format!("memfx_{digest}");
+                        execute_cached(
+                            conn,
+                            "INSERT INTO memory_outbox(worker,binding,entity_key,effect_id,revision,
+                             kind,payload_blob,status,attempt_count,next_attempt_at_ms)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',0,?8)",
+                            (worker.as_str(), binding.as_str(), entity.as_str(), effect_id,
+                             revision, effect.kind, effect.payload, now),
+                        ).await?;
+                    }
+                    if let Some(command) = command_result {
+                        execute_cached(
+                            conn,
+                            "INSERT INTO memory_commands(worker,binding,entity_key,idempotency_key,result_blob,revision)
+                             VALUES (?1,?2,?3,?4,?5,?6)",
+                            (worker, binding, entity, command.idempotency_key, command.result, revision),
+                        ).await?;
+                    }
+                    Ok(MemoryBatchApplyResult { max_version: revision })
+                })
+            }).await
     }
 
     pub async fn command_result(
@@ -650,63 +448,49 @@ impl MemoryStore {
         memory_key: &str,
         idempotency_key: &str,
     ) -> Result<Option<MemoryCommandResult>> {
-        let key = idempotency_key.trim();
-        if key.is_empty() {
-            return Ok(None);
-        }
-        let conn = self.connect(namespace, memory_key).await?;
-        let mut rows = query_cached(
-            &conn,
-            "SELECT result_blob, revision
-                 FROM memory_commands
-                 WHERE entity_key = ?1 AND idempotency_key = ?2
-                 LIMIT 1",
-            (memory_key, key),
-        )
-        .await
-        .map_err(memory_error)?;
-        let Some(row) = rows.next().await.map_err(memory_error)? else {
-            return Ok(None);
-        };
-        let result = row.get::<Vec<u8>>(0).map_err(memory_error)?;
-        let revision = row.get::<i64>(1).map_err(memory_error)?;
-        let _ = rows.next().await.map_err(memory_error)?;
-        Ok(Some(MemoryCommandResult { result, revision }))
+        let (worker, binding) = namespace_owner(namespace)?;
+        let conn = self
+            .state
+            .read(StateStore::shard_index(worker, binding, memory_key))
+            .await?;
+        let mut rows=query_cached(&conn, "SELECT result_blob,revision FROM memory_commands WHERE worker=?1 AND binding=?2 AND entity_key=?3 AND idempotency_key=?4", (worker,binding,memory_key,idempotency_key)).await.map_err(storage_error)?;
+        rows.next()
+            .await
+            .map_err(storage_error)?
+            .map(|row| {
+                Ok::<_, turso::Error>(MemoryCommandResult {
+                    result: row.get(0)?,
+                    revision: row.get(1)?,
+                })
+            })
+            .transpose()
+            .map_err(storage_error)
     }
-
-    #[allow(dead_code)]
     pub async fn outbox_records(
         &self,
         namespace: &str,
         memory_key: &str,
     ) -> Result<Vec<MemoryOutboxRecord>> {
-        let conn = self.connect(namespace, memory_key).await?;
+        let (worker, binding) = namespace_owner(namespace)?;
+        let conn = self
+            .state
+            .read(StateStore::shard_index(worker, binding, memory_key))
+            .await?;
         let mut rows = query_cached(
             &conn,
-                "SELECT effect_id, kind, payload_blob, revision, status, attempt_count, next_attempt_at_ms
+            "SELECT effect_id,kind,payload_blob,revision,status,attempt_count,next_attempt_at_ms
                  FROM memory_outbox
-                 WHERE entity_key = ?1
-                 ORDER BY revision, effect_id",
-                (memory_key,),
-            )
-            .await
-            .map_err(memory_error)?;
+                 WHERE worker=?1 AND binding=?2 AND entity_key=?3 ORDER BY revision,effect_id",
+            (worker, binding, memory_key),
+        )
+        .await
+        .map_err(storage_error)?;
         let mut records = Vec::new();
-        while let Some(row) = rows.next().await.map_err(memory_error)? {
-            records.push(MemoryOutboxRecord {
-                effect_id: row.get::<String>(0).map_err(memory_error)?,
-                kind: row.get::<String>(1).map_err(memory_error)?,
-                payload: row.get::<Vec<u8>>(2).map_err(memory_error)?,
-                revision: row.get::<i64>(3).map_err(memory_error)?,
-                status: row.get::<String>(4).map_err(memory_error)?,
-                attempt_count: row.get::<i64>(5).map_err(memory_error)?,
-                next_attempt_at_ms: row.get::<i64>(6).map_err(memory_error)?,
-            });
+        while let Some(row) = rows.next().await.map_err(storage_error)? {
+            records.push(outbox_record(&row, 0).map_err(storage_error)?);
         }
         Ok(records)
     }
-
-    #[allow(dead_code)]
     pub async fn claim_outbox_records(
         &self,
         namespace: &str,
@@ -714,144 +498,41 @@ impl MemoryStore {
         limit: usize,
         lease_for: Duration,
     ) -> Result<Vec<MemoryOutboxRecord>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let now_ms = epoch_ms_i64()?;
-        let lease_until_ms = now_ms.saturating_add(duration_ms_i64(lease_for)?);
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut conn = self.writer_connection(namespace, memory_key).await?;
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match conn.execute("BEGIN IMMEDIATE", ()).await {
-                Ok(_) => {}
-                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                    self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
-                    continue;
-                }
-                Err(error) => {
-                    conn.discard();
-                    return Err(memory_error_after_retry(error));
-                }
-            }
-
-            let outcome = async {
-                let mut rows = query_cached(
-                    &conn,
-                        "SELECT effect_id, kind, payload_blob, revision, status, attempt_count, next_attempt_at_ms
-                         FROM memory_outbox
-                         WHERE entity_key = ?1
-                           AND status IN ('pending', 'inflight')
-                           AND next_attempt_at_ms <= ?2
-                         ORDER BY revision, effect_id
-                         LIMIT ?3",
-                        (memory_key, now_ms, limit),
-                    )
-                    .await?;
-                let mut records = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    records.push(MemoryOutboxRecord {
-                        effect_id: row.get::<String>(0)?,
-                        kind: row.get::<String>(1)?,
-                        payload: row.get::<Vec<u8>>(2)?,
-                        revision: row.get::<i64>(3)?,
-                        status: "inflight".to_string(),
-                        attempt_count: row.get::<i64>(5)?.saturating_add(1),
-                        next_attempt_at_ms: lease_until_ms,
-                    });
-                }
-                for record in &records {
-                    execute_cached(
-                        &conn,
-                        "UPDATE memory_outbox
-                         SET status = 'inflight',
-                             attempt_count = ?1,
-                             next_attempt_at_ms = ?2,
-                             updated_at_ms = ?3
-                         WHERE effect_id = ?4
-                           AND entity_key = ?5
-                           AND status IN ('pending', 'inflight')
-                           AND next_attempt_at_ms <= ?3",
-                        (
-                            record.attempt_count,
-                            lease_until_ms,
-                            now_ms,
-                            record.effect_id.as_str(),
-                            memory_key,
-                        ),
-                    )
-                    .await?;
-                }
-                Ok::<_, MemoryTransactionError>(records)
-            }
-            .await;
-
-            match outcome {
-                Ok(records) => match conn.execute("COMMIT", ()).await {
-                    Ok(_) => return Ok(records),
-                    Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
-                            .await;
-                        continue;
-                    }
-                    Err(error) => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        conn.discard();
-                        return Err(memory_error_after_retry(error));
-                    }
-                },
-                Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    if error.is_retryable() && attempt < 8 {
-                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
-                            .await;
-                        continue;
-                    }
-                    conn.discard();
-                    return Err(error.into());
-                }
-            }
-        }
+        let (worker, binding) = namespace_owner(namespace)?;
+        let claims = self
+            .claim(
+                StateStore::shard_index(worker, binding, memory_key),
+                limit,
+                lease_for,
+                &[],
+                Some((worker.to_owned(), binding.to_owned(), memory_key.to_owned())),
+            )
+            .await?;
+        Ok(claims.into_iter().map(|claim| claim.record).collect())
     }
-
     pub async fn claim_due_outbox_records(
         &self,
         limit: usize,
         lease_for: Duration,
         kinds: &[&str],
     ) -> Result<Vec<MemoryOutboxClaim>> {
-        if limit == 0 || kinds.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (exact_kinds, kind_prefixes) = normalize_outbox_kind_selectors(kinds);
-        if exact_kinds.is_empty() && kind_prefixes.is_empty() {
-            return Ok(Vec::new());
-        }
         let mut claims = Vec::new();
-        for shard_index in 0..self.namespace_shards {
+        for shard in 0..STATE_SHARDS {
             if claims.len() >= limit {
                 break;
             }
-            let remaining = limit.saturating_sub(claims.len());
-            let mut shard_claims = self
-                .claim_due_outbox_records_for_shard_index_with_selectors(
-                    shard_index,
-                    remaining,
+            claims.extend(
+                self.claim_due_outbox_records_for_shard_index(
+                    shard,
+                    limit - claims.len(),
                     lease_for,
-                    &exact_kinds,
-                    &kind_prefixes,
+                    kinds,
                 )
-                .await?;
-            claims.append(&mut shard_claims);
+                .await?,
+            );
         }
         Ok(claims)
     }
-
     pub async fn claim_due_outbox_records_for_shard_index(
         &self,
         shard_index: usize,
@@ -859,53 +540,143 @@ impl MemoryStore {
         lease_for: Duration,
         kinds: &[&str],
     ) -> Result<Vec<MemoryOutboxClaim>> {
-        if limit == 0 || kinds.is_empty() {
+        if kinds.is_empty() {
             return Ok(Vec::new());
         }
-        let (exact_kinds, kind_prefixes) = normalize_outbox_kind_selectors(kinds);
-        if exact_kinds.is_empty() && kind_prefixes.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.claim_due_outbox_records_for_shard_index_with_selectors(
-            shard_index,
-            limit,
-            lease_for,
-            &exact_kinds,
-            &kind_prefixes,
-        )
-        .await
+        self.claim(shard_index, limit, lease_for, kinds, None).await
     }
-
-    #[allow(dead_code)]
+    async fn claim(
+        &self,
+        shard: usize,
+        limit: usize,
+        lease_for: Duration,
+        kinds: &[&str],
+        entity: Option<(String, String, String)>,
+    ) -> Result<Vec<MemoryOutboxClaim>> {
+        if shard >= STATE_SHARDS {
+            return Err(PlatformError::bad_request(format!(
+                "state shard {shard} outside 0..{STATE_SHARDS}"
+            )));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = epoch_ms()?;
+        let until =
+            now.saturating_add(i64::try_from(lease_for.as_millis()).map_err(storage_error)?);
+        let mut sql = String::from(
+            "SELECT worker,binding,entity_key,effect_id,kind,payload_blob,revision,status,attempt_count,next_attempt_at_ms
+                 FROM memory_outbox
+                 WHERE status IN ('pending','inflight') AND next_attempt_at_ms<=?1",
+        );
+        let mut params = vec![Value::Integer(now)];
+        if let Some((worker, binding, entity)) = entity {
+            sql.push_str(" AND worker=?2 AND binding=?3 AND entity_key=?4");
+            params.extend([
+                Value::Text(worker),
+                Value::Text(binding),
+                Value::Text(entity),
+            ]);
+        }
+        if !kinds.is_empty() {
+            sql.push_str(" AND (");
+            for (index, kind) in kinds.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(" OR ");
+                }
+                let parameter = params.len() + 1;
+                if let Some(prefix) = kind.strip_suffix('*') {
+                    sql.push_str(&format!("kind LIKE ?{parameter} ESCAPE '\\'"));
+                    params.push(Value::Text(format!(
+                        "{}%",
+                        prefix
+                            .replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_")
+                    )));
+                } else {
+                    sql.push_str(&format!("kind=?{parameter}"));
+                    params.push(Value::Text((*kind).into()));
+                }
+            }
+            sql.push(')');
+        }
+        sql.push_str(&format!(
+            " ORDER BY revision,effect_id LIMIT ?{}",
+            params.len() + 1
+        ));
+        params.push(Value::Integer(
+            i64::try_from(limit.min(4096)).map_err(storage_error)?,
+        ));
+        {
+            let conn = self.state.read(shard).await?;
+            let mut rows = conn
+                .query(&sql, params.clone())
+                .await
+                .map_err(storage_error)?;
+            if rows.next().await.map_err(storage_error)?.is_none() {
+                return Ok(Vec::new());
+            }
+        }
+        self.state
+            .write(shard, sql.len() + 4096, move |conn, _| {
+                let sql = sql.clone();
+                let params = params.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params).await?;
+                    let mut claims = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        let worker = row.get::<String>(0)?;
+                        let binding = row.get::<String>(1)?;
+                        let entity = row.get::<String>(2)?;
+                        let mut record = outbox_record(&row, 3)?;
+                        record.status = "inflight".into();
+                        record.attempt_count += 1;
+                        record.next_attempt_at_ms = until;
+                        claims.push(MemoryOutboxClaim {
+                            namespace: worker_namespace(&worker, &binding),
+                            memory_key: entity,
+                            record,
+                        });
+                    }
+                    drop(rows);
+                    for claim in &claims {
+                        let (worker, binding) = namespace_owner(&claim.namespace)?;
+                        execute_cached(
+                            conn,
+                            "UPDATE memory_outbox
+                         SET status='inflight',attempt_count=?1,next_attempt_at_ms=?2
+                         WHERE worker=?3 AND binding=?4 AND entity_key=?5 AND effect_id=?6",
+                            (
+                                claim.record.attempt_count,
+                                until,
+                                worker,
+                                binding,
+                                claim.memory_key.as_str(),
+                                claim.record.effect_id.as_str(),
+                            ),
+                        )
+                        .await?;
+                    }
+                    Ok(claims)
+                })
+            })
+            .await
+    }
     pub async fn mark_outbox_delivered(
         &self,
         namespace: &str,
         memory_key: &str,
         effect_id: &str,
     ) -> Result<()> {
-        let effect_id = effect_id.trim();
-        if effect_id.is_empty() {
-            return Err(PlatformError::bad_request(
-                "memory outbox effect_id is required",
-            ));
-        }
-        let now_ms = epoch_ms_i64()?;
-        let conn = self.writer_connection(namespace, memory_key).await?;
-        execute_cached(
-            &conn,
-            "UPDATE memory_outbox
-             SET status = 'delivered',
-                 updated_at_ms = ?1
-             WHERE entity_key = ?2
-               AND effect_id = ?3",
-            (now_ms, memory_key, effect_id),
-        )
+        self.apply_outbox_delivery_outcomes(&[MemoryOutboxDeliveryOutcome {
+            namespace: namespace.into(),
+            memory_key: memory_key.into(),
+            effect_id: effect_id.into(),
+            action: MemoryOutboxDeliveryAction::Delivered,
+        }])
         .await
-        .map_err(memory_error)?;
-        Ok(())
     }
-
-    #[allow(dead_code)]
     pub async fn retry_outbox_record(
         &self,
         namespace: &str,
@@ -913,331 +684,75 @@ impl MemoryStore {
         effect_id: &str,
         retry_after: Duration,
     ) -> Result<()> {
-        let effect_id = effect_id.trim();
-        if effect_id.is_empty() {
-            return Err(PlatformError::bad_request(
-                "memory outbox effect_id is required",
-            ));
-        }
-        let now_ms = epoch_ms_i64()?;
-        let next_attempt_at_ms = now_ms.saturating_add(duration_ms_i64(retry_after)?);
-        let conn = self.writer_connection(namespace, memory_key).await?;
-        execute_cached(
-            &conn,
-            "UPDATE memory_outbox
-             SET status = 'pending',
-                 next_attempt_at_ms = ?1,
-                 updated_at_ms = ?2
-             WHERE entity_key = ?3
-               AND effect_id = ?4",
-            (next_attempt_at_ms, now_ms, memory_key, effect_id),
-        )
+        self.apply_outbox_delivery_outcomes(&[MemoryOutboxDeliveryOutcome {
+            namespace: namespace.into(),
+            memory_key: memory_key.into(),
+            effect_id: effect_id.into(),
+            action: MemoryOutboxDeliveryAction::Retry { retry_after },
+        }])
         .await
-        .map_err(memory_error)?;
-        Ok(())
     }
-
     pub async fn apply_outbox_delivery_outcomes(
         &self,
         outcomes: &[MemoryOutboxDeliveryOutcome],
     ) -> Result<()> {
-        if outcomes.is_empty() {
-            return Ok(());
-        }
-        let mut grouped: BTreeMap<(String, String), Vec<&MemoryOutboxDeliveryOutcome>> =
-            BTreeMap::new();
+        let now = epoch_ms()?;
         for outcome in outcomes {
-            if outcome.effect_id.trim().is_empty() {
-                return Err(PlatformError::bad_request(
-                    "memory outbox effect_id is required",
-                ));
-            }
-            grouped
-                .entry((outcome.namespace.clone(), outcome.memory_key.clone()))
-                .or_default()
-                .push(outcome);
-        }
-
-        for ((namespace, memory_key), entity_outcomes) in grouped {
-            let mut conn = self.writer_connection(&namespace, &memory_key).await?;
-            let mut attempt = 0usize;
-            loop {
-                attempt += 1;
-                match conn.execute("BEGIN IMMEDIATE", ()).await {
-                    Ok(_) => {}
-                    Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
-                            .await;
-                        continue;
-                    }
-                    Err(error) => {
-                        conn.discard();
-                        return Err(memory_error_after_retry(error));
-                    }
-                }
-
-                let outcome = async {
-                    let now_ms = epoch_ms_i64()?;
-                    for delivery in &entity_outcomes {
-                        match delivery.action {
-                            MemoryOutboxDeliveryAction::Delivered
-                            | MemoryOutboxDeliveryAction::DroppedTerminal => {
-                                execute_cached(
-                                    &conn,
-                                    "UPDATE memory_outbox
-                                     SET status = 'delivered',
-                                         updated_at_ms = ?1
-                                     WHERE entity_key = ?2
-                                       AND effect_id = ?3",
-                                    (now_ms, memory_key.as_str(), delivery.effect_id.as_str()),
-                                )
-                                .await?;
-                            }
-                            MemoryOutboxDeliveryAction::Retry { retry_after } => {
-                                let next_attempt_at_ms =
-                                    now_ms.saturating_add(duration_ms_i64(retry_after)?);
-                                execute_cached(
-                                    &conn,
-                                    "UPDATE memory_outbox
-                                     SET status = 'pending',
-                                         next_attempt_at_ms = ?1,
-                                         updated_at_ms = ?2
-                                     WHERE entity_key = ?3
-                                       AND effect_id = ?4",
-                                    (
-                                        next_attempt_at_ms,
-                                        now_ms,
-                                        memory_key.as_str(),
-                                        delivery.effect_id.as_str(),
-                                    ),
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    Ok::<_, MemoryTransactionError>(())
-                }
-                .await;
-
-                match outcome {
-                    Ok(()) => match conn.execute("COMMIT", ()).await {
-                        Ok(_) => break,
-                        Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                            let _ = conn.execute("ROLLBACK", ()).await;
-                            self.record_profile(
-                                MemoryProfileMetricKind::StoreWriterBusyRetry,
-                                0,
-                                1,
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                5 * attempt as u64,
-                            ))
-                            .await;
-                            continue;
-                        }
-                        Err(error) => {
-                            let _ = conn.execute("ROLLBACK", ()).await;
-                            conn.discard();
-                            return Err(memory_error_after_retry(error));
-                        }
-                    },
-                    Err(error) => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        if error.is_retryable() && attempt < 8 {
-                            self.record_profile(
-                                MemoryProfileMetricKind::StoreWriterBusyRetry,
-                                0,
-                                1,
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                5 * attempt as u64,
-                            ))
-                            .await;
-                            continue;
-                        }
-                        conn.discard();
-                        return Err(error.into());
-                    }
-                }
-            }
+            let (worker, binding) = namespace_owner(&outcome.namespace)?;
+            let shard = StateStore::shard_index(worker, binding, &outcome.memory_key);
+            let worker = worker.to_owned();
+            let binding = binding.to_owned();
+            let outcome = outcome.clone();
+            let bytes =
+                outcome.namespace.len() + outcome.memory_key.len() + outcome.effect_id.len() + 256;
+            self.state
+                .write(shard, bytes, move |conn, _| {
+                    let worker = worker.clone();
+                    let binding = binding.clone();
+                    let outcome = outcome.clone();
+                    Box::pin(async move {
+                        let (status, next) = match outcome.action {
+                            MemoryOutboxDeliveryAction::Delivered => ("delivered", now),
+                            MemoryOutboxDeliveryAction::DroppedTerminal => ("dropped", now),
+                            MemoryOutboxDeliveryAction::Retry { retry_after } => (
+                                "pending",
+                                now.saturating_add(
+                                    i64::try_from(retry_after.as_millis())
+                                        .map_err(storage_error)?,
+                                ),
+                            ),
+                        };
+                        execute_cached(
+                            conn,
+                            "UPDATE memory_outbox SET status=?1,next_attempt_at_ms=?2
+                         WHERE worker=?3 AND binding=?4 AND entity_key=?5 AND effect_id=?6",
+                            (
+                                status,
+                                next,
+                                worker,
+                                binding,
+                                outcome.memory_key,
+                                outcome.effect_id,
+                            ),
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
         }
         Ok(())
     }
+}
 
-    async fn claim_due_outbox_records_for_shard_index_with_selectors(
-        &self,
-        shard_index: usize,
-        limit: usize,
-        lease_for: Duration,
-        exact_kinds: &[String],
-        kind_prefixes: &[String],
-    ) -> Result<Vec<MemoryOutboxClaim>> {
-        if limit == 0 || (exact_kinds.is_empty() && kind_prefixes.is_empty()) {
-            return Ok(Vec::new());
-        }
-        let shard_index = shard_index % self.namespace_shards.max(1);
-        let mut claims = Vec::new();
-        let namespaces = self.discover_namespaces_for_shard(shard_index).await?;
-        for namespace in namespaces {
-            if claims.len() >= limit {
-                break;
-            }
-            let remaining = limit.saturating_sub(claims.len());
-            let mut namespace_claims = self
-                .claim_due_outbox_records_for_namespace_shard(
-                    &namespace,
-                    shard_index,
-                    remaining,
-                    lease_for,
-                    exact_kinds,
-                    kind_prefixes,
-                )
-                .await?;
-            claims.append(&mut namespace_claims);
-        }
-        Ok(claims)
-    }
-
-    async fn claim_due_outbox_records_for_namespace_shard(
-        &self,
-        namespace: &str,
-        shard_index: usize,
-        limit: usize,
-        lease_for: Duration,
-        exact_kinds: &[String],
-        kind_prefixes: &[String],
-    ) -> Result<Vec<MemoryOutboxClaim>> {
-        if limit == 0 || (exact_kinds.is_empty() && kind_prefixes.is_empty()) {
-            return Ok(Vec::new());
-        }
-        let now_ms = epoch_ms_i64()?;
-        let lease_until_ms = now_ms.saturating_add(duration_ms_i64(lease_for)?);
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut kind_selectors = Vec::with_capacity(exact_kinds.len() + kind_prefixes.len());
-        let mut next_placeholder = 2usize;
-        for _ in exact_kinds {
-            kind_selectors.push(format!("kind = ?{next_placeholder}"));
-            next_placeholder += 1;
-        }
-        for _ in kind_prefixes {
-            kind_selectors.push(format!("kind LIKE ?{next_placeholder} ESCAPE '\\'"));
-            next_placeholder += 1;
-        }
-        let kind_filter = kind_selectors.join(" OR ");
-        let limit_placeholder = next_placeholder;
-        let select_sql = format!(
-            "SELECT entity_key, effect_id, kind, payload_blob, revision, status, attempt_count, next_attempt_at_ms
-             FROM memory_outbox
-             WHERE status IN ('pending', 'inflight')
-               AND next_attempt_at_ms <= ?1
-               AND ({kind_filter})
-             ORDER BY revision, effect_id
-             LIMIT ?{limit_placeholder}"
-        );
-        let mut select_params = Vec::with_capacity(exact_kinds.len() + kind_prefixes.len() + 2);
-        select_params.push(Value::Integer(now_ms));
-        select_params.extend(exact_kinds.iter().map(|kind| Value::Text(kind.clone())));
-        select_params.extend(
-            kind_prefixes
-                .iter()
-                .map(|prefix| Value::Text(format!("{}%", escape_sql_like_prefix(prefix)))),
-        );
-        select_params.push(Value::Integer(limit));
-        let mut conn = self.writer_connection_shard(namespace, shard_index).await?;
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            match conn.execute("BEGIN IMMEDIATE", ()).await {
-                Ok(_) => {}
-                Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                    self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                    tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64)).await;
-                    continue;
-                }
-                Err(error) => {
-                    conn.discard();
-                    return Err(memory_error_after_retry(error));
-                }
-            }
-
-            let outcome = async {
-                let mut rows = conn.query(&select_sql, select_params.clone()).await?;
-                let mut claims = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    let memory_key = row.get::<String>(0)?;
-                    claims.push(MemoryOutboxClaim {
-                        namespace: namespace.to_string(),
-                        memory_key,
-                        record: MemoryOutboxRecord {
-                            effect_id: row.get::<String>(1)?,
-                            kind: row.get::<String>(2)?,
-                            payload: row.get::<Vec<u8>>(3)?,
-                            revision: row.get::<i64>(4)?,
-                            status: "inflight".to_string(),
-                            attempt_count: row.get::<i64>(6)?.saturating_add(1),
-                            next_attempt_at_ms: lease_until_ms,
-                        },
-                    });
-                }
-                for claim in &claims {
-                    execute_cached(
-                        &conn,
-                        "UPDATE memory_outbox
-                         SET status = 'inflight',
-                             attempt_count = ?1,
-                             next_attempt_at_ms = ?2,
-                             updated_at_ms = ?3
-                         WHERE effect_id = ?4
-                           AND entity_key = ?5
-                           AND kind = ?6
-                           AND status IN ('pending', 'inflight')
-                           AND next_attempt_at_ms <= ?3",
-                        (
-                            claim.record.attempt_count,
-                            lease_until_ms,
-                            now_ms,
-                            claim.record.effect_id.as_str(),
-                            claim.memory_key.as_str(),
-                            claim.record.kind.as_str(),
-                        ),
-                    )
-                    .await?;
-                }
-                Ok::<_, MemoryTransactionError>(claims)
-            }
-            .await;
-
-            match outcome {
-                Ok(claims) => match conn.execute("COMMIT", ()).await {
-                    Ok(_) => return Ok(claims),
-                    Err(error) if is_retryable_memory_error(&error) && attempt < 8 => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
-                            .await;
-                        continue;
-                    }
-                    Err(error) => {
-                        let _ = conn.execute("ROLLBACK", ()).await;
-                        conn.discard();
-                        return Err(memory_error_after_retry(error));
-                    }
-                },
-                Err(error) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    if error.is_retryable() && attempt < 8 {
-                        self.record_profile(MemoryProfileMetricKind::StoreWriterBusyRetry, 0, 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(5 * attempt as u64))
-                            .await;
-                        continue;
-                    }
-                    conn.discard();
-                    return Err(error.into());
-                }
-            }
-        }
-    }
-
-
+fn outbox_record(row: &turso::Row, offset: usize) -> turso::Result<MemoryOutboxRecord> {
+    Ok(MemoryOutboxRecord {
+        effect_id: row.get(offset)?,
+        kind: row.get(offset + 1)?,
+        payload: row.get(offset + 2)?,
+        revision: row.get(offset + 3)?,
+        status: row.get(offset + 4)?,
+        attempt_count: row.get(offset + 5)?,
+        next_attempt_at_ms: row.get(offset + 6)?,
+    })
 }

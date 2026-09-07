@@ -121,7 +121,7 @@ test("warnings do not fail CLI but failures do", async () => {
     { cwd: repoRoot, encoding: "utf8" },
   );
   assert.equal(warningRun.status, 0, warningRun.stderr);
-  assert.match(warningRun.stdout, /WARN direct write baseline/);
+  assert.match(warningRun.stdout, /WARN write-only transaction baseline/);
 
   const failure = await writeRegressionFixture({
     atomicCross8: 2200,
@@ -178,7 +178,7 @@ async function writeRegressionFixture(options = {}) {
         options,
       ),
       config("atomic-readwrite-memory-wide", "same-shard", 8, 2000, sampleCount, options),
-      config("direct-write-memory-wide", "cross-shard", 8, 8000, sampleCount, options),
+      config("atomic-write-only-memory-wide", "cross-shard", 8, 8000, sampleCount, options),
     ],
   };
   if (options.duplicateAtomicCross8) {
@@ -217,10 +217,10 @@ function ratioAssertion(overrides) {
 
 function baselineAssertion(overrides) {
   return {
-    name: "direct write baseline",
+    name: "write-only transaction baseline",
     metric: "throughput_rps",
     operator: "baseline",
-    selector: selector("direct-write-memory-wide", "cross-shard", 8),
+    selector: selector("atomic-write-only-memory-wide", "cross-shard", 8),
     baseline: 8000,
     warning: 0.1,
     failure: 0.2,
@@ -231,7 +231,7 @@ function baselineAssertion(overrides) {
 }
 
 function selector(mode, keys, isolates) {
-  return { mode, keys, isolates, shards: 8 };
+  return { mode, keys, isolates };
 }
 
 function config(mode, keys, isolates, throughput, sampleCount, options) {
@@ -254,13 +254,12 @@ function config(mode, keys, isolates, throughput, sampleCount, options) {
     ],
   }));
   return {
-    name: `smoke.sh::isolates=${isolates},shards=8,keys=${keys},mode=${mode}`,
+    name: `smoke.sh::isolates=${isolates},keys=${keys},mode=${mode}`,
     env: {
       DD_BENCH_MODE: mode,
       DD_BENCH_MEMORY_KEY_MODE: keys,
       DD_BENCH_MIN_ISOLATES: String(isolates),
       DD_BENCH_MAX_ISOLATES: String(isolates),
-      DD_BENCH_MEMORY_NAMESPACE_SHARDS: "8",
     },
     samples,
     summaries: [

@@ -1,38 +1,4 @@
-pub(super) const MEMORY_READ_ASYNC_STORAGE_WORKER_SOURCE: &str = r#"
-export function seed(state) {
-  state.set("payload", "1");
-  return true;
-}
-
-export function read(state) {
-  return String(state.get("payload") ?? "0");
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
-    const memory = env.BENCH_MEMORY.get(id);
-    if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
-        headers: [["content-type", "application/json"]],
-      });
-    }
-    if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
-      return new Response("ok");
-    }
-    if (url.pathname === "/seed") {
-      await memory.atomic(seed);
-      return new Response("ok");
-    }
-    const value = await memory.atomic(read);
-    return new Response(String(value));
-  },
-};
-"#;
-
-pub(super) const MEMORY_READ_ASYNC_MEMORY_WORKER_SOURCE: &str = r#"
+pub(super) const MEMORY_ATOMIC_CALLBACK_WORKER_SOURCE: &str = r#"
 export function read(_state) { return "1"; }
 
 export default {
@@ -46,49 +12,7 @@ export default {
 };
 "#;
 
-pub(super) const MEMORY_READ_SYNC_MEMORY_WORKER_SOURCE: &str = r#"
-export function read(_state) { return "1"; }
-
-export default {
-  async fetch(_request, env) {
-    const url = new URL(_request.url);
-    const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
-    const memory = env.BENCH_MEMORY.get(id);
-    return new Response(String(await memory.atomic(read)));
-  },
-};
-"#;
-
-pub(super) const MEMORY_DIRECT_READ_WORKER_SOURCE: &str = r#"
-export function seed(state) {
-  state.set("payload", "1");
-  return true;
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
-    const memory = env.BENCH_MEMORY.get(id);
-    if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
-        headers: [["content-type", "application/json"]],
-      });
-    }
-    if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
-      return new Response("ok");
-    }
-    if (url.pathname === "/seed") {
-      await memory.atomic(seed);
-      return new Response("ok");
-    }
-    return new Response(String(await memory.read("payload") ?? "0"));
-  },
-};
-"#;
-
-pub(super) const MEMORY_DIRECT_WRITE_WORKER_SOURCE: &str = r#"
+pub(super) const MEMORY_ATOMIC_WRITE_ONLY_WORKER_SOURCE: &str = r#"
 export function readStrong(state) {
   return String(state.get("payload") ?? "0");
 }
@@ -99,21 +23,21 @@ export default {
     const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
     const memory = env.BENCH_MEMORY.get(id);
     if (url.pathname === "/seed") {
-      await memory.write("payload", "0");
+      await memory.atomic((tx) => tx.put("payload", "0"));
       return new Response("ok");
     }
     if (url.pathname === "/read") {
-      return new Response(String(await memory.read("payload") ?? "0"));
+      return new Response(String(await memory.atomic((tx) => tx.get("payload")) ?? "0"));
     }
     if (url.pathname === "/get-strong") {
       return new Response(String(await memory.atomic(readStrong)));
     }
     if (url.pathname === "/write") {
-      await memory.write("payload", "1");
+      await memory.atomic((tx) => tx.put("payload", "1"));
       return new Response("ok");
     }
     if (url.pathname === "/delete") {
-      await memory.delete("payload");
+      await memory.atomic((tx) => tx.delete("payload"));
       return new Response("ok");
     }
     return new Response("not found", { status: 404 });
@@ -123,7 +47,7 @@ export default {
 
 pub(super) const MEMORY_ATOMIC_READ_MEMORY_WORKER_SOURCE: &str = r#"
 export function seed(state) {
-  state.set("payload", "1");
+  state.put("payload", "1");
   return true;
 }
 
@@ -161,12 +85,12 @@ export function readPayload(state) {
 
 export function readWritePayload(state) {
   state.get("payload");
-  state.set("payload", "1");
+  state.put("payload", "1");
   return "1";
 }
 
 export function writePayloadAndEffect(state) {
-  state.set("payload", "1");
+  state.put("payload", "1");
   state.emit("audit.bench.write", { payload: "1" });
   return "1";
 }
@@ -203,53 +127,9 @@ export default {
 };
 "#;
 
-pub(super) const MEMORY_COORDINATED_INCREMENT_WORKER_SOURCE: &str = r#"
+pub(super) const MEMORY_ATOMIC_INCREMENT_WORKER_SOURCE: &str = r#"
 export function seed(state) {
-  state.set("count", "0");
-  return true;
-}
-
-export function increment(state) {
-  const current = Number(state.get("count") ?? 0);
-  const next = current + 1;
-  state.set("count", String(next));
-  return next;
-}
-
-export function readCount(state) {
-  return String(state.get("count") ?? "0");
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
-    const memory = env.BENCH_MEMORY.get(id);
-    if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
-        headers: [["content-type", "application/json"]],
-      });
-    }
-    if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
-      return new Response("ok");
-    }
-    if (url.pathname === "/seed") {
-      await memory.atomic(seed);
-      return new Response("ok");
-    }
-    if (url.pathname === "/get") {
-      return new Response(String(await memory.atomic(readCount)));
-    }
-    const value = await memory.atomic(increment);
-    return new Response(String(value));
-  },
-};
-"#;
-
-pub(super) const MEMORY_COORDINATED_READ_WRITE_WORKER_SOURCE: &str = r#"
-export function seed(state) {
-  state.set("count", "0");
+  state.put("count", "0");
   return true;
 }
 
@@ -260,7 +140,7 @@ export function readCount(state) {
 export function increment(state) {
   const current = Number(state.get("count") ?? 0);
   const next = current + 1;
-  state.set("count", String(next));
+  state.put("count", String(next));
   return next;
 }
 
@@ -306,42 +186,6 @@ export default {
 };
 "#;
 
-pub(super) const MEMORY_ATOMIC_PUT_INCREMENT_WORKER_SOURCE: &str = r#"
-export function seed(state) {
-  state.set("count", "0");
-  return true;
-}
-
-export function increment(state) {
-  let next = 0;
-  state.put("count", (previous) => {
-    next = Number(previous ?? "0") + 1;
-    return String(next);
-  });
-  return next;
-}
-
-export function readCount(state) {
-  return String(state.get("count") ?? "0");
-}
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const id = env.BENCH_MEMORY.idFromName("hot");
-    const memory = env.BENCH_MEMORY.get(id);
-    if (url.pathname === "/seed") {
-      await memory.atomic(seed);
-      return new Response("ok");
-    }
-    if (url.pathname === "/get") {
-      return new Response(String(await memory.atomic(readCount)));
-    }
-    return new Response(String(await memory.atomic(increment)));
-  },
-};
-"#;
-
 pub(super) const REALWORLD_RATE_LIMITER_WORKER_SOURCE: &str = r#"
 const LIMIT = 1_000_000;
 const WINDOW_MS = 60 * 60 * 1000;
@@ -354,10 +198,10 @@ function json(value, init = {}) {
 }
 
 export function seedBucket(state) {
-  state.set("count", "0");
-  state.set("denied", "0");
-  state.set("resetAt", "0");
-  state.set("lastSeenAt", "0");
+  state.put("count", "0");
+  state.put("denied", "0");
+  state.put("resetAt", "0");
+  state.put("lastSeenAt", "0");
   return true;
 }
 
@@ -375,10 +219,10 @@ export function checkBucket(state) {
   const allowed = nextCount <= LIMIT;
   const denied = allowed ? Number(state.get("denied") ?? "0") : Number(state.get("denied") ?? "0") + 1;
 
-  state.set("count", String(nextCount));
-  state.set("denied", String(denied));
-  state.set("resetAt", String(nextResetAt));
-  state.set("lastSeenAt", String(now));
+  state.put("count", String(nextCount));
+  state.put("denied", String(denied));
+  state.put("resetAt", String(nextResetAt));
+  state.put("lastSeenAt", String(now));
 
   return {
     allowed,
@@ -465,9 +309,9 @@ async function loadUser(env, key) {
 }
 
 export function seedSession(state) {
-  state.set("count", "0");
-  state.set("lastSeenAt", "0");
-  state.set("expiresAt", "0");
+  state.put("count", "0");
+  state.put("lastSeenAt", "0");
+  state.put("expiresAt", "0");
   return true;
 }
 
@@ -479,9 +323,9 @@ export function touchSession(state) {
   const now = Date.now();
   const count = Number(state.get("count") ?? "0") + 1;
   const expiresAt = now + SESSION_TTL_MS;
-  state.set("count", String(count));
-  state.set("lastSeenAt", String(now));
-  state.set("expiresAt", String(expiresAt));
+  state.put("count", String(count));
+  state.put("lastSeenAt", String(now));
+  state.put("expiresAt", String(expiresAt));
   return { count, lastSeenAt: now, expiresAt };
 }
 

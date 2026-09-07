@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from "node:child_process";
-import { cpus } from "node:os";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { collectMetadata } from "./lib/metadata.mjs";
 import {
   discoverConfigs,
   expandConfigs,
@@ -49,7 +50,7 @@ validateRunBudget(plan, options);
 const run = {
   schema_version: 1,
   started_at: startedAt,
-  metadata: collectMetadata(),
+  metadata: collectMetadata(repoRoot),
   sample_count: options.samples,
   complete: true,
   failures: [],
@@ -58,11 +59,18 @@ const run = {
 
 for (const config of configs) {
   const script = config.script;
-  const env = { ...parseConfigEnv(script), ...(config.envOverrides ?? {}) };
+  const defaults = parseConfigEnv(script);
+  const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    key.startsWith("DD_BENCH_") && key !== "DD_BENCH_SOURCE_DIR"));
+  const env = { ...defaults, ...inherited, ...(config.envOverrides ?? {}) };
+  if (env.DD_BENCH_CPUSET === "first-available") {
+    env.DD_BENCH_CPUSET = run.metadata.cpu_affinity.split(/[-,]/)[0];
+  }
   const configRun = {
     name: config.name,
     path: relativePath(config.path),
     env,
+    script_sha256: createHash("sha256").update(script).digest("hex"),
     samples: [],
     summaries: [],
   };
@@ -70,7 +78,7 @@ for (const config of configs) {
 
   for (let index = 1; index <= options.samples; index += 1) {
     console.error(`[bench] ${config.name} sample ${index}/${options.samples}`);
-    const sample = await runConfig(config.path, index, config.envOverrides ?? {});
+    const sample = await runConfig(config.path, index, env);
     configRun.samples.push(sample);
     if (sample.status !== 0 || sample.signal) {
       run.complete = false;
@@ -118,36 +126,6 @@ one sampled config per matrix combination and passes selected values as
 environment overrides to the config script. Matrix configs marked
 DD_BENCH_MATRIX_OPT_IN=1 are skipped unless explicitly selected. Use --plan to
 inspect variants without spawning child processes.`);
-}
-
-function collectMetadata() {
-  return {
-    git_commit: commandText("git", ["rev-parse", "HEAD"]),
-    git_dirty: commandStatus("git", ["diff", "--quiet"]) !== 0,
-    rustc: commandText("rustc", ["--version"]),
-    cargo: commandText("cargo", ["--version"]),
-    os: commandText("uname", ["-a"]),
-    logical_cpus: cpus().length,
-  };
-}
-
-function commandText(command, args) {
-  const result = spawnSync(command, args, {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-  if (result.status !== 0) {
-    return null;
-  }
-  return result.stdout.trim();
-}
-
-function commandStatus(command, args) {
-  const result = spawnSync(command, args, {
-    cwd: repoRoot,
-    encoding: "utf8",
-  });
-  return result.status ?? (result.signal ? 128 : 1);
 }
 
 async function runConfig(path, sample, envOverrides) {

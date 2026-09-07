@@ -8,9 +8,9 @@ import { generateScalingSummary, replaceGeneratedBlock } from "../summarize.mjs"
 import { repoRoot } from "./runner-config.mjs";
 
 const modes = [
-  "direct-write-memory-wide",
+  "atomic-write-only-memory-wide",
   "atomic-readwrite-memory-wide",
-  "atomic-write-memory-wide",
+  "atomic-write-effect-memory-wide",
 ];
 const coreModes = modes;
 const isolates = [1, 2, 4, 8, 16, 32];
@@ -50,10 +50,10 @@ test("mixed hardware metadata is rejected", async () => {
 });
 
 test("missing and duplicate rows fail with exact selectors", async () => {
-  const { fixedPath, corePath } = await writeFixtures({ omitFixedMode: "atomic-write-memory-wide" });
+  const { fixedPath, corePath } = await writeFixtures({ omitFixedMode: "atomic-write-effect-memory-wide" });
   await assert.rejects(
     () => generateScalingSummary({ ...defaultOptions(), fixed: fixedPath, core: corePath }),
-    /missing benchmark row for atomic-write-memory-wide cross-shard isolates=16 shards=16/,
+    /missing benchmark row for atomic-write-effect-memory-wide cross-shard isolates=16/,
   );
 
   const duplicate = await writeFixtures({ duplicateFixed: true });
@@ -129,8 +129,6 @@ function defaultOptions() {
   return {
     allowDirty: false,
     fixedIsolates: 16,
-    fixedShards: 16,
-    coreShards: 16,
     coreIsolates: isolates,
   };
 }
@@ -155,7 +153,7 @@ async function writeFixtures(options = {}) {
     fixed.configs.push(configFixture(mode, "same-shard", 16, throughput(mode, "same-shard", 16), options));
   }
   if (options.duplicateFixed) {
-    fixed.configs.push(configFixture("direct-write-memory-wide", "cross-shard", 16, 13_206, options));
+    fixed.configs.push(configFixture("atomic-write-only-memory-wide", "cross-shard", 16, 13_206, options));
   }
   for (const mode of coreModes) {
     for (const keys of ["cross-shard", "same-shard"]) {
@@ -190,13 +188,12 @@ function resultFixture({ sampleCount, dirty = false, logicalCpus = 16, schemaVer
 
 function configFixture(mode, keys, isolate, throughputRps, options) {
   return {
-    name: `scaling-atomic-memory-matrix.sh::isolates=${isolate},shards=16,keys=${keys},mode=${mode}`,
+    name: `scaling-atomic-memory-matrix.sh::isolates=${isolate},keys=${keys},mode=${mode}`,
     env: {
       DD_BENCH_MODE: mode,
       DD_BENCH_MEMORY_KEY_MODE: keys,
       DD_BENCH_MIN_ISOLATES: String(isolate),
       DD_BENCH_MAX_ISOLATES: String(isolate),
-      DD_BENCH_MEMORY_NAMESPACE_SHARDS: "16",
     },
     samples: [{ sample: 1, status: options.failedSample ? 1 : 0, signal: null }],
     summaries: [
@@ -219,7 +216,7 @@ function configFixture(mode, keys, isolate, throughputRps, options) {
 
 function throughput(mode, keys, isolate) {
   const data = {
-    "direct-write-memory-wide": {
+    "atomic-write-only-memory-wide": {
       "cross-shard": { 1: 6_107, 2: 11_196, 4: 17_540, 8: 18_723, 16: 13_206, 32: 15_843 },
       "same-shard": { 1: 6_194, 2: 6_049, 4: 5_991, 8: 4_472, 16: 4_237, 32: 5_137 },
     },
@@ -227,7 +224,7 @@ function throughput(mode, keys, isolate) {
       "cross-shard": { 1: 2_549, 2: 4_307, 4: 6_413, 8: 8_405, 16: 8_620, 32: 9_123 },
       "same-shard": { 1: 2_828, 2: 2_581, 4: 2_387, 8: 2_050, 16: 2_342, 32: 2_359 },
     },
-    "atomic-write-memory-wide": {
+    "atomic-write-effect-memory-wide": {
       "cross-shard": { 1: 1_565, 2: 2_321, 4: 2_999, 8: 3_918, 16: 3_521, 32: 4_222 },
       "same-shard": { 1: 1_256, 2: 921, 4: 930, 8: 782, 16: 715, 32: 852 },
     },
@@ -236,7 +233,7 @@ function throughput(mode, keys, isolate) {
 }
 
 function p95(mode, keys) {
-  if (mode === "direct-write-memory-wide") {
+  if (mode === "atomic-write-only-memory-wide") {
     return keys === "cross-shard" ? 23.02 : 104.04;
   }
   if (mode === "atomic-readwrite-memory-wide") {
@@ -246,7 +243,7 @@ function p95(mode, keys) {
 }
 
 function p99(mode, keys) {
-  if (mode === "direct-write-memory-wide") {
+  if (mode === "atomic-write-only-memory-wide") {
     return keys === "cross-shard" ? 34.06 : 329.39;
   }
   if (mode === "atomic-readwrite-memory-wide") {

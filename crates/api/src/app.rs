@@ -1,11 +1,9 @@
 use crate::ServerLimits;
+use crate::handlers::invocation::handle_dev_worker_request;
 use crate::handlers::{handle_private_request, handle_public_request};
-#[cfg(feature = "http3")]
-use crate::public_quic;
 use crate::state::AppState;
 use common::{PlatformError, Result};
-use http::header::{ALT_SVC, HeaderValue};
-use http::{Request, Response};
+use http::Request;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -66,51 +64,22 @@ async fn serve_listeners(
     info!("public tcp listener on http://{}", public_addr);
     info!("private tcp listener on http://{}", private_addr);
 
-    match public_h3_enabled(&state) {
-        true => {
-            info!("public quic listener on https://{} (http/3)", public_addr);
-            #[cfg(feature = "http3")]
-            tokio::select! {
-                result = serve_public_listener(public_listener, state.clone(), build_alt_svc_header(public_addr.port()), limits.clone()) => result,
-                result = serve_private_listener(private_listener, state.clone(), limits.clone()) => result,
-                result = public_quic::serve_public_h3(public_addr, state) => result,
-            }
-            #[cfg(not(feature = "http3"))]
-            unreachable!("public_h3_enabled is false without the http3 feature")
-        }
-        false => {
-            warn!(
-                "public http/3 disabled because PUBLIC_TLS_CERT_PATH/PUBLIC_TLS_KEY_PATH are not configured"
-            );
-            tokio::select! {
-                result = serve_public_listener(public_listener, state.clone(), None, limits.clone()) => result,
-                result = serve_private_listener(private_listener, state, limits) => result,
-            }
-        }
+    tokio::select! {
+        result = serve_public_listener(public_listener, state.clone(), limits.clone()) => result,
+        result = serve_private_listener(private_listener, state, limits) => result,
     }
-}
-
-#[cfg(feature = "http3")]
-fn public_h3_enabled(state: &AppState) -> bool {
-    state.public_tls_cert_path.is_some() && state.public_tls_key_path.is_some()
-}
-
-#[cfg(not(feature = "http3"))]
-fn public_h3_enabled(_state: &AppState) -> bool {
-    false
 }
 
 async fn serve_public_listener(
     listener: tokio::net::TcpListener,
     state: AppState,
-    alt_svc_header: Option<HeaderValue>,
     limits: ServerLimits,
 ) -> Result<()> {
     let max_connections = limits.max_public_connections;
     serve_listener(
         listener,
         state,
-        ListenerKind::Public { alt_svc_header },
+        ListenerKind::Public,
         limits,
         max_connections,
     )
@@ -133,17 +102,45 @@ async fn serve_private_listener(
     .await
 }
 
+pub async fn serve_worker_listener(
+    listener: tokio::net::TcpListener,
+    runtime: runtime::RuntimeService,
+    worker_name: String,
+) -> Result<()> {
+    let deploy_tokens =
+        crate::deploy_tokens::DeployTokenStore::from_control_store(runtime.control_store());
+    let state = AppState::new(
+        runtime,
+        deploy_tokens,
+        16 * 1024 * 1024,
+        String::new(),
+        None,
+    );
+    let limits = ServerLimits::default();
+    let max_connections = limits.max_public_connections;
+    serve_listener(
+        listener,
+        state,
+        ListenerKind::Worker(worker_name),
+        limits,
+        max_connections,
+    )
+    .await
+}
+
 #[derive(Clone)]
 enum ListenerKind {
-    Public { alt_svc_header: Option<HeaderValue> },
+    Public,
     Private,
+    Worker(String),
 }
 
 impl ListenerKind {
     fn label(&self) -> &'static str {
         match self {
-            Self::Public { .. } => "public",
+            Self::Public => "public",
             Self::Private => "private",
+            Self::Worker(_) => "worker",
         }
     }
 }
@@ -188,16 +185,13 @@ async fn serve_listener(
                 let state = state.clone();
                 let kind = kind.clone();
                 async move {
-                    let mut response = match &kind {
-                        ListenerKind::Public { .. } => handle_public_request(state, request).await,
+                    let response = match &kind {
+                        ListenerKind::Public => handle_public_request(state, request).await,
                         ListenerKind::Private => handle_private_request(state, request).await,
+                        ListenerKind::Worker(name) => {
+                            handle_dev_worker_request(state, request, name.clone()).await
+                        }
                     };
-                    if let ListenerKind::Public {
-                        alt_svc_header: Some(value),
-                    } = &kind
-                    {
-                        annotate_alt_svc_header(&mut response, value);
-                    }
                     Ok::<_, Infallible>(response)
                 }
             });
@@ -218,14 +212,4 @@ async fn serve_listener(
             }
         });
     }
-}
-
-#[cfg(feature = "http3")]
-fn build_alt_svc_header(port: u16) -> Option<HeaderValue> {
-    let value = format!("h3=\":{port}\"; ma=86400");
-    HeaderValue::from_str(&value).ok()
-}
-
-fn annotate_alt_svc_header<T>(response: &mut Response<T>, value: &HeaderValue) {
-    response.headers_mut().insert(ALT_SVC, value.clone());
 }

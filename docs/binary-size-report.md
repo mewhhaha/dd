@@ -1,5 +1,9 @@
 # Binary Size Report
 
+This is a historical measurement. The Wasmtime experiment and direct HTTP/3
+implementation have since been removed; regenerate measurements with
+`scripts/measure-binary-size.sh` for the current tree.
+
 ## Binary Size
 
 Baseline commit: `96bbb2eca0cd7b1808179efe819901bfe5dc9502`
@@ -73,9 +77,6 @@ Each focused benchmark was run five times on the same host for baseline and cand
 | --- | ---: | ---: | ---: |
 | direct memory read throughput | 12,292 req/s | 12,955 req/s | +5.4% |
 | direct memory write throughput | 2,024 req/s | 2,052 req/s | +1.4% |
-| dynamic baseline throughput | 4,479 req/s | 4,387 req/s | -2.1% |
-| dynamic hot fetch throughput | 3,464 req/s | 3,513 req/s | +1.4% |
-| dynamic hot fetch + host RPC throughput | 2,058 req/s | 2,116 req/s | +2.8% |
 | startup-to-ready | 77ms | 76ms | -1.3% |
 | idle RSS | 124,064 KiB | 79,948 KiB | -35.6% |
 
@@ -105,6 +106,5 @@ Smoke checks:
 
 Compatibility notes:
 
-- V8/`deno_core`, Deno Web/Fetch/WebCrypto, Turso, and Cap'n Proto remain in place.
-- HTTP/3, WebSocket over HTTP/3, and WebTransport black-box tests pass.
+- V8/`deno_core`, Deno Web/Fetch/WebCrypto, and Turso remain in place.
 - OTLP remains available through HTTP protobuf; `OTEL_EXPORTER_OTLP_ENDPOINT` and `DD_OTEL_ENDPOINT` base URLs are normalized to `/v1/traces`.

@@ -1,4 +1,76 @@
 use super::*;
+pub(crate) async fn handle_dev_worker_request<B>(
+    state: AppState,
+    request: Request<B>,
+    worker_name: String,
+) -> Response<ResponseBody>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let Some(active_request) = state.operations.try_begin_request() else {
+        return respond(Err(PlatformError::overloaded("service is draining").into()));
+    };
+    let response = async {
+        let mut request = request;
+        let url = match request.headers_mut().remove("x-dd-dev-request-url") {
+            Some(value) => value
+                .to_str()
+                .map_err(|error| {
+                    PlatformError::bad_request(format!("invalid dev request URL header: {error}"))
+                })?
+                .to_string(),
+            None => format!(
+                "http://{}{}",
+                request
+                    .headers()
+                    .get(HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("localhost"),
+                request.uri()
+            ),
+        };
+        let original_url = url::Url::parse(&url).map_err(|error| {
+            PlatformError::bad_request(format!("invalid dev request URL {url:?}: {error}"))
+        })?;
+        if !matches!(original_url.scheme(), "http" | "https") || original_url.host_str().is_none() {
+            return Err(
+                PlatformError::bad_request(format!("unsupported dev request URL {url:?}")).into(),
+            );
+        }
+        let host = match request.headers_mut().remove("x-dd-dev-request-host") {
+            Some(host) => host,
+            None => HeaderValue::from_str(
+                &original_url[url::Position::BeforeHost..url::Position::AfterPort],
+            )
+            .map_err(|error| {
+                PlatformError::bad_request(format!("invalid dev request host in {url:?}: {error}"))
+            })?,
+        };
+        request.headers_mut().insert(HOST, host);
+        let ws_upgrade = if is_websocket_upgrade(request.headers()) {
+            Some(prepare_websocket_upgrade(&mut request)?)
+        } else {
+            None
+        };
+        let (parts, body) = request.into_parts();
+        if ws_upgrade.is_some() {
+            return websocket::invoke_worker_websocket_with_target(
+                state,
+                parts,
+                body,
+                worker_name,
+                url,
+                ws_upgrade,
+            )
+            .await;
+        }
+        invoke_worker_with_target(state, parts, body, worker_name, url, false).await
+    }
+    .await;
+    track_response(respond(response), active_request)
+}
+
 pub async fn invoke_worker_private<B>(
     state: AppState,
     request: Request<B>,
@@ -42,22 +114,6 @@ where
     invoke_worker_with_target(state, parts, body, worker_name, url, true).await
 }
 
-#[cfg(feature = "http3")]
-pub async fn invoke_worker_public_h3(
-    state: AppState,
-    request: Request<()>,
-    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
-) -> ApiResult<Response<ResponseBody>> {
-    let (parts, _body) = request.into_parts();
-    let worker_name = parse_public_worker_name_from_request(
-        &parts.headers,
-        &parts.uri,
-        &state.public_base_domain,
-    )?;
-    let url = build_public_request_url(&parts.headers, &parts.uri)?;
-    invoke_worker_from_body_stream(state, parts, request_body_stream, worker_name, url, true).await
-}
-
 async fn invoke_worker_with_target<B>(
     state: AppState,
     parts: http::request::Parts,
@@ -76,7 +132,13 @@ where
         drain_forbidden_request_body(&parts.method, body, max_body_bytes).await?;
         None
     } else {
-        Some(build_request_body_stream(body, max_body_bytes))
+        let (budget, chunk_bytes) = state.runtime.request_body_budget();
+        Some(build_request_body_stream(
+            body,
+            max_body_bytes,
+            budget,
+            chunk_bytes,
+        ))
     };
     invoke_worker_from_body_stream(
         state,
@@ -562,7 +624,23 @@ fn normalize_host(host: &str) -> Option<String> {
     Some(lower)
 }
 
-fn build_request_body_stream<B>(body: B, max_bytes: usize) -> runtime::InvokeRequestBodyReceiver
+struct AdmittedRequestChunk {
+    bytes: Bytes,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for AdmittedRequestChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn build_request_body_stream<B>(
+    body: B,
+    max_bytes: usize,
+    budget: std::sync::Arc<tokio::sync::Semaphore>,
+    chunk_bytes: usize,
+) -> runtime::InvokeRequestBodyReceiver
 where
     B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
     B::Error: std::fmt::Display + Send + Sync + 'static,
@@ -571,7 +649,15 @@ where
     tokio::spawn(async move {
         let mut stream = body.into_data_stream();
         let mut total = 0usize;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                chunk = stream.next() => match chunk {
+                    Some(chunk) => chunk,
+                    None => return,
+                },
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -590,8 +676,28 @@ where
                     .await;
                 return;
             }
-            if tx.send(Ok(chunk)).await.is_err() {
-                return;
+            for bytes in chunk.chunks(chunk_bytes) {
+                let permit = tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    permit = std::sync::Arc::clone(&budget).acquire_many_owned(bytes.len() as u32) => {
+                        match permit {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        }
+                    },
+                };
+                let admitted = Bytes::from_owner(AdmittedRequestChunk {
+                    bytes: if bytes.len() == chunk.len() {
+                        chunk.clone()
+                    } else {
+                        Bytes::copy_from_slice(bytes)
+                    },
+                    _permit: permit,
+                });
+                if tx.send(Ok(admitted)).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -677,4 +783,75 @@ fn build_direct_buffered_response(
     );
     annotate_response_with_trace_id(&mut response);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn request_chunks_hold_admission_until_the_consumer_releases_the_bytes() {
+        let budget = Arc::new(Semaphore::new(4));
+        let mut first = build_request_body_stream(
+            http_body_util::Full::new(Bytes::from_static(b"abcdefgh")),
+            16,
+            Arc::clone(&budget),
+            4,
+        );
+        let retained = first
+            .recv()
+            .await
+            .expect("first chunk")
+            .expect("valid body");
+        assert_eq!(retained.as_ref(), b"abcd");
+        let mut second = build_request_body_stream(
+            http_body_util::Full::new(Bytes::from_static(b"second")),
+            16,
+            budget,
+            4,
+        );
+        drop(first);
+        assert!(
+            timeout(Duration::from_millis(30), second.recv())
+                .await
+                .is_err()
+        );
+        drop(retained);
+        let admitted = timeout(Duration::from_secs(1), second.recv())
+            .await
+            .expect("released bytes admit the next upload")
+            .expect("next chunk")
+            .expect("valid body");
+        assert_eq!(admitted.as_ref(), b"seco");
+        drop(admitted);
+        let remaining = second
+            .recv()
+            .await
+            .expect("remaining bytes")
+            .expect("valid body");
+        assert_eq!(remaining.as_ref(), b"nd");
+        drop(remaining);
+        assert!(second.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn canceling_an_upload_drops_a_pending_network_body() {
+        let (network, receiver) =
+            mpsc::channel::<Result<Frame<Bytes>, std::convert::Infallible>>(1);
+        let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|frame| (frame, receiver))
+        })
+        .boxed();
+        let upload =
+            build_request_body_stream(StreamBody::new(stream), 16, Arc::new(Semaphore::new(4)), 4);
+        tokio::task::yield_now().await;
+        drop(upload);
+        timeout(Duration::from_secs(1), network.closed())
+            .await
+            .expect("canceling a queued upload drops its pending network stream");
+    }
 }

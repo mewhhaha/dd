@@ -1,16 +1,11 @@
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
-use crate::kv::{
-    KvBatchMutation, KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup,
-};
+use crate::kv::{KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup};
 use crate::memory::{
     MemoryBatchMutation, MemoryCommandResultWrite, MemoryOutboxEffectWrite,
     MemoryProfileMetricKind, MemorySnapshotEntry, MemoryStore,
 };
-use crate::memory_rpc::{
-    MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse, decode_memory_invoke_response,
-    encode_memory_invoke_request,
-};
-use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
+
+use crate::service::MemoryExecutionCall;
 use bytes::Bytes;
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
 use deno_core::{JsBuffer, OpState};
@@ -26,14 +21,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_traits::impls::RealSys;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
-#[path = "ops/dynamic.rs"]
-mod dynamic_ops;
-#[path = "ops/dynamic_types.rs"]
-mod dynamic_types;
 #[path = "ops/memory.rs"]
 mod memory_ops;
 #[path = "ops/memory_types.rs"]
 mod memory_types;
+#[path = "ops/request_control.rs"]
+mod request_control_ops;
+#[path = "ops/request_control_types.rs"]
+mod request_control_types;
 #[path = "ops/request.rs"]
 mod request_ops;
 #[path = "ops/request_types.rs"]
@@ -41,13 +36,13 @@ mod request_types;
 #[path = "ops/storage_http.rs"]
 mod storage_http_ops;
 
-use self::dynamic_ops::*;
-pub(crate) use self::dynamic_types::*;
 use self::memory_ops::*;
 pub(crate) use self::memory_ops::{
     clear_memory_batch_handles, clear_memory_byte_handles, clear_memory_command_handles,
 };
 pub(crate) use self::memory_types::*;
+use self::request_control_ops::*;
+pub(crate) use self::request_control_types::*;
 use self::request_ops::*;
 pub(crate) use self::request_types::*;
 use self::storage_http_ops::*;
@@ -60,12 +55,11 @@ pub struct IsolateEventSender(pub Rc<dyn Fn(IsolateEventPayload) -> bool>);
 #[derive(Clone, Default)]
 pub struct MemoryOpenHandleRegistry {
     socket_handles: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
-    transport_handles: Arc<StdMutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl MemoryOpenHandleRegistry {
     fn owner_key(binding: &str, key: &str) -> String {
-        format!("{binding}\u{001f}{key}")
+        format!("{}:{binding}{key}", binding.len())
     }
 
     pub fn list_socket_handles(&self, binding: &str, key: &str) -> Vec<String> {
@@ -74,19 +68,6 @@ impl MemoryOpenHandleRegistry {
             .socket_handles
             .lock()
             .expect("socket handle registry mutex poisoned")
-            .get(&owner_key)
-            .map(|values| values.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        handles.sort();
-        handles
-    }
-
-    pub fn list_transport_handles(&self, binding: &str, key: &str) -> Vec<String> {
-        let owner_key = Self::owner_key(binding, key);
-        let mut handles = self
-            .transport_handles
-            .lock()
-            .expect("transport handle registry mutex poisoned")
             .get(&owner_key)
             .map(|values| values.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
@@ -121,41 +102,10 @@ impl MemoryOpenHandleRegistry {
         }
     }
 
-    pub fn add_transport_handle(&self, binding: &str, key: &str, handle: &str) {
-        let owner_key = Self::owner_key(binding, key);
-        self.transport_handles
-            .lock()
-            .expect("transport handle registry mutex poisoned")
-            .entry(owner_key)
-            .or_default()
-            .insert(handle.to_string());
-    }
-
-    pub fn remove_transport_handle(&self, binding: &str, key: &str, handle: &str) {
-        let owner_key = Self::owner_key(binding, key);
-        let mut handles = self
-            .transport_handles
-            .lock()
-            .expect("transport handle registry mutex poisoned");
-        let remove_owner = if let Some(values) = handles.get_mut(&owner_key) {
-            values.remove(handle);
-            values.is_empty()
-        } else {
-            false
-        };
-        if remove_owner {
-            handles.remove(&owner_key);
-        }
-    }
-
     pub fn clear(&self) {
         self.socket_handles
             .lock()
             .expect("socket handle registry mutex poisoned")
-            .clear();
-        self.transport_handles
-            .lock()
-            .expect("transport handle registry mutex poisoned")
             .clear();
     }
 }
@@ -184,21 +134,9 @@ pub enum IsolateEventPayload {
         reply: oneshot::Sender<Result<()>>,
     },
     CacheRevalidate(CacheRevalidatePayload),
-    MemoryInvoke(MemoryInvokeEvent),
     MemorySocketSend(MemorySocketSendEvent),
     MemorySocketClose(MemorySocketCloseEvent),
-    MemorySocketConsumeClose(MemorySocketConsumeCloseEvent),
-    MemoryTransportSendStream(MemoryTransportSendStreamEvent),
-    MemoryTransportSendDatagram(MemoryTransportSendDatagramEvent),
-    MemoryTransportClose(MemoryTransportCloseEvent),
-    MemoryTransportConsumeClose(MemoryTransportConsumeCloseEvent),
-    DynamicWorkerCreate(DynamicWorkerCreateEvent),
-    DynamicWorkerLookup(DynamicWorkerLookupEvent),
-    DynamicWorkerList(DynamicWorkerListEvent),
-    DynamicWorkerDelete(DynamicWorkerDeleteEvent),
-    DynamicHostRpcInvoke(DynamicHostRpcInvokeEvent),
     TestAsyncReply(TestAsyncReplyEvent),
-    TestNestedTargetedInvoke(TestNestedTargetedInvokeEvent),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,6 +152,8 @@ pub(crate) struct CacheRevalidatePayload {
 pub(crate) struct RuntimeExecutionLimits {
     pub(crate) max_request_body_bytes: usize,
     pub(crate) max_isolate_heap_bytes: usize,
+    pub(crate) max_buffered_response_bytes: usize,
+    pub(crate) response_byte_budget: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -267,35 +207,20 @@ deno_core::extension!(
         op_kv_profile_record_js,
         op_kv_profile_take,
         op_kv_profile_reset,
-        op_kv_take_failed_write_version,
         op_kv_put,
         op_kv_put_value_bytes,
         op_kv_delete,
-        op_kv_enqueue_put,
-        op_kv_enqueue_put_value_bytes,
-        op_kv_enqueue_delete,
         op_kv_list,
         op_cache_match,
         op_cache_put,
         op_cache_delete,
-        op_dynamic_profile_take,
-        op_dynamic_profile_reset,
-        op_dynamic_module_graph_register,
-        op_dynamic_module_graph_release,
         op_http_prepare,
         op_http_check_url,
-        op_dynamic_cancel_reply,
-        op_dynamic_take_control_items,
+        op_request_reply_cancel,
+        op_request_control_take,
         op_test_async_reply_start,
         op_test_async_reply_cancel,
-        op_test_nested_targeted_invoke_start,
-        op_dynamic_worker_create,
-        op_dynamic_worker_lookup,
-        op_dynamic_worker_list,
-        op_dynamic_worker_delete,
-        op_dynamic_worker_fetch_start,
         op_service_binding_fetch_start,
-        op_dynamic_host_rpc_invoke,
         op_request_invocation_descriptor,
         op_take_worker_deployment_config,
         op_request_wait_until_register,
@@ -304,13 +229,11 @@ deno_core::extension!(
         op_request_context_close,
         op_request_context_cancel,
         op_memory_request_scope_close,
-        op_memory_invoke_method,
+        op_memory_lease_acquire,
         op_memory_profile_record_js,
         op_memory_profile_take,
         op_memory_profile_reset,
-        op_memory_state_get,
         op_memory_state_snapshot,
-        op_memory_state_version_if_newer,
         op_memory_bytes_put,
         op_memory_bytes_take,
         op_memory_batch_begin,
@@ -321,19 +244,12 @@ deno_core::extension!(
         op_memory_batch_list_overlay,
         op_memory_batch_effect,
         op_memory_batch_command_result,
-        op_memory_direct_apply,
         op_memory_batch_apply,
         op_memory_command_begin,
         op_memory_command_close,
         op_memory_socket_send,
         op_memory_socket_close,
         op_memory_socket_list,
-        op_memory_socket_consume_close,
-        op_memory_transport_send_stream,
-        op_memory_transport_send_datagram,
-        op_memory_transport_close,
-        op_memory_transport_list,
-        op_memory_transport_consume_close,
         op_emit_completion_ok,
         op_emit_completion_error,
         op_emit_wait_until_done,
@@ -407,6 +323,8 @@ pub fn register_memory_request_scope(
     state
         .borrow_mut::<MemoryRequestScopes>()
         .insert(MemoryRequestScope {
+            request_context_handle: 0,
+            lease: None,
             namespace,
             memory_key,
             owner_epoch,
@@ -479,6 +397,10 @@ pub fn clear_memory_request_scope(state: &mut OpState, memory_scope_handle: u32)
 
 pub fn clear_request_secret_context(state: &mut OpState, request_context_handle: u32) {
     state
+        .borrow_mut::<MemoryRequestScopes>()
+        .scopes
+        .retain(|_, scope| scope.request_context_handle != request_context_handle);
+    state
         .borrow_mut::<ActiveRequestContextHandles>()
         .remove_handle(request_context_handle);
     if let Some(context) = state
@@ -510,8 +432,8 @@ fn wall_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DynamicControlInbox, DynamicControlItem, DynamicPendingReplyResult,
-        DynamicPushedReplyPayload, EgressAllowHost, is_egress_url_allowed, parse_egress_allow_host,
+        EgressAllowHost, PushedReplyPayload, RequestControlInbox, RequestControlItem,
+        TestAsyncReplyResult, is_egress_url_allowed, parse_egress_allow_host,
     };
 
     #[test]
@@ -609,85 +531,91 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_control_inbox_batches_reply_items_under_one_schedule() {
-        let inbox = DynamicControlInbox::default();
-        assert!(inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-            DynamicPendingReplyResult {
-                reply_id: "dynr-1".to_string(),
-                ready: true,
-                ..DynamicPendingReplyResult::default()
-            }
-        )));
-        assert!(!inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-            DynamicPendingReplyResult {
-                reply_id: "dynr-2".to_string(),
-                ready: true,
-                ..DynamicPendingReplyResult::default()
-            }
-        )));
+    fn request_control_inbox_batches_reply_items_under_one_schedule() {
+        let inbox = RequestControlInbox::default();
+        assert!(
+            inbox.push_reply(PushedReplyPayload::TestAsync(TestAsyncReplyResult {
+                reply_id: "reply-1".to_string(),
+                ok: true,
+                value: String::new(),
+                error: String::new(),
+            }))
+        );
+        assert!(
+            !inbox.push_reply(PushedReplyPayload::TestAsync(TestAsyncReplyResult {
+                reply_id: "reply-2".to_string(),
+                ok: true,
+                value: String::new(),
+                error: String::new(),
+            }))
+        );
 
         let first = inbox.take_batch();
         assert_eq!(first.len(), 2);
         assert!(matches!(
             &first[0],
-            DynamicControlItem::Reply(DynamicPushedReplyPayload::Dynamic(payload))
-                if payload.reply_id == "dynr-1"
+            RequestControlItem::Reply(PushedReplyPayload::TestAsync(payload))
+                if payload.reply_id == "reply-1"
         ));
         assert!(matches!(
             &first[1],
-            DynamicControlItem::Reply(DynamicPushedReplyPayload::Dynamic(payload))
-                if payload.reply_id == "dynr-2"
+            RequestControlItem::Reply(PushedReplyPayload::TestAsync(payload))
+                if payload.reply_id == "reply-2"
         ));
         assert!(inbox.take_batch().is_empty());
-        assert!(inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-            DynamicPendingReplyResult {
-                reply_id: "dynr-3".to_string(),
-                ready: true,
-                ..DynamicPendingReplyResult::default()
-            }
-        )));
+        assert!(
+            inbox.push_reply(PushedReplyPayload::TestAsync(TestAsyncReplyResult {
+                reply_id: "reply-3".to_string(),
+                ok: true,
+                value: String::new(),
+                error: String::new(),
+            }))
+        );
     }
 
     #[test]
-    fn dynamic_control_inbox_reschedules_after_empty_drain() {
-        let inbox = DynamicControlInbox::default();
-        assert!(inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-            DynamicPendingReplyResult {
-                reply_id: "dynr-1".to_string(),
-                ready: true,
-                ..DynamicPendingReplyResult::default()
-            }
-        )));
+    fn request_control_inbox_reschedules_after_empty_drain() {
+        let inbox = RequestControlInbox::default();
+        assert!(
+            inbox.push_reply(PushedReplyPayload::TestAsync(TestAsyncReplyResult {
+                reply_id: "reply-1".to_string(),
+                ok: true,
+                value: String::new(),
+                error: String::new(),
+            }))
+        );
 
         let first = inbox.take_batch();
         assert_eq!(first.len(), 1);
         assert!(matches!(
             &first[0],
-            DynamicControlItem::Reply(DynamicPushedReplyPayload::Dynamic(payload))
-                if payload.reply_id == "dynr-1"
+            RequestControlItem::Reply(PushedReplyPayload::TestAsync(payload))
+                if payload.reply_id == "reply-1"
         ));
 
-        assert!(!inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-            DynamicPendingReplyResult {
-                reply_id: "dynr-2".to_string(),
-                ready: true,
-                ..DynamicPendingReplyResult::default()
-            }
-        )));
+        assert!(
+            !inbox.push_reply(PushedReplyPayload::TestAsync(TestAsyncReplyResult {
+                reply_id: "reply-2".to_string(),
+                ok: true,
+                value: String::new(),
+                error: String::new(),
+            }))
+        );
         let second = inbox.take_batch();
         assert_eq!(second.len(), 1);
         assert!(matches!(
             &second[0],
-            DynamicControlItem::Reply(DynamicPushedReplyPayload::Dynamic(payload))
-                if payload.reply_id == "dynr-2"
+            RequestControlItem::Reply(PushedReplyPayload::TestAsync(payload))
+                if payload.reply_id == "reply-2"
         ));
         assert!(inbox.take_batch().is_empty());
-        assert!(inbox.push_reply(DynamicPushedReplyPayload::Dynamic(
-            DynamicPendingReplyResult {
-                reply_id: "dynr-3".to_string(),
-                ready: true,
-                ..DynamicPendingReplyResult::default()
-            }
-        )));
+        assert!(
+            inbox.push_reply(PushedReplyPayload::TestAsync(TestAsyncReplyResult {
+                reply_id: "reply-3".to_string(),
+                ok: true,
+                value: String::new(),
+                error: String::new(),
+            }))
+        );
     }
 }

@@ -17,27 +17,20 @@ export default {
     }
 
     const stub = room(env);
-    return await stub.atomic(() => {
-      const { response } = stub.accept(request);
+    return await stub.atomic((tx) => {
+      const { response } = tx.accept(request);
       return response;
     });
   },
 
   async wake(event) {
-    if (!event?.stub || event.type !== "socketopen") {
+    if (!event?.stub || event.type !== "socketmessage") {
       return;
     }
 
-    // This is the tiny shape of the old deadlock:
-    //
-    // socketopen wake is running on the isolate lane
-    //   -> sockets.values() asks Rust for the active handles
-    //     -> Rust replies through isolate event delivery
-    //       -> isolate cannot deliver it because this wake is awaiting values()
-    //
-    // A healthy runtime sends "ready:1" immediately. The broken runtime hangs.
     const handles = await event.stub.sockets.values();
-    const socket = new WebSocket(event.handle);
-    socket.send(`ready:${handles.length}`, "text");
+    await event.stub.atomic((tx) => {
+      tx.sockets.send(event.handle, `ready:${handles.length}`);
+    });
   },
 };

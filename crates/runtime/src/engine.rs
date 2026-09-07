@@ -1,16 +1,15 @@
 use crate::assets::{
     BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER, install_worker_js,
 };
-use crate::dynamic_modules::{
-    DynamicModuleRegistry, RuntimeModuleKind, normalize_dynamic_module_path,
-    resolve_dynamic_module_path,
+use crate::module_registry::{
+    ModuleRegistry, RuntimeModuleKind, normalize_module_path, resolve_module_path,
 };
 use crate::ops::{
     WorkerDeploymentPayload, WorkerRequestPayload, WorkerSource, clear_request_invocation,
     clear_worker_deployment_config, register_request_invocation, register_worker_deployment_config,
     runtime_extension,
 };
-use crate::service::{HostRpcExecutionCall, MemoryExecutionCall};
+use crate::service::MemoryExecutionCall;
 use base64::Engine;
 use common::{PlatformError, Result, WorkerInvocation};
 use deno_core::{
@@ -34,19 +33,25 @@ include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 const NODE_ASYNC_HOOKS_SOURCE: &str = include_str!("../js/node_async_hooks.js");
 
 static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
+static BOOTSTRAP_SNAPSHOT: OnceLock<Result<Box<[u8]>>> = OnceLock::new();
 
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
-    let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
-        extensions: runtime_extensions(),
-        module_loader: Some(Rc::new(RuntimeModuleLoader::default())),
-        create_params: Some(runtime_create_params(0)),
-        ..Default::default()
-    });
-    runtime
-        .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
-        .map_err(runtime_error)?;
-    let snapshot = runtime.snapshot();
-    Ok(Box::leak(snapshot))
+    BOOTSTRAP_SNAPSHOT
+        .get_or_init(|| {
+            let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
+                extensions: runtime_extensions(),
+                module_loader: Some(Rc::new(RuntimeModuleLoader::default())),
+                create_params: Some(runtime_create_params(0)),
+                ..Default::default()
+            });
+            runtime
+                .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
+                .map_err(runtime_error)?;
+            let snapshot = runtime.snapshot();
+            Ok(snapshot)
+        })
+        .as_deref()
+        .map_err(Clone::clone)
 }
 
 pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
@@ -82,6 +87,7 @@ pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn validate_worker(
     bootstrap_snapshot: &'static [u8],
     source: &str,
@@ -91,30 +97,31 @@ pub async fn validate_worker(
         bootstrap_snapshot,
         allow_code_generation,
         0,
-        DynamicModuleRegistry::default(),
+        ModuleRegistry::default(),
     )?;
     load_worker(&mut runtime, source).await
 }
 
+#[cfg(test)]
 pub fn new_runtime_from_snapshot(
     startup_snapshot: &'static [u8],
     allow_code_generation: bool,
-    dynamic_modules: DynamicModuleRegistry,
+    module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
-    new_runtime(startup_snapshot, allow_code_generation, 0, dynamic_modules)
+    new_runtime(startup_snapshot, allow_code_generation, 0, module_registry)
 }
 
 pub fn new_runtime_from_snapshot_with_heap_limit(
     startup_snapshot: &'static [u8],
     allow_code_generation: bool,
     max_heap_bytes: usize,
-    dynamic_modules: DynamicModuleRegistry,
+    module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
     new_runtime(
         startup_snapshot,
         allow_code_generation,
         max_heap_bytes,
-        dynamic_modules,
+        module_registry,
     )
 }
 
@@ -125,12 +132,12 @@ pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
 }
 
 pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) -> Result<()> {
-    let dynamic_modules = runtime
+    let module_registry = runtime
         .op_state()
         .borrow()
-        .borrow::<DynamicModuleRegistry>()
+        .borrow::<ModuleRegistry>()
         .clone();
-    let source = worker_source_text(source, &dynamic_modules)?;
+    let source = worker_source_text(source, &module_registry)?;
     load_worker(runtime, source.as_ref()).await
 }
 
@@ -138,7 +145,7 @@ struct RuntimeEntrypoints {
     install_worker_deployment_handle: Rc<v8::Global<v8::Function>>,
     execute_worker_handle: Rc<v8::Global<v8::Function>>,
     abort_worker_request_handle: Rc<v8::Global<v8::Function>>,
-    drain_dynamic_control_queue: Rc<v8::Global<v8::Function>>,
+    drain_request_control_queue: Rc<v8::Global<v8::Function>>,
 }
 
 pub fn install_worker_deployment_config(
@@ -178,8 +185,8 @@ pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
         let execute_worker_handle = global_function(scope, global, "__dd_execute_worker_handle")?;
         let abort_worker_request_handle =
             global_function(scope, global, "__dd_abort_worker_request_handle")?;
-        let drain_dynamic_control_queue =
-            global_function(scope, global, "__dd_drain_dynamic_control_queue_handle")?;
+        let drain_request_control_queue =
+            global_function(scope, global, "__dd_drain_request_control_queue_handle")?;
         RuntimeEntrypoints {
             install_worker_deployment_handle: Rc::new(v8::Global::new(
                 scope,
@@ -190,9 +197,9 @@ pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
                 scope,
                 abort_worker_request_handle,
             )),
-            drain_dynamic_control_queue: Rc::new(v8::Global::new(
+            drain_request_control_queue: Rc::new(v8::Global::new(
                 scope,
-                drain_dynamic_control_queue,
+                drain_request_control_queue,
             )),
         }
     };
@@ -209,7 +216,6 @@ pub struct WorkerDispatchRequest<'a> {
     pub request_body_stream_handle: u32,
     pub stream_response: bool,
     pub memory_call: Option<&'a MemoryExecutionCall>,
-    pub host_rpc_call: Option<&'a HostRpcExecutionCall>,
     pub request: WorkerInvocation,
 }
 
@@ -225,7 +231,6 @@ pub fn dispatch_worker_request(
         request_body_stream_handle,
         stream_response,
         memory_call,
-        host_rpc_call,
         mut request,
     } = dispatch;
     let request_handle = {
@@ -243,7 +248,6 @@ pub fn dispatch_worker_request(
             completion_handle,
             memory_request_scope_handle,
             memory_call: memory_call.cloned(),
-            host_rpc_call: host_rpc_call.cloned(),
             request_body_stream_handle,
             request_headers_handle,
             request_body_handle,
@@ -283,11 +287,11 @@ pub fn abort_worker_request_handle(
     )
 }
 
-pub fn drain_dynamic_control_queue(runtime: &mut JsRuntime) -> Result<()> {
+pub fn drain_request_control_queue(runtime: &mut JsRuntime) -> Result<()> {
     call_cached_noarg_function(
         runtime,
-        "__dd_drain_dynamic_control_queue_handle",
-        |entrypoints| Rc::clone(&entrypoints.drain_dynamic_control_queue),
+        "__dd_drain_request_control_queue_handle",
+        |entrypoints| Rc::clone(&entrypoints.drain_request_control_queue),
     )
 }
 
@@ -303,20 +307,28 @@ fn new_runtime(
     startup_snapshot: &'static [u8],
     allow_code_generation: bool,
     max_heap_bytes: usize,
-    dynamic_modules: DynamicModuleRegistry,
+    module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
     let create_params = Some(runtime_create_params(max_heap_bytes));
     let mut runtime = JsRuntime::try_new(RuntimeOptions {
         extensions: runtime_extensions(),
         module_loader: Some(Rc::new(RuntimeModuleLoader {
-            dynamic_modules: dynamic_modules.clone(),
+            module_registry: module_registry.clone(),
         })),
         startup_snapshot: Some(startup_snapshot),
         create_params,
         ..Default::default()
     })
     .map_err(runtime_error)?;
-    runtime.op_state().borrow_mut().put(dynamic_modules);
+    if max_heap_bytes > 0 {
+        let isolate = runtime.v8_isolate().thread_safe_handle();
+        runtime.add_near_heap_limit_callback(move |current_limit, _| {
+            isolate.terminate_execution();
+            // V8 needs headroom to unwind after termination instead of aborting the process.
+            current_limit.saturating_add(16 * 1024 * 1024)
+        });
+    }
+    runtime.op_state().borrow_mut().put(module_registry);
     set_code_generation_from_strings(&mut runtime, allow_code_generation);
     Ok(runtime)
 }
@@ -441,7 +453,7 @@ fn without_esm(extension: Extension) -> Extension {
 
 #[derive(Default)]
 struct RuntimeModuleLoader {
-    dynamic_modules: DynamicModuleRegistry,
+    module_registry: ModuleRegistry,
 }
 
 impl ModuleLoader for RuntimeModuleLoader {
@@ -451,11 +463,11 @@ impl ModuleLoader for RuntimeModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
-        if referrer.starts_with("dd-dynamic:")
+        if referrer.starts_with("dd-module:")
             && !specifier.starts_with("//")
             && !has_url_scheme(specifier)
         {
-            return resolve_dd_dynamic_import(specifier, referrer);
+            return resolve_dd_module_import(specifier, referrer);
         }
         resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
     }
@@ -467,8 +479,8 @@ impl ModuleLoader for RuntimeModuleLoader {
         options: deno_core::ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         ModuleLoadResponse::Sync(match module_specifier.scheme() {
-            "dd-dynamic" => load_dd_dynamic_module(
-                &self.dynamic_modules,
+            "dd-module" => load_dd_module(
+                &self.module_registry,
                 module_specifier,
                 options.requested_module_type,
             ),
@@ -485,34 +497,34 @@ impl ModuleLoader for RuntimeModuleLoader {
     }
 }
 
-fn resolve_dd_dynamic_import(
+fn resolve_dd_module_import(
     specifier: &str,
     referrer: &str,
 ) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
     let referrer = ModuleSpecifier::parse(referrer).map_err(JsErrorBox::from_err)?;
-    let (graph_id, referrer_path) = dd_dynamic_module_parts(&referrer)?;
+    let (graph_id, referrer_path) = dd_module_parts(&referrer)?;
     let module_path =
-        resolve_dynamic_module_path(&referrer_path, specifier).map_err(JsErrorBox::generic)?;
+        resolve_module_path(&referrer_path, specifier).map_err(JsErrorBox::generic)?;
     let encoded_path = module_path
         .split('/')
         .map(percent_encode_path_segment)
         .collect::<Vec<_>>()
         .join("/");
-    ModuleSpecifier::parse(&format!("dd-dynamic://graph/{graph_id}/{encoded_path}"))
+    ModuleSpecifier::parse(&format!("dd-module://graph/{graph_id}/{encoded_path}"))
         .map_err(JsErrorBox::from_err)
 }
 
-fn load_dd_dynamic_module(
-    dynamic_modules: &DynamicModuleRegistry,
+fn load_dd_module(
+    module_registry: &ModuleRegistry,
     module_specifier: &ModuleSpecifier,
     requested_module_type: RequestedModuleType,
 ) -> std::result::Result<ModuleSource, JsErrorBox> {
-    let (graph_id, module_path) = dd_dynamic_module_parts(module_specifier)?;
-    let module = dynamic_modules
+    let (graph_id, module_path) = dd_module_parts(module_specifier)?;
+    let module = module_registry
         .module(&graph_id, &module_path)
         .ok_or_else(|| {
             JsErrorBox::generic(format!(
-                "dynamic module graph {graph_id} does not contain module: {module_path}"
+                "module graph {graph_id} does not contain module: {module_path}"
             ))
         })?;
     let module_type = deno_module_type(module.kind);
@@ -526,7 +538,7 @@ fn load_dd_dynamic_module(
             String::from_utf8(module.code.as_ref().to_vec())
                 .map_err(|error| {
                     JsErrorBox::generic(format!(
-                        "dynamic JavaScript module is not valid UTF-8: {module_path}: {error}"
+                        "JavaScript module is not valid UTF-8: {module_path}: {error}"
                     ))
                 })?
                 .into(),
@@ -538,7 +550,7 @@ fn load_dd_dynamic_module(
             String::from_utf8(module.code.as_ref().to_vec())
                 .map_err(|error| {
                     JsErrorBox::generic(format!(
-                        "dynamic text module is not valid UTF-8: {module_path}: {error}"
+                        "text module is not valid UTF-8: {module_path}: {error}"
                     ))
                 })?
                 .into(),
@@ -574,23 +586,23 @@ export default new WebAssembly.Module(bytes);
     .into()
 }
 
-fn dd_dynamic_module_parts(
+fn dd_module_parts(
     module_specifier: &ModuleSpecifier,
 ) -> std::result::Result<(String, String), JsErrorBox> {
-    if module_specifier.scheme() != "dd-dynamic" {
+    if module_specifier.scheme() != "dd-module" {
         return Err(JsErrorBox::generic(format!(
-            "expected dd-dynamic module URL, got {module_specifier}"
+            "expected dd-module module URL, got {module_specifier}"
         )));
     }
     if module_specifier.host_str() != Some("graph") {
         return Err(JsErrorBox::generic(format!(
-            "expected dd-dynamic://graph module URL, got {module_specifier}"
+            "expected dd-module://graph module URL, got {module_specifier}"
         )));
     }
     let path = module_specifier.path().trim_start_matches('/');
     let (graph_id, module_path) = path.split_once('/').ok_or_else(|| {
         JsErrorBox::generic(format!(
-            "dd-dynamic module URL is missing graph id or module path: {module_specifier}"
+            "dd-module module URL is missing graph id or module path: {module_specifier}"
         ))
     })?;
     let graph_id = graph_id.trim();
@@ -599,14 +611,14 @@ fn dd_dynamic_module_parts(
         || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(JsErrorBox::generic(format!(
-            "invalid dd-dynamic graph id in module URL: {module_specifier}"
+            "invalid dd-module graph id in module URL: {module_specifier}"
         )));
     }
     let bytes = percent_decode(module_path).map_err(JsErrorBox::generic)?;
     let path = String::from_utf8(bytes).map_err(|error| {
-        JsErrorBox::generic(format!("invalid UTF-8 in dd-dynamic module path: {error}"))
+        JsErrorBox::generic(format!("invalid UTF-8 in dd-module module path: {error}"))
     })?;
-    normalize_dynamic_module_path(&path)
+    normalize_module_path(&path)
         .map(|path| (graph_id.to_string(), path))
         .map_err(JsErrorBox::generic)
 }
@@ -648,16 +660,15 @@ fn percent_encode_path_segment(value: &str) -> String {
 
 fn worker_source_text<'a>(
     source: &'a WorkerSource,
-    dynamic_modules: &DynamicModuleRegistry,
+    module_registry: &ModuleRegistry,
 ) -> Result<Cow<'a, str>> {
     match source {
         WorkerSource::Inline(source) => Ok(Cow::Borrowed(source.as_ref())),
-        WorkerSource::DynamicModule {
+        WorkerSource::Module {
             graph_id,
             entrypoint,
         } => {
-            let specifier =
-                dynamic_module_entrypoint_specifier(dynamic_modules, graph_id, entrypoint)?;
+            let specifier = module_entrypoint_specifier(module_registry, graph_id, entrypoint)?;
             Ok(Cow::Owned(format!(
                 "export {{ default }} from {specifier:?};\n"
             )))
@@ -665,8 +676,8 @@ fn worker_source_text<'a>(
     }
 }
 
-fn dynamic_module_entrypoint_specifier(
-    dynamic_modules: &DynamicModuleRegistry,
+fn module_entrypoint_specifier(
+    module_registry: &ModuleRegistry,
     graph_id: &str,
     entrypoint: &str,
 ) -> Result<String> {
@@ -675,16 +686,14 @@ fn dynamic_module_entrypoint_specifier(
         || graph_id.len() > 128
         || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(PlatformError::bad_request(
-            "dynamic module graph id is invalid",
-        ));
+        return Err(PlatformError::bad_request("module graph id is invalid"));
     }
-    let entrypoint = normalize_dynamic_module_path(entrypoint).map_err(|error| {
-        PlatformError::bad_request(format!("invalid dynamic module entrypoint: {error}"))
+    let entrypoint = normalize_module_path(entrypoint).map_err(|error| {
+        PlatformError::bad_request(format!("invalid module entrypoint: {error}"))
     })?;
-    if dynamic_modules.source(graph_id, &entrypoint).is_none() {
+    if module_registry.source(graph_id, &entrypoint).is_none() {
         return Err(PlatformError::bad_request(format!(
-            "dynamic module graph {graph_id} does not contain entrypoint: {entrypoint}"
+            "module graph {graph_id} does not contain entrypoint: {entrypoint}"
         )));
     }
     let encoded_path = entrypoint
@@ -692,7 +701,7 @@ fn dynamic_module_entrypoint_specifier(
         .map(percent_encode_path_segment)
         .collect::<Vec<_>>()
         .join("/");
-    Ok(format!("dd-dynamic://graph/{graph_id}/{encoded_path}"))
+    Ok(format!("dd-module://graph/{graph_id}/{encoded_path}"))
 }
 
 fn percent_decode(value: &str) -> std::result::Result<Vec<u8>, String> {
@@ -826,7 +835,7 @@ mod tests {
         let snapshot = build_bootstrap_snapshot()
             .await
             .expect("bootstrap snapshot should build");
-        let _ = new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
+        let _ = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
             .expect("runtime should start from snapshot");
     }
 
@@ -840,9 +849,8 @@ mod tests {
         let snapshot = runtime
             .block_on(build_bootstrap_snapshot())
             .expect("bootstrap snapshot should build");
-        let mut js_runtime =
-            new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
-                .expect("runtime should start from snapshot");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
 
         js_runtime
             .execute_script(
@@ -980,9 +988,8 @@ mod tests {
                 .expect("worker should validate");
             bootstrap
         });
-        let mut js_runtime =
-            new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
-                .expect("runtime should start from bootstrap snapshot");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from bootstrap snapshot");
         runtime
             .block_on(load_worker(&mut js_runtime, simple_worker_source()))
             .expect("worker should load into runtime");
@@ -1035,9 +1042,8 @@ mod tests {
                 .expect("worker should validate");
             bootstrap
         });
-        let mut js_runtime =
-            new_runtime_from_snapshot(snapshot, false, DynamicModuleRegistry::default())
-                .expect("runtime should start from bootstrap snapshot");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from bootstrap snapshot");
         runtime
             .block_on(load_worker(&mut js_runtime, simple_worker_source()))
             .expect("worker should load into runtime");

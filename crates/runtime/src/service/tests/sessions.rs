@@ -2,345 +2,6 @@ use super::*;
 
 #[tokio::test]
 #[serial]
-async fn transport_open_works_with_deno_request_compatibility() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "transport-runtime".to_string(),
-            transport_echo_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MEDIA".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    let (stream_tx, mut stream_rx) = mpsc::channel(16);
-    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
-    let opened = service
-        .open_transport(
-            "transport-runtime".to_string(),
-            test_transport_invocation(),
-            stream_tx,
-            datagram_tx,
-        )
-        .await
-        .expect("transport open should succeed");
-
-    assert_eq!(opened.output.status, 200);
-
-    service
-        .transport_push_stream(
-            "transport-runtime".to_string(),
-            opened.session_id.clone(),
-            b"hello-transport".to_vec(),
-            false,
-        )
-        .await
-        .expect("transport push should succeed");
-
-    let echoed = timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .expect("stream echo should arrive")
-        .expect("stream echo channel should stay open");
-    assert_eq!(echoed, b"hello-transport");
-
-    service
-        .transport_close(
-            "transport-runtime".to_string(),
-            opened.session_id,
-            0,
-            "done".to_string(),
-        )
-        .await
-        .expect("transport close should succeed");
-}
-
-#[tokio::test]
-#[serial]
-async fn transport_open_preserves_connect_shape_for_memory_namespace_code() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "transport-shape".to_string(),
-            transport_shape_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MEDIA".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    let (stream_tx, _stream_rx) = mpsc::channel(16);
-    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
-    let opened = service
-        .open_transport(
-            "transport-shape".to_string(),
-            test_transport_invocation(),
-            stream_tx,
-            datagram_tx,
-        )
-        .await
-        .expect("transport open should succeed");
-
-    assert_eq!(opened.output.status, 200);
-}
-
-#[tokio::test]
-#[serial]
-async fn transport_wake_can_list_transport_handles_without_deadlock() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "transport-values".to_string(),
-            transport_values_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MEDIA".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    let (stream_tx, mut stream_rx) = mpsc::channel(16);
-    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
-    let opened = tokio::time::timeout(
-        Duration::from_secs(5),
-        service.open_transport(
-            "transport-values".to_string(),
-            test_transport_invocation(),
-            stream_tx,
-            datagram_tx,
-        ),
-    )
-    .await
-    .expect("transport open should not hang")
-    .expect("transport open should succeed");
-    assert_eq!(opened.output.status, 200);
-
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        service.transport_push_stream(
-            "transport-values".to_string(),
-            opened.session_id.clone(),
-            b"ping".to_vec(),
-            false,
-        ),
-    )
-    .await
-    .expect("transport push should not hang")
-    .expect("transport push should succeed");
-
-    let echoed = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
-        .await
-        .expect("transport reply should arrive")
-        .expect("transport reply channel should stay open");
-    assert_eq!(echoed, b"ready:1");
-
-    service
-        .transport_close(
-            "transport-values".to_string(),
-            opened.session_id,
-            0,
-            "done".to_string(),
-        )
-        .await
-        .expect("transport close should succeed");
-}
-
-#[tokio::test]
-#[serial]
-async fn transport_session_survives_idle_ttl_and_scales_down_after_close() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_millis(200),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "transport-idle".to_string(),
-            transport_echo_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MEDIA".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    let (stream_tx, mut stream_rx) = mpsc::channel(16);
-    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
-    let opened = service
-        .open_transport(
-            "transport-idle".to_string(),
-            test_transport_invocation(),
-            stream_tx,
-            datagram_tx,
-        )
-        .await
-        .expect("transport open should succeed");
-
-    sleep(Duration::from_millis(500)).await;
-    let stats = service
-        .stats("transport-idle".to_string())
-        .await
-        .expect("worker stats should exist");
-    assert_eq!(stats.isolates_total, 1);
-
-    service
-        .transport_push_stream(
-            "transport-idle".to_string(),
-            opened.session_id.clone(),
-            b"idle-transport".to_vec(),
-            false,
-        )
-        .await
-        .expect("transport push should succeed");
-    let echoed = timeout(Duration::from_secs(2), stream_rx.recv())
-        .await
-        .expect("transport echo should arrive")
-        .expect("transport stream should stay open");
-    assert_eq!(echoed, b"idle-transport");
-
-    service
-        .transport_close(
-            "transport-idle".to_string(),
-            opened.session_id,
-            0,
-            "done".to_string(),
-        )
-        .await
-        .expect("transport close should succeed");
-}
-
-#[tokio::test]
-#[serial]
-async fn transport_session_reaped_when_owner_isolate_fails() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
-
-    service
-        .deploy_with_config(
-            "transport-reap".to_string(),
-            transport_echo_worker(),
-            DeployConfig {
-                public: false,
-                cache: Default::default(),
-                internal: DeployInternalConfig { trace: None },
-                bindings: vec![DeployBinding::Memory {
-                    binding: "MEDIA".to_string(),
-                }],
-            },
-        )
-        .await
-        .expect("deploy should succeed");
-
-    let (stream_tx, _stream_rx) = mpsc::channel(16);
-    let (datagram_tx, _datagram_rx) = mpsc::channel(16);
-    let opened = service
-        .open_transport(
-            "transport-reap".to_string(),
-            test_transport_invocation(),
-            stream_tx,
-            datagram_tx,
-        )
-        .await
-        .expect("transport open should succeed");
-
-    let dump = service
-        .debug_dump("transport-reap".to_string())
-        .await
-        .expect("debug dump should exist");
-    let isolate_id = dump
-        .isolates
-        .first()
-        .map(|isolate| isolate.id)
-        .expect("transport isolate should exist");
-    assert!(
-        service
-            .force_fail_isolate_for_test("transport-reap".to_string(), dump.generation, isolate_id,)
-            .await
-    );
-
-    let error = service
-        .transport_push_stream(
-            "transport-reap".to_string(),
-            opened.session_id,
-            b"after-fail".to_vec(),
-            false,
-        )
-        .await
-        .expect_err("reaped transport session should fail promptly");
-    assert!(
-        error.to_string().contains("transport session not found"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-#[serial]
 async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -358,6 +19,7 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
             "ws-storage".to_string(),
             websocket_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -421,7 +83,7 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
 
 #[tokio::test]
 #[serial]
-async fn websocket_stub_apply_can_send_from_a_normal_request() {
+async fn websocket_transaction_can_broadcast_from_a_normal_request() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -436,8 +98,9 @@ async fn websocket_stub_apply_can_send_from_a_normal_request() {
     service
         .deploy_with_config(
             "ws-stub-apply".to_string(),
-            websocket_stub_apply_worker(),
+            websocket_transaction_broadcast_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -513,6 +176,7 @@ async fn websocket_wake_can_list_socket_handles_without_deadlock() {
             "ws-values".to_string(),
             websocket_values_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -611,6 +275,7 @@ async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
             "ws-idle".to_string(),
             websocket_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -685,6 +350,7 @@ async fn websocket_session_reaped_when_owner_isolate_fails() {
             "ws-reap".to_string(),
             websocket_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -737,11 +403,12 @@ async fn websocket_session_reaped_when_owner_isolate_fails() {
 
 #[tokio::test]
 #[serial]
-async fn websocket_session_survives_redeploy_while_old_generation_stays_live() {
+async fn redeployment_closes_websockets_and_bounds_generation_retirement() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates: 1,
         max_inflight_per_isolate: 1,
+        request_wall_timeout: Duration::from_millis(300),
         idle_ttl: Duration::from_millis(200),
         scale_tick: Duration::from_millis(50),
         queue_warn_thresholds: vec![10],
@@ -750,6 +417,7 @@ async fn websocket_session_survives_redeploy_while_old_generation_stays_live() {
     .await;
 
     let deploy_config = DeployConfig {
+        egress_allow_hosts: Vec::new(),
         public: false,
         cache: Default::default(),
         internal: DeployInternalConfig { trace: None },
@@ -785,32 +453,40 @@ async fn websocket_session_survives_redeploy_while_old_generation_stays_live() {
         .await
         .expect("redeploy should succeed");
 
-    sleep(Duration::from_millis(500)).await;
-
-    let echoed = service
+    let close = service
+        .websocket_drain_frame("ws-redeploy".to_string(), opened.session_id.clone())
+        .await
+        .expect("close signal should be available")
+        .expect("redeployment emits a frame");
+    assert!(
+        close
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-dd-ws-close-code" && value == "1012")
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = service
+                .stats("ws-redeploy".to_string())
+                .await
+                .expect("stats");
+            if stats.global_isolates_total == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a client that ignores the close cannot retain an old generation");
+    service
         .websocket_send_frame(
             "ws-redeploy".to_string(),
-            opened.session_id.clone(),
-            b"after-redeploy".to_vec(),
+            opened.session_id,
+            b"late".to_vec(),
             false,
         )
         .await
-        .expect("old generation websocket should stay live");
-    assert_eq!(echoed.status, 204);
-    assert_eq!(
-        String::from_utf8(echoed.body).expect("utf8"),
-        r#"{"seen":"after-redeploy","count":1}"#
-    );
-
-    service
-        .websocket_close(
-            "ws-redeploy".to_string(),
-            opened.session_id,
-            1000,
-            "done".to_string(),
-        )
-        .await
-        .expect("websocket close should succeed");
+        .expect_err("retired session must be unavailable");
 }
 
 #[tokio::test]
@@ -832,6 +508,7 @@ async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
             "ws-surface".to_string(),
             websocket_socket_surface_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -854,7 +531,7 @@ async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
     assert_eq!(surface["stubSurface"]["send"], "undefined");
     assert_eq!(surface["stubSurface"]["close"], "undefined");
     assert_eq!(surface["stateSurface"]["accept"], "function");
-    assert_eq!(surface["stateSurface"]["sockets"], "undefined");
+    assert_eq!(surface["stateSurface"]["sockets"], "object");
 }
 
 #[tokio::test]
@@ -876,6 +553,7 @@ async fn websocket_message_handler_can_close_handle_backed_socket() {
             "ws-close".to_string(),
             websocket_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -940,6 +618,7 @@ async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() 
             "ws-storage".to_string(),
             websocket_storage_worker(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1018,6 +697,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
             "chat".to_string(),
             include_str!("../../../../../examples/chat-worker/src/worker.js").to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1190,6 +870,7 @@ async fn chat_worker_refresh_replaces_prior_participant_socket() {
             "chat".to_string(),
             include_str!("../../../../../examples/chat-worker/src/worker.js").to_string(),
             DeployConfig {
+                egress_allow_hosts: Vec::new(),
                 public: false,
                 cache: Default::default(),
                 internal: DeployInternalConfig { trace: None },
@@ -1299,4 +980,49 @@ async fn chat_worker_refresh_replaces_prior_participant_socket() {
             "done".to_string(),
         )
         .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn memory_socket_handles_are_private_to_workers() {
+    let service = test_service(RuntimeConfig::default()).await;
+    for worker in ["alpha", "beta"] {
+        service
+            .deploy_with_config(
+                worker.to_string(),
+                websocket_values_worker(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Memory {
+                        binding: "CHAT".to_string(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("worker deploys");
+    }
+    let opened = service
+        .open_websocket(
+            "alpha".to_string(),
+            test_websocket_invocation("/ws", "private-socket"),
+            None,
+        )
+        .await
+        .expect("socket opens");
+    assert_eq!(opened.output.status, 101);
+    for (worker, expected) in [("alpha", 1), ("beta", 0)] {
+        let response = service
+            .invoke(
+                worker.to_string(),
+                test_invocation_with_path("/handles", worker),
+            )
+            .await
+            .expect("handles load");
+        let handles: Value =
+            serde_json::from_slice(&response.body).expect("handles response is JSON");
+        assert_eq!(
+            handles["count"], expected,
+            "worker {worker} sees only its sockets"
+        );
+    }
 }

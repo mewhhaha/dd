@@ -32,9 +32,8 @@ jobs:
       - name: Plan benchmark smoke matrix
         run: |
           DD_BENCH_MATRIX_ISOLATES="1 8" \
-          DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
           DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
-          DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
+          DD_BENCH_MATRIX_MODES="atomic-write-only-memory-wide atomic-readwrite-memory-wide" \
           node benchmarks/run.mjs --plan --samples "$DD_BENCH_SAMPLES" \
             --config scaling-atomic-memory-matrix.sh
       - name: Run benchmark smoke matrix
@@ -44,9 +43,8 @@ jobs:
             extra_flags+=(--allow-large-run)
           fi
           DD_BENCH_MATRIX_ISOLATES="1 8" \
-          DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS="8" \
           DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
-          DD_BENCH_MATRIX_MODES="direct-write-memory-wide atomic-readwrite-memory-wide" \
+          DD_BENCH_MATRIX_MODES="atomic-write-only-memory-wide atomic-readwrite-memory-wide" \
           node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
             --config scaling-atomic-memory-matrix.sh \
             --out benchmarks/results/memory-smoke.json \
@@ -97,7 +95,8 @@ jobs:
         if: steps.baseline-profile.outputs.available == 'true'
         working-directory: ${{ runner.temp }}/dd-baseline
         run: |
-          node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
+          DD_BENCH_SOURCE_DIR="$RUNNER_TEMP/dd-baseline" \
+          node "$GITHUB_WORKSPACE/benchmarks/run.mjs" --samples "$DD_BENCH_SAMPLES" \
             --config fly-production.sh \
             --out "${RUNNER_TEMP}/dd-baseline.json"
       - name: Run candidate

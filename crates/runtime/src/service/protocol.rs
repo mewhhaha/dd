@@ -41,11 +41,11 @@ pub(super) fn append_or_update_header(headers: &mut Vec<(String, String)>, key: 
 }
 
 pub(super) fn memory_owner_key(binding: &str, key: &str) -> String {
-    format!("{binding}\u{001f}{key}")
+    format!("{}:{binding}{key}", binding.len())
 }
 
 pub(super) fn memory_handle_key(binding: &str, key: &str, handle: &str) -> String {
-    format!("{binding}\u{001f}{key}\u{001f}{handle}")
+    format!("{}:{binding}{}:{key}{handle}", binding.len(), key.len())
 }
 
 pub(super) fn internal_header_value<'a>(
@@ -118,59 +118,6 @@ pub(super) fn strip_websocket_frame_internal_headers(
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_HANDLE_HEADER))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_BINDING_HEADER))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_KEY_HEADER))
-        .cloned()
-        .collect()
-}
-
-pub(super) fn parse_transport_open_metadata(
-    output: &WorkerOutput,
-    expected_session_id: &str,
-) -> Result<(String, String, String)> {
-    if output.status != 200 {
-        return Err(PlatformError::bad_request(
-            "transport connect rejected by worker",
-        ));
-    }
-    let accepted = internal_header_value(&output.headers, INTERNAL_TRANSPORT_ACCEPT_HEADER)
-        .map(|value| value == "1")
-        .unwrap_or(false);
-    if !accepted {
-        return Err(PlatformError::bad_request(
-            "worker did not accept transport request",
-        ));
-    }
-    let handle = internal_header_value(&output.headers, INTERNAL_TRANSPORT_HANDLE_HEADER)
-        .map(str::to_string)
-        .unwrap_or_else(|| expected_session_id.to_string());
-    let binding = internal_header_value(&output.headers, INTERNAL_TRANSPORT_BINDING_HEADER)
-        .map(str::to_string)
-        .ok_or_else(|| PlatformError::bad_request("missing transport memory binding metadata"))?;
-    let key = internal_header_value(&output.headers, INTERNAL_TRANSPORT_KEY_HEADER)
-        .map(str::to_string)
-        .ok_or_else(|| PlatformError::bad_request("missing transport memory key metadata"))?;
-    if let Some(session_id) =
-        internal_header_value(&output.headers, INTERNAL_TRANSPORT_SESSION_HEADER)
-        && session_id != expected_session_id
-    {
-        return Err(PlatformError::bad_request(
-            "transport session metadata mismatch",
-        ));
-    }
-    Ok((handle, binding, key))
-}
-
-pub(super) fn strip_transport_open_internal_headers(
-    headers: &[(String, String)],
-) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_ACCEPT_HEADER))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_SESSION_HEADER))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_HANDLE_HEADER))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_BINDING_HEADER))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_KEY_HEADER))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_CLOSE_CODE_HEADER))
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TRANSPORT_CLOSE_REASON_HEADER))
         .cloned()
         .collect()
 }

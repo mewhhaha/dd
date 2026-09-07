@@ -41,9 +41,6 @@ export async function createWorkerTestRuntime(options = {}) {
     },
     deploy,
     reload: deploy,
-    invoke(request) {
-      return runtime.invoke(name, request);
-    },
     fetch(input, init) {
       return runtime.fetch(name, input, init);
     },

@@ -39,7 +39,7 @@ jobs:
         with:
           toolchain: 1.94.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --profile dist -p runtime --bin dd_dev_runtime
+      - run: cargo build --locked --profile dist -p dd_server --no-default-features --features websocket --bin dd_dev_runtime
       - name: Smoke binary
         shell: bash
         run: target/dist/${{ matrix.binary }} --help

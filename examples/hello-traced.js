@@ -111,10 +111,9 @@ export default {
 
     if (url.pathname === "/api/memory/ping" && request.method === "GET") {
       const memory = env.USER_MEMORY.get(env.USER_MEMORY.idFromName(user));
-      const pings = memory.tvar("pings", 0);
-      return json(await memory.atomic(() => {
-        const next = Number(pings.read()) + 1;
-        pings.write(next);
+      return json(await memory.atomic((tx) => {
+        const next = Number(tx.get("pings") ?? 0) + 1;
+        tx.put("pings", next);
         return {
           ok: true,
           feature: "memory-namespace",

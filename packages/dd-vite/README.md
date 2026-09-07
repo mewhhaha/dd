@@ -1,9 +1,11 @@
 # @mewhhaha/vite-plugin-dd
 
 Vite and Vitest helpers for running `dd` workers against the native runtime in
-debug/dev mode. The helpers do not start a private `dd_server`; they launch
-`dd_dev_runtime` as a stdio child process and send deploy/invoke commands
-directly to `RuntimeService`.
+debug/dev mode. They launch `dd_dev_runtime` with stdio for deployment and control.
+Each worker receives a loopback HTTP listener using the production streaming and
+WebSocket transport. `fetch()` preserves the original request URL, streams request
+and response bodies, and propagates cancellation. For a native WebSocket client,
+use `runtime.workerUrl(name)` and change the URL scheme to `ws:`.
 
 `@mewhhaha/vite-plugin-dd` optionally installs `@mewhhaha/dd`, which selects a platform-specific
 binary package such as `@mewhhaha/dd-linux-x64` or `@mewhhaha/dd-darwin-arm64`.
@@ -52,7 +54,8 @@ The default export is the Vite plugin factory, so you can name it whatever fits
 your config. The named `ddVitePlugin` export remains available. If the package
 root contains `dd.json`, the plugin reads it by default for the worker name,
 entrypoint, and deploy config. Inline plugin options override values from
-`dd.json`.
+`dd.json`. Generated deployments use the same defaults as the CLI: workers are
+private, and outbound fetch requires an explicit `config.egress_allow_hosts`.
 
 The plugin also registers a Vite Environment API environment for the entry
 worker, backed by `createFetchableDevEnvironment`, for framework code that wants
@@ -207,7 +210,7 @@ Runtime binary resolution order:
 1. `runtimeOptions.binary`
 2. `DD_DEV_RUNTIME_BIN`
 3. the optional `@mewhhaha/dd` platform binary
-4. `cargo run -p runtime --bin dd_dev_runtime` when running inside this source checkout
+4. `cargo run -p dd_server --no-default-features --features websocket --bin dd_dev_runtime` inside this source checkout
 
 Packaged runtime binaries are built for small install size, not maximum runtime
 throughput. Set `DD_DEV_RUNTIME_BIN=/path/to/dd_dev_runtime` to test a custom

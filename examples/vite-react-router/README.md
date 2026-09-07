@@ -9,9 +9,9 @@ shim in the example config. Vite still serves its own module graph, client
 runtime, and React Router development endpoints.
 
 The worker binds `EXAMPLE_MEMORY` and passes it through React Router's request
-context. The project route loader increments an STM-backed request counter with
+context. The project route loader increments an transactional request counter with
 `memory.atomic(...)`, renders the count, and app responses mirror it in
-`x-dd-stm-count`. The smoke test requires both values to advance together.
+`x-memory-count`. The smoke test requires both values to advance together.
 
 Tailwind CSS is enabled through `@tailwindcss/vite`; the root route imports
 `app/tailwind.css` and uses a Tailwind component class in the navigation.

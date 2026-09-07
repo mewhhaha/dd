@@ -1,0 +1,186 @@
+[
+  {
+    "name": "defaults",
+    "input": {},
+    "expected": {
+      "egress_allow_hosts": [],
+      "public": false,
+      "cache": {
+        "enabled": false
+      },
+      "bindings": [],
+      "internal": {
+        "trace": null
+      }
+    }
+  },
+  {
+    "name": "static service and egress",
+    "input": {
+      "public": true,
+      "bindings": [
+        {
+          "type": "service",
+          "binding": "AUTH",
+          "service": "auth"
+        }
+      ],
+      "egress_allow_hosts": [
+        "api.example.com"
+      ]
+    },
+    "expected": {
+      "egress_allow_hosts": [
+        "api.example.com"
+      ],
+      "public": true,
+      "cache": {
+        "enabled": false
+      },
+      "bindings": [
+        {
+          "type": "service",
+          "binding": "AUTH",
+          "service": "auth"
+        }
+      ],
+      "internal": {
+        "trace": null
+      }
+    }
+  },
+  {
+    "name": "trace defaults",
+    "input": {
+      "cache": {},
+      "internal": {
+        "trace": {
+          "worker": "trace"
+        }
+      }
+    },
+    "expected": {
+      "egress_allow_hosts": [],
+      "public": false,
+      "cache": {
+        "enabled": false
+      },
+      "bindings": [],
+      "internal": {
+        "trace": {
+          "worker": "trace",
+          "path": "/ingest"
+        }
+      }
+    }
+  },
+  {
+    "name": "unknown field",
+    "input": {
+      "publik": true
+    },
+    "reject": true
+  },
+  {
+    "name": "dynamic binding",
+    "input": {
+      "bindings": [
+        {
+          "type": "dynamic",
+          "binding": "CHILD"
+        }
+      ]
+    },
+    "reject": true
+  },
+  {
+    "name": "binding unknown field",
+    "input": {
+      "bindings": [
+        {
+          "type": "kv",
+          "binding": "KV",
+          "namespace": "other"
+        }
+      ]
+    },
+    "reject": true
+  },
+  {
+    "name": "service missing target",
+    "input": {
+      "bindings": [
+        {
+          "type": "service",
+          "binding": "AUTH"
+        }
+      ]
+    },
+    "reject": true
+  },
+  {
+    "name": "invalid public type",
+    "input": {
+      "public": "yes"
+    },
+    "reject": true
+  },
+  {
+    "name": "invalid cache type",
+    "input": {
+      "cache": {
+        "enabled": 1
+      }
+    },
+    "reject": true
+  },
+  {
+    "name": "invalid binding name",
+    "input": {
+      "bindings": [
+        {
+          "type": "kv",
+          "binding": 7
+        }
+      ]
+    },
+    "reject": true
+  },
+  {
+    "name": "invalid egress type",
+    "input": {
+      "egress_allow_hosts": "example.com"
+    },
+    "reject": true
+  },
+  {
+    "name": "invalid egress element",
+    "input": {
+      "egress_allow_hosts": [
+        4
+      ]
+    },
+    "reject": true
+  },
+  {
+    "name": "missing trace worker",
+    "input": {
+      "internal": {
+        "trace": {}
+      }
+    },
+    "reject": true
+  },
+  {
+    "name": "invalid trace path type",
+    "input": {
+      "internal": {
+        "trace": {
+          "worker": "trace",
+          "path": 7
+        }
+      }
+    },
+    "reject": true
+  }
+]

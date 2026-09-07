@@ -39,24 +39,6 @@ where
     )
 }
 
-#[cfg(feature = "http3")]
-pub async fn handle_public_h3_request(
-    state: AppState,
-    request: Request<()>,
-    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
-) -> Response<ResponseBody> {
-    if request_may_run_while_draining(request.method(), request.uri().path()) {
-        return respond(route_public_h3_request(state, request, request_body_stream).await);
-    }
-    let Some(active_request) = state.operations.try_begin_request() else {
-        return respond(Err(PlatformError::overloaded("service is draining").into()));
-    };
-    track_response(
-        respond(route_public_h3_request(state, request, request_body_stream).await),
-        active_request,
-    )
-}
-
 async fn route_private_request<B>(
     state: AppState,
     mut request: Request<B>,
@@ -196,12 +178,6 @@ where
             return Ok(json_response(StatusCode::OK, &response)?);
         }
     }
-    if request.method() == Method::POST && path == "/v1/dynamic/deploy" {
-        let payload: DynamicDeployRequest =
-            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
-        let response = deploy_dynamic_worker(state, payload).await?;
-        return Ok(json_response(StatusCode::OK, &response)?);
-    }
     if path == "/v1/invoke" || path.starts_with("/v1/invoke/") {
         let ws_upgrade = if is_websocket_upgrade(request.headers()) {
             Some(prepare_websocket_upgrade(&mut request)?)
@@ -296,36 +272,6 @@ fn request_may_run_while_draining(method: &Method, path: &str) -> bool {
             ))
 }
 
-#[cfg(feature = "http3")]
-async fn route_public_h3_request(
-    state: AppState,
-    request: Request<()>,
-    request_body_stream: Option<runtime::InvokeRequestBodyReceiver>,
-) -> ApiResult<Response<ResponseBody>> {
-    let path = request.uri().path().to_string();
-    if request.method() == Method::GET && path == "/healthz" {
-        return Ok(json_response(
-            StatusCode::OK,
-            &serde_json::json!({"ok": true}),
-        )?);
-    }
-    if request.method() == Method::GET && path == "/readyz" {
-        return readiness_response(&state).await;
-    }
-    if public_route_is_reserved(&path) {
-        return Err(PlatformError::not_found("not found").into());
-    }
-    if is_websocket_upgrade(request.headers()) {
-        return Err(
-            PlatformError::bad_request("websocket upgrade is unsupported over http/3").into(),
-        );
-    }
-    if request.method() == Method::CONNECT {
-        return Err(PlatformError::bad_request("CONNECT is unsupported over http/3").into());
-    }
-    invoke_worker_public_h3(state, request, request_body_stream).await
-}
-
 pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult<DeployResponse> {
     let name = validate_deploy_request(&payload)?;
     let span = tracing::info_span!("http.deploy", worker.name = %name);
@@ -398,24 +344,4 @@ fn query_parameter(uri: &http::Uri, name: &str) -> Option<String> {
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned())
         .filter(|value| !value.is_empty())
-}
-
-pub async fn deploy_dynamic_worker(
-    state: AppState,
-    payload: DynamicDeployRequest,
-) -> ApiResult<DynamicDeployResponse> {
-    if payload.source.trim().is_empty() {
-        return Err(PlatformError::bad_request("Worker source must not be empty").into());
-    }
-    let deployed = state
-        .runtime
-        .deploy_dynamic(payload.source, payload.env, payload.egress_allow_hosts)
-        .await?;
-
-    Ok(DynamicDeployResponse {
-        ok: true,
-        worker: deployed.worker,
-        deployment_id: deployed.deployment_id,
-        env_placeholders: deployed.env_placeholders,
-    })
 }

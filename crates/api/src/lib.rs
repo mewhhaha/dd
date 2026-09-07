@@ -3,8 +3,6 @@ mod deploy_tokens;
 mod handlers;
 #[cfg(test)]
 mod handlers_runtime_tests;
-#[cfg(feature = "http3")]
-mod public_quic;
 mod state;
 mod trace_health;
 
@@ -12,11 +10,10 @@ use common::{DEFAULT_PRIVATE_BIND_ADDR, DEFAULT_PUBLIC_BIND_ADDR, PlatformError,
 use deploy_tokens::DeployTokenStore;
 use runtime::{RuntimeService, RuntimeServiceConfig};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
 
-pub use app::{serve, serve_until};
+pub use app::{serve, serve_until, serve_worker_listener};
 pub use state::AppState;
 
 #[doc(hidden)]
@@ -32,9 +29,6 @@ pub struct ServerConfig {
     pub public_base_domain: String,
     pub private_bearer_token: Option<String>,
     pub allow_insecure_private_loopback: bool,
-    pub public_tls_cert_path: Option<PathBuf>,
-    pub public_tls_key_path: Option<PathBuf>,
-    pub token_store_path: Option<PathBuf>,
     pub runtime: RuntimeServiceConfig,
     pub invoke_max_body_bytes: usize,
     pub limits: ServerLimits,
@@ -75,9 +69,6 @@ impl Default for ServerConfig {
             public_base_domain: "example.com".to_string(),
             private_bearer_token: None,
             allow_insecure_private_loopback: false,
-            public_tls_cert_path: None,
-            public_tls_key_path: None,
-            token_store_path: None,
             runtime: RuntimeServiceConfig::default(),
             invoke_max_body_bytes: 16 * 1024 * 1024,
             limits: ServerLimits::default(),
@@ -92,9 +83,6 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         public_base_domain,
         private_bearer_token,
         allow_insecure_private_loopback,
-        public_tls_cert_path,
-        public_tls_key_path,
-        token_store_path,
         runtime,
         invoke_max_body_bytes,
         limits,
@@ -104,29 +92,14 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         private_bearer_token,
         allow_insecure_private_loopback,
     )?;
-    let token_store_path =
-        token_store_path.unwrap_or_else(|| runtime.storage.store_dir.join("tokens.json"));
     let runtime = RuntimeService::start_with_service_config(runtime).await?;
-    let deploy_tokens = match DeployTokenStore::from_control_store(
-        runtime.control_store(),
-        Some(&token_store_path),
-    )
-    .await
-    {
-        Ok(store) => store,
-        Err(error) => {
-            let _ = runtime.shutdown().await;
-            return Err(error);
-        }
-    };
+    let deploy_tokens = DeployTokenStore::from_control_store(runtime.control_store());
     let state = AppState::new(
         runtime,
         deploy_tokens,
         invoke_max_body_bytes,
         public_base_domain,
         private_bearer_token,
-        public_tls_cert_path,
-        public_tls_key_path,
     );
     let serve_result = serve_until(
         bind_public_addr,

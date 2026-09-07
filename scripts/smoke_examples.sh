@@ -69,11 +69,5 @@ check_contains "receipts root" "$(fetch_text GET "$(url receipts /)" "")" '"rece
 check_contains "trace-hub root" "$(fetch_text GET "$(url trace-hub /)" "")" '"routes"'
 check_contains "trace-sink root" "$(fetch_text GET "$(url trace-sink /)" "")" "worker traces receiver"
 check_contains "hello-traced root" "$(fetch_text GET "$(url hello-traced /)" "")" "hello-traced"
-check_contains "dynamic root" "$(fetch_text GET "$(url dynamic /)" "")" "dynamic namespace demo"
-check_contains "dynamic run" "$(fetch_text GET "$(url dynamic '/run?path=/hello')" "")" '"ok":true'
-check_contains "llm root" "$(fetch_text GET "$(url llm-dynamic /)" "")" "pretend-llm dynamic executor"
-check_contains "llm run" "$(fetch_text GET "$(url llm-dynamic '/run?prompt=echo&input=hello')" "")" '"output":"HELLO"'
-check_contains "preview root" "$(fetch_text GET "$(url preview-dynamic /)" "")" "Dynamic Preview Manager"
-check_contains "preview health" "$(fetch_text GET "$(url preview-dynamic '/preview/pr-123/api/health')" "")" '"ok":true'
 check_contains "swr root" "$(fetch_text GET "$(url swr-site /)" "")" "dd SWR demo"
 check_contains "bundled-router root" "$(fetch_text GET "$(url bundled-router /)" "")" '"service":"bundled-router"'

@@ -23,6 +23,7 @@
       "items": { "$ref": "#/$defs/server_module" }
     },
     "config": { "$ref": "#/$defs/runtime_config" },
+    "egress_allow_hosts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "public": { "type": "boolean" },
     "cache": { "$ref": "#/$defs/cache_config" },
     "bindings": {
@@ -83,15 +84,6 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["type", "binding"],
-          "properties": {
-            "type": { "const": "dynamic" },
-            "binding": { "type": "string", "minLength": 1 }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
           "required": ["type", "binding", "service"],
           "properties": {
             "type": { "const": "service" },
@@ -105,6 +97,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "egress_allow_hosts": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "public": { "type": "boolean" },
         "cache": { "$ref": "#/$defs/cache_config" },
         "bindings": {

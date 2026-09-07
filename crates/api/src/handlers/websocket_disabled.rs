@@ -51,3 +51,18 @@ pub(super) fn prepare_websocket_upgrade<B>(
 }
 
 pub struct PreparedWebSocketUpgrade;
+
+pub(super) async fn invoke_worker_websocket_with_target<B>(
+    _state: AppState,
+    _parts: http::request::Parts,
+    _body: B,
+    _worker_name: String,
+    _url: String,
+    _ws_upgrade: Option<PreparedWebSocketUpgrade>,
+) -> ApiResult<Response<ResponseBody>>
+where
+    B: HttpBody<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    Err(PlatformError::bad_request("websocket support is disabled").into())
+}

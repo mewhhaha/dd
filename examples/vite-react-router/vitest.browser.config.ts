@@ -21,7 +21,7 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
   const manifestStatuses: number[] = [];
 
   appPage.on("console", (message) => {
-    if (message.type() === "error" && !message.text().startsWith("Failed to fetch manifest patches")) {
+    if (message.type() === "error") {
       consoleErrors.push(message.text());
     }
   });
@@ -44,8 +44,10 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
       });
     });
 
+    const manifestReady = appPage.waitForResponse((response) => response.url().includes("/__manifest"));
     await appPage.goto(appServer.base, { waitUntil: "domcontentloaded" });
     await appPage.getByRole("heading", { name: "Edge Goods" }).waitFor();
+    await manifestReady;
     await waitForImages(appPage);
     const homeAddButton = appPage.getByTestId("home-add-runtime");
     await homeAddButton.scrollIntoViewIfNeeded();
@@ -102,6 +104,7 @@ async function startAppServer(): Promise<AppServer> {
       cwd: exampleDir,
       env: {
         ...process.env,
+        NODE_ENV: "development",
         FORCE_COLOR: "0",
         NO_COLOR: "1",
       },

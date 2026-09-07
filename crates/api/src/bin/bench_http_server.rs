@@ -742,18 +742,9 @@ async fn run_server_child() -> Result<(), String> {
     let storage_defaults = RuntimeStorageConfig::default();
     let storage = RuntimeStorageConfig {
         store_dir: store_dir.clone(),
-        database_url: format!("file:{}/dd-http-bench.db", store_dir.display()),
-        memory_namespace_shards: env_usize(
-            "DD_BENCH_MEMORY_NAMESPACE_SHARDS",
-            storage_defaults.memory_namespace_shards,
-        ),
         memory_outbox_max_concurrent_shards: env_usize(
             "DD_BENCH_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS",
             storage_defaults.memory_outbox_max_concurrent_shards,
-        ),
-        memory_db_cache_max_open: env_usize(
-            "DD_BENCH_MEMORY_DB_CACHE_MAX_OPEN",
-            storage_defaults.memory_db_cache_max_open,
         ),
         memory_snapshot_cache_max_entries: env_usize(
             "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
@@ -763,16 +754,7 @@ async fn run_server_child() -> Result<(), String> {
             "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES",
             storage_defaults.memory_snapshot_cache_max_bytes,
         ),
-        memory_db_read_connections_per_database: env_usize(
-            "DD_BENCH_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE",
-            storage_defaults.memory_db_read_connections_per_database,
-        ),
-        memory_db_max_total_connections: env_usize(
-            "DD_BENCH_MEMORY_DB_MAX_TOTAL_CONNECTIONS",
-            storage_defaults.memory_db_max_total_connections,
-        ),
         worker_store_enabled: false,
-        ..storage_defaults
     };
     let min_isolates = env_usize_allow_zero("DD_BENCH_MIN_ISOLATES", 8);
     let max_isolates = env_usize("DD_BENCH_MAX_ISOLATES", 8).max(min_isolates);
@@ -791,7 +773,6 @@ async fn run_server_child() -> Result<(), String> {
         bind_private_addr: private_addr,
         public_base_domain: PUBLIC_BASE_DOMAIN.to_string(),
         private_bearer_token: Some(PRIVATE_TOKEN.to_string()),
-        token_store_path: Some(store_dir.join("tokens.json")),
         runtime: RuntimeServiceConfig { runtime, storage },
         ..ServerConfig::default()
     })

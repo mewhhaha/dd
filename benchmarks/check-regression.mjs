@@ -164,7 +164,6 @@ function normalizeSelector(selector) {
     mode: selector.mode,
     keys: selector.keys,
     isolates: selector.isolates,
-    shards: selector.shards,
   };
 }
 

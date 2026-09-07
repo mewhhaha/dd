@@ -8,9 +8,9 @@ environment for the RSC dev proxy, and the worker imports
 `virtual:dd-react-router-rsc-server` instead of a generated local build helper.
 
 The worker binds `EXAMPLE_MEMORY` and passes it through React Router's request
-context. The project route loader increments an STM-backed request counter with
+context. The project route loader increments an transactional request counter with
 `memory.atomic(...)`, the RSC route server component renders the count from
-`loaderData`, and app responses mirror it in `x-dd-stm-count`. The smoke test
+`loaderData`, and app responses mirror it in `x-memory-count`. The smoke test
 requires both values to advance together.
 
 Tailwind CSS is enabled through `@tailwindcss/vite`; the root route imports

@@ -8,7 +8,7 @@ binary_name="dd_server"
 
 case "$variant" in
   full)
-    feature_args=(--no-default-features --features http3,websocket,otel)
+    feature_args=(--no-default-features --features websocket,otel)
     ;;
   lean)
     feature_args=(--no-default-features)

@@ -8,46 +8,36 @@ pub(super) async fn start_service(
     tokio::fs::create_dir_all(&paths.store_dir)
         .await
         .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    RuntimeService::start_with_service_config(runtime_service_config(
-        runtime,
-        &paths.db_path,
-        &paths.store_dir,
-    ))
-    .await
+    RuntimeService::start_with_service_config(runtime_service_config(runtime, &paths.store_dir))
+        .await
 }
 
 pub(super) struct BenchPaths {
-    pub(super) db_path: PathBuf,
     pub(super) store_dir: PathBuf,
 }
 
 pub(super) fn bench_paths(tag: &str) -> BenchPaths {
-    let root = PathBuf::from(format!("/tmp/dd-bench-{tag}-{}", Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("dd-bench-{tag}-{}", Uuid::new_v4()));
     BenchPaths {
-        db_path: root.join("dd-kv.db"),
         store_dir: root.join("store"),
     }
 }
 
 pub(super) fn runtime_service_config(
     runtime: RuntimeConfig,
-    db_path: &Path,
     store_dir: &Path,
 ) -> RuntimeServiceConfig {
     RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
-            database_url: format!("file:{}", db_path.display()),
-            memory_namespace_shards: env_memory_namespace_shards(),
-            memory_outbox_max_concurrent_shards: env_memory_namespace_shards()
+            memory_outbox_max_concurrent_shards: storage::state::STATE_SHARDS
                 .min(
                     std::thread::available_parallelism()
                         .map(usize::from)
                         .unwrap_or(1),
                 )
                 .clamp(1, 8),
-            memory_db_cache_max_open: env_usize("DD_BENCH_MEMORY_DB_CACHE_MAX_OPEN", 4096),
             memory_snapshot_cache_max_entries: env_usize(
                 "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
                 4096,
@@ -56,15 +46,6 @@ pub(super) fn runtime_service_config(
                 "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES",
                 64 * 1024 * 1024,
             ),
-            memory_db_read_connections_per_database: env_usize(
-                "DD_BENCH_MEMORY_DB_READ_CONNECTIONS_PER_DATABASE",
-                4,
-            ),
-            memory_db_max_total_connections: env_usize(
-                "DD_BENCH_MEMORY_DB_MAX_TOTAL_CONNECTIONS",
-                4096usize.saturating_mul(5),
-            ),
-            memory_db_idle_ttl: Duration::from_secs(60),
             worker_store_enabled: true,
         },
     }
@@ -127,8 +108,8 @@ export default {
                 requests: 1,
                 concurrency: 1,
                 path: "/",
-                key_space: 1,
             },
+            Arc::new(MemoryKeySet::from_env(&worker_name, "BENCH_MEMORY", "", 1)),
             &options,
             watchdog_state,
             started_at,

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -206,6 +206,8 @@ pub enum DeployServerModuleKind {
 #[serde(deny_unknown_fields)]
 pub struct DeployConfig {
     #[serde(default)]
+    pub egress_allow_hosts: Vec<String>,
+    #[serde(default)]
     pub public: bool,
     #[serde(default)]
     pub cache: DeployCacheConfig,
@@ -242,16 +244,13 @@ fn default_trace_path() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum DeployBinding {
     Kv {
         binding: String,
     },
     #[serde(rename = "memory")]
     Memory {
-        binding: String,
-    },
-    Dynamic {
         binding: String,
     },
     Service {
@@ -410,24 +409,6 @@ pub struct DeployTokenDeleteResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DynamicDeployRequest {
-    pub source: String,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub egress_allow_hosts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DynamicDeployResponse {
-    pub ok: bool,
-    pub worker: String,
-    pub deployment_id: String,
-    pub env_placeholders: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInvocation {
     pub method: String,
     pub url: String,
@@ -470,6 +451,27 @@ mod tests {
             Some("fallback")
         );
         assert!(first_non_empty_trimmed(["", "  "]).is_none());
+    }
+
+    #[test]
+    fn deployment_configuration_matches_shared_contract() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/config/deploy-config.json"))
+                .expect("config fixtures must parse");
+        for case in cases.as_array().expect("fixtures must be an array") {
+            let name = case["name"].as_str().expect("fixture name");
+            let parsed = serde_json::from_value::<DeployConfig>(case["input"].clone());
+            if case["reject"] == true {
+                assert!(parsed.is_err(), "{name} must be rejected");
+                continue;
+            }
+            let config = parsed.unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                serde_json::to_value(config).expect("config serialization"),
+                case["expected"],
+                "{name}"
+            );
+        }
     }
 
     #[test]

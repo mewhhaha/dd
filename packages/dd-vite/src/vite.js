@@ -5,6 +5,7 @@ import {
   mergeConfig,
 } from "vite";
 import { spawn } from "node:child_process";
+import { json as readJson } from "node:stream/consumers";
 import { randomUUID } from "node:crypto";
 import { rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -45,7 +46,6 @@ import {
   normalizeMount,
   nodeRequestToWorkerRequest,
   patchViteResolvedUrls,
-  readIncomingBody,
   rewriteViteDevServerUrls,
   shouldBypassStaticRoutingRequest,
   shouldBypassViteRequest,
@@ -292,7 +292,7 @@ export function ddVitePlugin(options = {}) {
       options.config ??
       source.config.config ??
       topLevelRuntimeConfig(source.config) ??
-      { public: true },
+      {},
       auxiliaryWorkers,
     );
   }
@@ -338,7 +338,7 @@ export function ddVitePlugin(options = {}) {
       entryWorker,
       ...auxiliaryWorkers.map((worker) => {
         const workerViteEnvironment = worker.viteEnvironment;
-        const runtimeName = worker.kind === "service" ? worker.service : worker.id;
+        const runtimeName = worker.service;
         return {
           ...worker,
           role: "auxiliary",
@@ -349,7 +349,7 @@ export function ddVitePlugin(options = {}) {
           viteEnvironment: workerViteEnvironment,
           entry: worker.entry ? resolveFrameworkPath(root, worker.entry) : undefined,
           source: worker.source,
-          config: worker.kind === "service" ? auxiliaryWorkerServiceConfig(worker) : cloneJson(worker.config),
+          config: auxiliaryWorkerServiceConfig(worker),
         };
       }),
     ];
@@ -436,9 +436,8 @@ export function ddVitePlugin(options = {}) {
             name: worker.name,
             kind: worker.kind,
             binding: worker.binding,
-            id: worker.id,
             service: worker.service,
-            config: worker.kind === "dynamic" ? await auxiliaryWorkerDynamicConfig(worker) : cloneJson(worker.config),
+            config: cloneJson(worker.config),
           },
         ]),
       ),
@@ -446,16 +445,6 @@ export function ddVitePlugin(options = {}) {
     return `const workers = ${JSON.stringify(records)};\nexport { workers };\nexport default workers;\n`;
   }
 
-  async function auxiliaryWorkerDynamicConfig(worker) {
-    const config = cloneJson(worker.config);
-    if (!config.source && !config.modules) {
-      config.source = await auxiliaryWorkerSource(worker);
-    }
-    if (Array.isArray(config.bindings) && config.bindings.length > 0 && config.allow_state_bindings == null) {
-      config.allow_state_bindings = true;
-    }
-    return config;
-  }
 
   async function auxiliaryWorkerSource(worker) {
     const resolved = (await resolvedWorkers()).find((entry) => entry.role === "auxiliary" && entry.name === worker.name) ?? worker;
@@ -540,9 +529,6 @@ export function ddVitePlugin(options = {}) {
     }
     for (const worker of await resolvedWorkers()) {
       if (!worker.entry || typeof worker.source === "string" || typeof worker.source === "function") {
-        continue;
-      }
-      if (worker.role !== "entry" && worker.kind !== "service") {
         continue;
       }
       if (!usesViteModuleRunner(worker)) {
@@ -895,7 +881,7 @@ export function ddVitePlugin(options = {}) {
             return;
           }
           const workerName = await effectiveWorkerName();
-          const request = await nodeRequestToWorkerRequest(req, originalUrl, mount, workerName);
+          const request = await nodeRequestToWorkerRequest(req, originalUrl, mount, workerName, res);
           const response = await runtime.fetch(workerName, request);
           await writeNodeResponse(res, response);
         } catch (error) {
@@ -1246,10 +1232,7 @@ function normalizeAuxiliaryWorkers(value) {
       kind,
       name,
       binding: nonEmptyString(entry?.binding) ?? auxiliaryBindingName(name),
-      id: nonEmptyString(entry?.id) ?? name,
-      service: kind === "service"
-        ? nonEmptyString(entry?.service) ?? nonEmptyString(entry?.workerName) ?? name
-        : undefined,
+      service: nonEmptyString(entry?.service) ?? nonEmptyString(entry?.workerName) ?? name,
       deployment: entry?.deployment && typeof entry.deployment === "object"
         ? cloneJson(entry.deployment)
         : undefined,
@@ -1259,10 +1242,10 @@ function normalizeAuxiliaryWorkers(value) {
 
 function normalizeAuxiliaryWorkerKind(value) {
   if (value == null) {
-    return "dynamic";
+    return "service";
   }
   const kind = String(value).trim().toLowerCase();
-  if (kind !== "dynamic" && kind !== "service") {
+  if (kind !== "service") {
     throw new Error(`ddVitePlugin auxiliary worker kind is invalid: ${kind}`);
   }
   return kind;
@@ -1280,16 +1263,10 @@ function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
   const runtimeConfig = cloneJson(config);
   const bindings = Array.isArray(runtimeConfig.bindings) ? [...runtimeConfig.bindings] : [];
   for (const worker of auxiliaryWorkers) {
-    if (worker.kind === "service") {
-      if (!bindings.some((binding) =>
-        String(binding?.type ?? "").toLowerCase() === "service" && binding?.binding === worker.binding
-      )) {
-        bindings.push({ type: "service", binding: worker.binding, service: worker.service });
-      }
-    } else if (!bindings.some((binding) =>
-      String(binding?.type ?? "").toLowerCase() === "dynamic" && binding?.binding === worker.binding
+    if (!bindings.some((binding) =>
+      String(binding?.type ?? "").toLowerCase() === "service" && binding?.binding === worker.binding
     )) {
-      bindings.push({ type: "dynamic", binding: worker.binding });
+      bindings.push({ type: "service", binding: worker.binding, service: worker.service });
     }
   }
   runtimeConfig.bindings = bindings;
@@ -1468,7 +1445,7 @@ function installViteModuleMiddleware(viteServer, options) {
         res.end("forbidden");
         return;
       }
-      const body = JSON.parse((await readIncomingBody(req)).toString("utf8") || "{}");
+      const body = await readJson(req);
       const environmentName = nonEmptyString(body.environmentName);
       const id = nonEmptyString(body.id);
       const importer = nonEmptyString(body.importer);

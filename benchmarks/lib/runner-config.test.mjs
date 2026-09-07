@@ -27,14 +27,14 @@ test("default discovery skips opt-in matrix configs", async () => {
 test("explicit selection includes and expands opt-in atomic matrix", async () => {
   const { configs } = await discoverConfigs(["scaling-atomic-memory-matrix.sh"]);
   const expanded = await expandConfigs(configs, {});
-  assert.equal(expanded.length, 378);
+  assert.equal(expanded.length, 54);
 });
 
-test("five samples of atomic matrix produce 1890 planned runs", async () => {
+test("five samples of atomic matrix produce 270 planned runs", async () => {
   const { configs } = await discoverConfigs(["scaling-atomic-memory-matrix.sh"]);
   const expanded = await expandConfigs(configs, {});
   const plan = planRun(expanded, parseArgs(["--samples", "5"]), "out.json");
-  assert.equal(plan.totalRuns, 1890);
+  assert.equal(plan.totalRuns, 270);
   assert.throws(() => validateRunBudget(plan, parseArgs(["--samples", "5"])), /exceeding/);
   assert.doesNotThrow(() =>
     validateRunBudget(plan, parseArgs(["--samples", "5", "--allow-large-run"])),
@@ -57,7 +57,6 @@ test("environment overrides narrow dimensions and deduplicate values", async () 
   const env = parseConfigEnv(script);
   const variants = expandMatrixVariants(env, {
     DD_BENCH_MATRIX_ISOLATES: "1 1 2",
-    DD_BENCH_MATRIX_MEMORY_NAMESPACE_SHARDS: "16",
     DD_BENCH_MATRIX_KEY_MODES: "same-shard same-shard",
     DD_BENCH_MATRIX_MODES: "atomic-readwrite-memory-wide",
   });
@@ -104,10 +103,10 @@ test("invalid dimensions fail before execution", () => {
     () =>
       expandMatrixVariants(
         {
-          DD_BENCH_MATRIX_MODES: "direct-write-memory-wide",
+          DD_BENCH_MATRIX_MODES: "atomic-write-only-memory-wide",
         },
         {
-          DD_BENCH_MODE: "direct-read-memory-wide",
+          DD_BENCH_MODE: "atomic-read-memory-wide",
         },
       ),
     /conflicts/,

@@ -8,9 +8,69 @@ const row = (throughputRps, p99Ms) => ({
   mode: "rate-limiter",
   keys: "cross-shard",
   isolates: 8,
-  shards: 8,
+  requests: 4096,
+  concurrency: 128,
+  samples: 5,
+  sampleCount: 5,
+  sampleMetrics: Array.from({ length: 5 }, () => ({ throughput_rps: throughputRps, p99_ms: p99Ms })),
+  scriptHash: "same-benchmark-and-build-command",
+  effectiveConfig: { DD_BENCH_DURABILITY: "committed" },
+  metadata: {
+    git_commit: "baseline",
+    git_dirty: false,
+    logical_cpus: 32,
+    cpu_affinity: "0-15",
+    cpu_model: "test cpu",
+    memory_bytes: 32 * 1024 ** 3,
+    memory_limit: "max",
+    cpu_limit: "max 100000",
+    disk: "test disk",
+    os: "Linux test",
+    rustc: "rustc test",
+    cargo: "cargo test",
+    build: { profile: "release", rustflags: "" },
+  },
   throughputRps,
   p99Ms,
+});
+
+test("rejects empty and duplicate comparisons", () => {
+  assert.equal(compareBenchmarkRows([], []).passes.length, 0);
+  assert.equal(compareBenchmarkRows([], []).failures.length, 2);
+  for (const [baseline, candidate] of [
+    [[row(1000, 10), row(1000, 10)], [row(1000, 10)]],
+    [[row(1000, 10)], [row(1000, 10), row(1000, 10)]],
+  ]) {
+    assert.match(compareBenchmarkRows(baseline, candidate).failures[0].reason, /duplicate/);
+  }
+});
+
+test("allows different commits with identical workload and environment", () => {
+  const candidate = row(1000, 10);
+  candidate.metadata.git_commit = "candidate";
+  assert.equal(compareBenchmarkRows([row(1000, 10)], [candidate]).failures.length, 0);
+});
+
+test("rejects mismatched workload, durability and execution constraints", () => {
+  for (const change of [
+    (candidate) => { candidate.requests *= 2; },
+    (candidate) => { candidate.concurrency *= 2; },
+    (candidate) => { candidate.samples = 1; },
+    (candidate) => { candidate.sampleMetrics.pop(); },
+    (candidate) => { candidate.scriptHash = "different-build-command"; },
+    (candidate) => { candidate.metadata.cpu_affinity = "0"; },
+    (candidate) => { candidate.metadata.memory_limit = "1073741824"; },
+    (candidate) => { candidate.metadata.build.rustflags = "-C target-cpu=native"; },
+    (candidate) => { candidate.metadata.git_dirty = true; },
+    (candidate) => { candidate.effectiveConfig.DD_BENCH_DURABILITY = "queued"; },
+    (candidate) => { delete candidate.metadata.cpu_affinity; },
+  ]) {
+    const candidate = row(1000, 10);
+    change(candidate);
+    const report = compareBenchmarkRows([row(1000, 10)], [candidate]);
+    assert.equal(report.passes.length, 0);
+    assert.equal(report.failures.length, 1);
+  }
 });
 
 test("accepts results within the production regression budgets", () => {

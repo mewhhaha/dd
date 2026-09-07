@@ -1,41 +1,39 @@
+mod bindings;
 mod config;
 mod control;
 mod debug;
+mod deployment;
 mod dispatch;
-mod dynamic;
 mod facade;
 mod isolate;
 mod lifecycle;
 mod model;
 mod protocol;
+mod router;
 mod runtime;
 mod sessions;
 mod storage;
 
-use crate::blob::BlobStore;
 use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::control_store::{ControlDeployment, ControlStore};
 use crate::engine::{
     WorkerDispatchRequest, abort_worker_request_handle, build_bootstrap_snapshot,
-    cache_runtime_entrypoints, dispatch_worker_request, drain_dynamic_control_queue,
-    ensure_v8_flags, install_worker_deployment_config, new_runtime_from_snapshot,
-    new_runtime_from_snapshot_with_heap_limit, pump_event_loop_once, validate_worker,
+    cache_runtime_entrypoints, dispatch_worker_request, drain_request_control_queue,
+    ensure_v8_flags, install_worker_deployment_config, new_runtime_from_snapshot_with_heap_limit,
+    pump_event_loop_once,
 };
 use crate::kv::KvStore;
 use crate::memory::{
     DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES, DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
-    MEMORY_ENTITY_CACHE_STRIPES, MemoryOutboxClaim, MemoryOutboxDeliveryAction,
-    MemoryOutboxDeliveryOutcome, MemoryProfileMetricKind, MemoryStore,
+    MemoryOutboxClaim, MemoryOutboxDeliveryAction, MemoryOutboxDeliveryOutcome,
+    MemoryProfileMetricKind, MemoryStore,
 };
-use crate::memory_rpc::{
-    MemoryInvokeCall, MemoryInvokeRequest, MemoryInvokeResponse, decode_memory_invoke_request,
-    decode_memory_invoke_response, encode_memory_invoke_request, encode_memory_invoke_response,
-};
+
 use crate::ops::{
-    CacheRevalidatePayload, IsolateEventPayload, IsolateEventSender, MemoryInvokeEvent,
-    RequestBodyStreams, RequestExecutionContext, RequestExecutionContextInit,
-    clear_request_body_stream, clear_request_secret_context, register_memory_request_scope,
-    register_request_body_stream, register_request_secret_context,
+    CacheRevalidatePayload, IsolateEventPayload, IsolateEventSender, RequestBodyStreams,
+    RequestExecutionContext, RequestExecutionContextInit, clear_request_body_stream,
+    clear_request_secret_context, register_memory_request_scope, register_request_body_stream,
+    register_request_secret_context,
 };
 use crate::static_assets::{
     AssetBundle, AssetRequest, AssetResponse, compile_asset_bundle, resolve_asset,
@@ -43,7 +41,7 @@ use crate::static_assets::{
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use common::{
-    DeployAsset, DeployBinding, DeployConfig, DeployServerModule, ErrorKind, PlatformError, Result,
+    DeployAsset, DeployConfig, DeployServerModule, ErrorKind, PlatformError, Result,
     WorkerInvocation, WorkerOutput,
 };
 use futures_util::FutureExt;
@@ -53,7 +51,6 @@ use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 #[cfg(feature = "otel")]
 use opentelemetry::trace::TraceContextExt;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::mem;
 use std::panic::AssertUnwindSafe;
@@ -72,11 +69,7 @@ use tracing::{Instrument, Level, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
-use self::config::{
-    DeployBindings, MAX_DYNAMIC_HOST_RPC_ARG_BYTES, MAX_DYNAMIC_HOST_RPC_METHODS,
-    MAX_DYNAMIC_HOST_RPC_REPLY_BYTES, ValidatedDynamicWorkerPolicy, build_dynamic_worker_config,
-    extract_bindings, full_dynamic_internal_policy, validate_runtime_config,
-};
+use self::config::{DeployBindings, extract_bindings, validate_runtime_config};
 use self::control::RuntimeEvent;
 use self::sessions::{
     MemoryOutboxDrainSender, memory_outbox_worker_channel, run_memory_outbox_worker,
@@ -86,12 +79,11 @@ type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
 type AssetCatalogSnapshot = Arc<ArcSwap<HashMap<String, Arc<AssetCatalogEntry>>>>;
 pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
-    DynamicDeployResult, DynamicHandleDebug, DynamicRuntimeDebugDump, HostRpcProviderDebug,
     InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug, MemoryShardDebug,
     PublicRouteAssetResolution, RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig,
     RuntimeReadiness, RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, RuntimeWorkerStatus, TransportOpen, WebSocketOpen, WorkerDebugDump,
-    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    RuntimeStorageConfig, RuntimeWorkerStatus, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
+    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };
 
 #[derive(Clone)]
@@ -148,9 +140,9 @@ struct AssetCatalogEntry {
     cache_enabled: bool,
 }
 pub(crate) use self::isolate::*;
-pub(crate) use self::model::DynamicQuotaState;
 use self::model::*;
 use self::protocol::*;
+use self::router::*;
 use self::runtime::*;
 use self::storage::epoch_ms_i64;
 
@@ -166,16 +158,8 @@ const INTERNAL_WS_KEY_HEADER: &str = "x-dd-ws-memory-key";
 const INTERNAL_WS_BINARY_HEADER: &str = "x-dd-ws-binary";
 const INTERNAL_WS_CLOSE_CODE_HEADER: &str = "x-dd-ws-close-code";
 const INTERNAL_WS_CLOSE_REASON_HEADER: &str = "x-dd-ws-close-reason";
-const INTERNAL_TRANSPORT_ACCEPT_HEADER: &str = "x-dd-transport-accept";
-const INTERNAL_TRANSPORT_SESSION_HEADER: &str = "x-dd-transport-session";
-const INTERNAL_TRANSPORT_HANDLE_HEADER: &str = "x-dd-transport-handle";
-const INTERNAL_TRANSPORT_BINDING_HEADER: &str = "x-dd-transport-memory-binding";
-const INTERNAL_TRANSPORT_KEY_HEADER: &str = "x-dd-transport-memory-key";
-const INTERNAL_TRANSPORT_CLOSE_CODE_HEADER: &str = "x-dd-transport-close-code";
-const INTERNAL_TRANSPORT_CLOSE_REASON_HEADER: &str = "x-dd-transport-close-reason";
 const CONTENT_TYPE_HEADER: &str = "content-type";
 const JSON_CONTENT_TYPE: &str = "application/json";
-const MEMORY_ATOMIC_METHOD: &str = "__dd_atomic";
 
 static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
 

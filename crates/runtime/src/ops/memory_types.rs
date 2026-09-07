@@ -260,6 +260,8 @@ impl MemoryBatchHandles {
 }
 
 pub(crate) struct MemoryBatchHandle {
+    // An in-flight commit retains entity ownership after request cancellation.
+    pub(crate) _lease: Option<Arc<crate::memory::MemoryLease>>,
     pub(crate) request_context_handle: u32,
     pub(crate) namespace: String,
     pub(crate) memory_key: String,
@@ -274,24 +276,6 @@ pub(crate) struct MemoryBatchHandle {
 
 pub(crate) struct MemoryBatchCommandResult {
     pub(crate) value: Vec<u8>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct MemoryDirectMutationInput {
-    pub(crate) key: String,
-    pub(crate) value_handle: u32,
-    pub(crate) encoding: String,
-    pub(crate) deleted: bool,
-}
-
-pub struct MemoryInvokeEvent {
-    pub request_frame: Vec<u8>,
-    pub created_at: Instant,
-    pub caller_worker_name: String,
-    pub caller_generation: u64,
-    pub caller_isolate_id: u64,
-    pub prefer_caller_isolate: bool,
-    pub reply: oneshot::Sender<Result<Vec<u8>>>,
 }
 
 pub struct MemorySocketSendEvent {
@@ -313,66 +297,14 @@ pub struct MemorySocketCloseEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct MemorySocketCloseReplayEvent {
-    pub code: u16,
-    pub reason: String,
-}
-
-pub struct MemorySocketConsumeCloseEvent {
-    pub reply: oneshot::Sender<Result<Vec<MemorySocketCloseReplayEvent>>>,
-    pub binding: String,
-    pub key: String,
-    pub handle: String,
-}
-
-pub struct MemoryTransportSendStreamEvent {
-    pub reply: oneshot::Sender<Result<()>>,
-    pub handle: String,
-    pub binding: String,
-    pub key: String,
-    pub chunk: Vec<u8>,
-}
-
-pub struct MemoryTransportSendDatagramEvent {
-    pub reply: oneshot::Sender<Result<()>>,
-    pub handle: String,
-    pub binding: String,
-    pub key: String,
-    pub datagram: Vec<u8>,
-}
-
-pub struct MemoryTransportCloseEvent {
-    pub reply: oneshot::Sender<Result<()>>,
-    pub handle: String,
-    pub binding: String,
-    pub key: String,
-    pub code: u16,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MemoryTransportCloseReplayEvent {
-    pub code: u16,
-    pub reason: String,
-}
-
-pub struct MemoryTransportConsumeCloseEvent {
-    pub reply: oneshot::Sender<Result<Vec<MemoryTransportCloseReplayEvent>>>,
-    pub binding: String,
-    pub key: String,
-    pub handle: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct TimeBoundary {
     pub now_ms: u64,
     pub perf_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryInvokeMethodResult {
-    pub(crate) ok: bool,
-    pub(crate) value_handle: u32,
+pub(crate) struct MemoryLeaseResult {
+    pub(crate) handle: u32,
     pub(crate) error: String,
 }
 
@@ -390,70 +322,8 @@ pub(crate) struct MemorySocketListResult {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemorySocketReplayClose {
-    pub(crate) code: u16,
-    pub(crate) reason: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemorySocketConsumeCloseResult {
-    pub(crate) ok: bool,
-    pub(crate) events: Vec<MemorySocketReplayClose>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct MemorySocketCloseResult {
     pub(crate) ok: bool,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryTransportSendResult {
-    pub(crate) ok: bool,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryTransportListResult {
-    pub(crate) ok: bool,
-    pub(crate) handles: Vec<String>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryTransportReplayClose {
-    pub(crate) code: u16,
-    pub(crate) reason: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryTransportConsumeCloseResult {
-    pub(crate) ok: bool,
-    pub(crate) events: Vec<MemoryTransportReplayClose>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryTransportCloseResult {
-    pub(crate) ok: bool,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryStateGetEntry {
-    pub(crate) key: String,
-    pub(crate) value_handle: u32,
-    pub(crate) encoding: String,
-    pub(crate) version: i64,
-    pub(crate) deleted: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryStateGetResult {
-    pub(crate) ok: bool,
-    pub(crate) record: Option<MemoryStateGetEntry>,
-    pub(crate) max_version: i64,
     pub(crate) error: String,
 }
 
@@ -478,14 +348,6 @@ pub(crate) struct MemoryStateSnapshotResult {
 pub(crate) struct MemoryProfileResult {
     pub(crate) ok: bool,
     pub(crate) snapshot: Option<crate::memory::MemoryProfileSnapshot>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryStateVersionIfNewerResult {
-    pub(crate) ok: bool,
-    pub(crate) stale: bool,
-    pub(crate) max_version: i64,
     pub(crate) error: String,
 }
 

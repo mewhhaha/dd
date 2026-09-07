@@ -8,7 +8,6 @@ pub(super) enum IsolateCommand {
         request_body: Option<InvokeRequestBodyReceiver>,
         stream_response: bool,
         memory_call: Box<Option<MemoryExecutionCall>>,
-        host_rpc_call: Option<HostRpcExecutionCall>,
         memory_route: Box<Option<MemoryRoute>>,
         dispatched_at: Instant,
         profile_memory_atomic: bool,
@@ -16,11 +15,7 @@ pub(super) enum IsolateCommand {
     Abort {
         runtime_request_id: String,
     },
-    DrainDynamicControl,
-    Shutdown,
-    ShutdownAndFlushCache {
-        reply: oneshot::Sender<Result<()>>,
-    },
+    DrainRequestControl,
 }
 
 pub(super) struct IsolateEventLoopWaker {
@@ -40,12 +35,6 @@ impl Wake for IsolateEventLoopWaker {
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(crate) enum MemoryExecutionCall {
-    Method {
-        binding: String,
-        key: String,
-        name: String,
-        args: Vec<u8>,
-    },
     Message {
         binding: String,
         key: String,
@@ -54,8 +43,6 @@ pub(crate) enum MemoryExecutionCall {
         data: Vec<u8>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
     },
     Close {
         binding: String,
@@ -65,55 +52,47 @@ pub(crate) enum MemoryExecutionCall {
         reason: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    #[serde(rename = "transport_datagram")]
-    TransportDatagram {
-        binding: String,
-        key: String,
-        handle: String,
-        data: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    #[serde(rename = "transport_stream")]
-    TransportStream {
-        binding: String,
-        key: String,
-        handle: String,
-        data: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
-    },
-    #[serde(rename = "transport_close")]
-    TransportClose {
-        binding: String,
-        key: String,
-        handle: String,
-        code: u16,
-        reason: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        socket_handles: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        transport_handles: Vec<String>,
     },
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct HostRpcExecutionCall {
-    pub(super) target_id: String,
-    pub(super) method: String,
-    pub(super) args: Vec<u8>,
+impl MemoryExecutionCall {
+    pub(super) fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Message {
+                binding,
+                key,
+                handle,
+                data,
+                socket_handles,
+                ..
+            } => {
+                binding.len()
+                    + key.len()
+                    + handle.len()
+                    + data.len()
+                    + socket_handles.iter().map(String::len).sum::<usize>()
+            }
+            Self::Close {
+                binding,
+                key,
+                handle,
+                reason,
+                socket_handles,
+                ..
+            } => {
+                binding.len()
+                    + key.len()
+                    + handle.len()
+                    + reason.len()
+                    + socket_handles.iter().map(String::len).sum::<usize>()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(super) struct InvokeCancelGuard {
-    pub(super) cancel_sender: mpsc::Sender<RuntimeCommand>,
+    pub(super) cancel_sender: RuntimeCancellationSender,
     pub(super) worker_name: String,
     pub(super) runtime_request_id: String,
     pub(super) armed: bool,
@@ -121,7 +100,7 @@ pub(super) struct InvokeCancelGuard {
 
 impl InvokeCancelGuard {
     pub(super) fn new(
-        cancel_sender: mpsc::Sender<RuntimeCommand>,
+        cancel_sender: RuntimeCancellationSender,
         worker_name: String,
         runtime_request_id: String,
     ) -> Self {
@@ -144,9 +123,38 @@ impl Drop for InvokeCancelGuard {
             return;
         }
 
-        let _ = self.cancel_sender.try_send(RuntimeCommand::Cancel {
+        let _ = self.cancel_sender.send(RuntimeCommand::Cancel {
             worker_name: self.worker_name.clone(),
             runtime_request_id: self.runtime_request_id.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_survives_a_scheduler_backlog() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        for request in 0..8192 {
+            drop(InvokeCancelGuard::new(
+                RuntimeCancellationSender::new(sender.clone(), WorkerRoutes::default()),
+                "worker".to_string(),
+                request.to_string(),
+            ));
+        }
+        drop(sender);
+        for request in 0..8192 {
+            match receiver
+                .try_recv()
+                .expect("accepted request cancellation must arrive")
+            {
+                RuntimeCommand::Cancel {
+                    runtime_request_id, ..
+                } => assert_eq!(runtime_request_id, request.to_string()),
+                _ => panic!("unexpected command on cancellation channel"),
+            }
+        }
     }
 }

@@ -94,12 +94,14 @@ size-report-all profile="dist":
 
 # Syntax-check source-only JS integration package.
 check-js:
+  node scripts/check-runtime-contract.mjs
   node --check benchmarks/run.mjs
   node --check benchmarks/summarize.mjs
   node --check benchmarks/check-regression.mjs
   node --check benchmarks/compare-commits.mjs
   node --check benchmarks/lib/runner-config.mjs
   node --check benchmarks/lib/results.mjs
+  node --check benchmarks/lib/metadata.mjs
   node --test benchmarks/lib/runner-config.test.mjs
   node --test benchmarks/lib/summarize.test.mjs
   node --test benchmarks/lib/check-regression.test.mjs
@@ -110,6 +112,12 @@ check-js:
   node --check packages/dd-vite/src/vite.js
   node --check packages/dd-vite/src/vitest.js
   node --check packages/dd-vite/src/vitest-environment.js
+  pnpm --filter dd-vite-hono-example exec tsc -p ../../scripts/kv-contract.tsconfig.json
+
+# Verify acknowledged state mutations across forced server termination in a disposable store.
+check-state-crash:
+  cargo build --locked -p dd_server --bin dd_server
+  python3 scripts/verify-durable-state.py
 
 # Regenerate the checked-in keyed-memory scaling summary from local ignored JSON.
 benchmark-summary fixed='benchmarks/results/local-atomic-memory-scaling-matrix.json' core='benchmarks/results/local-atomic-memory-scaling-matrix.json':

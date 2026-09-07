@@ -1,14 +1,14 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { once } from "node:events";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeRuntimeConfig } from "./vite/config.js";
 
 const DEFAULT_WORKER_NAME = "test-worker";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
-const BODYLESS_METHODS = new Set(["GET", "HEAD"]);
-const BODYLESS_RESPONSE_STATUSES = new Set([204, 205, 304]);
 const require = createRequire(import.meta.url);
 
 export function createDdRuntime(options = {}) {
@@ -20,6 +20,7 @@ export class DdRuntimeClient {
   #generation = 0;
   #nextId = 1;
   #pending = new Map();
+  #workers = new Map();
   #stdout = "";
   #stderr = "";
   #closed = false;
@@ -42,94 +43,45 @@ export class DdRuntimeClient {
       op: "deploy",
       name,
       source,
-      config,
+      config: normalizeRuntimeConfig(config, `worker ${name} config`),
     });
+    this.#workers.set(name, result.url);
     return result;
   }
 
-  async invoke(name, request) {
-    const body = request.body_base64 ?? "";
-    return this.request({
-      op: "invoke",
-      name,
-      method: request.method ?? "GET",
-      url: request.url ?? "http://worker/",
-      headers: request.headers ?? [],
-      body_base64: body,
-      request_id: request.request_id,
-    });
+  workerUrl(name) {
+    this.#liveChild();
+    const url = this.#workers.get(name);
+    if (!url) {
+      throw new Error(`dd worker ${name} is not deployed in this runtime`);
+    }
+    return url;
   }
 
   async fetch(nameOrInput, inputOrInit, maybeInit) {
-    const hasWorkerName = typeof nameOrInput === "string" && arguments.length > 1;
+    const hasWorkerName = typeof nameOrInput === "string" && (
+      typeof inputOrInit === "string" || inputOrInit instanceof URL || inputOrInit instanceof Request
+    );
     const name = hasWorkerName ? nameOrInput : DEFAULT_WORKER_NAME;
     const input = hasWorkerName ? inputOrInit : nameOrInput;
     const init = hasWorkerName ? maybeInit : inputOrInit;
-    const request = input instanceof Request ? input : new Request(input, init);
-    const body_base64 = BODYLESS_METHODS.has(request.method.toUpperCase())
-      ? ""
-      : Buffer.from(await request.arrayBuffer()).toString("base64");
-    const result = await this.invoke(name, {
+    const request = new Request(input, init);
+    const originalUrl = new URL(request.url);
+    const target = new URL(this.workerUrl(name));
+    target.pathname = originalUrl.pathname;
+    target.search = originalUrl.search;
+    const headers = new Headers(request.headers);
+    headers.set("x-dd-dev-request-url", request.url);
+    headers.set("x-dd-dev-request-host", headers.get("host") ?? originalUrl.host);
+    headers.delete("host");
+    headers.delete("transfer-encoding");
+    return fetch(target, {
       method: request.method,
-      url: request.url,
-      headers: [...request.headers.entries()],
-      body_base64,
-    });
-    const body = BODYLESS_RESPONSE_STATUSES.has(result.status)
-      ? undefined
-      : Buffer.from(result.body_base64, "base64");
-    return new Response(body, {
-      status: result.status,
-      headers: result.headers,
-    });
-  }
-
-  async openWebSocket(name, request) {
-    return this.request({
-      op: "open_websocket",
-      name,
-      method: request.method ?? "GET",
-      url: request.url ?? "http://worker/",
-      headers: request.headers ?? [],
-      body_base64: request.body_base64 ?? "",
-      request_id: request.request_id,
-    });
-  }
-
-  async sendWebSocketFrame(name, sessionId, body, options = {}) {
-    const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body ?? "");
-    return this.request({
-      op: "send_websocket_frame",
-      name,
-      session_id: sessionId,
-      body_base64: buffer.toString("base64"),
-      binary: options.binary === true,
-    });
-  }
-
-  async drainWebSocketFrame(name, sessionId) {
-    return this.request({
-      op: "drain_websocket_frame",
-      name,
-      session_id: sessionId,
-    });
-  }
-
-  async waitWebSocketFrame(name, sessionId) {
-    return this.request({
-      op: "wait_websocket_frame",
-      name,
-      session_id: sessionId,
-    }, { timeoutMs: 0 });
-  }
-
-  async closeWebSocket(name, sessionId, options = {}) {
-    return this.request({
-      op: "close_websocket",
-      name,
-      session_id: sessionId,
-      code: options.code ?? 1000,
-      reason: options.reason ?? "",
+      headers,
+      body: request.body,
+      duplex: "half",
+      signal: request.signal,
+      redirect: "manual",
     });
   }
 
@@ -189,12 +141,14 @@ export class DdRuntimeClient {
       return;
     }
     try {
+      const exited = once(child, "exit");
       await Promise.race([
-        this.request({ op: "shutdown" }),
+        this.request({ op: "shutdown" }).then(() => exited),
         delay(this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS),
       ]);
     } catch {}
     this.#closed = true;
+    this.#workers.clear();
     this.#rejectAll(new Error("dd runtime client is closed"));
     child.kill("SIGTERM");
   }
@@ -265,6 +219,7 @@ export class DdRuntimeClient {
       return;
     }
     this.#child = undefined;
+    this.#workers.clear();
     this.#generation += 1;
   }
 
@@ -400,7 +355,7 @@ function runtimeCommand(options) {
     }
     return {
       command: "cargo",
-      args: ["run", "--quiet", "-p", "runtime", "--bin", "dd_dev_runtime", "--", ...args],
+      args: ["run", "--quiet", "-p", "dd_server", "--no-default-features", "--features", "websocket", "--bin", "dd_dev_runtime", "--", ...args],
       cwd: repoRoot,
     };
   }

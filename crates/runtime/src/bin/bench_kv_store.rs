@@ -1,6 +1,5 @@
 use runtime::KvStore;
 use std::env;
-use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -96,11 +95,11 @@ fn print_help() {
 }
 
 async fn run_scenario(scenario: Scenario) -> Result<(), String> {
-    let root = PathBuf::from(format!("/tmp/dd-bench-kv-store-{}", Uuid::new_v4()));
-    let db_url = format!("file:{}", root.join("dd-kv.db").display());
-    let store = KvStore::from_database_url(&db_url)
+    let root = std::env::temp_dir().join(format!("dd-bench-kv-store-{}", Uuid::new_v4()));
+    let state = storage::state::StateStore::open(root.join("state"))
         .await
         .map_err(|error| error.to_string())?;
+    let store = KvStore::from_state(state);
     store
         .put("worker-a", "MY_KV", "hot", "1")
         .await

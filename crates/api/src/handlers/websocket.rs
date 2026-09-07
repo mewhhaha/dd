@@ -34,7 +34,7 @@ where
     invoke_worker_websocket_with_target(state, parts, body, worker_name, url, ws_upgrade).await
 }
 
-async fn invoke_worker_websocket_with_target<B>(
+pub(super) async fn invoke_worker_websocket_with_target<B>(
     state: AppState,
     parts: http::request::Parts,
     _body: B,
@@ -223,46 +223,6 @@ pub(crate) async fn open_websocket_session_from_parts(
         .open_websocket(worker_name, invocation, None)
         .await
         .map_err(|error| PlatformError::bad_request(format!("websocket open failed: {error}")))
-}
-
-#[cfg(feature = "http3")]
-pub(crate) async fn open_transport_session_from_parts(
-    state: &AppState,
-    parts: &http::request::Parts,
-    worker_name: String,
-    url: String,
-    stream_sender: mpsc::Sender<Vec<u8>>,
-    datagram_sender: mpsc::Sender<Vec<u8>>,
-) -> Result<runtime::TransportOpen, PlatformError> {
-    if parts.method != Method::CONNECT {
-        return Err(PlatformError::bad_request(
-            "transport open requires CONNECT",
-        ));
-    }
-
-    let mut headers = Vec::with_capacity(parts.headers.len());
-    for (name, value) in &parts.headers {
-        let value = value.to_str().map_err(|error| {
-            PlatformError::bad_request(format!("invalid header value for {name}: {error}"))
-        })?;
-        headers.push((name.as_str().to_string(), value.to_string()));
-    }
-    inject_current_trace_context(&mut headers);
-    let request_id = Uuid::new_v4().to_string();
-
-    let invocation = WorkerInvocation {
-        method: parts.method.as_str().to_string(),
-        url,
-        headers,
-        body: Vec::new(),
-        request_id,
-    };
-
-    state
-        .runtime
-        .open_transport(worker_name, invocation, stream_sender, datagram_sender)
-        .await
-        .map_err(|error| PlatformError::bad_request(format!("transport open failed: {error}")))
 }
 
 pub(crate) async fn handle_websocket_session<S>(

@@ -37,7 +37,7 @@ function withStmHeader(response: Response, context: DdRequestContext): Response 
   }
   const headers = new Headers(response.headers);
   if (count !== undefined) {
-    headers.set("x-dd-stm-count", String(count));
+    headers.set("x-memory-count", String(count));
   }
   if (context.sessionCookie) {
     headers.append("set-cookie", context.sessionCookie);
