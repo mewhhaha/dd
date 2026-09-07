@@ -37,7 +37,7 @@ async fn unmatched_outbox_kinds_do_not_commit_state_transactions() {
             &namespace,
             "entity",
             MemoryCommit {
-                outbox_effects: &[MemoryOutboxEffectWrite {
+                outbox_effects: vec![MemoryOutboxEffectWrite {
                     kind: "audit.custom".into(),
                     payload: b"retained effect".to_vec(),
                 }],

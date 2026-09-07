@@ -18,6 +18,8 @@ const ENV_NAMES: &[&str] = &[
     "DD_FANOUT_MODE",
     "DD_FANOUT_POPULATION",
     "DD_FANOUT_PAYLOAD_BYTES",
+    "DD_FANOUT_KEYS_PER_ENTITY",
+    "DD_FANOUT_PAYLOAD_KIND",
     "DD_FANOUT_CONCURRENCY",
     "DD_FANOUT_DURATION_MS",
     "DD_FANOUT_WARMUP_MS",
@@ -37,6 +39,8 @@ struct Config {
     mode: Mode,
     population: usize,
     payload_bytes: usize,
+    keys_per_entity: usize,
+    payload_kind: String,
     concurrency: usize,
     duration_ms: usize,
     warmup_ms: usize,
@@ -75,11 +79,19 @@ impl Config {
             mode,
             population: env_usize("DD_FANOUT_POPULATION", 1024, 1)?,
             payload_bytes: env_usize("DD_FANOUT_PAYLOAD_BYTES", 128, 0)?,
+            keys_per_entity: env_usize("DD_FANOUT_KEYS_PER_ENTITY", 1, 1)?,
+            payload_kind: std::env::var("DD_FANOUT_PAYLOAD_KIND")
+                .unwrap_or_else(|_| "repeated".to_string()),
             concurrency: env_usize("DD_FANOUT_CONCURRENCY", 4 * available_cpus, 1)?,
             duration_ms: env_usize("DD_FANOUT_DURATION_MS", 8000, 1)?,
             warmup_ms: env_usize("DD_FANOUT_WARMUP_MS", 2000, 0)?,
             available_cpus,
         };
+        if config.keys_per_entity > 256
+            || !["repeated", "varied"].contains(&config.payload_kind.as_str())
+        {
+            return Err("expected 1..=256 keys per entity and repeated/varied payload kind".into());
+        }
         if ![1, 4, 16].contains(&config.width) {
             return Err(format!(
                 "DD_FANOUT_WIDTH={}; expected 1, 4, or 16",
@@ -119,6 +131,7 @@ enum Operation {
     Seed,
     Read,
     Write,
+    Verify,
 }
 
 #[derive(Serialize)]
@@ -354,7 +367,7 @@ async fn run_phase(
 async fn verify(service: &RuntimeService, counts: &[u64]) -> Result<(), String> {
     for start in (0..counts.len()).step_by(16) {
         let plan = RequestPlan {
-            operation: Operation::Read,
+            operation: Operation::Verify,
             sequence: start as u64,
             entities: (start..(start + 16).min(counts.len())).collect(),
         };
@@ -404,8 +417,9 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
             .deploy_with_config(
                 WORKER.to_string(),
                 format!(
-                    "const payloadBytes = {};\n{WORKER_SOURCE}",
-                    config.payload_bytes
+                    "const payloadBytes = {}; const keysPerEntity = {}; const payloadKind = {};\n{WORKER_SOURCE}",
+                    config.payload_bytes, config.keys_per_entity,
+                    serde_json::to_string(&config.payload_kind).map_err(|error| error.to_string())?
                 ),
                 DeployConfig {
                     bindings: vec![DeployBinding::Memory {

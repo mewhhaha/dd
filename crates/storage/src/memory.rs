@@ -1,5 +1,6 @@
-use crate::state::{STATE_SHARDS, StateStore, WriteOptions, storage_error};
+use crate::state::{STATE_SHARDS, StateStore, WriteOptions, WriteOutcome, storage_error};
 use crate::turso_util::{execute_cached, query_cached};
+use bytes::Bytes;
 use common::{PlatformError, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -57,7 +58,114 @@ impl SnapshotCache {
         self.order.remove(&removed.ordinal);
         Some(removed.snapshot)
     }
+
+    pub(crate) fn publish_committed(
+        snapshots: &Mutex<Self>,
+        changes: &[(&MemorySnapshotKey, Option<&MemorySnapshotChange>)],
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut grouped = HashMap::<_, Vec<_>>::new();
+        for (key, change) in changes {
+            grouped.entry(*key).or_default().push(*change);
+        }
+        let pending = {
+            let cache = snapshots.lock().expect("memory snapshots lock poisoned");
+            grouped
+                .into_iter()
+                .filter_map(|(key, changes)| {
+                    cache
+                        .entries
+                        .get(key)
+                        .map(|cached| (key, Arc::clone(&cached.snapshot), changes))
+                })
+                .collect::<Vec<_>>()
+        };
+        // Copy and merge outside the shared lock. The lease stays with the queued
+        // commit until publication and acknowledgement, including caller cancellation.
+        let updated = pending
+            .into_iter()
+            .map(|(key, original, changes)| {
+                let next = if changes.iter().any(Option::is_none) {
+                    None
+                } else {
+                    let mut next = (*original).clone();
+                    let mut complete = true;
+                    for change in changes.into_iter().flatten() {
+                        // A concurrent SQL fill can already contain the entire committed group.
+                        if next.max_version >= change.version {
+                            continue;
+                        }
+                        if next.max_version != change.previous_version {
+                            complete = false;
+                            break;
+                        }
+                        for mutation in &change.commit.mutations {
+                            let entry = MemorySnapshotEntry {
+                                key: mutation.key.clone(),
+                                value: mutation.value.clone(),
+                                encoding: mutation.encoding.clone(),
+                                deleted: mutation.deleted,
+                                version: change.version,
+                            };
+                            match next
+                                .entries
+                                .binary_search_by(|entry| entry.key.cmp(&mutation.key))
+                            {
+                                Ok(index) => next.entries[index] = entry,
+                                Err(index) => next.entries.insert(index, entry),
+                            }
+                        }
+                        next.max_version = change.version;
+                    }
+                    complete.then(|| {
+                        let bytes = next.cache_bytes(key);
+                        (Arc::new(next), bytes)
+                    })
+                };
+                (key, original, next)
+            })
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        {
+            let mut cache = snapshots.lock().expect("memory snapshots lock poisoned");
+            for (key, original, next) in &updated {
+                let Some(cached) = cache.entries.get(*key) else {
+                    continue;
+                };
+                // Eviction, resized budgets, or a newer fill win over this derived update.
+                if !Arc::ptr_eq(&cached.snapshot, original) {
+                    continue;
+                }
+                let previous_bytes = cached.bytes;
+                if let Some((snapshot, bytes)) = next
+                    && *bytes <= cache.max_bytes - (cache.bytes - previous_bytes)
+                {
+                    cache.bytes = cache.bytes - previous_bytes + bytes;
+                    let cached = cache
+                        .entries
+                        .get_mut(*key)
+                        .expect("matched cached snapshot");
+                    cached.bytes = *bytes;
+                    removed.push(std::mem::replace(
+                        &mut cached.snapshot,
+                        Arc::clone(snapshot),
+                    ));
+                } else {
+                    removed.push(cache.remove(key).expect("matched cached snapshot"));
+                }
+            }
+        }
+        drop(removed);
+    }
 }
+pub(crate) struct MemorySnapshotChange {
+    pub previous_version: i64,
+    pub version: i64,
+    pub commit: Arc<MemoryCommit>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryProfileMetricKind {
     JsReadOnlyCommit,
@@ -140,7 +248,7 @@ pub struct MemoryProfile {
 #[derive(Debug, Clone)]
 pub struct MemorySnapshotEntry {
     pub key: String,
-    pub value: Vec<u8>,
+    pub value: Bytes,
     pub encoding: String,
     pub version: i64,
     pub deleted: bool,
@@ -152,6 +260,19 @@ pub struct MemorySnapshot {
     pub max_version: i64,
 }
 
+impl MemorySnapshot {
+    fn cache_bytes(&self, key: &MemorySnapshotKey) -> usize {
+        key.0.len()
+            + key.1.len()
+            + 128
+            + self
+                .entries
+                .iter()
+                .map(|entry| entry.key.len() + entry.value.len() + entry.encoding.len() + 96)
+                .sum::<usize>()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MemoryPointRead {
     pub record: Option<MemorySnapshotEntry>,
@@ -161,16 +282,16 @@ pub struct MemoryPointRead {
 #[derive(Debug, Clone)]
 pub struct MemoryBatchMutation {
     pub key: String,
-    pub value: Vec<u8>,
+    pub value: Bytes,
     pub encoding: String,
     pub deleted: bool,
 }
 
 #[derive(Default)]
-pub struct MemoryCommit<'a> {
-    pub mutations: &'a [MemoryBatchMutation],
-    pub command_result: Option<&'a MemoryCommandResultWrite>,
-    pub outbox_effects: &'a [MemoryOutboxEffectWrite],
+pub struct MemoryCommit {
+    pub mutations: Vec<MemoryBatchMutation>,
+    pub command_result: Option<MemoryCommandResultWrite>,
+    pub outbox_effects: Vec<MemoryOutboxEffectWrite>,
     pub owner_epoch: Option<i64>,
     pub lease: Option<Arc<MemoryLease>>,
 }

@@ -13,6 +13,9 @@ current storage layout.
 The [concurrent memory comparison](MEMORY-FANOUT.md) measures workers calling
 multiple independent memories, including core scaling, read/write mixes,
 response validation, and exact state verification after reopening.
+The [memory performance follow-up](MEMORY-FANOUT-FOLLOWUP.md) measures direct
+buffer staging and bounded snapshot reuse against that checkpoint, including
+larger multi-key memories, cache overflow, and core scaling.
 
 For equivalent durable workloads across the consolidation, use the
 [state comparison build and run instructions](../docs/storage-conversion.md).

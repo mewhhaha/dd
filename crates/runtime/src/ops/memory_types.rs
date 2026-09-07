@@ -174,13 +174,6 @@ pub(crate) struct MemoryByteHandle {
     pub(crate) value: Bytes,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryBytesPutResult {
-    pub(crate) ok: bool,
-    pub(crate) handle: u32,
-    pub(crate) error: String,
-}
-
 #[derive(Default)]
 pub struct MemoryBatchHandles {
     next: u32,
@@ -339,7 +332,8 @@ pub(crate) struct MemoryStateSnapshotEntry {
 #[derive(Debug, Serialize)]
 pub(crate) struct MemoryStateSnapshotResult {
     pub(crate) ok: bool,
-    pub(crate) entries: Vec<MemoryStateSnapshotEntry>,
+    pub(crate) entries: Option<Vec<MemoryStateSnapshotEntry>>,
+    pub(crate) revision: String,
     pub(crate) max_version: i64,
     pub(crate) error: String,
 }
@@ -356,6 +350,7 @@ pub(crate) struct MemoryStateApplyBatchResult {
     pub(crate) ok: bool,
     pub(crate) applied: bool,
     pub(crate) read_only: bool,
+    pub(crate) revision: String,
     pub(crate) max_version: i64,
     pub(crate) mutation_count: usize,
     pub(crate) effect_count: usize,

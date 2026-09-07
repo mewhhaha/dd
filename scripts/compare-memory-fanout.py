@@ -23,16 +23,21 @@ def write_json(path, value):
 
 def parse_case(value):
     parts = value.split(":")
-    if len(parts) != 4 or parts[0] not in {"read", "write", "mixed"}:
-        raise argparse.ArgumentTypeError(f"case {value!r} must be MODE:WIDTH:POPULATION:PAYLOAD_BYTES")
+    if len(parts) not in {4, 6} or parts[0] not in {"read", "write", "mixed"}:
+        raise argparse.ArgumentTypeError(f"case {value!r} must be MODE:WIDTH:POPULATION:PAYLOAD_BYTES[:KEYS_PER_ENTITY:PAYLOAD_KIND]")
     try:
-        width, population, payload = map(int, parts[1:])
+        width, population, payload = map(int, parts[1:4])
+        keys = int(parts[4]) if len(parts) == 6 else 1
     except ValueError as error:
         raise argparse.ArgumentTypeError(f"case {value!r} requires integer dimensions") from error
     if width not in {1, 4, 16} or population < width or payload < 1:
         raise argparse.ArgumentTypeError(f"case {value!r} requires width 1/4/16, population >= width, and positive payload")
+    kind = parts[5] if len(parts) == 6 else "repeated"
+    if not 1 <= keys <= 256 or kind not in {"repeated", "varied"}:
+        raise argparse.ArgumentTypeError("expected 1..=256 keys and repeated/varied payload kind")
     return {"name": value.replace(":", "-"), "mode": parts[0], "width": width,
-            "population": population, "payload_bytes": payload}
+            "population": population, "payload_bytes": payload,
+            "keys_per_entity": keys, "payload_kind": kind}
 
 
 def run_sample(folder, binary, cpus, case, arguments):
@@ -46,6 +51,8 @@ def run_sample(folder, binary, cpus, case, arguments):
         "DD_FANOUT_MODE": case["mode"], "DD_FANOUT_WIDTH": str(case["width"]),
         "DD_FANOUT_POPULATION": str(case["population"]),
         "DD_FANOUT_PAYLOAD_BYTES": str(case["payload_bytes"]),
+        "DD_FANOUT_KEYS_PER_ENTITY": str(case["keys_per_entity"]),
+        "DD_FANOUT_PAYLOAD_KIND": case["payload_kind"],
         "DD_FANOUT_CONCURRENCY": str(arguments.concurrency or len(cpus) * 4),
         "DD_FANOUT_DURATION_MS": str(arguments.duration_ms),
         "DD_FANOUT_WARMUP_MS": str(arguments.warmup_ms),
@@ -93,7 +100,7 @@ def run_sample(folder, binary, cpus, case, arguments):
     if child.returncode:
         raise RuntimeError(f"benchmark exited {child.returncode}; inspect {folder}")
     result = json.loads((folder / "stdout.log").read_text())
-    expected_config = {key: case[key] for key in ['mode', 'width', 'population', 'payload_bytes']}
+    expected_config = {key: case[key] for key in ['mode', 'width', 'population', 'payload_bytes', 'keys_per_entity', 'payload_kind']}
     expected_config.update(concurrency=arguments.concurrency or len(cpus) * 4,
                            duration_ms=arguments.duration_ms, warmup_ms=arguments.warmup_ms,
                            available_cpus=len(cpus))

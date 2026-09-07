@@ -234,7 +234,6 @@ deno_core::extension!(
         op_memory_profile_take,
         op_memory_profile_reset,
         op_memory_state_snapshot,
-        op_memory_bytes_put,
         op_memory_bytes_take,
         op_memory_batch_begin,
         op_memory_batch_close,

@@ -445,7 +445,7 @@ impl KvStore {
                         ),
                     )
                     .await?;
-                        Ok(version)
+                        Ok(version.into())
                     })
                 },
             )

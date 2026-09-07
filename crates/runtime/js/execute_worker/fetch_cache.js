@@ -340,6 +340,7 @@
     if (!entry.storageState) {
       entry.storageState = {
         fullSnapshotLoaded: false,
+        snapshotRevision: "",
         hydrating: null,
         mirror: new Map(),
         committedVersion: -1,
@@ -363,8 +364,55 @@
     };
   };
 
+  const idleMemorySnapshots = globalThis.__dd_idle_memory_snapshots ??= {
+    entries: new Map(),
+    bytes: 0,
+  };
+  const MEMORY_IDLE_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
+  const MEMORY_IDLE_SNAPSHOT_MAX_ENTRIES = 4096;
+
+  const clearMemorySnapshot = (storageState) => {
+    storageState.mirror.clear();
+    storageState.fullSnapshotLoaded = false;
+    storageState.snapshotRevision = "";
+  };
+
+  const acquireMemorySnapshot = (entry) => {
+    const cached = idleMemorySnapshots.entries.get(entry.cacheKey);
+    if (cached) {
+      idleMemorySnapshots.entries.delete(entry.cacheKey);
+      idleMemorySnapshots.bytes -= cached.bytes;
+    }
+  };
+
+  const releaseMemorySnapshot = (entry) => {
+    const storageState = ensureMemoryStorageState(entry);
+    if (!storageState.fullSnapshotLoaded || storageState.failedError) {
+      clearMemorySnapshot(storageState);
+      return;
+    }
+    let bytes = 128 + entry.cacheKey.length * 2;
+    for (const record of storageState.mirror.values()) {
+      bytes += record.value.byteLength + (record.key.length + record.encoding.length) * 2 + 96;
+    }
+    if (bytes > MEMORY_IDLE_SNAPSHOT_MAX_BYTES) {
+      clearMemorySnapshot(storageState);
+      return;
+    }
+    while (idleMemorySnapshots.entries.size >= MEMORY_IDLE_SNAPSHOT_MAX_ENTRIES
+      || idleMemorySnapshots.bytes + bytes > MEMORY_IDLE_SNAPSHOT_MAX_BYTES) {
+      const [key, oldest] = idleMemorySnapshots.entries.entries().next().value;
+      idleMemorySnapshots.entries.delete(key);
+      idleMemorySnapshots.bytes -= oldest.bytes;
+      clearMemorySnapshot(oldest.storageState);
+    }
+    idleMemorySnapshots.entries.set(entry.cacheKey, { storageState, bytes });
+    idleMemorySnapshots.bytes += bytes;
+  };
+
   const createMemoryTxn = (entry, options = undefined) => ({
     entry,
+    pendingRecords: new Map(),
     batchHandle: beginMemoryBatch(entry, {
       commandHandle: Math.max(0, Math.trunc(Number(options?.commandHandle ?? 0) || 0)),
     }),
@@ -511,17 +559,17 @@
           memoryScopedScopeHandle(entry),
           entry.binding,
           entry.memoryKey,
+          storageState.fullSnapshotLoaded ? storageState.snapshotRevision : "",
         );
         await syncFrozenTime();
         if (!result || typeof result !== "object" || result.ok === false) {
           throw new Error(String(result?.error ?? "memory storage snapshot failed"));
         }
-        replaceMemorySnapshot(
-          storageState,
-          result.entries,
-          result.max_version,
-        );
-        recordMemoryProfile("js_hydrate_full", performance.now() - started, result.entries?.length ?? 1);
+        if (result.entries !== null) {
+          replaceMemorySnapshot(storageState, result.entries, result.max_version);
+          recordMemoryProfile("js_hydrate_full", performance.now() - started, result.entries.length);
+        }
+        storageState.snapshotRevision = result.revision;
         storageState.hydrating = null;
         return storageState;
       })().catch(async (error) => {
@@ -539,7 +587,7 @@
         "op_memory_batch_effect",
         txn.batchHandle,
         kind,
-        putMemoryBytes(payload),
+        toArrayBytes(payload),
       ),
       "effect",
     );
@@ -577,18 +625,6 @@
     }
   };
 
-  const putMemoryBytes = (value) => {
-    const bytes = toArrayBytes(value);
-    if (bytes.byteLength === 0) {
-      return 0;
-    }
-    const result = callOp("op_memory_bytes_put", activeRequestContextHandle(), bytes);
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory byte handle put failed"));
-    }
-    return Math.max(0, Math.trunc(Number(result.handle ?? 0) || 0));
-  };
-
   const beginMemoryBatch = (entry, options = undefined) => {
     const result = callOp(
       "op_memory_batch_begin",
@@ -614,6 +650,7 @@
   const closeMemoryTxnBatch = (txn) => {
     if (txn) {
       closeMemoryBatch(txn.batchHandle);
+      txn.pendingRecords.clear();
     }
   };
 
@@ -638,7 +675,7 @@
       callOp(
         "op_memory_batch_command_result",
         txn.batchHandle,
-        putMemoryBytes(value),
+        toArrayBytes(value),
       ),
       "command result",
     );
@@ -649,13 +686,14 @@
       "op_memory_batch_mutation",
       txn.batchHandle,
       mutation.key,
-      putMemoryBytes(mutation.value),
+      toArrayBytes(mutation.value),
       mutation.encoding,
       mutation.deleted === true,
     );
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory batch mutation failed"));
     }
+    txn.pendingRecords.set(mutation.key, mutation);
   };
 
   const finishMemoryTxn = async (txn, runtimeRequestId) => {
@@ -673,8 +711,10 @@
       recordMemoryProfile("js_read_only_commit", performance.now() - started, 1);
       return;
     }
-    storageState.mirror.clear();
-    storageState.fullSnapshotLoaded = false;
+    for (const record of txn.pendingRecords.values()) {
+      storageState.mirror.set(record.key, { ...record, version: result.max_version });
+    }
+    storageState.snapshotRevision = result.revision;
     storageState.committedVersion = result.max_version;
     if (result.output_gate_required === true) {
       await gateMemoryOutput(txn.entry, runtimeRequestId, async () => undefined);
@@ -686,6 +726,8 @@
     );
   };
 
+
+  const memoryStorageKey = (key) => String(key).toWellFormed();
 
   const createMemoryStorageBinding = (entry, runtimeRequestId, txn = null) => {
     const rejectStorageOptions = (operation, options) => {
@@ -705,7 +747,7 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        const normalizedKey = String(key);
+        const normalizedKey = memoryStorageKey(key);
         if (txn && !storageState.fullSnapshotLoaded) {
           throw new Error("memory transaction storage must be hydrated before execution");
         }
@@ -730,7 +772,7 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        const normalizedKey = String(key);
+        const normalizedKey = memoryStorageKey(key);
         const encoded = encodeMemoryStorageValue(value);
         const record = {
           key: normalizedKey,
@@ -749,7 +791,7 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        const normalizedKey = String(key);
+        const normalizedKey = memoryStorageKey(key);
         const record = {
           key: normalizedKey,
           value: new Uint8Array(),
@@ -766,7 +808,7 @@
         if (txn && !storageState.fullSnapshotLoaded) {
           throw new Error("memory transaction storage must be hydrated before execution");
         }
-        const prefix = String(options?.prefix ?? "");
+        const prefix = memoryStorageKey(options?.prefix ?? "");
         const limitInput = Number(options?.limit ?? 100);
         const limit = Number.isFinite(limitInput)
           ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
@@ -780,7 +822,17 @@
         return Array.from(merged.values())
           .filter((record) => !record.deleted)
           .filter((record) => record.key.startsWith(prefix))
-          .sort((left, right) => left.key.localeCompare(right.key))
+          .sort((left, right) => {
+            const order = left.key.localeCompare(right.key);
+            if (order !== 0 || left.key === right.key) return order;
+            // Match SQL's binary ordering for distinct keys with equal collation.
+            const leftBytes = toUtf8Bytes(left.key);
+            const rightBytes = toUtf8Bytes(right.key);
+            for (let index = 0; index < Math.min(leftBytes.length, rightBytes.length); index++) {
+              if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
+            }
+            return leftBytes.length - rightBytes.length;
+          })
           .slice(0, limit)
           .map((record) => ({
             key: record.key,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize completed paired memory fanout runs; optionally plot one run's core scaling."""
+"""Summarize completed paired memory fanout runs; optionally plot core scaling."""
 
 import argparse
 import json
@@ -40,7 +40,7 @@ def print_run(folder, manifest, groups):
         binary = manifest['binaries'][side]
         print(f"- {side.capitalize()} binary SHA-256: `{binary['sha256']}`; "
               f"source patch SHA-256: `{binary['build_record']['source_patch_sha256']}`.")
-    print("\n| CPUs | Mode / fanout / population / bytes | Requests/s before → after | Transactions/s before → after | Gain (pair range) | p99 ms before → after |")
+    print("\n| CPUs | Mode / fanout / population / bytes / keys / payload | Requests/s before → after | Transactions/s before → after | Gain (pair range) | p99 ms before → after |")
     print("|---:|---|---:|---:|---:|---:|")
     for group in groups:
         rates = [median(group, side, lambda run: run['sample']['request_throughput_rps'])
@@ -51,7 +51,8 @@ def print_run(folder, manifest, groups):
                      for side in ['baseline', 'candidate']]
         ratios = [pair['throughput_ratio'] for pair in group['pairs']]
         case = group['case']
-        label = f"{case['mode']} / {case['width']} / {case['population']} / {case['payload_bytes']}"
+        label = (f"{case['mode']} / {case['width']} / {case['population']} / {case['payload_bytes']} / "
+                 f"{case.get('keys_per_entity', 1)} / {case.get('payload_kind', 'repeated')}")
         print(f"| {group['cpus']} | {label} | {rates[0]:,.0f} → {rates[1]:,.0f} | "
               f"{transactions[0]:,.0f} → {transactions[1]:,.0f} | "
               f"{statistics.median(ratios):.2f}× ({min(ratios):.2f}–{max(ratios):.2f}) | "
@@ -75,23 +76,26 @@ def print_run(folder, manifest, groups):
           f"Host one-minute load ranged from {min(loads):.2f} to {max(loads):.2f}.\n")
 
 
-def plot_scaling(path, manifest, groups):
+def plot_scaling(path, comparisons):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.ticker import FuncFormatter
 
-    modes = [mode for mode in ['read', 'mixed', 'write'] if sum(
-        group['case']['name'] == f'{mode}-16-1024-128' for group in groups) >= 2]
-    if not modes:
-        raise ValueError('need at least two CPU counts for a MODE:16:1024:128 case')
-    figure, panels = plt.subplots(1, len(modes), figsize=(4.2 * len(modes), 4.2),
+    series = []
+    for manifest, groups in comparisons:
+        for name in dict.fromkeys(group['case']['name'] for group in groups):
+            selected = sorted([group for group in groups if group['case']['name'] == name],
+                              key=lambda group: group['cpus'])
+            if len({group['cpus'] for group in selected}) > 1:
+                series.append((manifest, selected))
+    if not series:
+        raise ValueError('need a workload measured at two or more CPU counts')
+    figure, panels = plt.subplots(1, len(series), figsize=(4.8 * len(series), 4.6),
                                  constrained_layout=True, squeeze=False)
     axes = panels[0]
-    for axis, mode in zip(axes, modes):
-        selected = sorted([group for group in groups if group['case'] == {
-            'name': f'{mode}-16-1024-128', 'mode': mode, 'width': 16,
-            'population': 1024, 'payload_bytes': 128}], key=lambda group: group['cpus'])
+    for axis, (manifest, selected) in zip(axes, series):
+        case = selected[0]['case']
         counts = [group['cpus'] for group in selected]
         for side, label, color in [('baseline', 'Before', '#64748b'), ('candidate', 'After', '#087f8c')]:
             samples = [[pair['runs'][side]['sample']['transaction_throughput_rps'] / 1000
@@ -105,15 +109,15 @@ def plot_scaling(path, manifest, groups):
                                else f'{manifest["physical_cores"]}+SMT' for count in counts])
         axis.set_ylim(bottom=0)
         axis.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f'{value:g}k'))
-        axis.set_title({'read': 'Read', 'mixed': '90% read / 10% write', 'write': 'Durable write'}[mode])
-        axis.set_xlabel('Physical cores, then SMT threads')
+        mode = {'read': 'Read', 'mixed': '90% read / 10% write', 'write': 'Durable write'}[case['mode']]
+        axis.set_title(f"{mode} · {case['width']} memories/request\n"
+                       f"{case.get('keys_per_entity', 1)} {'key' if case.get('keys_per_entity', 1) == 1 else 'keys'} × {case['payload_bytes']:,} B · "
+                       f"{case['population']:,} entities", fontsize=10)
+        axis.set_xlabel(f"Physical cores, then SMT · callers: {manifest['concurrency']}")
         axis.grid(alpha=0.2)
     axes[0].set_ylabel('Memory transactions / second')
     axes[-1].legend(frameon=False)
-    title = '16 memories / request · 1,024 entities · 128-byte payload'
-    if len(modes) == 1:
-        title = '16 memories / request · 1,024 entities\n128-byte payload'
-    figure.suptitle(f"{title}\nCallers: {manifest['concurrency']}", fontsize=11)
+    figure.suptitle('Concurrent memory throughput\nMedians and full run ranges on a shared host', fontsize=12)
     figure.savefig(path, metadata={'Date': None})
     plt.close(figure)
 
@@ -121,10 +125,11 @@ def plot_scaling(path, manifest, groups):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('runs', nargs='+', type=Path)
-    parser.add_argument('--plot', type=Path, help='SVG/PNG scaling plot from the first run; requires matplotlib')
+    parser.add_argument('--plot', type=Path, help='SVG/PNG plot of workloads measured across CPU counts; requires matplotlib')
     arguments = parser.parse_args()
     print('# Concurrent memory measurements\n')
-    for index, folder in enumerate(arguments.runs):
+    comparisons = []
+    for folder in arguments.runs:
         manifest = json.loads((folder / 'manifest.json').read_text())
         groups = json.loads((folder / 'summary.json').read_text())
         completion = json.loads((folder / 'completion.json').read_text())
@@ -133,8 +138,9 @@ def main():
         if completion != expected or 'candidate' not in manifest['binaries']:
             raise ValueError(f'{folder} is not a complete verified paired comparison')
         print_run(folder, manifest, groups)
-        if index == 0 and arguments.plot:
-            plot_scaling(arguments.plot, manifest, groups)
+        comparisons.append((manifest, groups))
+    if arguments.plot:
+        plot_scaling(arguments.plot, comparisons)
 
 
 if __name__ == '__main__':

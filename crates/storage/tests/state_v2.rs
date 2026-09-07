@@ -15,7 +15,7 @@ fn temporary_root() -> PathBuf {
 fn mutation(key: &str, value: &[u8]) -> MemoryBatchMutation {
     MemoryBatchMutation {
         key: key.into(),
-        value: value.into(),
+        value: bytes::Bytes::copy_from_slice(value),
         encoding: "utf8".into(),
         deleted: false,
     }
@@ -64,12 +64,12 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
             &namespace,
             "entity",
             storage::memory::MemoryCommit {
-                mutations: &[mutation("count", b"42")],
-                command_result: Some(&MemoryCommandResultWrite {
+                mutations: vec![mutation("count", b"42")],
+                command_result: Some(MemoryCommandResultWrite {
                     idempotency_key: "command".into(),
                     result: b"result".to_vec(),
                 }),
-                outbox_effects: &[MemoryOutboxEffectWrite {
+                outbox_effects: vec![MemoryOutboxEffectWrite {
                     kind: "fetch".into(),
                     payload: b"effect".to_vec(),
                 }],
@@ -81,7 +81,9 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
         .unwrap()
         .max_version;
     assert_eq!(
-        memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+        memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"42"
     );
     assert!(
@@ -162,7 +164,7 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
             &namespace,
             "entity",
             storage::memory::MemoryCommit {
-                mutations: &[mutation("count", b"43")],
+                mutations: vec![mutation("count", b"43")],
                 owner_epoch: Some(next_lease.owner_epoch()),
                 ..Default::default()
             },
@@ -177,7 +179,7 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
                 &namespace,
                 "entity",
                 storage::memory::MemoryCommit {
-                    mutations: &[mutation("count", b"stale")],
+                    mutations: vec![mutation("count", b"stale")],
                     owner_epoch: Some(owner),
                     ..Default::default()
                 },
@@ -186,7 +188,9 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
             .is_err()
     );
     assert_eq!(
-        memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+        memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"43"
     );
     drop(next_lease);
@@ -223,14 +227,16 @@ async fn snapshot_cache_preserves_recent_entities_and_refreshes_committed_values
             &namespace,
             "a",
             storage::memory::MemoryCommit {
-                mutations: &[mutation("value", b"updated")],
+                mutations: vec![mutation("value", b"updated")],
                 ..Default::default()
             },
         )
         .await
         .unwrap();
     assert_eq!(
-        memory.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        memory.snapshot(&namespace, "a").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"updated"
     );
     drop(memory);
@@ -255,7 +261,7 @@ async fn commits_preserve_unrelated_memory_snapshots_on_the_same_shard() {
                 &namespace,
                 entity,
                 storage::memory::MemoryCommit {
-                    mutations: &[mutation("value", b"before")],
+                    mutations: vec![mutation("value", b"before")],
                     ..Default::default()
                 },
             )
@@ -269,7 +275,7 @@ async fn commits_preserve_unrelated_memory_snapshots_on_the_same_shard() {
             &namespace,
             &other,
             storage::memory::MemoryCommit {
-                mutations: &[mutation("value", b"after")],
+                mutations: vec![mutation("value", b"after")],
                 ..Default::default()
             },
         )
@@ -279,7 +285,9 @@ async fn commits_preserve_unrelated_memory_snapshots_on_the_same_shard() {
         .await
         .unwrap();
     assert_eq!(
-        memory.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        memory.snapshot(&namespace, "a").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"before"
     );
     assert_eq!(
@@ -287,12 +295,14 @@ async fn commits_preserve_unrelated_memory_snapshots_on_the_same_shard() {
         before.snapshot_hits + 1
     );
     assert_eq!(
-        memory.snapshot(&namespace, &other).await.unwrap().entries[0].value,
+        memory.snapshot(&namespace, &other).await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"after"
     );
     assert_eq!(
         memory.cache_performance_snapshot().snapshot_misses,
-        before.snapshot_misses + 1
+        before.snapshot_misses
     );
     drop(memory);
     drop(kv);
@@ -320,20 +330,24 @@ async fn memory_facades_share_snapshot_freshness_and_cache_limits() {
             &namespace,
             "a",
             storage::memory::MemoryCommit {
-                mutations: &[mutation("value", b"committed")],
+                mutations: vec![mutation("value", b"committed")],
                 ..Default::default()
             },
         )
         .await
         .unwrap();
     assert_eq!(
-        first.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        first.snapshot(&namespace, "a").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"committed"
     );
     let before = first.cache_performance_snapshot();
     second.snapshot(&namespace, "b").await.unwrap();
     assert_eq!(
-        first.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        first.snapshot(&namespace, "a").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"committed"
     );
     assert_eq!(
@@ -356,19 +370,21 @@ async fn returned_snapshots_do_not_modify_cached_values() {
             &namespace,
             "entity",
             storage::memory::MemoryCommit {
-                mutations: &[mutation("value", b"original")],
+                mutations: vec![mutation("value", b"original")],
                 ..Default::default()
             },
         )
         .await
         .unwrap();
     let mut first = memory.snapshot(&namespace, "entity").await.unwrap();
-    first.entries[0].value.clear();
+    Arc::make_mut(&mut first).entries[0].value.clear();
     let mut second = memory.snapshot(&namespace, "entity").await.unwrap();
-    assert_eq!(second.entries[0].value, b"original");
-    second.entries.clear();
+    assert_eq!(second.entries[0].value.as_ref(), b"original");
+    Arc::make_mut(&mut second).entries.clear();
     assert_eq!(
-        memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+        memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+            .value
+            .as_ref(),
         b"original"
     );
     drop(memory);
@@ -394,7 +410,7 @@ async fn effect_commits_refresh_snapshots_but_delivery_maintenance_preserves_the
             &namespace,
             "entity",
             storage::memory::MemoryCommit {
-                outbox_effects: &[MemoryOutboxEffectWrite {
+                outbox_effects: vec![MemoryOutboxEffectWrite {
                     kind: "deliver".into(),
                     payload: b"payload".to_vec(),
                 }],
@@ -597,7 +613,7 @@ async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
         snapshot
             .entries
             .iter()
-            .any(|entry| entry.value == b"legacy text")
+            .any(|entry| entry.value.as_ref() == b"legacy text")
     );
     assert!(memory.next_owner_epoch().unwrap() > 700);
     assert_eq!(
@@ -643,7 +659,8 @@ fn acknowledged_writes_survive_abrupt_process_exit() {
                 .await
                 .unwrap()
                 .entries[0]
-                .value,
+                .value
+                .as_ref(),
             b"acknowledged"
         );
         let namespace = worker_namespace("crash", "MEMORY");
@@ -681,12 +698,12 @@ fn crash_child() {
                 &worker_namespace("crash", "MEMORY"),
                 "entity",
                 storage::memory::MemoryCommit {
-                    mutations: &[mutation("key", b"acknowledged")],
-                    command_result: Some(&MemoryCommandResultWrite {
+                    mutations: vec![mutation("key", b"acknowledged")],
+                    command_result: Some(MemoryCommandResultWrite {
                         idempotency_key: "crash-command".into(),
                         result: b"saved result".to_vec(),
                     }),
-                    outbox_effects: &[MemoryOutboxEffectWrite {
+                    outbox_effects: vec![MemoryOutboxEffectWrite {
                         kind: "fetch".into(),
                         payload: b"saved effect".to_vec(),
                     }],
@@ -759,4 +776,115 @@ async fn converter_rejects_unsafe_destinations_and_duplicate_namespace_keys_befo
     }
     std::fs::remove_file(map).unwrap();
     std::fs::remove_dir_all(source).unwrap();
+}
+
+#[tokio::test]
+async fn committed_snapshots_preserve_tombstones_versions_and_cache_byte_limits() {
+    use storage::memory::MemoryCommit;
+    let root = temporary_root();
+    let state = StateStore::open(&root).await.unwrap();
+    let mut memory = MemoryStore::from_state(state);
+    memory.set_snapshot_cache_limits(2, 1024);
+    let namespace = worker_namespace("worker", "MEMORY");
+    memory.snapshot(&namespace, "entity").await.unwrap();
+    let before = memory.cache_performance_snapshot();
+    let initial = memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            MemoryCommit {
+                mutations: vec![mutation("z", b"untouched"), mutation("a", b"before")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
+    assert_eq!(snapshot.max_version, initial.max_version);
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "z"]
+    );
+    let deleted = memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            MemoryCommit {
+                mutations: vec![MemoryBatchMutation {
+                    deleted: true,
+                    ..mutation("a", b"")
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
+    assert!(snapshot.entries[0].deleted);
+    assert_eq!(snapshot.entries[0].version, deleted.max_version);
+    assert_eq!(snapshot.entries[1].version, initial.max_version);
+    let restored = memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            MemoryCommit {
+                mutations: vec![mutation("a", b"restored")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let command = memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            MemoryCommit {
+                command_result: Some(MemoryCommandResultWrite {
+                    idempotency_key: "once".into(),
+                    result: b"reply".to_vec(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(command.max_version, restored.max_version);
+    let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
+    assert!(!snapshot.entries[0].deleted);
+    assert_eq!(snapshot.entries[0].value.as_ref(), b"restored");
+    assert_eq!(snapshot.max_version, restored.max_version);
+    assert_eq!(
+        memory.cache_performance_snapshot().snapshot_misses,
+        before.snapshot_misses
+    );
+
+    memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            MemoryCommit {
+                mutations: vec![mutation("a", &vec![b'x'; 2048])],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+                .value
+                .len(),
+            2048
+        );
+    }
+    assert_eq!(
+        memory.cache_performance_snapshot().snapshot_misses,
+        before.snapshot_misses + 2
+    );
+    drop(memory);
+    std::fs::remove_dir_all(root).unwrap();
 }

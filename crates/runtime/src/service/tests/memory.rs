@@ -895,7 +895,7 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
             "6:memoryMY_MEMORY",
             "startup-effect",
             storage::memory::MemoryCommit {
-                outbox_effects: &effects,
+                outbox_effects: effects.clone(),
                 ..Default::default()
             },
         )

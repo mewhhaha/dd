@@ -272,38 +272,6 @@ fn stage_memory_batch_command_result(
     Ok(())
 }
 
-#[deno_core::op2]
-#[serde]
-pub(super) fn op_memory_bytes_put(
-    state: &mut OpState,
-    request_context_handle: u32,
-    #[buffer] value: JsBuffer,
-) -> MemoryBytesPutResult {
-    if request_context_handle == 0 {
-        return MemoryBytesPutResult {
-            ok: false,
-            handle: 0,
-            error: "memory byte handle requires request_context_handle".to_string(),
-        };
-    }
-    match state.borrow_mut::<MemoryByteHandles>().insert(
-        request_context_handle,
-        Bytes::copy_from_slice(value.as_ref()),
-        MEMORY_BATCH_MAX_STAGED_BYTES,
-    ) {
-        Ok(handle) => MemoryBytesPutResult {
-            ok: true,
-            handle,
-            error: String::new(),
-        },
-        Err(error) => MemoryBytesPutResult {
-            ok: false,
-            handle: 0,
-            error: error.to_string(),
-        },
-    }
-}
-
 fn memory_bytes_for_handle_state(
     state: &mut OpState,
     request_context_handle: u32,
@@ -317,17 +285,15 @@ fn memory_bytes_for_handle_state(
 fn memory_output_bytes_insert(
     state: &mut OpState,
     request_context_handle: u32,
-    value: Vec<u8>,
+    value: Bytes,
 ) -> Result<u32> {
     if value.is_empty() {
         return Ok(0);
     }
     let max_owner_bytes = MEMORY_BATCH_MAX_STAGED_BYTES;
-    state.borrow_mut::<MemoryByteHandles>().insert(
-        request_context_handle,
-        Bytes::from(value),
-        max_owner_bytes,
-    )
+    state
+        .borrow_mut::<MemoryByteHandles>()
+        .insert(request_context_handle, value, max_owner_bytes)
 }
 
 #[deno_core::op2]
@@ -441,43 +407,25 @@ pub(super) fn op_memory_batch_mutation(
     state: &mut OpState,
     batch_handle: u32,
     #[string] key: String,
-    value_handle: u32,
+    #[buffer] value: &[u8],
     #[string] encoding: String,
     deleted: bool,
 ) -> MemoryBatchMutationResult {
-    let request_context_handle = {
-        let batches = state.borrow::<MemoryBatchHandles>();
-        let Some(batch) = batches.get(batch_handle) else {
-            return MemoryBatchMutationResult {
-                ok: false,
-                error: "memory batch handle is invalid".to_string(),
-            };
+    let Some(batch) = state
+        .borrow_mut::<MemoryBatchHandles>()
+        .get_mut(batch_handle)
+    else {
+        return MemoryBatchMutationResult {
+            ok: false,
+            error: "memory batch handle is invalid".to_string(),
         };
-        batch.request_context_handle
-    };
-    let value = if value_handle == 0 {
-        Bytes::new()
-    } else {
-        match memory_bytes_for_handle_state(state, request_context_handle, value_handle) {
-            Ok(value) => value,
-            Err(error) => {
-                return MemoryBatchMutationResult {
-                    ok: false,
-                    error: error.to_string(),
-                };
-            }
-        }
     };
     let next = MemoryBatchMutation {
         key,
-        value: value.to_vec(),
+        value: Bytes::copy_from_slice(value),
         encoding,
         deleted,
     };
-    let batch = state
-        .borrow_mut::<MemoryBatchHandles>()
-        .get_mut(batch_handle)
-        .expect("validated memory batch handle");
     match stage_memory_batch_mutation(batch, next) {
         Ok(()) => MemoryBatchMutationResult {
             ok: true,
@@ -603,23 +551,8 @@ pub(super) fn op_memory_batch_effect(
     state: &mut OpState,
     batch_handle: u32,
     #[string] kind: String,
-    payload_handle: u32,
+    #[buffer] payload: &[u8],
 ) -> bool {
-    let request_context_handle = {
-        let batches = state.borrow::<MemoryBatchHandles>();
-        let Some(batch) = batches.get(batch_handle) else {
-            return false;
-        };
-        batch.request_context_handle
-    };
-    let payload = if payload_handle == 0 {
-        Bytes::new()
-    } else {
-        match memory_bytes_for_handle_state(state, request_context_handle, payload_handle) {
-            Ok(value) => value,
-            Err(_) => return false,
-        }
-    };
     let Some(batch) = state
         .borrow_mut::<MemoryBatchHandles>()
         .get_mut(batch_handle)
@@ -640,23 +573,8 @@ pub(super) fn op_memory_batch_effect(
 pub(super) fn op_memory_batch_command_result(
     state: &mut OpState,
     batch_handle: u32,
-    value_handle: u32,
+    #[buffer] value: &[u8],
 ) -> bool {
-    let request_context_handle = {
-        let batches = state.borrow::<MemoryBatchHandles>();
-        let Some(batch) = batches.get(batch_handle) else {
-            return false;
-        };
-        batch.request_context_handle
-    };
-    let value = if value_handle == 0 {
-        Bytes::new()
-    } else {
-        match memory_bytes_for_handle_state(state, request_context_handle, value_handle) {
-            Ok(value) => value,
-            Err(_) => return false,
-        }
-    };
     let Some(batch) = state
         .borrow_mut::<MemoryBatchHandles>()
         .get_mut(batch_handle)
@@ -741,6 +659,7 @@ pub(super) async fn op_memory_state_snapshot(
     memory_scope_handle: u32,
     #[string] binding: String,
     #[string] key: String,
+    #[string] known_revision: String,
 ) -> MemoryStateSnapshotResult {
     let started = Instant::now();
     let (namespace, memory_key) =
@@ -749,7 +668,8 @@ pub(super) async fn op_memory_state_snapshot(
             Err(error) => {
                 return MemoryStateSnapshotResult {
                     ok: false,
-                    entries: Vec::new(),
+                    entries: None,
+                    revision: String::new(),
                     max_version: -1,
                     error: error.to_string(),
                 };
@@ -763,9 +683,21 @@ pub(super) async fn op_memory_state_snapshot(
                 started.elapsed().as_micros() as u64,
                 1,
             );
+            // Keep cache validation exact above JavaScript's safe integer range.
+            let revision = snapshot.max_version.to_string();
+            if revision == known_revision {
+                return MemoryStateSnapshotResult {
+                    ok: true,
+                    entries: None,
+                    revision,
+                    max_version: snapshot.max_version,
+                    error: String::new(),
+                };
+            }
             let entries = match snapshot
                 .entries
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|entry| {
                     memory_snapshot_entry(&mut state.borrow_mut(), request_context_handle, entry)
                 })
@@ -775,7 +707,8 @@ pub(super) async fn op_memory_state_snapshot(
                 Err(error) => {
                     return MemoryStateSnapshotResult {
                         ok: false,
-                        entries: Vec::new(),
+                        entries: None,
+                        revision: String::new(),
                         max_version: -1,
                         error: error.to_string(),
                     };
@@ -783,14 +716,16 @@ pub(super) async fn op_memory_state_snapshot(
             };
             MemoryStateSnapshotResult {
                 ok: true,
-                entries,
+                entries: Some(entries),
+                revision,
                 max_version: snapshot.max_version,
                 error: String::new(),
             }
         }
         Err(error) => MemoryStateSnapshotResult {
             ok: false,
-            entries: Vec::new(),
+            entries: None,
+            revision: String::new(),
             max_version: -1,
             error: error.to_string(),
         },
@@ -890,7 +825,7 @@ pub(super) async fn op_memory_batch_apply(
     batch_handle: u32,
 ) -> MemoryStateApplyBatchResult {
     let started = std::time::Instant::now();
-    let Some(batch) = state
+    let Some(mut batch) = state
         .borrow_mut()
         .borrow_mut::<MemoryBatchHandles>()
         .remove(batch_handle)
@@ -900,6 +835,7 @@ pub(super) async fn op_memory_batch_apply(
             applied: false,
             read_only: false,
             max_version: -1,
+            revision: String::new(),
             mutation_count: 0,
             effect_count: 0,
             accepted: false,
@@ -915,6 +851,7 @@ pub(super) async fn op_memory_batch_apply(
             applied: false,
             read_only: true,
             max_version: -1,
+            revision: String::new(),
             mutation_count,
             effect_count,
             accepted: batch.accepted,
@@ -930,6 +867,7 @@ pub(super) async fn op_memory_batch_apply(
                 applied: false,
                 read_only: false,
                 max_version: -1,
+                revision: String::new(),
                 mutation_count,
                 effect_count,
                 accepted: batch.accepted,
@@ -946,6 +884,7 @@ pub(super) async fn op_memory_batch_apply(
                 applied: false,
                 read_only: false,
                 max_version: -1,
+                revision: String::new(),
                 mutation_count,
                 effect_count,
                 accepted: batch.accepted,
@@ -960,9 +899,9 @@ pub(super) async fn op_memory_batch_apply(
             &batch.namespace,
             &batch.memory_key,
             storage::memory::MemoryCommit {
-                mutations: &batch.mutations,
-                command_result: command_result.as_ref(),
-                outbox_effects: &batch.effects,
+                mutations: std::mem::take(&mut batch.mutations),
+                command_result,
+                outbox_effects: std::mem::take(&mut batch.effects),
                 owner_epoch: Some(owner_epoch),
                 lease: batch._lease.clone(),
             },
@@ -981,6 +920,7 @@ pub(super) async fn op_memory_batch_apply(
                 applied: true,
                 read_only: false,
                 max_version: result.max_version,
+                revision: result.max_version.to_string(),
                 mutation_count,
                 effect_count,
                 accepted: batch.accepted,
@@ -993,6 +933,7 @@ pub(super) async fn op_memory_batch_apply(
             applied: false,
             read_only: false,
             max_version: -1,
+            revision: String::new(),
             mutation_count,
             effect_count,
             accepted: batch.accepted,
@@ -1067,7 +1008,7 @@ pub(super) async fn op_memory_command_begin(
             let value_handle = match memory_output_bytes_insert(
                 &mut state.borrow_mut(),
                 request_context_handle,
-                result.result,
+                result.result.into(),
             ) {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -1317,7 +1258,7 @@ mod tests {
     fn mutation(key: impl Into<String>, value_len: usize) -> MemoryBatchMutation {
         MemoryBatchMutation {
             key: key.into(),
-            value: vec![b'x'; value_len],
+            value: vec![b'x'; value_len].into(),
             encoding: "utf8".to_string(),
             deleted: false,
         }

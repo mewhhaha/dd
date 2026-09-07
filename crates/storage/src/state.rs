@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use turso::{Builder, Connection, Database};
 
-use crate::memory::{MemorySnapshotKey, SnapshotCache};
+use crate::memory::{MemorySnapshotChange, MemorySnapshotKey, SnapshotCache};
 use crate::turso_util::{
     configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
     record_storage_retry,
@@ -137,7 +137,21 @@ pub(crate) type WriteFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, WriteError>> + 'a>>;
 type WriteReply = Box<dyn Any + Send>;
 type WriteOperation =
-    Box<dyn for<'a> Fn(&'a Connection, i64) -> WriteFuture<'a, WriteReply> + Send>;
+    Box<dyn for<'a> Fn(&'a Connection, i64) -> WriteFuture<'a, WriteOutcome<WriteReply>> + Send>;
+
+pub(crate) struct WriteOutcome<T> {
+    pub value: T,
+    pub snapshot: Option<MemorySnapshotChange>,
+}
+
+impl<T> From<T> for WriteOutcome<T> {
+    fn from(value: T) -> Self {
+        Self {
+            value,
+            snapshot: None,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct WriteOptions {
@@ -435,7 +449,10 @@ impl StateStore {
         operation: F,
     ) -> Result<T>
     where
-        F: for<'a> Fn(&'a Connection, i64) -> WriteFuture<'a, T> + Send + Sync + 'static,
+        F: for<'a> Fn(&'a Connection, i64) -> WriteFuture<'a, WriteOutcome<T>>
+            + Send
+            + Sync
+            + 'static,
     {
         let shard = &self.shards[shard];
         if bytes > QUEUE_BYTES {
@@ -464,9 +481,10 @@ impl StateStore {
             operation: Box::new(move |conn, version| {
                 let operation = Arc::clone(&operation);
                 Box::pin(async move {
-                    operation(conn, version)
-                        .await
-                        .map(|value| Box::new(value) as WriteReply)
+                    operation(conn, version).await.map(|outcome| WriteOutcome {
+                        value: Box::new(outcome.value) as WriteReply,
+                        snapshot: outcome.snapshot,
+                    })
                 })
             }),
             reply,
@@ -566,11 +584,10 @@ async fn run_writer(
             }
         }
         let result = commit_group(&database, &mut conn, &metrics, &epoch, &snapshots, &batch).await;
-        invalidate_memory_snapshots(&epoch, &snapshots, &batch);
         match result {
             Ok(replies) => {
                 for (command, reply) in batch.into_iter().zip(replies) {
-                    let _ = command.reply.send(Ok(reply));
+                    let _ = command.reply.send(Ok(reply.value));
                 }
             }
             Err(_) if batch.len() > 1 => {
@@ -584,8 +601,7 @@ async fn run_writer(
                         std::slice::from_ref(&command),
                     )
                     .await
-                    .map(|mut replies| replies.remove(0));
-                    invalidate_memory_snapshots(&epoch, &snapshots, std::slice::from_ref(&command));
+                    .map(|mut replies| replies.remove(0).value);
                     let _ = command.reply.send(result);
                 }
             }
@@ -631,7 +647,7 @@ async fn commit_group(
     epoch: &AtomicU64,
     snapshots: &Mutex<SnapshotCache>,
     batch: &[WriteCommand],
-) -> Result<Vec<WriteReply>> {
+) -> Result<Vec<WriteOutcome<WriteReply>>> {
     for attempt in 0..8 {
         if slot.is_none() {
             let conn = database.connect().map_err(storage_error)?;
@@ -639,7 +655,7 @@ async fn commit_group(
             *slot = Some(conn);
         }
         let conn = slot.as_ref().expect("state writer connection");
-        let result: std::result::Result<Vec<WriteReply>, WriteError> = async {
+        let result: std::result::Result<Vec<WriteOutcome<WriteReply>>, WriteError> = async {
             execute_cached(conn, "BEGIN IMMEDIATE", ()).await?;
             let mut rows = query_cached(
                 conn,
@@ -672,6 +688,19 @@ async fn commit_group(
         .await;
         match result {
             Ok(replies) => {
+                epoch.fetch_add(1, Ordering::AcqRel);
+                let changes = batch
+                    .iter()
+                    .zip(&replies)
+                    .filter_map(|(command, reply)| {
+                        command
+                            .options
+                            .invalidate_memory
+                            .as_ref()
+                            .map(|key| (key, reply.snapshot.as_ref()))
+                    })
+                    .collect::<Vec<_>>();
+                SnapshotCache::publish_committed(snapshots, &changes);
                 metrics.committed_groups.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .committed_commands
@@ -691,6 +720,7 @@ async fn commit_group(
                     metrics.rollbacks.fetch_add(1, Ordering::Relaxed);
                 }
                 if !retry || attempt == 7 {
+                    invalidate_memory_snapshots(epoch, snapshots, batch);
                     return Err(error.into());
                 }
                 record_storage_retry();
@@ -805,7 +835,7 @@ mod tests {
         blocker.execute("BEGIN IMMEDIATE", ()).await.unwrap();
         let mutations = [MemoryBatchMutation {
             key: "key".into(),
-            value: b"committed".to_vec(),
+            value: b"committed".as_slice().into(),
             encoding: "utf8".into(),
             deleted: false,
         }];
@@ -813,7 +843,7 @@ mod tests {
             &namespace,
             "entity",
             crate::memory::MemoryCommit {
-                mutations: &mutations,
+                mutations: mutations.into(),
                 owner_epoch: Some(owner),
                 lease: Some(lease),
                 ..Default::default()
@@ -847,7 +877,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(
-            memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+                .value
+                .as_ref(),
             b"committed"
         );
         drop(next);
@@ -868,9 +900,9 @@ mod tests {
                 &namespace,
                 "entity",
                 crate::memory::MemoryCommit {
-                    mutations: &[MemoryBatchMutation {
+                    mutations: vec![MemoryBatchMutation {
                         key: "key".into(),
-                        value: b"before".to_vec(),
+                        value: b"before".as_slice().into(),
                         encoding: "utf8".into(),
                         deleted: false,
                     }],
@@ -880,7 +912,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+                .value
+                .as_ref(),
             b"before"
         );
 
@@ -904,7 +938,7 @@ mod tests {
                         if attempts.fetch_add(1, Ordering::Relaxed) > 0 {
                             retry_started.notify_one();
                             release_retry.notified().await;
-                            return Ok(());
+                            return Ok(().into());
                         }
                         execute_cached(conn,
                             "UPDATE memory_state SET value=?1,version=?2 WHERE worker='worker' AND binding='MEMORY' AND entity_key='entity' AND item_key='key'",
@@ -928,13 +962,148 @@ mod tests {
         release_retry.notify_one();
         commit.await.unwrap().unwrap();
         assert_eq!(
-            observed.entries[0].value, b"committed",
+            observed.entries[0].value.as_ref(),
+            b"committed",
             "a retry must not expose the cache from before an ambiguous commit"
         );
         assert_eq!(
-            memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+                .value
+                .as_ref(),
             b"committed"
         );
+        drop(memory);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn grouped_memory_commits_and_failed_group_fallback_match_persisted_snapshots() {
+        use crate::memory::{MemoryCommandResultWrite, MemoryCommit};
+        let root = std::env::temp_dir().join(format!("dd-group-cache-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        let mut memory = MemoryStore::from_state(Arc::clone(&state));
+        let namespace = worker_namespace("worker", "MEMORY");
+        memory
+            .apply_batch(
+                &namespace,
+                "entity",
+                MemoryCommit {
+                    command_result: Some(MemoryCommandResultWrite {
+                        idempotency_key: "exists".into(),
+                        result: vec![],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for round in 0..2 {
+            memory.set_snapshot_cache_limits(4096, 64 * 1024 * 1024);
+            memory.snapshot(&namespace, "entity").await.unwrap();
+            let before = memory.cache_performance_snapshot();
+            let metrics = state.performance_snapshot();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let writer = Arc::clone(&state);
+            let queued_entered = Arc::clone(&entered);
+            let queued_release = Arc::clone(&release);
+            let blocker = tokio::spawn(async move {
+                writer
+                    .write(
+                        StateStore::shard_index("worker", "MEMORY", "entity"),
+                        1,
+                        WriteOptions::default(),
+                        move |_, _| {
+                            let entered = Arc::clone(&queued_entered);
+                            let release = Arc::clone(&queued_release);
+                            Box::pin(async move {
+                                entered.notify_one();
+                                release.notified().await;
+                                Ok(WriteOutcome::from(()))
+                            })
+                        },
+                    )
+                    .await
+                    .unwrap();
+            });
+            entered.notified().await;
+            let mut writes = tokio::task::JoinSet::new();
+            for index in 0..16 {
+                let memory = memory.clone();
+                let namespace = namespace.clone();
+                writes.spawn(async move {
+                    let value: bytes::Bytes =
+                        format!("round-{round}-write-{index}").into_bytes().into();
+                    memory
+                        .apply_batch(
+                            &namespace,
+                            "entity",
+                            MemoryCommit {
+                                mutations: vec![
+                                    MemoryBatchMutation {
+                                        key: format!("key-{index:02}"),
+                                        value: value.clone(),
+                                        encoding: "utf8".into(),
+                                        deleted: false,
+                                    },
+                                    MemoryBatchMutation {
+                                        key: "shared".into(),
+                                        value,
+                                        encoding: "utf8".into(),
+                                        deleted: index % 3 == 0,
+                                    },
+                                ],
+                                command_result: (round == 1 && index == 7).then(|| {
+                                    MemoryCommandResultWrite {
+                                        idempotency_key: "exists".into(),
+                                        result: b"must roll back".to_vec(),
+                                    }
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.performance_snapshot().pending_commands != 17 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            release.notify_one();
+            blocker.await.unwrap();
+            let mut failures = 0;
+            while let Some(result) = writes.join_next().await {
+                failures += usize::from(result.unwrap().is_err());
+            }
+            assert_eq!(failures, round);
+            let warm = memory.snapshot(&namespace, "entity").await.unwrap();
+            assert_eq!(warm.entries.len(), 17);
+            if round == 0 {
+                assert_eq!(
+                    state.performance_snapshot().committed_groups - metrics.committed_groups,
+                    2
+                );
+                assert_eq!(
+                    memory.cache_performance_snapshot().snapshot_misses,
+                    before.snapshot_misses
+                );
+            } else {
+                assert!(state.performance_snapshot().rollbacks > metrics.rollbacks);
+            }
+            memory.set_snapshot_cache_limits(0, 0);
+            let persisted = memory.snapshot(&namespace, "entity").await.unwrap();
+            assert_eq!(warm.max_version, persisted.max_version);
+            for (cached, stored) in warm.entries.iter().zip(&persisted.entries) {
+                assert_eq!(
+                    (&cached.key, &cached.value, cached.version, cached.deleted),
+                    (&stored.key, &stored.value, stored.version, stored.deleted)
+                );
+            }
+        }
         drop(memory);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();

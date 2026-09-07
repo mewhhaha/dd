@@ -106,7 +106,7 @@ impl MemoryStore {
         StateStore::shard_index(worker, binding, memory_key)
     }
 
-    pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<MemorySnapshot> {
+    pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<Arc<MemorySnapshot>> {
         let (worker, binding) = namespace_owner(namespace)?;
         let shard = StateStore::shard_index(worker, binding, memory_key);
         let epoch = self.state.epoch(shard);
@@ -136,7 +136,7 @@ impl MemoryStore {
         if let Some(snapshot) = cached {
             self.profile
                 .record(MemoryProfileMetricKind::StoreSnapshotCacheHit, 0, 1);
-            return Ok((*snapshot).clone());
+            return Ok(snapshot);
         }
         self.profile
             .record(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
@@ -153,7 +153,7 @@ impl MemoryStore {
             if let Some(key) = row.get::<Option<String>>(1).map_err(storage_error)? {
                 snapshot.entries.push(MemorySnapshotEntry {
                     key,
-                    value: row.get(2).map_err(storage_error)?,
+                    value: row.get::<Vec<u8>>(2).map_err(storage_error)?.into(),
                     encoding: row.get(3).map_err(storage_error)?,
                     version: row.get(4).map_err(storage_error)?,
                     deleted: row.get::<i64>(5).map_err(storage_error)? != 0,
@@ -162,14 +162,7 @@ impl MemoryStore {
         }
         drop(rows);
         drop(conn);
-        let bytes = namespace.len()
-            + memory_key.len()
-            + 128
-            + snapshot
-                .entries
-                .iter()
-                .map(|entry| entry.key.len() + entry.value.len() + entry.encoding.len() + 96)
-                .sum::<usize>();
+        let bytes = snapshot.cache_bytes(&cache_key);
         let snapshot = Arc::new(snapshot);
         let mut evicted_snapshots = Vec::new();
         {
@@ -205,7 +198,7 @@ impl MemoryStore {
             }
         }
         drop(evicted_snapshots);
-        Ok(Arc::unwrap_or_clone(snapshot))
+        Ok(snapshot)
     }
 
     pub async fn point_read(
@@ -235,7 +228,7 @@ impl MemoryStore {
             .map(|key| {
                 Ok::<_, turso::Error>(MemorySnapshotEntry {
                     key,
-                    value: row.get(2)?,
+                    value: row.get::<Vec<u8>>(2)?.into(),
                     encoding: row.get(3)?,
                     version: row.get(4)?,
                     deleted: row.get::<i64>(5)? != 0,
@@ -254,7 +247,7 @@ impl MemoryStore {
         memory_key: &str,
         keys: &[String],
     ) -> Result<MemorySnapshot> {
-        let mut snapshot = self.snapshot(namespace, memory_key).await?;
+        let mut snapshot = Arc::unwrap_or_clone(self.snapshot(namespace, memory_key).await?);
         if !keys.is_empty() {
             snapshot.entries.retain(|entry| keys.contains(&entry.key));
         }
@@ -293,15 +286,16 @@ impl MemoryStore {
         &self,
         namespace: &str,
         memory_key: &str,
-        commit: MemoryCommit<'_>,
+        commit: MemoryCommit,
     ) -> Result<MemoryBatchApplyResult> {
         let MemoryCommit {
             mutations,
             command_result,
             outbox_effects,
             owner_epoch,
-            lease,
-        } = commit;
+            ..
+        } = &commit;
+        let owner_epoch = *owner_epoch;
         let (worker, binding) = namespace_owner(namespace)?;
         if memory_key.is_empty() {
             return Err(PlatformError::bad_request("memory entity key is empty"));
@@ -344,7 +338,7 @@ impl MemoryStore {
                     mutation.key.len() + mutation.value.len() + mutation.encoding.len() + 96
                 })
                 .sum::<usize>()
-            + command_result.map_or(0, |command| {
+            + command_result.as_ref().map_or(0, |command| {
                 command.idempotency_key.len() + command.result.len() + 96
             })
             + outbox_effects
@@ -355,9 +349,7 @@ impl MemoryStore {
         let worker = worker.to_owned();
         let binding = binding.to_owned();
         let entity = memory_key.to_owned();
-        let mutations = mutations.to_vec();
-        let command_result = command_result.cloned();
-        let effects = outbox_effects.to_vec();
+        let commit = Arc::new(commit);
         let now = epoch_ms()?;
         self.state
             .write(shard, bytes, WriteOptions {
@@ -366,12 +358,8 @@ impl MemoryStore {
                 let worker = worker.clone();
                 let binding = binding.clone();
                 let entity = entity.clone();
-                let mutations = mutations.clone();
-                let command_result = command_result.clone();
-                let effects = effects.clone();
-                let lease = lease.clone();
+                let commit = Arc::clone(&commit);
                 Box::pin(async move {
-                    let _lease = lease;
                     let mut rows = query_cached(
                         conn,
                         "SELECT max_version, owner_epoch FROM memory_meta
@@ -388,12 +376,12 @@ impl MemoryStore {
                                 "stale memory owner epoch {owner}; current owner epoch {previous_owner} for {worker}/{binding}/{entity}"
                             )).into());
                         }
-                    let revision = if mutations.is_empty() && effects.is_empty() {
+                    let revision = if commit.mutations.is_empty() && commit.outbox_effects.is_empty() {
                         current
                     } else {
                         version
                     };
-                    for mutation in mutations {
+                    for mutation in &commit.mutations {
                         execute_cached(
                             conn,
                             "INSERT INTO memory_state(worker,binding,entity_key,item_key,value,encoding,deleted,version)
@@ -401,8 +389,8 @@ impl MemoryStore {
                              ON CONFLICT(worker,binding,entity_key,item_key) DO UPDATE SET
                              value=excluded.value,encoding=excluded.encoding,
                              deleted=excluded.deleted,version=excluded.version",
-                            (worker.as_str(), binding.as_str(), entity.as_str(), mutation.key,
-                             mutation.value, mutation.encoding, i64::from(mutation.deleted), revision),
+                            (worker.as_str(), binding.as_str(), entity.as_str(), mutation.key.as_str(),
+                             mutation.value.as_ref(), mutation.encoding.as_str(), i64::from(mutation.deleted), revision),
                         ).await?;
                     }
                     execute_cached(
@@ -414,7 +402,7 @@ impl MemoryStore {
                         (worker.as_str(), binding.as_str(), entity.as_str(), revision,
                          owner_epoch.unwrap_or(previous_owner)),
                     ).await?;
-                    for (ordinal, effect) in effects.into_iter().enumerate() {
+                    for (ordinal, effect) in commit.outbox_effects.iter().enumerate() {
                         use sha2::{Digest, Sha256};
                         let mut hash = Sha256::new();
                         for component in [&worker, &binding, &entity] {
@@ -432,18 +420,23 @@ impl MemoryStore {
                              kind,payload_blob,status,attempt_count,next_attempt_at_ms)
                              VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',0,?8)",
                             (worker.as_str(), binding.as_str(), entity.as_str(), effect_id,
-                             revision, effect.kind, effect.payload, now),
+                             revision, effect.kind.as_str(), effect.payload.as_slice(), now),
                         ).await?;
                     }
-                    if let Some(command) = command_result {
+                    if let Some(command) = &commit.command_result {
                         execute_cached(
                             conn,
                             "INSERT INTO memory_commands(worker,binding,entity_key,idempotency_key,result_blob,revision)
                              VALUES (?1,?2,?3,?4,?5,?6)",
-                            (worker, binding, entity, command.idempotency_key, command.result, revision),
+                            (worker, binding, entity, command.idempotency_key.as_str(), command.result.as_slice(), revision),
                         ).await?;
                     }
-                    Ok(MemoryBatchApplyResult { max_version: revision })
+                    Ok(WriteOutcome {
+                        value: MemoryBatchApplyResult { max_version: revision },
+                        snapshot: Some(MemorySnapshotChange {
+                            previous_version: current, version: revision, commit,
+                        }),
+                    })
                 })
             }).await
     }
@@ -668,7 +661,7 @@ impl MemoryStore {
                             )
                             .await?;
                         }
-                        Ok(claims)
+                        Ok(claims.into())
                     })
                 },
             )
@@ -747,7 +740,7 @@ impl MemoryStore {
                             ),
                         )
                         .await?;
-                        Ok(())
+                        Ok(().into())
                     })
                 })
                 .await?;

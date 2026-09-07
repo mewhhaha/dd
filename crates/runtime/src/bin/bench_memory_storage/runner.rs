@@ -497,9 +497,9 @@ async fn run_storage_write_scenario(
                         &memory_keys.namespace,
                         &memory_key,
                         storage::memory::MemoryCommit {
-                            mutations: &[MemoryBatchMutation {
+                            mutations: vec![MemoryBatchMutation {
                                 key: "payload".to_string(),
-                                value: b"1".to_vec(),
+                                value: b"1".as_slice().into(),
                                 encoding: "utf8".to_string(),
                                 deleted: false,
                             }],
@@ -580,7 +580,7 @@ async fn verify_storage_distinct_memory_sum(
         .map_err(|error| error.to_string())?;
         let value = point
             .record
-            .and_then(|entry| String::from_utf8(entry.value).ok())
+            .and_then(|entry| String::from_utf8(entry.value.to_vec()).ok())
             .unwrap_or_default();
         total = total.saturating_add(value.trim().parse::<usize>().unwrap_or(0));
     }
