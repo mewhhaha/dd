@@ -220,9 +220,6 @@ globalThis.__dd_execute_worker = (payload) => {
     if (!runtime || typeof runtime.listOpenHandles !== "function") {
       throw new Error(`memory same-lane socket runtime is unavailable`);
     }
-    if (typeof runtime.hasOpenHandleSnapshot === "function" && !runtime.hasOpenHandleSnapshot()) {
-      throw new Error(`memory same-lane socket handles are not initialized`);
-    }
     return runtime;
   };
 

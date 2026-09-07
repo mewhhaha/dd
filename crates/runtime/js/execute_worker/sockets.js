@@ -1,7 +1,20 @@
-  const createMemorySocketRuntime = (entry, runtimeRequestId, allowSocketAccept) => {
-    const openHandles = entry.openSocketHandles ??= new Set();
-    const markOpenHandlesInitialized = () => {
-      entry.openSocketHandlesInitialized = true;
+  const listMemorySocketHandles = (binding, memoryKey, scopeHandle = 0) => {
+    const result = callOp("op_memory_socket_list", scopeHandle, binding, memoryKey);
+    if (!result || typeof result !== "object" || result.ok === false) {
+      throw new Error(String(result?.error ?? "socket values failed"));
+    }
+    return result.handles.map(String);
+  };
+
+  const createMemorySocketRuntime = (entry, { allowSocketAccept, handles }) => {
+    let openHandles = handles === undefined ? null : new Set(handles.map(String));
+    const loadOpenHandles = () => {
+      openHandles ??= new Set(listMemorySocketHandles(
+        entry.binding,
+        entry.memoryKey,
+        memoryScopedScopeHandle(entry),
+      ));
+      return openHandles;
     };
     const upgradeAccepted = { used: false };
     const sockets = {
@@ -37,8 +50,7 @@
         headers.set(INTERNAL_WS_BINDING_HEADER, entry.binding);
         headers.set(INTERNAL_WS_KEY_HEADER, entry.memoryKey);
         upgradeAccepted.used = true;
-        openHandles.add(handle);
-        markOpenHandlesInitialized();
+        loadOpenHandles().add(handle);
         return {
           handle,
           response: {
@@ -50,35 +62,14 @@
         };
       },
       values() {
-        return Array.from(openHandles.values());
+        return Array.from(loadOpenHandles());
       },
     };
 
     return {
       sockets,
-      async refreshOpenHandles() {
-        const result = await callOp(
-          "op_memory_socket_list",
-          memoryScopedScopeHandle(entry),
-          entry.binding,
-          entry.memoryKey,
-        );
-        await syncFrozenTime();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? "socket values failed"));
-        }
-        openHandles.clear();
-        const handles = Array.isArray(result?.handles) ? result.handles : [];
-        for (const value of handles) {
-          openHandles.add(String(value));
-        }
-        markOpenHandlesInitialized();
-      },
       listOpenHandles() {
-        return Array.from(openHandles.values());
-      },
-      hasOpenHandleSnapshot() {
-        return entry.openSocketHandlesInitialized === true;
+        return Array.from(loadOpenHandles());
       },
     };
   };
@@ -181,7 +172,6 @@
         binding,
         memoryKey,
         cacheKey,
-        openSocketHandles: new Set(),
       };
       memoryStateEntries.set(cacheKey, entry);
     }
@@ -200,20 +190,8 @@
       if (localRuntime) {
         return localRuntime.listOpenHandles();
       }
-      return (async () => {
-        const result = await callOp(
-          "op_memory_socket_list",
-          0,
-          bindingName,
-          memoryKey,
-        );
-        await syncFrozenTime();
-        if (result && typeof result === "object" && result.ok === false) {
-          throw new Error(String(result.error ?? "socket values failed"));
-        }
-        return Array.isArray(result?.handles)
-          ? result.handles.map((value) => String(value))
-          : [];
-      })();
+      const handles = listMemorySocketHandles(bindingName, memoryKey);
+      await syncFrozenTime();
+      return handles;
     },
   });

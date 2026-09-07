@@ -1,4 +1,4 @@
-use crate::state::{STATE_SHARDS, StateStore, storage_error};
+use crate::state::{STATE_SHARDS, StateStore, WriteOptions, storage_error};
 use crate::turso_util::{execute_cached, query_cached};
 use common::{PlatformError, Result};
 use serde::Serialize;
@@ -21,19 +21,42 @@ pub struct MemoryStore {
     profile: Arc<MemoryProfile>,
     snapshots: Arc<Mutex<SnapshotCache>>,
 }
-struct SnapshotCache {
-    entries: HashMap<(String, String), CachedSnapshot>,
-    order: BTreeMap<u64, (String, String)>,
+pub(crate) type MemorySnapshotKey = (String, String);
+
+pub(crate) struct SnapshotCache {
+    entries: HashMap<MemorySnapshotKey, CachedSnapshot>,
+    order: BTreeMap<u64, MemorySnapshotKey>,
     next_ordinal: u64,
     bytes: usize,
     max_entries: usize,
     max_bytes: usize,
 }
 struct CachedSnapshot {
-    shard_epoch: u64,
-    snapshot: MemorySnapshot,
+    snapshot: Arc<MemorySnapshot>,
     bytes: usize,
     ordinal: u64,
+}
+
+impl Default for SnapshotCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: BTreeMap::new(),
+            next_ordinal: 0,
+            bytes: 0,
+            max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
+            max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
+        }
+    }
+}
+
+impl SnapshotCache {
+    pub(crate) fn remove(&mut self, key: &MemorySnapshotKey) -> Option<Arc<MemorySnapshot>> {
+        let removed = self.entries.remove(key)?;
+        self.bytes -= removed.bytes;
+        self.order.remove(&removed.ordinal);
+        Some(removed.snapshot)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryProfileMetricKind {

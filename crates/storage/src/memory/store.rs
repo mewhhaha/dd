@@ -37,16 +37,9 @@ fn epoch_ms() -> Result<i64> {
 impl MemoryStore {
     pub fn from_state(state: Arc<StateStore>) -> Self {
         Self {
+            snapshots: Arc::clone(&state.memory_snapshots),
             state,
             profile: Arc::new(MemoryProfile::default()),
-            snapshots: Arc::new(Mutex::new(SnapshotCache {
-                entries: HashMap::new(),
-                order: BTreeMap::new(),
-                next_ordinal: 0,
-                bytes: 0,
-                max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
-                max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
-            })),
         }
     }
     pub fn state_performance_snapshot(&self) -> crate::state::StatePerformanceSnapshot {
@@ -70,16 +63,21 @@ impl MemoryStore {
         self.profile.set_enabled(enabled);
     }
     pub fn set_snapshot_cache_limits(&mut self, max_entries: usize, max_bytes: usize) {
-        let mut cache = self
-            .snapshots
-            .lock()
-            .expect("memory snapshots lock poisoned");
-        cache.entries.clear();
-        cache.order.clear();
-        cache.next_ordinal = 0;
-        cache.bytes = 0;
-        cache.max_entries = max_entries;
-        cache.max_bytes = max_bytes;
+        let previous = {
+            let mut cache = self
+                .snapshots
+                .lock()
+                .expect("memory snapshots lock poisoned");
+            std::mem::replace(
+                &mut *cache,
+                SnapshotCache {
+                    max_entries,
+                    max_bytes,
+                    ..Default::default()
+                },
+            )
+        };
+        drop(previous);
     }
     pub fn cache_performance_snapshot(&self) -> MemoryCachePerformanceSnapshot {
         self.profile.cache_performance_snapshot()
@@ -113,15 +111,13 @@ impl MemoryStore {
         let shard = StateStore::shard_index(worker, binding, memory_key);
         let epoch = self.state.epoch(shard);
         let cache_key = (namespace.to_owned(), memory_key.to_owned());
-        {
+        let cached = {
             let mut cache = self
                 .snapshots
                 .lock()
                 .expect("memory snapshots lock poisoned");
-            if let Some(cached) = cache.entries.get(&cache_key)
-                && cached.shard_epoch == epoch
-            {
-                let snapshot = cached.snapshot.clone();
+            if let Some(cached) = cache.entries.get(&cache_key) {
+                let snapshot = Arc::clone(&cached.snapshot);
                 let previous_ordinal = cached.ordinal;
                 let ordinal = cache.next_ordinal;
                 cache.next_ordinal += 1;
@@ -132,10 +128,15 @@ impl MemoryStore {
                     .get_mut(&cache_key)
                     .expect("cached snapshot")
                     .ordinal = ordinal;
-                self.profile
-                    .record(MemoryProfileMetricKind::StoreSnapshotCacheHit, 0, 1);
-                return Ok(snapshot);
+                Some(snapshot)
+            } else {
+                None
             }
+        };
+        if let Some(snapshot) = cached {
+            self.profile
+                .record(MemoryProfileMetricKind::StoreSnapshotCacheHit, 0, 1);
+            return Ok((*snapshot).clone());
         }
         self.profile
             .record(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
@@ -159,6 +160,8 @@ impl MemoryStore {
                 });
             }
         }
+        drop(rows);
+        drop(conn);
         let bytes = namespace.len()
             + memory_key.len()
             + 128
@@ -167,41 +170,42 @@ impl MemoryStore {
                 .iter()
                 .map(|entry| entry.key.len() + entry.value.len() + entry.encoding.len() + 96)
                 .sum::<usize>();
-        let mut cache = self
-            .snapshots
-            .lock()
-            .expect("memory snapshots lock poisoned");
-        if self.state.epoch(shard) == epoch && bytes <= cache.max_bytes && cache.max_entries > 0 {
-            if let Some(previous) = cache.entries.remove(&cache_key) {
-                cache.bytes -= previous.bytes;
-                cache.order.remove(&previous.ordinal);
-            }
-            while cache.entries.len() >= cache.max_entries || cache.bytes + bytes > cache.max_bytes
+        let snapshot = Arc::new(snapshot);
+        let mut evicted_snapshots = Vec::new();
+        {
+            let mut cache = self
+                .snapshots
+                .lock()
+                .expect("memory snapshots lock poisoned");
+            if self.state.epoch(shard) == epoch && bytes <= cache.max_bytes && cache.max_entries > 0
             {
-                let (_, oldest) = cache.order.pop_first().expect("nonempty snapshot cache");
-                let evicted = cache
-                    .entries
-                    .remove(&oldest)
-                    .expect("snapshot eviction key");
-                cache.bytes -= evicted.bytes;
-                self.profile
-                    .record(MemoryProfileMetricKind::StoreSnapshotCacheEviction, 0, 1);
+                if let Some(previous) = cache.remove(&cache_key) {
+                    evicted_snapshots.push(previous);
+                }
+                while cache.entries.len() >= cache.max_entries
+                    || cache.bytes + bytes > cache.max_bytes
+                {
+                    let (_, oldest) = cache.order.pop_first().expect("nonempty snapshot cache");
+                    evicted_snapshots.push(cache.remove(&oldest).expect("snapshot eviction key"));
+                    self.profile
+                        .record(MemoryProfileMetricKind::StoreSnapshotCacheEviction, 0, 1);
+                }
+                cache.bytes += bytes;
+                let ordinal = cache.next_ordinal;
+                cache.next_ordinal += 1;
+                cache.order.insert(ordinal, cache_key.clone());
+                cache.entries.insert(
+                    cache_key,
+                    CachedSnapshot {
+                        snapshot: Arc::clone(&snapshot),
+                        bytes,
+                        ordinal,
+                    },
+                );
             }
-            cache.bytes += bytes;
-            let ordinal = cache.next_ordinal;
-            cache.next_ordinal += 1;
-            cache.order.insert(ordinal, cache_key.clone());
-            cache.entries.insert(
-                cache_key,
-                CachedSnapshot {
-                    shard_epoch: epoch,
-                    snapshot: snapshot.clone(),
-                    bytes,
-                    ordinal,
-                },
-            );
         }
-        Ok(snapshot)
+        drop(evicted_snapshots);
+        Ok(Arc::unwrap_or_clone(snapshot))
     }
 
     pub async fn point_read(
@@ -356,7 +360,9 @@ impl MemoryStore {
         let effects = outbox_effects.to_vec();
         let now = epoch_ms()?;
         self.state
-            .write(shard, bytes, move |conn, version| {
+            .write(shard, bytes, WriteOptions {
+                invalidate_memory: Some((namespace.to_owned(), memory_key.to_owned())),
+            }, move |conn, version| {
                 let worker = worker.clone();
                 let binding = binding.clone();
                 let entity = entity.clone();
@@ -619,48 +625,53 @@ impl MemoryStore {
             }
         }
         self.state
-            .write(shard, sql.len() + 4096, move |conn, _| {
-                let sql = sql.clone();
-                let params = params.clone();
-                Box::pin(async move {
-                    let mut rows = conn.query(&sql, params).await?;
-                    let mut claims = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        let worker = row.get::<String>(0)?;
-                        let binding = row.get::<String>(1)?;
-                        let entity = row.get::<String>(2)?;
-                        let mut record = outbox_record(&row, 3)?;
-                        record.status = "inflight".into();
-                        record.attempt_count += 1;
-                        record.next_attempt_at_ms = until;
-                        claims.push(MemoryOutboxClaim {
-                            namespace: worker_namespace(&worker, &binding),
-                            memory_key: entity,
-                            record,
-                        });
-                    }
-                    drop(rows);
-                    for claim in &claims {
-                        let (worker, binding) = namespace_owner(&claim.namespace)?;
-                        execute_cached(
-                            conn,
-                            "UPDATE memory_outbox
+            .write(
+                shard,
+                sql.len() + 4096,
+                WriteOptions::default(),
+                move |conn, _| {
+                    let sql = sql.clone();
+                    let params = params.clone();
+                    Box::pin(async move {
+                        let mut rows = conn.query(&sql, params).await?;
+                        let mut claims = Vec::new();
+                        while let Some(row) = rows.next().await? {
+                            let worker = row.get::<String>(0)?;
+                            let binding = row.get::<String>(1)?;
+                            let entity = row.get::<String>(2)?;
+                            let mut record = outbox_record(&row, 3)?;
+                            record.status = "inflight".into();
+                            record.attempt_count += 1;
+                            record.next_attempt_at_ms = until;
+                            claims.push(MemoryOutboxClaim {
+                                namespace: worker_namespace(&worker, &binding),
+                                memory_key: entity,
+                                record,
+                            });
+                        }
+                        drop(rows);
+                        for claim in &claims {
+                            let (worker, binding) = namespace_owner(&claim.namespace)?;
+                            execute_cached(
+                                conn,
+                                "UPDATE memory_outbox
                          SET status='inflight',attempt_count=?1,next_attempt_at_ms=?2
                          WHERE worker=?3 AND binding=?4 AND entity_key=?5 AND effect_id=?6",
-                            (
-                                claim.record.attempt_count,
-                                until,
-                                worker,
-                                binding,
-                                claim.memory_key.as_str(),
-                                claim.record.effect_id.as_str(),
-                            ),
-                        )
-                        .await?;
-                    }
-                    Ok(claims)
-                })
-            })
+                                (
+                                    claim.record.attempt_count,
+                                    until,
+                                    worker,
+                                    binding,
+                                    claim.memory_key.as_str(),
+                                    claim.record.effect_id.as_str(),
+                                ),
+                            )
+                            .await?;
+                        }
+                        Ok(claims)
+                    })
+                },
+            )
             .await
     }
     pub async fn mark_outbox_delivered(
@@ -706,7 +717,7 @@ impl MemoryStore {
             let bytes =
                 outcome.namespace.len() + outcome.memory_key.len() + outcome.effect_id.len() + 256;
             self.state
-                .write(shard, bytes, move |conn, _| {
+                .write(shard, bytes, WriteOptions::default(), move |conn, _| {
                     let worker = worker.clone();
                     let binding = binding.clone();
                     let outcome = outcome.clone();

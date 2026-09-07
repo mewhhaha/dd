@@ -2,6 +2,238 @@ use super::*;
 
 #[tokio::test]
 #[serial]
+async fn snapshot_failure_closes_live_sockets_without_a_caller_handle_snapshot() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy_with_config(
+            "socket-failure".into(),
+            r#"
+export default {
+  async fetch(request, env) {
+    const path = new URL(request.url).pathname;
+    const room = env.CHAT.get(path === "/other" ? "other" : "failed");
+    if (path !== "/fail") return room.atomic(tx => tx.accept(request).response);
+
+    // Model a caller isolate that has never loaded this room's socket handles.
+    globalThis.__dd_memory_state_entries.clear();
+    const snapshot = Deno.core.ops.op_memory_state_snapshot;
+    Deno.core.ops.op_memory_state_snapshot = () => ({
+      ok: false, error: "injected memory snapshot failure",
+    });
+    let callbackRan = false;
+    try {
+      await room.atomic(() => { callbackRan = true; });
+      return Response.json({ callbackRan, error: null });
+    } catch (error) {
+      return Response.json({ callbackRan, error: error.message });
+    } finally {
+      Deno.core.ops.op_memory_state_snapshot = snapshot;
+    }
+  },
+  async wake(event) {
+    if (event.type === "socketmessage") {
+      await event.stub.atomic(tx => tx.sockets.send(event.handle, event.data));
+    }
+  },
+};
+"#
+            .into(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Memory {
+                    binding: "CHAT".into(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("socket failure worker deploys");
+    let mut sockets = Vec::new();
+    for path in ["/failed", "/failed", "/other"] {
+        sockets.push(
+            service
+                .open_websocket(
+                    "socket-failure".into(),
+                    test_websocket_invocation(path, path),
+                    None,
+                )
+                .await
+                .expect("socket opens"),
+        );
+    }
+    let response = service
+        .invoke(
+            "socket-failure".into(),
+            test_invocation_with_path("/fail", "snapshot-failure"),
+        )
+        .await
+        .expect("worker reports the original snapshot error");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).expect("failure JSON"),
+        serde_json::json!({
+            "callbackRan": false, "error": "injected memory snapshot failure"
+        })
+    );
+    for opened in &sockets[..2] {
+        timeout(
+            Duration::from_secs(2),
+            service.websocket_wait_frame("socket-failure".into(), opened.session_id.clone()),
+        )
+        .await
+        .expect("snapshot failure must close every affected socket promptly")
+        .expect("close frame arrives");
+        let close = service
+            .websocket_drain_frame("socket-failure".into(), opened.session_id.clone())
+            .await
+            .expect("close frame drains")
+            .expect("affected socket receives a close frame");
+        assert!(
+            close
+                .headers
+                .iter()
+                .any(|(name, value)| name == "x-dd-ws-close-code" && value == "1011")
+        );
+    }
+    let unaffected = &sockets[2];
+    assert!(
+        service
+            .websocket_drain_frame("socket-failure".into(), unaffected.session_id.clone())
+            .await
+            .expect("unrelated socket remains available")
+            .is_none()
+    );
+    let echo = service
+        .websocket_send_frame(
+            "socket-failure".into(),
+            unaffected.session_id.clone(),
+            b"still open".to_vec(),
+            false,
+        )
+        .await
+        .expect("unrelated memory still handles socket messages");
+    assert_eq!(echo.body, b"still open");
+    for opened in sockets {
+        service
+            .websocket_close(
+                "socket-failure".into(),
+                opened.session_id,
+                1000,
+                "done".into(),
+            )
+            .await
+            .expect("socket closes");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn socket_snapshots_include_new_accepts_and_refresh_between_transactions() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy_with_config(
+            "socket-snapshots".into(),
+            r#"
+export default {
+  async fetch(request, env) {
+    const room = env.CHAT.get("room");
+    const path = new URL(request.url).pathname;
+    if (path === "/handles") {
+      const atomic = await room.atomic((tx) => {
+        tx.sockets.values().pop();
+        return tx.sockets.values();
+      });
+      return Response.json({ atomic, outside: await room.sockets.values() });
+    }
+    return room.atomic((tx) => {
+      const before = path === "/list-first" ? tx.sockets.values() : [];
+      const accepted = tx.accept(request);
+      const after = tx.sockets.values();
+      if (!after.includes(accepted.handle) || after.length !== before.length + 1) {
+        throw new Error(`accept snapshot mismatch: ${JSON.stringify({ before, after })}`);
+      }
+      return accepted.response;
+    });
+  },
+  async wake() {},
+};
+"#
+            .into(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Memory {
+                    binding: "CHAT".into(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("socket snapshot worker deploys");
+
+    let first = service
+        .open_websocket(
+            "socket-snapshots".into(),
+            test_websocket_invocation("/accept-first", "first"),
+            None,
+        )
+        .await
+        .expect("accept initializes its socket snapshot");
+    let second = service
+        .open_websocket(
+            "socket-snapshots".into(),
+            test_websocket_invocation("/list-first", "second"),
+            None,
+        )
+        .await
+        .expect("values before accept preserve the existing socket");
+    let mut expected = vec![first.session_id.clone(), second.session_id.clone()];
+    expected.sort();
+    for remaining in [2, 1] {
+        let response = service
+            .invoke(
+                "socket-snapshots".into(),
+                test_invocation_with_path("/handles", "snapshot"),
+            )
+            .await
+            .expect("socket handles load");
+        let observed: Value = serde_json::from_slice(&response.body).expect("socket handle JSON");
+        assert_eq!(
+            observed,
+            serde_json::json!({ "atomic": expected, "outside": expected })
+        );
+        if remaining == 2 {
+            service
+                .websocket_close(
+                    "socket-snapshots".into(),
+                    first.session_id.clone(),
+                    1000,
+                    "done".into(),
+                )
+                .await
+                .expect("first socket closes");
+            expected.retain(|handle| handle != &first.session_id);
+        }
+    }
+    service
+        .websocket_close(
+            "socket-snapshots".into(),
+            second.session_id,
+            1000,
+            "done".into(),
+        )
+        .await
+        .expect("second socket closes");
+}
+
+#[tokio::test]
+#[serial]
 async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,

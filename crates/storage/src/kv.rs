@@ -418,12 +418,16 @@ impl KvStore {
         let worker = worker_name.to_owned();
         let binding = binding.to_owned();
         self.state
-            .write(shard, bytes, move |conn, version| {
-                let worker = worker.clone();
-                let binding = binding.clone();
-                let mutation = mutation.clone();
-                Box::pin(async move {
-                    execute_cached(
+            .write(
+                shard,
+                bytes,
+                crate::state::WriteOptions::default(),
+                move |conn, version| {
+                    let worker = worker.clone();
+                    let binding = binding.clone();
+                    let mutation = mutation.clone();
+                    Box::pin(async move {
+                        execute_cached(
                         conn,
                         "INSERT INTO worker_kv(worker,binding,key,value,encoding,deleted,version)
                      VALUES (?1,?2,?3,?4,?5,?6,?7)
@@ -441,9 +445,10 @@ impl KvStore {
                         ),
                     )
                     .await?;
-                    Ok(version)
-                })
-            })
+                        Ok(version)
+                    })
+                },
+            )
             .await
     }
     pub async fn list(

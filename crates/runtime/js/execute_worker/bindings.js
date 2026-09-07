@@ -298,8 +298,7 @@
   ) => {
     await ensureMemoryStorageHydrated(entry, runtimeRequestId, { force: true });
     const txn = createMemoryTxn(entry, { commandHandle });
-    const socketRuntime = createMemorySocketRuntime(entry, runtimeRequestId, true);
-    await socketRuntime.refreshOpenHandles();
+    const socketRuntime = createMemorySocketRuntime(entry, { allowSocketAccept: true });
     const scopedState = createMemoryAtomicState(entry, runtimeRequestId, txn, socketRuntime);
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
@@ -368,18 +367,6 @@
     return event;
   };
 
-  const seedMemoryHandleSnapshots = (entry, memoryCall) => {
-    if (!memoryCall || typeof memoryCall !== "object") {
-      return;
-    }
-    if (Array.isArray(memoryCall.socket_handles)) {
-      entry.openSocketHandles = new Set(
-        memoryCall.socket_handles.map((value) => String(value)),
-      );
-      entry.openSocketHandlesInitialized = true;
-    }
-  };
-
   const invokeMemoryCall = async (memoryCall, request, env) => {
     if (!memoryCall || typeof memoryCall !== "object") {
       throw new Error("memory invoke config is missing");
@@ -394,9 +381,11 @@
     }
     const runtimeRequestId = activeRequestId();
     const entry = await ensureMemoryEntry(binding, memoryKey, runtimeRequestId, { hydrate: false });
-    seedMemoryHandleSnapshots(entry, memoryCall);
     const kind = String(memoryCall.kind ?? "");
-    const socketRuntime = createMemorySocketRuntime(entry, runtimeRequestId, false);
+    const socketRuntime = createMemorySocketRuntime(entry, {
+      allowSocketAccept: false,
+      handles: memoryCall.socket_handles,
+    });
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
     const previousMemoryRequestId = current.memoryRequestId;

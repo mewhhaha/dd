@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use turso::{Builder, Connection, Database};
 
+use crate::memory::{MemorySnapshotKey, SnapshotCache};
 use crate::turso_util::{
     configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
     record_storage_retry,
@@ -37,6 +38,7 @@ pub struct StateStore {
     owner_epoch: AtomicI64,
     leases: Mutex<EntityLeases>,
     lease_admissions: Arc<Semaphore>,
+    pub(crate) memory_snapshots: Arc<Mutex<SnapshotCache>>,
 }
 
 type EntityLeases = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
@@ -136,9 +138,16 @@ pub(crate) type WriteFuture<'a, T> =
 type WriteReply = Box<dyn Any + Send>;
 type WriteOperation =
     Box<dyn for<'a> Fn(&'a Connection, i64) -> WriteFuture<'a, WriteReply> + Send>;
+
+#[derive(Default)]
+pub(crate) struct WriteOptions {
+    pub invalidate_memory: Option<MemorySnapshotKey>,
+}
+
 struct WriteCommand {
     operation: WriteOperation,
     reply: oneshot::Sender<Result<WriteReply>>,
+    options: WriteOptions,
     _bytes: OwnedSemaphorePermit,
     _command: OwnedSemaphorePermit,
 }
@@ -211,6 +220,7 @@ impl StateStore {
             ))
         })?;
         let mut shards = Vec::with_capacity(STATE_SHARDS);
+        let memory_snapshots = Arc::new(Mutex::new(SnapshotCache::default()));
         let mut owner_epoch = 0i64;
         for index in 0..STATE_SHARDS {
             let path = root.join(format!("shard-{index:02}.db"));
@@ -284,6 +294,7 @@ impl StateStore {
             let writer_epoch = Arc::clone(&epoch);
             let metrics = Arc::new(WriterMetrics::default());
             let writer_metrics = Arc::clone(&metrics);
+            let writer_snapshots = Arc::clone(&memory_snapshots);
             let writer = std::thread::Builder::new()
                 .name(format!("state-{index:02}"))
                 .spawn(move || {
@@ -295,6 +306,7 @@ impl StateStore {
                         writer_database,
                         writer_epoch,
                         writer_metrics,
+                        writer_snapshots,
                         receiver,
                     ));
                 })
@@ -322,6 +334,7 @@ impl StateStore {
             owner_epoch: AtomicI64::new(owner_epoch),
             leases: Mutex::new(HashMap::new()),
             lease_admissions: Arc::new(Semaphore::new(4096)),
+            memory_snapshots,
         }))
     }
 
@@ -418,6 +431,7 @@ impl StateStore {
         &self,
         shard: usize,
         bytes: usize,
+        options: WriteOptions,
         operation: F,
     ) -> Result<T>
     where
@@ -456,6 +470,7 @@ impl StateStore {
                 })
             }),
             reply,
+            options,
             _bytes: byte_permit,
             _command: command_permit,
         };
@@ -538,6 +553,7 @@ async fn run_writer(
     database: Arc<Database>,
     epoch: Arc<AtomicU64>,
     metrics: Arc<WriterMetrics>,
+    snapshots: Arc<Mutex<SnapshotCache>>,
     mut receiver: mpsc::Receiver<WriteCommand>,
 ) {
     let mut conn = None;
@@ -549,8 +565,8 @@ async fn run_writer(
                 Err(_) => break,
             }
         }
-        let result = commit_group(&database, &mut conn, &metrics, &batch).await;
-        epoch.fetch_add(1, Ordering::AcqRel);
+        let result = commit_group(&database, &mut conn, &metrics, &epoch, &snapshots, &batch).await;
+        invalidate_memory_snapshots(&epoch, &snapshots, &batch);
         match result {
             Ok(replies) => {
                 for (command, reply) in batch.into_iter().zip(replies) {
@@ -563,11 +579,13 @@ async fn run_writer(
                         &database,
                         &mut conn,
                         &metrics,
+                        &epoch,
+                        &snapshots,
                         std::slice::from_ref(&command),
                     )
                     .await
                     .map(|mut replies| replies.remove(0));
-                    epoch.fetch_add(1, Ordering::AcqRel);
+                    invalidate_memory_snapshots(&epoch, &snapshots, std::slice::from_ref(&command));
                     let _ = command.reply.send(result);
                 }
             }
@@ -578,10 +596,40 @@ async fn run_writer(
     }
 }
 
+fn invalidate_memory_snapshots(
+    epoch: &AtomicU64,
+    snapshots: &Mutex<SnapshotCache>,
+    batch: &[WriteCommand],
+) {
+    // Advancing before eviction rejects old fills that reach the cache afterward.
+    epoch.fetch_add(1, Ordering::AcqRel);
+    if !batch
+        .iter()
+        .any(|command| command.options.invalidate_memory.is_some())
+    {
+        return;
+    }
+    let mut removed = Vec::with_capacity(batch.len());
+    {
+        let mut cache = snapshots.lock().expect("memory snapshots lock poisoned");
+        for key in batch
+            .iter()
+            .filter_map(|command| command.options.invalidate_memory.as_ref())
+        {
+            if let Some(snapshot) = cache.remove(key) {
+                removed.push(snapshot);
+            }
+        }
+    }
+    drop(removed);
+}
+
 async fn commit_group(
     database: &Database,
     slot: &mut Option<Connection>,
     metrics: &WriterMetrics,
+    epoch: &AtomicU64,
+    snapshots: &Mutex<SnapshotCache>,
     batch: &[WriteCommand],
 ) -> Result<Vec<WriteReply>> {
     for attempt in 0..8 {
@@ -634,6 +682,8 @@ async fn commit_group(
                 let retry = matches!(&error, WriteError::Database(error) if is_retryable_turso_error(error));
                 if execute_cached(conn, "ROLLBACK", ()).await.is_err() {
                     slot.take();
+                    // A failed rollback leaves the commit outcome unknown before a retry.
+                    invalidate_memory_snapshots(epoch, snapshots, batch);
                     metrics
                         .discarded_connections
                         .fetch_add(1, Ordering::Relaxed);
@@ -738,6 +788,14 @@ mod tests {
         let state = StateStore::open(&root).await.unwrap();
         let memory = MemoryStore::from_state(Arc::clone(&state));
         let namespace = worker_namespace("worker", "MEMORY");
+        assert!(
+            memory
+                .snapshot(&namespace, "entity")
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
         let lease = memory.acquire_lease(&namespace, "entity").await.unwrap();
         let owner = lease.owner_epoch();
         let blocker = state
@@ -793,6 +851,90 @@ mod tests {
             b"committed"
         );
         drop(next);
+        drop(memory);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_commit_invalidates_cached_values_before_retrying() {
+        let root =
+            std::env::temp_dir().join(format!("dd-ambiguous-cache-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        let memory = MemoryStore::from_state(Arc::clone(&state));
+        let namespace = worker_namespace("worker", "MEMORY");
+        memory
+            .apply_batch(
+                &namespace,
+                "entity",
+                crate::memory::MemoryCommit {
+                    mutations: &[MemoryBatchMutation {
+                        key: "key".into(),
+                        value: b"before".to_vec(),
+                        encoding: "utf8".into(),
+                        deleted: false,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+            b"before"
+        );
+
+        let retry_started = Arc::new(tokio::sync::Notify::new());
+        let release_retry = Arc::new(tokio::sync::Notify::new());
+        let attempts = Arc::new(AtomicU64::new(0));
+        let queued_state = Arc::clone(&state);
+        let queued_retry_started = Arc::clone(&retry_started);
+        let queued_release_retry = Arc::clone(&release_retry);
+        let queued_namespace = namespace.clone();
+        let commit = tokio::spawn(async move {
+            queued_state.write(
+                StateStore::shard_index("worker", "MEMORY", "entity"),
+                1024,
+                WriteOptions { invalidate_memory: Some((queued_namespace, "entity".into())) },
+                move |conn, version| {
+                    let attempts = Arc::clone(&attempts);
+                    let retry_started = Arc::clone(&queued_retry_started);
+                    let release_retry = Arc::clone(&queued_release_retry);
+                    Box::pin(async move {
+                        if attempts.fetch_add(1, Ordering::Relaxed) > 0 {
+                            retry_started.notify_one();
+                            release_retry.notified().await;
+                            return Ok(());
+                        }
+                        execute_cached(conn,
+                            "UPDATE memory_state SET value=?1,version=?2 WHERE worker='worker' AND binding='MEMORY' AND entity_key='entity' AND item_key='key'",
+                            (b"committed".to_vec(), version),
+                        ).await?;
+                        execute_cached(conn,
+                            "UPDATE memory_meta SET max_version=?1 WHERE worker='worker' AND binding='MEMORY' AND entity_key='entity'",
+                            (version,),
+                        ).await?;
+                        execute_cached(conn, "UPDATE state_floor SET version=?1 WHERE singleton=1", (version,)).await?;
+                        execute_cached(conn, "COMMIT", ()).await?;
+                        Err(turso::Error::Busy("injected lost commit acknowledgement".into()).into())
+                    })
+                },
+            ).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), retry_started.notified())
+            .await
+            .unwrap();
+        let observed = memory.snapshot(&namespace, "entity").await.unwrap();
+        release_retry.notify_one();
+        commit.await.unwrap().unwrap();
+        assert_eq!(
+            observed.entries[0].value, b"committed",
+            "a retry must not expose the cache from before an ambiguous commit"
+        );
+        assert_eq!(
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+            b"committed"
+        );
         drop(memory);
         drop(state);
         std::fs::remove_dir_all(root).unwrap();

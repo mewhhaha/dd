@@ -95,6 +95,8 @@ size-report-all profile="dist":
 # Syntax-check source-only JS integration package.
 check-js:
   node scripts/check-runtime-contract.mjs
+  node --check crates/runtime/src/bin/bench_memory_fanout/worker.js
+  node --check scripts/check-dd-dev-transport.mjs
   node --check benchmarks/run.mjs
   node --check benchmarks/summarize.mjs
   node --check benchmarks/check-regression.mjs

@@ -22,6 +22,50 @@ async fn deploy_memory_contract_worker(body: &str) -> RuntimeService {
 
 #[tokio::test]
 #[serial]
+async fn staged_values_and_deletes_remain_visible_before_and_after_commit() {
+    let service = deploy_memory_contract_worker(
+        r#"
+const payload = new Uint8Array(64 * 1024).fill(7);
+const before = await memory.atomic((tx) => {
+  const putIsUndefined = tx.put("bytes", payload) === undefined;
+  payload[0] = 99;
+  tx.get("bytes")[1] = 100;
+  tx.put("text", "first");
+  tx.put("text", "last");
+  tx.put("removed", 1);
+  const deleted = [tx.delete("removed"), tx.delete("removed")];
+  return {
+    putIsUndefined, deleted,
+    bytes: Array.from(tx.get("bytes").slice(0, 2)),
+    text: tx.get("text"), keys: tx.list().map(({ key }) => key),
+  };
+});
+const after = await memory.atomic((tx) => ({
+  bytes: Array.from(tx.get("bytes").slice(0, 2)),
+  text: tx.get("text"), keys: tx.list().map(({ key }) => key),
+}));
+return Response.json({ before, after });
+"#,
+    )
+    .await;
+    let response = service
+        .invoke("contract".into(), test_invocation())
+        .await
+        .expect("staged and committed reads succeed");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).expect("json"),
+        serde_json::json!({
+            "before": {
+                "putIsUndefined": true, "deleted": [true, false],
+                "bytes": [7, 7], "text": "last", "keys": ["bytes", "text"]
+            },
+            "after": { "bytes": [7, 7], "text": "last", "keys": ["bytes", "text"] }
+        })
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn async_callbacks_are_rejected_before_their_body_runs() {
     let service = deploy_memory_contract_worker(
         r#"

@@ -238,6 +238,214 @@ async fn snapshot_cache_preserves_recent_entities_and_refreshes_committed_values
 }
 
 #[tokio::test]
+async fn commits_preserve_unrelated_memory_snapshots_on_the_same_shard() {
+    let root = temporary_root();
+    let state = StateStore::open(&root).await.unwrap();
+    let memory = MemoryStore::from_state(Arc::clone(&state));
+    let kv = KvStore::from_state(state);
+    let namespace = worker_namespace("worker", "MEMORY");
+    let shard = memory.shard_index_for_key(&namespace, "a");
+    let other = (0..4096)
+        .map(|index| format!("entity-{index}"))
+        .find(|entity| memory.shard_index_for_key(&namespace, entity) == shard)
+        .expect("fixture must contain a different entity on the same shard");
+    for entity in ["a", other.as_str()] {
+        memory
+            .apply_batch(
+                &namespace,
+                entity,
+                storage::memory::MemoryCommit {
+                    mutations: &[mutation("value", b"before")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        memory.snapshot(&namespace, entity).await.unwrap();
+    }
+    let before = memory.cache_performance_snapshot();
+    memory
+        .apply_batch(
+            &namespace,
+            &other,
+            storage::memory::MemoryCommit {
+                mutations: &[mutation("value", b"after")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    kv.put("worker", "MEMORY", "a", "separate KV value")
+        .await
+        .unwrap();
+    assert_eq!(
+        memory.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        b"before"
+    );
+    assert_eq!(
+        memory.cache_performance_snapshot().snapshot_hits,
+        before.snapshot_hits + 1
+    );
+    assert_eq!(
+        memory.snapshot(&namespace, &other).await.unwrap().entries[0].value,
+        b"after"
+    );
+    assert_eq!(
+        memory.cache_performance_snapshot().snapshot_misses,
+        before.snapshot_misses + 1
+    );
+    drop(memory);
+    drop(kv);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn memory_facades_share_snapshot_freshness_and_cache_limits() {
+    let root = temporary_root();
+    let state = StateStore::open(&root).await.unwrap();
+    let mut first = MemoryStore::from_state(Arc::clone(&state));
+    first.set_snapshot_cache_limits(1, 1024 * 1024);
+    let second = MemoryStore::from_state(state);
+    let namespace = worker_namespace("worker", "MEMORY");
+    assert!(
+        first
+            .snapshot(&namespace, "a")
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    second
+        .apply_batch(
+            &namespace,
+            "a",
+            storage::memory::MemoryCommit {
+                mutations: &[mutation("value", b"committed")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        b"committed"
+    );
+    let before = first.cache_performance_snapshot();
+    second.snapshot(&namespace, "b").await.unwrap();
+    assert_eq!(
+        first.snapshot(&namespace, "a").await.unwrap().entries[0].value,
+        b"committed"
+    );
+    assert_eq!(
+        first.cache_performance_snapshot().snapshot_misses,
+        before.snapshot_misses + 1
+    );
+    drop(first);
+    drop(second);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn returned_snapshots_do_not_modify_cached_values() {
+    let root = temporary_root();
+    let state = StateStore::open(&root).await.unwrap();
+    let memory = MemoryStore::from_state(state);
+    let namespace = worker_namespace("worker", "MEMORY");
+    memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            storage::memory::MemoryCommit {
+                mutations: &[mutation("value", b"original")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut first = memory.snapshot(&namespace, "entity").await.unwrap();
+    first.entries[0].value.clear();
+    let mut second = memory.snapshot(&namespace, "entity").await.unwrap();
+    assert_eq!(second.entries[0].value, b"original");
+    second.entries.clear();
+    assert_eq!(
+        memory.snapshot(&namespace, "entity").await.unwrap().entries[0].value,
+        b"original"
+    );
+    drop(memory);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn effect_commits_refresh_snapshots_but_delivery_maintenance_preserves_them() {
+    let root = temporary_root();
+    let state = StateStore::open(&root).await.unwrap();
+    let memory = MemoryStore::from_state(state);
+    let namespace = worker_namespace("worker", "MEMORY");
+    assert_eq!(
+        memory
+            .snapshot(&namespace, "entity")
+            .await
+            .unwrap()
+            .max_version,
+        -1
+    );
+    let applied = memory
+        .apply_batch(
+            &namespace,
+            "entity",
+            storage::memory::MemoryCommit {
+                outbox_effects: &[MemoryOutboxEffectWrite {
+                    kind: "deliver".into(),
+                    payload: b"payload".to_vec(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        memory
+            .snapshot(&namespace, "entity")
+            .await
+            .unwrap()
+            .max_version,
+        applied.max_version
+    );
+    let before = memory.cache_performance_snapshot();
+    let claims = memory
+        .claim_outbox_records(&namespace, "entity", 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        memory
+            .snapshot(&namespace, "entity")
+            .await
+            .unwrap()
+            .max_version,
+        applied.max_version
+    );
+    memory
+        .mark_outbox_delivered(&namespace, "entity", &claims[0].effect_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        memory
+            .snapshot(&namespace, "entity")
+            .await
+            .unwrap()
+            .max_version,
+        applied.max_version
+    );
+    assert_eq!(
+        memory.cache_performance_snapshot().snapshot_hits,
+        before.snapshot_hits + 2
+    );
+    drop(memory);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
     let source = temporary_root();
     let destination = temporary_root();

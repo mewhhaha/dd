@@ -361,7 +361,6 @@ pub(crate) struct MemoryStateApplyBatchResult {
     pub(crate) effect_count: usize,
     pub(crate) accepted: bool,
     pub(crate) output_gate_required: bool,
-    pub(crate) mutations: Vec<MemoryStateSnapshotEntry>,
     pub(crate) error: String,
 }
 
@@ -392,9 +391,6 @@ pub(crate) struct MemoryBatchBeginResult {
 #[derive(Debug, Serialize)]
 pub(crate) struct MemoryBatchMutationResult {
     pub(crate) ok: bool,
-    pub(crate) record: Option<MemoryStateSnapshotEntry>,
-    pub(crate) mutation_count: usize,
-    pub(crate) effect_count: usize,
     pub(crate) error: String,
 }
 

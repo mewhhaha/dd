@@ -10,6 +10,10 @@ threshold misses. The [scaling matrix guide](SCALING.md) describes the separate
 scaling workloads; its historical results do not establish performance of the
 current storage layout.
 
+The [concurrent memory comparison](MEMORY-FANOUT.md) measures workers calling
+multiple independent memories, including core scaling, read/write mixes,
+response validation, and exact state verification after reopening.
+
 For equivalent durable workloads across the consolidation, use the
 [state comparison build and run instructions](../docs/storage-conversion.md).
 That runner verifies prebuilt binaries against exact source snapshots, including

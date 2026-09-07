@@ -178,7 +178,7 @@ fn memory_batch_staged_bytes_without_command_result(batch: &MemoryBatchHandle) -
 fn stage_memory_batch_mutation(
     batch: &mut MemoryBatchHandle,
     next: MemoryBatchMutation,
-) -> Result<MemoryBatchMutation> {
+) -> Result<()> {
     if next.key.trim().is_empty() {
         return Err(PlatformError::bad_request(
             "memory batch mutation key must not be empty",
@@ -212,14 +212,13 @@ fn stage_memory_batch_mutation(
             "memory batch staged data exceeded {MEMORY_BATCH_MAX_STAGED_BYTES} bytes"
         )));
     }
-    let record = next.clone();
     if let Some(existing_idx) = existing_idx {
         batch.mutations[existing_idx] = next;
     } else {
         batch.mutations.push(next);
     }
     batch.staged_bytes = next_staged_bytes;
-    Ok(record)
+    Ok(())
 }
 
 fn stage_memory_batch_effect(
@@ -451,9 +450,6 @@ pub(super) fn op_memory_batch_mutation(
         let Some(batch) = batches.get(batch_handle) else {
             return MemoryBatchMutationResult {
                 ok: false,
-                record: None,
-                mutation_count: 0,
-                effect_count: 0,
                 error: "memory batch handle is invalid".to_string(),
             };
         };
@@ -467,9 +463,6 @@ pub(super) fn op_memory_batch_mutation(
             Err(error) => {
                 return MemoryBatchMutationResult {
                     ok: false,
-                    record: None,
-                    mutation_count: 0,
-                    effect_count: 0,
                     error: error.to_string(),
                 };
             }
@@ -481,51 +474,19 @@ pub(super) fn op_memory_batch_mutation(
         encoding,
         deleted,
     };
-    let (staged, mutation_count, effect_count) = {
-        let Some(batch) = state
-            .borrow_mut::<MemoryBatchHandles>()
-            .get_mut(batch_handle)
-        else {
-            return MemoryBatchMutationResult {
-                ok: false,
-                record: None,
-                mutation_count: 0,
-                effect_count: 0,
-                error: "memory batch handle is invalid".to_string(),
-            };
-        };
-        let staged = match stage_memory_batch_mutation(batch, next) {
-            Ok(record) => record,
-            Err(error) => {
-                return MemoryBatchMutationResult {
-                    ok: false,
-                    record: None,
-                    mutation_count: batch.mutations.len(),
-                    effect_count: batch.effects.len(),
-                    error: error.to_string(),
-                };
-            }
-        };
-        (staged, batch.mutations.len(), batch.effects.len())
-    };
-    let record = match memory_batch_mutation_entry(state, request_context_handle, &staged, -1) {
-        Ok(record) => record,
-        Err(error) => {
-            return MemoryBatchMutationResult {
-                ok: false,
-                record: None,
-                mutation_count,
-                effect_count,
-                error: error.to_string(),
-            };
-        }
-    };
-    MemoryBatchMutationResult {
-        ok: true,
-        record: Some(record),
-        mutation_count,
-        effect_count,
-        error: String::new(),
+    let batch = state
+        .borrow_mut::<MemoryBatchHandles>()
+        .get_mut(batch_handle)
+        .expect("validated memory batch handle");
+    match stage_memory_batch_mutation(batch, next) {
+        Ok(()) => MemoryBatchMutationResult {
+            ok: true,
+            error: String::new(),
+        },
+        Err(error) => MemoryBatchMutationResult {
+            ok: false,
+            error: error.to_string(),
+        },
     }
 }
 
@@ -943,7 +904,6 @@ pub(super) async fn op_memory_batch_apply(
             effect_count: 0,
             accepted: false,
             output_gate_required: false,
-            mutations: Vec::new(),
             error: "memory batch handle is invalid".to_string(),
         };
     };
@@ -959,7 +919,6 @@ pub(super) async fn op_memory_batch_apply(
             effect_count,
             accepted: batch.accepted,
             output_gate_required: false,
-            mutations: Vec::new(),
             error: String::new(),
         };
     }
@@ -975,7 +934,6 @@ pub(super) async fn op_memory_batch_apply(
                 effect_count,
                 accepted: batch.accepted,
                 output_gate_required: false,
-                mutations: Vec::new(),
                 error: error.to_string(),
             };
         }
@@ -992,7 +950,6 @@ pub(super) async fn op_memory_batch_apply(
                 effect_count,
                 accepted: batch.accepted,
                 output_gate_required: false,
-                mutations: Vec::new(),
                 error: error.to_string(),
             };
         }
@@ -1019,35 +976,6 @@ pub(super) async fn op_memory_batch_apply(
                 started.elapsed().as_micros() as u64,
                 mutation_count as u64 + 1,
             );
-            let mutations = match batch
-                .mutations
-                .iter()
-                .map(|mutation| {
-                    memory_batch_mutation_entry(
-                        &mut state.borrow_mut(),
-                        batch.request_context_handle,
-                        mutation,
-                        result.max_version,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(mutations) => mutations,
-                Err(error) => {
-                    return MemoryStateApplyBatchResult {
-                        ok: false,
-                        applied: false,
-                        read_only: false,
-                        max_version: -1,
-                        mutation_count,
-                        effect_count,
-                        accepted: batch.accepted,
-                        output_gate_required: false,
-                        mutations: Vec::new(),
-                        error: error.to_string(),
-                    };
-                }
-            };
             MemoryStateApplyBatchResult {
                 ok: true,
                 applied: true,
@@ -1057,7 +985,6 @@ pub(super) async fn op_memory_batch_apply(
                 effect_count,
                 accepted: batch.accepted,
                 output_gate_required: batch.accepted || effect_count > 0,
-                mutations,
                 error: String::new(),
             }
         }
@@ -1070,7 +997,6 @@ pub(super) async fn op_memory_batch_apply(
             effect_count,
             accepted: batch.accepted,
             output_gate_required: false,
-            mutations: Vec::new(),
             error: error.to_string(),
         },
     }
@@ -1342,7 +1268,7 @@ pub(super) async fn op_memory_socket_close(
 
 #[deno_core::op2]
 #[serde]
-pub(super) async fn op_memory_socket_list(
+pub(super) fn op_memory_socket_list(
     state: Rc<RefCell<OpState>>,
     memory_scope_handle: u32,
     #[string] binding: String,

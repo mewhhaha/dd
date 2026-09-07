@@ -38,6 +38,30 @@ export default {
     });
   },
 };`;
+const fanoutSource = `
+export default {
+  async fetch(request, env) {
+    const { operation, caller, entities } = await request.json();
+    const results = await Promise.all(entities.map(({ key, payload }) =>
+      env.MEMORY.get(key).atomic(tx => {
+        const previous = tx.get("state");
+        if (operation === "seed") {
+          if (previous !== null) throw new Error("memory already seeded: " + key);
+          tx.put("state", { count: 0, payload });
+        } else {
+          if (previous?.payload !== payload) throw new Error("stored payload mismatch: " + key);
+          if (operation === "write") {
+            tx.put("state", { count: previous.count + 1, payload: previous.payload });
+          } else if (operation !== "read") {
+            throw new Error("unknown memory operation: " + operation);
+          }
+        }
+        return { key, ...tx.get("state") };
+      })
+    ));
+    return Response.json({ caller, results });
+  },
+};`;
 
 const server = createServer(async (req, res) => {
   try {
@@ -73,6 +97,53 @@ try {
   assert.equal(replacement.url, deployed.url, "hot redeployment must preserve the worker listener");
 
   console.log("dev transport: URL and redeploy checks passed");
+  const fanout = await runtime.deploy("fanout-smoke", fanoutSource, {
+    bindings: [{ type: "memory", binding: "MEMORY" }],
+  });
+  const entities = Array.from({ length: 16 }, (_, entity) => ({
+    key: `entity-${entity}`,
+    payload: `memory-${entity}:\u0000λ:` + Array.from(
+      { length: 4096 },
+      (_, offset) => String.fromCharCode(33 + (entity * 17 + offset) % 90),
+    ).join(""),
+  }));
+  const callFanout = async (operation, caller) => {
+    const response = await fetch(fanout.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation, caller, entities }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, `fanout ${operation}/${caller} failed: ${body}`);
+    const observed = JSON.parse(body);
+    assert.equal(observed.caller, caller, "fanout response must belong to its HTTP caller");
+    assert.deepEqual(
+      observed.results.map(({ key, payload }) => ({ key, payload })),
+      entities,
+      `fanout ${operation}/${caller} must preserve every entity's complete payload`,
+    );
+    return observed.results;
+  };
+  assert.deepEqual(await callFanout("seed", "seed"), entities.map(entity => ({ ...entity, count: 0 })));
+  const callerCount = 8;
+  const replies = await Promise.all(Array.from(
+    { length: callerCount },
+    (_, caller) => callFanout("write", caller),
+  ));
+  for (let entity = 0; entity < entities.length; entity += 1) {
+    assert.deepEqual(
+      replies.map(reply => reply[entity].count).sort((left, right) => left - right),
+      Array.from({ length: callerCount }, (_, caller) => caller + 1),
+      `${entities[entity].key} must commit each concurrent increment exactly once`,
+    );
+  }
+  assert.deepEqual(
+    await callFanout("read", "final"),
+    entities.map(entity => ({ ...entity, count: callerCount })),
+    "fresh HTTP reads must observe every committed increment and intact payload",
+  );
+  console.log("dev transport: 8 concurrent HTTP callers × 16 memories, exact increments, and full payloads passed");
+
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -155,7 +226,7 @@ try {
   const chatClosed = once(chatSocket, "close");
   chatSocket.close(1000, "finished");
   await chatClosed;
-  console.log("dev transport: original URLs, redeploy, streaming upload/response, cancellation, native/proxied WebSockets, and chat transactions passed");
+  console.log("dev transport: original URLs, redeploy, HTTP memory fanout, streaming upload/response, cancellation, native/proxied WebSockets, and chat transactions passed");
 } finally {
   clearTimeout(timeout);
   server.closeAllConnections();

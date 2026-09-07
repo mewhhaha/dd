@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the three dist benchmark binaries and record reproducible source/build provenance."""
+"""Build dist benchmark binaries and record reproducible source/build provenance."""
 
 import argparse
 import hashlib
@@ -41,9 +41,14 @@ def main():
     parser.add_argument("--target-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path, help="new artifact directory outside the source tree")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--bin", action="append", dest="binaries",
+                        help="repeat to select runtime benchmark binaries; defaults to the state comparison set")
     arguments = parser.parse_args()
     if arguments.jobs < 1:
         parser.error("jobs must be positive")
+    binaries = arguments.binaries or BINARIES
+    if len(set(binaries)) != len(binaries):
+        parser.error("benchmark binary names must be unique")
     source = arguments.source.resolve(strict=True)
     target = arguments.target_dir.resolve()
     output = arguments.output.resolve()
@@ -53,7 +58,7 @@ def main():
     before, patch = source_snapshot(source)
     (output / "source.patch").write_bytes(patch)
     command = ["cargo", "build", "--locked", "--profile", "dist", "-p", "runtime"]
-    for binary in BINARIES:
+    for binary in binaries:
         command += ["--bin", binary]
     command += ["--target-dir", str(target), "--jobs", str(arguments.jobs)]
     configuration = tomllib.loads((source / "Cargo.toml").read_text())
@@ -70,6 +75,13 @@ def main():
         "profile": "dist", "profile_definitions": configuration.get("profile", {}),
         "cargo_lock_sha256": sha256(source / "Cargo.lock"),
         "cargo_configuration_sha256": {str(path): sha256(path) for path in configuration_paths if path.is_file()},
+        "benchmark_sources_sha256": {
+            str(path.relative_to(source)): sha256(path)
+            for binary in binaries
+            for path in [source / "crates/runtime/src/bin" / f"{binary}.rs",
+                         *(source / "crates/runtime/src/bin" / binary).rglob("*")]
+            if path.is_file()
+        },
         "build_log": str(output / "build.log"), "started_at_unix": time.time(),
     }
     record_path = output / "build-record.json"
@@ -82,7 +94,7 @@ def main():
     record.update(returncode=completed.returncode, wall_seconds=time.monotonic() - started,
                   source_unchanged=before == after, source_after=after)
     if completed.returncode == 0:
-        record["binary_sha256"] = {binary: sha256(target / "dist" / binary) for binary in BINARIES}
+        record["binary_sha256"] = {binary: sha256(target / "dist" / binary) for binary in binaries}
     record_path.write_text(json.dumps(record, indent=2) + "\n")
     if completed.returncode:
         raise SystemExit(completed.returncode)
