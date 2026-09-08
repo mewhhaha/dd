@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "type": "module",
   "exports": {
+    "./memory": {
+      "types": "./src/memory.d.ts",
+      "default": "./src/memory.js"
+    },
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"

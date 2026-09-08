@@ -55,7 +55,7 @@ export default {
       if (request.method === 'DELETE') {
         await memory.atomic((tx) => tx.delete('count'));
       }
-      return Response.json(await memory.atomic((tx) => tx.get('count')));
+      return Response.json(await memory.read((snapshot) => snapshot.get('count')));
     }
     if (request.method === 'PUT') {
       await env.STATE.put('record', { committed: true, count: 42 });

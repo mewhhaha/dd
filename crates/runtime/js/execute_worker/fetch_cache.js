@@ -339,11 +339,6 @@
   const ensureMemoryStorageState = (entry) => {
     if (!entry.storageState) {
       entry.storageState = {
-        fullSnapshotLoaded: false,
-        snapshotRevision: "",
-        hydrating: null,
-        mirror: new Map(),
-        committedVersion: -1,
         failedError: null,
         outputGate: Promise.resolve(),
       };
@@ -351,135 +346,20 @@
     return entry.storageState;
   };
 
-  const cloneMemoryRecord = (record) => {
-    if (!record) {
-      return null;
-    }
-    return {
-      key: String(record.key ?? ""),
-      value: takeMemoryBytes(record),
-      encoding: String(record.encoding ?? "utf8"),
-      version: Number(record.version ?? -1),
-      deleted: record.deleted === true,
-    };
-  };
-
-  const idleMemorySnapshots = globalThis.__dd_idle_memory_snapshots ??= {
-    entries: new Map(),
-    bytes: 0,
-  };
-  const MEMORY_IDLE_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
-  const MEMORY_IDLE_SNAPSHOT_MAX_ENTRIES = 4096;
-
-  const clearMemorySnapshot = (storageState) => {
-    storageState.mirror.clear();
-    storageState.fullSnapshotLoaded = false;
-    storageState.snapshotRevision = "";
-  };
-
-  const acquireMemorySnapshot = (entry) => {
-    const cached = idleMemorySnapshots.entries.get(entry.cacheKey);
-    if (cached) {
-      idleMemorySnapshots.entries.delete(entry.cacheKey);
-      idleMemorySnapshots.bytes -= cached.bytes;
-    }
-  };
-
-  const releaseMemorySnapshot = (entry) => {
-    const storageState = ensureMemoryStorageState(entry);
-    if (!storageState.fullSnapshotLoaded || storageState.failedError) {
-      clearMemorySnapshot(storageState);
-      return;
-    }
-    let bytes = 128 + entry.cacheKey.length * 2;
-    for (const record of storageState.mirror.values()) {
-      bytes += record.value.byteLength + (record.key.length + record.encoding.length) * 2 + 96;
-    }
-    if (bytes > MEMORY_IDLE_SNAPSHOT_MAX_BYTES) {
-      clearMemorySnapshot(storageState);
-      return;
-    }
-    while (idleMemorySnapshots.entries.size >= MEMORY_IDLE_SNAPSHOT_MAX_ENTRIES
-      || idleMemorySnapshots.bytes + bytes > MEMORY_IDLE_SNAPSHOT_MAX_BYTES) {
-      const [key, oldest] = idleMemorySnapshots.entries.entries().next().value;
-      idleMemorySnapshots.entries.delete(key);
-      idleMemorySnapshots.bytes -= oldest.bytes;
-      clearMemorySnapshot(oldest.storageState);
-    }
-    idleMemorySnapshots.entries.set(entry.cacheKey, { storageState, bytes });
-    idleMemorySnapshots.bytes += bytes;
-  };
-
-  const createMemoryTxn = (entry, options = undefined) => ({
-    entry,
-    pendingRecords: new Map(),
-    batchHandle: beginMemoryBatch(entry, {
-      commandHandle: Math.max(0, Math.trunc(Number(options?.commandHandle ?? 0) || 0)),
-    }),
-  });
-
-  const replaceMemorySnapshot = (storageState, entries, maxVersion) => {
-    storageState.mirror.clear();
-    for (const entryValue of Array.isArray(entries) ? entries : []) {
-      const key = String(entryValue?.key ?? "");
-      if (!key) {
-        continue;
-      }
-      storageState.mirror.set(key, {
-        key,
-        value: takeMemoryBytes(entryValue),
-        encoding: String(entryValue?.encoding ?? "utf8"),
-        version: Number(entryValue?.version ?? -1),
-        deleted: entryValue?.deleted === true,
-      });
-    }
-    const nextCommittedVersion = Number(maxVersion ?? storageState.committedVersion ?? -1);
-    storageState.committedVersion = Math.max(
-      Number(storageState.committedVersion ?? -1),
-      nextCommittedVersion,
-    );
-    storageState.fullSnapshotLoaded = true;
-  };
-
-
   const memoryTxnReadRecord = (txn, key) => {
-    const normalizedKey = String(key);
-    const staged = memoryTxnMutation(txn, normalizedKey);
-    if (staged) {
-      return staged;
+    const result = callOp("op_memory_batch_get", txn.batchHandle, key);
+    if (result.ok === false) {
+      throw new Error(result.error);
     }
-    const storageState = ensureMemoryStorageState(txn.entry);
-    return storageState.mirror.get(normalizedKey) ?? null;
+    return result.record;
   };
 
-  const memoryTxnMutation = (txn, key) => {
-    if (!txn) {
-      return null;
+  const memoryTxnKeys = (txn, prefix) => {
+    const result = callOp("op_memory_batch_keys", txn.batchHandle, prefix);
+    if (result.ok === false) {
+      throw new Error(result.error);
     }
-    const result = callOp("op_memory_batch_get_mutation", txn.batchHandle, String(key));
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory batch mutation lookup failed"));
-    }
-    return result.record == null ? null : cloneMemoryRecord(result.record);
-  };
-
-  const memoryTxnListOverlay = (txn, prefix) => {
-    if (!txn) {
-      return {
-        entries: [],
-        mutation_count: 0,
-      };
-    }
-    const result = callOp("op_memory_batch_list_overlay", txn.batchHandle, String(prefix ?? ""));
-    if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory batch list overlay failed"));
-    }
-    return {
-      entries: Array.isArray(result.entries)
-        ? result.entries.map((entryValue) => cloneMemoryRecord(entryValue))
-        : [],
-      mutation_count: Math.max(0, Math.trunc(Number(result.mutation_count ?? 0) || 0)),
-    };
+    return result.keys;
   };
 
   const closeMemoryResourcesOnFailure = async (entry) => {
@@ -545,42 +425,6 @@
   };
 
 
-  const ensureMemoryStorageHydrated = async (entry, runtimeRequestId, options = {}) => {
-    const storageState = ensureMemoryStorageState(entry);
-    if (storageState.fullSnapshotLoaded && options?.force !== true) {
-      return storageState;
-    }
-    if (!storageState.hydrating) {
-      storageState.hydrating = (async () => {
-        const started = performance.now();
-        const result = await callOp(
-          "op_memory_state_snapshot",
-          activeRequestContextHandle(),
-          memoryScopedScopeHandle(entry),
-          entry.binding,
-          entry.memoryKey,
-          storageState.fullSnapshotLoaded ? storageState.snapshotRevision : "",
-        );
-        await syncFrozenTime();
-        if (!result || typeof result !== "object" || result.ok === false) {
-          throw new Error(String(result?.error ?? "memory storage snapshot failed"));
-        }
-        if (result.entries !== null) {
-          replaceMemorySnapshot(storageState, result.entries, result.max_version);
-          recordMemoryProfile("js_hydrate_full", performance.now() - started, result.entries.length);
-        }
-        storageState.snapshotRevision = result.revision;
-        storageState.hydrating = null;
-        return storageState;
-      })().catch(async (error) => {
-        storageState.hydrating = null;
-        return await failMemoryEntry(entry, error);
-      });
-    }
-    return await storageState.hydrating;
-  };
-
-
   const stageMemoryTxnEffect = (txn, kind, payload) => {
     requireMemoryBatchOp(
       callOp(
@@ -625,19 +469,26 @@
     }
   };
 
-  const beginMemoryBatch = (entry, options = undefined) => {
-    const result = callOp(
+  const createMemoryTxn = async (entry, commandHandle) => {
+    const started = performance.now();
+    const result = await callOp(
       "op_memory_batch_begin",
       activeRequestContextHandle(),
       memoryScopedScopeHandle(entry),
       entry.binding,
       entry.memoryKey,
-      Math.max(0, Math.trunc(Number(options?.commandHandle ?? 0) || 0)),
+      commandHandle,
     );
+    await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
-      throw new Error(String(result?.error ?? "memory batch begin failed"));
+      const error = new Error(String(result?.error ?? "memory batch begin failed"));
+      if (result?.storage_failure === true) {
+        return await failMemoryEntry(entry, error);
+      }
+      throw error;
     }
-    return Math.max(0, Math.trunc(Number(result.handle ?? 0) || 0));
+    recordMemoryProfile("js_txn_begin", performance.now() - started, 1);
+    return { entry, batchHandle: result.handle };
   };
 
   const closeMemoryBatch = (handle) => {
@@ -650,7 +501,6 @@
   const closeMemoryTxnBatch = (txn) => {
     if (txn) {
       closeMemoryBatch(txn.batchHandle);
-      txn.pendingRecords.clear();
     }
   };
 
@@ -693,7 +543,6 @@
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory batch mutation failed"));
     }
-    txn.pendingRecords.set(mutation.key, mutation);
   };
 
   const finishMemoryTxn = async (txn, runtimeRequestId) => {
@@ -701,7 +550,6 @@
       return;
     }
     const started = performance.now();
-    const storageState = ensureMemoryStorageState(txn.entry);
     const result = await callOp("op_memory_batch_apply", txn.batchHandle);
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
@@ -711,11 +559,6 @@
       recordMemoryProfile("js_read_only_commit", performance.now() - started, 1);
       return;
     }
-    for (const record of txn.pendingRecords.values()) {
-      storageState.mirror.set(record.key, { ...record, version: result.max_version });
-    }
-    storageState.snapshotRevision = result.revision;
-    storageState.committedVersion = result.max_version;
     if (result.output_gate_required === true) {
       await gateMemoryOutput(txn.entry, runtimeRequestId, async () => undefined);
     }
@@ -729,15 +572,26 @@
 
   const memoryStorageKey = (key) => String(key).toWellFormed();
 
-  const createMemoryStorageBinding = (entry, runtimeRequestId, txn = null) => {
+  const compareMemoryKeys = (left, right) => {
+    const order = left.localeCompare(right);
+    if (order !== 0 || left === right) return order;
+    // Match SQL's binary ordering for distinct keys with equal collation.
+    const leftBytes = toUtf8Bytes(left);
+    const rightBytes = toUtf8Bytes(right);
+    for (let index = 0; index < Math.min(leftBytes.length, rightBytes.length); index++) {
+      if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
+    }
+    return leftBytes.length - rightBytes.length;
+  };
+
+  const createMemoryStorageBinding = (entry, txn) => {
     const rejectStorageOptions = (operation, options) => {
       if (
         options
         && typeof options === "object"
         && Object.keys(options).length > 0
       ) {
-        const scope = txn ? "memory atomic" : "memory";
-        throw new Error(`${scope} ${operation} options are unsupported`);
+        throw new Error(`memory atomic ${operation} options are unsupported`);
       }
     };
     return {
@@ -748,26 +602,16 @@
           throw storageState.failedError;
         }
         const normalizedKey = memoryStorageKey(key);
-        if (txn && !storageState.fullSnapshotLoaded) {
-          throw new Error("memory transaction storage must be hydrated before execution");
-        }
-        const record = txn
-          ? memoryTxnReadRecord(txn, normalizedKey)
-          : storageState.mirror.get(normalizedKey);
-        if (!record || record.deleted) {
+        const record = memoryTxnReadRecord(txn, normalizedKey);
+        if (!record) {
           return null;
         }
         return {
           value: decodeMemoryStorageValue(record),
-          version: Number(record.version ?? -1),
-          encoding: String(record.encoding ?? "utf8"),
         };
       },
       put(key, value, options = {}) {
         rejectStorageOptions("set", options);
-        if (!txn) {
-          throw new Error("memory storage writes require stub.atomic(...)");
-        }
         const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
@@ -784,9 +628,6 @@
       },
       delete(key, options = {}) {
         rejectStorageOptions("delete", options);
-        if (!txn) {
-          throw new Error("memory storage writes require stub.atomic(...)");
-        }
         const storageState = ensureMemoryStorageState(entry);
         if (storageState.failedError) {
           throw storageState.failedError;
@@ -805,40 +646,15 @@
         if (storageState.failedError) {
           throw storageState.failedError;
         }
-        if (txn && !storageState.fullSnapshotLoaded) {
-          throw new Error("memory transaction storage must be hydrated before execution");
-        }
         const prefix = memoryStorageKey(options?.prefix ?? "");
         const limitInput = Number(options?.limit ?? 100);
         const limit = Number.isFinite(limitInput)
           ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
           : 100;
-        const merged = new Map(storageState.mirror);
-        if (txn) {
-          for (const record of memoryTxnListOverlay(txn, prefix).entries) {
-            merged.set(record.key, cloneMemoryRecord(record));
-          }
-        }
-        return Array.from(merged.values())
-          .filter((record) => !record.deleted)
-          .filter((record) => record.key.startsWith(prefix))
-          .sort((left, right) => {
-            const order = left.key.localeCompare(right.key);
-            if (order !== 0 || left.key === right.key) return order;
-            // Match SQL's binary ordering for distinct keys with equal collation.
-            const leftBytes = toUtf8Bytes(left.key);
-            const rightBytes = toUtf8Bytes(right.key);
-            for (let index = 0; index < Math.min(leftBytes.length, rightBytes.length); index++) {
-              if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
-            }
-            return leftBytes.length - rightBytes.length;
-          })
+        return memoryTxnKeys(txn, prefix)
+          .sort(compareMemoryKeys)
           .slice(0, limit)
-          .map((record) => ({
-            key: record.key,
-            value: decodeMemoryStorageValue(record),
-            version: Number(record.version ?? -1),
-          }));
+          .map(key => ({ key, value: decodeMemoryStorageValue(memoryTxnReadRecord(txn, key)) }));
       },
     };
   };

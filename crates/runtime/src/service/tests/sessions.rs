@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 #[serial]
-async fn snapshot_failure_closes_live_sockets_without_a_caller_handle_snapshot() {
+async fn only_snapshot_failures_close_live_memory_sockets() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -17,13 +17,14 @@ export default {
   async fetch(request, env) {
     const path = new URL(request.url).pathname;
     const room = env.CHAT.get(path === "/other" ? "other" : "failed");
-    if (path !== "/fail") return room.atomic(tx => tx.accept(request).response);
+    if (path !== "/fail" && path !== "/reject") return room.atomic(tx => tx.accept(request).response);
 
     // Model a caller isolate that has never loaded this room's socket handles.
     globalThis.__dd_memory_state_entries.clear();
-    const snapshot = Deno.core.ops.op_memory_state_snapshot;
-    Deno.core.ops.op_memory_state_snapshot = () => ({
-      ok: false, error: "injected memory snapshot failure",
+    const snapshot = Deno.core.ops.op_memory_batch_begin;
+    Deno.core.ops.op_memory_batch_begin = () => ({
+      ok: false, storage_failure: path === "/fail",
+      error: path === "/fail" ? "injected memory snapshot failure" : "injected memory admission rejection",
     });
     let callbackRan = false;
     try {
@@ -32,7 +33,7 @@ export default {
     } catch (error) {
       return Response.json({ callbackRan, error: error.message });
     } finally {
-      Deno.core.ops.op_memory_state_snapshot = snapshot;
+      Deno.core.ops.op_memory_batch_begin = snapshot;
     }
   },
   async wake(event) {
@@ -65,6 +66,29 @@ export default {
                 .expect("socket opens"),
         );
     }
+    let rejected = service
+        .invoke(
+            "socket-failure".into(),
+            test_invocation_with_path("/reject", "admission-rejection"),
+        )
+        .await
+        .expect("worker reports admission rejection");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&rejected.body).unwrap(),
+        serde_json::json!({
+            "callbackRan": false, "error": "injected memory admission rejection"
+        })
+    );
+    let echo = service
+        .websocket_send_frame(
+            "socket-failure".into(),
+            sockets[0].session_id.clone(),
+            b"still open".to_vec(),
+            false,
+        )
+        .await
+        .expect("rejected transaction leaves existing sockets available");
+    assert_eq!(echo.body, b"still open");
     let response = service
         .invoke(
             "socket-failure".into(),

@@ -1,5 +1,13 @@
 # Benchmark configurations
 
+The [concurrent snapshot-read report](MEMORY-READ.md) compares `memory.read()`
+with `memory.atomic()` using the same executable and matched concurrent-memory
+workloads. `bench_memory_fanout` accepts `DD_FANOUT_READ_API=atomic|snapshot`;
+only read and verification operations select that API, while seed and write
+operations always use `atomic()`. The paired runner exposes this as
+`--baseline-read-api atomic --candidate-read-api snapshot`. Both sides can use
+the same binary and build record. Raw configurations record the selected API.
+
 The scripts in [`configs/`](configs/) are the canonical commands for the
 workloads we intentionally test. Raw sampler output is generated under
 `benchmarks/results/` and is not committed.
@@ -16,6 +24,9 @@ response validation, and exact state verification after reopening.
 The [memory performance follow-up](MEMORY-FANOUT-FOLLOWUP.md) measures direct
 buffer staging and bounded snapshot reuse against that checkpoint, including
 larger multi-key memories, cache overflow, and core scaling.
+The [native snapshot report](MEMORY-NATIVE-SNAPSHOTS.md) profiles those costs
+and compares reading directly from native transaction snapshots, including
+core scaling, small-memory holdouts, and durable write traffic.
 
 For equivalent durable workloads across the consolidation, use the
 [state comparison build and run instructions](../docs/storage-conversion.md).

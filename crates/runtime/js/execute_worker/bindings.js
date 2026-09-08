@@ -296,15 +296,13 @@
     callback,
     commandHandle,
   ) => {
-    acquireMemorySnapshot(entry);
     let txn;
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
     const previousMemoryRequestId = current.memoryRequestId;
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
     try {
-      await ensureMemoryStorageHydrated(entry, runtimeRequestId, { force: true });
-      txn = createMemoryTxn(entry, { commandHandle });
+      txn = await createMemoryTxn(entry, commandHandle);
       const socketRuntime = createMemorySocketRuntime(entry, { allowSocketAccept: true });
       const scopedState = createMemoryAtomicState(entry, runtimeRequestId, txn, socketRuntime);
       current.memoryEntry = entry;
@@ -334,7 +332,6 @@
       return value;
     } finally {
       closeMemoryTxnBatch(txn);
-      releaseMemorySnapshot(entry);
       current.memoryEntry = previousMemoryEntry;
       current.memoryRequestId = previousMemoryRequestId;
       current.socketRuntimeProvider = previousSocketRuntimeProvider;
@@ -383,7 +380,7 @@
       throw new Error(`memory binding not declared for worker: ${binding}`);
     }
     const runtimeRequestId = activeRequestId();
-    const entry = await ensureMemoryEntry(binding, memoryKey, runtimeRequestId, { hydrate: false });
+    const entry = ensureMemoryEntry(binding, memoryKey);
     const kind = String(memoryCall.kind ?? "");
     const socketRuntime = createMemorySocketRuntime(entry, {
       allowSocketAccept: false,

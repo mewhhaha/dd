@@ -87,37 +87,167 @@ pub(crate) fn clear_memory_batch_handles(state: &mut OpState, request_context_ha
         .clear_owner(request_context_handle);
 }
 
-fn memory_batch_mutation_entry(
-    state: &mut OpState,
+pub(crate) fn clear_memory_read_handles(state: &mut OpState, request_context_handle: u32) {
+    state
+        .borrow_mut::<MemoryReadHandles>()
+        .clear_owner(request_context_handle);
+}
+
+#[deno_core::op2]
+#[serde]
+pub(super) async fn op_memory_read_begin(
+    state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
-    mutation: &MemoryBatchMutation,
-    version: i64,
-) -> Result<MemoryStateSnapshotEntry> {
-    Ok(MemoryStateSnapshotEntry {
-        key: mutation.key.clone(),
-        value_handle: memory_output_bytes_insert(
-            state,
-            request_context_handle,
-            mutation.value.clone(),
-        )?,
-        encoding: mutation.encoding.clone(),
-        version,
-        deleted: mutation.deleted,
+    #[string] binding: String,
+    #[string] key: String,
+) -> MemoryBeginResult {
+    let mut storage_failure = false;
+    let result = async {
+        if binding.is_empty() || key.is_empty() || binding.len() + key.len() > 1024 {
+            return Err(PlatformError::bad_request(
+                "memory read requires binding and key within 1024 bytes",
+            ));
+        }
+        let (store, namespace, canceled, canceled_notify) = {
+            let op_state = state.borrow();
+            let request = op_state
+                .borrow::<RequestSecretContexts>()
+                .get(request_context_handle)
+                .ok_or_else(|| PlatformError::runtime("memory read request is unavailable"))?;
+            let worker = &op_state.borrow::<WorkerCacheNamespace>().0;
+            (
+                op_state.borrow::<MemoryStore>().clone(),
+                crate::memory::worker_namespace(worker, &binding),
+                Arc::clone(&request.canceled),
+                Arc::clone(&request.canceled_notify),
+            )
+        };
+        let cancellation = canceled_notify.notified();
+        tokio::pin!(cancellation);
+        cancellation.as_mut().enable();
+        if canceled.load(Ordering::SeqCst) {
+            return Err(PlatformError::runtime("memory read request was canceled"));
+        }
+        let started = Instant::now();
+        let snapshot = tokio::select! {
+            biased;
+            _ = &mut cancellation => return Err(PlatformError::runtime("memory read request was canceled")),
+            result = store.snapshot(&namespace, &key) => result.inspect_err(|_| {
+                storage_failure = true;
+            })?,
+        };
+        store.record_profile(
+            MemoryProfileMetricKind::OpSnapshot,
+            started.elapsed().as_micros() as u64,
+            1,
+        );
+        let value_bytes: usize = snapshot.entries.iter().map(|entry| entry.value.len()).sum();
+        if value_bytes > MEMORY_BATCH_MAX_STAGED_BYTES {
+            return Err(PlatformError::bad_request(format!(
+                "memory snapshot exceeded {MEMORY_BATCH_MAX_STAGED_BYTES} bytes"
+            )));
+        }
+        let mut op_state = state.borrow_mut();
+        if op_state
+            .borrow::<RequestSecretContexts>()
+            .get(request_context_handle)
+            .is_none_or(|request| request.canceled.load(Ordering::SeqCst))
+        {
+            return Err(PlatformError::runtime("memory read request was canceled"));
+        }
+        op_state.borrow_mut::<MemoryReadHandles>().insert(
+            MemoryReadHandle {
+                request_context_handle,
+                snapshot,
+            },
+            MEMORY_MAX_READ_HANDLES_PER_REQUEST,
+        )
+    }
+    .await;
+    match result {
+        Ok(handle) => MemoryBeginResult {
+            ok: true,
+            storage_failure: false,
+            handle,
+            error: String::new(),
+        },
+        Err(error) => MemoryBeginResult {
+            ok: false,
+            storage_failure,
+            handle: 0,
+            error: error.to_string(),
+        },
+    }
+}
+
+#[deno_core::op2(fast)]
+pub(super) fn op_memory_read_close(state: &mut OpState, read_handle: u32) {
+    state.borrow_mut::<MemoryReadHandles>().remove(read_handle);
+}
+
+fn memory_snapshot_record(
+    snapshot: &crate::memory::MemorySnapshot,
+    key: &str,
+) -> Option<MemoryReadValue> {
+    // Persisted snapshots and committed deltas both keep binary key order.
+    let index = snapshot
+        .entries
+        .binary_search_by(|entry| entry.key.as_str().cmp(key))
+        .ok()?;
+    let entry = &snapshot.entries[index];
+    (!entry.deleted).then(|| MemoryReadValue {
+        // JavaScript receives its own mutable buffer, never the shared snapshot's storage.
+        value: entry.value.to_vec().into(),
+        encoding: entry.encoding.clone(),
     })
 }
 
-fn memory_snapshot_entry(
+#[deno_core::op2]
+#[serde]
+pub(super) fn op_memory_read_get(
     state: &mut OpState,
-    request_context_handle: u32,
-    entry: MemorySnapshotEntry,
-) -> Result<MemoryStateSnapshotEntry> {
-    Ok(MemoryStateSnapshotEntry {
-        key: entry.key,
-        value_handle: memory_output_bytes_insert(state, request_context_handle, entry.value)?,
-        encoding: entry.encoding,
-        version: entry.version,
-        deleted: entry.deleted,
-    })
+    read_handle: u32,
+    #[string] key: String,
+) -> MemoryGetResult {
+    let Some(read) = state.borrow::<MemoryReadHandles>().get(read_handle) else {
+        return MemoryGetResult {
+            ok: false,
+            record: None,
+            error: "memory read handle is invalid".into(),
+        };
+    };
+    MemoryGetResult {
+        ok: true,
+        record: memory_snapshot_record(&read.snapshot, &key),
+        error: String::new(),
+    }
+}
+
+#[deno_core::op2]
+#[serde]
+pub(super) fn op_memory_read_keys(
+    state: &mut OpState,
+    read_handle: u32,
+    #[string] prefix: String,
+) -> MemoryKeysResult {
+    let Some(read) = state.borrow::<MemoryReadHandles>().get(read_handle) else {
+        return MemoryKeysResult {
+            ok: false,
+            keys: Vec::new(),
+            error: "memory read handle is invalid".into(),
+        };
+    };
+    MemoryKeysResult {
+        ok: true,
+        keys: read
+            .snapshot
+            .entries
+            .iter()
+            .filter(|entry| !entry.deleted && entry.key.starts_with(&prefix))
+            .map(|entry| entry.key.clone())
+            .collect(),
+        error: String::new(),
+    }
 }
 
 fn memory_batch_requires_commit(batch: &MemoryBatchHandle) -> bool {
@@ -143,6 +273,7 @@ const MEMORY_BATCH_MAX_KEY_BYTES: usize = 4096;
 const MEMORY_BATCH_MAX_EFFECT_KIND_BYTES: usize = 256;
 const MEMORY_MAX_COMMAND_HANDLES_PER_REQUEST: usize = 128;
 const MEMORY_MAX_BATCH_HANDLES_PER_REQUEST: usize = 128;
+const MEMORY_MAX_READ_HANDLES_PER_REQUEST: usize = 128;
 
 fn memory_batch_mutation_size(mutation: &MemoryBatchMutation) -> usize {
     mutation
@@ -313,17 +444,18 @@ pub(super) fn op_memory_bytes_take(
 
 #[deno_core::op2]
 #[serde]
-pub(super) fn op_memory_batch_begin(
+pub(super) async fn op_memory_batch_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     memory_scope_handle: u32,
     #[string] binding: String,
     #[string] key: String,
     command_handle: u32,
-) -> MemoryBatchBeginResult {
+) -> MemoryBeginResult {
     if request_context_handle == 0 {
-        return MemoryBatchBeginResult {
+        return MemoryBeginResult {
             ok: false,
+            storage_failure: false,
             handle: 0,
             error: "memory batch begin requires request_context_handle".to_string(),
         };
@@ -332,18 +464,60 @@ pub(super) fn op_memory_batch_begin(
         match memory_scope_for_payload_with_epoch(&state, memory_scope_handle, &binding, &key) {
             Ok(scope) => scope,
             Err(error) => {
-                return MemoryBatchBeginResult {
+                return MemoryBeginResult {
                     ok: false,
+                    storage_failure: false,
                     handle: 0,
                     error: error.to_string(),
                 };
             }
         };
     if scope.lease.is_none() {
-        return MemoryBatchBeginResult {
+        return MemoryBeginResult {
             ok: false,
+            storage_failure: false,
             handle: 0,
             error: format!("memory batch for {binding}/{key} requires an active transaction lease"),
+        };
+    }
+    let store = state.borrow().borrow::<MemoryStore>().clone();
+    let started = Instant::now();
+    let snapshot = match store.snapshot(&scope.namespace, &scope.memory_key).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return MemoryBeginResult {
+                ok: false,
+                storage_failure: true,
+                handle: 0,
+                error: error.to_string(),
+            };
+        }
+    };
+    store.record_profile(
+        MemoryProfileMetricKind::OpSnapshot,
+        started.elapsed().as_micros() as u64,
+        1,
+    );
+    let value_bytes: usize = snapshot.entries.iter().map(|entry| entry.value.len()).sum();
+    if value_bytes > MEMORY_BATCH_MAX_STAGED_BYTES {
+        return MemoryBeginResult {
+            ok: false,
+            storage_failure: true,
+            handle: 0,
+            error: format!("memory snapshot exceeded {MEMORY_BATCH_MAX_STAGED_BYTES} bytes"),
+        };
+    }
+    if state
+        .borrow()
+        .borrow::<RequestSecretContexts>()
+        .get(request_context_handle)
+        .is_none_or(|request| request.canceled.load(Ordering::SeqCst))
+    {
+        return MemoryBeginResult {
+            ok: false,
+            storage_failure: false,
+            handle: 0,
+            error: "memory transaction request was canceled".into(),
         };
     }
     let batch = MemoryBatchHandle {
@@ -353,6 +527,7 @@ pub(super) fn op_memory_batch_begin(
         owner_epoch: scope.owner_epoch,
         _lease: scope.lease,
         command_handle,
+        snapshot,
         staged_bytes: 0,
         accepted: false,
         command_result: None,
@@ -366,15 +541,17 @@ pub(super) fn op_memory_batch_begin(
     {
         Ok(handle) => handle,
         Err(error) => {
-            return MemoryBatchBeginResult {
+            return MemoryBeginResult {
                 ok: false,
+                storage_failure: false,
                 handle: 0,
                 error: error.to_string(),
             };
         }
     };
-    MemoryBatchBeginResult {
+    MemoryBeginResult {
         ok: true,
+        storage_failure: false,
         handle,
         error: String::new(),
     }
@@ -440,108 +617,69 @@ pub(super) fn op_memory_batch_mutation(
 
 #[deno_core::op2]
 #[serde]
-pub(super) fn op_memory_batch_get_mutation(
+pub(super) fn op_memory_batch_get(
     state: &mut OpState,
     batch_handle: u32,
     #[string] key: String,
-) -> MemoryBatchGetMutationResult {
-    let (request_context_handle, mutation, mutation_count, effect_count) = {
-        let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
-            return MemoryBatchGetMutationResult {
-                ok: false,
-                record: None,
-                mutation_count: 0,
-                effect_count: 0,
-                error: "memory batch handle is invalid".to_string(),
-            };
+) -> MemoryGetResult {
+    let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
+        return MemoryGetResult {
+            ok: false,
+            record: None,
+            error: "memory batch handle is invalid".into(),
         };
-        (
-            batch.request_context_handle,
-            batch
-                .mutations
-                .iter()
-                .find(|mutation| mutation.key == key)
-                .cloned(),
-            batch.mutations.len(),
-            batch.effects.len(),
-        )
     };
-    let record = match mutation
-        .as_ref()
-        .map(|mutation| memory_batch_mutation_entry(state, request_context_handle, mutation, -1))
-        .transpose()
+    let record = if let Some(mutation) = batch.mutations.iter().find(|mutation| mutation.key == key)
     {
-        Ok(record) => record,
-        Err(error) => {
-            return MemoryBatchGetMutationResult {
-                ok: false,
-                record: None,
-                mutation_count,
-                effect_count,
-                error: error.to_string(),
-            };
-        }
+        (!mutation.deleted).then(|| MemoryReadValue {
+            value: mutation.value.to_vec().into(),
+            encoding: mutation.encoding.clone(),
+        })
+    } else {
+        memory_snapshot_record(&batch.snapshot, &key)
     };
-    MemoryBatchGetMutationResult {
+    MemoryGetResult {
         ok: true,
         record,
-        mutation_count,
-        effect_count,
         error: String::new(),
     }
 }
 
 #[deno_core::op2]
 #[serde]
-pub(super) fn op_memory_batch_list_overlay(
+pub(super) fn op_memory_batch_keys(
     state: &mut OpState,
     batch_handle: u32,
     #[string] prefix: String,
-) -> MemoryBatchListOverlayResult {
-    let (request_context_handle, mutations, mutation_count) = {
-        let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
-            return MemoryBatchListOverlayResult {
-                ok: false,
-                entries: Vec::new(),
-                mutation_count: 0,
-                error: "memory batch handle is invalid".to_string(),
-            };
+) -> MemoryKeysResult {
+    let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
+        return MemoryKeysResult {
+            ok: false,
+            keys: Vec::new(),
+            error: "memory batch handle is invalid".into(),
         };
-        let mut latest_by_key = HashMap::new();
-        for mutation in batch
-            .mutations
-            .iter()
-            .filter(|mutation| mutation.key.starts_with(&prefix))
-        {
-            latest_by_key.insert(mutation.key.clone(), mutation.clone());
-        }
-        let mut mutations = latest_by_key.into_values().collect::<Vec<_>>();
-        mutations.sort_by(|left, right| left.key.cmp(&right.key));
-        (
-            batch.request_context_handle,
-            mutations,
-            batch.mutations.len(),
-        )
     };
-    let entries = match mutations
+    let mut keys = batch
+        .snapshot
+        .entries
         .iter()
-        .map(|mutation| memory_batch_mutation_entry(state, request_context_handle, mutation, -1))
-        .collect::<Result<Vec<_>>>()
+        .filter(|entry| !entry.deleted && entry.key.starts_with(&prefix))
+        .map(|entry| entry.key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for mutation in batch
+        .mutations
+        .iter()
+        .filter(|mutation| mutation.key.starts_with(&prefix))
     {
-        Ok(entries) => entries,
-        Err(error) => {
-            return MemoryBatchListOverlayResult {
-                ok: false,
-                entries: Vec::new(),
-                mutation_count,
-                error: error.to_string(),
-            };
+        if mutation.deleted {
+            keys.remove(mutation.key.as_str());
+        } else {
+            keys.insert(&mutation.key);
         }
-    };
-    MemoryBatchListOverlayResult {
+    }
+    MemoryKeysResult {
         ok: true,
-        entries,
-        mutation_count,
+        keys: keys.into_iter().map(str::to_owned).collect(),
         error: String::new(),
     }
 }
@@ -651,87 +789,6 @@ fn memory_scope_for_payload_with_epoch(
     ))
 }
 
-#[deno_core::op2]
-#[serde]
-pub(super) async fn op_memory_state_snapshot(
-    state: Rc<RefCell<OpState>>,
-    request_context_handle: u32,
-    memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] known_revision: String,
-) -> MemoryStateSnapshotResult {
-    let started = Instant::now();
-    let (namespace, memory_key) =
-        match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return MemoryStateSnapshotResult {
-                    ok: false,
-                    entries: None,
-                    revision: String::new(),
-                    max_version: -1,
-                    error: error.to_string(),
-                };
-            }
-        };
-    let store = state.borrow().borrow::<MemoryStore>().clone();
-    match store.snapshot(&namespace, &memory_key).await {
-        Ok(snapshot) => {
-            store.record_profile(
-                MemoryProfileMetricKind::OpSnapshot,
-                started.elapsed().as_micros() as u64,
-                1,
-            );
-            // Keep cache validation exact above JavaScript's safe integer range.
-            let revision = snapshot.max_version.to_string();
-            if revision == known_revision {
-                return MemoryStateSnapshotResult {
-                    ok: true,
-                    entries: None,
-                    revision,
-                    max_version: snapshot.max_version,
-                    error: String::new(),
-                };
-            }
-            let entries = match snapshot
-                .entries
-                .iter()
-                .cloned()
-                .map(|entry| {
-                    memory_snapshot_entry(&mut state.borrow_mut(), request_context_handle, entry)
-                })
-                .collect::<Result<Vec<_>>>()
-            {
-                Ok(entries) => entries,
-                Err(error) => {
-                    return MemoryStateSnapshotResult {
-                        ok: false,
-                        entries: None,
-                        revision: String::new(),
-                        max_version: -1,
-                        error: error.to_string(),
-                    };
-                }
-            };
-            MemoryStateSnapshotResult {
-                ok: true,
-                entries: Some(entries),
-                revision,
-                max_version: snapshot.max_version,
-                error: String::new(),
-            }
-        }
-        Err(error) => MemoryStateSnapshotResult {
-            ok: false,
-            entries: None,
-            revision: String::new(),
-            max_version: -1,
-            error: error.to_string(),
-        },
-    }
-}
-
 #[deno_core::op2(fast)]
 pub(super) fn op_memory_profile_record_js(
     state: &mut OpState,
@@ -741,7 +798,7 @@ pub(super) fn op_memory_profile_record_js(
 ) {
     let kind = match metric.as_str() {
         "js_read_only_commit" => MemoryProfileMetricKind::JsReadOnlyCommit,
-        "js_hydrate_full" => MemoryProfileMetricKind::JsHydrateFull,
+        "js_txn_begin" => MemoryProfileMetricKind::JsTxnBegin,
         "js_txn_commit" => MemoryProfileMetricKind::JsTxnCommit,
         _ => return,
     };
@@ -834,8 +891,6 @@ pub(super) async fn op_memory_batch_apply(
             ok: false,
             applied: false,
             read_only: false,
-            max_version: -1,
-            revision: String::new(),
             mutation_count: 0,
             effect_count: 0,
             accepted: false,
@@ -850,8 +905,6 @@ pub(super) async fn op_memory_batch_apply(
             ok: true,
             applied: false,
             read_only: true,
-            max_version: -1,
-            revision: String::new(),
             mutation_count,
             effect_count,
             accepted: batch.accepted,
@@ -866,8 +919,6 @@ pub(super) async fn op_memory_batch_apply(
                 ok: false,
                 applied: false,
                 read_only: false,
-                max_version: -1,
-                revision: String::new(),
                 mutation_count,
                 effect_count,
                 accepted: batch.accepted,
@@ -883,8 +934,6 @@ pub(super) async fn op_memory_batch_apply(
                 ok: false,
                 applied: false,
                 read_only: false,
-                max_version: -1,
-                revision: String::new(),
                 mutation_count,
                 effect_count,
                 accepted: batch.accepted,
@@ -908,7 +957,7 @@ pub(super) async fn op_memory_batch_apply(
         )
         .await;
     match apply_result {
-        Ok(result) => {
+        Ok(_) => {
             close_memory_command_for_committed_batch(&state, &batch);
             store.record_profile(
                 MemoryProfileMetricKind::OpApplyBatch,
@@ -919,8 +968,6 @@ pub(super) async fn op_memory_batch_apply(
                 ok: true,
                 applied: true,
                 read_only: false,
-                max_version: result.max_version,
-                revision: result.max_version.to_string(),
                 mutation_count,
                 effect_count,
                 accepted: batch.accepted,
@@ -932,8 +979,6 @@ pub(super) async fn op_memory_batch_apply(
             ok: false,
             applied: false,
             read_only: false,
-            max_version: -1,
-            revision: String::new(),
             mutation_count,
             effect_count,
             accepted: batch.accepted,
@@ -1247,6 +1292,10 @@ mod tests {
             memory_key: "entity".to_string(),
             owner_epoch,
             command_handle: 0,
+            snapshot: Arc::new(crate::memory::MemorySnapshot {
+                entries: Vec::new(),
+                max_version: -1,
+            }),
             staged_bytes: 0,
             accepted: false,
             command_result: None,
@@ -1495,6 +1544,33 @@ mod tests {
         handles.clear_owner(7);
         assert_eq!(handles.owner_count(7), 0);
         assert_eq!(handles.owner_count(8), 1);
+    }
+
+    #[test]
+    fn read_handles_release_snapshots_and_keep_request_quotas_separate() {
+        let snapshot = Arc::new(crate::memory::MemorySnapshot {
+            entries: Vec::new(),
+            max_version: -1,
+        });
+        let read = |request_context_handle| MemoryReadHandle {
+            request_context_handle,
+            snapshot: Arc::clone(&snapshot),
+        };
+        let mut handles = MemoryReadHandles::default();
+        let first = handles.insert(read(1), 1).unwrap();
+        assert!(handles.insert(read(1), 1).is_err());
+        let second = handles.insert(read(2), 1).unwrap();
+        assert_eq!(Arc::strong_count(&snapshot), 3);
+        handles.clear_owner(1);
+        assert!(handles.get(first).is_none());
+        assert!(handles.get(second).is_some());
+        assert_eq!(handles.owner_count(1), 0);
+        assert_eq!(handles.owner_count(2), 1);
+        assert_eq!(Arc::strong_count(&snapshot), 2);
+        handles.insert(read(1), 1).unwrap();
+        handles.remove(second).unwrap();
+        handles.clear_owner(1);
+        assert_eq!(Arc::strong_count(&snapshot), 1);
     }
 
     #[test]

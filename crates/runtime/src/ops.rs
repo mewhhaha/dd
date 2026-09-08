@@ -2,7 +2,7 @@ use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
 use crate::kv::{KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup};
 use crate::memory::{
     MemoryBatchMutation, MemoryCommandResultWrite, MemoryOutboxEffectWrite,
-    MemoryProfileMetricKind, MemorySnapshotEntry, MemoryStore,
+    MemoryProfileMetricKind, MemoryStore,
 };
 
 use crate::service::MemoryExecutionCall;
@@ -39,6 +39,7 @@ mod storage_http_ops;
 use self::memory_ops::*;
 pub(crate) use self::memory_ops::{
     clear_memory_batch_handles, clear_memory_byte_handles, clear_memory_command_handles,
+    clear_memory_read_handles,
 };
 pub(crate) use self::memory_types::*;
 use self::request_control_ops::*;
@@ -233,14 +234,17 @@ deno_core::extension!(
         op_memory_profile_record_js,
         op_memory_profile_take,
         op_memory_profile_reset,
-        op_memory_state_snapshot,
         op_memory_bytes_take,
+        op_memory_read_begin,
+        op_memory_read_close,
+        op_memory_read_get,
+        op_memory_read_keys,
         op_memory_batch_begin,
         op_memory_batch_close,
         op_memory_batch_accept,
         op_memory_batch_mutation,
-        op_memory_batch_get_mutation,
-        op_memory_batch_list_overlay,
+        op_memory_batch_get,
+        op_memory_batch_keys,
         op_memory_batch_effect,
         op_memory_batch_command_result,
         op_memory_batch_apply,

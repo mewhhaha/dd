@@ -60,10 +60,11 @@ impl MemoryProfile {
         }
         let target = match metric {
             MemoryProfileMetricKind::JsReadOnlyCommit => &self.js_read_only_commit,
-            MemoryProfileMetricKind::JsHydrateFull => &self.js_hydrate_full,
+            MemoryProfileMetricKind::JsTxnBegin => &self.js_txn_begin,
             MemoryProfileMetricKind::JsTxnCommit => &self.js_txn_commit,
             MemoryProfileMetricKind::OpSnapshot => &self.op_snapshot,
             MemoryProfileMetricKind::OpApplyBatch => &self.op_apply_batch,
+            MemoryProfileMetricKind::StoreLease => &self.store_lease,
             MemoryProfileMetricKind::StoreSnapshotCacheHit => &self.store_snapshot_cache_hit,
             MemoryProfileMetricKind::StoreSnapshotCacheMiss => &self.store_snapshot_cache_miss,
             MemoryProfileMetricKind::StoreSnapshotCacheEviction => {
@@ -94,10 +95,11 @@ impl MemoryProfile {
         let snapshot = MemoryProfileSnapshot {
             enabled: self.enabled.load(Ordering::Relaxed),
             js_read_only_commit: self.js_read_only_commit.snapshot(),
-            js_hydrate_full: self.js_hydrate_full.snapshot(),
+            js_txn_begin: self.js_txn_begin.snapshot(),
             js_txn_commit: self.js_txn_commit.snapshot(),
             op_snapshot: self.op_snapshot.snapshot(),
             op_apply_batch: self.op_apply_batch.snapshot(),
+            store_lease: self.store_lease.snapshot(),
             store_snapshot_cache_hit: self.store_snapshot_cache_hit.snapshot(),
             store_snapshot_cache_miss: self.store_snapshot_cache_miss.snapshot(),
             store_snapshot_cache_eviction: self.store_snapshot_cache_eviction.snapshot(),
@@ -113,10 +115,11 @@ impl MemoryProfile {
 
     fn reset(&self) {
         self.js_read_only_commit.reset();
-        self.js_hydrate_full.reset();
+        self.js_txn_begin.reset();
         self.js_txn_commit.reset();
         self.op_snapshot.reset();
         self.op_apply_batch.reset();
+        self.store_lease.reset();
         self.store_snapshot_cache_hit.reset();
         self.store_snapshot_cache_miss.reset();
         self.store_snapshot_cache_eviction.reset();

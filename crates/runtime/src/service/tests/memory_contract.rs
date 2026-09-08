@@ -103,6 +103,11 @@ async fn unchanged_snapshots_keep_decoded_values_independent_and_refresh_after_w
 await memory.atomic((tx) => tx.put("state", { count: 1, bytes: new Uint8Array([2, 3]) }));
 const observed = [];
 for (let index = 0; index < 4; index++) {
+  if (index % 2 === 0) {
+    for (let padding = 0; padding < 2; padding++) {
+      await env.STATE.get(`padding-${padding}`).atomic(tx => tx.put("padding", "x".repeat(4 * 1024 * 1024)));
+    }
+  }
   observed.push(await memory.atomic((tx) => {
     const state = tx.get("state");
     const original = [state.count, ...state.bytes];
@@ -144,7 +149,7 @@ return Response.json(observed);
 
 #[tokio::test]
 #[serial]
-async fn idle_snapshot_reuse_obeys_the_byte_budget_and_skips_oversized_snapshots() {
+async fn transactions_reuse_native_snapshots_for_large_values() {
     let service = deploy_memory_contract_worker(
         r#"
 const payload = "p".repeat(1024 * 1024);
@@ -183,8 +188,8 @@ return new Response("ok");
     let profile = service.memory_store.take_profile_snapshot_and_reset();
     assert_eq!(profile.op_snapshot.calls, 16);
     assert_eq!(
-        profile.js_hydrate_full.calls, 14,
-        "two hot reads reuse their snapshot; evicted and oversized snapshots hydrate again"
+        profile.store_snapshot_cache_hit.calls, 5,
+        "reads reuse shared native snapshots without an isolate byte-budget eviction"
     );
 }
 

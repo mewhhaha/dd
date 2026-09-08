@@ -57,10 +57,16 @@ impl MemoryStore {
         entity: &str,
     ) -> Result<Arc<crate::state::MemoryLease>> {
         namespace_owner(namespace)?;
-        self.state.acquire_lease(namespace, entity).await
+        let started = self.profile.enabled.load(Ordering::Relaxed).then(std::time::Instant::now);
+        let result = self.state.acquire_lease(namespace, entity).await;
+        if let Some(started) = started {
+            self.profile.record(MemoryProfileMetricKind::StoreLease, started.elapsed().as_micros() as u64, 1);
+        }
+        result
     }
     pub fn set_profile_enabled(&self, enabled: bool) {
         self.profile.set_enabled(enabled);
+        self.state.set_profile_enabled(enabled);
     }
     pub fn set_snapshot_cache_limits(&mut self, max_entries: usize, max_bytes: usize) {
         let previous = {
@@ -68,11 +74,17 @@ impl MemoryStore {
                 .snapshots
                 .lock()
                 .expect("memory snapshots lock poisoned");
+            let loads = std::mem::take(&mut cache.loads);
+            #[cfg(test)]
+            let before_fill = cache.before_fill.take();
             std::mem::replace(
                 &mut *cache,
                 SnapshotCache {
                     max_entries,
                     max_bytes,
+                    loads,
+                    #[cfg(test)]
+                    before_fill,
                     ..Default::default()
                 },
             )
@@ -106,17 +118,13 @@ impl MemoryStore {
         StateStore::shard_index(worker, binding, memory_key)
     }
 
-    pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<Arc<MemorySnapshot>> {
-        let (worker, binding) = namespace_owner(namespace)?;
-        let shard = StateStore::shard_index(worker, binding, memory_key);
-        let epoch = self.state.epoch(shard);
-        let cache_key = (namespace.to_owned(), memory_key.to_owned());
+    fn cached_snapshot(&self, cache_key: &MemorySnapshotKey) -> Option<Arc<MemorySnapshot>> {
         let cached = {
             let mut cache = self
                 .snapshots
                 .lock()
                 .expect("memory snapshots lock poisoned");
-            if let Some(cached) = cache.entries.get(&cache_key) {
+            if let Some(cached) = cache.entries.get(cache_key) {
                 let snapshot = Arc::clone(&cached.snapshot);
                 let previous_ordinal = cached.ordinal;
                 let ordinal = cache.next_ordinal;
@@ -125,7 +133,7 @@ impl MemoryStore {
                 cache.order.insert(ordinal, cache_key.clone());
                 cache
                     .entries
-                    .get_mut(&cache_key)
+                    .get_mut(cache_key)
                     .expect("cached snapshot")
                     .ordinal = ordinal;
                 Some(snapshot)
@@ -136,8 +144,38 @@ impl MemoryStore {
         if let Some(snapshot) = cached {
             self.profile
                 .record(MemoryProfileMetricKind::StoreSnapshotCacheHit, 0, 1);
+            return Some(snapshot);
+        }
+        None
+    }
+
+    pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<Arc<MemorySnapshot>> {
+        let (worker, binding) = namespace_owner(namespace)?;
+        let shard = StateStore::shard_index(worker, binding, memory_key);
+        let cache_key = (namespace.to_owned(), memory_key.to_owned());
+        if let Some(snapshot) = self.cached_snapshot(&cache_key) {
             return Ok(snapshot);
         }
+        let loading = {
+            let mut cache = self.snapshots.lock().expect("memory snapshots lock poisoned");
+            if cache.loads.len() >= DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES {
+                cache.loads.retain(|_, loading| loading.strong_count() > 0);
+            }
+            if let Some(loading) = cache.loads.get(&cache_key).and_then(Weak::upgrade) {
+                loading
+            } else {
+                let loading = Arc::new(tokio::sync::Mutex::new(()));
+                cache.loads.insert(cache_key.clone(), Arc::downgrade(&loading));
+                loading
+            }
+        };
+        // Cold fills must stay ordered even between SQL COMMIT and cache publication.
+        // This lock is independent of the entity's write lease; warm readers bypass it.
+        let _load = loading.lock().await;
+        if let Some(snapshot) = self.cached_snapshot(&cache_key) {
+            return Ok(snapshot);
+        }
+        let epoch = self.state.epoch(shard);
         self.profile
             .record(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
         let conn = self.state.read(shard).await?;
@@ -162,6 +200,14 @@ impl MemoryStore {
         }
         drop(rows);
         drop(conn);
+        #[cfg(test)]
+        {
+            let pause = self.snapshots.lock().unwrap().before_fill.take();
+            if let Some(pause) = pause {
+                pause.loaded.notify_one();
+                pause.resume.notified().await;
+            }
+        }
         let bytes = snapshot.cache_bytes(&cache_key);
         let snapshot = Arc::new(snapshot);
         let mut evicted_snapshots = Vec::new();
@@ -759,4 +805,100 @@ fn outbox_record(row: &turso::Row, offset: usize) -> turso::Result<MemoryOutboxR
         attempt_count: row.get(offset + 5)?,
         next_attempt_at_ms: row.get(offset + 6)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cold_loads_stay_ordered_across_cache_resizes_and_concurrent_commits() {
+        let root = std::env::temp_dir().join(format!("dd-cold-load-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        let mut memory = MemoryStore::from_state(state);
+        let namespace = worker_namespace("worker", "MEMORY");
+        let commit = |value: &'static [u8]| MemoryCommit {
+            mutations: vec![MemoryBatchMutation {
+                key: "key".into(),
+                value: Bytes::from_static(value),
+                encoding: "utf8".into(),
+                deleted: false,
+            }],
+            ..Default::default()
+        };
+        memory
+            .apply_batch(&namespace, "entity", commit(b"before"))
+            .await
+            .unwrap();
+        memory.set_profile_enabled(true);
+        let pause = Arc::new(SnapshotLoadPause::default());
+        memory.snapshots.lock().unwrap().before_fill = Some(Arc::clone(&pause));
+        let first_memory = memory.clone();
+        let first_namespace = namespace.clone();
+        let first = tokio::spawn(async move {
+            first_memory
+                .snapshot(&first_namespace, "entity")
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), pause.loaded.notified())
+            .await
+            .unwrap();
+        memory.set_snapshot_cache_limits(1, 1024);
+        memory
+            .apply_batch(&namespace, "entity", commit(b"after"))
+            .await
+            .unwrap();
+        let misses = memory.cache_performance_snapshot().snapshot_misses;
+        let mut second = Box::pin(memory.snapshot(&namespace, "entity"));
+        std::future::poll_fn(|context| {
+            assert!(
+                second.as_mut().poll(context).is_pending(),
+                "a second cold load must await the first fill"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            memory.cache_performance_snapshot().snapshot_misses,
+            misses,
+            "duplicate SQL loads can fill the cache out of order during publication"
+        );
+        tokio::time::timeout(Duration::from_secs(2), memory.snapshot(&namespace, "other"))
+            .await
+            .unwrap()
+            .unwrap();
+        pause.resume.notify_one();
+        assert_eq!(first.await.unwrap().entries[0].value.as_ref(), b"before");
+        assert_eq!(second.await.unwrap().entries[0].value.as_ref(), b"after");
+        assert_eq!(
+            memory.snapshot(&namespace, "entity").await.unwrap().entries[0]
+                .value
+                .as_ref(),
+            b"after"
+        );
+        let canceled_pause = Arc::new(SnapshotLoadPause::default());
+        memory.snapshots.lock().unwrap().before_fill = Some(Arc::clone(&canceled_pause));
+        let canceled_memory = memory.clone();
+        let canceled_namespace = namespace.clone();
+        let canceled = tokio::spawn(async move {
+            canceled_memory
+                .snapshot(&canceled_namespace, "canceled")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), canceled_pause.loaded.notified())
+            .await
+            .unwrap();
+        canceled.abort();
+        assert!(canceled.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            memory.snapshot(&namespace, "canceled"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(memory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

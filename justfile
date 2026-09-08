@@ -109,6 +109,7 @@ check-js:
   node --test benchmarks/lib/check-regression.test.mjs
   node --test benchmarks/lib/compare-commits.test.mjs
   node --check packages/dd-vite/src/index.js
+  node --check packages/dd-vite/src/memory.js
   node --check packages/dd-runtime/index.cjs
   node --check packages/dd-vite/src/runtime.js
   node --check packages/dd-vite/src/vite.js

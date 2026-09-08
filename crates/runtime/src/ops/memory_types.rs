@@ -175,6 +175,85 @@ pub(crate) struct MemoryByteHandle {
 }
 
 #[derive(Default)]
+pub struct MemoryReadHandles {
+    next: u32,
+    handles: HashMap<u32, MemoryReadHandle>,
+    owner_counts: HashMap<u32, usize>,
+}
+
+impl MemoryReadHandles {
+    pub(crate) fn insert(
+        &mut self,
+        handle: MemoryReadHandle,
+        max_owner_handles: usize,
+    ) -> Result<u32> {
+        let request_context_handle = handle.request_context_handle;
+        let next_owner_count = self
+            .owner_counts
+            .get(&request_context_handle)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if next_owner_count > max_owner_handles {
+            return Err(PlatformError::bad_request(format!(
+                "memory read handles exceeded {max_owner_handles} active handles"
+            )));
+        }
+        loop {
+            self.next = self.next.wrapping_add(1);
+            if self.next == 0 {
+                continue;
+            }
+            if !self.handles.contains_key(&self.next) {
+                self.handles.insert(self.next, handle);
+                self.owner_counts
+                    .insert(request_context_handle, next_owner_count);
+                return Ok(self.next);
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, handle: u32) -> Option<&MemoryReadHandle> {
+        self.handles.get(&handle)
+    }
+
+    pub(crate) fn remove(&mut self, handle: u32) -> Option<MemoryReadHandle> {
+        let removed = self.handles.remove(&handle)?;
+        self.decrement_owner_count(removed.request_context_handle);
+        Some(removed)
+    }
+
+    pub(crate) fn clear_owner(&mut self, request_context_handle: u32) {
+        self.handles
+            .retain(|_, handle| handle.request_context_handle != request_context_handle);
+        self.owner_counts.remove(&request_context_handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_count(&self, request_context_handle: u32) -> usize {
+        self.owner_counts
+            .get(&request_context_handle)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn decrement_owner_count(&mut self, request_context_handle: u32) {
+        let Some(current) = self.owner_counts.get_mut(&request_context_handle) else {
+            return;
+        };
+        *current = current.saturating_sub(1);
+        if *current == 0 {
+            self.owner_counts.remove(&request_context_handle);
+        }
+    }
+}
+
+pub(crate) struct MemoryReadHandle {
+    pub(crate) request_context_handle: u32,
+    pub(crate) snapshot: Arc<crate::memory::MemorySnapshot>,
+}
+
+#[derive(Default)]
 pub struct MemoryBatchHandles {
     next: u32,
     handles: HashMap<u32, MemoryBatchHandle>,
@@ -260,6 +339,7 @@ pub(crate) struct MemoryBatchHandle {
     pub(crate) memory_key: String,
     pub(crate) owner_epoch: i64,
     pub(crate) command_handle: u32,
+    pub(crate) snapshot: Arc<crate::memory::MemorySnapshot>,
     pub(crate) staged_bytes: usize,
     pub(crate) accepted: bool,
     pub(crate) command_result: Option<MemoryBatchCommandResult>,
@@ -321,21 +401,9 @@ pub(crate) struct MemorySocketCloseResult {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryStateSnapshotEntry {
-    pub(crate) key: String,
-    pub(crate) value_handle: u32,
+pub(crate) struct MemoryReadValue {
+    pub(crate) value: deno_core::serde_v8::ToJsBuffer,
     pub(crate) encoding: String,
-    pub(crate) version: i64,
-    pub(crate) deleted: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryStateSnapshotResult {
-    pub(crate) ok: bool,
-    pub(crate) entries: Option<Vec<MemoryStateSnapshotEntry>>,
-    pub(crate) revision: String,
-    pub(crate) max_version: i64,
-    pub(crate) error: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,8 +418,6 @@ pub(crate) struct MemoryStateApplyBatchResult {
     pub(crate) ok: bool,
     pub(crate) applied: bool,
     pub(crate) read_only: bool,
-    pub(crate) revision: String,
-    pub(crate) max_version: i64,
     pub(crate) mutation_count: usize,
     pub(crate) effect_count: usize,
     pub(crate) accepted: bool,
@@ -360,25 +426,23 @@ pub(crate) struct MemoryStateApplyBatchResult {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryBatchListOverlayResult {
+pub(crate) struct MemoryKeysResult {
     pub(crate) ok: bool,
-    pub(crate) entries: Vec<MemoryStateSnapshotEntry>,
-    pub(crate) mutation_count: usize,
+    pub(crate) keys: Vec<String>,
     pub(crate) error: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryBatchGetMutationResult {
+pub(crate) struct MemoryGetResult {
     pub(crate) ok: bool,
-    pub(crate) record: Option<MemoryStateSnapshotEntry>,
-    pub(crate) mutation_count: usize,
-    pub(crate) effect_count: usize,
+    pub(crate) record: Option<MemoryReadValue>,
     pub(crate) error: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryBatchBeginResult {
+pub(crate) struct MemoryBeginResult {
     pub(crate) ok: bool,
+    pub(crate) storage_failure: bool,
     pub(crate) handle: u32,
     pub(crate) error: String,
 }

@@ -783,6 +783,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             op_state.put(crate::ops::MemoryCommandHandles::default());
                             op_state.put(crate::ops::MemoryByteHandles::default());
                             op_state.put(crate::ops::MemoryBatchHandles::default());
+                            op_state.put(crate::ops::MemoryReadHandles::default());
                             op_state.put(crate::ops::MemoryRequestScopes::default());
                             op_state.put(crate::ops::ActiveRequestContextHandles::default());
                             op_state.put(crate::ops::RequestSecretContexts::default());
@@ -1068,6 +1069,10 @@ pub(super) async fn handle_isolate_command(
                             &mut op_state,
                             request_context_handle,
                         );
+                        crate::ops::clear_memory_read_handles(
+                            &mut op_state,
+                            request_context_handle,
+                        );
                         clear_request_secret_context(&mut op_state, request_context_handle);
                     }
                     tracing::warn!(
@@ -1110,6 +1115,7 @@ pub(super) async fn handle_isolate_command(
                     crate::ops::clear_memory_command_handles(&mut op_state, request_context_handle);
                     crate::ops::clear_memory_byte_handles(&mut op_state, request_context_handle);
                     crate::ops::clear_memory_batch_handles(&mut op_state, request_context_handle);
+                    crate::ops::clear_memory_read_handles(&mut op_state, request_context_handle);
                 }
                 request_context_handle
             };

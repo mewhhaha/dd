@@ -40,7 +40,7 @@ def parse_case(value):
             "keys_per_entity": keys, "payload_kind": kind}
 
 
-def run_sample(folder, binary, cpus, case, arguments):
+def run_sample(folder, binary, cpus, case, arguments, read_api):
     folder.mkdir()
     temporary = folder / "store-root"
     temporary.mkdir()
@@ -49,6 +49,7 @@ def run_sample(folder, binary, cpus, case, arguments):
     settings = {
         "TMPDIR": str(temporary), "DD_OTEL_ENABLED": "false",
         "DD_FANOUT_MODE": case["mode"], "DD_FANOUT_WIDTH": str(case["width"]),
+        "DD_FANOUT_READ_API": read_api,
         "DD_FANOUT_POPULATION": str(case["population"]),
         "DD_FANOUT_PAYLOAD_BYTES": str(case["payload_bytes"]),
         "DD_FANOUT_KEYS_PER_ENTITY": str(case["keys_per_entity"]),
@@ -56,7 +57,10 @@ def run_sample(folder, binary, cpus, case, arguments):
         "DD_FANOUT_CONCURRENCY": str(arguments.concurrency or len(cpus) * 4),
         "DD_FANOUT_DURATION_MS": str(arguments.duration_ms),
         "DD_FANOUT_WARMUP_MS": str(arguments.warmup_ms),
+        "DD_FANOUT_PROFILE": "1" if arguments.profile or arguments.v8_profile else "0",
     }
+    if arguments.v8_profile:
+        settings["DD_FANOUT_V8_LOG"] = str(folder / 'v8.log')
     environment.update(settings)
     command = [shutil.which("taskset"), "--cpu-list", ",".join(map(str, cpus)), str(binary)]
     record = {"command": command, "environment": settings, "started_at_unix": time.time(),
@@ -85,7 +89,16 @@ def run_sample(folder, binary, cpus, case, arguments):
                         continue
                     name = raw[raw.index("(") + 1:raw.rindex(")")]
                     fields = raw[raw.rindex(")") + 2:].split()
-                    threads[stat.parent.name] = {"name": name, "cpu_ticks": int(fields[11]) + int(fields[12])}
+                    thread = threads.setdefault(stat.parent.name, {})
+                    thread.update(name=name, cpu_ticks=int(fields[11]) + int(fields[12]))
+                    if arguments.profile or arguments.v8_profile:
+                        try:
+                            thread['schedstat'] = list(map(int, (stat.parent / 'schedstat').read_text().split()))
+                            wait = (stat.parent / 'wchan').read_text().strip()
+                        except (FileNotFoundError, ProcessLookupError):
+                            continue
+                        waits = thread.setdefault('wait_samples', {})
+                        waits[wait] = waits.get(wait, 0) + 1
                 time.sleep(0.1)
         except BaseException:
             child.kill()
@@ -101,10 +114,14 @@ def run_sample(folder, binary, cpus, case, arguments):
         raise RuntimeError(f"benchmark exited {child.returncode}; inspect {folder}")
     result = json.loads((folder / "stdout.log").read_text())
     expected_config = {key: case[key] for key in ['mode', 'width', 'population', 'payload_bytes', 'keys_per_entity', 'payload_kind']}
-    expected_config.update(concurrency=arguments.concurrency or len(cpus) * 4,
+    expected_config.update(read_api=read_api, concurrency=arguments.concurrency or len(cpus) * 4,
                            duration_ms=arguments.duration_ms, warmup_ms=arguments.warmup_ms,
-                           available_cpus=len(cpus))
+                           available_cpus=len(cpus), profile=arguments.profile or arguments.v8_profile,
+                           v8_log=settings.get('DD_FANOUT_V8_LOG'))
     verification = result.get('measurements', {}).get('verification', {})
+    profile = result.get('measurements', {}).get('memory_profile')
+    if expected_config['profile'] and (not isinstance(profile, dict) or profile.get('enabled') is not True):
+        raise RuntimeError(f"benchmark did not enable memory profiling; inspect {folder}")
     if (result.get('ok') is not True or result.get('config') != expected_config
             or verification.get('before_shutdown') is not True
             or verification.get('after_reopen') is not True):
@@ -125,6 +142,8 @@ def main():
     parser.add_argument("--baseline-record", required=True, type=Path)
     parser.add_argument("--candidate", type=Path)
     parser.add_argument("--candidate-record", type=Path)
+    parser.add_argument("--baseline-read-api", choices=["atomic", "snapshot"], default="atomic")
+    parser.add_argument("--candidate-read-api", choices=["atomic", "snapshot"], default="atomic")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--cpu-count", action="append", type=int, choices=[1, 2, 4, 8, 16, 32])
     parser.add_argument("--case", action="append", type=parse_case)
@@ -133,6 +152,8 @@ def main():
     parser.add_argument("--warmup-ms", type=int, default=2000)
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--profile", action="store_true", help="collect native phase timings and thread wait samples; diagnostic runs only")
+    parser.add_argument("--v8-profile", action="store_true", help="also write per-isolate V8 sampling logs; diagnostic runs only")
     arguments = parser.parse_args()
     if min(arguments.pairs, arguments.duration_ms, arguments.warmup_ms, arguments.timeout) < 1:
         parser.error("pair counts, durations and timeouts must be positive")
@@ -171,7 +192,8 @@ def main():
             parser.error(f"{side} build did not verify a stable successful source build")
         if digest != record.get('binary_sha256', {}).get('bench_memory_fanout'):
             parser.error(f"{side} binary differs from its build record")
-        binaries[side] = {'path': str(binary), 'sha256': digest, 'build_record': record}
+        binaries[side] = {'path': str(binary), 'sha256': digest, 'build_record': record,
+                          'read_api': getattr(arguments, f'{side}_read_api')}
     if arguments.candidate:
         baseline = binaries['baseline']['build_record']
         candidate = binaries['candidate']['build_record']
@@ -195,6 +217,7 @@ def main():
     if filesystem in {'tmpfs', 'ramfs'}:
         parser.error(f"durable comparisons require physical-disk storage; {output} is {filesystem}")
     manifest = {'binaries': binaries, 'cpu_sets': {count: cpu_order[:count] for count in counts},
+                'profile': arguments.profile or arguments.v8_profile, 'v8_profile': arguments.v8_profile,
                 'cpu_topology': topology, 'physical_cores': len(physical), 'cases': cases,
                 'pairs': arguments.pairs, 'duration_ms': arguments.duration_ms, 'warmup_ms': arguments.warmup_ms,
                 'run_order': 'paired rounds across CPU/workload groups; reverse group and binary order each round',
@@ -218,7 +241,8 @@ def main():
             runs = {}
             for side in order:
                 print(f"{count} CPUs {case['name']} pair {pair + 1}/{arguments.pairs}: {side}", flush=True)
-                runs[side] = run_sample(folder / side, Path(binaries[side]['path']), cpu_order[:count], case, arguments)
+                runs[side] = run_sample(folder / side, Path(binaries[side]['path']), cpu_order[:count], case, arguments,
+                                        binaries[side]['read_api'])
             sample = {'order': order, 'runs': runs}
             if 'candidate' in runs:
                 b, c = [runs[side]['sample'] for side in ['baseline', 'candidate']]

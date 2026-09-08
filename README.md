@@ -111,13 +111,42 @@ export default {
       return Response.json({ user, count: next });
     }
 
-    const current = await memory.atomic((tx) => Number(tx.get("count") ?? 0));
+    const current = await memory.read((snapshot) => Number(snapshot.get("count") ?? 0));
     return Response.json({ user, count: current });
   },
 };
 ```
 
 Pass `{ idempotencyKey: "command-id" }` as the second argument to replay a committed result across retries and restarts. Reads, writes, listing and effects use the explicit transaction object; that object becomes unavailable when the callback returns. Memory identity survives worker redeployment.
+
+Use `memory.read(snapshot => ...)` for reads that do not need to update state. It
+captures one committed snapshot, then exposes synchronous `get` and `list`
+without acquiring the entity's transaction lease. All reads in the callback
+see that same snapshot, including when a concurrent write commits. A write
+acknowledged before `read()` starts is visible. Snapshots for different memories
+are independent; `Promise.all()` does not create a transaction across them.
+Callbacks must be synchronous, cannot nest memory operations, and cannot retain
+a usable snapshot after returning. Retrieved objects are independent copies.
+Use `atomic()` for read-modify-write operations; a separate `read()` followed by
+`atomic()` cannot protect an invariant spanning both calls.
+
+The optional `memoryCommand` wrapper expresses writes as functional transitions:
+
+```js
+import { memoryCommand } from "@mewhhaha/vite-plugin-dd/memory";
+
+const increment = memoryCommand(env.COUNTERS.get(user), (snapshot, { by }) => {
+  const count = (snapshot.get("count") ?? 0) + by;
+  return { writes: [{ key: "count", value: count }], result: count };
+});
+
+await increment({ by: 1 }, { idempotencyKey: commandId });
+```
+
+Transitions may also return `deletes: string[]` and `effects: { kind, payload }[]`.
+Deletes apply before writes, and effects commit with the changes. The wrapper
+runs on `atomic()`, preserves its idempotency behavior, and does not enforce
+purity or add a performance optimization.
 
 ## KV
 
@@ -282,6 +311,9 @@ cargo run -p runtime --bin bench_memory_storage --release
 Benchmark configurations and reproducible measurement instructions live in
 [benchmarks/README.md](benchmarks/README.md). Contributor/dev notes live in
 [docs/development.md](docs/development.md).
+
+The [native memory snapshot report](benchmarks/MEMORY-NATIVE-SNAPSHOTS.md)
+covers concurrent memory throughput, core scaling, and storage wait profiles.
 
 ## Reproducible reports
 

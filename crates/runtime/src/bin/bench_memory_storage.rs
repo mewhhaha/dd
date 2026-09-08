@@ -73,7 +73,7 @@ struct MemoryProfileMetric {
 struct MemoryProfileSnapshot {
     enabled: bool,
     js_read_only_commit: MemoryProfileMetric,
-    js_hydrate_full: MemoryProfileMetric,
+    js_txn_begin: MemoryProfileMetric,
     js_txn_commit: MemoryProfileMetric,
     op_snapshot: MemoryProfileMetric,
     op_apply_batch: MemoryProfileMetric,

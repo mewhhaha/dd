@@ -24,10 +24,19 @@ function payloadFor(entity, field) {
 
 export default {
   async fetch(request, env) {
+    if (request.method === "GET") {
+      if (request.url.endsWith("/profile/reset")) {
+        Deno.core.ops.op_memory_profile_reset();
+        return Response.json({ ok: true });
+      }
+      return Response.json(Deno.core.ops.op_memory_profile_take());
+    }
     const { operation, sequence, entities } = await request.json();
     const results = await Promise.all(entities.map((entity) => {
       const expectedPayload = payloadFor(entity, 0);
-      return env.MEMORY.get(`entity-${entity}`).atomic((tx) => {
+      const method = readApi === "snapshot" && (operation === "read" || operation === "verify")
+        ? "read" : "atomic";
+      return env.MEMORY.get(`entity-${entity}`)[method]((tx) => {
         const state = tx.get("state");
         if (operation === "seed") {
           if (state !== null) throw new Error(`entity ${entity} was already seeded`);

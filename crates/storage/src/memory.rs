@@ -5,7 +5,7 @@ use common::{PlatformError, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use turso::Value;
 
@@ -26,11 +26,21 @@ pub(crate) type MemorySnapshotKey = (String, String);
 
 pub(crate) struct SnapshotCache {
     entries: HashMap<MemorySnapshotKey, CachedSnapshot>,
+    loads: HashMap<MemorySnapshotKey, Weak<tokio::sync::Mutex<()>>>,
     order: BTreeMap<u64, MemorySnapshotKey>,
     next_ordinal: u64,
     bytes: usize,
     max_entries: usize,
     max_bytes: usize,
+    #[cfg(test)]
+    before_fill: Option<Arc<SnapshotLoadPause>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SnapshotLoadPause {
+    loaded: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 struct CachedSnapshot {
     snapshot: Arc<MemorySnapshot>,
@@ -42,11 +52,14 @@ impl Default for SnapshotCache {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            loads: HashMap::new(),
             order: BTreeMap::new(),
             next_ordinal: 0,
             bytes: 0,
             max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
             max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
+            #[cfg(test)]
+            before_fill: None,
         }
     }
 }
@@ -169,10 +182,11 @@ pub(crate) struct MemorySnapshotChange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryProfileMetricKind {
     JsReadOnlyCommit,
-    JsHydrateFull,
+    JsTxnBegin,
     JsTxnCommit,
     OpSnapshot,
     OpApplyBatch,
+    StoreLease,
     StoreSnapshotCacheHit,
     StoreSnapshotCacheMiss,
     StoreSnapshotCacheEviction,
@@ -203,10 +217,11 @@ pub struct MemoryProfileMetricSnapshot {
 pub struct MemoryProfileSnapshot {
     pub enabled: bool,
     pub js_read_only_commit: MemoryProfileMetricSnapshot,
-    pub js_hydrate_full: MemoryProfileMetricSnapshot,
+    pub js_txn_begin: MemoryProfileMetricSnapshot,
     pub js_txn_commit: MemoryProfileMetricSnapshot,
     pub op_snapshot: MemoryProfileMetricSnapshot,
     pub op_apply_batch: MemoryProfileMetricSnapshot,
+    pub store_lease: MemoryProfileMetricSnapshot,
     pub store_snapshot_cache_hit: MemoryProfileMetricSnapshot,
     pub store_snapshot_cache_miss: MemoryProfileMetricSnapshot,
     pub store_snapshot_cache_eviction: MemoryProfileMetricSnapshot,
@@ -231,10 +246,11 @@ pub struct MemoryProfile {
     snapshot_cache_misses_total: AtomicU64,
     snapshot_cache_evictions_total: AtomicU64,
     js_read_only_commit: MemoryProfileMetric,
-    js_hydrate_full: MemoryProfileMetric,
+    js_txn_begin: MemoryProfileMetric,
     js_txn_commit: MemoryProfileMetric,
     op_snapshot: MemoryProfileMetric,
     op_apply_batch: MemoryProfileMetric,
+    store_lease: MemoryProfileMetric,
     store_snapshot_cache_hit: MemoryProfileMetric,
     store_snapshot_cache_miss: MemoryProfileMetric,
     store_snapshot_cache_eviction: MemoryProfileMetric,
@@ -351,7 +367,7 @@ pub struct MemoryOutboxDeliveryOutcome {
     pub action: MemoryOutboxDeliveryAction,
 }
 
+pub use crate::state::MemoryLease;
+
 include!("memory/profiling.rs");
 include!("memory/store.rs");
-
-pub use crate::state::MemoryLease;

@@ -26,10 +26,10 @@ pub(super) fn print_profile(profile: &MemoryProfileSnapshot) {
         return;
     }
     println!(
-        "profile-memory read_only_commit={:.2}ms write_commit={:.2}ms hydrate_full={:.2}ms",
+        "profile-memory read_only_commit={:.2}ms write_commit={:.2}ms txn_begin={:.2}ms",
         metric_mean_ms(&profile.js_read_only_commit),
         metric_mean_ms(&profile.js_txn_commit),
-        metric_mean_ms(&profile.js_hydrate_full),
+        metric_mean_ms(&profile.js_txn_begin),
     );
     println!(
         "profile-memory-op snapshot={:.2}ms apply={:.2}ms snapshot_cache_hit={} snapshot_cache_miss={} snapshot_cache_eviction={}",

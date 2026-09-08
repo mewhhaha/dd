@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use turso::{Builder, Connection, Database};
 
@@ -52,6 +52,18 @@ pub struct StatePerformanceSnapshot {
     pub busy_retries: u64,
     pub pending_commands: usize,
     pub pending_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<StateTimingSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StateTimingSnapshot {
+    pub queued_commands: u64,
+    pub sql_attempts: u64,
+    pub queue_wait_us: u64,
+    pub sql_us: u64,
+    pub commit_us: u64,
+    pub snapshot_publish_us: u64,
 }
 
 #[derive(Default)]
@@ -61,6 +73,36 @@ struct WriterMetrics {
     rollbacks: AtomicU64,
     discarded_connections: AtomicU64,
     busy_retries: AtomicU64,
+    profile_enabled: AtomicBool,
+    queued_commands: AtomicU64,
+    sql_attempts: AtomicU64,
+    queue_wait_us: AtomicU64,
+    sql_us: AtomicU64,
+    commit_us: AtomicU64,
+    snapshot_publish_us: AtomicU64,
+}
+
+struct WritePhaseTiming<'a> {
+    started: Option<Instant>,
+    total_us: &'a AtomicU64,
+}
+
+impl<'a> WritePhaseTiming<'a> {
+    fn new(enabled: bool, total_us: &'a AtomicU64) -> Self {
+        Self {
+            started: enabled.then(Instant::now),
+            total_us,
+        }
+    }
+}
+
+impl Drop for WritePhaseTiming<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            self.total_us
+                .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 struct StateShard {
@@ -162,6 +204,7 @@ struct WriteCommand {
     operation: WriteOperation,
     reply: oneshot::Sender<Result<WriteReply>>,
     options: WriteOptions,
+    queued_at: Option<Instant>,
     _bytes: OwnedSemaphorePermit,
     _command: OwnedSemaphorePermit,
 }
@@ -478,6 +521,11 @@ impl StateStore {
         let (reply, completion) = oneshot::channel();
         let operation = Arc::new(operation);
         let command = WriteCommand {
+            queued_at: shard
+                .metrics
+                .profile_enabled
+                .load(Ordering::Relaxed)
+                .then(Instant::now),
             operation: Box::new(move |conn, version| {
                 let operation = Arc::clone(&operation);
                 Box::pin(async move {
@@ -517,8 +565,27 @@ impl StateStore {
             snapshot.busy_retries += shard.metrics.busy_retries.load(Ordering::Relaxed);
             snapshot.pending_commands += QUEUE_COMMANDS - shard.commands.available_permits();
             snapshot.pending_bytes += QUEUE_BYTES - shard.bytes.available_permits();
+            if shard.metrics.profile_enabled.load(Ordering::Relaxed) {
+                let timings = snapshot.timings.get_or_insert_default();
+                timings.queued_commands += shard.metrics.queued_commands.load(Ordering::Relaxed);
+                timings.sql_attempts += shard.metrics.sql_attempts.load(Ordering::Relaxed);
+                timings.queue_wait_us += shard.metrics.queue_wait_us.load(Ordering::Relaxed);
+                timings.sql_us += shard.metrics.sql_us.load(Ordering::Relaxed);
+                timings.commit_us += shard.metrics.commit_us.load(Ordering::Relaxed);
+                timings.snapshot_publish_us +=
+                    shard.metrics.snapshot_publish_us.load(Ordering::Relaxed);
+            }
         }
         snapshot
+    }
+
+    pub fn set_profile_enabled(&self, enabled: bool) {
+        for shard in &self.shards {
+            shard
+                .metrics
+                .profile_enabled
+                .store(enabled, Ordering::Relaxed);
+        }
     }
 
     pub async fn checkpoint(&self) -> Result<()> {
@@ -581,6 +648,14 @@ async fn run_writer(
             match receiver.try_recv() {
                 Ok(command) => batch.push(command),
                 Err(_) => break,
+            }
+        }
+        for command in &batch {
+            if let Some(queued_at) = command.queued_at {
+                metrics.queued_commands.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .queue_wait_us
+                    .fetch_add(queued_at.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
         let result = commit_group(&database, &mut conn, &metrics, &epoch, &snapshots, &batch).await;
@@ -655,7 +730,12 @@ async fn commit_group(
             *slot = Some(conn);
         }
         let conn = slot.as_ref().expect("state writer connection");
+        let profile = metrics.profile_enabled.load(Ordering::Relaxed);
         let result: std::result::Result<Vec<WriteOutcome<WriteReply>>, WriteError> = async {
+            let sql_timing = WritePhaseTiming::new(profile, &metrics.sql_us);
+            if profile {
+                metrics.sql_attempts.fetch_add(1, Ordering::Relaxed);
+            }
             execute_cached(conn, "BEGIN IMMEDIATE", ()).await?;
             let mut rows = query_cached(
                 conn,
@@ -682,12 +762,15 @@ async fn commit_group(
                 (version,),
             )
             .await?;
+            drop(sql_timing);
+            let _commit_timing = WritePhaseTiming::new(profile, &metrics.commit_us);
             execute_cached(conn, "COMMIT", ()).await?;
             Ok(replies)
         }
         .await;
         match result {
             Ok(replies) => {
+                let _publish_timing = WritePhaseTiming::new(profile, &metrics.snapshot_publish_us);
                 epoch.fetch_add(1, Ordering::AcqRel);
                 let changes = batch
                     .iter()

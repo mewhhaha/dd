@@ -74,12 +74,34 @@ pooled readers. Writer admission has count and byte limits and grouped
 `synchronous=FULL` commits. Version floors and tombstones persist across restarts.
 
 Memory callbacks execute synchronously in the caller isolate under a shared
-entity lease. The callback sees a complete snapshot and stages mutations and
-effects. Storage retries the staged batch without re-executing JavaScript.
+entity lease. Before the callback starts, its native transaction holds an
+immutable snapshot from the shared cache. Reads consult staged mutations first,
+then search the snapshot; only the requested value is copied into JavaScript
+and decoded. Lists merge keys and apply ordering and limits before transferring
+values. There is no second snapshot cache in each JavaScript isolate.
+The callback stages mutations and effects. Storage retries the staged batch
+without re-executing JavaScript.
 The queued commit retains the lease even if its request is canceled.
 An optional idempotency key stores the callback result in the same transaction
 as state and outbox effects. Async callbacks, nested transactions and returned
 thenables fail; transaction handles cannot escape the callback.
+
+Read-only callbacks use `memory.read(snapshot => ...)`. A separate native handle
+retains one committed immutable snapshot, with no entity lease, command lookup,
+socket setup, or commit operation. Concurrent readers can retain the previous
+snapshot while a writer commits and publishes its replacement. Cache misses
+load a snapshot with one SQL query. Cold loads for the same entity share a load
+lock, separate from the write lease, and recheck the cache after acquiring it.
+This prevents overlapping SQL loads from publishing out of order during the
+COMMIT-to-cache-publication interval. Load locks survive cache resizing and
+release on cancellation; their weak-reference catalog prunes inactive entries
+once it reaches 4,096 keys. Shard epochs prevent an old fill from replacing a
+snapshot after a commit. A read started after an acknowledged write
+observes that write. Each callback sees one entity snapshot, not a snapshot
+across entities. The API exposes only `get` and `list`, rejects async and nested
+callbacks, and invalidates the view after the callback. Native read handles are
+limited to 128 per request and a 16 MiB value payload per snapshot; completion
+and cancellation release them. Reads do not create isolate entry metadata.
 
 One outbox coordinator scans and retries durable effects. Socket effects route
 to the owning worker. Delivery may be retried, so effect consumers must account

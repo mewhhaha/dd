@@ -30,6 +30,8 @@ mod memory;
 mod memory_contract;
 #[path = "tests/memory_list.rs"]
 mod memory_list;
+#[path = "tests/memory_read.rs"]
+mod memory_read;
 #[path = "tests/request_control.rs"]
 mod request_control;
 mod scheduling;

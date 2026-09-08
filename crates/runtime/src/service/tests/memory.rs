@@ -856,7 +856,7 @@ async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
     .expect("profile should parse");
     let snapshot = &profile["snapshot"];
     for metric in [
-        "js_hydrate_full",
+        "js_txn_begin",
         "js_txn_commit",
         "op_apply_batch",
         "runtime_outbox_drain",

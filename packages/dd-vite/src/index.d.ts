@@ -81,12 +81,15 @@ export interface DdMemoryListEntry<T = unknown> {
   value: T;
 }
 
-export interface DdMemoryTransaction {
-  readonly id: DdMemoryId;
+export interface DdMemorySnapshot {
   get<T = unknown>(key: string): T | null;
+  list<T = unknown>(options?: { prefix?: string; limit?: number }): Array<DdMemoryListEntry<T>>;
+}
+
+export interface DdMemoryTransaction extends DdMemorySnapshot {
+  readonly id: DdMemoryId;
   put(key: string, value: unknown): void;
   delete(key: string): boolean;
-  list<T = unknown>(options?: { prefix?: string; limit?: number }): Array<DdMemoryListEntry<T>>;
   emit(kind: string, payload?: unknown): void;
   accept(request: Request): { handle: string; response: Response };
   readonly sockets: {
@@ -100,6 +103,9 @@ export interface DdMemoryStub {
   readonly id: DdMemoryId;
   readonly binding: string;
   readonly sockets: { values(): Promise<string[]> };
+  read<T>(
+    callback: (snapshot: DdMemorySnapshot) => T & (T extends { then: (...args: never[]) => unknown } ? never : unknown),
+  ): Promise<T>;
   atomic<T>(
     callback: (tx: DdMemoryTransaction) => T & (T extends { then: (...args: never[]) => unknown } ? never : unknown),
     options?: { idempotencyKey?: string },

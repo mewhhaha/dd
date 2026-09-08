@@ -80,7 +80,7 @@
     txn,
     socketRuntime,
   ) => {
-    const storage = createMemoryStorageBinding(entry, runtimeRequestId, txn);
+    const storage = createMemoryStorageBinding(entry, txn);
     const assertActive = () => {
       if (!txn.callbackActive) {
         throw new Error("memory transaction is outside its synchronous callback");
@@ -159,12 +159,7 @@
     },
   });
 
-  const ensureMemoryEntry = async (
-    binding,
-    memoryKey,
-    hydrationRequestId,
-    options = {},
-  ) => {
+  const ensureMemoryEntry = (binding, memoryKey) => {
     const cacheKey = memoryEntryKey(binding, memoryKey);
     let entry = memoryStateEntries.get(cacheKey);
     if (!entry) {
@@ -178,9 +173,6 @@
     entry.binding = binding;
     entry.memoryKey = memoryKey;
     entry.cacheKey = cacheKey;
-    if (options?.hydrate !== false) {
-      await ensureMemoryStorageHydrated(entry, hydrationRequestId);
-    }
     return entry;
   };
 

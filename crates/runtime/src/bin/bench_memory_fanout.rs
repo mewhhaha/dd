@@ -2,7 +2,7 @@ use common::{DeployBinding, DeployConfig, WorkerInvocation};
 use runtime::{RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,6 +16,7 @@ const WORKER_SOURCE: &str = include_str!("bench_memory_fanout/worker.js");
 const ENV_NAMES: &[&str] = &[
     "DD_FANOUT_WIDTH",
     "DD_FANOUT_MODE",
+    "DD_FANOUT_READ_API",
     "DD_FANOUT_POPULATION",
     "DD_FANOUT_PAYLOAD_BYTES",
     "DD_FANOUT_KEYS_PER_ENTITY",
@@ -23,6 +24,8 @@ const ENV_NAMES: &[&str] = &[
     "DD_FANOUT_CONCURRENCY",
     "DD_FANOUT_DURATION_MS",
     "DD_FANOUT_WARMUP_MS",
+    "DD_FANOUT_PROFILE",
+    "DD_FANOUT_V8_LOG",
 ];
 
 #[derive(Clone, Copy, Serialize)]
@@ -33,10 +36,18 @@ enum Mode {
     Mixed,
 }
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReadApi {
+    Atomic,
+    Snapshot,
+}
+
 #[derive(Clone, Serialize)]
 struct Config {
     width: usize,
     mode: Mode,
+    read_api: ReadApi,
     population: usize,
     payload_bytes: usize,
     keys_per_entity: usize,
@@ -45,6 +56,8 @@ struct Config {
     duration_ms: usize,
     warmup_ms: usize,
     available_cpus: usize,
+    profile: bool,
+    v8_log: Option<PathBuf>,
 }
 
 impl Config {
@@ -77,6 +90,15 @@ impl Config {
         let config = Self {
             width: env_usize("DD_FANOUT_WIDTH", 1, 1)?,
             mode,
+            read_api: match std::env::var("DD_FANOUT_READ_API").as_deref() {
+                Ok("atomic") | Err(std::env::VarError::NotPresent) => ReadApi::Atomic,
+                Ok("snapshot") => ReadApi::Snapshot,
+                value => {
+                    return Err(format!(
+                        "DD_FANOUT_READ_API must be atomic or snapshot, got {value:?}"
+                    ));
+                }
+            },
             population: env_usize("DD_FANOUT_POPULATION", 1024, 1)?,
             payload_bytes: env_usize("DD_FANOUT_PAYLOAD_BYTES", 128, 0)?,
             keys_per_entity: env_usize("DD_FANOUT_KEYS_PER_ENTITY", 1, 1)?,
@@ -86,6 +108,12 @@ impl Config {
             duration_ms: env_usize("DD_FANOUT_DURATION_MS", 8000, 1)?,
             warmup_ms: env_usize("DD_FANOUT_WARMUP_MS", 2000, 0)?,
             available_cpus,
+            profile: match std::env::var("DD_FANOUT_PROFILE").as_deref() {
+                Ok("1") => true,
+                Ok("0") | Err(std::env::VarError::NotPresent) => false,
+                value => return Err(format!("DD_FANOUT_PROFILE must be 0 or 1, got {value:?}")),
+            },
+            v8_log: std::env::var_os("DD_FANOUT_V8_LOG").map(PathBuf::from),
         };
         if config.keys_per_entity > 256
             || !["repeated", "varied"].contains(&config.payload_kind.as_str())
@@ -388,6 +416,10 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
         runtime: RuntimeConfig {
             max_global_isolates: config.available_cpus,
             max_isolates: config.available_cpus,
+            memory_profile_enabled: config.profile,
+            v8_flags: config.v8_log.as_ref().map_or_else(Vec::new, |path| {
+                vec!["--prof".into(), format!("--logfile={}", path.display())]
+            }),
             ..RuntimeConfig::default()
         },
         storage: RuntimeStorageConfig {
@@ -417,9 +449,10 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
             .deploy_with_config(
                 WORKER.to_string(),
                 format!(
-                    "const payloadBytes = {}; const keysPerEntity = {}; const payloadKind = {};\n{WORKER_SOURCE}",
+                    "const payloadBytes = {}; const keysPerEntity = {}; const payloadKind = {}; const readApi = {};\n{WORKER_SOURCE}",
                     config.payload_bytes, config.keys_per_entity,
-                    serde_json::to_string(&config.payload_kind).map_err(|error| error.to_string())?
+                    serde_json::to_string(&config.payload_kind).map_err(|error| error.to_string())?,
+                    serde_json::to_string(&config.read_api).map_err(|error| error.to_string())?
                 ),
                 DeployConfig {
                     bindings: vec![DeployBinding::Memory {
@@ -459,6 +492,9 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
             .await
             .map_err(|error| format!("warmup failed: {error}"))?;
         timings.insert("warmup_seconds".to_string(), json!(warmup.elapsed_seconds));
+        if config.profile {
+            memory_profile(&service, "reset").await?;
+        }
         let admin_before = service.admin_snapshot().await;
         let timed_sequence_start = sequence.load(Ordering::Relaxed);
         eprintln!("fanout-phase=timed");
@@ -468,6 +504,11 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
         timings.insert("timed_seconds".to_string(), json!(timed.elapsed_seconds));
         eprintln!("fanout-phase=verification");
         let admin_after = service.admin_snapshot().await;
+        let profile = if config.profile {
+            memory_profile(&service, "take").await?
+        } else {
+            Value::Null
+        };
         let started = Instant::now();
         let mut writes = vec![Vec::<u64>::new(); config.population];
         for phase in [&warmup, &timed] {
@@ -521,6 +562,7 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
                 "admin_after_seed": admin_after_seed,
                 "admin_before_timed": admin_before,
                 "admin_after_timed": admin_after,
+                "memory_profile": profile,
             }),
             counts,
         ))
@@ -578,6 +620,27 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
     measured["effective_config"] = effective_config;
     measured["verification"] = json!({ "entities": counts.len(), "completed_writes": counts.iter().sum::<u64>(), "before_shutdown": true, "after_reopen": true });
     Ok(measured)
+}
+
+async fn memory_profile(service: &RuntimeService, operation: &str) -> Result<Value, String> {
+    let output = service
+        .invoke(
+            WORKER.to_string(),
+            WorkerInvocation {
+                method: "GET".into(),
+                url: format!("http://memory-fanout/profile/{operation}"),
+                headers: vec![],
+                body: vec![],
+                request_id: format!("profile-{operation}"),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let profile: Value = serde_json::from_slice(&output.body).map_err(|error| error.to_string())?;
+    if output.status != 200 || profile["ok"] != true {
+        return Err(format!("memory profile {operation} failed: {profile}"));
+    }
+    Ok(profile["snapshot"].clone())
 }
 
 #[tokio::main]

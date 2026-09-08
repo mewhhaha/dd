@@ -6,6 +6,7 @@ import type {
   DdRuntimeClient,
   DdRuntimeOptions,
 } from "../packages/dd-vite/src/index.js";
+import { memoryCommand } from "../packages/dd-vite/src/memory.js";
 
 export const projectConfig: DdProjectConfig = {
   schema_version: 1,
@@ -55,6 +56,30 @@ export async function exerciseMemoryContract(memory: import("../packages/dd-vite
     tx.emit("audit.count", { next });
     return next;
   }, { idempotencyKey: "command-1" });
+  const current: number = await counter.read(snapshot => snapshot.get<number>("count") ?? 0);
+  await counter.read(snapshot => {
+    const entries: Array<{ key: string; value: number }> = snapshot.list<number>();
+    // @ts-expect-error Read snapshots cannot stage writes.
+    snapshot.put("count", 1);
+    // @ts-expect-error Read snapshots cannot emit effects.
+    snapshot.emit("audit", {});
+    return entries;
+  });
+  // @ts-expect-error Read callbacks cannot suspend.
+  await counter.read(async snapshot => snapshot.get("count"));
+  // @ts-expect-error Read callbacks cannot return thenables.
+  await counter.read(() => ({ then(resolve: (value: number) => void) { resolve(1); } }));
+  const increment = memoryCommand(counter, (snapshot, { by }: { by: number }) => {
+    const next = (snapshot.get<number>("count") ?? 0) + by;
+    return { writes: [{ key: "count", value: next }], result: next };
+  });
+  const next: number = await increment({ by: current }, { idempotencyKey: "command-2" });
+  // @ts-expect-error Command input is inferred from the transition.
+  await increment({ by: "1" });
+  // @ts-expect-error Command transitions cannot suspend.
+  memoryCommand(counter, async () => ({ writes: [], result: 1 }));
+  // @ts-expect-error Command results cannot be Promise-like either.
+  memoryCommand(counter, () => ({ writes: [], result: Promise.resolve(1) }));
   // @ts-expect-error Transactions cannot suspend.
   await counter.atomic(async (tx) => tx.get("count"));
   // @ts-expect-error Promise-like results cannot suspend a transaction either.
@@ -63,5 +88,5 @@ export async function exerciseMemoryContract(memory: import("../packages/dd-vite
   counter.tvar("count", 0);
   // @ts-expect-error Read and write operations require an explicit transaction.
   counter.write("count", count);
-  return count;
+  return { count, current, next };
 }
