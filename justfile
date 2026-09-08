@@ -68,6 +68,7 @@ fly-worker-deploy-config-at server config:
 # Contributor check path.
 check:
   bash scripts/check_public_memory_naming.sh
+  python3 scripts/test-bench-fly-api.py
   just check-deno-sources
   just check-js
   cargo fmt --all -- --check
@@ -96,6 +97,7 @@ size-report-all profile="dist":
 check-js:
   node scripts/check-runtime-contract.mjs
   node --check crates/runtime/src/bin/bench_memory_fanout/worker.js
+  node --check scripts/fly-api-case-studies/inventory.js
   node --check scripts/check-dd-dev-transport.mjs
   node --check benchmarks/run.mjs
   node --check benchmarks/summarize.mjs

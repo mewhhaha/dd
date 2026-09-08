@@ -1,5 +1,9 @@
 # Benchmark configurations
 
+For a small public API check, use the [bounded Fly case-study runner](FLY-API.md).
+It caps requests and concurrency, verifies responses and counters, and removes
+its temporary workers. Its offered rates are not maximum-throughput results.
+
 The [concurrent snapshot-read report](MEMORY-READ.md) compares `memory.read()`
 with `memory.atomic()` using the same executable and matched concurrent-memory
 workloads. `bench_memory_fanout` accepts `DD_FANOUT_READ_API=atomic|snapshot`;
