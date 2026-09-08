@@ -27,6 +27,13 @@ def commit_density(run):
     return commands / groups if groups else 0
 
 
+def cpu_ms_per_request(run):
+    measurements = run['sample']['measurements']
+    requests = measurements['warmup']['requests'] + measurements['timed']['requests']
+    cpu_seconds = run['resources']['user_seconds'] + run['resources']['system_seconds']
+    return 1000 * cpu_seconds / requests
+
+
 def print_run(folder, manifest, groups):
     print(f"## {folder.name}\n")
     print(f"Raw artifacts: `{folder}`. Each row has {manifest['pairs']} alternating paired runs; "
@@ -82,11 +89,14 @@ def print_run(folder, manifest, groups):
                 ranges = ' → '.join(f'{min(side):.2f}–{max(side):.2f}' for side in p99s)
                 print(f"| {group['cpus']} | {group['case']['name']} | {operation} | "
                       f"{means[0]:.2f} → {means[1]:.2f} | {medians[0]:.2f} → {medians[1]:.2f} | {ranges} |")
-    print("\n| CPUs | Case | Cache misses % before → after | Commands/commit before → after | CPU seconds before → after | Peak RSS MiB before → after |")
-    print("|---:|---|---:|---:|---:|---:|")
+    print("\nCPU ms/request divides whole-process CPU time by completed warmup and timed requests. "
+          "It includes setup and verification CPU, so it is an amortized process cost, not isolated handler CPU.\n")
+    print("| CPUs | Case | Cache misses % before → after | Commands/commit before → after | CPU seconds before → after | CPU ms/request before → after | Peak RSS MiB before → after |")
+    print("|---:|---|---:|---:|---:|---:|---:|")
     for group in groups:
         measures = [cache_miss_percent, commit_density,
                     lambda run: run['resources']['user_seconds'] + run['resources']['system_seconds'],
+                    cpu_ms_per_request,
                     lambda run: run['resources']['max_rss_kib'] / 1024]
         values = [[median(group, side, measure) for side in ['baseline', 'candidate']]
                   for measure in measures]

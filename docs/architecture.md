@@ -90,8 +90,10 @@ Read-only callbacks use `memory.read(snapshot => ...)`. A separate native handle
 retains one committed immutable snapshot, with no entity lease, command lookup,
 socket setup, or commit operation. Concurrent readers can retain the previous
 snapshot while a writer commits and publishes its replacement. Cache misses
-load a snapshot with one SQL query. Cold loads for the same entity share a load
-lock, separate from the write lease, and recheck the cache after acquiring it.
+load a snapshot with one SQL query. Cache hits use the qualified entity key
+directly; shard routing is computed only when a SQL load is needed.
+Cold loads for the same entity share a load lock, separate from the write
+lease, and recheck the cache after acquiring it.
 This prevents overlapping SQL loads from publishing out of order during the
 COMMIT-to-cache-publication interval. Load locks survive cache resizing and
 release on cancellation; their weak-reference catalog prunes inactive entries

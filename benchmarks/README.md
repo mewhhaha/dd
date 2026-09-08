@@ -19,6 +19,11 @@ write distributions; `dispatch_delay` reports the caller backlog and timer
 delay separately. These modes measure latency and capacity under different
 loads; a capped request rate is not a maximum-throughput result.
 
+The [memory overhead investigation](MEMORY-OVERHEAD.md) records rejected cache
+and JavaScript scheduling changes, including core scaling and workloads that
+exceed the cache. The summarizer also reports whole-process CPU milliseconds
+per completed warmup/timed request, including setup and verification overhead.
+
 The scripts in [`configs/`](configs/) are the canonical commands for the
 workloads we intentionally test. Raw sampler output is generated under
 `benchmarks/results/` and is not committed.

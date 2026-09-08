@@ -151,7 +151,6 @@ impl MemoryStore {
 
     pub async fn snapshot(&self, namespace: &str, memory_key: &str) -> Result<Arc<MemorySnapshot>> {
         let (worker, binding) = namespace_owner(namespace)?;
-        let shard = StateStore::shard_index(worker, binding, memory_key);
         let cache_key = (namespace.to_owned(), memory_key.to_owned());
         if let Some(snapshot) = self.cached_snapshot(&cache_key) {
             return Ok(snapshot);
@@ -175,6 +174,7 @@ impl MemoryStore {
         if let Some(snapshot) = self.cached_snapshot(&cache_key) {
             return Ok(snapshot);
         }
+        let shard = StateStore::shard_index(worker, binding, memory_key);
         let epoch = self.state.epoch(shard);
         self.profile
             .record(MemoryProfileMetricKind::StoreSnapshotCacheMiss, 0, 1);
