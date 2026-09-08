@@ -32,6 +32,10 @@ def print_run(folder, manifest, groups):
     print(f"Raw artifacts: `{folder}`. Each row has {manifest['pairs']} alternating paired runs; "
           f"{manifest['warmup_ms'] / 1000:g}s warmup and {manifest['duration_ms'] / 1000:g}s timed work. "
           f"Caller concurrency: {manifest['concurrency']}.\n")
+    rate = manifest.get('requests_per_second', 0)
+    print(f"Offered load: {str(rate) + ' scheduled requests/s' if rate else 'saturated caller pool'}. "
+          "For fixed-rate runs, latency starts at scheduled arrival and includes caller backlog; "
+          "all arrivals drain before verification.\n")
     print("Values are medians. Gain is the median candidate/baseline ratio of matched pairs; "
           "the range shows every pair, not a confidence interval. Request latency includes all concurrent "
           "memory transactions and response validation. CPU time and RSS cover the whole process, "
@@ -39,6 +43,7 @@ def print_run(folder, manifest, groups):
     for side in ['baseline', 'candidate']:
         binary = manifest['binaries'][side]
         print(f"- {side.capitalize()} binary SHA-256: `{binary['sha256']}`; "
+              f"read API: `{binary.get('read_api', 'atomic')}`; "
               f"source patch SHA-256: `{binary['build_record']['source_patch_sha256']}`.")
     print("\n| CPUs | Mode / fanout / population / bytes / keys / payload | Requests/s before → after | Transactions/s before → after | Gain (pair range) | p99 ms before → after |")
     print("|---:|---|---:|---:|---:|---:|")
@@ -57,6 +62,26 @@ def print_run(folder, manifest, groups):
               f"{transactions[0]:,.0f} → {transactions[1]:,.0f} | "
               f"{statistics.median(ratios):.2f}× ({min(ratios):.2f}–{max(ratios):.2f}) | "
               f"{latencies[0]:.2f} → {latencies[1]:.2f} |")
+    classified = [group for group in groups
+                  if all('by_operation' in pair['runs'][side]['sample']['measurements']['timed']
+                         for pair in group['pairs'] for side in ['baseline', 'candidate'])]
+    if classified:
+        print("\nLatency below is separated by completed request operation. Values are medians of runs; "
+              "p99 ranges retain every run. A request waits for its entire memory fanout.\n")
+        print("| CPUs | Case | Operation | Mean ms before → after | p99 ms before → after | p99 range ms before → after |")
+        print("|---:|---|---|---:|---:|---|")
+        for group in classified:
+            for operation in ['read', 'write']:
+                samples = [[pair['runs'][side]['sample']['measurements']['timed']['by_operation'][operation]
+                            for pair in group['pairs']] for side in ['baseline', 'candidate']]
+                if all(sample['requests'] == 0 for side in samples for sample in side):
+                    continue
+                means = [statistics.median(sample['mean_ms'] for sample in side) for side in samples]
+                p99s = [[sample['p99_ms'] for sample in side] for side in samples]
+                medians = [statistics.median(side) for side in p99s]
+                ranges = ' → '.join(f'{min(side):.2f}–{max(side):.2f}' for side in p99s)
+                print(f"| {group['cpus']} | {group['case']['name']} | {operation} | "
+                      f"{means[0]:.2f} → {means[1]:.2f} | {medians[0]:.2f} → {medians[1]:.2f} | {ranges} |")
     print("\n| CPUs | Case | Cache misses % before → after | Commands/commit before → after | CPU seconds before → after | Peak RSS MiB before → after |")
     print("|---:|---|---:|---:|---:|---:|")
     for group in groups:

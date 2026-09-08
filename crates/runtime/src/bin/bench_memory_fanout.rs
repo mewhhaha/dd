@@ -22,6 +22,7 @@ const ENV_NAMES: &[&str] = &[
     "DD_FANOUT_KEYS_PER_ENTITY",
     "DD_FANOUT_PAYLOAD_KIND",
     "DD_FANOUT_CONCURRENCY",
+    "DD_FANOUT_REQUESTS_PER_SECOND",
     "DD_FANOUT_DURATION_MS",
     "DD_FANOUT_WARMUP_MS",
     "DD_FANOUT_PROFILE",
@@ -53,6 +54,7 @@ struct Config {
     keys_per_entity: usize,
     payload_kind: String,
     concurrency: usize,
+    requests_per_second: usize,
     duration_ms: usize,
     warmup_ms: usize,
     available_cpus: usize,
@@ -105,6 +107,7 @@ impl Config {
             payload_kind: std::env::var("DD_FANOUT_PAYLOAD_KIND")
                 .unwrap_or_else(|_| "repeated".to_string()),
             concurrency: env_usize("DD_FANOUT_CONCURRENCY", 4 * available_cpus, 1)?,
+            requests_per_second: env_usize("DD_FANOUT_REQUESTS_PER_SECOND", 0, 0)?,
             duration_ms: env_usize("DD_FANOUT_DURATION_MS", 8000, 1)?,
             warmup_ms: env_usize("DD_FANOUT_WARMUP_MS", 2000, 0)?,
             available_cpus,
@@ -246,10 +249,11 @@ async fn invoke(service: &RuntimeService, plan: &RequestPlan) -> Result<Vec<Enti
 
 #[derive(Default)]
 struct LaneSamples {
-    latencies_ms: Vec<f64>,
+    read_latencies_ms: Vec<f64>,
+    write_latencies_ms: Vec<f64>,
+    dispatch_delays_ms: Vec<f64>,
     writes: Vec<(usize, u64)>,
     highest_counts: Vec<u64>,
-    write_requests: usize,
 }
 
 struct PhaseSamples {
@@ -260,22 +264,19 @@ struct PhaseSamples {
 
 impl PhaseSamples {
     fn summary(&self, width: usize) -> Value {
-        let mut latencies = self
+        let reads = self
             .lanes
             .iter()
-            .flat_map(|lane| lane.latencies_ms.iter().copied())
+            .flat_map(|lane| lane.read_latencies_ms.iter().copied())
             .collect::<Vec<_>>();
-        latencies.sort_unstable_by(f64::total_cmp);
-        let requests = latencies.len();
-        let write_requests = self
+        let writes = self
             .lanes
             .iter()
-            .map(|lane| lane.write_requests)
-            .sum::<usize>();
-        let percentile = |percent: usize| {
-            (!latencies.is_empty())
-                .then(|| latencies[(requests * percent).div_ceil(100).saturating_sub(1)])
-        };
+            .flat_map(|lane| lane.write_latencies_ms.iter().copied())
+            .collect::<Vec<_>>();
+        let write_requests = writes.len();
+        let requests = reads.len() + write_requests;
+        let all = latency_summary(reads.iter().chain(&writes).copied().collect());
         json!({
             "requests": requests,
             "transactions": requests * width,
@@ -287,11 +288,34 @@ impl PhaseSamples {
             "drain_seconds": (self.elapsed_seconds - self.requested_seconds).max(0.0),
             "requests_per_second": requests as f64 / self.elapsed_seconds,
             "transactions_per_second": (requests * width) as f64 / self.elapsed_seconds,
-            "p50_ms": percentile(50),
-            "p95_ms": percentile(95),
-            "p99_ms": percentile(99),
+            "p50_ms": all["p50_ms"],
+            "p95_ms": all["p95_ms"],
+            "p99_ms": all["p99_ms"],
+            "by_operation": {
+                "read": latency_summary(reads),
+                "write": latency_summary(writes),
+            },
+            "dispatch_delay": latency_summary(self.lanes.iter()
+                .flat_map(|lane| lane.dispatch_delays_ms.iter().copied()).collect()),
         })
     }
+}
+
+fn latency_summary(mut latencies: Vec<f64>) -> Value {
+    latencies.sort_unstable_by(f64::total_cmp);
+    let requests = latencies.len();
+    let percentile = |percent: usize| {
+        (!latencies.is_empty())
+            .then(|| latencies[(requests * percent).div_ceil(100).saturating_sub(1)])
+    };
+    json!({
+        "requests": requests,
+        "mean_ms": (requests > 0).then(|| latencies.iter().sum::<f64>() / requests as f64),
+        "p50_ms": percentile(50),
+        "p95_ms": percentile(95),
+        "p99_ms": percentile(99),
+        "max_ms": latencies.last(),
+    })
 }
 
 async fn run_phase(
@@ -306,20 +330,41 @@ async fn run_phase(
         .checked_add(duration)
         .ok_or_else(|| format!("phase duration {duration_ms}ms exceeds the clock range"))?;
     let stopped = Arc::new(AtomicBool::new(false));
+    let arrivals = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
     for _ in 0..config.concurrency {
         let service = service.clone();
         let config = config.clone();
         let sequence = Arc::clone(sequence);
         let stopped = Arc::clone(&stopped);
+        let arrivals = Arc::clone(&arrivals);
         tasks.spawn(async move {
             let mut samples = LaneSamples {
                 highest_counts: vec![0; config.population],
                 ..LaneSamples::default()
             };
             let blocks_per_entity_sweep = config.population.div_ceil(10 * config.width) as u64;
-            while Instant::now() < deadline && !stopped.load(Ordering::Relaxed) {
-                let request_started = Instant::now();
+            while !stopped.load(Ordering::Relaxed) {
+                let request_started = if config.requests_per_second == 0 {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    now
+                } else {
+                    let arrival = arrivals.fetch_add(1, Ordering::Relaxed);
+                    let offset =
+                        Duration::from_secs_f64(arrival as f64 / config.requests_per_second as f64);
+                    if offset >= duration {
+                        break;
+                    }
+                    let scheduled = started + offset;
+                    tokio::time::sleep_until(scheduled.into()).await;
+                    scheduled
+                };
+                // Preserve scheduled arrival time when all callers are occupied. Late
+                // requests drain after the phase deadline and include that queueing.
+                let dispatch_delay = request_started.elapsed().as_secs_f64() * 1000.0;
                 let sequence = sequence.fetch_add(1, Ordering::Relaxed);
                 let write_slot = (sequence / 10 / blocks_per_entity_sweep) % 10;
                 let writes = matches!(config.mode, Mode::Write)
@@ -359,10 +404,13 @@ async fn run_phase(
                         samples.writes.push((result.entity, result.count));
                     }
                 }
-                samples.write_requests += usize::from(writes);
-                samples
-                    .latencies_ms
-                    .push(request_started.elapsed().as_secs_f64() * 1000.0);
+                let latencies = if writes {
+                    &mut samples.write_latencies_ms
+                } else {
+                    &mut samples.read_latencies_ms
+                };
+                latencies.push(request_started.elapsed().as_secs_f64() * 1000.0);
+                samples.dispatch_delays_ms.push(dispatch_delay);
             }
             Ok(samples)
         });
@@ -382,7 +430,11 @@ async fn run_phase(
     if !errors.is_empty() {
         return Err(errors.join("; "));
     }
-    if duration_ms > 0 && lanes.iter().all(|lane| lane.latencies_ms.is_empty()) {
+    if duration_ms > 0
+        && lanes
+            .iter()
+            .all(|lane| lane.read_latencies_ms.is_empty() && lane.write_latencies_ms.is_empty())
+    {
         return Err(format!("phase of {duration_ms}ms completed no requests"));
     }
     Ok(PhaseSamples {

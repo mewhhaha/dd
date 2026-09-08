@@ -59,6 +59,8 @@ def run_sample(folder, binary, cpus, case, arguments, read_api):
         "DD_FANOUT_WARMUP_MS": str(arguments.warmup_ms),
         "DD_FANOUT_PROFILE": "1" if arguments.profile or arguments.v8_profile else "0",
     }
+    if arguments.requests_per_second:
+        settings["DD_FANOUT_REQUESTS_PER_SECOND"] = str(arguments.requests_per_second)
     if arguments.v8_profile:
         settings["DD_FANOUT_V8_LOG"] = str(folder / 'v8.log')
     environment.update(settings)
@@ -118,6 +120,8 @@ def run_sample(folder, binary, cpus, case, arguments, read_api):
                            duration_ms=arguments.duration_ms, warmup_ms=arguments.warmup_ms,
                            available_cpus=len(cpus), profile=arguments.profile or arguments.v8_profile,
                            v8_log=settings.get('DD_FANOUT_V8_LOG'))
+    if 'requests_per_second' in result.get('config', {}) or arguments.requests_per_second:
+        expected_config['requests_per_second'] = arguments.requests_per_second
     verification = result.get('measurements', {}).get('verification', {})
     profile = result.get('measurements', {}).get('memory_profile')
     if expected_config['profile'] and (not isinstance(profile, dict) or profile.get('enabled') is not True):
@@ -131,6 +135,18 @@ def run_sample(folder, binary, cpus, case, arguments, read_api):
             raise RuntimeError(f"invalid {key}={result.get(key)!r}; inspect {folder}")
     if not math.isclose(result['transaction_throughput_rps'], result['request_throughput_rps'] * case['width']):
         raise RuntimeError(f"transaction throughput does not match requested fanout; inspect {folder}")
+    for phase in ['warmup', 'timed']:
+        measured = result['measurements'][phase]
+        if arguments.requests_per_second:
+            duration_ms = arguments.warmup_ms if phase == 'warmup' else arguments.duration_ms
+            expected_requests = (arguments.requests_per_second * duration_ms + 999) // 1000
+            if measured['requests'] != expected_requests:
+                raise RuntimeError(f"fixed-rate phase skipped scheduled requests; inspect {folder}")
+        by_operation = measured.get('by_operation')
+        if by_operation is not None:
+            if (by_operation['write']['requests'] != measured['write_requests']
+                    or sum(operation['requests'] for operation in by_operation.values()) != measured['requests']):
+                raise RuntimeError(f"read/write latency counts do not match completed requests; inspect {folder}")
     record["sample"] = result
     write_json(folder / "run.json", record)
     return record
@@ -151,6 +167,8 @@ def main():
     parser.add_argument("--duration-ms", type=int, default=8000)
     parser.add_argument("--warmup-ms", type=int, default=2000)
     parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--requests-per-second", type=int, default=0,
+                        help="scheduled request rate; 0 saturates the caller pool; late requests drain and retain scheduled latency")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--profile", action="store_true", help="collect native phase timings and thread wait samples; diagnostic runs only")
     parser.add_argument("--v8-profile", action="store_true", help="also write per-isolate V8 sampling logs; diagnostic runs only")
@@ -159,6 +177,8 @@ def main():
         parser.error("pair counts, durations and timeouts must be positive")
     if arguments.concurrency is not None and arguments.concurrency < 1:
         parser.error("concurrency must be positive")
+    if arguments.requests_per_second < 0:
+        parser.error("requests per second must be nonnegative")
     if bool(arguments.candidate) != bool(arguments.candidate_record):
         parser.error("candidate binary and build record must be supplied together")
     if not shutil.which("taskset") or not hasattr(os, "sched_getaffinity"):
@@ -220,6 +240,7 @@ def main():
                 'profile': arguments.profile or arguments.v8_profile, 'v8_profile': arguments.v8_profile,
                 'cpu_topology': topology, 'physical_cores': len(physical), 'cases': cases,
                 'pairs': arguments.pairs, 'duration_ms': arguments.duration_ms, 'warmup_ms': arguments.warmup_ms,
+                'requests_per_second': arguments.requests_per_second,
                 'run_order': 'paired rounds across CPU/workload groups; reverse group and binary order each round',
                 'concurrency': arguments.concurrency or '4 per allowed CPU', 'filesystem': filesystem,
                 'storage_mount': json.loads(subprocess.check_output(

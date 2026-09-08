@@ -174,6 +174,8 @@ read_results=/home/mewhhaha/dd-memory-read-reproduction-results
 python3 /home/mewhhaha/dd-memory-read-tools-20260908/build-state-benchmarks.py \
   --source "$PWD" --target-dir "$PWD/target" --output "$read_build" \
   --bin bench_memory_fanout
+mkdir "$read_build/bin"
+cp target/dist/bench_memory_fanout "$read_build/bin/bench_memory_fanout"
 python3 scripts/compare-memory-fanout.py \
   --baseline "$read_build/bin/bench_memory_fanout" \
   --baseline-record "$read_build/build-record.json" \

@@ -8,6 +8,17 @@ operations always use `atomic()`. The paired runner exposes this as
 `--baseline-read-api atomic --candidate-read-api snapshot`. Both sides can use
 the same binary and build record. Raw configurations record the selected API.
 
+The [memory latency follow-up](MEMORY-LATENCY.md) separates read and write
+latency and examines durable commit waits. Use `--requests-per-second N` on
+the paired runner, or `DD_FANOUT_REQUESTS_PER_SECOND=N` on the executable,
+to compare at a scheduled arrival rate. Zero retains the saturated caller
+pool. Fixed-rate latency includes waiting for an available caller, every
+scheduled request drains before verification, and the runner checks the
+completed request count. `measurements.timed.by_operation` reports read and
+write distributions; `dispatch_delay` reports the caller backlog and timer
+delay separately. These modes measure latency and capacity under different
+loads; a capped request rate is not a maximum-throughput result.
+
 The scripts in [`configs/`](configs/) are the canonical commands for the
 workloads we intentionally test. Raw sampler output is generated under
 `benchmarks/results/` and is not committed.

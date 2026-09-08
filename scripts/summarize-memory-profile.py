@@ -22,6 +22,7 @@ def summarize(path):
         'run': str(path), 'config': result['config'],
         'transactions_per_second': result['transaction_throughput_rps'],
         'request_p99_ms': result['p99_ms'],
+        'latency_by_operation': measurement['timed'].get('by_operation'),
         'snapshot_reload_fraction': (profile['js_hydrate_full']['calls'] / profile['op_snapshot']['calls']
                                      if 'js_hydrate_full' in profile else None),
         'mean_native_us': {name: mean(profile[name]['total_us'], profile[name]['calls'])
