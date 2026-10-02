@@ -1,0 +1,11 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -49,7 +49,7 @@
+ features = ["kv"]
+
+ [dependencies.rustls]
+-version = "=0.23.40"
++version = "0.23.45"
+ features = [
+     "logging",
+     "std",

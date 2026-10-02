@@ -41,6 +41,8 @@ pub struct RuntimeConfig {
     pub max_buffered_request_bytes: usize,
     pub max_response_body_bytes: usize,
     pub max_buffered_response_bytes: usize,
+    pub max_buffered_websocket_bytes: usize,
+    pub max_buffered_websocket_bytes_per_session: usize,
     pub max_isolate_heap_bytes: usize,
     pub isolate_startup_timeout: Duration,
     pub idle_ttl: Duration,
@@ -75,6 +77,8 @@ impl Default for RuntimeConfig {
             max_buffered_request_bytes: 64 * 1024 * 1024,
             max_response_body_bytes: 64 * 1024 * 1024,
             max_buffered_response_bytes: 64 * 1024 * 1024,
+            max_buffered_websocket_bytes: 64 * 1024 * 1024,
+            max_buffered_websocket_bytes_per_session: 1024 * 1024,
             max_isolate_heap_bytes: 128 * 1024 * 1024,
             isolate_startup_timeout: Duration::from_secs(5),
             idle_ttl: Duration::from_secs(30),
@@ -418,6 +422,45 @@ pub struct WebSocketOpen {
     pub session_id: String,
     pub worker_name: String,
     pub output: WorkerOutput,
+}
+
+/// Keeps queued and in-flight WebSocket bytes charged until the consumer is done.
+#[derive(Debug, Default)]
+pub struct WebSocketFrameLease {
+    pub(super) _permits: Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
+}
+
+#[derive(Debug)]
+pub struct WebSocketFrameOutput {
+    pub output: WorkerOutput,
+    pub(super) lease: WebSocketFrameLease,
+}
+
+impl From<WorkerOutput> for WebSocketFrameOutput {
+    fn from(output: WorkerOutput) -> Self {
+        Self {
+            output,
+            lease: WebSocketFrameLease::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for WebSocketFrameOutput {
+    type Target = WorkerOutput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.output
+    }
+}
+
+impl WebSocketFrameOutput {
+    /// Retain the returned lease until the transport finishes sending the body.
+    pub fn into_parts(self) -> (WorkerOutput, WebSocketFrameLease) {
+        (self.output, self.lease)
+    }
 }
 
 pub struct PublicRouteAssetResolution {
@@ -1352,7 +1395,7 @@ impl RuntimeService {
         session_id: String,
         frame: Vec<u8>,
         is_binary: bool,
-    ) -> Result<WorkerOutput> {
+    ) -> Result<WebSocketFrameOutput> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::SendWebsocketFrame {
@@ -1398,7 +1441,7 @@ impl RuntimeService {
         &self,
         worker_name: String,
         session_id: String,
-    ) -> Result<Option<WorkerOutput>> {
+    ) -> Result<Option<WebSocketFrameOutput>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(RuntimeCommand::DrainWebsocketFrame {

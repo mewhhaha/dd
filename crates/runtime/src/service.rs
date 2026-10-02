@@ -82,8 +82,9 @@ pub use self::facade::{
     InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug, MemoryShardDebug,
     PublicRouteAssetResolution, RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig,
     RuntimeReadiness, RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig,
-    RuntimeStorageConfig, RuntimeWorkerStatus, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
-    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    RuntimeStorageConfig, RuntimeWorkerStatus, WebSocketFrameLease, WebSocketFrameOutput,
+    WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate, WorkerDebugRequest, WorkerStats,
+    WorkerStreamBody, WorkerStreamOutput,
 };
 
 #[derive(Clone)]

@@ -10,9 +10,9 @@ base64.workspace = true
 clap.workspace = true
 common = { path = "../common" }
 storage = { path = "../storage" }
-keyring = "4"
+keyring = "4.2.0"
 reqwest.workspace = true
-rpassword = "7"
+rpassword = "7.5.4"
 serde.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true

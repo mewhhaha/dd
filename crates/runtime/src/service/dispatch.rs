@@ -276,7 +276,7 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         runtime_request_id: &str,
-        reply: oneshot::Sender<Result<WorkerOutput>>,
+        reply: InvocationReply,
         reply_kind: &PendingReplyKind,
         error: PlatformError,
     ) {
@@ -361,6 +361,15 @@ impl WorkerManager {
                             now.duration_since(pending.dispatched_at) >= request_wall_timeout
                         })
                         .map(|(request_id, _)| request_id.clone())
+                        .chain(
+                            isolate
+                                .pending_wait_until
+                                .iter()
+                                .filter(|(_, pending)| {
+                                    now.duration_since(pending.completed_at) >= request_wall_timeout
+                                })
+                                .map(|(request_id, _)| format!("{request_id}:waitUntil")),
+                        )
                         .collect::<Vec<_>>();
                     if expired_request_ids.is_empty() {
                         continue;
@@ -905,6 +914,7 @@ impl WorkerManager {
         let open_handle_registry = self.open_handle_registry.clone();
         let execution_limits = crate::ops::RuntimeExecutionLimits {
             max_request_body_bytes: self.config.max_request_body_bytes,
+            max_response_body_bytes: self.config.max_response_body_bytes,
             max_isolate_heap_bytes: self.config.max_isolate_heap_bytes,
             max_buffered_response_bytes: self.config.max_buffered_response_bytes,
             response_byte_budget: Arc::clone(&self.response_byte_budget),
@@ -1173,9 +1183,13 @@ impl WorkerManager {
                             "completion token mismatch for runtime request {request_id}"
                         )));
                     } else if wait_until_count > 0 {
-                        isolate
-                            .pending_wait_until
-                            .insert(request_id.to_string(), completion_token.to_string());
+                        isolate.pending_wait_until.insert(
+                            request_id.to_string(),
+                            PendingWaitUntil {
+                                completion_token: completion_token.to_string(),
+                                completed_at: finished_at,
+                            },
+                        );
                     }
                     clear_revalidation = true;
                     execution_ms = Some(pending.dispatched_at.elapsed().as_millis() as u64);
@@ -1434,7 +1448,7 @@ impl WorkerManager {
             body,
             request_id: Uuid::new_v4().to_string(),
         };
-        let (reply, reply_rx) = oneshot::channel();
+        let (reply, reply_rx) = oneshot::channel::<Result<WorkerOutput>>();
         if let Err(error) = self
             .runtime_fast_sender
             .try_send(RuntimeCommand::InvokeInternal(EnqueueInvokeRequest {
@@ -1448,7 +1462,7 @@ impl WorkerManager {
                 target_isolate_id: None,
                 target_generation: None,
                 internal_origin: true,
-                reply,
+                reply: reply.into(),
                 reply_kind: PendingReplyKind::Normal,
             }))
         {

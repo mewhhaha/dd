@@ -124,5 +124,8 @@ if [[ ! -s "$tmp_file" ]]; then
   exit 0
 fi
 
+# GNU patch accepts an empty context line without its space marker. Strip that
+# marker so generated patch artifacts also pass git's whitespace checks.
+sed -i 's/^ $//' "$tmp_file"
 mv "$tmp_file" "$patch_file"
 echo "wrote $patch_file"

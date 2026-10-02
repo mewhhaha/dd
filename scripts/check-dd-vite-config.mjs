@@ -1,14 +1,25 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { ddVitePlugin } from "../packages/dd-vite/src/vite.js";
 import { shouldBypassViteRequest } from "../packages/dd-vite/src/vite/dev.js";
 
 const require = createRequire(new URL("../packages/dd-vite/package.json", import.meta.url));
 const { createBuilder, resolveConfig } = await import(require.resolve("vite"));
 const root = await mkdtemp(join(tmpdir(), "dd-vite-config-"));
+const runFile = promisify(execFile);
+const privateModules = [
+  { type: "ESModule", path: "private/helper.js", file: "private/helper.js", bytes: Buffer.from("export default 42;\n") },
+  { type: "Json", path: "private/config.json", file: "private/config.json", bytes: Buffer.from('{"answer":42}\n') },
+  { type: "Text", path: "private/query.sql", file: "private/query.sql", bytes: Buffer.from("SELECT 42;\n") },
+  { type: "Data", path: "private/value.bin", file: "private/value.bin", bytes: Buffer.from([0, 255, 13, 10]) },
+  { type: "CompiledWasm", path: "private/module.wasm", file: "private/module.wasm", bytes: Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]) },
+];
 const workerBundleEnv = "DD_VITE_WORKER_BUNDLE";
 const previousWorkerBundleEnv = process.env[workerBundleEnv];
 delete process.env[workerBundleEnv];
@@ -32,6 +43,10 @@ assert.equal(
 
 try {
   await mkdir(join(root, "src"), { recursive: true });
+  await mkdir(join(root, "private"), { recursive: true });
+  for (const module of privateModules) {
+    await writeFile(join(root, module.file), module.bytes);
+  }
   await writeFile(join(root, "package.json"), JSON.stringify({ type: "module" }));
   await writeFile(
     join(root, "dd.json"),
@@ -42,6 +57,7 @@ try {
       baseUrl: "https://dd.example.test",
       temporary: true,
       asset_excludes: ["secret-local.txt"],
+      server_modules: privateModules.map(({ bytes, ...module }) => module),
       config: { public: true },
     }),
   );
@@ -195,6 +211,7 @@ try {
     plugins: [
       ddVitePlugin({
         middleware: false,
+        deploymentConfig: { input: "dd.json" },
       }),
     ],
   });
@@ -213,6 +230,30 @@ try {
   assert.equal(generatedConfig.public, undefined);
   assert.equal(generatedConfig.bindings, undefined);
   assert.equal(generatedConfig.internal, undefined);
+  assert.equal(generatedConfig.server_modules.length, privateModules.length);
+  for (const [index, module] of generatedConfig.server_modules.entries()) {
+    assert.equal(module.path, privateModules[index].path);
+    assert.equal(module.type, privateModules[index].type);
+    assert(module.file.startsWith("server-modules/"));
+    assert.deepEqual(
+      await readFile(join(root, "dist/config-check-worker", module.file)),
+      privateModules[index].bytes,
+      "generated module references must resolve to the original private bytes",
+    );
+  }
+  if (process.env.DD_CLI_BIN) {
+    const { stdout } = await runFile(process.env.DD_CLI_BIN, [
+      "package-deploy-config", join(root, "dist/config-check-worker/dd.deploy.json"),
+      "--allow-outside-config-root",
+    ], { maxBuffer: 4 * 1024 * 1024 });
+    const request = JSON.parse(stdout);
+    assert.equal(request.server_modules.length, privateModules.length);
+    for (const [index, module] of request.server_modules.entries()) {
+      assert.equal(module.path, privateModules[index].path);
+      assert.deepEqual(Buffer.from(module.content_base64, "base64"), privateModules[index].bytes);
+    }
+    assert(request.assets.every((asset) => !asset.path.includes("private/") && !asset.path.includes("server-modules/")));
+  }
   const workerArtifact = await readFile(join(root, "dist/config-check-worker/worker.js"), "utf8");
   assert(workerArtifact, "dd worker artifact should be emitted even when an unrelated ssr environment exists");
   assert(
@@ -227,6 +268,11 @@ try {
     undefined,
     "dd worker bundle guard should not leak into later Vite plugin initialization",
   );
+  const urlInputConfig = await resolveConfig({
+    root, configFile: false, logLevel: "silent",
+    plugins: [ddVitePlugin({ deploymentConfig: { input: pathToFileURL(join(root, "dd.json")) } })],
+  }, "build");
+  assert(urlInputConfig.environments["config_check_worker"], "file URL config inputs must resolve successfully");
 
   await buildApp({
     root,

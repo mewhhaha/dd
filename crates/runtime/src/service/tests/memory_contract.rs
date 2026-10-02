@@ -22,6 +22,35 @@ async fn deploy_memory_contract_worker(body: &str) -> RuntimeService {
 
 #[tokio::test]
 #[serial]
+async fn aggregate_growth_rejection_preserves_reads_and_deletes() {
+    let service = deploy_memory_contract_worker(
+        r#"
+await memory.atomic((tx) => tx.put("first", new Uint8Array(9 * 1024 * 1024)));
+let rejected = false;
+try {
+  await memory.atomic((tx) => tx.put("second", new Uint8Array(9 * 1024 * 1024)));
+} catch (error) {
+  rejected = error.message.includes("memory entity values exceeded");
+}
+const before = await memory.read((snapshot) => snapshot.list().map(({ key }) => key));
+await memory.atomic((tx) => tx.delete("first"));
+const after = await memory.read((snapshot) => snapshot.list().map(({ key }) => key));
+return Response.json({ rejected, before, after });
+"#,
+    )
+    .await;
+    let response = service
+        .invoke("contract".into(), test_invocation())
+        .await
+        .expect("rejected growth leaves the entity available");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response.body).unwrap(),
+        serde_json::json!({ "rejected": true, "before": ["first"], "after": [] })
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn staged_values_and_deletes_remain_visible_before_and_after_commit() {
     let service = deploy_memory_contract_worker(
         r#"

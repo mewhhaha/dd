@@ -332,8 +332,14 @@ impl MemoryStore {
         &self,
         namespace: &str,
         memory_key: &str,
-        commit: MemoryCommit,
+        mut commit: MemoryCommit,
     ) -> Result<MemoryBatchApplyResult> {
+        for mutation in &mut commit.mutations {
+            if mutation.deleted {
+                mutation.value = Bytes::new();
+                mutation.encoding = "utf8".into();
+            }
+        }
         let MemoryCommit {
             mutations,
             command_result,
@@ -427,6 +433,11 @@ impl MemoryStore {
                     } else {
                         version
                     };
+                    let previous_bytes = if commit.mutations.is_empty() {
+                        None
+                    } else {
+                        Some(entity_value_bytes(conn, &worker, &binding, &entity).await?)
+                    };
                     for mutation in &commit.mutations {
                         execute_cached(
                             conn,
@@ -438,6 +449,16 @@ impl MemoryStore {
                             (worker.as_str(), binding.as_str(), entity.as_str(), mutation.key.as_str(),
                              mutation.value.as_ref(), mutation.encoding.as_str(), i64::from(mutation.deleted), revision),
                         ).await?;
+                    }
+                    if let Some(previous_bytes) = previous_bytes {
+                        let next_bytes = entity_value_bytes(conn, &worker, &binding, &entity).await?;
+                        if next_bytes > MEMORY_ENTITY_MAX_VALUE_BYTES as i64
+                            && next_bytes >= previous_bytes
+                        {
+                            return Err(PlatformError::bad_request(format!(
+                                "memory entity values exceeded {MEMORY_ENTITY_MAX_VALUE_BYTES} bytes; oversized entities must shrink"
+                            )).into());
+                        }
                     }
                     execute_cached(
                         conn,
@@ -795,6 +816,22 @@ impl MemoryStore {
     }
 }
 
+async fn entity_value_bytes(
+    conn: &turso::Connection,
+    worker: &str,
+    binding: &str,
+    entity: &str,
+) -> turso::Result<i64> {
+    let mut rows = query_cached(
+        conn,
+        "SELECT COALESCE(SUM(length(value)), 0) FROM memory_state
+         WHERE worker=?1 AND binding=?2 AND entity_key=?3 AND deleted=0",
+        (worker, binding, entity),
+    )
+    .await?;
+    rows.next().await?.expect("memory entity size").get(0)
+}
+
 fn outbox_record(row: &turso::Row, offset: usize) -> turso::Result<MemoryOutboxRecord> {
     Ok(MemoryOutboxRecord {
         effect_id: row.get(offset)?,
@@ -810,6 +847,156 @@ fn outbox_record(row: &turso::Row, offset: usize) -> turso::Result<MemoryOutboxR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn value_commit(key: &str, bytes: usize) -> MemoryCommit {
+        MemoryCommit {
+            mutations: vec![MemoryBatchMutation {
+                key: key.into(),
+                value: Bytes::from(vec![b'x'; bytes]),
+                encoding: "utf8".into(),
+                deleted: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_value_limit_rolls_back_growth_and_serializes_concurrent_writes() {
+        let root = std::env::temp_dir().join(format!("dd-memory-budget-{}", uuid::Uuid::new_v4()));
+        let memory = MemoryStore::from_state(StateStore::open(&root).await.unwrap());
+        let namespace = worker_namespace("worker", "MEMORY");
+        let half = MEMORY_ENTITY_MAX_VALUE_BYTES / 2;
+        memory
+            .apply_batch(&namespace, "entity", value_commit("a", half))
+            .await
+            .unwrap();
+        let revision = memory
+            .apply_batch(&namespace, "entity", value_commit("b", half))
+            .await
+            .unwrap()
+            .max_version;
+        let mut excess = value_commit("b", half + 1);
+        excess.command_result = Some(MemoryCommandResultWrite {
+            idempotency_key: "rejected".into(),
+            result: b"must not persist".to_vec(),
+        });
+        excess.outbox_effects.push(MemoryOutboxEffectWrite {
+            kind: "audit".into(),
+            payload: b"must not deliver".to_vec(),
+        });
+        let error = memory
+            .apply_batch(&namespace, "entity", excess)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), common::ErrorKind::BadRequest);
+        let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
+        assert_eq!(snapshot.value_bytes(), MEMORY_ENTITY_MAX_VALUE_BYTES);
+        assert_eq!(snapshot.max_version, revision);
+        assert!(
+            memory
+                .command_result(&namespace, "entity", "rejected")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            memory
+                .outbox_records(&namespace, "entity")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        memory
+            .apply_batch(&namespace, "concurrent", value_commit("existing", 9 * 1024 * 1024))
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            memory.apply_batch(&namespace, "concurrent", value_commit("a", 4 * 1024 * 1024)),
+            memory.apply_batch(&namespace, "concurrent", value_commit("b", 4 * 1024 * 1024)),
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let error = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(error.kind(), common::ErrorKind::BadRequest);
+        assert_eq!(
+            memory
+                .snapshot(&namespace, "concurrent")
+                .await
+                .unwrap()
+                .value_bytes(),
+            13 * 1024 * 1024
+        );
+        drop(memory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_legacy_entities_can_shrink_and_delete_without_growing() {
+        let root =
+            std::env::temp_dir().join(format!("dd-memory-recovery-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        let namespace = worker_namespace("worker", "MEMORY");
+        let conn = state
+            .read(StateStore::shard_index("worker", "MEMORY", "entity"))
+            .await
+            .unwrap();
+        for key in ["a", "b", "c"] {
+            conn.execute("INSERT INTO memory_state VALUES ('worker','MEMORY','entity',?1,zeroblob(?2),'utf8',0,0)", (key, 9 * 1024 * 1024)).await.unwrap();
+        }
+        conn.execute(
+            "INSERT INTO memory_meta VALUES ('worker','MEMORY','entity',0,0)",
+            (),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        let memory = MemoryStore::from_state(state);
+        assert_eq!(
+            memory
+                .snapshot(&namespace, "entity")
+                .await
+                .unwrap()
+                .value_bytes(),
+            27 * 1024 * 1024
+        );
+        assert!(
+            memory
+                .apply_batch(&namespace, "entity", value_commit("a", 9 * 1024 * 1024))
+                .await
+                .is_err()
+        );
+        memory
+            .apply_batch(&namespace, "entity", value_commit("a", 8 * 1024 * 1024))
+            .await
+            .unwrap();
+        assert_eq!(
+            memory
+                .snapshot(&namespace, "entity")
+                .await
+                .unwrap()
+                .value_bytes(),
+            26 * 1024 * 1024
+        );
+        for key in ["b", "c"] {
+            let mut deletion = value_commit(key, 1);
+            deletion.mutations[0].deleted = true;
+            memory
+                .apply_batch(&namespace, "entity", deletion)
+                .await
+                .unwrap();
+        }
+        let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
+        assert_eq!(snapshot.value_bytes(), 8 * 1024 * 1024);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .filter(|entry| entry.deleted)
+                .all(|entry| entry.value.is_empty())
+        );
+        drop(memory);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn cold_loads_stay_ordered_across_cache_resizes_and_concurrent_commits() {

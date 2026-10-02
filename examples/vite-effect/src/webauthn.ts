@@ -38,7 +38,7 @@ type PasskeysService = {
   ) => PasskeyCredential;
 };
 
-export class Passkeys extends Context.Tag("vite-effect/Passkeys")<Passkeys, PasskeysService>() {}
+export class Passkeys extends Context.Service<Passkeys, PasskeysService>()("vite-effect/Passkeys") {}
 
 export const PasskeysLive = Layer.effect(Passkeys, Effect.gen(function* () {
   const { request } = yield* RequestContext;

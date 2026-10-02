@@ -279,8 +279,8 @@ impl WorkerManager {
                 .isolates
                 .iter_mut()
                 .find(|isolate| isolate.id == isolate_id)
-                && let Some(token) = isolate.pending_wait_until.get(request_id)
-                && token == completion_token
+                && let Some(pending) = isolate.pending_wait_until.get(request_id)
+                && pending.completion_token == completion_token
             {
                 isolate.pending_wait_until.remove(request_id);
                 if isolate.inflight_count == 0 && isolate.pending_wait_until.is_empty() {
@@ -466,7 +466,7 @@ impl WorkerManager {
             body: Vec::new(),
             request_id,
         };
-        let (reply, _receiver) = oneshot::channel();
+        let (reply, _receiver) = oneshot::channel::<Result<WorkerOutput>>();
         let warn_thresholds = self.config.queue_warn_thresholds.clone();
         let queued_bytes = estimate_pending_invoke_bytes(&invocation, false);
         let admission_error = self
@@ -502,7 +502,7 @@ impl WorkerManager {
                 memory_call: None,
                 target_isolate_id: None,
                 internal_origin: false,
-                reply,
+                reply: reply.into(),
                 reply_kind: PendingReplyKind::Normal,
                 enqueued_at: Instant::now(),
                 queued_bytes,

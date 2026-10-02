@@ -4,7 +4,8 @@ Contributor-focused notes moved here so the root README can stay product- and us
 
 ## Prerequisites
 
-- Rust toolchain
+- Rust 1.99 (selected by `rust-toolchain.toml`)
+- Node.js 24 or newer and the pnpm version declared in `package.json`
 
 ## Local run
 
@@ -49,8 +50,10 @@ cargo run -p cli -- auth status
 cargo run -p cli -- auth logout
 ```
 
-Deno extension modules and the snapshot-ready Cargo-package forms are checked
-in under `crates/runtime/js/vendor` and hash-checked during the runtime build.
+Snapshot-ready Deno JavaScript sources are checked in under
+`crates/runtime/js/vendor/lazy` and hash-checked during the runtime build.
+The runtime loads those upstream implementations through Deno's lazy extension
+API; local adapters live under `crates/runtime/js/compat/dd_deno_runtime`.
 After updating the locked Deno crates, run `just refresh-deno-sources` and commit
 the refreshed `lazy/` tree with `manifest.txt`.
 
@@ -90,6 +93,13 @@ just size-report-all
 Reports are written to `target/size-report/<git-sha>/<profile>/<variant>/` and
 include exact unstripped/stripped bytes, section sizes, dependency trees, and
 optional `cargo bloat`/`bloaty` output when those tools are installed.
+
+For a tagged release, the tag, Cargo workspace version, and every publishable
+npm package must agree. Check before tagging with
+`node scripts/check-release-version.mjs v0.1.0` (substitute the release version).
+The release workflow creates a missing GitHub Release, restores executable
+permissions lost during artifact transfer, and extracts and smoke-tests the
+Linux downloads before upload. npm publishing follows successful GitHub upload.
 
 ## Vite and Vitest worker development
 
@@ -178,28 +188,28 @@ React Router RSC uses `@mewhhaha/vite-plugin-dd/react-router-rsc`, which sets
 up the dd-backed `rsc` environment and runnable `ssr` child environment expected
 by `@vitejs/plugin-rsc`.
 
-This follows the same broad direction as Cloudflare's Vite plugin integration:
-use Vite's Environment API and let full-stack frameworks merge with their SSR
-environment. The current implementation still rebuilds and redeploys worker
-source through the native runtime on demand; full React Router RSC-style module
-evaluation inside the isolate needs a dedicated Vite ModuleRunner transport.
+The plugin uses Vite's Environment API and lets frameworks merge their SSR
+environments. A development module runner loads Vite-transformed modules inside
+the native isolate and invalidates them on hot updates.
 
 During `vite build`, the plugin also writes a deployment config into Vite's
 output directory:
 
 ```text
-dist/dd.deploy.json
-dist/worker.js
+dist/client/
+dist/<entry-worker>/dd.deploy.json
+dist/<entry-worker>/worker.js
+dist/dd.workers.json
 ```
 
 By default, the plugin uses root `dd.json` as the source config. That file can
 point at `src/worker.ts` and source assets. The generated output config
 preserves only the deploy fields the CLI consumes, such as `name`, `config`,
 `base_url`, and `temporary`, then replaces `entrypoint` with the bundled worker
-path and `assets_dir` with the Vite output directory. It also excludes the
+path and `assets_dir` with the sibling client output directory. It also excludes the
 generated worker and config file from static asset packaging. Unknown source
 config keys are rejected against `schema/dd.schema.json`. The plugin
-also writes `dist/_headers` with an immutable cache policy for Vite's
+also writes `_headers` in the client output directory with an immutable cache policy for Vite's
 fingerprinted build assets, such as `/assets/*`.
 
 Server-only module assets can be listed in `server_modules`. These files are
@@ -217,6 +227,10 @@ imported from the worker module graph:
 }
 ```
 
+File paths are relative to the source config directory. Vite stages the private
+files into `dist/<entry-worker>/server-modules/` and rewrites the generated
+config, so the worker output can be moved without retaining the source tree.
+
 Use import attributes for JSON, text, and bytes modules, for example
 `import config from "./data/config.json" with { type: "json" }`. `CompiledWasm`
 imports default-export a `WebAssembly.Module`.
@@ -233,11 +247,14 @@ dd({
 Package or deploy the generated config with:
 
 ```bash
-cargo run -p cli -- package-deploy-config dist/dd.deploy.json
-cargo run -p cli -- deploy-config dist/dd.deploy.json
-cargo run -p cli -- deploy-config dist/dd.deploy.json --temporary
-just fly-worker-deploy-config dist/dd.deploy.json
+cargo run -p cli -- package-deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
+cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
+cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root --temporary
+just fly-worker-deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
+
+The generated config points at sibling client assets, so the CLI requires the
+explicit `--allow-outside-config-root` flag. Check that path before deploying.
 
 `--temporary` keeps a worker deployed for one hour. Redeploying the same
 temporary worker with `--temporary` refreshes that hour, and a normal redeploy
@@ -258,7 +275,7 @@ cargo run -p cli -- --server http://127.0.0.1:18081 mint-token \
   --max-asset-bytes 16777216
 
 export DD_TOKEN=dddt_...
-cargo run -p cli -- --server https://your-dd-app.fly.dev deploy-config dist/dd.deploy.json
+cargo run -p cli -- --server https://your-dd-app.fly.dev deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
 
 The token capability set controls worker names, public/private deploys,
@@ -269,7 +286,7 @@ repository token. For local use, store the returned token with:
 
 ```bash
 cargo run -p cli -- --server https://your-dd-app.fly.dev auth login
-cargo run -p cli -- deploy-config dist/dd.deploy.json
+cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
 
 Revoke with:
@@ -324,8 +341,9 @@ Patch files under `./patches` are audit and refresh artifacts. Keep them in sync
 
 ```bash
 just patch deno_crypto
-just patch-save deno_crypto 0.268.0
-just patch-refresh deno_crypto 0.268.0
+just patch-save deno_crypto 0.273.0
+just patch-refresh deno_crypto 0.273.0
+just patch-refresh deno_tls 0.246.0
 ```
 
 ## Library embedding

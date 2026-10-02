@@ -1,24 +1,33 @@
-export const TRACING_ENABLED = false;
-export const PROPAGATORS = [];
+(function () {
+  const { internals } = __bootstrap;
+  const TRACING_ENABLED = false;
+  const PROPAGATORS = [];
 
-export const ContextManager = {
-  active() {
-    return undefined;
-  },
-};
-
-export function builtinTracer() {
-  return {
-    startSpan() {
-      return {
-        end() {},
-      };
+  const ContextManager = {
+    active() {
+      return undefined;
     },
   };
-}
 
-export function enterSpan(_span) {
-  return undefined;
-}
+  function builtinTracer() {
+    return {
+      startSpan() {
+        return {
+          end() {},
+        };
+      },
+    };
+  }
 
-export function restoreSnapshot(_snapshot) {}
+  function enterSpan(_span) {
+    return undefined;
+  }
+
+  function restoreSnapshot(_snapshot) {}
+
+  const DID_NOT_ENTER = Symbol("dd.noopTracing");
+  function exitSpan(_snapshot) {}
+  const telemetry = { TRACING_ENABLED, PROPAGATORS, ContextManager, builtinTracer, enterSpan, exitSpan, DID_NOT_ENTER, restoreSnapshot };
+  internals.__telemetry = telemetry;
+  return telemetry;
+})();

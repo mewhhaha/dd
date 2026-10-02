@@ -51,7 +51,7 @@ editors can use [schema/dd.schema.json](schema/dd.schema.json) for validation an
 
 ```bash
 cargo run -p cli -- auth login
-cargo run -p cli -- deploy-config dist/dd.deploy.json
+cargo run -p cli -- deploy-config dist/hello/dd.deploy.json --allow-outside-config-root
 ```
 
 CLI server precedence is `--server`, `DD_SERVER`, config `base_url`, then the
@@ -242,8 +242,8 @@ worker request. Framework integrations use subpath presets such as
 `@mewhhaha/vite-plugin-dd/react-router` and
 `@mewhhaha/vite-plugin-dd/react-router-rsc`.
 
-During `vite build`, the plugin emits `dist/dd.deploy.json` and a bundled
-`dist/worker.js`. The generated config keeps the deploy fields the CLI consumes
+During `vite build`, the plugin emits `dist/<worker>/dd.deploy.json`, a bundled
+`dist/<worker>/worker.js`, and the `dist/dd.workers.json` manifest. The generated config keeps the deploy fields the CLI consumes
 while pointing at the bundled worker and Vite output assets.
 
 `@mewhhaha/vite-plugin-dd` has a default plugin export, so configs can use any local name:

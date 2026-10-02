@@ -64,7 +64,7 @@ impl WorkerManager {
                 target_isolate_id: None,
                 target_generation: None,
                 internal_origin: true,
-                reply: inner_reply_tx,
+                reply: inner_reply_tx.into(),
                 reply_kind: PendingReplyKind::Normal,
             }))
         {

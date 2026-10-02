@@ -123,8 +123,8 @@ where
         return Ok(json_response(StatusCode::OK, &response)?);
     }
     if request.method() == Method::POST && path == "/v1/admin/undeploy" {
-        let payload: WorkerNameRequest =
-            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
+        let (payload, _upload_permit): (WorkerNameRequest, _) =
+            read_control_json_body(&state, request.into_body()).await?;
         let worker = validate_worker_name(&payload.worker)?;
         state.runtime.undeploy(worker.clone()).await?;
         return Ok(json_response(
@@ -133,8 +133,8 @@ where
         )?);
     }
     if request.method() == Method::POST && path == "/v1/admin/rollback" {
-        let payload: RollbackRequest =
-            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
+        let (payload, _upload_permit): (RollbackRequest, _) =
+            read_control_json_body(&state, request.into_body()).await?;
         let worker = validate_worker_name(&payload.worker)?;
         if payload.deployment_id.trim().is_empty() {
             return Err(PlatformError::bad_request("deployment id must not be empty").into());
@@ -153,14 +153,14 @@ where
         )?);
     }
     if request.method() == Method::POST && path == "/v1/deploy" {
-        let payload: DeployRequest =
-            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
-        let response = deploy_worker(state, payload).await?;
+        let (payload, upload_permit): (DeployRequest, _) =
+            read_control_json_body(&state, request.into_body()).await?;
+        let response = deploy_admitted_worker(state, payload, upload_permit).await?;
         return Ok(json_response(StatusCode::OK, &response)?);
     }
     if request.method() == Method::POST && path == "/v1/admin/tokens" {
-        let payload: DeployTokenMintRequest =
-            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
+        let (payload, _upload_permit): (DeployTokenMintRequest, _) =
+            read_control_json_body(&state, request.into_body()).await?;
         let response = mint_deploy_token(state, payload).await?;
         return Ok(json_response(StatusCode::OK, &response)?);
     }
@@ -212,14 +212,14 @@ where
             .ok_or_else(|| PlatformError::unauthorized("public deploy requires a token"))?
             .to_string();
         state.deploy_tokens.preflight(&token).await?;
-        let payload: DeployRequest =
-            read_json_body(request.into_body(), state.invoke_max_body_bytes).await?;
+        let (payload, upload_permit): (DeployRequest, _) =
+            read_control_json_body(&state, request.into_body()).await?;
         validate_deploy_request(&payload)?;
         state
             .deploy_tokens
             .authorize_deploy(&token, &payload)
             .await?;
-        let response = deploy_worker(state, payload).await?;
+        let response = deploy_admitted_worker(state, payload, upload_permit).await?;
         return Ok(json_response(StatusCode::OK, &response)?);
     }
     if public_route_is_reserved(&path) {
@@ -270,6 +270,21 @@ fn request_may_run_while_draining(method: &Method, path: &str) -> bool {
                 path,
                 "/v1/admin/drain" | "/v1/admin/resume" | "/v1/admin/checkpoint"
             ))
+}
+
+async fn deploy_admitted_worker(
+    state: AppState,
+    payload: DeployRequest,
+    upload_permit: tokio::sync::OwnedSemaphorePermit,
+) -> ApiResult<DeployResponse> {
+    // Accepted deployments finish on disconnect. Keep their upload reservation
+    // with that work until validation and persistence complete.
+    tokio::spawn(async move {
+        let _upload_permit = upload_permit;
+        deploy_worker(state, payload).await
+    })
+    .await
+    .map_err(|error| PlatformError::internal(format!("deployment task failed: {error}")))?
 }
 
 pub async fn deploy_worker(state: AppState, payload: DeployRequest) -> ApiResult<DeployResponse> {

@@ -35,9 +35,25 @@ in its command queue. A response waiting for a reader does not suspend its
 worker scheduler. Buffered chunks retain byte permits until their last consumer
 releases them, including after the producer has completed.
 
+`waitUntil` work has a native deadline measured from response completion, using
+the configured request wall timeout. The scheduler terminates an expired
+isolate even when its JavaScript event loop cannot process timers.
+
+WebSocket frames retain per-session and shared service byte permits through
+transport delivery. Budgets include frame metadata so empty messages are
+bounded too. Full buffers cause durable socket effects to retry with backoff;
+a frame that cannot fit the configured limits closes its socket with code
+`1009` and is rejected.
+
 Service-binding fetches collect a complete response under the per-response
-size limit. The shared streaming byte budget applies to public and development
+size limit, checked incrementally while reading and canceling an oversized
+producer. The shared streaming byte budget applies to public and development
 HTTP response streams; it does not turn service-binding replies into streams.
+
+JSON control-plane requests reserve their maximum payload size from a shared
+byte budget before reading. The reservation remains held through parsing and
+deployment persistence, including when the client disconnects. Uploads have
+a read deadline; a full budget rejects new requests with `503`.
 
 ## Default limits
 
@@ -52,10 +68,15 @@ HTTP response streams; it does not turn service-binding replies into streams.
 | Queued requests across the service | 16,384 |
 | Queued request bytes across the service | 64 MiB |
 | Buffered upload bytes across HTTP requests | 64 MiB |
+| Buffered control-plane JSON bytes | 64 MiB |
+| Control-plane body read timeout | 30 seconds |
 | Buffered streamed response bytes | 64 MiB |
+| Buffered and in-flight WebSocket bytes across the service | 64 MiB |
+| Buffered and in-flight WebSocket bytes per session | 1 MiB |
 | Isolate heap | 128 MiB |
 | Startup timeout | 5 seconds |
 | Request wall timeout | 30 seconds |
+| Background work deadline after response completion | Request wall timeout |
 | Queue wait timeout | 30 seconds |
 
 `RuntimeConfig` is authoritative for runtime limits. The server exposes upload
@@ -63,6 +84,9 @@ and response budgets as `DD_RUNTIME_MAX_BUFFERED_REQUEST_BYTES` and
 `DD_RUNTIME_MAX_BUFFERED_RESPONSE_BYTES`, or corresponding
 `--runtime-max-buffered-*-bytes` flags. Queue admission and live stream buffers
 use separate budgets so readers can release capacity while queues are full.
+WebSocket budgets use `DD_RUNTIME_MAX_BUFFERED_WEBSOCKET_BYTES` and
+`DD_RUNTIME_MAX_BUFFERED_WEBSOCKET_BYTES_PER_SESSION`. Control-plane limits use
+`DD_CONTROL_MAX_BUFFERED_BODY_BYTES` and `DD_CONTROL_BODY_TIMEOUT_SECONDS`.
 
 ## State and transactions
 
@@ -102,8 +126,11 @@ snapshot after a commit. A read started after an acknowledged write
 observes that write. Each callback sees one entity snapshot, not a snapshot
 across entities. The API exposes only `get` and `list`, rejects async and nested
 callbacks, and invalidates the view after the callback. Native read handles are
-limited to 128 per request and a 16 MiB value payload per snapshot; completion
-and cancellation release them. Reads do not create isolate entry metadata.
+limited to 128 per request and a 16 MiB live value payload per entity; completion
+and cancellation release them. Storage checks the projected entity size inside
+the write transaction. Existing oversized entities remain writable when a batch
+reduces their live values, allowing deletion and recovery. Reads do not create
+isolate entry metadata.
 
 One outbox coordinator scans and retries durable effects. Socket effects route
 to the owning worker. Delivery may be retried, so effect consumers must account

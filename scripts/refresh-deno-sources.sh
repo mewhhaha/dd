@@ -63,8 +63,8 @@ source_dir_for() {
 }
 
 # Cargo packages contain the snapshot-ready IIFE form consumed by
-# dd_embedded_lazy_js_source. Keep it separate from the ESM sources in the
-# parent vendor directories, which deno_core::extension! loads as modules.
+# dd_embedded_lazy_js_source. The runtime uses these same script exports
+# directly so each Web API has one implementation and one set of brands.
 for package in deno_webidl deno_web deno_fetch; do
   version="$(locked_version_for "$package")"
   if [[ -z "$version" ]]; then

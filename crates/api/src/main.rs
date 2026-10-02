@@ -18,6 +18,7 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider as OTelTracerProvider;
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
+#[cfg(feature = "otel")]
 use std::env;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
@@ -86,6 +87,18 @@ struct Cli {
     )]
     runtime_max_buffered_request_bytes: Option<usize>,
 
+    #[arg(long, env = "DD_RUNTIME_MAX_BUFFERED_WEBSOCKET_BYTES")]
+    runtime_max_buffered_websocket_bytes: Option<usize>,
+
+    #[arg(long, env = "DD_RUNTIME_MAX_BUFFERED_WEBSOCKET_BYTES_PER_SESSION")]
+    runtime_max_buffered_websocket_bytes_per_session: Option<usize>,
+
+    #[arg(long, env = "DD_CONTROL_MAX_BUFFERED_BODY_BYTES")]
+    control_max_buffered_body_bytes: Option<usize>,
+
+    #[arg(long, env = "DD_CONTROL_BODY_TIMEOUT_SECONDS")]
+    control_body_timeout_seconds: Option<u64>,
+
     #[arg(
         long = "runtime-min-isolates-per-worker",
         env = "DD_RUNTIME_MIN_ISOLATES_PER_WORKER"
@@ -152,6 +165,21 @@ async fn main() -> Result<()> {
     }
     if let Some(value) = cli.runtime_max_buffered_request_bytes {
         server_config.runtime.runtime.max_buffered_request_bytes = value;
+    }
+    if let Some(value) = cli.runtime_max_buffered_websocket_bytes {
+        server_config.runtime.runtime.max_buffered_websocket_bytes = value;
+    }
+    if let Some(value) = cli.runtime_max_buffered_websocket_bytes_per_session {
+        server_config
+            .runtime
+            .runtime
+            .max_buffered_websocket_bytes_per_session = value;
+    }
+    if let Some(value) = cli.control_max_buffered_body_bytes {
+        server_config.limits.max_buffered_control_body_bytes = value;
+    }
+    if let Some(value) = cli.control_body_timeout_seconds {
+        server_config.limits.control_body_timeout = std::time::Duration::from_secs(value);
     }
     if let Some(value) = cli.runtime_min_isolates_per_worker {
         server_config.runtime.runtime.min_isolates = value;

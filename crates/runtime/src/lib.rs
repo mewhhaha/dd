@@ -14,7 +14,7 @@ pub use memory::{MemoryBatchMutation, MemoryStore};
 pub use service::{
     InvokeRequestBodyReceiver, PublicRouteAssetResolution, RuntimeAdminSnapshot,
     RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness, RuntimeRestoreFailure,
-    RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, RuntimeWorkerStatus, WebSocketOpen,
-    WorkerDebugDump, WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody,
-    WorkerStreamOutput,
+    RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, RuntimeWorkerStatus,
+    WebSocketFrameLease, WebSocketFrameOutput, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
+    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };

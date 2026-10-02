@@ -131,6 +131,11 @@ worker needs private files outside the public asset bundle. Supported types are
 use import attributes, while `CompiledWasm` default-exports a
 `WebAssembly.Module`.
 
+Private module file paths are resolved relative to the source config file (or
+the project root for inline config). Builds copy those files into the worker's
+`server-modules/` directory and rewrite the generated `file` references. The
+private files stay outside the client assets.
+
 ```js
 export default defineConfig({
   plugins: [
@@ -169,9 +174,13 @@ dd({
 With the default layout, deploy the entry worker from its output directory:
 
 ```bash
-cargo run -p cli -- package-deploy-config dist/<entry-worker>/dd.deploy.json
-cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json
+cargo run -p cli -- package-deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
+cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
+
+The flag permits the generated config to include its sibling `../client`
+directory. Inspect the generated config before permitting paths outside its
+worker directory.
 
 Auxiliary workers can also be built as private service-bound workers:
 

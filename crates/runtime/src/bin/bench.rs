@@ -935,6 +935,7 @@ async fn run_websocket_roundtrip(
                     ),
                 )
                 .await?;
+                let (sent, _byte_lease) = sent.into_parts();
                 if sent.status != 204 {
                     return Err(common::PlatformError::runtime(format!(
                         "websocket benchmark send failed with status {}",

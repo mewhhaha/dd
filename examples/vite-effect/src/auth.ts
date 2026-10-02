@@ -12,8 +12,8 @@ import { renderAccount, renderAudit, renderHome } from "./views";
 import { Passkeys } from "./webauthn";
 
 const RegistrationInputSchema = Schema.Struct({
-  username: Schema.Trim.pipe(Schema.minLength(1), Schema.maxLength(64)),
-  displayName: Schema.Trim.pipe(Schema.minLength(1), Schema.maxLength(80)),
+  username: Schema.Trim.check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+  displayName: Schema.Trim.check(Schema.isMinLength(1), Schema.isMaxLength(80)),
 });
 
 export function home(): Effect.Effect<Response, AppError, Storage> {
@@ -120,7 +120,7 @@ export function finishRegistration(): Effect.Effect<Response, AppError, RequestC
     yield* storage.saveUser(nextUser);
     const session = yield* storage.createSession(nextUser);
     yield* storage.appendAudit("passkey.register", nextUser.username, `credential ${credential.id.slice(0, 8)}`).pipe(
-      Effect.catchAll(() => Effect.void),
+      Effect.catch(() => Effect.void),
     );
     return jsonResponse({
       verified: true,
@@ -131,7 +131,7 @@ export function finishRegistration(): Effect.Effect<Response, AppError, RequestC
       },
     });
   }).pipe(
-    Effect.catchAll((error) => recordFailure("passkey.register.failure", error)),
+    Effect.catch((error) => recordFailure("passkey.register.failure", error)),
   );
 }
 
@@ -169,7 +169,7 @@ export function finishAuthentication(): Effect.Effect<Response, AppError, Reques
     yield* storage.saveUser(nextUser);
     const session = yield* storage.createSession(nextUser);
     yield* storage.appendAudit("passkey.login", nextUser.username, `credential ${nextCredential.id.slice(0, 8)}`).pipe(
-      Effect.catchAll(() => Effect.void),
+      Effect.catch(() => Effect.void),
     );
     return jsonResponse({
       verified: true,
@@ -180,7 +180,7 @@ export function finishAuthentication(): Effect.Effect<Response, AppError, Reques
       },
     });
   }).pipe(
-    Effect.catchAll((error) => recordFailure("passkey.login.failure", error)),
+    Effect.catch((error) => recordFailure("passkey.login.failure", error)),
   );
 }
 
@@ -191,7 +191,7 @@ export function logout(): Effect.Effect<Response, AppError, Storage> {
     if (session) {
       yield* storage.deleteSession(session.id);
       yield* storage.appendAudit("logout", session.username, `session ${session.id.slice(0, 8)}`).pipe(
-        Effect.catchAll(() => Effect.void),
+        Effect.catch(() => Effect.void),
       );
     }
     return redirectResponse("/", {
@@ -203,7 +203,7 @@ export function logout(): Effect.Effect<Response, AppError, Storage> {
 function recordFailure(type: string, error: AppError): Effect.Effect<never, AppError, Storage> {
   return Storage.pipe(
     Effect.flatMap((storage) => storage.appendAudit(type, "anonymous", error.message).pipe(
-      Effect.catchAll(() => Effect.void),
+      Effect.catch(() => Effect.void),
       Effect.flatMap(() => Effect.fail(error)),
     )),
   );
@@ -244,7 +244,7 @@ function userForSession(storage: StorageService, session: Session): Effect.Effec
 
 function registrationInput(): Effect.Effect<RegistrationInput, AppError, RequestContext> {
   return requestJson<unknown>().pipe(
-    Effect.flatMap((body) => Schema.decodeUnknown(RegistrationInputSchema)(body)),
+    Effect.flatMap((body) => Schema.decodeUnknownEffect(RegistrationInputSchema)(body)),
     Effect.mapError(() => badRequest("Username and display name are required")),
     Effect.flatMap((input) => {
       const username = normalizeUsername(input.username);

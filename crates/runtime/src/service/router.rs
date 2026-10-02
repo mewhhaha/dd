@@ -277,6 +277,7 @@ pub(super) struct RuntimeAdmission {
     idle_candidates: StdMutex<HashMap<String, (Instant, String, u64, u64)>>,
     idle_retirement: AtomicBool,
     pub(super) response_bytes: Arc<tokio::sync::Semaphore>,
+    pub(super) websocket_bytes: Arc<tokio::sync::Semaphore>,
     pub(super) capacity_changed: tokio::sync::watch::Sender<()>,
     pub(super) reclaim_idle: tokio::sync::watch::Sender<Option<(String, u64)>>,
 }
@@ -292,6 +293,9 @@ impl RuntimeAdmission {
             idle_retirement: AtomicBool::new(false),
             response_bytes: Arc::new(tokio::sync::Semaphore::new(
                 config.max_buffered_response_bytes,
+            )),
+            websocket_bytes: Arc::new(tokio::sync::Semaphore::new(
+                config.max_buffered_websocket_bytes,
             )),
             capacity_changed: tokio::sync::watch::channel(()).0,
             reclaim_idle: tokio::sync::watch::channel(None).0,
@@ -501,7 +505,10 @@ impl RuntimeCommand {
             | Self::Shutdown { reply } => {
                 let _ = reply.send(Err(error));
             }
-            Self::Invoke { reply, .. } | Self::SendWebsocketFrame { reply, .. } => {
+            Self::Invoke { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::SendWebsocketFrame { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::InvokeInternal(invoke) => {

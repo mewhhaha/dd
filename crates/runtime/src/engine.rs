@@ -252,6 +252,9 @@ pub fn dispatch_worker_request(
             request_headers_handle,
             request_body_handle,
             stream_response,
+            max_response_body_bytes: op_state
+                .borrow::<crate::ops::RuntimeExecutionLimits>()
+                .max_response_body_bytes,
             method: mem::take(&mut request.method),
             url: mem::take(&mut request.url),
             input_request_id: mem::take(&mut request.request_id),

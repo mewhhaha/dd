@@ -2,15 +2,15 @@
 
 use aws_lc_rs::signature::KeyPair;
 use aws_lc_rs::signature::UnparsedPublicKey;
-use aws_lc_rs::unstable::signature::ML_DSA_44;
-use aws_lc_rs::unstable::signature::ML_DSA_44_SIGNING;
-use aws_lc_rs::unstable::signature::ML_DSA_65;
-use aws_lc_rs::unstable::signature::ML_DSA_65_SIGNING;
-use aws_lc_rs::unstable::signature::ML_DSA_87;
-use aws_lc_rs::unstable::signature::ML_DSA_87_SIGNING;
-use aws_lc_rs::unstable::signature::PqdsaKeyPair;
-use aws_lc_rs::unstable::signature::PqdsaSigningAlgorithm;
-use aws_lc_rs::unstable::signature::PqdsaVerificationAlgorithm;
+use aws_lc_rs::signature::ML_DSA_44;
+use aws_lc_rs::signature::ML_DSA_44_SIGNING;
+use aws_lc_rs::signature::ML_DSA_65;
+use aws_lc_rs::signature::ML_DSA_65_SIGNING;
+use aws_lc_rs::signature::ML_DSA_87;
+use aws_lc_rs::signature::ML_DSA_87_SIGNING;
+use aws_lc_rs::signature::PqdsaKeyPair;
+use aws_lc_rs::signature::PqdsaSigningAlgorithm;
+use aws_lc_rs::signature::PqdsaVerificationAlgorithm;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
 
@@ -324,7 +324,7 @@ pub(crate) fn mldsa_export_pkcs8(
   let p = params(variant)?;
   let key_pair = PqdsaKeyPair::from_seed(p.signing, seed)
     .map_err(|_| MlDsaError::InvalidKeyData)?;
-  let pkcs8 = key_pair.to_pkcs8().map_err(|_| MlDsaError::FailedExport)?;
+  let pkcs8 = key_pair.to_pkcs8v1().map_err(|_| MlDsaError::FailedExport)?;
   Ok(pkcs8.as_ref().to_vec())
 }
 
@@ -395,7 +395,7 @@ trait AsRawBytesVec {
   fn as_raw_bytes_vec(&self) -> Result<Vec<u8>, ()>;
 }
 
-impl AsRawBytesVec for aws_lc_rs::unstable::signature::PqdsaPrivateKey<'_> {
+impl AsRawBytesVec for aws_lc_rs::signature::PqdsaPrivateKey<'_> {
   fn as_raw_bytes_vec(&self) -> Result<Vec<u8>, ()> {
     use aws_lc_rs::encoding::AsRawBytes;
     let raw = self.as_raw_bytes().map_err(|_| ())?;

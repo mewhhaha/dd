@@ -11,6 +11,7 @@ arc-swap.workspace = true
 common = { path = "../common" }
 storage = { path = "../storage" }
 deno_core.workspace = true
+# The latest Deno crate family pins this shared error type exactly.
 deno_error = "=0.7.1"
 serde.workspace = true
 serde_json.workspace = true
@@ -21,28 +22,28 @@ tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 uuid.workspace = true
 reqwest.workspace = true
-getrandom = "0.4"
+getrandom = "0.4.3"
 base64.workspace = true
-bytes = "1"
-futures-util = "0.3"
-sha2 = "0.11"
-mime_guess = "2"
-regex = "1"
-deno_webidl = "0.254.0"
-deno_web = "0.285.0"
-deno_fetch = "0.278.0"
-deno_crypto = "0.268.0"
-deno_permissions = "0.113.0"
-hyper-util = { version = "0.1", features = ["client-legacy"] }
-rustls = "0.23"
-sys_traits = { version = "0.1.28", features = ["real", "libc"] }
+bytes = "1.12.1"
+futures-util = "0.3.34"
+sha2 = "0.11.0"
+mime_guess = "2.0.5"
+regex = "1.13.1"
+deno_webidl = "0.259.0"
+deno_web = "0.290.0"
+deno_fetch = "0.283.0"
+deno_crypto = "0.273.0"
+deno_permissions = "0.118.0"
+hyper-util = { version = "0.1.21", features = ["client-legacy"] }
+rustls = "0.23.45"
+sys_traits = { version = "0.1.29", features = ["real", "libc"] }
 
 [features]
 default = []
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry"]
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4.0.1"
 
 [build-dependencies]
-sha2 = "0.11"
+sha2 = "0.11.0"

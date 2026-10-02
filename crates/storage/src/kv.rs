@@ -462,16 +462,15 @@ impl KvStore {
             return Ok(Vec::new());
         }
         let mut entries = Vec::new();
-        let pattern = format!(
-            "{}%",
-            prefix
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
+        let upper = prefix_upper_bound(prefix);
+        let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         for shard in 0..STATE_SHARDS {
             let conn = self.state.read(shard).await?;
-            let mut rows = query_cached(&conn, "SELECT key, value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key LIKE ?3 ESCAPE '\\' ORDER BY key LIMIT ?4", (worker_name, binding, pattern.as_str(), i64::try_from(limit).unwrap_or(i64::MAX))).await.map_err(storage_error)?;
+            let mut rows = if let Some(upper) = &upper {
+                query_cached(&conn, "SELECT key, value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key >= ?3 AND key < ?4 ORDER BY key LIMIT ?5", (worker_name, binding, prefix, upper.as_str(), sql_limit)).await
+            } else {
+                query_cached(&conn, "SELECT key, value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key >= ?3 ORDER BY key LIMIT ?4", (worker_name, binding, prefix, sql_limit)).await
+            }.map_err(storage_error)?;
             while let Some(row) = rows.next().await.map_err(storage_error)? {
                 entries.push(KvEntry {
                     key: row.get(0).map_err(storage_error)?,
@@ -484,4 +483,18 @@ impl KvStore {
         entries.truncate(limit);
         Ok(entries)
     }
+}
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    for (index, character) in prefix.char_indices().rev() {
+        let next = match character {
+            '\u{10ffff}' => continue,
+            '\u{d7ff}' => '\u{e000}',
+            _ => char::from_u32(character as u32 + 1).expect("next Unicode scalar"),
+        };
+        let mut upper = prefix[..index].to_owned();
+        upper.push(next);
+        return Some(upper);
+    }
+    None
 }

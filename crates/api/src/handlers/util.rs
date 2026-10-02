@@ -372,6 +372,45 @@ pub(super) fn json_response<T: serde::Serialize>(
         .map_err(|error| PlatformError::internal(error.to_string()))
 }
 
+pub(super) async fn read_control_json_body<T, B>(
+    state: &AppState,
+    body: B,
+) -> Result<(T, tokio::sync::OwnedSemaphorePermit), PlatformError>
+where
+    T: serde::de::DeserializeOwned,
+    B: HttpBody<Data = Bytes> + Send,
+    B::Error: std::fmt::Display,
+{
+    read_admitted_json_body(
+        body,
+        state.invoke_max_body_bytes,
+        &state.control_body_admission,
+    )
+    .await
+}
+
+async fn read_admitted_json_body<T, B>(
+    body: B,
+    max_bytes: usize,
+    admission: &crate::state::ControlBodyAdmission,
+) -> Result<(T, tokio::sync::OwnedSemaphorePermit), PlatformError>
+where
+    T: serde::de::DeserializeOwned,
+    B: HttpBody<Data = Bytes> + Send,
+    B::Error: std::fmt::Display,
+{
+    let max_bytes = max_bytes.min(admission.max_buffered_bytes);
+    // Reserve the whole body before reading so partial uploads cannot exhaust
+    // the budget while each waits for more capacity to finish.
+    let permit = std::sync::Arc::clone(&admission.byte_budget)
+        .try_acquire_many_owned(max_bytes as u32)
+        .map_err(|_| PlatformError::overloaded("control upload byte budget exhausted"))?;
+    let payload = tokio::time::timeout(admission.timeout, read_json_body(body, max_bytes))
+        .await
+        .map_err(|_| PlatformError::bad_request("control request body deadline exceeded"))??;
+    Ok((payload, permit))
+}
+
 pub(super) async fn read_json_body<T, B>(body: B, max_bytes: usize) -> Result<T, PlatformError>
 where
     T: serde::de::DeserializeOwned,
@@ -393,4 +432,67 @@ where
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| PlatformError::bad_request(format!("invalid json: {error}")))
+}
+
+#[cfg(test)]
+mod control_body_tests {
+    use super::read_admitted_json_body;
+    use crate::state::ControlBodyAdmission;
+    use bytes::Bytes;
+    use common::ErrorKind;
+    use futures_util::stream;
+    use http_body_util::{Full, StreamBody};
+    use hyper::body::Frame;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn control_body_reservation_lasts_until_payload_processing_finishes() {
+        let admission = ControlBodyAdmission::new(4, Duration::from_secs(1)).unwrap();
+        let body = || Full::new(Bytes::from_static(b"{}"));
+        let (_, permit) = read_admitted_json_body::<serde_json::Value, _>(body(), 4, &admission)
+            .await
+            .unwrap();
+        assert_eq!(admission.byte_budget.available_permits(), 0);
+        let error = read_admitted_json_body::<serde_json::Value, _>(body(), 4, &admission)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Overloaded);
+        drop(permit);
+        assert_eq!(admission.byte_budget.available_permits(), 4);
+        assert!(
+            read_admitted_json_body::<serde_json::Value, _>(body(), 4, &admission)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_control_body_has_deadline_and_releases_reservation() {
+        let admission = ControlBodyAdmission::new(4, Duration::from_millis(10)).unwrap();
+        let body = StreamBody::new(stream::pending::<
+            Result<Frame<Bytes>, std::convert::Infallible>,
+        >());
+        let error = read_admitted_json_body::<serde_json::Value, _>(body, 4, &admission)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(admission.byte_budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn rejected_control_body_releases_reservation() {
+        let admission = ControlBodyAdmission::new(4, Duration::from_secs(1)).unwrap();
+        for bytes in [b"12345".as_slice(), b"{".as_slice()] {
+            assert!(
+                read_admitted_json_body::<serde_json::Value, _>(
+                    Full::new(Bytes::copy_from_slice(bytes)),
+                    4,
+                    &admission,
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(admission.byte_budget.available_permits(), 4);
+        }
+    }
 }

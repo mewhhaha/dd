@@ -2,6 +2,71 @@ use super::*;
 
 #[tokio::test]
 #[serial]
+async fn buffered_response_limit_cancels_endless_producer_before_completion() {
+    let service = test_service(RuntimeConfig {
+        max_isolates: 1,
+        max_response_body_bytes: 4,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "buffered-endless".into(),
+            r#"
+let canceled = false;
+let pulls = 0;
+export default {
+  fetch(request) {
+    if (new URL(request.url).pathname === '/state') {
+      return new Response(canceled ? 'yes' : 'no', { headers: { 'x-pulls': String(pulls) } });
+    }
+    return new Response(new ReadableStream({
+      pull(controller) { pulls++; controller.enqueue(new Uint8Array(3)); },
+      cancel() { canceled = true; },
+    }));
+  },
+};
+"#
+            .into(),
+        )
+        .await
+        .expect("endless producer deploys");
+    let error = timeout(
+        Duration::from_secs(2),
+        service.invoke("buffered-endless".into(), test_invocation()),
+    )
+    .await
+    .expect("size bound rejects before request wall timeout")
+    .expect_err("oversized response fails");
+    assert!(
+        error.to_string().contains("max_response_body_bytes"),
+        "{error}"
+    );
+    let state = service
+        .invoke(
+            "buffered-endless".into(),
+            test_invocation_with_path("/state", "after-body-limit"),
+        )
+        .await
+        .expect("isolate remains usable");
+    assert_eq!(state.body, b"yes");
+    let pulls: usize = state
+        .headers
+        .iter()
+        .find(|(name, _)| name == "x-pulls")
+        .expect("pull count is returned")
+        .1
+        .parse()
+        .unwrap();
+    assert!(
+        pulls <= 3,
+        "producer must stop on its second consumed chunk: {pulls}"
+    );
+    service.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test]
+#[serial]
 async fn an_unread_response_does_not_block_other_workers_or_cancellation() {
     let service = test_service(RuntimeConfig {
         max_isolates: 1,

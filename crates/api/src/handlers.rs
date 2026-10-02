@@ -207,11 +207,13 @@ pub use self::routing::{handle_private_request, handle_public_request};
 #[cfg(feature = "websocket")]
 use self::util::empty_body;
 use self::util::inject_current_trace_context;
+#[cfg(test)]
+use self::util::read_json_body;
 pub(crate) use self::util::{annotate_response_with_trace_id, full_body};
 use self::util::{
     append_safe_worker_headers, bearer_token_from_headers, json_response, private_auth_response,
     private_request_is_authorized, private_route_requires_auth, public_route_is_reserved,
-    read_json_body, respond, set_span_parent_from_http_headers, validate_deploy_bindings,
+    read_control_json_body, respond, set_span_parent_from_http_headers, validate_deploy_bindings,
     validate_internal_config, validate_worker_name,
 };
 use self::websocket::{

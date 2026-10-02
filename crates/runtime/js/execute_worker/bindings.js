@@ -415,7 +415,7 @@
     }
   };
 
-  const emitWaitUntilDone = async (timedOut) => {
+  const emitWaitUntilDone = async () => {
     await syncFrozenTime();
     const emitted = callOp(
       "op_emit_wait_until_done",
@@ -469,19 +469,13 @@
   };
 
   const waitForWaitUntils = async () => {
-    if (requestContext.waitUntilPromises.length === 0) {
-      return true;
-    }
-
-    let timeoutId = 0;
-    const timeout = new Promise((resolve) => {
-      timeoutId = setTimeout(() => resolve(false), 30_000);
-    });
-    const settled = Promise.allSettled(requestContext.waitUntilPromises).then(() => true);
-    try {
-      return await Promise.race([settled, timeout]);
-    } finally {
-      clearTimeout(timeoutId);
+    // The scheduler enforces the deadline from another thread, including while
+    // JavaScript is stuck in a CPU loop. Include work registered by earlier work.
+    let completed = 0;
+    while (completed < requestContext.waitUntilPromises.length) {
+      const batch = requestContext.waitUntilPromises.slice(completed);
+      completed += batch.length;
+      await Promise.allSettled(batch);
     }
   };
 
@@ -567,21 +561,33 @@
       }
       if (!isWebSocketAcceptResponse && response.body) {
         const reader = response.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
+            }
+            const chunk = toByteChunk(value);
+            if (chunk.length === 0) {
+              continue;
+            }
+            if (streamResponse) {
+              await emitResponseChunk(chunk);
+            } else {
+              if (bodyLength + chunk.byteLength > maxResponseBodyBytes) {
+                throw new Error(`response body exceeded max_response_body_bytes (${maxResponseBodyBytes} bytes)`);
+              }
+              bodyChunks.push(chunk);
+              bodyLength += chunk.byteLength;
+            }
           }
-          const chunk = toByteChunk(value);
-          if (chunk.length === 0) {
-            continue;
-          }
-          if (streamResponse) {
-            await emitResponseChunk(chunk);
-          } else {
-            bodyChunks.push(chunk);
-            bodyLength += chunk.byteLength;
-          }
+        } catch (error) {
+          // Start cancellation without letting an uncooperative cancel callback
+          // delay the size-limit failure delivered to the caller.
+          void reader.cancel(error).catch(() => undefined);
+          throw error;
+        } finally {
+          reader.releaseLock();
         }
       }
 
@@ -621,7 +627,8 @@
         Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0)),
       );
 
-      await emitWaitUntilDone(!(await waitForWaitUntils()));
+      await waitForWaitUntils();
+      await emitWaitUntilDone();
     })
     .catch(async (error) => {
       const message = String((error && (error.stack || error.message)) || error);
@@ -631,7 +638,8 @@
         message,
       );
 
-      await emitWaitUntilDone(!(await waitForWaitUntils()));
+      await waitForWaitUntils();
+      await emitWaitUntilDone();
     });
 };
 
@@ -671,6 +679,7 @@ globalThis.__dd_execute_worker_handle = (requestHandle) => {
       Math.trunc(Number(descriptor.request_body_stream_handle ?? 0) || 0),
     ),
     stream_response: descriptor.stream_response === true,
+    max_response_body_bytes: descriptor.max_response_body_bytes,
     method: String(descriptor.method ?? "GET"),
     url: String(descriptor.url ?? ""),
     headers: Array.isArray(headers) ? headers : [],

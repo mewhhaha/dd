@@ -25,110 +25,18 @@ fn generate_deno_js_extension() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"));
     let output_path = out_dir.join("dd_deno_js_extension.rs");
 
-    let entries = [
-        (
-            "ext:deno_webidl/00_webidl.js",
-            PathBuf::from("js/vendor/deno_webidl/00_webidl.js"),
-        ),
-        (
-            "ext:deno_web/00_url.js",
-            PathBuf::from("js/vendor/deno_web/00_url.js"),
-        ),
-        (
-            "ext:deno_web/00_infra.js",
-            PathBuf::from("js/vendor/deno_web/00_infra.js"),
-        ),
-        (
-            "ext:deno_web/01_console.js",
-            PathBuf::from("js/vendor/deno_web/01_console.js"),
-        ),
-        (
-            "ext:deno_web/01_dom_exception.js",
-            PathBuf::from("js/vendor/deno_web/01_dom_exception.js"),
-        ),
-        (
-            "ext:deno_web/01_mimesniff.js",
-            PathBuf::from("js/vendor/deno_web/01_mimesniff.js"),
-        ),
-        (
-            "ext:deno_web/01_urlpattern.js",
-            PathBuf::from("js/vendor/deno_web/01_urlpattern.js"),
-        ),
-        (
-            "ext:deno_web/02_event.js",
-            PathBuf::from("js/vendor/deno_web/02_event.js"),
-        ),
-        (
-            "ext:deno_web/02_structured_clone.js",
-            PathBuf::from("js/vendor/deno_web/02_structured_clone.js"),
-        ),
-        (
-            "ext:deno_web/03_abort_signal.js",
-            PathBuf::from("js/vendor/deno_web/03_abort_signal.js"),
-        ),
-        (
-            "ext:deno_web/06_streams.js",
-            PathBuf::from("js/vendor/deno_web/06_streams.js"),
-        ),
-        (
-            "ext:deno_web/08_text_encoding.js",
-            PathBuf::from("js/vendor/deno_web/08_text_encoding.js"),
-        ),
-        (
-            "ext:deno_web/09_file.js",
-            PathBuf::from("js/vendor/deno_web/09_file.js"),
-        ),
-        (
-            "ext:deno_web/12_location.js",
-            PathBuf::from("js/vendor/deno_web/12_location.js"),
-        ),
-        (
-            "ext:deno_web/15_performance.js",
-            PathBuf::from("js/vendor/deno_web/15_performance.js"),
-        ),
-        (
-            "ext:deno_fetch/20_headers.js",
-            PathBuf::from("js/vendor/deno_fetch/20_headers.js"),
-        ),
-        (
-            "ext:deno_fetch/21_formdata.js",
-            PathBuf::from("js/vendor/deno_fetch/21_formdata.js"),
-        ),
-        (
-            "ext:deno_fetch/22_body.js",
-            PathBuf::from("js/vendor/deno_fetch/22_body.js"),
-        ),
-        (
-            "ext:deno_fetch/22_http_client.js",
-            PathBuf::from("js/compat/dd_deno_runtime/http_client.js"),
-        ),
-        (
-            "ext:deno_fetch/23_request.js",
-            PathBuf::from("js/vendor/deno_fetch/23_request.js"),
-        ),
-        (
-            "ext:deno_fetch/23_response.js",
-            PathBuf::from("js/vendor/deno_fetch/23_response.js"),
-        ),
-        (
-            "ext:deno_fetch/26_fetch.js",
-            PathBuf::from("js/vendor/deno_fetch/26_fetch.js"),
-        ),
+    let entries = [(
+        "ext:dd_deno_runtime/init.js",
+        PathBuf::from("js/compat/dd_deno_runtime/init.js"),
+    )];
+    let compatibility_scripts = [
         (
             "ext:deno_telemetry/telemetry.ts",
-            PathBuf::from("js/compat/dd_deno_runtime/telemetry.ts"),
+            "js/compat/dd_deno_runtime/telemetry.ts",
         ),
         (
             "ext:deno_telemetry/util.ts",
-            PathBuf::from("js/compat/dd_deno_runtime/telemetry_util.ts"),
-        ),
-        (
-            "ext:deno_crypto/00_crypto.js",
-            PathBuf::from("../../patched-crates/deno_crypto/00_crypto.js"),
-        ),
-        (
-            "ext:dd_deno_runtime/init.js",
-            PathBuf::from("js/compat/dd_deno_runtime/init.js"),
+            "js/compat/dd_deno_runtime/telemetry_util.ts",
         ),
     ];
 
@@ -141,6 +49,13 @@ fn generate_deno_js_extension() {
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         generated.push_str(&format!("    {specifier:?} = {{ source = {source:?} }},\n"));
     }
+    generated.push_str("  ],\n  lazy_loaded_js = [\n");
+    for (specifier, path) in compatibility_scripts {
+        println!("cargo:rerun-if-changed={path}");
+        let source = fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {path}: {error}"));
+        generated.push_str(&format!("    {specifier:?} = {{ source = {source:?} }},\n"));
+    }
     generated.push_str("  ],\n);\n");
     generated.push_str(
         "\nfn dd_embedded_lazy_js_source(\n  specifier: &'static str,\n) -> Option<deno_core::ExtensionFileSource> {\n  match specifier {\n",
@@ -151,6 +66,12 @@ fn generate_deno_js_extension() {
             .and_then(|name| name.to_str())
             .unwrap_or_else(|| panic!("lazy JS source has no UTF-8 file name: {}", path.display()));
         let specifier = format!("ext:{extension}/{file_name}");
+        println!("cargo:rerun-if-changed={}", path.display());
+        let path = if specifier == "ext:deno_fetch/22_http_client.js" {
+            PathBuf::from("js/compat/dd_deno_runtime/http_client.js")
+        } else {
+            path
+        };
         println!("cargo:rerun-if-changed={}", path.display());
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));

@@ -28,6 +28,7 @@ import {
   normalizeDeploymentAssetsDir,
   normalizeDeploymentConfigOptions,
   relativeDeploymentAssetsDir,
+  stageDeploymentServerModules,
   resolveBuildOutputRoot,
   topLevelRuntimeConfig,
   uniqueStrings,
@@ -662,6 +663,7 @@ export function ddVitePlugin(options = {}) {
     }
     const outRoot = buildOutputRoot ?? resolveBuildOutputRoot(resolvedConfig, resolveFrameworkRoot());
     const clientAssetsRel = await resolveClientAssetsDir(outRoot);
+    const source = await sourceConfig();
     const manifestWorkers = [];
     for (const worker of workers) {
       const workerOutDir = join(outRoot, worker.outputName);
@@ -673,6 +675,7 @@ export function ddVitePlugin(options = {}) {
         configFile,
         clientAssetsRel,
       });
+      await stageDeploymentServerModules(config, source.dir, workerOutDir);
       await writeOutputFile(workerOutDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
       manifestWorkers.push({
         name: worker.name,

@@ -1,5 +1,5 @@
 import type { DdKvNamespace, DdMemoryNamespace, DdMemoryStub } from "@mewhhaha/vite-plugin-dd";
-import { Context, Effect, Either, Layer, Schedule, Schema } from "effect";
+import { Context, Effect, Option, Layer, Schedule, Schema } from "effect";
 import { internalError, tooManyRequests, unauthorized, type AppError } from "./errors";
 import { sessionCookie } from "./http";
 import { RequestContext, WorkerEnv } from "./runtime";
@@ -10,14 +10,13 @@ const AUDIT_INDEX_KEY = "auth:audit-index";
 const RATE_LIMIT = 5;
 const RATE_WINDOW_MS = 60_000;
 const CHALLENGE_TTL_MS = 300_000;
-const STORAGE_RETRY = Schedule.spaced("10 millis").pipe(Schedule.intersect(Schedule.recurs(2)));
-const TransportSchema = Schema.Literal("ble", "cable", "hybrid", "internal", "nfc", "smart-card", "usb");
+const STORAGE_RETRY = Schedule.max([Schedule.spaced("10 millis"), Schedule.recurs(2)]);
 const PasskeyCredentialSchema = Schema.Struct({
   id: Schema.NonEmptyString,
   publicKey: Schema.NonEmptyString,
-  counter: Schema.Number.pipe(Schema.nonNegative()),
-  transports: Schema.optional(Schema.Array(TransportSchema)),
-  deviceType: Schema.Literal("singleDevice", "multiDevice"),
+  counter: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
+  transports: Schema.optional(Schema.Array(Schema.NonEmptyString)),
+  deviceType: Schema.Literals(["singleDevice", "multiDevice"]),
   backedUp: Schema.Boolean,
   createdAt: Schema.NonEmptyString,
   lastUsedAt: Schema.optional(Schema.String),
@@ -26,7 +25,7 @@ const UserSchema = Schema.Struct({
   id: Schema.NonEmptyString,
   username: Schema.NonEmptyString,
   displayName: Schema.NonEmptyString,
-  role: Schema.Literal("admin", "viewer"),
+  role: Schema.Literals(["admin", "viewer"]),
   credentials: Schema.Array(PasskeyCredentialSchema),
   createdAt: Schema.NonEmptyString,
   updatedAt: Schema.NonEmptyString,
@@ -60,7 +59,7 @@ export type StorageService = {
   readonly recentAudit: Effect.Effect<AuditEvent[], AppError>;
 };
 
-export class Storage extends Context.Tag("vite-effect/Storage")<Storage, StorageService>() {}
+export class Storage extends Context.Service<Storage, StorageService>()("vite-effect/Storage") {}
 
 export const StorageLive = Layer.effect(Storage, Effect.gen(function* () {
   const env = yield* WorkerEnv;
@@ -317,12 +316,12 @@ function parseStringArray(value: unknown): string[] {
   return [...(decodeStored(StringArraySchema, value) ?? [])];
 }
 
-function decodeStored<A, I>(schema: Schema.Schema<A, I, never>, value: unknown): A | null {
+function decodeStored<A, I>(schema: Schema.Codec<A, I>, value: unknown): A | null {
   const parsed = parseStored(value);
   if (parsed === null) {
     return null;
   }
-  return Either.getOrNull(Schema.decodeUnknownEither(schema)(parsed));
+  return Option.getOrNull(Schema.decodeUnknownOption(schema)(parsed));
 }
 
 function parseStored(value: unknown): unknown | null {

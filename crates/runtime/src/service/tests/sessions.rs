@@ -2,6 +2,152 @@ use super::*;
 
 #[tokio::test]
 #[serial]
+async fn websocket_global_byte_lease_survives_queue_pop_across_workers() {
+    websocket_byte_lease_backpressure(true).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn websocket_session_byte_lease_survives_queue_pop() {
+    websocket_byte_lease_backpressure(false).await;
+}
+
+async fn websocket_byte_lease_backpressure(shared_global: bool) {
+    let frame_bytes = std::mem::size_of::<crate::service::model::WebSocketOutboundFrame>() + 4;
+    let service = test_service(RuntimeConfig {
+        max_global_isolates: 2,
+        max_isolates: 1,
+        max_buffered_websocket_bytes: if shared_global {
+            frame_bytes
+        } else {
+            2 * frame_bytes
+        },
+        max_buffered_websocket_bytes_per_session: frame_bytes,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    let mut sessions = HashMap::new();
+    for worker in ["socket-budget-a", "socket-budget-b"] {
+        service
+            .deploy_with_config(
+                worker.into(),
+                r#"
+export default {
+  async fetch(request, env) {
+    const room = env.CHAT.get('room');
+    if (new URL(request.url).pathname === '/send') {
+      await room.atomic(tx => {
+        for (const handle of tx.sockets.values()) tx.sockets.send(handle, 'data');
+      });
+      return new Response('ok');
+    }
+    return room.atomic(tx => tx.accept(request).response);
+  },
+};
+"#
+                .into(),
+                DeployConfig {
+                    bindings: vec![DeployBinding::Memory {
+                        binding: "CHAT".into(),
+                    }],
+                    ..DeployConfig::default()
+                },
+            )
+            .await
+            .expect("socket worker deploys");
+        let opened = service
+            .open_websocket(
+                worker.into(),
+                test_websocket_invocation("/ws", worker),
+                None,
+            )
+            .await
+            .expect("socket opens");
+        sessions.insert(worker, opened.session_id);
+    }
+    service
+        .invoke(
+            "socket-budget-a".into(),
+            test_invocation_with_path("/send", "first-send"),
+        )
+        .await
+        .expect("first durable message commits");
+    timeout(
+        Duration::from_secs(2),
+        service.websocket_wait_frame(
+            "socket-budget-a".into(),
+            sessions["socket-budget-a"].clone(),
+        ),
+    )
+    .await
+    .expect("first message is queued")
+    .unwrap();
+    let held = service
+        .websocket_drain_frame(
+            "socket-budget-a".into(),
+            sessions["socket-budget-a"].clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.body, b"data");
+
+    let target = if shared_global {
+        "socket-budget-b"
+    } else {
+        "socket-budget-a"
+    };
+    service
+        .invoke(
+            target.into(),
+            test_invocation_with_path("/send", "second-send"),
+        )
+        .await
+        .expect("second message commits while the first frame is in flight");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if service
+                .stats(target.into())
+                .await
+                .unwrap()
+                .memory_outbox_delivery_retry_count
+                > 0
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("durable message retries while the consumer retains the lease");
+    assert!(
+        service
+            .websocket_drain_frame(target.into(), sessions[target].clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "queue pop must not release the byte budget"
+    );
+    drop(held);
+    timeout(
+        Duration::from_secs(2),
+        service.websocket_wait_frame(target.into(), sessions[target].clone()),
+    )
+    .await
+    .expect("dropping the sent frame releases its permits")
+    .unwrap();
+    let retried = service
+        .websocket_drain_frame(target.into(), sessions[target].clone())
+        .await
+        .unwrap()
+        .expect("previously blocked durable message is delivered");
+    assert_eq!(retried.body, b"data");
+    drop(retried);
+    service.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test]
+#[serial]
 async fn only_snapshot_failures_close_live_memory_sockets() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -309,7 +455,7 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
         .expect("websocket message should succeed");
     assert_eq!(echoed.status, 204);
     assert_eq!(
-        String::from_utf8(echoed.body).expect("utf8"),
+        String::from_utf8(echoed.body.clone()).expect("utf8"),
         r#"{"seen":"ready","count":1}"#
     );
 
@@ -570,7 +716,7 @@ async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
         .expect("websocket message should succeed");
     assert_eq!(echoed.status, 204);
     assert_eq!(
-        String::from_utf8(echoed.body).expect("utf8"),
+        String::from_utf8(echoed.body.clone()).expect("utf8"),
         r#"{"seen":"idle","count":1}"#
     );
 
@@ -905,7 +1051,7 @@ async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() 
         .await
         .expect("first websocket message should succeed");
     assert_eq!(
-        String::from_utf8(first.body).expect("utf8"),
+        String::from_utf8(first.body.clone()).expect("utf8"),
         r#"{"seen":"first","count":1}"#
     );
 
@@ -919,7 +1065,7 @@ async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() 
         .await
         .expect("second websocket message should succeed");
     assert_eq!(
-        String::from_utf8(second.body).expect("utf8"),
+        String::from_utf8(second.body.clone()).expect("utf8"),
         r#"{"seen":"second","count":2}"#
     );
 
@@ -1024,7 +1170,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
     .expect("bob ready should not hang")
     .expect("bob ready should succeed");
     assert_eq!(bob_ready.status, 204);
-    let bob_ready_body = String::from_utf8(bob_ready.body).expect("utf8");
+    let bob_ready_body = String::from_utf8(bob_ready.body.clone()).expect("utf8");
     assert!(
         bob_ready_body.contains("alice"),
         "bob ready payload should include alice: {bob_ready_body}"
@@ -1046,7 +1192,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
     .expect("alice participant drain should succeed")
     .expect("alice should have a pending participant update");
     let alice_participants_body =
-        String::from_utf8(alice_participants.body).expect("participant payload utf8");
+        String::from_utf8(alice_participants.body.clone()).expect("participant payload utf8");
     assert!(
         alice_participants_body.contains("bob"),
         "alice participant payload should include bob: {alice_participants_body}"
@@ -1065,7 +1211,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
     .expect("alice message should not hang")
     .expect("alice message should succeed");
     assert_eq!(alice_message.status, 204);
-    let alice_message_body = String::from_utf8(alice_message.body).expect("utf8");
+    let alice_message_body = String::from_utf8(alice_message.body.clone()).expect("utf8");
     assert!(
         alice_message_body.contains("hello"),
         "alice message payload should include the sent message: {alice_message_body}"
@@ -1086,7 +1232,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
     .expect("bob message drain should not hang")
     .expect("bob message drain should succeed")
     .expect("bob should have a pending message update");
-    let bob_message_body = String::from_utf8(bob_message.body).expect("utf8");
+    let bob_message_body = String::from_utf8(bob_message.body.clone()).expect("utf8");
     assert!(
         bob_message_body.contains("hello"),
         "bob message payload should include the sent message: {bob_message_body}"
@@ -1213,7 +1359,7 @@ async fn chat_worker_refresh_replaces_prior_participant_socket() {
     .expect("refreshed message should not hang")
     .expect("refreshed message should succeed");
     let refreshed_message_body =
-        String::from_utf8(refreshed_message.body).expect("message payload utf8");
+        String::from_utf8(refreshed_message.body.clone()).expect("message payload utf8");
     assert!(
         refreshed_message_body.contains("after-refresh"),
         "refreshed message payload should include the sent message: {refreshed_message_body}"

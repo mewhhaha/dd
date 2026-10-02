@@ -6,4 +6,4 @@ publish = false
 version.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.189"

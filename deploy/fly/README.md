@@ -202,11 +202,11 @@ Deploy a generated Vite config through the public endpoint:
 
 ```bash
 export DD_TOKEN=dddt_...
-cargo run -p cli -- --server https://your-dd-app.fly.dev deploy-config dist/dd.deploy.json
+cargo run -p cli -- --server https://your-dd-app.fly.dev deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
 
 For local machines, put the public app URL in `dd.json` or the generated
-`dist/dd.deploy.json`, then store the token in the OS credential store:
+`dist/<entry-worker>/dd.deploy.json`, then store the token in the OS credential store:
 
 ```json
 {
@@ -216,13 +216,13 @@ For local machines, put the public app URL in `dd.json` or the generated
 
 ```bash
 cargo run -p cli -- auth login
-cargo run -p cli -- deploy-config dist/dd.deploy.json
+cargo run -p cli -- deploy-config dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
 
 Helper:
 
 ```bash
-DD_TOKEN=dddt_... just fly-worker-public-deploy-config your-dd-app dist/dd.deploy.json
+DD_TOKEN=dddt_... just fly-worker-public-deploy-config your-dd-app dist/<entry-worker>/dd.deploy.json --allow-outside-config-root
 ```
 
 ## 8) Public routing

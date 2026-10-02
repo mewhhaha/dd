@@ -673,13 +673,47 @@ impl WorkerManager {
             .get(&index_key)
             .cloned()
             .ok_or_else(|| PlatformError::not_found("websocket session not found"))?;
-        self.websocket_outbound_frames
+        // Charge frame metadata too, so empty and tiny messages are bounded.
+        let charged_bytes = message
+            .len()
+            .saturating_add(std::mem::size_of::<WebSocketOutboundFrame>());
+        if charged_bytes > self.config.max_buffered_websocket_bytes_per_session
+            || charged_bytes > self.config.max_buffered_websocket_bytes
+        {
+            self.close_memory_socket(
+                binding,
+                key,
+                handle,
+                1009,
+                "outbound message too large".into(),
+            )?;
+            return Err(PlatformError::bad_request(
+                "WebSocket outbound message exceeds byte limit",
+            ));
+        }
+        let queue = self
+            .websocket_outbound_frames
             .entry(session_id.clone())
-            .or_default()
-            .push_back(WebSocketOutboundFrame {
-                is_binary: !is_text,
-                payload: message,
+            .or_insert_with(|| {
+                WebSocketOutboundQueue::new(self.config.max_buffered_websocket_bytes_per_session)
             });
+        let session_permit = Arc::clone(&queue.byte_budget)
+            .try_acquire_many_owned(charged_bytes as u32)
+            .map_err(|_| {
+                PlatformError::overloaded("WebSocket session outbound byte budget is full")
+            })?;
+        let global_permit = Arc::clone(&self.admission.websocket_bytes)
+            .try_acquire_many_owned(charged_bytes as u32)
+            .map_err(|_| {
+                PlatformError::overloaded("WebSocket global outbound byte budget is full")
+            })?;
+        queue.frames.push_back(WebSocketOutboundFrame {
+            is_binary: !is_text,
+            payload: message,
+            lease: WebSocketFrameLease {
+                _permits: Some((session_permit, global_permit)),
+            },
+        });
         self.flush_pending_websocket_frame_replies(&session_id);
         self.notify_websocket_frame_waiters(&session_id);
         Ok(())

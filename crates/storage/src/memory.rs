@@ -11,6 +11,7 @@ use turso::Value;
 
 pub const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const MEMORY_ENTITY_MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn worker_namespace(worker: &str, binding: &str) -> String {
     format!("{}:{worker}{binding}", worker.len())
@@ -277,6 +278,14 @@ pub struct MemorySnapshot {
 }
 
 impl MemorySnapshot {
+    pub fn value_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.deleted)
+            .map(|entry| entry.value.len())
+            .sum()
+    }
+
     fn cache_bytes(&self, key: &MemorySnapshotKey) -> usize {
         key.0.len()
             + key.1.len()

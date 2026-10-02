@@ -306,7 +306,7 @@ fn front_response_is_cacheable(output: &WorkerOutput) -> bool {
 }
 
 async fn maybe_store_front_cache(state: &AppState, request: &CacheRequest, output: &WorkerOutput) {
-    if !front_response_is_cacheable(output) {
+    if request.method != "GET" || !front_response_is_cacheable(output) {
         return;
     }
     let _ = state
@@ -325,7 +325,7 @@ async fn maybe_store_front_cache(state: &AppState, request: &CacheRequest, outpu
 async fn spawn_front_cache_revalidation(
     state: AppState,
     worker_name: String,
-    invocation: WorkerInvocation,
+    mut invocation: WorkerInvocation,
     mut cache_request: CacheRequest,
 ) {
     let key = format!("{worker_name}:{}", cache_request.url);
@@ -338,6 +338,12 @@ async fn spawn_front_cache_revalidation(
         return;
     }
     cache_request.bypass_stale = true;
+    // A HEAD response contains no representation body. Refresh the GET entry
+    // so a HEAD cache hit can advance the same cache used by GET requests.
+    if invocation.method == "HEAD" {
+        invocation.method = "GET".into();
+        cache_request.method = "GET".into();
+    }
     tokio::spawn(async move {
         if let Ok(output) = state.runtime.invoke(worker_name, invocation).await {
             maybe_store_front_cache(&state, &cache_request, &output).await;
@@ -351,12 +357,14 @@ fn build_front_cached_response(
     method: &str,
     status: &'static str,
 ) -> ApiResult<Response<ResponseBody>> {
+    let content_length = Some(response.body.len() as u64);
     build_front_response(
         response.status,
         response.headers,
         response.body,
         method,
         status,
+        content_length,
     )
 }
 
@@ -365,12 +373,22 @@ fn build_front_origin_response(
     method: &str,
     status: &'static str,
 ) -> ApiResult<Response<ResponseBody>> {
+    let content_length = if method == "HEAD" {
+        output
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+    } else {
+        Some(output.body.len() as u64)
+    };
     build_front_response(
         output.status,
         output.headers,
         output.body.into(),
         method,
         status,
+        content_length,
     )
 }
 
@@ -380,19 +398,21 @@ fn build_front_response(
     body: Bytes,
     method: &str,
     cache_status: &'static str,
+    content_length: Option<u64>,
 ) -> ApiResult<Response<ResponseBody>> {
-    let content_length = body.len();
     let response_body = if method == "HEAD" { Bytes::new() } else { body };
     let mut response = Response::builder()
         .status(status_code)
         .body(full_body(response_body))
         .map_err(|error| PlatformError::internal(error.to_string()))?;
     append_safe_worker_headers(response.headers_mut(), headers);
-    response.headers_mut().insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&content_length.to_string())
-            .map_err(|error| PlatformError::internal(error.to_string()))?,
-    );
+    if let Some(content_length) = content_length {
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&content_length.to_string())
+                .map_err(|error| PlatformError::internal(error.to_string()))?,
+        );
+    }
     response
         .headers_mut()
         .insert("x-dd-cache", HeaderValue::from_static(cache_status));

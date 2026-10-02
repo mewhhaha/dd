@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
+FROM rust:1.99-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -21,6 +21,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY scripts ./scripts
 COPY patches ./patches
 RUN ./scripts/patch-crate.sh deno_crypto
+RUN ./scripts/patch-crate.sh deno_tls
 COPY crates ./crates
 
 RUN --mount=type=cache,id=dd-cargo-registry,target=/usr/local/cargo/registry \

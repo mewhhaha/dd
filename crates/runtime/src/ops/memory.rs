@@ -141,10 +141,10 @@ pub(super) async fn op_memory_read_begin(
             started.elapsed().as_micros() as u64,
             1,
         );
-        let value_bytes: usize = snapshot.entries.iter().map(|entry| entry.value.len()).sum();
-        if value_bytes > MEMORY_BATCH_MAX_STAGED_BYTES {
+        if snapshot.value_bytes() > storage::memory::MEMORY_ENTITY_MAX_VALUE_BYTES {
             return Err(PlatformError::bad_request(format!(
-                "memory snapshot exceeded {MEMORY_BATCH_MAX_STAGED_BYTES} bytes"
+                "memory snapshot exceeded {} bytes",
+                storage::memory::MEMORY_ENTITY_MAX_VALUE_BYTES
             )));
         }
         let mut op_state = state.borrow_mut();
@@ -268,7 +268,7 @@ fn memory_batch_commit_owner_epoch(batch: &MemoryBatchHandle) -> Result<i64> {
 
 const MEMORY_BATCH_MAX_MUTATIONS: usize = 1024;
 const MEMORY_BATCH_MAX_EFFECTS: usize = 256;
-const MEMORY_BATCH_MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
+const MEMORY_BATCH_MAX_STAGED_BYTES: usize = storage::memory::MEMORY_ENTITY_MAX_VALUE_BYTES;
 const MEMORY_BATCH_MAX_KEY_BYTES: usize = 4096;
 const MEMORY_BATCH_MAX_EFFECT_KIND_BYTES: usize = 256;
 const MEMORY_MAX_COMMAND_HANDLES_PER_REQUEST: usize = 128;
@@ -498,15 +498,8 @@ pub(super) async fn op_memory_batch_begin(
         started.elapsed().as_micros() as u64,
         1,
     );
-    let value_bytes: usize = snapshot.entries.iter().map(|entry| entry.value.len()).sum();
-    if value_bytes > MEMORY_BATCH_MAX_STAGED_BYTES {
-        return MemoryBeginResult {
-            ok: false,
-            storage_failure: true,
-            handle: 0,
-            error: format!("memory snapshot exceeded {MEMORY_BATCH_MAX_STAGED_BYTES} bytes"),
-        };
-    }
+    // Existing oversized entities must remain writable so a callback can delete
+    // or shrink their values. Storage checks the projected size before commit.
     if state
         .borrow()
         .borrow::<RequestSecretContexts>()

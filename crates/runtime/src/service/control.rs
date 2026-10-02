@@ -84,7 +84,7 @@ pub(crate) enum RuntimeCommand {
         session_id: String,
         frame: Vec<u8>,
         is_binary: bool,
-        reply: oneshot::Sender<Result<WorkerOutput>>,
+        reply: oneshot::Sender<Result<WebSocketFrameOutput>>,
     },
     WaitWebsocketFrame {
         worker_name: String,
@@ -94,7 +94,7 @@ pub(crate) enum RuntimeCommand {
     DrainWebsocketFrame {
         worker_name: String,
         session_id: String,
-        reply: oneshot::Sender<Result<Option<WorkerOutput>>>,
+        reply: oneshot::Sender<Result<Option<WebSocketFrameOutput>>>,
     },
     CloseWebsocket {
         worker_name: String,
@@ -352,7 +352,7 @@ impl WorkerManager {
                         target_isolate_id: None,
                         target_generation: None,
                         internal_origin: false,
-                        reply,
+                        reply: reply.into(),
                         reply_kind: PendingReplyKind::Normal,
                     },
                     event_tx,
@@ -380,7 +380,7 @@ impl WorkerManager {
                         target_isolate_id: None,
                         target_generation: None,
                         internal_origin: false,
-                        reply,
+                        reply: reply.into(),
                         reply_kind: PendingReplyKind::Stream,
                     },
                     event_tx,
@@ -422,7 +422,7 @@ impl WorkerManager {
                     let _ = reply.send(Err(PlatformError::not_found("Worker not found")));
                     return true;
                 }
-                let (inner_tx, _inner_rx) = oneshot::channel();
+                let (inner_tx, _inner_rx) = oneshot::channel::<Result<WorkerOutput>>();
                 append_or_update_header(
                     &mut request.headers,
                     INTERNAL_WS_SESSION_HEADER,
@@ -443,7 +443,7 @@ impl WorkerManager {
                         target_isolate_id: None,
                         target_generation: None,
                         internal_origin: false,
-                        reply: inner_tx,
+                        reply: inner_tx.into(),
                         reply_kind: PendingReplyKind::WebsocketOpen { session_id },
                     },
                     event_tx,
@@ -785,7 +785,7 @@ impl WorkerManager {
                 target_isolate_id: None,
                 target_generation: Some(generation),
                 internal_origin: true,
-                reply,
+                reply: reply.into(),
                 reply_kind: PendingReplyKind::WebsocketFrame {
                     session_id: session_id.to_string(),
                 },
@@ -837,7 +837,7 @@ impl WorkerManager {
             body: Vec::new(),
             request_id: format!("ws-close-{runtime_request_id}"),
         };
-        let (reply, receiver) = oneshot::channel();
+        let (reply, receiver) = oneshot::channel::<Result<WorkerOutput>>();
         self.enqueue_invoke(
             EnqueueInvokeRequest {
                 queue_admission: None,
@@ -850,7 +850,7 @@ impl WorkerManager {
                 target_isolate_id: None,
                 target_generation: Some(session.generation),
                 internal_origin: true,
-                reply,
+                reply: reply.into(),
                 reply_kind: PendingReplyKind::Normal,
             },
             event_tx,
@@ -916,7 +916,7 @@ impl WorkerManager {
         &mut self,
         worker_name: &str,
         session_id: &str,
-    ) -> Result<Option<WorkerOutput>> {
+    ) -> Result<Option<WebSocketFrameOutput>> {
         let Some(session) = self.websocket_sessions.get(session_id) else {
             return Err(PlatformError::not_found("websocket session not found"));
         };
@@ -926,11 +926,11 @@ impl WorkerManager {
             ));
         }
 
-        let mut output = WorkerOutput {
+        let mut output = WebSocketFrameOutput::from(WorkerOutput {
             status: 204,
             headers: Vec::new(),
             body: Vec::new(),
-        };
+        });
         let mut has_output = false;
 
         if let Some(frame) = self
@@ -939,21 +939,22 @@ impl WorkerManager {
             .and_then(|queue| queue.pop_front())
         {
             has_output = true;
-            output.body = frame.payload;
+            output.output.body = frame.payload;
+            output.lease = frame.lease;
             if frame.is_binary {
-                append_or_update_header(&mut output.headers, INTERNAL_WS_BINARY_HEADER, "1");
+                append_or_update_header(&mut output.output.headers, INTERNAL_WS_BINARY_HEADER, "1");
             }
         }
 
         if let Some(close) = self.websocket_close_signals.remove(session_id) {
             has_output = true;
             append_or_update_header(
-                &mut output.headers,
+                &mut output.output.headers,
                 INTERNAL_WS_CLOSE_CODE_HEADER,
                 close.code.to_string().as_str(),
             );
             append_or_update_header(
-                &mut output.headers,
+                &mut output.output.headers,
                 INTERNAL_WS_CLOSE_REASON_HEADER,
                 &close.reason,
             );
@@ -969,7 +970,7 @@ impl WorkerManager {
     pub(super) fn complete_websocket_frame(
         &mut self,
         session_id: String,
-        reply: Option<oneshot::Sender<Result<WorkerOutput>>>,
+        reply: Option<InvocationReply>,
         result: Result<WorkerOutput>,
         wait_for_outbox_frame: bool,
     ) {
@@ -977,8 +978,10 @@ impl WorkerManager {
             return;
         };
         match result {
-            Ok(mut output) => {
-                output.headers = strip_websocket_frame_internal_headers(&output.headers);
+            Ok(output) => {
+                let mut output = WebSocketFrameOutput::from(output);
+                output.output.headers =
+                    strip_websocket_frame_internal_headers(&output.output.headers);
                 let mut has_outbox_output = false;
                 if let Some(frame) = self
                     .websocket_outbound_frames
@@ -986,15 +989,16 @@ impl WorkerManager {
                     .and_then(|queue| queue.pop_front())
                 {
                     has_outbox_output = true;
-                    output.body = frame.payload;
+                    output.output.body = frame.payload;
+                    output.lease = frame.lease;
                     if frame.is_binary {
                         append_or_update_header(
-                            &mut output.headers,
+                            &mut output.output.headers,
                             INTERNAL_WS_BINARY_HEADER,
                             "1",
                         );
                     } else {
-                        output.headers.retain(|(name, _)| {
+                        output.output.headers.retain(|(name, _)| {
                             !name.eq_ignore_ascii_case(INTERNAL_WS_BINARY_HEADER)
                         });
                     }
@@ -1002,12 +1006,12 @@ impl WorkerManager {
                 if let Some(close) = self.websocket_close_signals.remove(&session_id) {
                     has_outbox_output = true;
                     append_or_update_header(
-                        &mut output.headers,
+                        &mut output.output.headers,
                         INTERNAL_WS_CLOSE_CODE_HEADER,
                         close.code.to_string().as_str(),
                     );
                     append_or_update_header(
-                        &mut output.headers,
+                        &mut output.output.headers,
                         INTERNAL_WS_CLOSE_REASON_HEADER,
                         &close.reason,
                     );
@@ -1019,7 +1023,7 @@ impl WorkerManager {
                         .push(WebSocketFrameReply { output, reply });
                     return;
                 }
-                let _ = reply.send(Ok(output));
+                let _ = reply.send_websocket(Ok(output));
             }
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -1039,11 +1043,17 @@ impl WorkerManager {
                 .and_then(|queue| queue.pop_front())
             {
                 has_output = true;
-                output.body = frame.payload;
+                output.output.body = frame.payload;
+                output.lease = frame.lease;
                 if frame.is_binary {
-                    append_or_update_header(&mut output.headers, INTERNAL_WS_BINARY_HEADER, "1");
+                    append_or_update_header(
+                        &mut output.output.headers,
+                        INTERNAL_WS_BINARY_HEADER,
+                        "1",
+                    );
                 } else {
                     output
+                        .output
                         .headers
                         .retain(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_BINARY_HEADER));
                 }
@@ -1051,18 +1061,18 @@ impl WorkerManager {
             if let Some(close) = self.websocket_close_signals.remove(session_id) {
                 has_output = true;
                 append_or_update_header(
-                    &mut output.headers,
+                    &mut output.output.headers,
                     INTERNAL_WS_CLOSE_CODE_HEADER,
                     close.code.to_string().as_str(),
                 );
                 append_or_update_header(
-                    &mut output.headers,
+                    &mut output.output.headers,
                     INTERNAL_WS_CLOSE_REASON_HEADER,
                     &close.reason,
                 );
             }
             if has_output {
-                let _ = reply.send(Ok(output));
+                let _ = reply.send_websocket(Ok(output));
             } else {
                 self.websocket_pending_frame_replies
                     .entry(session_id.to_string())

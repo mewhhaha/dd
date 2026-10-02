@@ -1,5 +1,5 @@
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const CONFIG_SCHEMA_VERSION = 1;
@@ -185,6 +185,25 @@ export async function writeOutputFile(outDir, file, contents) {
   const path = join(outDir, file);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, contents);
+}
+
+export async function stageDeploymentServerModules(deployment, sourceDir, outDir) {
+  for (const [index, module] of (deployment.server_modules ?? []).entries()) {
+    const source = module.file ?? module.path;
+    if (typeof source !== "string" || !source.trim()) {
+      throw new Error(`server_modules[${index}].file must be a non-empty file path`);
+    }
+    const sourcePath = resolve(sourceDir, source);
+    const metadata = await lstat(sourcePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`server_modules[${index}].file must be a regular file without symlinks: ${sourcePath}`);
+    }
+    const stagedFile = joinConfigRelativePath("server-modules", `${index}-${basename(sourcePath)}`);
+    const stagedPath = join(outDir, stagedFile);
+    await mkdir(dirname(stagedPath), { recursive: true });
+    await copyFile(sourcePath, stagedPath);
+    module.file = stagedFile;
+  }
 }
 
 export async function writeGeneratedStaticRoutes(outDir, deploymentConfig) {
@@ -412,7 +431,7 @@ export async function loadDeploymentConfigInput(input, root) {
     return { config: cloneJson(await input()), dir: root, path: undefined };
   }
   if (typeof input === "string" || input instanceof URL) {
-    const path = normalizeFile(input);
+    const path = input instanceof URL ? fileURLToPath(input) : resolve(root, input);
     const source = await readFile(path, "utf8");
     return {
       config: parseDdConfig(source, path),

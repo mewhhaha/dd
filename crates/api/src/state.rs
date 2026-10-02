@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 use crate::deploy_tokens::DeployTokenStore;
 use runtime::RuntimeService;
@@ -135,11 +135,40 @@ impl Drop for ActiveRequestGuard {
 }
 
 #[derive(Clone)]
+pub struct ControlBodyAdmission {
+    pub byte_budget: Arc<Semaphore>,
+    pub max_buffered_bytes: usize,
+    pub timeout: Duration,
+}
+
+impl ControlBodyAdmission {
+    pub fn new(max_buffered_bytes: usize, timeout: Duration) -> common::Result<Self> {
+        if max_buffered_bytes == 0 || max_buffered_bytes > u32::MAX as usize || timeout.is_zero() {
+            return Err(common::PlatformError::bad_request(
+                "control body byte budget and timeout must be positive; byte budget must fit u32",
+            ));
+        }
+        Ok(Self {
+            byte_budget: Arc::new(Semaphore::new(max_buffered_bytes)),
+            max_buffered_bytes,
+            timeout,
+        })
+    }
+}
+
+impl Default for ControlBodyAdmission {
+    fn default() -> Self {
+        Self::new(64 * 1024 * 1024, Duration::from_secs(30)).expect("valid control body limits")
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub runtime: RuntimeService,
     pub deploy_tokens: DeployTokenStore,
     pub front_cache_revalidations: Arc<Mutex<HashSet<String>>>,
     pub invoke_max_body_bytes: usize,
+    pub control_body_admission: ControlBodyAdmission,
     pub public_base_domain: String,
     pub private_bearer_token: Option<String>,
     pub websocket_sessions: Arc<Mutex<HashMap<String, WebSocketSession>>>,
@@ -159,6 +188,7 @@ impl AppState {
             deploy_tokens,
             front_cache_revalidations: Arc::new(Mutex::new(HashSet::new())),
             invoke_max_body_bytes,
+            control_body_admission: ControlBodyAdmission::default(),
             public_base_domain: public_base_domain.trim().to_ascii_lowercase(),
             private_bearer_token,
             websocket_sessions: Arc::new(Mutex::new(HashMap::new())),

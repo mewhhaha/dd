@@ -155,6 +155,16 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
             "max_queue_wait must be greater than 0",
         ));
     }
+    if config.max_buffered_websocket_bytes == 0
+        || config.max_buffered_websocket_bytes > u32::MAX as usize
+        || config.max_buffered_websocket_bytes > tokio::sync::Semaphore::MAX_PERMITS
+        || config.max_buffered_websocket_bytes_per_session == 0
+        || config.max_buffered_websocket_bytes_per_session > config.max_buffered_websocket_bytes
+    {
+        return Err(PlatformError::internal(
+            "WebSocket byte limits must satisfy 0 < per-session <= global <= semaphore/u32 capacity",
+        ));
+    }
     if config.request_wall_timeout.is_zero() {
         return Err(PlatformError::internal(
             "request_wall_timeout must be greater than 0",

@@ -2,6 +2,64 @@ use super::*;
 
 #[tokio::test]
 #[serial]
+async fn wait_until_cpu_loop_releases_global_capacity_at_native_deadline() {
+    let service = test_service(RuntimeConfig {
+        max_global_isolates: 1,
+        max_isolates: 1,
+        request_wall_timeout: Duration::from_millis(200),
+        scale_tick: Duration::from_millis(10),
+        idle_ttl: Duration::from_secs(3600),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "background-loop".into(),
+            r#"
+export default {
+  fetch(_request, _env, ctx) {
+    ctx.waitUntil(Deno.core.ops.op_sleep(50).then(() => { while (true) {} }));
+    return new Response("returned");
+  },
+};
+"#
+            .into(),
+        )
+        .await
+        .expect("background worker deploys");
+    service
+        .deploy(
+            "healthy-after-background".into(),
+            "export default { fetch() { return new Response('healthy'); } };".into(),
+        )
+        .await
+        .expect("healthy worker deploys");
+    let first = timeout(
+        Duration::from_secs(2),
+        service.invoke("background-loop".into(), test_invocation()),
+    )
+    .await
+    .expect("response arrives before background CPU loop")
+    .expect("response succeeds");
+    assert_eq!(first.body, b"returned");
+    let recovered = timeout(
+        Duration::from_secs(3),
+        service.invoke("healthy-after-background".into(), test_invocation()),
+    )
+    .await;
+    // Stop the looping isolate even if the regression assertion fails.
+    service.shutdown().await.expect("runtime shuts down");
+    assert_eq!(
+        recovered
+            .expect("native deadline releases the global isolate permit")
+            .expect("another worker receives capacity")
+            .body,
+        b"healthy"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn a_service_call_to_its_own_worker_can_use_reserved_capacity() {
     let service = test_service(RuntimeConfig {
         max_global_isolates: 1,

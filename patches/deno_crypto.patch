@@ -1,17 +1,15 @@
 --- a/00_crypto.js
 +++ b/00_crypto.js
-@@ -13,8 +13,8 @@
+@@ -13,7 +13,7 @@
  // singletons (cppgc allocations can't run at snapshot-build time), the
  // structured-clone resurrection callback, and the small `deriveBits`
  // forwarder that gives the spec-mandated `Function.length === 2`.
 -
--(function () {
 +//
-+const ddCrypto = (function () {
+ (function () {
  const { core, primordials, internals } = __bootstrap;
  const {
-   Crypto,
-@@ -34,7 +34,9 @@
+@@ -37,7 +37,9 @@
  const { createFilteredInspectProxy } = core.loadExtScript(
    "ext:deno_web/01_console.js",
  );
@@ -19,45 +17,65 @@
 +// dd does not embed deno_node, which normally installs this private symbol.
 +// WebCrypto only needs a stable symbol shared by its own objects.
 +const kKeyObject = SymbolFor("dd.crypto.kKeyObject");
- 
+
  // op2-generated interface constructors expose the macro's internal
  // new-target signal (`_: bool`) as a formal parameter, giving the
-@@ -298,3 +300,24 @@
-   SubtleCrypto,
- };
- })();
-+
-+const {
-+  Crypto,
-+  CryptoKey,
-+  cryptoKeyExportNodeKeyMaterial,
-+  importCryptoKeySync,
-+  SubtleCrypto,
-+} = ddCrypto;
-+
-+function getCrypto() {
-+  return ddCrypto.crypto;
-+}
-+
-+export {
-+  Crypto,
-+  CryptoKey,
-+  cryptoKeyExportNodeKeyMaterial,
-+  getCrypto,
-+  importCryptoKeySync,
-+  SubtleCrypto,
-+};
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -31,7 +31,7 @@
  path = "lib.rs"
- 
+
  [dependencies.aes]
 -version = "=0.8.3"
 +version = "0.8.4"
- 
+
  [dependencies.aes-gcm]
  version = "0.10"
+--- a/mldsa.rs
++++ b/mldsa.rs
+@@ -2,15 +2,15 @@
+
+ use aws_lc_rs::signature::KeyPair;
+ use aws_lc_rs::signature::UnparsedPublicKey;
+-use aws_lc_rs::unstable::signature::ML_DSA_44;
+-use aws_lc_rs::unstable::signature::ML_DSA_44_SIGNING;
+-use aws_lc_rs::unstable::signature::ML_DSA_65;
+-use aws_lc_rs::unstable::signature::ML_DSA_65_SIGNING;
+-use aws_lc_rs::unstable::signature::ML_DSA_87;
+-use aws_lc_rs::unstable::signature::ML_DSA_87_SIGNING;
+-use aws_lc_rs::unstable::signature::PqdsaKeyPair;
+-use aws_lc_rs::unstable::signature::PqdsaSigningAlgorithm;
+-use aws_lc_rs::unstable::signature::PqdsaVerificationAlgorithm;
++use aws_lc_rs::signature::ML_DSA_44;
++use aws_lc_rs::signature::ML_DSA_44_SIGNING;
++use aws_lc_rs::signature::ML_DSA_65;
++use aws_lc_rs::signature::ML_DSA_65_SIGNING;
++use aws_lc_rs::signature::ML_DSA_87;
++use aws_lc_rs::signature::ML_DSA_87_SIGNING;
++use aws_lc_rs::signature::PqdsaKeyPair;
++use aws_lc_rs::signature::PqdsaSigningAlgorithm;
++use aws_lc_rs::signature::PqdsaVerificationAlgorithm;
+ use spki::der::Encode;
+ use spki::der::asn1::BitString;
+
+@@ -324,7 +324,7 @@
+   let p = params(variant)?;
+   let key_pair = PqdsaKeyPair::from_seed(p.signing, seed)
+     .map_err(|_| MlDsaError::InvalidKeyData)?;
+-  let pkcs8 = key_pair.to_pkcs8().map_err(|_| MlDsaError::FailedExport)?;
++  let pkcs8 = key_pair.to_pkcs8v1().map_err(|_| MlDsaError::FailedExport)?;
+   Ok(pkcs8.as_ref().to_vec())
+ }
+
+@@ -395,7 +395,7 @@
+   fn as_raw_bytes_vec(&self) -> Result<Vec<u8>, ()>;
+ }
+
+-impl AsRawBytesVec for aws_lc_rs::unstable::signature::PqdsaPrivateKey<'_> {
++impl AsRawBytesVec for aws_lc_rs::signature::PqdsaPrivateKey<'_> {
+   fn as_raw_bytes_vec(&self) -> Result<Vec<u8>, ()> {
+     use aws_lc_rs::encoding::AsRawBytes;
+     let raw = self.as_raw_bytes().map_err(|_| ())?;
 --- a/subtle_generate_key.rs
 +++ b/subtle_generate_key.rs
 @@ -190,8 +190,11 @@

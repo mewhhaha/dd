@@ -429,12 +429,13 @@ async fn deliver_websocket_output<S>(
     runtime: &runtime::RuntimeService,
     worker_name: &str,
     session_id: &str,
-    output: WorkerOutput,
+    output: runtime::WebSocketFrameOutput,
     fallback_binary: bool,
 ) -> std::result::Result<(), ()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let (output, _byte_lease) = output.into_parts();
     if let Some((close_code, close_reason)) = extract_websocket_close_signal(&output.headers) {
         let _ = sender
             .send(Message::Close(Some(CloseFrame {
@@ -473,15 +474,11 @@ where
         return Ok(());
     }
 
-    if let Ok(body) = String::from_utf8(output.body.clone()) {
-        if sender.send(Message::Text(body.into())).await.is_err() {
-            return Err(());
-        }
-    } else if sender
-        .send(Message::Binary(output.body.into()))
-        .await
-        .is_err()
-    {
+    let message = match String::from_utf8(output.body) {
+        Ok(body) => Message::Text(body.into()),
+        Err(error) => Message::Binary(error.into_bytes().into()),
+    };
+    if sender.send(message).await.is_err() {
         return Err(());
     }
 

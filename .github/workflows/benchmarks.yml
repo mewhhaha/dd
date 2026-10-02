@@ -26,7 +26,7 @@ jobs:
       DD_BENCH_SAMPLES: ${{ inputs.samples || '3' }}
       DD_BENCH_ALLOW_LARGE_RUN: ${{ inputs.allow_large_run || 'false' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
       - name: Plan benchmark smoke matrix
@@ -56,7 +56,7 @@ jobs:
             --results benchmarks/results/memory-smoke.json \
             --policy benchmarks/baselines/memory-scaling-policy.json \
             | tee "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: memory-smoke-benchmark
@@ -70,14 +70,14 @@ jobs:
     env:
       DD_BENCH_SAMPLES: ${{ inputs.samples || '3' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
       - name: Configure benchmark target directory
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/dd-benchmark-target" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.94.0
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: scheduled-production-benchmarks
@@ -111,7 +111,7 @@ jobs:
             --baseline "${RUNNER_TEMP}/dd-baseline.json" \
             --candidate "${RUNNER_TEMP}/dd-candidate.json" \
             | tee "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: production-regression-benchmarks

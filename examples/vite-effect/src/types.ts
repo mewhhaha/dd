@@ -1,5 +1,4 @@
 import type { DdKvNamespace, DdMemoryNamespace } from "@mewhhaha/vite-plugin-dd";
-import type { AuthenticatorTransportFuture } from "@simplewebauthn/server";
 
 export type ServiceBinding = {
   readonly worker?: string;
@@ -24,7 +23,7 @@ export type PasskeyCredential = {
   id: string;
   publicKey: string;
   counter: number;
-  transports?: AuthenticatorTransportFuture[];
+  transports?: string[];
   deviceType: "singleDevice" | "multiDevice";
   backedUp: boolean;
   createdAt: string;

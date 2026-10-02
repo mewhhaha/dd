@@ -25,7 +25,7 @@ pub(super) struct WorkerManager {
     pub(super) websocket_handle_index: HashMap<String, String>,
     pub(super) websocket_open_handles: HashMap<String, HashSet<String>>,
     pub(super) open_handle_registry: crate::ops::MemoryOpenHandleRegistry,
-    pub(super) websocket_outbound_frames: HashMap<String, VecDeque<WebSocketOutboundFrame>>,
+    pub(super) websocket_outbound_frames: HashMap<String, WebSocketOutboundQueue>,
     pub(super) websocket_close_signals: HashMap<String, SocketCloseEvent>,
     pub(super) websocket_frame_waiters: HashMap<String, Vec<oneshot::Sender<Result<()>>>>,
     pub(super) websocket_pending_frame_replies: HashMap<String, Vec<WebSocketFrameReply>>,
@@ -158,10 +158,70 @@ pub(super) struct SocketCloseEvent {
     pub(super) reason: String,
 }
 
-#[derive(Clone)]
 pub(super) struct WebSocketOutboundFrame {
     pub(super) is_binary: bool,
     pub(super) payload: Vec<u8>,
+    pub(super) lease: WebSocketFrameLease,
+}
+
+pub(super) struct WebSocketOutboundQueue {
+    pub(super) frames: VecDeque<WebSocketOutboundFrame>,
+    pub(super) byte_budget: Arc<tokio::sync::Semaphore>,
+}
+
+impl WebSocketOutboundQueue {
+    pub(super) fn new(byte_limit: usize) -> Self {
+        Self {
+            frames: VecDeque::new(),
+            byte_budget: Arc::new(tokio::sync::Semaphore::new(byte_limit)),
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    pub(super) fn pop_front(&mut self) -> Option<WebSocketOutboundFrame> {
+        self.frames.pop_front()
+    }
+}
+
+pub(super) enum InvocationReply {
+    Worker(oneshot::Sender<Result<WorkerOutput>>),
+    WebSocket(oneshot::Sender<Result<WebSocketFrameOutput>>),
+}
+
+impl From<oneshot::Sender<Result<WorkerOutput>>> for InvocationReply {
+    fn from(reply: oneshot::Sender<Result<WorkerOutput>>) -> Self {
+        Self::Worker(reply)
+    }
+}
+
+impl From<oneshot::Sender<Result<WebSocketFrameOutput>>> for InvocationReply {
+    fn from(reply: oneshot::Sender<Result<WebSocketFrameOutput>>) -> Self {
+        Self::WebSocket(reply)
+    }
+}
+
+impl InvocationReply {
+    pub(super) fn send(self, result: Result<WorkerOutput>) -> std::result::Result<(), ()> {
+        match self {
+            Self::Worker(reply) => reply.send(result).map_err(|_| ()),
+            Self::WebSocket(reply) => reply
+                .send(result.map(WebSocketFrameOutput::from))
+                .map_err(|_| ()),
+        }
+    }
+
+    pub(super) fn send_websocket(
+        self,
+        result: Result<WebSocketFrameOutput>,
+    ) -> std::result::Result<(), ()> {
+        match self {
+            Self::WebSocket(reply) => reply.send(result).map_err(|_| ()),
+            Self::Worker(_) => unreachable!("WebSocket frames require a frame reply channel"),
+        }
+    }
 }
 
 pub(super) struct WebSocketFrameRequest {
@@ -170,12 +230,12 @@ pub(super) struct WebSocketFrameRequest {
     pub(super) frame: Vec<u8>,
     pub(super) is_binary: bool,
     pub(super) queue_admission: Option<QueueAdmission>,
-    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) reply: oneshot::Sender<Result<WebSocketFrameOutput>>,
 }
 
 pub(super) struct WebSocketFrameReply {
-    pub(super) output: WorkerOutput,
-    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) output: WebSocketFrameOutput,
+    pub(super) reply: InvocationReply,
 }
 
 pub(super) struct StreamRegistration {
@@ -1212,7 +1272,7 @@ pub(super) struct PendingInvoke {
     pub(super) target_isolate_id: Option<u64>,
     pub(super) reply_kind: PendingReplyKind,
     pub(super) internal_origin: bool,
-    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) reply: InvocationReply,
     pub(super) enqueued_at: Instant,
     pub(super) queued_bytes: usize,
 }
@@ -1228,7 +1288,7 @@ pub(crate) struct EnqueueInvokeRequest {
     pub(super) target_isolate_id: Option<u64>,
     pub(super) target_generation: Option<u64>,
     pub(super) internal_origin: bool,
-    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) reply: InvocationReply,
     pub(super) reply_kind: PendingReplyKind,
 }
 
@@ -1263,7 +1323,7 @@ pub(super) struct PendingReply {
     pub(super) active_memory_lease: Option<MemoryEntityLease>,
     pub(super) memory_outbox_shard: Option<usize>,
     pub(super) internal_origin: bool,
-    pub(super) reply: oneshot::Sender<Result<WorkerOutput>>,
+    pub(super) reply: InvocationReply,
     pub(super) completion_meta: Option<PendingReplyMeta>,
     pub(super) kind: PendingReplyKind,
     pub(super) dispatched_at: Instant,
@@ -1272,7 +1332,7 @@ pub(super) struct PendingReply {
 #[derive(Default)]
 pub(super) struct RemovedIsolate {
     pub(super) removed: bool,
-    pub(super) replies: Vec<(String, oneshot::Sender<Result<WorkerOutput>>)>,
+    pub(super) replies: Vec<(String, InvocationReply)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1481,7 +1541,12 @@ pub(super) struct IsolateHandle {
     pub(super) served_requests: u64,
     pub(super) last_used_at: Instant,
     pub(super) pending_replies: HashMap<String, PendingReply>,
-    pub(super) pending_wait_until: HashMap<String, String>,
+    pub(super) pending_wait_until: HashMap<String, PendingWaitUntil>,
+}
+
+pub(super) struct PendingWaitUntil {
+    pub(super) completion_token: String,
+    pub(super) completed_at: Instant,
 }
 
 impl IsolateHandle {
@@ -1546,7 +1611,7 @@ mod tests {
         target_isolate_id: Option<u64>,
         memory_route: Option<MemoryRoute>,
     ) -> PendingInvoke {
-        let (reply, _) = oneshot::channel();
+        let (reply, _) = oneshot::channel::<Result<WorkerOutput>>();
         PendingInvoke {
             queue_admission: None,
             runtime_request_id: request_id.to_string(),
@@ -1563,7 +1628,7 @@ mod tests {
             target_isolate_id,
             reply_kind: PendingReplyKind::Normal,
             internal_origin: false,
-            reply,
+            reply: reply.into(),
             enqueued_at: Instant::now(),
             queued_bytes: 1,
         }

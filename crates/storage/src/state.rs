@@ -440,7 +440,7 @@ impl StateStore {
 
     pub fn next_owner_epoch(&self) -> Result<i64> {
         self.owner_epoch
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
                 epoch.checked_add(1)
             })
             .map(|epoch| epoch + 1)

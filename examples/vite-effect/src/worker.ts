@@ -14,8 +14,8 @@ const AuthSessionViewSchema = Schema.Struct({
   user: Schema.Struct({
     username: Schema.NonEmptyString,
     displayName: Schema.NonEmptyString,
-    role: Schema.Literal("admin", "viewer"),
-    passkeys: Schema.Number.pipe(Schema.nonNegative()),
+    role: Schema.Literals(["admin", "viewer"]),
+    passkeys: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
   }),
   session: Schema.Struct({
     id: Schema.NonEmptyString,
@@ -88,12 +88,12 @@ function sessionView(): Effect.Effect<AuthSessionView | null, AppError, Frontend
   );
 }
 
-function responseJson<A, I>(response: Response, schema: Schema.Schema<A, I, never>): Effect.Effect<A, AppError> {
+function responseJson<A, I>(response: Response, schema: Schema.Codec<A, I>): Effect.Effect<A, AppError> {
   return Effect.tryPromise({
     try: () => response.json(),
     catch: (error) => internalParseError(error),
   }).pipe(
-    Effect.flatMap((body) => Schema.decodeUnknown(schema)(body)),
+    Effect.flatMap((body) => Schema.decodeUnknownEffect(schema)(body)),
     Effect.mapError((error) => internalParseError(error)),
   );
 }
@@ -111,7 +111,7 @@ function effectHandler(
 ): (request: IRequest, env: AppEnv) => Promise<Response> {
   return (request, env) => Effect.runPromise(
     program.pipe(
-      Effect.catchAll((error) => Effect.succeed(errorResponse(error))),
+      Effect.catch((error) => Effect.succeed(errorResponse(error))),
       Effect.provide(frontendLayer(env)),
       Effect.provide(requestContextLayer(request)),
     ),

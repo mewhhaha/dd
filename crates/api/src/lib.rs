@@ -42,6 +42,8 @@ pub struct ServerLimits {
     pub max_headers: usize,
     pub http2_keep_alive_interval: Duration,
     pub http2_keep_alive_timeout: Duration,
+    pub max_buffered_control_body_bytes: usize,
+    pub control_body_timeout: Duration,
 }
 
 impl Default for ServerLimits {
@@ -53,6 +55,8 @@ impl Default for ServerLimits {
             max_headers: 100,
             http2_keep_alive_interval: Duration::from_secs(30),
             http2_keep_alive_timeout: Duration::from_secs(10),
+            max_buffered_control_body_bytes: 64 * 1024 * 1024,
+            control_body_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -92,15 +96,20 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         private_bearer_token,
         allow_insecure_private_loopback,
     )?;
+    let control_body_admission = state::ControlBodyAdmission::new(
+        limits.max_buffered_control_body_bytes,
+        limits.control_body_timeout,
+    )?;
     let runtime = RuntimeService::start_with_service_config(runtime).await?;
     let deploy_tokens = DeployTokenStore::from_control_store(runtime.control_store());
-    let state = AppState::new(
+    let mut state = AppState::new(
         runtime,
         deploy_tokens,
         invoke_max_body_bytes,
         public_base_domain,
         private_bearer_token,
     );
+    state.control_body_admission = control_body_admission;
     let serve_result = serve_until(
         bind_public_addr,
         bind_private_addr,

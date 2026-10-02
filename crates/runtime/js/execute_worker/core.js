@@ -27,6 +27,7 @@ globalThis.__dd_execute_worker = (payload) => {
   );
   const hasRequestBodyStream = requestBodyStreamHandle > 0;
   const streamResponse = payload?.stream_response === true;
+  const maxResponseBodyBytes = Number(payload?.max_response_body_bytes ?? 0);
   const worker = globalThis.__dd_worker;
 
   if (worker === undefined) {

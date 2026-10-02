@@ -51,7 +51,7 @@ function effectHandler(
 ): (request: IRequest, env: Env) => Promise<Response> {
   return (request, env) => Effect.runPromise(
     program.pipe(
-      Effect.catchAll((error) => Effect.succeed(errorResponse(error))),
+      Effect.catch((error) => Effect.succeed(errorResponse(error))),
       Effect.provide(services),
       Effect.provide(requestLayer(env, request)),
     ),

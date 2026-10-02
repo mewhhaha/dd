@@ -8,9 +8,9 @@ export type AuthClientService = {
   readonly proxy: Effect.Effect<Response, AppError, RequestContext>;
 };
 
-export class FrontendEnv extends Context.Tag("vite-effect/FrontendEnv")<FrontendEnv, AppEnv>() {}
+export class FrontendEnv extends Context.Service<FrontendEnv, AppEnv>()("vite-effect/FrontendEnv") {}
 
-export class AuthClient extends Context.Tag("vite-effect/AuthClient")<AuthClient, AuthClientService>() {}
+export class AuthClient extends Context.Service<AuthClient, AuthClientService>()("vite-effect/AuthClient") {}
 
 export function frontendLayer(env: AppEnv) {
   return AuthClientLive.pipe(

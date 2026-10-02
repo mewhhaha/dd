@@ -152,6 +152,7 @@ pub(crate) struct CacheRevalidatePayload {
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeExecutionLimits {
     pub(crate) max_request_body_bytes: usize,
+    pub(crate) max_response_body_bytes: usize,
     pub(crate) max_isolate_heap_bytes: usize,
     pub(crate) max_buffered_response_bytes: usize,
     pub(crate) response_byte_budget: Arc<tokio::sync::Semaphore>,

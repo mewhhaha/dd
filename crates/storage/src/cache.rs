@@ -278,7 +278,7 @@ impl HotCache {
                 })
                 .collect::<Vec<_>>()
         };
-        candidates.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+        candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.0));
 
         for (_, entry) in candidates {
             if !vary_values_match(&entry.vary_headers, &entry.vary_values, request_headers) {
@@ -679,9 +679,10 @@ impl CacheStore {
     }
 
     pub async fn put(&self, request: &CacheRequest, response: CacheResponse) -> Result<bool> {
-        let Some(method) = normalize_cache_method(&request.method) else {
+        let method = request.method.trim().to_ascii_uppercase();
+        if method != "GET" {
             return Ok(false);
-        };
+        }
         let request_headers = to_header_map(&request.headers);
         if request_headers.contains_key("authorization") || request_headers.contains_key("cookie") {
             return Ok(false);
@@ -1591,6 +1592,25 @@ mod tests {
         match hit {
             CacheLookup::Fresh(value) => assert_eq!(value.body.as_ref(), b"one"),
             other => panic!("expected fresh hit, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn head_responses_cannot_replace_or_create_get_entries() -> Result<()> {
+        let store = test_store(CacheConfig::default()).await;
+        let get = request("/head");
+        let mut head = get.clone();
+        head.method = "HEAD".into();
+        assert!(!store.put(&head, response("")).await?);
+        assert!(matches!(store.get(&get).await?, CacheLookup::Miss));
+        assert!(store.put(&get, response("get body")).await?);
+        assert!(!store.put(&head, response("")).await?);
+        for request in [&get, &head] {
+            let CacheLookup::Fresh(response) = store.get(request).await? else {
+                panic!("GET and HEAD lookups must share the stored GET response");
+            };
+            assert_eq!(response.body.as_ref(), b"get body");
         }
         Ok(())
     }

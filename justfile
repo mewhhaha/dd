@@ -38,8 +38,8 @@ fly-worker-deploy name file +flags:
   ./deploy/fly/post-worker-deploy.sh {{default_private_server}} {{name}} {{file}} {{flags}}
 
 # Deploy a generated worker config into the running Fly app through the private proxy.
-fly-worker-deploy-config config:
-  cargo run -p cli -- --server {{default_private_server}} deploy-config {{config}}
+fly-worker-deploy-config config *flags:
+  cargo run -p cli -- --server {{default_private_server}} deploy-config {{config}} {{flags}}
 
 # Mint a scoped token through the private proxy.
 fly-worker-mint-token +flags:
@@ -54,16 +54,16 @@ fly-worker-delete-token id:
   cargo run -p cli -- --server {{default_private_server}} delete-token {{id}}
 
 # Deploy a generated worker config through the public Fly endpoint with DD_TOKEN.
-fly-worker-public-deploy-config app=default_app config='dist/dd.deploy.json':
-  cargo run -p cli -- --server https://{{app}}.fly.dev deploy-config {{config}}
+fly-worker-public-deploy-config app=default_app config='dist/dev-worker/dd.deploy.json' *flags:
+  cargo run -p cli -- --server https://{{app}}.fly.dev deploy-config {{config}} {{flags}}
 
 # Deploy a worker into the running Fly app through an explicitly chosen private proxy endpoint.
 fly-worker-deploy-at server name file +flags:
   ./deploy/fly/post-worker-deploy.sh {{server}} {{name}} {{file}} {{flags}}
 
 # Deploy a generated worker config through an explicitly chosen private proxy endpoint.
-fly-worker-deploy-config-at server config:
-  cargo run -p cli -- --server {{server}} deploy-config {{config}}
+fly-worker-deploy-config-at server config *flags:
+  cargo run -p cli -- --server {{server}} deploy-config {{config}} {{flags}}
 
 # Contributor check path.
 check:
@@ -93,9 +93,14 @@ size-report-all profile="dist":
   ./scripts/measure-binary-size.sh {{profile}} full
   ./scripts/measure-binary-size.sh {{profile}} lean
 
-# Syntax-check source-only JS integration package.
+# Check JS integration, runtime contracts, and release packaging.
 check-js:
+  pnpm check:js
   node scripts/check-runtime-contract.mjs
+  node scripts/check-dd-vite-config.mjs
+  node scripts/check-release-version.mjs
+  node --test scripts/check-release-version.test.mjs
+  python3 scripts/test-release-artifacts.py
   node --check crates/runtime/src/bin/bench_memory_fanout/worker.js
   node --check scripts/fly-api-case-studies/inventory.js
   node --check scripts/check-dd-dev-transport.mjs
