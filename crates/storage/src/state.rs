@@ -213,6 +213,25 @@ struct WriteCommand {
     _command: OwnedSemaphorePermit,
 }
 
+impl WriteCommand {
+    fn complete(self, result: Result<WriteReply>) {
+        let Self {
+            operation,
+            reply,
+            options,
+            queued_at: _,
+            _bytes: bytes,
+            _command: command,
+        } = self;
+        // Release payloads and admission before the caller can submit another write.
+        drop(operation);
+        drop(options);
+        drop(bytes);
+        drop(command);
+        let _ = reply.send(result);
+    }
+}
+
 impl StateStore {
     pub async fn open(root: impl AsRef<Path>) -> Result<Arc<Self>> {
         Self::open_layout(root.as_ref(), false).await
@@ -670,7 +689,7 @@ async fn run_writer(
         match result {
             Ok(replies) => {
                 for (command, reply) in batch.into_iter().zip(replies) {
-                    let _ = command.reply.send(Ok(reply.value));
+                    command.complete(Ok(reply.value));
                 }
             }
             Err(_) if batch.len() > 1 => {
@@ -685,11 +704,11 @@ async fn run_writer(
                     )
                     .await
                     .map(|mut replies| replies.remove(0).value);
-                    let _ = command.reply.send(result);
+                    command.complete(result);
                 }
             }
             Err(error) => {
-                let _ = batch.remove(0).reply.send(Err(error));
+                batch.remove(0).complete(Err(error));
             }
         }
     }
@@ -950,6 +969,12 @@ mod tests {
         blocker.execute("ROLLBACK", ()).await.unwrap();
         drop(blocker);
         commit.await.unwrap();
+        let completed = state.performance_snapshot();
+        assert_eq!(completed.pending_commands, 0);
+        assert_eq!(completed.pending_bytes, 0);
+        kv.put_value("worker", "KV", "key", &value, "utf8")
+            .await
+            .expect("a completed write must release admission for the next large write");
         kv.put("worker", "KV", "key", "after pressure")
             .await
             .unwrap();
