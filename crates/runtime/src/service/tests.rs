@@ -900,8 +900,34 @@ export default {
 #[tokio::test]
 #[serial]
 async fn worker_queue_rejects_when_global_limit_is_full_across_workers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let gate = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let length = socket.read(&mut buffer).await.unwrap();
+                assert!(length > 0, "gate request ended before its headers");
+                request.extend_from_slice(&buffer[..length]);
+                assert!(request.len() <= 16 * 1024);
+            }
+            sockets.push(socket);
+        }
+        held.await.unwrap();
+        for mut socket in sockets {
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
+        max_global_isolates: 2,
         max_isolates: 1,
         max_inflight_per_isolate: 1,
         max_queued_requests_per_worker: 8,
@@ -916,21 +942,28 @@ async fn worker_queue_rejects_when_global_limit_is_full_across_workers() {
     .await;
     let worker_a = "global-queue-a".to_string();
     let worker_b = "global-queue-b".to_string();
-    let source = r#"
+    let source = format!(
+        "const gateUrl = {};\n{}",
+        serde_json::to_string(&format!("http://{address}/gate")).unwrap(),
+        r#"
 export default {
   async fetch(request) {
-    await Deno.core.ops.op_sleep(300);
+    if (new URL(request.url).pathname === "/one") await fetch(gateUrl);
     return new Response(new URL(request.url).pathname);
   },
 };
-"#
-    .to_string();
+"#,
+    );
+    let config = DeployConfig {
+        egress_allow_hosts: vec![format!("private:{address}")],
+        ..DeployConfig::default()
+    };
     service
-        .deploy(worker_a.clone(), source.clone())
+        .deploy_with_config(worker_a.clone(), source.clone(), config.clone())
         .await
         .expect("worker a deploy should succeed");
     service
-        .deploy(worker_b.clone(), source)
+        .deploy_with_config(worker_b.clone(), source, config)
         .await
         .expect("worker b deploy should succeed");
 
@@ -1018,6 +1051,9 @@ export default {
         .expect_err("worker b queued request should hit the global queue limit");
     assert_eq!(error.kind(), ErrorKind::Overloaded);
     assert!(error.to_string().contains("runtime queue is full"));
+
+    release.send(()).expect("release the occupied isolates");
+    gate.await.expect("queue gate should complete");
 
     timeout(Duration::from_secs(3), first_a)
         .await

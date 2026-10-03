@@ -8,6 +8,10 @@ import { defineConfig } from "vitest/config";
 const require = createRequire(import.meta.url);
 const exampleDir = fileURLToPath(new URL(".", import.meta.url));
 const viteBin = resolve(dirname(require.resolve("vite/package.json")), "bin/vite.js");
+const transparentPng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+XwK2AAAAAElFTkSuQmCC",
+  "base64",
+);
 
 const runRscAddToCartFlow = defineBrowserCommand(async ({ context }) => {
   const appServer = await startAppServer();
@@ -17,7 +21,8 @@ const runRscAddToCartFlow = defineBrowserCommand(async ({ context }) => {
 
   appPage.on("console", (message) => {
     if (message.type() === "error") {
-      consoleErrors.push(message.text());
+      const url = message.location().url;
+      consoleErrors.push(url ? `${message.text()} (${url})` : message.text());
     }
   });
   appPage.on("pageerror", (error) => {
@@ -25,6 +30,13 @@ const runRscAddToCartFlow = defineBrowserCommand(async ({ context }) => {
   });
 
   try {
+    await appPage.route("https://assets.ui.sh/**", async (route) => {
+      await route.fulfill({
+        body: transparentPng,
+        contentType: "image/png",
+        status: 200,
+      });
+    });
     await appPage.goto(`${appServer.base}/projects/runtime`, { waitUntil: "domcontentloaded" });
     await appPage.getByRole("heading", { name: "Runtime valley print" }).waitFor();
     await appPage.getByTestId("detail-add-to-cart").click();
