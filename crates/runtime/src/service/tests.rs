@@ -1076,7 +1076,7 @@ export default {
 #[serial]
 async fn worker_queue_expires_requests_after_queue_wait_limit() {
     let service = test_service(RuntimeConfig {
-        min_isolates: 0,
+        min_isolates: 1,
         max_isolates: 1,
         max_inflight_per_isolate: 1,
         max_queued_requests_per_worker: 8,
@@ -1110,6 +1110,29 @@ export default {
         )
         .await
         .expect("deploy should succeed");
+
+    // Isolate startup must finish before exercising the short queue deadline.
+    if let Err(error) = service
+        .invoke(
+            worker.clone(),
+            test_invocation_with_path("/warm", "queue-wait-warm"),
+        )
+        .await
+    {
+        assert_eq!(error.kind(), ErrorKind::Overloaded);
+        assert!(error.to_string().contains("queue wait limit"));
+    }
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = service.stats(worker.clone()).await.expect("stats");
+            if stats.isolates_total == 1 && stats.global_isolates_starting == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("queue timeout fixture should be ready");
 
     let first_service = service.clone();
     let first_worker = worker.clone();
