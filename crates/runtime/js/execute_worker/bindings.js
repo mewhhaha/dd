@@ -19,29 +19,35 @@
     targetWorker,
     request,
     requestContextHandle,
+    signal,
   ) => {
     const invokeLabel = `service binding fetch (${bindingName} -> ${targetWorker})`;
-    const headersHandle = storeResponseHeaders(request.headers);
-    const bodyHandle = Math.max(
-      0,
-      Math.trunc(Number(callOp(
-        "op_http_store_prepared_body",
-        request.body ?? new Uint8Array(),
-      ) ?? 0) || 0),
-    );
     const result = await awaitRequestReply(
       invokeLabel,
-      () => callOp(
-        "op_service_binding_fetch_start",
-        requestContextHandle,
-        bindingName,
-        request.method,
-        request.url,
-        headersHandle,
-        bodyHandle,
-      ),
+      () => {
+        let headersHandle = 0;
+        let bodyHandle = 0;
+        try {
+          headersHandle = storeResponseHeaders(request.headers);
+          bodyHandle = callOp("op_http_store_prepared_body", request.body);
+          return callOp(
+            "op_service_binding_fetch_start",
+            requestContextHandle,
+            bindingName,
+            request.method,
+            request.url,
+            headersHandle,
+            bodyHandle,
+          );
+        } finally {
+          // The start op consumes these handles; a thrown preparation/start op
+          // must release any handles that it did not consume.
+          if (headersHandle > 0) callOp("op_http_take_prepared_headers", headersHandle);
+          if (bodyHandle > 0) callOp("op_http_take_prepared_body", bodyHandle);
+        }
+      },
       30_000,
-      { syncTime: false },
+      { syncTime: false, signal },
     );
     if (!result || typeof result !== "object" || result.ok === false) {
       applyRequestReplyBoundary(result);
@@ -50,8 +56,11 @@
     applyRequestReplyBoundary(result);
     const replyHeadersHandle = Math.max(0, Math.trunc(Number(result.headers_handle ?? 0) || 0));
     const replyBodyHandle = Math.max(0, Math.trunc(Number(result.body_handle ?? 0) || 0));
-    const response = new Response(callOp("op_http_take_prepared_body", replyBodyHandle), {
-      status: Number(result.status ?? 200),
+    const body = callOp("op_http_take_prepared_body", replyBodyHandle);
+    const status = Number(result.status ?? 200);
+    const nullBody = request.method === "HEAD" || status === 204 || status === 205 || status === 304;
+    const response = new Response(nullBody ? null : body, {
+      status,
       headers: callOp("op_http_take_prepared_headers", replyHeadersHandle),
     });
     return response;
@@ -60,12 +69,13 @@
   const createServiceBinding = (bindingName, targetWorker) => Object.freeze({
     worker: targetWorker,
     async fetch(inputValue, initValue = undefined) {
-      const request = await normalizeServiceFetchInput(inputValue, initValue);
+      const request = await normalizeFetchInput(inputValue, initValue, true);
       return invokeServiceBindingFetch(
         bindingName,
         targetWorker,
         request,
         activeRequestContextHandle(),
+        request.signal,
       );
     },
   });
@@ -167,6 +177,10 @@
   };
 
   const awaitRequestReply = async (label, startOp, timeoutMs = 5_000, options = undefined) => {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      throw abortErrorForSignal(signal);
+    }
     const started = startOp();
     if (!started || typeof started !== "object" || started.ok === false) {
       throw new Error(String(started?.error ?? `${label} failed to start`));
@@ -176,6 +190,7 @@
       throw new Error(`${label} missing reply id`);
     }
     let timeoutId = null;
+    let onAbort;
     try {
       const reply = waitForRequestReply(replyId);
       const timeoutError = new Promise((_, reject) => {
@@ -184,7 +199,13 @@
           timeoutMs,
         );
       });
-      const result = await Promise.race([reply, timeoutError]);
+      const aborted = new Promise((_, reject) => {
+        if (!signal) return;
+        onAbort = () => reject(abortErrorForSignal(signal));
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
+      const result = await Promise.race([reply, timeoutError, aborted]);
       if (options?.syncTime !== false) {
         await syncFrozenTime();
       }
@@ -194,6 +215,7 @@
       throw error;
     } finally {
       clearTimeout(timeoutId);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
     }
   };
 
@@ -292,21 +314,18 @@
 
   const executeMemoryTransaction = async (
     entry,
-    runtimeRequestId,
     callback,
     commandHandle,
   ) => {
     let txn;
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
-    const previousMemoryRequestId = current.memoryRequestId;
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
     try {
       txn = await createMemoryTxn(entry, commandHandle);
       const socketRuntime = createMemorySocketRuntime(entry, { allowSocketAccept: true });
-      const scopedState = createMemoryAtomicState(entry, runtimeRequestId, txn, socketRuntime);
+      const scopedState = createMemoryAtomicState(entry, txn, socketRuntime);
       current.memoryEntry = entry;
-      current.memoryRequestId = runtimeRequestId;
       current.socketRuntimeProvider = () => socketRuntime;
       txn.callbackActive = true;
       let value;
@@ -328,12 +347,11 @@
       if (commandHandle > 0) {
         setMemoryBatchCommandResult(txn, await encodeMemoryCommandResult(value));
       }
-      await finishMemoryTxn(txn, runtimeRequestId);
+      await finishMemoryTxn(txn);
       return value;
     } finally {
       closeMemoryTxnBatch(txn);
       current.memoryEntry = previousMemoryEntry;
-      current.memoryRequestId = previousMemoryRequestId;
       current.socketRuntimeProvider = previousSocketRuntimeProvider;
     }
   };
@@ -379,7 +397,6 @@
     if (!Object.prototype.hasOwnProperty.call(env, binding)) {
       throw new Error(`memory binding not declared for worker: ${binding}`);
     }
-    const runtimeRequestId = activeRequestId();
     const entry = ensureMemoryEntry(binding, memoryKey);
     const kind = String(memoryCall.kind ?? "");
     const socketRuntime = createMemorySocketRuntime(entry, {
@@ -388,11 +405,9 @@
     });
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
-    const previousMemoryRequestId = current.memoryRequestId;
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
     current.socketRuntimeProvider = () => socketRuntime;
     current.memoryEntry = entry;
-    current.memoryRequestId = runtimeRequestId;
     try {
       if (
         kind === "message"
@@ -404,13 +419,12 @@
         }
         const event = buildWakeEvent(memoryCall, createMemoryStub(binding, memoryKey));
         await wakeMethod.call(worker, event, env);
-        await gateMemoryOutput(entry, runtimeRequestId, async () => undefined);
+        await gateMemoryOutput(entry, async () => undefined);
         return new Response(null, { status: 204 });
       }
       throw new Error(`unsupported memory invoke kind: ${kind}`);
     } finally {
       current.memoryEntry = previousMemoryEntry;
-      current.memoryRequestId = previousMemoryRequestId;
       current.socketRuntimeProvider = previousSocketRuntimeProvider;
     }
   };
@@ -559,7 +573,10 @@
       if (streamResponse) {
         await emitResponseStart(status, storeResponseHeaders(headers));
       }
-      if (!isWebSocketAcceptResponse && response.body) {
+      if (!isWebSocketAcceptResponse && response.body && input.method === "HEAD") {
+        // A HEAD reply exposes the same headers but must not consume a producer.
+        void response.body.cancel().catch(() => undefined);
+      } else if (!isWebSocketAcceptResponse && response.body) {
         const reader = response.body.getReader();
         try {
           while (true) {
@@ -680,6 +697,7 @@ globalThis.__dd_execute_worker_handle = (requestHandle) => {
     ),
     stream_response: descriptor.stream_response === true,
     max_response_body_bytes: descriptor.max_response_body_bytes,
+    max_request_body_bytes: descriptor.max_request_body_bytes,
     method: String(descriptor.method ?? "GET"),
     url: String(descriptor.url ?? ""),
     headers: Array.isArray(headers) ? headers : [],

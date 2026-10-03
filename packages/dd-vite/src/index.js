@@ -6,3 +6,4 @@ export {
 export { ddEnvironment, ddVitePlugin } from "./vite.js";
 export { ddVitePlugin as default } from "./vite.js";
 export { createWorkerTestRuntime } from "./vitest.js";
+export { DD_CONFIG_SCHEMA_VERSION } from "./vite/config.js";

@@ -1439,6 +1439,7 @@ pub(super) struct ServiceBindingFetchStart {
     pub(super) request: WorkerInvocation,
     pub(super) reply_id: String,
     pub(super) pending_replies: crate::ops::PendingReplies,
+    pub(super) cancellation: crate::ops::PendingReplyCancellation,
 }
 
 pub(super) struct RuntimeThreadStart {

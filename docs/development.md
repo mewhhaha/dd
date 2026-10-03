@@ -50,6 +50,15 @@ cargo run -p cli -- auth status
 cargo run -p cli -- auth logout
 ```
 
+Runtime fields at the top level of `dd.json` replace the corresponding nested
+`config` fields in both CLI packaging and Vite. For example, top-level
+`bindings: []` clears nested bindings. An explicit Vite plugin `config` replaces
+the resolved project runtime configuration.
+
+Runtime response declarations are generated from the serialized Rust structs.
+After changing those structs, run `pnpm generate:runtime-types`; `just check-js`
+verifies that the checked-in declarations match.
+
 Snapshot-ready Deno JavaScript sources are checked in under
 `crates/runtime/js/vendor/lazy` and hash-checked during the runtime build.
 The runtime loads those upstream implementations through Deno's lazy extension
@@ -162,9 +171,12 @@ options override `dd.json`.
 By default, app requests to the Vite dev server hit the worker at the root, so
 `localhost:5173/anything` behaves like the eventual deployed app. Vite's own
 HMR, module, and source requests bypass the worker. The plugin also registers a
-Vite Environment API environment named `dd`, backed by Vite's fetchable dev
+Vite Environment API environment for the entry worker, backed by Vite's fetchable dev
 environment API. Framework code can dispatch a `Request` to that environment
 while the worker still runs in the native `dd` runtime.
+Closing a Vite environment or the dev server closes its native runtime. An
+unused environment does not start a runtime, and failed initialization releases
+the runtime it created.
 During Vite hot updates, the plugin leaves Vite's normal browser and framework
 HMR path alone, discards the deployed worker, and lazily rebuilds it on the next
 worker request.
@@ -201,6 +213,15 @@ dist/<entry-worker>/dd.deploy.json
 dist/<entry-worker>/worker.js
 dist/dd.workers.json
 ```
+
+Set `deploymentConfig: false` or `deploymentConfig: { enabled: false }` to
+build worker bundles without deployment configs, private-module copies, or
+generated asset policy files. The worker manifest then omits `deployConfig`.
+Use `deploymentConfig.entrypoint` and `deploymentConfig.output` to change the
+bundle and config filenames inside the entry worker's output directory, for
+example `bundle/main.js` and `metadata/deploy.json`. Auxiliary workers accept
+the same options under `deployment`. Generated config paths are relative to
+the config's directory, including private modules staged beside that config.
 
 By default, the plugin uses root `dd.json` as the source config. That file can
 point at `src/worker.ts` and source assets. The generated output config

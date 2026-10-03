@@ -12,6 +12,9 @@ use turso::Value;
 pub const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const MEMORY_ENTITY_MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
+pub const MEMORY_ENTITY_MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+pub const MEMORY_ENTITY_MAX_ENTRIES: usize = 16_384;
+pub const DEFAULT_OUTBOX_CLAIM_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 
 pub fn worker_namespace(worker: &str, binding: &str) -> String {
     format!("{}:{worker}{binding}", worker.len())
@@ -116,6 +119,15 @@ impl SnapshotCache {
                             break;
                         }
                         for mutation in &change.commit.mutations {
+                            if mutation.deleted {
+                                if let Ok(index) = next
+                                    .entries
+                                    .binary_search_by(|entry| entry.key.cmp(&mutation.key))
+                                {
+                                    next.entries.remove(index);
+                                }
+                                continue;
+                            }
                             let entry = MemorySnapshotEntry {
                                 key: mutation.key.clone(),
                                 value: mutation.value.clone(),
@@ -286,6 +298,23 @@ impl MemorySnapshot {
             .sum()
     }
 
+    pub fn metadata_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.deleted)
+            .map(|entry| entry.key.len() + entry.encoding.len() + 96)
+            .sum()
+    }
+
+    pub fn validate_limits(&self) -> Result<()> {
+        EntitySize {
+            values: self.value_bytes() as i64,
+            metadata: self.metadata_bytes() as i64,
+            entries: self.entries.iter().filter(|entry| !entry.deleted).count() as i64,
+        }
+        .validate(None)
+    }
+
     fn cache_bytes(&self, key: &MemorySnapshotKey) -> usize {
         key.0.len()
             + key.1.len()
@@ -343,22 +372,49 @@ pub struct MemoryCommandResult {
     pub revision: i64,
 }
 
-#[allow(dead_code)]
 pub struct MemoryOutboxRecord {
     pub effect_id: String,
     pub kind: String,
     pub payload: Vec<u8>,
     pub revision: i64,
+    pub ordinal: i64,
     pub status: String,
     pub attempt_count: i64,
     pub next_attempt_at_ms: i64,
+    payload_lease: Option<Arc<MemoryOutboxPayloadLease>>,
 }
 
-#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct OutboxClaimBudget {
+    max_bytes: usize,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl OutboxClaimBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            permits: Arc::new(tokio::sync::Semaphore::new(max_bytes)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MemoryOutboxPayloadLease {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _budget: Arc<OutboxClaimBudget>,
+}
+
 pub struct MemoryOutboxClaim {
     pub namespace: String,
     pub memory_key: String,
     pub record: MemoryOutboxRecord,
+}
+
+impl MemoryOutboxClaim {
+    pub fn payload_lease(&self) -> Option<Arc<MemoryOutboxPayloadLease>> {
+        self.record.payload_lease.clone()
+    }
 }
 
 #[derive(Debug, Clone)]

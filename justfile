@@ -96,14 +96,22 @@ size-report-all profile="dist":
 # Check JS integration, runtime contracts, and release packaging.
 check-js:
   pnpm check:js
+  node scripts/check-worker-js.mjs
   node scripts/check-runtime-contract.mjs
+  node scripts/generate-runtime-types.mjs --check
+  node --test scripts/runtime-client.test.mjs
+  node --test scripts/memory-results.test.mjs
   node scripts/check-dd-vite-config.mjs
+  node scripts/check-dd-vite-exports.mjs
   node scripts/check-release-version.mjs
   node --test scripts/check-release-version.test.mjs
   python3 scripts/test-release-artifacts.py
+  python3 scripts/test-memory-profile.py
   node --check crates/runtime/src/bin/bench_memory_fanout/worker.js
   node --check scripts/fly-api-case-studies/inventory.js
   node --check scripts/check-dd-dev-transport.mjs
+  node --check scripts/check-dd-vite-lifecycle.mjs
+  node --check scripts/check-dd-vite-reload.mjs
   node --check benchmarks/run.mjs
   node --check benchmarks/summarize.mjs
   node --check benchmarks/check-regression.mjs

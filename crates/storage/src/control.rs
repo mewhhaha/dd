@@ -363,18 +363,14 @@ impl ControlStore {
         .await
     }
 
-    pub async fn list_deployments(&self, worker: Option<&str>) -> Result<Vec<ControlDeployment>> {
+    pub async fn list_deployments(&self, worker: Option<&str>) -> Result<Vec<DeploymentSummary>> {
         let conn = self.connect().await?;
-        let sql_all = "SELECT d.deployment_id, d.worker_name, d.source, d.config_json,
-                              d.assets_json, d.server_modules_json, d.asset_headers,
-                              d.created_at_ms, d.expires_at_ms,
+        let sql_all = "SELECT d.deployment_id, d.worker_name, d.created_at_ms, d.expires_at_ms,
                               CASE WHEN a.deployment_id = d.deployment_id THEN 1 ELSE 0 END
                        FROM deployments d
                        LEFT JOIN active_deployments a ON a.worker_name = d.worker_name
                        ORDER BY d.worker_name, d.created_at_ms DESC, d.deployment_id DESC";
-        let sql_worker = "SELECT d.deployment_id, d.worker_name, d.source, d.config_json,
-                                 d.assets_json, d.server_modules_json, d.asset_headers,
-                                 d.created_at_ms, d.expires_at_ms,
+        let sql_worker = "SELECT d.deployment_id, d.worker_name, d.created_at_ms, d.expires_at_ms,
                                  CASE WHEN a.deployment_id = d.deployment_id THEN 1 ELSE 0 END
                           FROM deployments d
                           LEFT JOIN active_deployments a ON a.worker_name = d.worker_name
@@ -387,7 +383,15 @@ impl ControlStore {
         .map_err(control_error)?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.map_err(control_error)? {
-            out.push(deployment_from_row(&row)?);
+            let expires_at_ms = row.get::<Option<i64>>(3).map_err(control_error)?;
+            out.push(DeploymentSummary {
+                deployment_id: row.get::<String>(0).map_err(control_error)?,
+                worker: row.get::<String>(1).map_err(control_error)?,
+                created_at_ms: row.get::<i64>(2).map_err(control_error)?,
+                expires_at_ms,
+                temporary: expires_at_ms.is_some(),
+                active: row.get::<i64>(4).map_err(control_error)? != 0,
+            });
         }
         Ok(out)
     }
@@ -1020,6 +1024,49 @@ mod tests {
                 .await?
         );
         assert!(store.active_deployments().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deployment_summaries_do_not_decode_bundle_columns() -> Result<()> {
+        let root = temp_dir("summary-projection");
+        let store = ControlStore::open(&root).await?;
+        let mut historical = deployment("a-worker", 1);
+        historical.expires_at_ms = Some(42);
+        store.insert_deployment(&historical).await?;
+        store.insert_deployment(&deployment("a-worker", 2)).await?;
+        let mut other = deployment("b-worker", 3);
+        other.expires_at_ms = Some(99);
+        store.insert_deployment(&other).await?;
+
+        let conn = store.connect().await?;
+        conn.execute(
+            "UPDATE deployments SET config_json = 'invalid', assets_json = 'invalid',
+             server_modules_json = 'invalid'",
+            (),
+        )
+        .await
+        .map_err(control_error)?;
+        assert!(store.get_deployment("deployment-1").await.is_err());
+
+        let summaries = store.list_deployments(None).await?;
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[0].deployment_id, "deployment-2");
+        assert_eq!(summaries[0].worker, "a-worker");
+        assert!(summaries[0].active);
+        assert!(!summaries[0].temporary);
+        assert_eq!(summaries[1].deployment_id, "deployment-1");
+        assert!(!summaries[1].active);
+        assert!(summaries[1].temporary);
+        assert_eq!(summaries[1].expires_at_ms, Some(42));
+        assert_eq!(summaries[2].worker, "b-worker");
+        assert!(summaries[2].active);
+        assert_eq!(summaries[2].expires_at_ms, Some(99));
+        assert_eq!(store.list_deployments(Some("a-worker")).await?.len(), 2);
+        assert!(store.list_deployments(Some("missing")).await?.is_empty());
+        drop(conn);
+        drop(store);
+        tokio::fs::remove_dir_all(root).await.unwrap();
         Ok(())
     }
 

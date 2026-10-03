@@ -56,12 +56,25 @@ root contains `dd.json`, the plugin reads it by default for the worker name,
 entrypoint, and deploy config. Inline plugin options override values from
 `dd.json`. Generated deployments use the same defaults as the CLI: workers are
 private, and outbound fetch requires an explicit `config.egress_allow_hosts`.
+When both nested `config` and top-level runtime fields are present, each
+top-level field replaces its nested counterpart. An explicit plugin `config`
+replaces this resolved configuration.
 
 The plugin also registers a Vite Environment API environment for the entry
 worker, backed by `createFetchableDevEnvironment`, for framework code that wants
 to dispatch `Request` objects directly. The environment name defaults to the
 worker name from `dd.json`, normalized for Vite, and can be overridden with the
-top-level `viteEnvironment.name`.
+top-level `viteEnvironment.name`. HTTP middleware and environment dispatch share
+one native runtime, deployment flow, and worker state, including auxiliary services.
+Closing or restarting the Vite server closes the runtime owned by the plugin.
+The restarted server starts a fresh runtime on its first request. If you inject a
+shared `runtime`, its caller owns shutdown; closing or restarting the Vite server, a worker
+test helper, or an environment leaves that runtime available to other workers.
+
+Hot reload considers the entry and auxiliary workers. The default reloads their
+code on file changes; `reloadOnHotUpdate: "entry"` limits file-backed workers to
+their entry files, and `false` disables code reload. Source factories are called
+again on reload, including when other workers use the Vite module runner.
 
 ```js
 import { defineConfig } from "vite";
@@ -125,6 +138,26 @@ environment name, output directory, and deploy config path. The plugin also
 writes `_headers` with an immutable cache policy for Vite's fingerprinted build
 assets, such as `/assets/*`.
 
+Set `deploymentConfig: false` or `{ enabled: false }` to build worker bundles
+without deployment configs, private module copies, or generated asset policies.
+The workers manifest still records every bundle and omits `deployConfig`.
+Use `deploymentConfig.entrypoint` and `deploymentConfig.output` to customize the
+bundle and config filenames relative to the worker output directory:
+
+```js
+dd({
+  deploymentConfig: {
+    entrypoint: "bundle/main.js",
+    output: "metadata/deploy.json",
+  },
+});
+```
+
+The generated config points to `../bundle/main.js`; its asset and private module
+references are relative to `metadata/`. Filenames must stay inside the worker
+output directory. Auxiliary workers accept the same filenames under their
+`deployment` option. The manifest records the resulting paths.
+
 Set `server_modules` in `dd.json` or `deploymentConfig.serverModules` when a
 worker needs private files outside the public asset bundle. Supported types are
 `ESModule`, `Json`, `Text`, `Data`, and `CompiledWasm`; JSON/text/data imports
@@ -147,10 +180,15 @@ export default defineConfig({
 If `dd.json` points at a TypeScript entrypoint or source asset directory, the
 generated output config replaces those with the environment-built worker path
 and Vite output asset path while preserving the deploy fields the CLI consumes: `name`,
-`config`, `base_url`, and `temporary`. Source files require `schema_version: 1`
-and reject fields outside the published JSON Schema, so misspellings fail the build.
+`config`, `base_url`, and `temporary`. Source files require `schema_version: 1`,
+`name`, and `entrypoint`. Fields are checked against the published JSON Schema:
+misspellings, invalid temporary flags, exclusion values, and module types fail
+configuration without converting or dropping the supplied values.
 
-Pass options inline when you want to override the file:
+Pass options inline when you want to override the file. Object inputs and values
+returned by sync or async functions use the same field validation as files.
+Inline configs can omit fields supplied by the plugin, including `schema_version`;
+if supplied, the version must be `1`. Unknown fields are rejected in every format:
 
 ```js
 dd({

@@ -17,6 +17,7 @@ pub(super) async fn status_response(state: &AppState) -> ApiResult<Response<Resp
             "draining": state.operations.is_draining(),
             "shutting_down": state.operations.is_shutting_down(),
             "active_requests": state.operations.active_requests(),
+            "active_control_operations": state.operations.active_control_operations(),
             "active_deployments": runtime.active_deployments,
             "restoration_failures": restoration_failures,
             "runtime": runtime,
@@ -57,6 +58,46 @@ pub(super) async fn metrics_response(state: &AppState) -> ApiResult<Response<Res
         &mut body,
         "dd_active_requests",
         state.operations.active_requests(),
+    );
+    metric_help(
+        &mut body,
+        "dd_active_control_operations",
+        "Accepted HTTP control operations still executing, including disconnected clients.",
+    );
+    metric(
+        &mut body,
+        "dd_active_control_operations",
+        state.operations.active_control_operations(),
+    );
+    metric_help(
+        &mut body,
+        "dd_runtime_deployment_operations",
+        "Accepted deployments and undeployments still executing.",
+    );
+    metric(
+        &mut body,
+        "dd_runtime_deployment_operations",
+        state.runtime.active_deployment_operations(),
+    );
+    metric_help(
+        &mut body,
+        "dd_memory_outbox_claimed_bytes",
+        "Bytes reserved by durable outbox claims across state shards.",
+    );
+    metric(
+        &mut body,
+        "dd_memory_outbox_claimed_bytes",
+        runtime.memory_outbox_claimed_bytes,
+    );
+    metric_help(
+        &mut body,
+        "dd_memory_outbox_claim_byte_limit",
+        "Maximum shared bytes available for durable outbox claims.",
+    );
+    metric(
+        &mut body,
+        "dd_memory_outbox_claim_byte_limit",
+        runtime.memory_outbox_max_claimed_bytes,
     );
     metric_help(
         &mut body,
@@ -425,10 +466,12 @@ pub(super) async fn checkpoint_response(state: &AppState) -> ApiResult<Response<
             PlatformError::conflict("checkpoint requires the service to be drained").into(),
         );
     }
-    if state.operations.active_requests() != 0 {
-        return Err(
-            PlatformError::conflict("checkpoint requires all active requests to finish").into(),
-        );
+    if state.operations.active_requests() != 0 || state.operations.active_control_operations() != 0
+    {
+        return Err(PlatformError::conflict(
+            "checkpoint requires all active requests and control operations to finish",
+        )
+        .into());
     }
     if !state.runtime.is_quiescent().await {
         return Err(PlatformError::conflict(

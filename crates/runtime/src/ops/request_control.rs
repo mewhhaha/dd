@@ -231,8 +231,25 @@ pub(super) fn op_service_binding_fetch_start(
         request_id: subrequest_id,
     };
 
-    let pending_replies = state.borrow().borrow::<PendingReplies>().clone();
-    let reply_id = pending_replies.allocate();
+    let (pending_replies, parent_canceled, parent_notify) = {
+        let op_state = state.borrow();
+        let Some(parent) = op_state
+            .borrow::<RequestSecretContexts>()
+            .get(request_context_handle)
+        else {
+            return reply_start_error("service binding request scope is unavailable");
+        };
+        if parent.canceled.load(Ordering::Acquire) {
+            return reply_start_error("service binding request was aborted");
+        }
+        (
+            op_state.borrow::<PendingReplies>().clone(),
+            Arc::clone(&parent.canceled),
+            Arc::clone(&parent.canceled_notify),
+        )
+    };
+    // Register cancellation before any command can dispatch the child request.
+    let (reply_id, cancellation) = pending_replies.allocate(parent_canceled, parent_notify);
     let command_sender = state
         .borrow()
         .borrow::<crate::service::RuntimeFastCommandSender>()
@@ -248,6 +265,7 @@ pub(super) fn op_service_binding_fetch_start(
             request,
             reply_id: reply_id.clone(),
             pending_replies: pending_replies.clone(),
+            cancellation,
         })
         .is_err()
     {

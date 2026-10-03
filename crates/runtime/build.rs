@@ -199,24 +199,24 @@ fn toml_string(block: &str, key: &str) -> Option<String> {
 fn generate_execute_worker_bundle() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR should be set"));
     let output_path = out_dir.join("execute_worker.generated.js");
-    let units = [
-        "js/execute_worker/core.js",
-        "js/execute_worker/fetch_cache.js",
-        "js/execute_worker/sockets.js",
-        "js/execute_worker/memory.js",
-        "js/execute_worker/bindings.js",
-    ];
+    let manifest = Path::new("js/execute_worker/units.txt");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    let units = fs::read_to_string(manifest)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
 
     let mut generated = String::new();
-    for unit in units {
-        println!("cargo:rerun-if-changed={unit}");
-        let path = Path::new(unit);
+    for unit in units.lines().map(str::trim).filter(|unit| !unit.is_empty()) {
+        let path = manifest
+            .parent()
+            .expect("source manifest directory")
+            .join(unit);
+        println!("cargo:rerun-if-changed={}", path.display());
         let label = path
             .strip_prefix("js/")
-            .unwrap_or(path)
+            .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let source = fs::read_to_string(path)
+        let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         generated.push_str(&format!("// __dd_source_unit:{label}\n"));
         generated.push_str(&source);

@@ -177,6 +177,21 @@ impl RuntimeCommandSender {
             .map_err(Box::new)
     }
 
+    pub(super) async fn cancel_request(&self, worker_name: String, runtime_request_id: String) {
+        let command = RuntimeCommand::Cancel {
+            worker_name,
+            runtime_request_id,
+        };
+        if let Some(route) = command
+            .worker_name()
+            .and_then(|worker| self.routes.get(worker))
+        {
+            let _ = route.cancellation.send(command);
+        } else {
+            let _ = self.coordinator.send(command).await;
+        }
+    }
+
     pub(super) fn blocking_send(
         &self,
         command: RuntimeCommand,

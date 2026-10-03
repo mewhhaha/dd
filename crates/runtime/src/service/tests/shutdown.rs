@@ -5,8 +5,9 @@ const DROP_CHILD: &str = "service::tests::shutdown::outbox_drop_child";
 #[tokio::test]
 #[serial]
 async fn automatic_shutdown_exits_with_pending_outbox_deliveries_and_retries_after_restart() {
-    let root = PathBuf::from(format!("/tmp/dd-outbox-drop-{}", Uuid::new_v4()));
-    let output = std::fs::File::create(root.with_extension("log")).expect("child log opens");
+    let store = TestStoreDir::new("dd-outbox-drop");
+    let root = store.path().to_path_buf();
+    let output = std::fs::File::create(root.join("shutdown.log")).expect("child log opens");
     let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args(["--ignored", "--exact", DROP_CHILD, "--nocapture"])
         .env("DD_OUTBOX_DROP_ROOT", &root)
@@ -30,22 +31,22 @@ async fn automatic_shutdown_exits_with_pending_outbox_deliveries_and_retries_aft
             child.wait().expect("stalled shutdown subprocess joins");
             panic!(
                 "automatic shutdown stalled; subprocess log: {}",
-                root.with_extension("log").display()
+                std::fs::read_to_string(root.join("shutdown.log")).unwrap_or_default()
             );
         }
     };
     assert!(
         status.success(),
         "outbox drop subprocess failed: {}",
-        root.with_extension("log").display()
+        std::fs::read_to_string(root.join("shutdown.log")).unwrap_or_default()
     );
 
-    let service = test_service_with_paths(
+    let service = test_service_with_store(
         RuntimeConfig {
             scale_tick: Duration::from_millis(10),
             ..RuntimeConfig::default()
         },
-        root.clone(),
+        store.clone(),
         false,
     )
     .await;
@@ -77,8 +78,6 @@ async fn automatic_shutdown_exits_with_pending_outbox_deliveries_and_retries_aft
     .await
     .expect("retained outbox effects deliver after their shutdown leases expire");
     drop(service);
-    std::fs::remove_dir_all(&root).expect("test store removes");
-    std::fs::remove_file(root.with_extension("log")).expect("test log removes");
 }
 
 #[tokio::test]

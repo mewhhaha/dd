@@ -111,6 +111,9 @@ struct Cli {
     )]
     memory_outbox_max_concurrent_shards: Option<usize>,
 
+    #[arg(long, env = "DD_MEMORY_OUTBOX_MAX_CLAIMED_BYTES")]
+    memory_outbox_max_claimed_bytes: Option<usize>,
+
     #[arg(
         long = "memory-snapshot-cache-max-entries",
         env = "DD_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES"
@@ -189,6 +192,12 @@ async fn main() -> Result<()> {
             .runtime
             .storage
             .memory_outbox_max_concurrent_shards = value;
+    }
+    if let Some(value) = cli.memory_outbox_max_claimed_bytes {
+        server_config
+            .runtime
+            .storage
+            .memory_outbox_max_claimed_bytes = value;
     }
     if let Some(value) = cli.memory_snapshot_cache_max_entries {
         server_config

@@ -20,15 +20,15 @@
       "default": "./src/react-router-rsc.js"
     },
     "./runtime": {
-      "types": "./src/index.d.ts",
+      "types": "./src/runtime.d.ts",
       "default": "./src/runtime.js"
     },
     "./vitest": {
-      "types": "./src/index.d.ts",
+      "types": "./src/vitest.d.ts",
       "default": "./src/vitest.js"
     },
     "./vitest-environment": {
-      "types": "./src/index.d.ts",
+      "types": "./src/vitest-environment.d.ts",
       "default": "./src/vitest-environment.js"
     }
   },

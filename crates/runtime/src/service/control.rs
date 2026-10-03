@@ -48,6 +48,7 @@ pub(crate) enum RuntimeCommand {
         request: WorkerInvocation,
         reply_id: String,
         pending_replies: crate::ops::PendingReplies,
+        cancellation: crate::ops::PendingReplyCancellation,
     },
     Cancel {
         worker_name: String,
@@ -396,6 +397,7 @@ impl WorkerManager {
                 request,
                 reply_id,
                 pending_replies,
+                cancellation,
             } => {
                 self.start_service_binding_fetch(ServiceBindingFetchStart {
                     reply_inbox,
@@ -407,6 +409,7 @@ impl WorkerManager {
                     request,
                     reply_id,
                     pending_replies,
+                    cancellation,
                 });
                 true
             }
@@ -946,7 +949,7 @@ impl WorkerManager {
             }
         }
 
-        if let Some(close) = self.websocket_close_signals.remove(session_id) {
+        if !has_output && let Some(close) = self.websocket_close_signals.remove(session_id) {
             has_output = true;
             append_or_update_header(
                 &mut output.output.headers,
@@ -1003,7 +1006,9 @@ impl WorkerManager {
                         });
                     }
                 }
-                if let Some(close) = self.websocket_close_signals.remove(&session_id) {
+                if !has_outbox_output
+                    && let Some(close) = self.websocket_close_signals.remove(&session_id)
+                {
                     has_outbox_output = true;
                     append_or_update_header(
                         &mut output.output.headers,
@@ -1058,7 +1063,7 @@ impl WorkerManager {
                         .retain(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_WS_BINARY_HEADER));
                 }
             }
-            if let Some(close) = self.websocket_close_signals.remove(session_id) {
+            if !has_output && let Some(close) = self.websocket_close_signals.remove(session_id) {
                 has_output = true;
                 append_or_update_header(
                     &mut output.output.headers,

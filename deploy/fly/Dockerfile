@@ -23,6 +23,7 @@ COPY patches ./patches
 RUN ./scripts/patch-crate.sh deno_crypto
 RUN ./scripts/patch-crate.sh deno_tls
 COPY crates ./crates
+COPY packages/dd-vite/src/shims ./packages/dd-vite/src/shims
 
 RUN --mount=type=cache,id=dd-cargo-registry,target=/usr/local/cargo/registry \
   --mount=type=cache,id=dd-cargo-git,target=/usr/local/cargo/git \

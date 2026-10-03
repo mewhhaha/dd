@@ -155,24 +155,6 @@ pub fn is_retryable_turso_error(error: &turso::Error) -> bool {
     matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 }
 
-pub struct VersionFloor;
-
-impl VersionFloor {
-    pub fn next_i64(counter: &AtomicU64) -> i64 {
-        counter.fetch_add(1, Ordering::SeqCst) as i64
-    }
-
-    pub fn set_floor(counter: &AtomicU64, floor: u64) {
-        let mut current = counter.load(Ordering::SeqCst);
-        while current < floor {
-            match counter.compare_exchange(current, floor, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -38,6 +38,8 @@ pub(super) fn runtime_service_config(
                         .unwrap_or(1),
                 )
                 .clamp(1, 8),
+            memory_outbox_max_claimed_bytes: RuntimeStorageConfig::default()
+                .memory_outbox_max_claimed_bytes,
             memory_snapshot_cache_max_entries: env_usize(
                 "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
                 4096,

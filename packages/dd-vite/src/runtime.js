@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { once } from "node:events";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +8,7 @@ import { normalizeRuntimeConfig } from "./vite/config.js";
 const DEFAULT_WORKER_NAME = "test-worker";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
+const TERMINATE_TIMEOUT_MS = 1_000;
 const require = createRequire(import.meta.url);
 
 export function createDdRuntime(options = {}) {
@@ -24,6 +24,8 @@ export class DdRuntimeClient {
   #stdout = "";
   #stderr = "";
   #closed = false;
+  #closing;
+  #terminating = new Map();
 
   constructor(options = {}) {
     this.options = {
@@ -93,19 +95,21 @@ export class DdRuntimeClient {
     if (this.#closed) {
       throw new Error("dd runtime client is closed");
     }
-    const child = this.#ensureStarted();
+    return this.#sendRequest(this.#ensureStarted(), command, options);
+  }
+
+  #sendRequest(child, command, options = {}) {
     const id = String(this.#nextId++);
     const timeoutMs = options.timeoutMs ?? this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const useTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
-    const payload = JSON.stringify({ id, ...command });
+    const payload = JSON.stringify({ ...command, id });
     return new Promise((resolveRequest, rejectRequest) => {
       const timeout = useTimeout
         ? setTimeout(() => {
           this.#pending.delete(id);
           if (this.#child === child) {
-            this.#discardChild(child);
-            child.kill("SIGTERM");
-            this.#rejectAll(
+            this.#failChild(
+              child,
               new Error(`dd runtime restarted after command timed out: ${command.op}`),
             );
           }
@@ -121,36 +125,48 @@ export class DdRuntimeClient {
         if (!error) {
           return;
         }
-        clearTimeout(timeout);
-        this.#pending.delete(id);
         if (this.#child === child) {
-          this.#discardChild(child);
+          this.#failChild(child, error);
+        } else {
+          clearTimeout(timeout);
+          this.#pending.delete(id);
+          rejectRequest(error);
         }
-        rejectRequest(error);
       });
     });
   }
 
-  async close() {
-    if (this.#closed) {
-      return;
-    }
-    const child = this.#liveChild();
-    if (!child) {
-      this.#closed = true;
-      return;
-    }
-    try {
-      const exited = once(child, "exit");
-      await Promise.race([
-        this.request({ op: "shutdown" }).then(() => exited),
-        delay(this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS),
-      ]);
-    } catch {}
+  close() {
+    if (this.#closing) return this.#closing;
     this.#closed = true;
+    this.#closing = this.#close();
+    return this.#closing;
+  }
+
+  async #close() {
+    const child = this.#liveChild();
+    if (child) {
+      this.#sendRequest(child, { op: "shutdown" }, { timeoutMs: 0 }).catch(() => {});
+      await waitForChildExit(child, this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS);
+      this.#failChild(child, new Error("dd runtime client is closed"));
+    }
     this.#workers.clear();
     this.#rejectAll(new Error("dd runtime client is closed"));
-    child.kill("SIGTERM");
+    await Promise.all(this.#terminating.values());
+  }
+
+  #failChild(child, error) {
+    if (this.#child === child) {
+      this.#discardChild(child);
+      this.#rejectAll(error);
+    }
+    if (!this.#terminating.has(child)) {
+      const terminating = terminateChild(child);
+      this.#terminating.set(child, terminating);
+      // Retain failures for close() to report; background command failures
+      // must not leave an unhandled rejection or an untracked subprocess.
+      terminating.then(() => this.#terminating.delete(child), () => {});
+    }
   }
 
   #ensureStarted() {
@@ -169,15 +185,19 @@ export class DdRuntimeClient {
     this.#stdout = "";
     this.#stderr = "";
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => this.#onStdout(chunk));
+    child.stdout.on("data", (chunk) => {
+      if (this.#child === child) this.#onStdout(chunk);
+    });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
-      this.#stderr = `${this.#stderr}${chunk}`.slice(-16_384);
+      if (this.#child === child) this.#stderr = `${this.#stderr}${chunk}`.slice(-16_384);
+    });
+    child.stdin.on("error", (error) => {
+      if (this.#child === child) this.#failChild(child, error);
     });
     child.on("error", (error) => {
       if (this.#child === child) {
-        this.#discardChild(child);
-        this.#rejectAll(error);
+        this.#failChild(child, error);
       }
     });
     child.on("exit", (code, signal) => {
@@ -185,9 +205,6 @@ export class DdRuntimeClient {
         return;
       }
       this.#discardChild(child);
-      if (this.#closed) {
-        return;
-      }
       this.#rejectAll(
         new Error(
           `dd runtime exited with ${signal ?? code}; stderr: ${this.#stderr.trim()}`,
@@ -208,7 +225,7 @@ export class DdRuntimeClient {
       child.stdin.destroyed ||
       child.stdin.writableEnded
     ) {
-      this.#discardChild(child);
+      this.#failChild(child, new Error("dd runtime subprocess is no longer writable"));
       return undefined;
     }
     return child;
@@ -274,11 +291,32 @@ export class DdRuntimeClient {
   }
 }
 
-function delay(ms) {
+function hasExited(child) {
+  return child.exitCode != null || child.signalCode != null;
+}
+
+function waitForChildExit(child, ms) {
+  if (hasExited(child) || !child.pid) return Promise.resolve(true);
   return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, ms);
-    timeout.unref?.();
+    const finish = (exited) => {
+      clearTimeout(timeout);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timeout = setTimeout(() => finish(false), ms);
+    child.once("exit", onExit);
   });
+}
+
+async function terminateChild(child) {
+  if (hasExited(child) || !child.pid) return;
+  child.kill("SIGTERM");
+  if (await waitForChildExit(child, TERMINATE_TIMEOUT_MS)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForChildExit(child, TERMINATE_TIMEOUT_MS))) {
+    throw new Error(`dd runtime subprocess ${child.pid} did not exit after SIGKILL`);
+  }
 }
 
 function isRuntimeProtocolLine(line) {

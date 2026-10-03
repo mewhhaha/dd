@@ -26,10 +26,14 @@ export async function exerciseRuntimeContract(runtime: DdRuntimeClient, status: 
   const workerSchedulers: number = status.runtime.worker_schedulers;
   const committedCommands: number = status.runtime.state_storage.committed_commands;
   const snapshotCacheHits: number = status.runtime.memory_snapshot_cache_hits;
+  const queueBytes: number = status.runtime.workers[0].queued_bytes;
+  const activeLeases: number = status.runtime.workers[0].active_memory_leases;
+  const commitMicros: number | undefined = status.runtime.state_storage.timings?.commit_us;
+  const expiresAt: number | null = status.runtime.workers[0].expires_at_ms;
   await runtime.request({ op: "stats", name: "contract" }, { timeoutMs: 1_000 });
   // @ts-expect-error Recency updates stay in RAM and have no persistent flush queue.
   status.runtime.cache_pending_recency_touches;
-  return { generation, workerSchedulers, committedCommands, snapshotCacheHits };
+  return { generation, workerSchedulers, committedCommands, snapshotCacheHits, queueBytes, activeLeases, commitMicros, expiresAt };
 }
 
 export async function exerciseKvContract(kv: DdKvNamespace) {

@@ -571,22 +571,16 @@ export function normalizeHotReloadMode(value) {
   throw new Error("ddVitePlugin reloadOnHotUpdate must be false, true, 'all', or 'entry'");
 }
 
-export async function shouldInvalidateOnHotUpdate(context, mode, effectiveWorkerEntry, options) {
+export function shouldInvalidateOnHotUpdate(context, mode, workers) {
   if (mode === false) {
     return false;
   }
   if (mode === "all") {
-    return hasReloadableWorkerSource(options, effectiveWorkerEntry);
+    return workers.some(worker => worker.entry || typeof worker.source === "function");
   }
-  const entry = await effectiveWorkerEntry();
-  if (!entry) {
-    return typeof options.source === "function";
-  }
-  return context.file === normalizeFile(entry);
-}
-
-export async function hasReloadableWorkerSource(options, effectiveWorkerEntry) {
-  return Boolean((await effectiveWorkerEntry()) || typeof options.source === "function");
+  return workers.some(worker => worker.entry
+    ? context.file === normalizeFile(worker.entry)
+    : typeof worker.source === "function");
 }
 
 export function isRecoverableRuntimeClientError(error) {

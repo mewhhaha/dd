@@ -7,6 +7,7 @@ import {
 import { spawn } from "node:child_process";
 import { json as readJson } from "node:stream/consumers";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -16,6 +17,7 @@ import { createWorkerTestRuntime } from "./vitest.js";
 import {
   arrayOfStrings,
   assertSafeBuildOutputRoot,
+  auxiliaryWorkerServiceConfig,
   buildAuxiliaryServiceDeploymentConfig,
   buildGeneratedDeploymentConfig,
   childBuildOutDir,
@@ -27,11 +29,13 @@ import {
   normalizeConfigRelativePath,
   normalizeDeploymentAssetsDir,
   normalizeDeploymentConfigOptions,
+  normalizeOutputPath,
   relativeDeploymentAssetsDir,
   stageDeploymentServerModules,
   resolveBuildOutputRoot,
-  topLevelRuntimeConfig,
+  resolveDeploymentRuntimeConfig,
   uniqueStrings,
+  validateRuntimeConfig,
   writeDdEnvTypes,
   writeGeneratedAssetPolicy,
   writeGeneratedStaticRoutes,
@@ -82,38 +86,9 @@ const DD_AUXILIARY_WORKERS_RESOLVED = "\0dd:auxiliary-workers";
 const DD_VITE_MODULE_HEADER = "x-dd-vite-module-token";
 const DD_VITE_MODULE_ENDPOINT_PATH = "/__dd_vite/module";
 const DD_VITE_MODULE_INVALIDATE_PATH = "/__dd_vite/invalidate";
-const DD_NODE_ASYNC_HOOKS_SHIM_SOURCE = `
-const asyncContext = globalThis.__dd_async_context;
-
-export class AsyncLocalStorage {
-  #storage;
-
-  run(store, callback, ...args) {
-    this.#storage ??= {};
-    return asyncContext.runWithAsyncLocalStore(this.#storage, store, callback, ...args);
-  }
-
-  getStore() {
-    if (!this.#storage) {
-      return undefined;
-    }
-    return asyncContext.getAsyncLocalStore(this.#storage);
-  }
-
-  enterWith(store) {
-    this.#storage ??= {};
-    asyncContext.enterWithAsyncLocalStore(this.#storage, store);
-  }
-
-  disable() {
-    if (!this.#storage) {
-      return;
-    }
-    asyncContext.disableAsyncLocalStore(this.#storage);
-    this.#storage = undefined;
-  }
-}
-`;
+const DD_NODE_ASYNC_HOOKS_SHIM_SOURCE = readFileSync(
+  new URL("./shims/node_async_hooks.js", import.meta.url), "utf8",
+);
 let workerBundleEnvDepth = 0;
 let workerBundleEnvPrevious;
 
@@ -126,23 +101,49 @@ export function ddEnvironment(options = {}) {
       dev: {
         createEnvironment(name, config) {
           let runtimePromise;
+          let closing;
           const getRuntime = () => {
+            if (closing) throw new Error(`dd Vite environment ${name} is closed`);
             runtimePromise ??= createWorkerTestRuntime({
               ...runtimeOptions,
               name: runtimeOptions.name ?? name,
             });
             return runtimePromise;
           };
-          return createFetchableDevEnvironment(name, config, {
+          const environment = createFetchableDevEnvironment(name, config, {
             async handleRequest(request) {
               const runtime = await getRuntime();
               return runtime.fetch(request);
             },
           });
+          const closeEnvironment = environment.close.bind(environment);
+          environment.close = () => closing ??= (async () => {
+            try {
+              const worker = await runtimePromise?.catch(() => undefined);
+              await worker?.close();
+            } finally {
+              await closeEnvironment();
+            }
+          })();
+          return environment;
         },
       },
     },
     environmentOptions,
+  );
+}
+
+function ddSharedEnvironment(options, handleRequest) {
+  return mergeConfig(
+    {
+      ...ddEnvironmentBaseOptions(options),
+      dev: {
+        createEnvironment(name, config) {
+          return createFetchableDevEnvironment(name, config, { handleRequest });
+        },
+      },
+    },
+    ddEnvironmentUserOptions(options),
   );
 }
 
@@ -240,9 +241,12 @@ export function ddVitePlugin(options = {}) {
   const auxiliaryWorkers = normalizeAuxiliaryWorkers(options.auxiliaryWorkers);
   const mount = normalizeMount(options.mount ?? DEFAULT_MOUNT);
   const moduleRunnerToken = randomUUID();
-  let runtime;
+  const ownsRuntime = options.runtime == null;
+  let runtime = options.runtime;
+  let runtimeClosed = false;
   let deployment;
   let deploymentRuntimeGeneration;
+  let deploymentModuleRunnerMode;
   let deploying;
   const hotReloadMode = normalizeHotReloadMode(options.reloadOnHotUpdate);
   const deploymentConfig = normalizeDeploymentConfigOptions(
@@ -289,11 +293,10 @@ export function ddVitePlugin(options = {}) {
 
   async function effectiveRuntimeConfig() {
     const source = await sourceConfig();
+    const config = resolveDeploymentRuntimeConfig(source.config, options.config);
+    validateRuntimeConfig(config, "runtime config");
     return withAuxiliaryRuntimeBindings(
-      options.config ??
-      source.config.config ??
-      topLevelRuntimeConfig(source.config) ??
-      {},
+      config,
       auxiliaryWorkers,
     );
   }
@@ -452,44 +455,69 @@ export function ddVitePlugin(options = {}) {
     return withWorkerBundleEnv(() => workerSource(resolved));
   }
 
+  async function stopRuntime() {
+    runtimeClosed = true;
+    deployment = undefined;
+    deploymentRuntimeGeneration = undefined;
+    deploymentModuleRunnerMode = undefined;
+    if (reactRouterRscClientUpdateTimer) {
+      clearTimeout(reactRouterRscClientUpdateTimer);
+      reactRouterRscClientUpdateTimer = undefined;
+      reactRouterRscClientUpdateFile = undefined;
+    }
+    if (ownsRuntime) {
+      const closingRuntime = runtime;
+      runtime = undefined;
+      await closingRuntime?.close();
+    }
+  }
+
   async function ensureDeployed() {
+    if (runtimeClosed) throw new Error("dd Vite runtime is closed");
     runtime ??= createDdRuntime(options.runtimeOptions);
-    if (deployment && deploymentRuntimeGeneration === runtime.generation) {
+    const workers = await resolvedWorkers();
+    const moduleRunnerMode = workers.some(worker => usesViteModuleRunner(worker));
+    if (deployment && deploymentRuntimeGeneration === runtime.generation && deploymentModuleRunnerMode === moduleRunnerMode) {
       return deployment;
     }
     deployment = undefined;
     deploymentRuntimeGeneration = undefined;
-    const entryWorker = await resolvedEntryWorker();
+    const entryWorker = workers[0];
+    const sourceOptions = { allowDevModuleRunner: moduleRunnerMode };
     const deployAll = async () => {
-      await deployAuxiliaryServiceWorkers(runtime);
-      return runtime.deploy(entryWorker.runtimeName, await bundledWorkerSource(), entryWorker.config);
+      await deployAuxiliaryServiceWorkers(runtime, sourceOptions);
+      const result = await runtime.deploy(entryWorker.runtimeName, await bundledWorkerSource(sourceOptions), entryWorker.config);
+      return { result, moduleRunnerMode };
     };
     deploying ??= deployAll()
       .catch(async (error) => {
-        if (!isRecoverableRuntimeClientError(error)) {
+        if (runtimeClosed || !isRecoverableRuntimeClientError(error)) {
           throw error;
         }
-        await runtime?.close().catch(() => {});
-        runtime = createDdRuntime(options.runtimeOptions);
-        await deployAuxiliaryServiceWorkers(runtime);
-        return runtime.deploy(entryWorker.runtimeName, await bundledWorkerSource(), entryWorker.config);
+        if (ownsRuntime) {
+          await runtime?.close().catch(() => {});
+          runtime = createDdRuntime(options.runtimeOptions);
+        }
+        return deployAll();
       })
       .finally(() => {
         deploying = undefined;
       });
-    deployment = await deploying;
+    const deployed = await deploying;
+    deployment = deployed.result;
+    deploymentModuleRunnerMode = deployed.moduleRunnerMode;
     deploymentRuntimeGeneration = runtime.generation;
     return deployment;
   }
 
-  async function deployAuxiliaryServiceWorkers(targetRuntime) {
+  async function deployAuxiliaryServiceWorkers(targetRuntime, sourceOptions) {
     for (const worker of await resolvedWorkers()) {
       if (worker.kind !== "service") {
         continue;
       }
       await targetRuntime.deploy(
         worker.runtimeName,
-        await workerSource(worker),
+        await workerSource(worker, sourceOptions),
         worker.config,
       );
     }
@@ -522,13 +550,16 @@ export function ddVitePlugin(options = {}) {
       !devServer ||
       !deployment ||
       !runtime ||
+      !deploymentModuleRunnerMode ||
       deploymentRuntimeGeneration !== runtime.generation
     ) {
       deployment = undefined;
       deploymentRuntimeGeneration = undefined;
       return false;
     }
-    for (const worker of await resolvedWorkers()) {
+    const workers = await resolvedWorkers();
+    if (workers.some(worker => typeof worker.source === "function")) return false;
+    for (const worker of workers) {
       if (!worker.entry || typeof worker.source === "string" || typeof worker.source === "function") {
         continue;
       }
@@ -559,7 +590,7 @@ export function ddVitePlugin(options = {}) {
   }
 
   function usesViteModuleRunner(worker, sourceOptions = {}) {
-    if (sourceOptions.allowDevModuleRunner === false || viteCommand !== "serve" || !devServer) {
+    if (sourceOptions.allowDevModuleRunner === false || viteCommand !== "serve" || !devServer || !viteDevServerActualUrl(devServer)) {
       return false;
     }
     if (!worker.entry || typeof worker.source === "string" || typeof worker.source === "function") {
@@ -588,7 +619,7 @@ export function ddVitePlugin(options = {}) {
       optimizeDepsEntries: entry ? [viteRequestForFile(entry, rootHint ?? process.cwd())] : [],
     });
     const output = {
-      entryFileNames: DEFAULT_DEPLOYMENT_WORKER_FILE,
+      entryFileNames: workerDeploymentFiles(worker).workerFile,
       chunkFileNames: "assets/[name]-[hash].js",
       assetFileNames: "assets/[name]-[hash][extname]",
       codeSplitting: false,
@@ -667,16 +698,19 @@ export function ddVitePlugin(options = {}) {
     const manifestWorkers = [];
     for (const worker of workers) {
       const workerOutDir = join(outRoot, worker.outputName);
-      const workerFile = DEFAULT_DEPLOYMENT_WORKER_FILE;
-      const configFile = DEFAULT_DEPLOYMENT_CONFIG_FILE;
-      const config = await buildWorkerDeploymentConfig({
-        worker,
-        workerFile,
-        configFile,
-        clientAssetsRel,
-      });
-      await stageDeploymentServerModules(config, source.dir, workerOutDir);
-      await writeOutputFile(workerOutDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
+      const { workerFile, configFile } = workerDeploymentFiles(worker);
+      let config;
+      if (deploymentConfig.enabled) {
+        config = await buildWorkerDeploymentConfig({
+          worker,
+          workerFile,
+          configFile,
+          clientAssetsRel,
+        });
+        const configOutDir = dirname(join(workerOutDir, configFile));
+        await stageDeploymentServerModules(config, source.dir, configOutDir);
+        await writeOutputFile(workerOutDir, configFile, `${JSON.stringify(config, null, 2)}\n`);
+      }
       manifestWorkers.push({
         name: worker.name,
         role: worker.role,
@@ -686,15 +720,16 @@ export function ddVitePlugin(options = {}) {
         environment: worker.environmentName,
         outDir: worker.outputName,
         worker: joinConfigRelativePath(worker.outputName, workerFile),
-        deployConfig: joinConfigRelativePath(worker.outputName, configFile),
+        deployConfig: config ? joinConfigRelativePath(worker.outputName, configFile) : undefined,
       });
-      if (worker.role === "entry") {
+      if (worker.role === "entry" && config) {
         const generatedDeploymentConfig = {
           ...worker.deploymentConfig,
           assetsDir: config.assets_dir ?? false,
         };
-        await writeGeneratedStaticRoutes(workerOutDir, generatedDeploymentConfig);
-        await writeGeneratedAssetPolicy(workerOutDir, resolvedConfig, generatedDeploymentConfig.assetsDir);
+        const configOutDir = dirname(join(workerOutDir, configFile));
+        await writeGeneratedStaticRoutes(configOutDir, generatedDeploymentConfig);
+        await writeGeneratedAssetPolicy(configOutDir, resolvedConfig, generatedDeploymentConfig.assetsDir);
       }
     }
     const entry = workers.find((worker) => worker.role === "entry");
@@ -727,14 +762,17 @@ export function ddVitePlugin(options = {}) {
 
   async function buildWorkerDeploymentConfig({ worker, workerFile, configFile, clientAssetsRel }) {
     const source = await sourceConfig();
+    const configOutputName = dirname(joinConfigRelativePath(worker.outputName, configFile));
+    const configWorkerFile = relativeDeploymentAssetsDir(configOutputName, joinConfigRelativePath(worker.outputName, workerFile));
+    const configFileName = configFile.split("/").at(-1);
     if (worker.role === "entry") {
       return buildGeneratedDeploymentConfig({
         base: source.config,
         options,
         workerName: worker.runtimeName,
-        workerFile,
-        configFile,
-        assetsDir: clientAssetsRel === false ? false : relativeDeploymentAssetsDir(worker.outputName, clientAssetsRel),
+        workerFile: configWorkerFile,
+        configFile: configFileName,
+        assetsDir: clientAssetsRel === false ? false : relativeDeploymentAssetsDir(configOutputName, clientAssetsRel),
         assetExcludes: deploymentConfig.assetExcludes,
         extraAssetExcludes: [],
         serverModules: deploymentConfig.serverModules ?? deploymentConfig.server_modules,
@@ -744,8 +782,18 @@ export function ddVitePlugin(options = {}) {
     return buildAuxiliaryServiceDeploymentConfig({
       base: source.config,
       worker,
-      workerFile,
+      workerFile: configWorkerFile,
     });
+  }
+
+  function workerDeploymentFiles(worker) {
+    const settings = worker.role === "entry" ? deploymentConfig : worker.deployment ?? {};
+    const workerFile = normalizeOutputPath(settings.entrypoint ?? DEFAULT_DEPLOYMENT_WORKER_FILE, "deploymentConfig.entrypoint");
+    const configFile = normalizeOutputPath(settings.output ?? DEFAULT_DEPLOYMENT_CONFIG_FILE, "deploymentConfig.output");
+    if (workerFile === configFile) {
+      throw new Error("deploymentConfig.output and entrypoint must name different files");
+    }
+    return { workerFile, configFile };
   }
 
   return {
@@ -803,7 +851,7 @@ export function ddVitePlugin(options = {}) {
       }
       const worker = currentResolvedWorkerByEnvironment(name);
       if (worker) {
-        return ddEnvironment({
+        return ddSharedEnvironment({
           ...options,
           ...worker,
           viteEnvironment: worker.viteEnvironment,
@@ -813,6 +861,11 @@ export function ddVitePlugin(options = {}) {
           optimizeDepsEntries: worker.entry
             ? [viteRequestForFile(worker.entry, resolveFrameworkRoot())]
             : [],
+        }, async (request) => {
+          await ensureDeployed();
+          const current = (await resolvedWorkers()).find(worker => worker.environmentName === name);
+          if (!current) throw new Error(`dd Vite environment ${name} has no active worker`);
+          return runtime.fetch(current.runtimeName, request);
         });
       }
       const parentWorker = currentResolvedWorkerByChildEnvironment(name);
@@ -832,20 +885,39 @@ export function ddVitePlugin(options = {}) {
     },
     configureServer(viteServer) {
       devServer = viteServer;
-      viteServer.httpServer?.once("close", () => {
-        if (reactRouterRscClientUpdateTimer) {
-          clearTimeout(reactRouterRscClientUpdateTimer);
-          reactRouterRscClientUpdateTimer = undefined;
-          reactRouterRscClientUpdateFile = undefined;
+      runtimeClosed = false;
+      deployment = undefined;
+      deploymentRuntimeGeneration = undefined;
+      deploymentModuleRunnerMode = undefined;
+      const closeServer = viteServer.close.bind(viteServer);
+      const restartServer = viteServer.restart.bind(viteServer);
+      let closing;
+      let restarting;
+      viteServer.close = () => closing ??= (async () => {
+        const results = await Promise.allSettled([
+          stopRuntime(),
+          (async () => closeServer())(),
+        ]);
+        const failure = results.find(result => result.status === "rejected");
+        if (failure) throw failure.reason;
+      })();
+      viteServer.restart = (...args) => restarting ??= (async () => {
+        const previousConfig = viteServer.config;
+        try {
+          await stopRuntime();
+          return await restartServer(...args);
+        } finally {
+          // A failed config reload leaves the existing server available.
+          if (!closing && viteServer.config === previousConfig) runtimeClosed = false;
+          restarting = undefined;
         }
-        void runtime?.close();
+      })();
+      installViteModuleMiddleware(viteServer, {
+        token: moduleRunnerToken,
       });
       if (options.middleware === false) {
         return;
       }
-      installViteModuleMiddleware(viteServer, {
-        token: moduleRunnerToken,
-      });
       const upgradeHandler = (req, socket, head) => {
         void handleDdWebSocketUpgrade(req, socket, head, {
           ensureDeployed,
@@ -901,7 +973,7 @@ export function ddVitePlugin(options = {}) {
         deployment = undefined;
         deploymentRuntimeGeneration = undefined;
       }
-      if (await shouldInvalidateOnHotUpdate(context, hotReloadMode, effectiveWorkerEntry, options)) {
+      if (shouldInvalidateOnHotUpdate(context, hotReloadMode, await resolvedWorkers())) {
         await invalidateDeployment();
         scheduleReactRouterRscClientUpdate(context);
       }
@@ -913,7 +985,8 @@ export function ddVitePlugin(options = {}) {
       },
     },
     async closeBundle() {
-      await runtime?.close();
+      if (viteCommand === "serve") return;
+      await stopRuntime();
     },
     resolveId(id) {
       if (id === DD_AUXILIARY_WORKERS_MODULE) {
@@ -1274,14 +1347,6 @@ function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
   }
   runtimeConfig.bindings = bindings;
   return runtimeConfig;
-}
-
-function auxiliaryWorkerServiceConfig(worker) {
-  const config = cloneJson(worker.config);
-  if (config.public == null) {
-    config.public = false;
-  }
-  return config;
 }
 
 function ddAuxiliaryWorkersVirtualPlugin(loadSource) {

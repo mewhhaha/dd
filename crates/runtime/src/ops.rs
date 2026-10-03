@@ -1,5 +1,5 @@
 use crate::cache::{CacheLookup, CacheRequest, CacheResponse, CacheStore};
-use crate::kv::{KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore, KvUtf8Lookup};
+use crate::kv::{KvEntry, KvProfileMetricKind, KvProfileSnapshot, KvStore};
 use crate::memory::{
     MemoryBatchMutation, MemoryCommandResultWrite, MemoryOutboxEffectWrite,
     MemoryProfileMetricKind, MemoryStore,
@@ -21,6 +21,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sys_traits::impls::RealSys;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
+#[path = "ops/cache.rs"]
+mod cache_ops;
+#[path = "ops/http.rs"]
+mod http_ops;
+#[path = "ops/kv.rs"]
+mod kv_ops;
 #[path = "ops/memory.rs"]
 mod memory_ops;
 #[path = "ops/memory_types.rs"]
@@ -33,9 +39,12 @@ mod request_control_types;
 mod request_ops;
 #[path = "ops/request_types.rs"]
 mod request_types;
-#[path = "ops/storage_http.rs"]
-mod storage_http_ops;
+#[path = "ops/response.rs"]
+mod response_ops;
 
+use self::cache_ops::*;
+use self::http_ops::*;
+use self::kv_ops::*;
 use self::memory_ops::*;
 pub(crate) use self::memory_ops::{
     clear_memory_batch_handles, clear_memory_byte_handles, clear_memory_command_handles,
@@ -46,7 +55,7 @@ use self::request_control_ops::*;
 pub(crate) use self::request_control_types::*;
 use self::request_ops::*;
 pub(crate) use self::request_types::*;
-use self::storage_http_ops::*;
+use self::response_ops::*;
 
 static PROCESS_MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -203,8 +212,6 @@ deno_core::extension!(
     ops = [
         op_sleep,
         op_time_boundary_now,
-        op_kv_get,
-        op_kv_get_many_utf8,
         op_kv_get_value,
         op_kv_profile_record_js,
         op_kv_profile_take,

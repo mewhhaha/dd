@@ -1602,12 +1602,19 @@ mod tests {
             serde_json::from_str(include_str!("../../../fixtures/config/deploy-config.json"))
                 .expect("shared runtime contract");
         for scenario in cases {
-            let config = serde_json::json!({
+            let mut config = serde_json::json!({
                 "schema_version": 1,
                 "name": "runtime-contract",
                 "entrypoint": "worker.js",
-                "config": scenario["input"],
             });
+            if let Some(deployment) = scenario.get("deployment") {
+                config
+                    .as_object_mut()
+                    .expect("deployment object")
+                    .extend(deployment.as_object().expect("mixed configuration").clone());
+            } else {
+                config["config"] = scenario["input"].clone();
+            }
             fs::write(
                 root.join("dd.deploy.json"),
                 serde_json::to_vec(&config).expect("encode deployment config"),
@@ -1848,7 +1855,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_legacy_actor_binding_flag() {
+    fn cli_rejects_retired_memory_binding_flag() {
         let result = Cli::try_parse_from([
             "dd",
             "deploy",

@@ -182,5 +182,86 @@
       }
     },
     "reject": true
+  },
+  {
+    "name": "top-level fields override nested runtime configuration",
+    "deployment": {
+      "public": true,
+      "cache": {
+        "enabled": true
+      },
+      "config": {
+        "public": false,
+        "bindings": [
+          {
+            "type": "kv",
+            "binding": "STATE"
+          }
+        ],
+        "egress_allow_hosts": [
+          "api.example.com"
+        ]
+      }
+    },
+    "expected": {
+      "egress_allow_hosts": [
+        "api.example.com"
+      ],
+      "public": true,
+      "cache": {
+        "enabled": true
+      },
+      "bindings": [
+        {
+          "type": "kv",
+          "binding": "STATE"
+        }
+      ],
+      "internal": {
+        "trace": null
+      }
+    }
+  },
+  {
+    "name": "empty top-level fields clear nested runtime configuration",
+    "deployment": {
+      "public": false,
+      "cache": {},
+      "bindings": [],
+      "internal": {},
+      "egress_allow_hosts": [],
+      "config": {
+        "public": true,
+        "cache": {
+          "enabled": true
+        },
+        "bindings": [
+          {
+            "type": "memory",
+            "binding": "ROOMS"
+          }
+        ],
+        "internal": {
+          "trace": {
+            "worker": "trace",
+            "path": "/custom"
+          }
+        },
+        "egress_allow_hosts": [
+          "nested.example.com"
+        ]
+      }
+    },
+    "expected": {
+      "egress_allow_hosts": [],
+      "public": false,
+      "cache": {
+        "enabled": false
+      },
+      "bindings": [],
+      "internal": {
+        "trace": null
+      }
+    }
   }
 ]

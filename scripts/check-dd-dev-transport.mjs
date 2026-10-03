@@ -87,6 +87,32 @@ const timeout = setTimeout(() => {
 try {
   const deployed = await runtime.deploy(name, source, { bindings: [{ type: "memory", binding: "SOCKETS" }] });
   assert.equal(runtime.workerUrl(name), deployed.url);
+  const workerStatsTypes = await readFile(new URL("../packages/dd-vite/src/runtime-contract.d.ts", import.meta.url), "utf8");
+  const workerStatsContract = /^export interface DdRuntimeWorkerStats \{\n([\s\S]*?)^\}/m.exec(workerStatsTypes);
+  assert(workerStatsContract, "the generated contract must declare dev worker stats");
+  const statsFields = [...workerStatsContract[1].matchAll(/^  (\w+): /gm)].map(match => match[1]).sort();
+  const { stats } = await runtime.stats(name);
+  assert.deepEqual(Object.keys(stats).sort(), statsFields, "native dev stats must match the generated TypeScript contract");
+  assert.equal(stats.temporary, false);
+  assert.equal(stats.expires_at_ms, null);
+  assert.equal(stats.active_memory_leases, 0);
+  assert.equal((await runtime.stats("not-deployed")).stats, null);
+
+  const generation = runtime.generation;
+  for (const command of [
+    { op: "stats" },
+    { op: "unknown_operation" },
+    { op: "deploy", name, source, config: { public: "invalid" } },
+  ]) {
+    await Promise.all([
+      assert.rejects(runtime.request(command, { timeoutMs: 1_000 }), error => error.kind === "bad_request"),
+      runtime.stats(name).then(({ stats }) => assert(stats, "invalid commands must preserve other pending requests")),
+    ]);
+    assert.equal(runtime.generation, generation, "validation errors must not restart the native runtime");
+    assert.equal(runtime.workerUrl(name), deployed.url, "validation errors must preserve deployed workers");
+  }
+  console.log("dev transport: full stats contract and correlated validation errors passed");
+
   const originalUrl = "https://original.example:8443//path?q=one%20two";
   const original = await runtime.fetch(name, originalUrl);
   assert.deepEqual(await original.json(), { url: originalUrl, host: "original.example:8443", transportHeader: null });

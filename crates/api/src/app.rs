@@ -42,6 +42,7 @@ where
         result = &mut listeners => result,
         () = &mut shutdown => {
             state.operations.begin_shutdown();
+            state.runtime.close_deployment_admission();
             info!(active_requests = state.operations.active_requests(), "shutdown signal received; listeners stopped");
             Ok(())
         }

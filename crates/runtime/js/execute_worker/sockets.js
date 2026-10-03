@@ -18,8 +18,7 @@
     };
     const upgradeAccepted = { used: false };
     const sockets = {
-      accept(request, options = {}) {
-        const _ = options;
+      accept(request) {
         if (!allowSocketAccept) {
           throw new Error("state.sockets.accept is only available during a keyed memory request");
         }
@@ -76,7 +75,6 @@
 
   const createMemoryAtomicState = (
     entry,
-    runtimeRequestId,
     txn,
     socketRuntime,
   ) => {
@@ -132,9 +130,9 @@
           toUtf8Bytes(JSON.stringify(payload ?? null)),
         );
       },
-      accept(request, options = {}) {
+      accept(request) {
         assertActive();
-        const accepted = socketRuntime.sockets.accept(request, options);
+        const accepted = socketRuntime.sockets.accept(request);
         markMemoryBatchAccepted(txn);
         return {
           handle: accepted.handle,
@@ -147,10 +145,6 @@
     });
   };
 
-  const memoryStateEntries = globalThis.__dd_memory_state_entries ??= new Map();
-
-  const memoryEntryKey = (binding, memoryKey) => JSON.stringify([binding, memoryKey]);
-
   const createMemoryId = (bindingName, memoryKey) => ({
     __dd_memory_key: memoryKey,
     __dd_memory_binding: bindingName,
@@ -160,20 +154,9 @@
   });
 
   const ensureMemoryEntry = (binding, memoryKey) => {
-    const cacheKey = memoryEntryKey(binding, memoryKey);
-    let entry = memoryStateEntries.get(cacheKey);
-    if (!entry) {
-      entry = {
-        binding,
-        memoryKey,
-        cacheKey,
-      };
-      memoryStateEntries.set(cacheKey, entry);
-    }
-    entry.binding = binding;
-    entry.memoryKey = memoryKey;
-    entry.cacheKey = cacheKey;
-    return entry;
+    const current = currentRequestContext(false)?.memoryEntry;
+    if (current?.binding === binding && current.memoryKey === memoryKey) return current;
+    return { binding, memoryKey };
   };
 
   const createMemoryStubSocketApi = (bindingName, memoryKey) => Object.freeze({

@@ -179,7 +179,7 @@ operations that must read and update a value atomically.
 
 Cache API looks like worker-style response cache. Good for HTTP response reuse, not coordination. Cache namespaces are isolated per worker.
 
-The platform front cache is separate and opt-in. Set `config.cache.enabled` in `dd.json`/the deployment document, or pass `dd deploy --cache`. It caches only unauthenticated `GET`/`HEAD` responses that explicitly include `Cache-Control: public` and a positive `s-maxage` or `max-age`; `stale-while-revalidate` refreshes stale entries in the background.
+The platform front cache is separate and opt-in. Set `config.cache.enabled` in `dd.json`/the deployment document, or pass `dd deploy --cache`. It caches only unauthenticated `GET`/`HEAD` responses that explicitly include `Cache-Control: public` and a positive `s-maxage` or `max-age`; `stale-while-revalidate` refreshes stale entries in the background. Each deployment has its own persisted cache namespace, so redeploying immediately stops reuse of responses from the previous deployment.
 
 ```json
 {
@@ -257,7 +257,7 @@ See [docs/development.md](docs/development.md#vite-and-vitest-worker-development
 
 Workers have independent schedulers and share CPU, queue and stream-buffer budgets. Deployment validation runs outside request scheduling. Redeployment sends WebSockets close code `1012` and gives the previous generation a bounded period to drain.
 
-KV and memory share 32 fixed state shards. Deployment records and tokens use `control.db`; rebuildable responses use `cache.db`. Existing stores require an offline conversion into a new directory, followed by redeployment of rebuilt bundles.
+KV and memory share 32 fixed state shards. Deployment records and tokens use `control.db`; rebuildable responses use `cache.db`. Stores from before this shard layout require an offline conversion into a new directory, followed by redeployment of rebuilt bundles. Current-format stores upgrade their SQL metadata on open.
 
 See [architecture and resource limits](docs/architecture.md) and [storage conversion](docs/storage-conversion.md).
 

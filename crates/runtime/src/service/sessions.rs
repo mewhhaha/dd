@@ -41,9 +41,7 @@ pub(super) async fn run_memory_outbox_worker(
 
         tokio::select! {
             _ = ticker.tick(), if accepting => {
-                for shard in 0..memory_store.namespace_shards().max(1) {
-                    coordinator.schedule(shard);
-                }
+                coordinator.schedule_periodic_scan(memory_store.shard_count());
             }
             command = receiver.recv(), if accepting => {
                 match command {
@@ -75,6 +73,7 @@ struct MemoryOutboxDrainResult {
 
 struct MemoryOutboxDrainCoordinator {
     max_concurrent_shards: usize,
+    next_scan_start: usize,
     pending: VecDeque<usize>,
     pending_members: HashSet<usize>,
     in_flight: HashSet<usize>,
@@ -89,6 +88,7 @@ impl MemoryOutboxDrainCoordinator {
     fn new(max_concurrent_shards: usize) -> Self {
         Self {
             max_concurrent_shards: max_concurrent_shards.max(1),
+            next_scan_start: 0,
             pending: VecDeque::new(),
             pending_members: HashSet::new(),
             in_flight: HashSet::new(),
@@ -98,6 +98,18 @@ impl MemoryOutboxDrainCoordinator {
             shard_requeue_count: 0,
             parallelism_peak: 0,
         }
+    }
+
+    fn schedule_periodic_scan(&mut self, shard_count: usize) {
+        let shard_count = shard_count.max(1);
+        let start = self.next_scan_start % shard_count;
+        // A claim can exhaust the shared byte budget without reaching the
+        // record limit. Rotate the first opportunity rather than repeatedly
+        // letting an early shard take the budget before every other shard.
+        for shard in (start..shard_count).chain(0..start) {
+            self.schedule(shard);
+        }
+        self.next_scan_start = (start + 1) % shard_count;
     }
 
     fn schedule(&mut self, shard_index: usize) {
@@ -237,6 +249,10 @@ async fn drain_memory_outbox_shard_in_background(
             }
         };
         let claimed = claims.len();
+        let _payload_leases = claims
+            .iter()
+            .filter_map(MemoryOutboxClaim::payload_lease)
+            .collect::<Vec<_>>();
         let saturated = claimed == MEMORY_OUTBOX_DRAIN_LIMIT;
         saturated_any |= saturated;
         memory_store.record_profile(
@@ -342,7 +358,7 @@ impl WorkerManager {
         shard_index: usize,
         event_tx: &RuntimeEventSender,
     ) {
-        let shard_count = self.memory_store.namespace_shards().max(1);
+        let shard_count = self.memory_store.shard_count().max(1);
         let shard_index = shard_index % shard_count;
         self.pending_memory_outbox_shards.insert(shard_index);
         if let Err(error) = self
@@ -817,36 +833,50 @@ impl WorkerManager {
         &mut self,
         claims: Vec<MemoryOutboxClaim>,
     ) -> Vec<MemoryOutboxDeliveryOutcome> {
+        // Keep the shared native byte charge for every original payload until
+        // the batch's parsed messages and delivery outcomes have been produced.
+        let _payload_leases = claims
+            .iter()
+            .filter_map(MemoryOutboxClaim::payload_lease)
+            .collect::<Vec<_>>();
         let mut outcomes = Vec::with_capacity(claims.len());
+        let mut deferred_entities = HashMap::new();
         for claim in claims {
             let effect_id = claim.record.effect_id.clone();
             let namespace = claim.namespace.clone();
             let memory_key = claim.memory_key.clone();
-            let delivery = self.deliver_memory_outbox_claim(&claim);
-            let action = match delivery {
-                Ok(()) => MemoryOutboxDeliveryAction::Delivered,
-                Err(error) if is_terminal_memory_outbox_delivery_error(&error) => {
-                    warn!(
-                        namespace = %namespace,
-                        memory_key = %memory_key,
-                        effect_id = %effect_id,
-                        kind = %claim.record.kind,
-                        error = %error,
-                        "memory outbox effect dropped"
-                    );
-                    MemoryOutboxDeliveryAction::DroppedTerminal
+            let entity = (namespace.clone(), memory_key.clone());
+            let action = if let Some(retry_after) = deferred_entities.get(&entity) {
+                MemoryOutboxDeliveryAction::Retry {
+                    retry_after: *retry_after,
                 }
-                Err(error) => {
-                    let retry_after = memory_outbox_retry_after(claim.record.attempt_count);
-                    warn!(
-                        namespace = %namespace,
-                        memory_key = %memory_key,
-                        effect_id = %effect_id,
-                        kind = %claim.record.kind,
-                        error = %error,
-                        "memory outbox delivery failed"
-                    );
-                    MemoryOutboxDeliveryAction::Retry { retry_after }
+            } else {
+                match self.deliver_memory_outbox_claim(&claim) {
+                    Ok(()) => MemoryOutboxDeliveryAction::Delivered,
+                    Err(error) if is_terminal_memory_outbox_delivery_error(&error) => {
+                        warn!(
+                            namespace = %namespace,
+                            memory_key = %memory_key,
+                            effect_id = %effect_id,
+                            kind = %claim.record.kind,
+                            error = %error,
+                            "memory outbox effect dropped"
+                        );
+                        MemoryOutboxDeliveryAction::DroppedTerminal
+                    }
+                    Err(error) => {
+                        let retry_after = memory_outbox_retry_after(claim.record.attempt_count);
+                        deferred_entities.insert(entity, retry_after);
+                        warn!(
+                            namespace = %namespace,
+                            memory_key = %memory_key,
+                            effect_id = %effect_id,
+                            kind = %claim.record.kind,
+                            error = %error,
+                            "memory outbox delivery failed"
+                        );
+                        MemoryOutboxDeliveryAction::Retry { retry_after }
+                    }
                 }
             };
             outcomes.push(MemoryOutboxDeliveryOutcome {
@@ -1032,6 +1062,30 @@ fn memory_outbox_retry_after(attempt_count: i64) -> Duration {
 #[cfg(test)]
 mod outbox_coordinator_tests {
     use super::*;
+
+    #[test]
+    fn periodic_scans_rotate_first_chance_after_budget_limited_batches() {
+        let mut coordinator = MemoryOutboxDrainCoordinator::new(3);
+        let mut first_claim_opportunities = Vec::new();
+        for _ in 0..3 {
+            coordinator.schedule_periodic_scan(3);
+            first_claim_opportunities.push(*coordinator.pending.front().unwrap());
+            // Model the first shard holding the byte budget while all other
+            // shards finish empty. None reaches the record limit, so these
+            // batches receive no immediate saturated-batch follow-up.
+            while let Some(shard_index) = coordinator.pending.pop_front() {
+                coordinator.pending_members.remove(&shard_index);
+                coordinator.in_flight.insert(shard_index);
+                coordinator.finish_joined(Some(Ok(MemoryOutboxDrainResult {
+                    shard_index,
+                    saturated: false,
+                    panicked: false,
+                })));
+            }
+        }
+        assert_eq!(first_claim_opportunities, [0, 1, 2]);
+        assert!(coordinator.pending.is_empty());
+    }
 
     #[test]
     fn coordinator_deduplicates_pending_shards() {

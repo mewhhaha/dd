@@ -151,6 +151,7 @@ pub(crate) struct WorkerRequestPayload {
     pub(crate) request_body_handle: u32,
     pub(crate) stream_response: bool,
     pub(crate) max_response_body_bytes: usize,
+    pub(crate) max_request_body_bytes: usize,
     pub(crate) method: String,
     pub(crate) url: String,
     pub(crate) input_request_id: String,
@@ -168,6 +169,7 @@ pub(crate) struct WorkerRequestDescriptorPayload {
     pub(crate) request_body_handle: u32,
     pub(crate) stream_response: bool,
     pub(crate) max_response_body_bytes: usize,
+    pub(crate) max_request_body_bytes: usize,
     pub(crate) method: String,
     pub(crate) url: String,
     pub(crate) input_request_id: String,
@@ -186,6 +188,7 @@ impl WorkerRequestDescriptorPayload {
             request_body_handle: payload.request_body_handle,
             stream_response: payload.stream_response,
             max_response_body_bytes: payload.max_response_body_bytes,
+            max_request_body_bytes: payload.max_request_body_bytes,
             method: payload.method.clone(),
             url: payload.url.clone(),
             input_request_id: payload.input_request_id.clone(),
@@ -491,6 +494,7 @@ mod tests {
             request_body_handle: 9,
             stream_response: false,
             max_response_body_bytes: 1024,
+            max_request_body_bytes: 1024,
             method: "POST".to_string(),
             url: "http://worker/path".to_string(),
             input_request_id: "user-1".to_string(),
@@ -599,6 +603,13 @@ pub(crate) struct RequestSecretContext {
     pub(crate) execution: RequestExecutionContext,
     pub(crate) canceled: Arc<AtomicBool>,
     pub(crate) canceled_notify: Arc<Notify>,
+}
+
+impl Drop for RequestSecretContext {
+    fn drop(&mut self) {
+        self.canceled.store(true, Ordering::Release);
+        self.canceled_notify.notify_waiters();
+    }
 }
 
 #[derive(Default)]

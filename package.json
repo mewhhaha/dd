@@ -9,6 +9,11 @@
   "scripts": {
     "build:vite-examples": "pnpm --filter './examples/vite-*' build",
     "check:dd-vite-config": "node scripts/check-dd-vite-config.mjs",
+    "check:dd-vite-exports": "node scripts/check-dd-vite-exports.mjs",
+    "check:dd-vite-lifecycle": "node scripts/check-dd-vite-lifecycle.mjs",
+    "check:dd-vite-reload": "node scripts/check-dd-vite-reload.mjs",
+    "check:worker-js": "node scripts/check-worker-js.mjs",
+    "generate:runtime-types": "node scripts/generate-runtime-types.mjs",
     "browser:vite-examples": "pnpm --filter './examples/vite-react-router' --filter './examples/vite-react-router-rsc' browser",
     "smoke:vite-examples": "pnpm --filter './examples/vite-*' smoke",
     "typecheck:vite-examples": "pnpm --filter './examples/vite-*' typecheck",

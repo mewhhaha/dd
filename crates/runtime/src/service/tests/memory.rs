@@ -449,7 +449,7 @@ async fn memory_atomic_idempotency_key_replays_committed_result() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
-    let root = PathBuf::from(format!("/tmp/dd-memory-idempotent-{}", Uuid::new_v4()));
+    let store = TestStoreDir::new("dd-memory-idempotent");
     let config = RuntimeConfig {
         min_isolates: 1,
         max_isolates: 2,
@@ -460,7 +460,7 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
         ..RuntimeConfig::default()
     };
 
-    let service = test_service_with_paths(config.clone(), root.clone(), true).await;
+    let service = test_service_with_store(config.clone(), store.clone(), true).await;
     service
         .deploy_with_config(
             "memory".to_string(),
@@ -492,7 +492,7 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
     service.shutdown().await.expect("service should shut down");
     drop(service);
 
-    let restored = test_service_with_paths(config, root.clone(), true).await;
+    let restored = test_service_with_store(config, store.clone(), true).await;
     let replay = restored
         .invoke(
             "memory".to_string(),
@@ -528,7 +528,6 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
         .shutdown()
         .await
         .expect("restored should shut down");
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
@@ -693,8 +692,8 @@ async fn memory_atomic_idempotency_key_replays_read_only_result() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_can_emit_durable_effect_records() {
-    let root = PathBuf::from(format!("/tmp/dd-memory-outbox-{}", Uuid::new_v4()));
-    let service = test_service_with_paths(
+    let store = TestStoreDir::new("dd-memory-outbox");
+    let service = test_service_with_store(
         RuntimeConfig {
             min_isolates: 1,
             max_isolates: 2,
@@ -704,7 +703,7 @@ async fn memory_atomic_can_emit_durable_effect_records() {
             queue_warn_thresholds: vec![10],
             ..RuntimeConfig::default()
         },
-        root.clone(),
+        store.clone(),
         false,
     )
     .await;
@@ -770,14 +769,13 @@ async fn memory_atomic_can_emit_durable_effect_records() {
             .iter()
             .all(|record| record.kind.starts_with("audit."))
     );
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
-    let root = PathBuf::from(format!("/tmp/dd-memory-profile-atomic-{}", Uuid::new_v4()));
-    let service = test_service_with_paths(
+    let store = TestStoreDir::new("dd-memory-profile-atomic");
+    let service = test_service_with_store(
         RuntimeConfig {
             min_isolates: 1,
             max_isolates: 2,
@@ -788,7 +786,7 @@ async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
             memory_profile_enabled: true,
             ..RuntimeConfig::default()
         },
-        root.clone(),
+        store.clone(),
         false,
     )
     .await;
@@ -872,14 +870,13 @@ async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
             .unwrap_or_default()
             >= 2
     );
-
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
 #[serial]
 async fn memory_outbox_pending_effects_drain_after_service_start() {
-    let root = PathBuf::from(format!("/tmp/dd-memory-outbox-startup-{}", Uuid::new_v4()));
+    let store = TestStoreDir::new("dd-memory-outbox-startup");
+    let root = store.path().to_path_buf();
     let state = storage::state::StateStore::open(root.join("state"))
         .await
         .expect("state opens");
@@ -909,7 +906,7 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
     assert!(seeded.iter().all(|record| record.status == "pending"));
     drop(seed_store);
 
-    let service = test_service_with_paths(
+    let service = test_service_with_store(
         RuntimeConfig {
             min_isolates: 0,
             max_isolates: 1,
@@ -919,7 +916,7 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
             queue_warn_thresholds: vec![10],
             ..RuntimeConfig::default()
         },
-        root.clone(),
+        store.clone(),
         false,
     )
     .await;
@@ -941,7 +938,6 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
     .expect("pending outbox should drain after service start");
 
     service.shutdown().await.expect("service should shutdown");
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
@@ -1406,7 +1402,7 @@ async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
 #[tokio::test]
 #[serial]
 async fn memory_owner_epoch_survives_runtime_restart() {
-    let root = PathBuf::from(format!("/tmp/dd-memory-owner-epoch-{}", Uuid::new_v4()));
+    let store = TestStoreDir::new("dd-memory-owner-epoch");
     let config = RuntimeConfig {
         min_isolates: 1,
         max_isolates: 1,
@@ -1417,7 +1413,7 @@ async fn memory_owner_epoch_survives_runtime_restart() {
         ..RuntimeConfig::default()
     };
 
-    let service = test_service_with_paths(config.clone(), root.clone(), true).await;
+    let service = test_service_with_store(config.clone(), store.clone(), true).await;
     service
         .deploy_with_config(
             "memory".to_string(),
@@ -1450,7 +1446,7 @@ async fn memory_owner_epoch_survives_runtime_restart() {
     service.shutdown().await.expect("service should shut down");
     drop(service);
 
-    let restored = test_service_with_paths(config, root.clone(), true).await;
+    let restored = test_service_with_store(config, store.clone(), true).await;
     let second = restored
         .invoke(
             "memory".to_string(),
@@ -1476,7 +1472,6 @@ async fn memory_owner_epoch_survives_runtime_restart() {
         .shutdown()
         .await
         .expect("restored should shut down");
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]

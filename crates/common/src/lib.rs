@@ -429,7 +429,7 @@ mod tests {
     use super::{DeployConfig, DeployRequest, ErrorBody, PlatformError, first_non_empty_trimmed};
 
     #[test]
-    fn deploy_binding_rejects_legacy_actor_json_type() {
+    fn deploy_binding_rejects_retired_memory_binding_type() {
         let result = serde_json::from_str::<DeployRequest>(
             r#"{
                 "name": "worker",
@@ -460,7 +460,16 @@ mod tests {
                 .expect("config fixtures must parse");
         for case in cases.as_array().expect("fixtures must be an array") {
             let name = case["name"].as_str().expect("fixture name");
-            let parsed = serde_json::from_value::<DeployConfig>(case["input"].clone());
+            let Some(input) = case.get("input") else {
+                // Mixed deployment fields are resolved by CLI/Vite packaging,
+                // outside the normalized runtime configuration contract.
+                assert!(
+                    case.get("deployment").is_some(),
+                    "{name} has no config input"
+                );
+                continue;
+            };
+            let parsed = serde_json::from_value::<DeployConfig>(input.clone());
             if case["reject"] == true {
                 assert!(parsed.is_err(), "{name} must be rejected");
                 continue;

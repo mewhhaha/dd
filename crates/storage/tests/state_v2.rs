@@ -46,13 +46,13 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
     let other_namespace = worker_namespace("beta", "MEMORY");
     kv.put("alpha", "KV", "key", "first").await.unwrap();
     assert_eq!(
-        kv.get_utf8("alpha", "KV", "key").await.unwrap().unwrap(),
-        "first"
+        kv.get("alpha", "KV", "key").await.unwrap().unwrap().value,
+        b"first".as_slice()
     );
     kv.put("alpha", "KV", "key", "last").await.unwrap();
     assert_eq!(
-        kv.get_utf8("alpha", "KV", "key").await.unwrap().unwrap(),
-        "last"
+        kv.get("alpha", "KV", "key").await.unwrap().unwrap().value,
+        b"last".as_slice()
     );
     assert!(kv.get("beta", "KV", "key").await.unwrap().is_none());
     let version = kv.delete("alpha", "KV", "key").await.unwrap();
@@ -597,14 +597,14 @@ async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
             .unwrap()
             .unwrap()
             .value,
-        [0, 255, 17]
+        [0, 255, 17].as_slice()
     );
     assert!(kv.put("alpha", "KV", "binary", "next").await.unwrap() > 250);
     let namespace = worker_namespace("alpha", "MEMORY");
     let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
     assert_eq!(snapshot.max_version, 90);
     assert!(
-        snapshot
+        !snapshot
             .entries
             .iter()
             .any(|entry| entry.key == "deleted" && entry.deleted)
@@ -646,11 +646,12 @@ fn acknowledged_writes_survive_abrupt_process_exit() {
         let state = StateStore::open(&root).await.unwrap();
         let kv = KvStore::from_state(Arc::clone(&state));
         assert_eq!(
-            kv.get_utf8("crash", "KV", "durable")
+            kv.get("crash", "KV", "durable")
                 .await
                 .unwrap()
-                .unwrap(),
-            "acknowledged"
+                .unwrap()
+                .value,
+            b"acknowledged".as_slice()
         );
         let memory = MemoryStore::from_state(state);
         assert_eq!(
@@ -779,7 +780,7 @@ async fn converter_rejects_unsafe_destinations_and_duplicate_namespace_keys_befo
 }
 
 #[tokio::test]
-async fn committed_snapshots_preserve_tombstones_versions_and_cache_byte_limits() {
+async fn committed_snapshots_compact_deletes_preserve_versions_and_cache_byte_limits() {
     use storage::memory::MemoryCommit;
     let root = temporary_root();
     let state = StateStore::open(&root).await.unwrap();
@@ -824,9 +825,10 @@ async fn committed_snapshots_preserve_tombstones_versions_and_cache_byte_limits(
         .await
         .unwrap();
     let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
-    assert!(snapshot.entries[0].deleted);
-    assert_eq!(snapshot.entries[0].version, deleted.max_version);
-    assert_eq!(snapshot.entries[1].version, initial.max_version);
+    assert_eq!(snapshot.max_version, deleted.max_version);
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].key, "z");
+    assert_eq!(snapshot.entries[0].version, initial.max_version);
     let restored = memory
         .apply_batch(
             &namespace,

@@ -308,7 +308,10 @@ async fn private_status_metrics_and_checkpoint_are_authenticated_and_operational
         .to_bytes();
     let checkpoint: serde_json::Value =
         serde_json::from_slice(&checkpoint_body).expect("checkpoint json");
-    assert_eq!(checkpoint["checkpoint"]["kv"], true);
+    assert_eq!(
+        checkpoint["checkpoint"]["state_shards"],
+        storage::state::STATE_SHARDS
+    );
     assert_eq!(checkpoint["checkpoint"]["cache"], true);
 
     state.shutdown().await;
@@ -467,6 +470,211 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn redeployment_isolates_warm_cache_and_late_previous_generation_responses() {
+    let state = TestState::new("example.com").await;
+    let config = DeployConfig {
+        public: true,
+        cache: DeployCacheConfig { enabled: true },
+        bindings: vec![DeployBinding::Kv {
+            binding: "KV".into(),
+        }],
+        ..DeployConfig::default()
+    };
+    state
+        .state
+        .runtime
+        .deploy_with_config(
+            "cache-redeploy".into(),
+            r#"
+export default { async fetch(request, env) {
+  const path = new URL(request.url).pathname;
+  if (path === '/ready') return new Response(await env.KV.get('started') ?? '');
+  if (path === '/late') {
+    await env.KV.put('started', 'yes');
+    while (await env.KV.get('release') !== 'yes') await new Promise(r => setTimeout(r, 10));
+  }
+  return new Response('old', { headers: { 'cache-control': 'public, max-age=60' } });
+} };
+"#
+            .into(),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+    let old_namespace = state
+        .state
+        .runtime
+        .front_cache_namespace("cache-redeploy")
+        .unwrap();
+    let invoke = |path: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", "cache-redeploy.example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    for cache_status in ["MISS", "HIT"] {
+        let response = invoke_worker_public(state.app(), invoke("/"), None)
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("x-dd-cache").unwrap(), cache_status);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "old"
+        );
+    }
+    let late = tokio::spawn({
+        let app = state.app();
+        let request = invoke("/late");
+        async move { invoke_worker_public(app, request, None).await.unwrap() }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response = invoke_worker_public(state.app(), invoke("/ready"), None)
+                .await
+                .unwrap();
+            if response.into_body().collect().await.unwrap().to_bytes() == "yes" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old generation invocation starts");
+    state
+        .state
+        .runtime
+        .deploy_with_config(
+            "cache-redeploy".into(),
+            r#"
+export default { async fetch(request, env) {
+  if (new URL(request.url).pathname === '/release') await env.KV.put('release', 'yes');
+  return new Response('new', { headers: { 'cache-control': 'public, max-age=60' } });
+} };
+"#
+            .into(),
+            config,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        state
+            .state
+            .runtime
+            .front_cache_namespace("cache-redeploy")
+            .unwrap(),
+        old_namespace
+    );
+    for cache_status in ["MISS", "HIT"] {
+        let response = invoke_worker_public(state.app(), invoke("/"), None)
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("x-dd-cache").unwrap(), cache_status);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "new"
+        );
+    }
+    invoke_worker_public(state.app(), invoke("/release"), None)
+        .await
+        .unwrap();
+    let old_response = tokio::time::timeout(std::time::Duration::from_secs(5), late)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        old_response.into_body().collect().await.unwrap().to_bytes(),
+        "old"
+    );
+    for cache_status in ["MISS", "HIT"] {
+        let response = invoke_worker_public(state.app(), invoke("/late"), None)
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("x-dd-cache").unwrap(), cache_status);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "new"
+        );
+    }
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn drain_waits_for_deployment_after_http_client_disconnects() {
+    let state = TestState::new("example.com").await;
+    let payload = DeployRequest {
+        name: "drain-deploy".into(),
+        source: "await new Promise(resolve => setTimeout(resolve, 400)); export default { fetch() { return new Response('ok'); } };".into(),
+        config: DeployConfig { cache: DeployCacheConfig { enabled: true }, ..DeployConfig::default() },
+        assets: Vec::new(), server_modules: Vec::new(), asset_headers: None, temporary: false,
+    };
+    let deploying = tokio::spawn({
+        let app = state.app();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/deploy")
+            .header("authorization", "Bearer test-private-token")
+            .body(Full::new(Bytes::from(
+                serde_json::to_vec(&payload).unwrap(),
+            )))
+            .unwrap();
+        async move { handle_private_request(app, request).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.state.runtime.active_deployment_operations() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("deployment is admitted");
+    deploying.abort();
+    assert!(deploying.await.unwrap_err().is_cancelled());
+    assert_eq!(state.state.operations.active_requests(), 0);
+    assert_eq!(state.state.operations.active_control_operations(), 1);
+    assert!(!state.state.runtime.is_quiescent().await);
+    state.state.operations.begin_drain();
+    let admin_request = |path| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer test-private-token")
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+    let checkpoint =
+        handle_private_request(state.app(), admin_request("/v1/admin/checkpoint")).await;
+    assert_eq!(checkpoint.status(), StatusCode::CONFLICT);
+    let drain = handle_private_request(state.app(), admin_request("/v1/admin/drain")).await;
+    assert_eq!(drain.status(), StatusCode::OK);
+    let body = drain.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["drained"], true);
+    assert_eq!(body["active_control_operations"], 0);
+    assert!(
+        state
+            .state
+            .runtime
+            .front_cache_namespace("drain-deploy")
+            .is_some()
+    );
+    assert!(
+        state
+            .state
+            .runtime
+            .control_store()
+            .active_deployments()
+            .await
+            .unwrap()
+            .iter()
+            .any(|deployment| deployment.worker == "drain-deploy")
+    );
+    state.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn front_cache_head_miss_preserves_get_body_and_representation_length() {
     let state = TestState::new("example.com").await;
     deploy_worker(
@@ -569,7 +777,11 @@ export default {
         .runtime
         .cache_put(
             storage::cache::CacheRequest {
-                cache_name: "front:head-revalidate".into(),
+                cache_name: state
+                    .state
+                    .runtime
+                    .front_cache_namespace("head-revalidate")
+                    .unwrap(),
                 method: "GET".into(),
                 url: "https://head-revalidate.example.com/".into(),
                 headers: Vec::new(),

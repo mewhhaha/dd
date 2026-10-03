@@ -16,6 +16,8 @@ def summarize(path):
     timings = {key: value - before['timings'][key] for key, value in after['timings'].items()}
     groups = after['committed_groups'] - before['committed_groups']
     commands = after['committed_commands'] - before['committed_commands']
+    hits = profile['store_snapshot_cache_hit']['calls']
+    misses = profile['store_snapshot_cache_miss']['calls']
     def mean(total, count):
         return total / count if count else None
     return {
@@ -23,8 +25,9 @@ def summarize(path):
         'transactions_per_second': result['transaction_throughput_rps'],
         'request_p99_ms': result['p99_ms'],
         'latency_by_operation': measurement['timed'].get('by_operation'),
-        'snapshot_reload_fraction': (profile['js_hydrate_full']['calls'] / profile['op_snapshot']['calls']
-                                     if 'js_hydrate_full' in profile else None),
+        'snapshot_cache': {'hits': hits, 'misses': misses,
+                           'hit_fraction': mean(hits, hits + misses),
+                           'evictions': profile['store_snapshot_cache_eviction']['calls']},
         'mean_native_us': {name: mean(profile[name]['total_us'], profile[name]['calls'])
                            for name in ['store_lease', 'op_snapshot', 'op_apply_batch']},
         'writer': {'commands': commands, 'groups': groups,
@@ -35,6 +38,10 @@ def summarize(path):
                    'mean_publication_us': mean(timings['snapshot_publish_us'], groups)},
         'verification': measurement['verification'],
     }
+
+
+def format_us(value):
+    return 'n/a' if value is None else f'{value:.1f} us'
 
 
 def main():
@@ -60,8 +67,8 @@ def main():
         print(f"{config['available_cpus']} CPUs {config['mode']} x{config['width']} "
               f"({config['population']} entities, {config['keys_per_entity']} x {config['payload_bytes']} B): "
               f"{run['transactions_per_second']:.0f} tx/s; "
-              f"lease {run['mean_native_us']['store_lease']:.1f} us; "
-              f"commit {writer['mean_commit_us'] or 0:.1f} us/group")
+              f"lease {format_us(run['mean_native_us']['store_lease'])}; "
+              f"commit {format_us(writer['mean_commit_us'])} per SQL attempt")
 
 
 if __name__ == '__main__':

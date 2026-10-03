@@ -2,6 +2,7 @@ import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
 
 export async function createWorkerTestRuntime(options = {}) {
   const name = options.name ?? "test-worker";
+  const ownsRuntime = options.runtime == null;
   const runtime = options.runtime ?? createDdRuntime(options.runtimeOptions);
   let deployment;
 
@@ -30,7 +31,12 @@ export async function createWorkerTestRuntime(options = {}) {
   }
 
   if (options.autoDeploy !== false) {
-    await deploy();
+    try {
+      await deploy();
+    } catch (error) {
+      if (ownsRuntime) await runtime.close();
+      throw error;
+    }
   }
 
   return {
@@ -47,8 +53,8 @@ export async function createWorkerTestRuntime(options = {}) {
     stats() {
       return runtime.stats(name);
     },
-    close() {
-      return runtime.close();
+    async close() {
+      if (ownsRuntime) await runtime.close();
     },
   };
 }

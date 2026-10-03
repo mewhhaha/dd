@@ -18,12 +18,15 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+#[path = "tests/deployment_drain.rs"]
+mod deployment_drain;
 #[path = "tests/egress.rs"]
 mod egress;
 #[path = "tests/examples.rs"]
 mod examples;
 #[path = "tests/fixtures.rs"]
 mod fixtures;
+mod host_fetch;
 #[path = "tests/memory.rs"]
 mod memory;
 #[path = "tests/memory_contract.rs"]
@@ -35,6 +38,7 @@ mod memory_read;
 #[path = "tests/request_control.rs"]
 mod request_control;
 mod scheduling;
+mod service_fetch;
 #[path = "tests/sessions.rs"]
 mod sessions;
 mod shutdown;
@@ -187,6 +191,7 @@ async fn last_service_handle_drop_shuts_down_and_joins_runtime_thread() {
         ..RuntimeConfig::default()
     })
     .await;
+    let store_path = service.store_path().to_path_buf();
     let worker = "automatic-shutdown".to_string();
     service
         .deploy(worker.clone(), counter_worker())
@@ -203,11 +208,19 @@ async fn last_service_handle_drop_shuts_down_and_joins_runtime_thread() {
 
     drop(service);
     assert!(
+        store_path.exists(),
+        "remaining service clones retain their store"
+    );
+    assert!(
         !shutdown.is_complete(),
         "dropping one clone must not shut down the runtime"
     );
 
     drop(remaining_handle);
+    assert!(
+        !store_path.exists(),
+        "last fixture drop removes the closed store"
+    );
     assert!(
         shutdown.is_complete(),
         "last service handle drop must not return before runtime teardown completes"
@@ -1047,7 +1060,12 @@ async fn worker_queue_expires_requests_after_queue_wait_limit() {
             r#"
 export default {
   async fetch(request) {
-    await Deno.core.ops.op_sleep(200);
+    if (new URL(request.url).pathname === "/one") {
+      await new Promise(resolve => {
+        request.signal.addEventListener("abort", resolve, { once: true });
+        if (request.signal.aborted) resolve();
+      });
+    }
     return new Response(new URL(request.url).pathname);
   },
 };
@@ -1099,11 +1117,15 @@ export default {
     assert_eq!(error.kind(), ErrorKind::Overloaded);
     assert!(error.to_string().contains("queue wait limit"));
 
-    timeout(Duration::from_secs(3), first)
-        .await
-        .expect("first join")
-        .expect("first request should complete")
-        .expect("first request should succeed");
+    first.abort();
+    assert!(
+        timeout(Duration::from_secs(3), first)
+            .await
+            .expect("first request cancellation should complete")
+            .expect_err("first task was canceled")
+            .is_cancelled()
+    );
+    service.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1653,9 +1675,9 @@ export default {
 #[tokio::test]
 #[serial]
 async fn deployed_assets_restore_from_worker_store() {
-    let root = PathBuf::from(format!("/tmp/dd-assets-{}", Uuid::new_v4()));
+    let store = TestStoreDir::new("dd-assets");
 
-    let service = test_service_with_paths(RuntimeConfig::default(), root.clone(), true).await;
+    let service = test_service_with_store(RuntimeConfig::default(), store.clone(), true).await;
     service
         .deploy_with_bundle_config(
             "assets".to_string(),
@@ -1668,14 +1690,12 @@ async fn deployed_assets_restore_from_worker_store() {
         .expect("deploy should succeed");
     drop(service);
 
-    let restored = test_service_with_paths(RuntimeConfig::default(), root.clone(), true).await;
+    let restored = test_service_with_store(RuntimeConfig::default(), store.clone(), true).await;
     let asset = restored
         .resolve_asset("assets", "GET", Some("foo.example.com"), "/a.js", &[])
         .expect("asset lookup should succeed")
         .expect("asset should exist after restore");
     assert_eq!(asset.body.as_ref(), b"asset-body");
-
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
@@ -1764,14 +1784,14 @@ async fn temporary_worker_redeploy_refreshes_and_normal_deploy_makes_permanent()
 #[tokio::test]
 #[serial]
 async fn temporary_worker_expires_and_is_not_restored_from_store() {
-    let root = PathBuf::from(format!("/tmp/dd-temp-workers-{}", Uuid::new_v4()));
+    let store = TestStoreDir::new("dd-temp-workers");
     let config = RuntimeConfig {
         scale_tick: Duration::from_secs(1),
         temporary_worker_ttl: Duration::from_millis(250),
         ..RuntimeConfig::default()
     };
 
-    let service = test_service_with_paths(config.clone(), root.clone(), true).await;
+    let service = test_service_with_store(config.clone(), store.clone(), true).await;
     service
         .deploy_temporary_with_bundle_config(
             "preview".to_string(),
@@ -1787,10 +1807,8 @@ async fn temporary_worker_expires_and_is_not_restored_from_store() {
     drop(service);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let restored = test_service_with_paths(config, root.clone(), true).await;
+    let restored = test_service_with_store(config, store.clone(), true).await;
     assert!(restored.stats("preview".to_string()).await.is_none());
-
-    let _ = tokio::fs::remove_dir_all(root).await;
 }
 
 #[tokio::test]
@@ -4180,6 +4198,7 @@ fn asset_catalog_copy_on_write_preserves_concurrent_updates_and_redeploy_snapsho
                 catalog.insert(
                     worker_name.clone(),
                     super::AssetCatalogEntry {
+                        deployment_id: format!("deployment-{generation}"),
                         worker_name,
                         generation,
                         assets,
@@ -4205,6 +4224,7 @@ fn asset_catalog_copy_on_write_preserves_concurrent_updates_and_redeploy_snapsho
         "worker-1".to_string(),
         super::AssetCatalogEntry {
             worker_name: "worker-1".to_string(),
+            deployment_id: "redeployed".to_string(),
             generation: 100,
             assets,
             public: false,
@@ -4265,7 +4285,8 @@ fn extract_bindings_rejects_duplicate_service_name() {
 #[tokio::test]
 #[serial_test::serial]
 async fn active_restore_failure_fails_startup_and_records_diagnostic() -> common::Result<()> {
-    let root = std::env::temp_dir().join(format!("dd-restore-failure-{}", Uuid::new_v4()));
+    let store = TestStoreDir::new("dd-restore-failure");
+    let root = store.path().to_path_buf();
     drop(storage::state::StateStore::open(root.join("state")).await?);
     let control = storage::control::ControlStore::open(&root).await?;
     let mut invalid = storage::control::ControlDeployment {
@@ -4310,6 +4331,5 @@ async fn active_restore_failure_fails_startup_and_records_diagnostic() -> common
     let failures = control.restore_failures().await?;
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].worker, "broken");
-    let _ = tokio::fs::remove_dir_all(root).await;
     Ok(())
 }

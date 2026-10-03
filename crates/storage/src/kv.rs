@@ -1,8 +1,9 @@
 use crate::state::{STATE_SHARDS, StateStore, storage_error};
 use crate::turso_util::{execute_cached, query_cached};
+use bytes::Bytes;
 use common::Result;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,14 +15,14 @@ pub struct KvStore {
 }
 #[derive(Debug, Clone)]
 pub struct KvValue {
-    pub value: Vec<u8>,
+    pub value: Bytes,
     pub encoding: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct KvEntry {
     pub key: String,
-    pub value: Vec<u8>,
+    pub value: Bytes,
     pub encoding: String,
 }
 
@@ -33,17 +34,9 @@ pub struct KvBatchMutation {
     pub deleted: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KvUtf8Lookup {
-    Missing,
-    WrongEncoding,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvProfileMetricKind {
     JsRequestTotal,
-    OpGet,
-    OpGetManyUtf8,
     OpGetValue,
 }
 
@@ -67,8 +60,6 @@ pub struct KvProfileMetricSnapshot {
 pub struct KvProfileSnapshot {
     pub enabled: bool,
     pub js_request_total: KvProfileMetricSnapshot,
-    pub op_get: KvProfileMetricSnapshot,
-    pub op_get_many_utf8: KvProfileMetricSnapshot,
     pub op_get_value: KvProfileMetricSnapshot,
 }
 
@@ -76,8 +67,6 @@ pub struct KvProfileSnapshot {
 pub struct KvProfile {
     enabled: AtomicBool,
     js_request_total: KvProfileMetric,
-    op_get: KvProfileMetric,
-    op_get_many_utf8: KvProfileMetric,
     op_get_value: KvProfileMetric,
 }
 
@@ -120,6 +109,18 @@ impl Default for CommittedKvCache {
 }
 
 impl CommittedKvCache {
+    fn lookup(&mut self, key: &KvWriteKey, shard_epoch: u64) -> Option<Option<KvValue>> {
+        let entry = self.entries.get_mut(key)?;
+        if entry.shard_epoch != shard_epoch {
+            return None;
+        }
+        self.order.remove(&entry.ordinal);
+        entry.ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        self.order.insert(entry.ordinal, key.clone());
+        Some(entry.value.clone())
+    }
+
     fn remove(&mut self, key: &KvWriteKey) {
         if let Some(entry) = self.entries.remove(key) {
             self.order.remove(&entry.ordinal);
@@ -223,8 +224,6 @@ impl KvProfile {
         KvProfileSnapshot {
             enabled: self.enabled(),
             js_request_total: self.js_request_total.snapshot(),
-            op_get: self.op_get.snapshot(),
-            op_get_many_utf8: self.op_get_many_utf8.snapshot(),
             op_get_value: self.op_get_value.snapshot(),
         }
     }
@@ -237,16 +236,12 @@ impl KvProfile {
 
     pub fn reset(&self) {
         self.js_request_total.reset();
-        self.op_get.reset();
-        self.op_get_many_utf8.reset();
         self.op_get_value.reset();
     }
 
     fn metric(&self, metric: KvProfileMetricKind) -> &KvProfileMetric {
         match metric {
             KvProfileMetricKind::JsRequestTotal => &self.js_request_total,
-            KvProfileMetricKind::OpGet => &self.op_get,
-            KvProfileMetricKind::OpGetManyUtf8 => &self.op_get_many_utf8,
             KvProfileMetricKind::OpGetValue => &self.op_get_value,
         }
     }
@@ -282,12 +277,6 @@ impl KvStore {
     pub fn reset_profile(&self) {
         self.profile.reset();
     }
-    pub async fn checkpoint(&self) -> Result<()> {
-        self.state.checkpoint().await
-    }
-    pub async fn health_check(&self) -> Result<()> {
-        self.state.health_check().await
-    }
 
     pub async fn get(
         &self,
@@ -304,11 +293,7 @@ impl KvStore {
         };
         {
             let mut cache = self.read_cache.lock().expect("kv cache lock poisoned");
-            if let Some(entry) = cache.entries.get(&cache_key)
-                && entry.shard_epoch == epoch
-            {
-                let value = entry.value.clone();
-                cache.insert(cache_key, value.clone(), epoch);
+            if let Some(value) = cache.lookup(&cache_key, epoch) {
                 return Ok(value);
             }
         }
@@ -320,7 +305,7 @@ impl KvStore {
             .map_err(storage_error)?
             .map(|row| {
                 Ok::<_, turso::Error>(KvValue {
-                    value: row.get(0)?,
+                    value: row.get::<Vec<u8>>(0)?.into(),
                     encoding: row.get(1)?,
                 })
             })
@@ -333,30 +318,6 @@ impl KvStore {
                 .insert(cache_key, value.clone(), epoch);
         }
         Ok(value)
-    }
-    pub async fn get_utf8(
-        &self,
-        worker_name: &str,
-        binding: &str,
-        key: &str,
-    ) -> Result<std::result::Result<String, KvUtf8Lookup>> {
-        match self.get(worker_name, binding, key).await? {
-            None => Ok(Err(KvUtf8Lookup::Missing)),
-            Some(value) if value.encoding != "utf8" => Ok(Err(KvUtf8Lookup::WrongEncoding)),
-            Some(value) => Ok(Ok(String::from_utf8(value.value).map_err(storage_error)?)),
-        }
-    }
-    pub async fn get_utf8_many(
-        &self,
-        worker_name: &str,
-        binding: &str,
-        keys: &[String],
-    ) -> Result<Vec<std::result::Result<String, KvUtf8Lookup>>> {
-        let mut values = Vec::with_capacity(keys.len());
-        for key in keys {
-            values.push(self.get_utf8(worker_name, binding, key).await?);
-        }
-        Ok(values)
     }
     pub async fn put(
         &self,
@@ -461,26 +422,33 @@ impl KvStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut entries = Vec::new();
+        let mut keys = BTreeSet::new();
         let upper = prefix_upper_bound(prefix);
         let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         for shard in 0..STATE_SHARDS {
             let conn = self.state.read(shard).await?;
             let mut rows = if let Some(upper) = &upper {
-                query_cached(&conn, "SELECT key, value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key >= ?3 AND key < ?4 ORDER BY key LIMIT ?5", (worker_name, binding, prefix, upper.as_str(), sql_limit)).await
+                query_cached(&conn, "SELECT key FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key >= ?3 AND key < ?4 ORDER BY key LIMIT ?5", (worker_name, binding, prefix, upper.as_str(), sql_limit)).await
             } else {
-                query_cached(&conn, "SELECT key, value, encoding FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key >= ?3 ORDER BY key LIMIT ?4", (worker_name, binding, prefix, sql_limit)).await
+                query_cached(&conn, "SELECT key FROM worker_kv WHERE worker = ?1 AND binding = ?2 AND deleted = 0 AND key >= ?3 ORDER BY key LIMIT ?4", (worker_name, binding, prefix, sql_limit)).await
             }.map_err(storage_error)?;
             while let Some(row) = rows.next().await.map_err(storage_error)? {
+                keys.insert(row.get::<String>(0).map_err(storage_error)?);
+                if keys.len() > limit {
+                    keys.pop_last();
+                }
+            }
+        }
+        let mut entries = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(worker_name, binding, &key).await? {
                 entries.push(KvEntry {
-                    key: row.get(0).map_err(storage_error)?,
-                    value: row.get(1).map_err(storage_error)?,
-                    encoding: row.get(2).map_err(storage_error)?,
+                    key,
+                    value: value.value,
+                    encoding: value.encoding,
                 });
             }
         }
-        entries.sort_by(|left, right| left.key.cmp(&right.key));
-        entries.truncate(limit);
         Ok(entries)
     }
 }
@@ -497,4 +465,96 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
         return Some(upper);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cache_hits_share_bytes_refresh_recency_and_observe_writes() {
+        let root = std::env::temp_dir().join(format!("dd-kv-cache-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        let store = KvStore::from_state(Arc::clone(&state));
+        store.set_read_cache_limits(2, 1024 * 1024);
+        for key in ["a", "b", "c"] {
+            store
+                .put_value("worker", "KV", key, &vec![b'x'; 128 * 1024], "utf8")
+                .await
+                .unwrap();
+        }
+        let first = store.get("worker", "KV", "a").await.unwrap().unwrap();
+        let second = store.get("worker", "KV", "b").await.unwrap().unwrap();
+        let hit = store.get("worker", "KV", "a").await.unwrap().unwrap();
+        assert_eq!(
+            first.value.as_ptr(),
+            hit.value.as_ptr(),
+            "a hit must share the cached payload"
+        );
+        store.get("worker", "KV", "c").await.unwrap();
+        let retained = store.get("worker", "KV", "a").await.unwrap().unwrap();
+        assert_eq!(
+            first.value.as_ptr(),
+            retained.value.as_ptr(),
+            "recently accessed values must survive eviction"
+        );
+        let reloaded = store.get("worker", "KV", "b").await.unwrap().unwrap();
+        assert_ne!(
+            second.value.as_ptr(),
+            reloaded.value.as_ptr(),
+            "the least recently used entry must be reloaded"
+        );
+        store.put("worker", "KV", "a", "updated").await.unwrap();
+        assert_eq!(
+            store.get("worker", "KV", "a").await.unwrap().unwrap().value,
+            b"updated".as_slice()
+        );
+        assert_eq!(first.value.len(), 128 * 1024);
+        assert!(first.value.iter().all(|byte| *byte == b'x'));
+        store.delete("worker", "KV", "a").await.unwrap();
+        assert!(store.get("worker", "KV", "a").await.unwrap().is_none());
+        assert!(store.get("worker", "KV", "a").await.unwrap().is_none());
+        drop(store);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn listing_projects_values_only_after_the_global_key_limit() {
+        let root = std::env::temp_dir().join(format!("dd-kv-projection-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        let store = KvStore::from_state(Arc::clone(&state));
+        store
+            .put("worker", "KV", "a-winner", "selected value")
+            .await
+            .unwrap();
+        let winner_shard = StateStore::shard_index("worker", "KV", "a-winner");
+        let mut seeded = std::collections::HashSet::new();
+        for index in 0..10_000 {
+            let key = format!("z-discard-{index:05}");
+            let shard = StateStore::shard_index("worker", "KV", &key);
+            if shard == winner_shard || !seeded.insert(shard) {
+                continue;
+            }
+            let conn = state.read(shard).await.unwrap();
+            // A discarded row deliberately has a value that cannot be decoded
+            // as BLOB, proving key selection never projects that value.
+            conn.execute("INSERT INTO worker_kv(worker,binding,key,value,encoding,deleted,version) VALUES ('worker','KV',?1,123,'utf8',0,0)",(key,)).await.unwrap();
+            if seeded.len() == STATE_SHARDS - 1 {
+                break;
+            }
+        }
+        assert_eq!(seeded.len(), STATE_SHARDS - 1);
+        let entries = store.list("worker", "KV", "", 1).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "a-winner");
+        assert_eq!(entries[0].value, b"selected value".as_slice());
+        assert!(
+            store.list("worker", "KV", "z-discard", 1).await.is_err(),
+            "fault injection remains observable when its row wins"
+        );
+        drop(store);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

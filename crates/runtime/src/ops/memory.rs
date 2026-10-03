@@ -141,12 +141,7 @@ pub(super) async fn op_memory_read_begin(
             started.elapsed().as_micros() as u64,
             1,
         );
-        if snapshot.value_bytes() > storage::memory::MEMORY_ENTITY_MAX_VALUE_BYTES {
-            return Err(PlatformError::bad_request(format!(
-                "memory snapshot exceeded {} bytes",
-                storage::memory::MEMORY_ENTITY_MAX_VALUE_BYTES
-            )));
-        }
+        snapshot.validate_limits()?;
         let mut op_state = state.borrow_mut();
         if op_state
             .borrow::<RequestSecretContexts>()

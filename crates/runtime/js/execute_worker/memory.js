@@ -89,15 +89,13 @@
         context.memoryRequestScopeHandle = lease.handle;
         let command;
         try {
-          const runtimeRequestId = activeRequestId();
           const entry = ensureMemoryEntry(namespace, memoryKey);
           context.memoryEntry = entry;
-          context.memoryRequestId = runtimeRequestId;
           command = await beginMemoryCommand(entry, idempotencyKey);
           if (command.hit) {
             return decodeMemoryCommandResult(command.value);
           }
-          return await executeMemoryTransaction(entry, runtimeRequestId, callback, command.handle);
+          return await executeMemoryTransaction(entry, callback, command.handle);
         } finally {
           closeMemoryCommand(command?.handle);
           callOp("op_memory_request_scope_close", lease.handle);

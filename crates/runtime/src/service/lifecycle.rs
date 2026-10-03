@@ -44,6 +44,7 @@ impl WorkerManager {
         });
         let asset_catalog_entry = AssetCatalogEntry {
             worker_name: worker_name.clone(),
+            deployment_id: deployment_id.clone(),
             generation,
             assets: compiled_assets.clone(),
             public: config.public,

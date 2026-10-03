@@ -165,8 +165,6 @@ export default {
     const room = env.CHAT.get(path === "/other" ? "other" : "failed");
     if (path !== "/fail" && path !== "/reject") return room.atomic(tx => tx.accept(request).response);
 
-    // Model a caller isolate that has never loaded this room's socket handles.
-    globalThis.__dd_memory_state_entries.clear();
     const snapshot = Deno.core.ops.op_memory_batch_begin;
     Deno.core.ops.op_memory_batch_begin = () => ({
       ok: false, storage_failure: path === "/fail",
@@ -1427,4 +1425,168 @@ async fn memory_socket_handles_are_private_to_workers() {
             "worker {worker} sees only its sockets"
         );
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn websocket_atomic_effects_keep_send_order_before_close() {
+    websocket_ordered_effects(false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn websocket_backpressure_defers_later_sends_and_close() {
+    websocket_ordered_effects(true).await;
+}
+
+async fn websocket_ordered_effects(backpressure: bool) {
+    let frame_bytes = std::mem::size_of::<crate::service::model::WebSocketOutboundFrame>() + 1;
+    let service = test_service(RuntimeConfig {
+        max_isolates: 1,
+        max_buffered_websocket_bytes: if backpressure {
+            frame_bytes
+        } else {
+            16 * frame_bytes
+        },
+        max_buffered_websocket_bytes_per_session: if backpressure {
+            frame_bytes
+        } else {
+            16 * frame_bytes
+        },
+        scale_tick: Duration::from_millis(10),
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy_with_config(
+            "ordered-socket".into(),
+            r#"
+export default {
+  async fetch(request, env) {
+    const room = env.CHAT.get('room');
+    const path = new URL(request.url).pathname;
+    if (path.startsWith('/send')) {
+      const markers = path === '/send-small-budget' ? 'AB' : 'ABCDEFGH';
+      await room.atomic(tx => {
+        for (const handle of tx.sockets.values()) {
+          for (const marker of markers) tx.sockets.send(handle, marker);
+          tx.sockets.close(handle, 1000, 'finished');
+        }
+      });
+      return new Response('committed');
+    }
+    return room.atomic(tx => tx.accept(request).response);
+  },
+};
+"#
+            .into(),
+            DeployConfig {
+                bindings: vec![DeployBinding::Memory {
+                    binding: "CHAT".into(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+    let opened = service
+        .open_websocket(
+            "ordered-socket".into(),
+            test_websocket_invocation("/ws", "ordered-open"),
+            None,
+        )
+        .await
+        .unwrap();
+    service
+        .invoke(
+            "ordered-socket".into(),
+            test_invocation_with_path(
+                if backpressure {
+                    "/send-small-budget"
+                } else {
+                    "/send"
+                },
+                "ordered-send",
+            ),
+        )
+        .await
+        .unwrap();
+    let markers = if backpressure {
+        b"AB".as_slice()
+    } else {
+        b"ABCDEFGH".as_slice()
+    };
+    for (index, marker) in markers.iter().enumerate() {
+        timeout(
+            Duration::from_secs(2),
+            service.websocket_wait_frame("ordered-socket".into(), opened.session_id.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let frame = service
+            .websocket_drain_frame("ordered-socket".into(), opened.session_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.body,
+            [*marker],
+            "transaction emits frames in source order"
+        );
+        assert!(
+            !frame
+                .headers
+                .iter()
+                .any(|(name, _)| name == "x-dd-ws-close-code"),
+            "close cannot accompany and discard a preceding send"
+        );
+        if backpressure && index == 0 {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if service
+                        .stats("ordered-socket".into())
+                        .await
+                        .unwrap()
+                        .memory_outbox_delivery_retry_count
+                        > 0
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                service
+                    .websocket_drain_frame("ordered-socket".into(), opened.session_id.clone())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "retry must defer the later close while an earlier frame holds the byte lease"
+            );
+        }
+        drop(frame);
+    }
+    timeout(
+        Duration::from_secs(2),
+        service.websocket_wait_frame("ordered-socket".into(), opened.session_id.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let close = service
+        .websocket_drain_frame("ordered-socket".into(), opened.session_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(close.body.is_empty());
+    assert!(
+        close
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-dd-ws-close-code" && value == "1000")
+    );
+    service.shutdown().await.unwrap();
 }

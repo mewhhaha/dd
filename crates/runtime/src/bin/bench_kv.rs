@@ -51,8 +51,6 @@ struct KvProfileMetric {
 struct KvProfileSnapshot {
     enabled: bool,
     js_request_total: KvProfileMetric,
-    op_get: KvProfileMetric,
-    op_get_many_utf8: KvProfileMetric,
     op_get_value: KvProfileMetric,
 }
 
@@ -409,6 +407,7 @@ async fn run_config_scenario(
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             memory_outbox_max_concurrent_shards: 8,
+            memory_outbox_max_claimed_bytes: 64 * 1024 * 1024,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: true,
@@ -498,10 +497,8 @@ fn print_profile(profile: &KvProfileSnapshot) {
         return;
     }
     println!(
-        "profile js_request={:.2}ms op_get={:.2}ms op_many={:.2}ms op_value={:.2}ms",
+        "profile js_request={:.2}ms op_value={:.2}ms",
         metric_mean_ms(&profile.js_request_total),
-        metric_mean_ms(&profile.op_get),
-        metric_mean_ms(&profile.op_get_many_utf8),
         metric_mean_ms(&profile.op_get_value),
     );
 }

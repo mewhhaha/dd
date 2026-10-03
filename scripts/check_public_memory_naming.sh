@@ -20,12 +20,16 @@ fi
 unexpected=()
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
-  case "$line" in
-    ./scripts/check_public_memory_naming.sh:*) continue ;;
-    ./crates/cli/src/main.rs:*) continue ;;
-    ./crates/common/src/lib.rs:*) continue ;;
-    ./crates/storage/src/control.rs:*) continue ;;
-    ./crates/storage/src/convert.rs:*) continue ;;
+  [[ "$line" == ./scripts/check_public_memory_naming.sh:* ]] && continue
+  content="${line#*:}"
+  content="${content#*:}"
+  content="${content#"${content%%[![:space:]]*}"}"
+  # Only rejection fixtures and the offline converter may name the retired type.
+  # Match entire source lines so other code in those files remains checked.
+  case "${line%%:*}:$content" in
+    './crates/cli/src/main.rs:"--actor-binding",') continue ;;
+    './crates/common/src/lib.rs:{ "type": "actor", "binding": "ROOMS" }') continue ;;
+    './crates/storage/src/convert.rs:Some("memory" | "actor")') continue ;;
   esac
   unexpected+=("$line")
 done <<< "$matches"

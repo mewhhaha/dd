@@ -581,6 +581,7 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
         storage: RuntimeStorageConfig {
             store_dir: paths.store_dir.clone(),
             memory_outbox_max_concurrent_shards: 8,
+            memory_outbox_max_claimed_bytes: 64 * 1024 * 1024,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: true,

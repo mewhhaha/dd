@@ -1,212 +1,3 @@
-  const normalizeServiceFetchInputFast = (inputValue, initValue) => {
-    if (inputValue instanceof Request) {
-      if (inputValue.body != null) {
-        return null;
-      }
-      const headers = initValue?.headers != null
-        ? toHeaderEntries(initValue.headers)
-        : Array.from(inputValue.headers.entries());
-      let body = new Uint8Array();
-      if (initValue && Object.prototype.hasOwnProperty.call(initValue, "body")) {
-        body = normalizeServiceFetchBody(initValue.body);
-        if (body == null) {
-          return null;
-        }
-      }
-      return {
-        method: String(initValue?.method ?? inputValue.method ?? "GET").toUpperCase(),
-        url: String(inputValue.url || "http://worker/"),
-        headers,
-        body,
-      };
-    }
-
-    const body = normalizeServiceFetchBody(initValue?.body);
-    if (body == null) {
-      return null;
-    }
-    const raw = String(inputValue ?? "/");
-    const method = String(initValue?.method ?? "GET").toUpperCase();
-    const url = raw.startsWith("http://") || raw.startsWith("https://")
-      ? raw
-      : new URL(raw, "http://worker").toString();
-    const headers = toHeaderEntries(initValue?.headers);
-    return {
-      method,
-      url,
-      headers,
-      body,
-    };
-  };
-
-  const normalizeServiceFetchInput = async (inputValue, initValue) => {
-    const fast = normalizeServiceFetchInputFast(inputValue, initValue);
-    if (fast) {
-      return fast;
-    }
-    return normalizeMemoryFetchInput(inputValue, initValue);
-  };
-
-  const toArrayBytes = (value) => {
-    if (value instanceof Uint8Array) {
-      return value;
-    }
-    if (ArrayBuffer.isView(value)) {
-      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    }
-    if (value instanceof ArrayBuffer) {
-      return new Uint8Array(value);
-    }
-    return new Uint8Array(Array.isArray(value) ? value : []);
-  };
-
-  const isPlainObject = (value) => {
-    if (!value || typeof value !== "object") {
-      return false;
-    }
-    const proto = Object.getPrototypeOf(value);
-    return proto === Object.prototype || proto === null;
-  };
-
-  const encodeMemoryCommandValue = async (value, references = new Map()) => {
-    if (typeof value === "function" || (value && typeof value.then === "function")) {
-      throw new Error("memory command results cannot contain functions or thenables");
-    }
-    if (references.has(value)) return references.get(value);
-    if (value instanceof Request) {
-      const encoded = {
-        __dd_rpc_type: "request",
-        url: String(value.url || ""),
-        method: String(value.method || "GET"),
-        headers: Array.from(value.headers.entries()),
-        body: new Uint8Array(await value.clone().arrayBuffer()),
-      };
-      references.set(value, encoded);
-      return encoded;
-    }
-    if (value instanceof Response) {
-      const encoded = {
-        __dd_rpc_type: "response",
-        status: Number(value.status || 200),
-        headers: Array.from(value.headers.entries()),
-        body: new Uint8Array(await value.clone().arrayBuffer()),
-      };
-      references.set(value, encoded);
-      return encoded;
-    }
-    if (Array.isArray(value)) {
-      const out = [];
-      references.set(value, out);
-      for (const item of value) {
-        out.push(await encodeMemoryCommandValue(item, references));
-      }
-      return out;
-    }
-    if (value instanceof Map) {
-      const out = new Map();
-      references.set(value, out);
-      for (const [key, item] of value.entries()) {
-        out.set(await encodeMemoryCommandValue(key, references), await encodeMemoryCommandValue(item, references));
-      }
-      return out;
-    }
-    if (value instanceof Set) {
-      const out = new Set();
-      references.set(value, out);
-      for (const item of value.values()) {
-        out.add(await encodeMemoryCommandValue(item, references));
-      }
-      return out;
-    }
-    if (isPlainObject(value)) {
-      const out = Object.create(null);
-      references.set(value, out);
-      for (const [key, item] of Object.entries(value)) {
-        out[key] = await encodeMemoryCommandValue(item, references);
-      }
-      return out;
-    }
-    return value;
-  };
-
-  const decodeMemoryCommandValue = (value, references = new Map()) => {
-    if (references.has(value)) return references.get(value);
-    if (value?.__dd_rpc_type === "socket_message") {
-      return normalizeSocketMessageForJs(value);
-    }
-    if (Array.isArray(value)) {
-      const out = [];
-      references.set(value, out);
-      for (const item of value) out.push(decodeMemoryCommandValue(item, references));
-      return out;
-    }
-    if (value instanceof Map) {
-      const out = new Map();
-      references.set(value, out);
-      for (const [key, item] of value.entries()) {
-        out.set(decodeMemoryCommandValue(key, references), decodeMemoryCommandValue(item, references));
-      }
-      return out;
-    }
-    if (value instanceof Set) {
-      const out = new Set();
-      references.set(value, out);
-      for (const item of value.values()) {
-        out.add(decodeMemoryCommandValue(item, references));
-      }
-      return out;
-    }
-    if (!isPlainObject(value)) {
-      return value;
-    }
-    if (value.__dd_rpc_type === "request") {
-      const method = String(value.method || "GET");
-      const bodyBytes = toArrayBytes(value.body);
-      const init = {
-        method,
-        headers: Array.isArray(value.headers) ? value.headers : [],
-      };
-      if (!(bodyBytes.byteLength === 0 && /^(GET|HEAD)$/i.test(method))) {
-        init.body = bodyBytes;
-      }
-      const request = new Request(String(value.url || "http://worker/"), init);
-      references.set(value, request);
-      return request;
-    }
-    if (value.__dd_rpc_type === "response") {
-      const status = Number(value.status || 200);
-      const bodyBytes = toArrayBytes(value.body);
-      const init = {
-        status,
-        headers: Array.isArray(value.headers) ? value.headers : [],
-      };
-      const body = (bodyBytes.byteLength === 0 && [101, 204, 205, 304].includes(status))
-        ? null
-        : bodyBytes;
-      const response = new Response(body, init);
-      references.set(value, response);
-      return response;
-    }
-    const out = {};
-    references.set(value, out);
-    for (const [key, item] of Object.entries(value)) {
-      Object.defineProperty(out, key, {
-        value: decodeMemoryCommandValue(item, references),
-        enumerable: true, writable: true, configurable: true,
-      });
-    }
-    return out;
-  };
-
-
-
-  const encodeMemoryCommandResult = async (value) => {
-    const encoded = await encodeMemoryCommandValue(value);
-    return new Uint8Array(Deno.core.serialize(encoded));
-  };
-
-  const decodeMemoryCommandResult = (bytes) => decodeMemoryCommandValue(Deno.core.deserialize(bytes));
-
   const INTERNAL_WS_ACCEPT_HEADER = "x-dd-ws-accept";
   const INTERNAL_WS_SESSION_HEADER = "x-dd-ws-session";
   const INTERNAL_WS_HANDLE_HEADER = "x-dd-ws-handle";
@@ -387,7 +178,6 @@
         console.warn("memory socket close after storage failure failed", error);
       }
     }
-
   };
 
   const failMemoryEntry = async (entry, error) => {
@@ -397,9 +187,6 @@
     }
     const failure = error instanceof Error ? error : new Error(String(error ?? "memory namespace failed"));
     storageState.failedError = failure;
-    if (entry.cacheKey) {
-      memoryStateEntries.delete(entry.cacheKey);
-    }
     try {
       await closeMemoryResourcesOnFailure(entry);
     } catch (closeError) {
@@ -408,7 +195,7 @@
     throw failure;
   };
 
-  const gateMemoryOutput = (entry, runtimeRequestId, callback) => {
+  const gateMemoryOutput = (entry, callback) => {
     const storageState = ensureMemoryStorageState(entry);
     const run = async () => {
       if (storageState.failedError) {
@@ -423,7 +210,6 @@
     );
     return gated;
   };
-
 
   const stageMemoryTxnEffect = (txn, kind, payload) => {
     requireMemoryBatchOp(
@@ -545,7 +331,7 @@
     }
   };
 
-  const finishMemoryTxn = async (txn, runtimeRequestId) => {
+  const finishMemoryTxn = async (txn) => {
     if (!txn) {
       return;
     }
@@ -560,7 +346,7 @@
       return;
     }
     if (result.output_gate_required === true) {
-      await gateMemoryOutput(txn.entry, runtimeRequestId, async () => undefined);
+      await gateMemoryOutput(txn.entry, async () => undefined);
     }
     recordMemoryProfile(
       "js_txn_commit",

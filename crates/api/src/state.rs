@@ -24,12 +24,28 @@ struct OperationalStateInner {
     draining: AtomicBool,
     shutting_down: AtomicBool,
     active_requests: AtomicUsize,
+    active_control_operations: AtomicUsize,
     drained: Notify,
 }
 
 pub struct ActiveRequestGuard {
     inner: Arc<OperationalStateInner>,
     active: bool,
+}
+
+pub(crate) struct ActiveControlOperationGuard(Arc<OperationalStateInner>);
+
+impl Drop for ActiveControlOperationGuard {
+    fn drop(&mut self) {
+        if self
+            .0
+            .active_control_operations
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.0.drained.notify_waiters();
+        }
+    }
 }
 
 impl OperationalState {
@@ -48,6 +64,19 @@ impl OperationalState {
 
     pub fn active_requests(&self) -> usize {
         self.inner.active_requests.load(Ordering::Acquire)
+    }
+
+    pub fn active_control_operations(&self) -> usize {
+        self.inner.active_control_operations.load(Ordering::Acquire)
+    }
+
+    /// Called while the parent HTTP request is still counted. The resulting
+    /// work guard stays with accepted control work after a client disconnects.
+    pub(crate) fn retain_control_operation(&self) -> ActiveControlOperationGuard {
+        self.inner
+            .active_control_operations
+            .fetch_add(1, Ordering::AcqRel);
+        ActiveControlOperationGuard(Arc::clone(&self.inner))
     }
 
     pub fn try_begin_request(&self) -> Option<ActiveRequestGuard> {
@@ -96,11 +125,11 @@ impl OperationalState {
     pub async fn wait_for_drain(&self, timeout: Duration) -> bool {
         let wait = async {
             loop {
-                if self.active_requests() == 0 {
+                if self.active_requests() == 0 && self.active_control_operations() == 0 {
                     return;
                 }
                 let notified = self.inner.drained.notified();
-                if self.active_requests() == 0 {
+                if self.active_requests() == 0 && self.active_control_operations() == 0 {
                     return;
                 }
                 notified.await;
@@ -223,6 +252,20 @@ mod tests {
         state.begin_drain();
         assert!(!state.wait_for_drain(Duration::from_millis(1)).await);
         drop(session);
+        assert!(state.wait_for_drain(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn detached_control_work_remains_in_drain_after_request_disconnects() {
+        let state = OperationalState::default();
+        let request = state.try_begin_request().unwrap();
+        let work = state.retain_control_operation();
+        drop(request);
+        state.begin_drain();
+        assert_eq!(state.active_requests(), 0);
+        assert_eq!(state.active_control_operations(), 1);
+        assert!(!state.wait_for_drain(Duration::from_millis(1)).await);
+        drop(work);
         assert!(state.wait_for_drain(Duration::from_secs(1)).await);
     }
 

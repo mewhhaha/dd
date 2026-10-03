@@ -746,6 +746,7 @@ async fn run_server_child() -> Result<(), String> {
             "DD_BENCH_MEMORY_OUTBOX_MAX_CONCURRENT_SHARDS",
             storage_defaults.memory_outbox_max_concurrent_shards,
         ),
+        memory_outbox_max_claimed_bytes: storage_defaults.memory_outbox_max_claimed_bytes,
         memory_snapshot_cache_max_entries: env_usize(
             "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
             storage_defaults.memory_snapshot_cache_max_entries,

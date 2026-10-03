@@ -30,7 +30,8 @@ use std::task::{Context, Poll, Waker};
 
 include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
 
-const NODE_ASYNC_HOOKS_SOURCE: &str = include_str!("../js/node_async_hooks.js");
+const NODE_ASYNC_HOOKS_SOURCE: &str =
+    include_str!("../../../packages/dd-vite/src/shims/node_async_hooks.js");
 
 static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
 static BOOTSTRAP_SNAPSHOT: OnceLock<Result<Box<[u8]>>> = OnceLock::new();
@@ -255,6 +256,9 @@ pub fn dispatch_worker_request(
             max_response_body_bytes: op_state
                 .borrow::<crate::ops::RuntimeExecutionLimits>()
                 .max_response_body_bytes,
+            max_request_body_bytes: op_state
+                .borrow::<crate::ops::RuntimeExecutionLimits>()
+                .max_request_body_bytes,
             method: mem::take(&mut request.method),
             url: mem::take(&mut request.url),
             input_request_id: mem::take(&mut request.request_id),

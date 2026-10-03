@@ -2,7 +2,8 @@ import { copyFile, lstat, mkdir, readFile, readdir, realpath, stat, writeFile } 
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const CONFIG_SCHEMA_VERSION = 1;
+export const DD_CONFIG_SCHEMA_VERSION = 1;
+const CONFIG_SCHEMA_VERSION = DD_CONFIG_SCHEMA_VERSION;
 const DEFAULT_SOURCE_CONFIG_FILE = "dd.json";
 const DEFAULT_DEPLOYMENT_CONFIG_FILE = "dd.deploy.json";
 const DEFAULT_DEPLOYMENT_WORKER_FILE = "worker.js";
@@ -63,15 +64,24 @@ function withAuxiliaryRuntimeBindings(config, auxiliaryWorkers) {
   return runtimeConfig;
 }
 
-function auxiliaryWorkerServiceConfig(worker) {
+export function auxiliaryWorkerServiceConfig(worker) {
+  if (worker.config !== undefined) validateRuntimeConfig(worker.config, `auxiliary worker ${worker.name}.config`);
   const config = cloneAuxiliaryConfig(worker.config);
-  if (config.public == null) config.public = false;
+  if (config.public === undefined) config.public = false;
   return config;
 }
 
 export function normalizeDeploymentConfigOptions(value) {
   if (value === false) {
     return { enabled: false };
+  }
+  if (value != null) {
+    assertConfigObject(value, "deploymentConfig");
+    if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+      throw new Error("Invalid dd config deploymentConfig.enabled: enabled must be a boolean");
+    }
+    if (value.assetExcludes !== undefined) validateConfigStringArray(value.assetExcludes, "deploymentConfig.assetExcludes");
+    if (value.serverModules !== undefined) validateServerModules(value.serverModules, "deploymentConfig.serverModules");
   }
   return { enabled: true, ...(value ?? {}) };
 }
@@ -333,9 +343,12 @@ export async function buildGeneratedDeploymentConfig({
   serverModules,
   staticRoutes,
 }) {
+  validateDdConfig(base, "deployment config input", { partial: true });
   const deployment = { schema_version: CONFIG_SCHEMA_VERSION };
+  const resolvedRuntimeConfig = resolveDeploymentRuntimeConfig(base, options.config);
+  validateRuntimeConfig(resolvedRuntimeConfig, "deployment runtime config");
   const runtimeConfig = withAuxiliaryRuntimeBindings(
-    options.config ?? base.config ?? topLevelRuntimeConfig(base) ?? {},
+    resolvedRuntimeConfig,
     normalizeAuxiliaryWorkers(options.auxiliaryWorkers),
   );
 
@@ -357,22 +370,21 @@ export async function buildGeneratedDeploymentConfig({
     );
   }
   deployment.asset_excludes = uniquePaths([
-    ...arrayOfStrings(base.asset_excludes),
-    ...arrayOfStrings(assetExcludes),
-    ...arrayOfStrings(extraAssetExcludes),
+    ...arrayOfStrings(base.asset_excludes, "asset_excludes"),
+    ...arrayOfStrings(assetExcludes, "deploymentConfig.assetExcludes"),
+    ...arrayOfStrings(extraAssetExcludes, "generated asset excludes"),
     ...(staticRoutes ? [DEFAULT_STATIC_ROUTES_FILE] : []),
-    workerFile,
-    configFile,
+    ...[workerFile, configFile].filter((file) => !file.split("/").includes("..")),
   ]);
   const serverModuleConfig = [
     ...arrayOfObjects(base.server_modules),
-    ...arrayOfObjects(base.serverModules),
     ...arrayOfObjects(serverModules),
   ];
   if (serverModuleConfig.length > 0) {
     deployment.server_modules = serverModuleConfig;
   }
   deployment.config = runtimeConfig;
+  validateDdConfig(deployment, configFile);
   return deployment;
 }
 
@@ -394,11 +406,12 @@ export function buildAuxiliaryServiceDeploymentConfig({
   if (base.temporary === true) {
     deployment.temporary = true;
   }
+  validateDdConfig(deployment, `auxiliary worker ${worker.name} deployment`);
   return deployment;
 }
 
 export async function loadSourceDeploymentConfig(deploymentConfig, root) {
-  const explicitInput = deploymentConfig.enabled ? deploymentConfig.input : undefined;
+  const explicitInput = deploymentConfig.input;
   if (explicitInput !== undefined) {
     return loadDeploymentConfigInput(explicitInput, root);
   }
@@ -427,9 +440,6 @@ export async function loadDeploymentConfigInput(input, root) {
   if (input == null) {
     return { config: {}, dir: root, path: undefined };
   }
-  if (typeof input === "function") {
-    return { config: cloneJson(await input()), dir: root, path: undefined };
-  }
   if (typeof input === "string" || input instanceof URL) {
     const path = input instanceof URL ? fileURLToPath(input) : resolve(root, input);
     const source = await readFile(path, "utf8");
@@ -439,7 +449,12 @@ export async function loadDeploymentConfigInput(input, root) {
       path,
     };
   }
-  return { config: cloneJson(input), dir: root, path: undefined };
+  const path = "inline deployment config";
+  const value = typeof input === "function" ? await input() : input;
+  assertConfigObject(value, path);
+  const config = cloneJson(value);
+  validateDdConfig(config, path, { partial: true });
+  return { config, dir: root, path: undefined };
 }
 
 export function parseDdConfig(source, path) {
@@ -453,9 +468,9 @@ export function parseDdConfig(source, path) {
   return value;
 }
 
-export function validateDdConfig(value, path = DEFAULT_SOURCE_CONFIG_FILE) {
+export function validateDdConfig(value, path = DEFAULT_SOURCE_CONFIG_FILE, { partial = false } = {}) {
   assertConfigObject(value, path);
-  if (value.schema_version !== CONFIG_SCHEMA_VERSION) {
+  if ((!partial || value.schema_version !== undefined) && value.schema_version !== CONFIG_SCHEMA_VERSION) {
     throw new Error(
       `Invalid dd config ${path}: schema_version must equal ${CONFIG_SCHEMA_VERSION}`,
     );
@@ -478,6 +493,25 @@ export function validateDdConfig(value, path = DEFAULT_SOURCE_CONFIG_FILE) {
     "internal",
     "egress_allow_hosts",
   ]), path);
+  for (const key of ["name", "entrypoint"]) {
+    if (!partial || value[key] !== undefined) validateConfigString(value[key], `${path}.${key}`, true);
+  }
+  if (value.$schema !== undefined) validateConfigString(value.$schema, `${path}.$schema`);
+  for (const key of ["base_url", "baseUrl"]) {
+    if (value[key] === undefined) continue;
+    validateConfigString(value[key], `${path}.${key}`, true);
+    try {
+      if (/\s/.test(value[key])) throw new Error("URI contains whitespace");
+      new URL(value[key]);
+    } catch (error) {
+      throw new Error(`Invalid dd config ${path}.${key}: expected an absolute URI`, { cause: error });
+    }
+  }
+  if (value.assets_dir !== undefined && value.assets_dir !== null) validateConfigString(value.assets_dir, `${path}.assets_dir`);
+  if (value.temporary !== undefined && typeof value.temporary !== "boolean") {
+    throw new Error(`Invalid dd config ${path}.temporary: temporary must be a boolean`);
+  }
+  if (value.asset_excludes !== undefined) validateConfigStringArray(value.asset_excludes, `${path}.asset_excludes`);
   if (value.config !== undefined) {
     validateRuntimeConfig(value.config, `${path}.config`);
   }
@@ -491,15 +525,38 @@ export function validateDdConfig(value, path = DEFAULT_SOURCE_CONFIG_FILE) {
     validateRuntimeConfig(topLevelRuntime, path);
   }
   if (value.server_modules !== undefined) {
-    if (!Array.isArray(value.server_modules)) {
-      throw new Error(`Invalid dd config ${path}: server_modules must be an array`);
-    }
-    value.server_modules.forEach((module, index) => {
-      const label = `${path}.server_modules[${index}]`;
-      assertConfigObject(module, label);
-      rejectUnknownConfigFields(module, new Set(["type", "kind", "path", "file"]), label);
-    });
+    validateServerModules(value.server_modules, `${path}.server_modules`);
   }
+}
+
+function validateConfigString(value, path, nonEmpty = false) {
+  if (typeof value !== "string" || (nonEmpty && !value.trim())) {
+    throw new Error(`Invalid dd config ${path}: expected ${nonEmpty ? "a non-empty string" : "a string"}`);
+  }
+}
+
+function validateConfigStringArray(value, path) {
+  if (!Array.isArray(value) || value.some(entry => typeof entry !== "string")) {
+    throw new Error(`Invalid dd config ${path}: must be an array of strings`);
+  }
+}
+
+function validateServerModules(value, path) {
+  if (!Array.isArray(value)) throw new Error(`Invalid dd config ${path}: server_modules must be an array`);
+  value.forEach((module, index) => {
+    const label = `${path}[${index}]`;
+    assertConfigObject(module, label);
+    rejectUnknownConfigFields(module, new Set(["type", "kind", "path", "file"]), label);
+    validateConfigString(module.path, `${label}.path`, true);
+    if ((module.type !== undefined) === (module.kind !== undefined)) {
+      throw new Error(`Invalid dd config ${label}: exactly one of type or kind is required`);
+    }
+    const kind = module.type ?? module.kind;
+    if (!["ESModule", "CompiledWasm", "Text", "Data", "Json"].includes(kind)) {
+      throw new Error(`Invalid dd config ${label}: unsupported module type ${kind}`);
+    }
+    if (module.file !== undefined && module.file !== null) validateConfigString(module.file, `${label}.file`);
+  });
 }
 
 export function normalizeRuntimeConfig(value = {}, path = "runtime") {
@@ -542,6 +599,10 @@ export function validateRuntimeConfig(value, path) {
       if (typeof value.internal.trace.worker !== "string" || (value.internal.trace.path !== undefined && typeof value.internal.trace.path !== "string")) {
         throw new Error(`Invalid dd config ${path}.internal.trace: worker and path must be strings`);
       }
+      validateConfigString(value.internal.trace.worker, `${path}.internal.trace.worker`, true);
+      if (value.internal.trace.path !== undefined && !value.internal.trace.path.startsWith("/")) {
+        throw new Error(`Invalid dd config ${path}.internal.trace.path: path must start with /`);
+      }
       rejectUnknownConfigFields(
         value.internal.trace,
         new Set(["worker", "path"]),
@@ -563,6 +624,8 @@ export function validateRuntimeConfig(value, path) {
       if (typeof binding.binding !== "string" || (binding.type === "service" && typeof binding.service !== "string")) {
         throw new Error(`Invalid dd config ${label}: binding and service names must be strings`);
       }
+      validateConfigString(binding.binding, `${label}.binding`, true);
+      if (binding.type === "service") validateConfigString(binding.service, `${label}.service`, true);
       if (!["kv", "memory", "service"].includes(binding.type)) {
         throw new Error(`Invalid dd config ${label}: unsupported binding type ${binding.type}`);
       }
@@ -618,20 +681,25 @@ export function topLevelRuntimeConfig(config) {
   return found ? runtimeConfig : undefined;
 }
 
-export function arrayOfStrings(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.map((entry) => String(entry));
+// Match the CLI: top-level runtime fields replace their nested counterparts.
+// An explicit plugin config replaces the resolved project configuration.
+export function resolveDeploymentRuntimeConfig(config, override) {
+  return override ?? { ...config.config, ...topLevelRuntimeConfig(config) };
+}
+
+export function arrayOfStrings(value, path = "string array") {
+  if (value === undefined) return [];
+  validateConfigStringArray(value, path);
+  return [...value];
 }
 
 export function arrayOfObjects(value) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value
-    .filter((entry) => entry && typeof entry === "object")
-    .map((entry) => cloneJson(entry));
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("Invalid dd config: expected an array of objects");
+  return value.map((entry) => {
+    assertConfigObject(entry, "object array entry");
+    return cloneJson(entry);
+  });
 }
 
 export function uniqueStrings(values) {
@@ -643,8 +711,8 @@ export function uniquePaths(paths) {
 }
 
 export function normalizeOutputPath(value, label) {
-  const normalized = normalizeConfigRelativePath(value, label);
-  if (normalized === ".") {
+  const normalized = normalizeConfigRelativePath(value, label).split("/").filter((part) => part !== ".").join("/");
+  if (!normalized) {
     throw new Error(`${label} must be a file path`);
   }
   return normalized;

@@ -49,6 +49,12 @@ Service-binding fetches collect a complete response under the per-response
 size limit, checked incrementally while reading and canceling an oversized
 producer. The shared streaming byte budget applies to public and development
 HTTP response streams; it does not turn service-binding replies into streams.
+HEAD replies and statuses 204, 205, and 304 have a null body. Aborting a service
+fetch cancels its child invocation through the cancellation lane; cancellation
+of the parent request also cancels its outstanding children.
+Service and outbound fetches share native `Request` normalization and a bounded,
+abortable body reader. FormData, Blob, URLSearchParams and stream bodies use the
+standard encodings; aborts preserve the caller's reason and cancel the producer.
 
 JSON control-plane requests reserve their maximum payload size from a shared
 byte budget before reading. The reservation remains held through parsing and
@@ -73,6 +79,10 @@ a read deadline; a full budget rejects new requests with `503`.
 | Buffered streamed response bytes | 64 MiB |
 | Buffered and in-flight WebSocket bytes across the service | 64 MiB |
 | Buffered and in-flight WebSocket bytes per session | 1 MiB |
+| Claimed durable outbox bytes across state shards | 64 MiB |
+| Live memory value bytes per entity | 16 MiB |
+| Live memory entries per entity | 16,384 |
+| Live memory key and entry metadata per entity | 4 MiB |
 | Isolate heap | 128 MiB |
 | Startup timeout | 5 seconds |
 | Request wall timeout | 30 seconds |
@@ -87,6 +97,11 @@ use separate budgets so readers can release capacity while queues are full.
 WebSocket budgets use `DD_RUNTIME_MAX_BUFFERED_WEBSOCKET_BYTES` and
 `DD_RUNTIME_MAX_BUFFERED_WEBSOCKET_BYTES_PER_SESSION`. Control-plane limits use
 `DD_CONTROL_MAX_BUFFERED_BODY_BYTES` and `DD_CONTROL_BODY_TIMEOUT_SECONDS`.
+The outbox claim budget uses `DD_MEMORY_OUTBOX_MAX_CLAIMED_BYTES` or
+`--memory-outbox-max-claimed-bytes`; it includes payload copies and effect metadata
+and remains reserved until delivery tasks release their claims.
+Each effect must fit that budget; lowering it below an already-persisted effect's
+charge prevents that effect from being claimed until the budget is increased.
 
 ## State and transactions
 
@@ -95,7 +110,13 @@ State identity is `(worker, binding, entity key)` for memory and
 SHA-256 routing over length-prefixed identities selects one of 32 state shards;
 a persisted manifest fixes that layout. Each shard has one writer and two
 pooled readers. Writer admission has count and byte limits and grouped
-`synchronous=FULL` commits. Version floors and tombstones persist across restarts.
+`synchronous=FULL` commits. Version floors persist across restarts. Memory deletes
+remove entry rows while retaining entity and shard version floors; opening a
+current-format shard compacts old memory tombstones. KV lists merge keys from
+shards before loading the globally selected values.
+KV cache hits share immutable value bytes and update recency in place. Deployment
+history queries project summary metadata without loading source, assets, or modules;
+individual deployment details still load the complete bundle.
 
 Memory callbacks execute synchronously in the caller isolate under a shared
 entity lease. Before the callback starts, its native transaction holds an
@@ -106,9 +127,15 @@ values. There is no second snapshot cache in each JavaScript isolate.
 The callback stages mutations and effects. Storage retries the staged batch
 without re-executing JavaScript.
 The queued commit retains the lease even if its request is canceled.
+JavaScript entity bookkeeping belongs to the request or transaction. Reused
+isolates retain no catalog of entities previously accessed by atomic callbacks.
 An optional idempotency key stores the callback result in the same transaction
 as state and outbox effects. Async callbacks, nested transactions and returned
 thenables fail; transaction handles cannot escape the callback.
+Stored command results have a versioned envelope with Request/Response metadata
+kept outside user objects. Replay preserves shared references and cycles without
+treating user property names as type markers. Older unversioned results remain
+readable; their Request/Response records are recognized by their complete shape.
 
 Read-only callbacks use `memory.read(snapshot => ...)`. A separate native handle
 retains one committed immutable snapshot, with no entity lease, command lookup,
@@ -126,17 +153,32 @@ snapshot after a commit. A read started after an acknowledged write
 observes that write. Each callback sees one entity snapshot, not a snapshot
 across entities. The API exposes only `get` and `list`, rejects async and nested
 callbacks, and invalidates the view after the callback. Native read handles are
-limited to 128 per request and a 16 MiB live value payload per entity; completion
-and cancellation release them. Storage checks the projected entity size inside
-the write transaction. Existing oversized entities remain writable when a batch
-reduces their live values, allowing deletion and recovery. Reads do not create
+limited to 128 per request; completion and cancellation release them. Storage
+checks live value bytes, entry count, and key/entry metadata inside the write
+transaction. Existing oversized entities remain writable when a batch reduces
+an exceeded limit without increasing another exceeded limit, allowing deletion
+and recovery. Read-only callbacks reject oversized snapshots. Reads do not create
 isolate entry metadata.
 
-One outbox coordinator scans and retries durable effects. Socket effects route
-to the owning worker. Delivery may be retried, so effect consumers must account
-for redelivery. Cache invalidation is published before durable acknowledgement;
+One outbox coordinator scans and retries durable effects. Persisted ordinals
+preserve commit and callback order; an undelivered predecessor blocks later
+effects for that entity, including during retry backoff. Socket effects route
+to the owning worker. Claims share a payload byte budget across shards, and the
+coordinator retains reservations through socket delivery. Delivery may be retried,
+so effect consumers must account for redelivery. Periodic scans rotate their first
+shard so byte-budget exhaustion cannot repeatedly favor the same shards.
+Cache invalidation is published before durable acknowledgement;
 reads use bounded shared caches of committed values. The response cache has its
-own database and keeps recency updates in RAM.
+own database and keeps recency updates in RAM. The opt-in front cache is keyed by
+the persisted deployment ID, so redeployment cannot reuse old responses or be
+repopulated by a late response from the previous generation. Restarting the same
+deployment retains its cache namespace.
+Cache fills retain the selected activation and are discarded if it changes before
+the origin response completes, including during rollback or undeploy.
+
+Readiness and checkpointing operate on the shared state store once, alongside
+the control and response-cache databases. Checkpoint responses report
+`state_shards`, `control`, and `cache` to describe these physical stores.
 
 ## Deployment and recovery
 
@@ -144,6 +186,10 @@ Validation runs in a separately limited isolate with an external timeout and
 heap limit. Successful deployments persist before their route is published.
 Accepted deployment operations finish even if their client disconnects. An
 invalid deployment leaves the previous generation serving requests.
+Drain and checkpoint checks count accepted control work and deployment operations
+through publication. Server shutdown closes deployment admission; after its grace
+period, it cancels queued deployment work and validation, waits for validation
+threads and any started persistence to finish, then stops the runtime.
 
 New requests use the current generation. The previous generation receives at
 most the configured request wall timeout to drain. Existing WebSockets receive
@@ -151,7 +197,7 @@ close code `1012`; a client ignoring that close cannot retain the generation
 indefinitely. Expiring a temporary deployment only removes its own active
 pointer, so it cannot remove a replacement deployed concurrently.
 
-Old storage is never converted during startup. The [offline converter](storage-conversion.md)
+Storage from before routing format 2 is never converted during startup. The [offline converter](storage-conversion.md)
 uses a new destination, explicit ownership for ambiguous namespaces, logical
 row hashes, source file hashes and an incomplete marker. Old bundles are
 archived; rebuild and redeploy them for the current public API.
@@ -160,3 +206,9 @@ Run `just check`, `just check-state-crash`, and
 `node scripts/check-dd-dev-transport.mjs` for the functional checks. Performance
 acceptance additionally requires equivalent durable workloads, fixed CPU
 affinity and disk-backed storage; see [benchmark instructions](../benchmarks/README.md).
+
+The worker JavaScript source order lives in
+`crates/runtime/js/execute_worker/units.txt`. Rust builds and `pnpm check:worker-js`
+read that same list; `just check-js` checks the assembled scope for undefined and
+unused bindings. Native operations are organized by KV, cache, HTTP, response,
+memory and request control responsibilities.

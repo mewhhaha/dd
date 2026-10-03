@@ -1,6 +1,45 @@
 use super::*;
 
-async fn deploy_memory_contract_worker(body: &str) -> RuntimeService {
+#[tokio::test]
+#[serial]
+async fn memory_atomic_does_not_retain_entity_metadata_between_requests() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates: 1,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service.deploy_with_config("memory-metadata".into(), r#"
+let requests = 0;
+export default {
+  async fetch(_request, env) {
+    requests++;
+    let empty = 0;
+    for (let index = 0; index < 128; index++) {
+      const entity = env.STATE.get(`${requests}:${index}`);
+      if (await entity.atomic(tx => tx.get('missing')) === null) empty++;
+    }
+    return Response.json({ requests, empty, retained: globalThis.__dd_memory_state_entries?.size ?? 0 });
+  },
+};
+"#.into(), DeployConfig {
+        bindings: vec![DeployBinding::Memory { binding: "STATE".into() }],
+        ..DeployConfig::default()
+    }).await.unwrap();
+    for requests in 1..=3 {
+        let output = service
+            .invoke("memory-metadata".into(), test_invocation())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.body).unwrap(),
+            serde_json::json!({ "requests": requests, "empty": 128, "retained": 0 })
+        );
+    }
+    service.shutdown().await.unwrap();
+}
+
+async fn deploy_memory_contract_worker(body: &str) -> TestRuntime {
     let service = test_service(RuntimeConfig::default()).await;
     service
         .deploy_with_config(
@@ -435,6 +474,52 @@ return Response.json({ cycle: value.self === value, shared: value.left === value
             serde_json::from_slice::<Value>(&response.body).expect("json"),
             serde_json::json!({
                 "cycle": true, "shared": true, "map": true, "property": "stored"
+            })
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn idempotent_results_keep_user_markers_separate_from_web_values() {
+    let service = deploy_memory_contract_worker(
+        r#"
+const value = await memory.atomic(tx => {
+  tx.put("executions", (tx.get("executions") ?? 0) + 1);
+  const request = new Request("https://fixture.test/request", { method: "POST", body: "request body" });
+  const response = new Response("response body", { status: 202, statusText: "Accepted", headers: { "x-result": "stored" } });
+  const plainRequest = { __dd_rpc_type: "request", url: "https://data.test/", method: "GET", headers: [], body: [] };
+  const plainResponse = { __dd_rpc_type: "response", status: 200, headers: [], body: [] };
+  const record = { request, requestAlias: request, response, plainRequest, plainResponse,
+    map: new Map([[request, response]]), set: new Set([response]) };
+  record.self = record;
+  return record;
+}, { idempotencyKey: "web-values" });
+return Response.json({
+  request: value.request instanceof Request, requestBody: await value.request.text(),
+  response: value.response instanceof Response, responseBody: await value.response.text(),
+  status: value.response.status, statusText: value.response.statusText, header: value.response.headers.get("x-result"),
+  plainRequest: !(value.plainRequest instanceof Request) && value.plainRequest.__dd_rpc_type === "request",
+  plainResponse: !(value.plainResponse instanceof Response) && value.plainResponse.__dd_rpc_type === "response",
+  shared: value.request === value.requestAlias && value.map.get(value.request) === value.response && value.set.has(value.response),
+  cyclic: value.self === value,
+  executions: await memory.read(snapshot => snapshot.get("executions")),
+});
+"#,
+    )
+    .await;
+    for _ in 0..2 {
+        let response = service
+            .invoke("contract".into(), test_invocation())
+            .await
+            .expect("web value command succeeds");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).expect("json"),
+            serde_json::json!({
+                "request": true, "requestBody": "request body", "response": true,
+                "responseBody": "response body", "status": 202, "statusText": "Accepted",
+                "header": "stored", "plainRequest": true, "plainResponse": true,
+                "shared": true, "cyclic": true, "executions": 1,
             })
         );
     }

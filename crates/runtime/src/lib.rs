@@ -9,12 +9,12 @@ mod service;
 mod static_assets;
 
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
-pub use kv::{KvStore, KvUtf8Lookup};
+pub use kv::KvStore;
 pub use memory::{MemoryBatchMutation, MemoryStore};
 pub use service::{
-    InvokeRequestBodyReceiver, PublicRouteAssetResolution, RuntimeAdminSnapshot,
-    RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness, RuntimeRestoreFailure,
-    RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, RuntimeWorkerStatus,
-    WebSocketFrameLease, WebSocketFrameOutput, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
-    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    FrontCacheDeployment, InvokeRequestBodyReceiver, PublicRouteAssetResolution,
+    RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness,
+    RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
+    RuntimeWorkerStatus, WebSocketFrameLease, WebSocketFrameOutput, WebSocketOpen, WorkerDebugDump,
+    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };

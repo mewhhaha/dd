@@ -363,6 +363,15 @@ pub async fn convert(
             source.display()
         )));
     }
+    // Verify the complete imported history first, then retain only live memory
+    // rows. Entity metadata and state_floor already preserve deletion revisions.
+    for shard in 0..STATE_SHARDS {
+        let conn = state.read(shard).await?;
+        conn.execute("DELETE FROM memory_state WHERE deleted<>0", ())
+            .await
+            .map_err(storage_error)?;
+    }
+    state.checkpoint().await?;
     write_file_synced(
         &destination.join("conversion-report.json"),
         &serde_json::to_vec_pretty(&report).map_err(storage_error)?,

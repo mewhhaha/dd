@@ -87,6 +87,7 @@ where
                 "requests_drained": requests_drained,
                 "runtime_drained": runtime_drained,
                 "active_requests": state.operations.active_requests(),
+                "active_control_operations": state.operations.active_control_operations(),
             }),
         )?);
     }
@@ -279,7 +280,9 @@ async fn deploy_admitted_worker(
 ) -> ApiResult<DeployResponse> {
     // Accepted deployments finish on disconnect. Keep their upload reservation
     // with that work until validation and persistence complete.
+    let active_work = state.operations.retain_control_operation();
     tokio::spawn(async move {
+        let _active_work = active_work;
         let _upload_permit = upload_permit;
         deploy_worker(state, payload).await
     })

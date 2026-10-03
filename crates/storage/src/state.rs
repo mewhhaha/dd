@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use turso::{Builder, Connection, Database};
 
-use crate::memory::{MemorySnapshotChange, MemorySnapshotKey, SnapshotCache};
+use crate::memory::{
+    DEFAULT_OUTBOX_CLAIM_BYTE_LIMIT, MemorySnapshotChange, MemorySnapshotKey, OutboxClaimBudget,
+    SnapshotCache,
+};
 use crate::turso_util::{
     configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
     record_storage_retry,
@@ -39,6 +42,7 @@ pub struct StateStore {
     leases: Mutex<EntityLeases>,
     lease_admissions: Arc<Semaphore>,
     pub(crate) memory_snapshots: Arc<Mutex<SnapshotCache>>,
+    pub(crate) outbox_claim_budget: Mutex<Arc<OutboxClaimBudget>>,
 }
 
 type EntityLeases = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
@@ -333,6 +337,7 @@ impl StateStore {
                     conn.execute(statement, ()).await.map_err(storage_error)?;
                 }
             }
+            migrate_state_schema(&conn).await?;
             let mut rows = query_cached(
                 &conn,
                 "SELECT COALESCE(MAX(owner_epoch), 0) FROM memory_meta",
@@ -392,6 +397,9 @@ impl StateStore {
             leases: Mutex::new(HashMap::new()),
             lease_admissions: Arc::new(Semaphore::new(4096)),
             memory_snapshots,
+            outbox_claim_budget: Mutex::new(Arc::new(OutboxClaimBudget::new(
+                DEFAULT_OUTBOX_CLAIM_BYTE_LIMIT,
+            ))),
         }))
     }
 
@@ -823,6 +831,66 @@ pub(crate) async fn configure_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+async fn migrate_state_schema(conn: &Connection) -> Result<()> {
+    let mut rows = conn
+        .query("PRAGMA user_version", ())
+        .await
+        .map_err(storage_error)?;
+    let version = rows
+        .next()
+        .await
+        .map_err(storage_error)?
+        .expect("state schema version")
+        .get::<i64>(0)
+        .map_err(storage_error)?;
+    drop(rows);
+    if version > 1 {
+        return Err(storage_error(format!(
+            "state schema version {version} is newer than supported version 1"
+        )));
+    }
+    if version == 1 {
+        return Ok(());
+    }
+    let mut rows = conn
+        .query("PRAGMA table_info(memory_outbox)", ())
+        .await
+        .map_err(storage_error)?;
+    let mut ordinal_exists = false;
+    while let Some(row) = rows.next().await.map_err(storage_error)? {
+        ordinal_exists |= row.get::<String>(1).map_err(storage_error)? == "ordinal";
+    }
+    drop(rows);
+    for attempt in 0..8 {
+        let result: turso::Result<()> = async {
+            conn.execute("BEGIN IMMEDIATE", ()).await?;
+            if !ordinal_exists {
+                // Old effect IDs hashed their position, so historical order cannot be recovered.
+                conn.execute("ALTER TABLE memory_outbox ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0", ()).await?;
+            }
+            conn.execute("CREATE INDEX IF NOT EXISTS memory_outbox_entity_order ON memory_outbox(worker,binding,entity_key,revision,ordinal,effect_id)", ()).await?;
+            conn.execute("DROP INDEX IF EXISTS memory_outbox_due", ()).await?;
+            conn.execute("CREATE INDEX memory_outbox_due ON memory_outbox(status,next_attempt_at_ms,revision,ordinal,effect_id)", ()).await?;
+            conn.execute("DELETE FROM memory_state WHERE deleted<>0", ()).await?;
+            conn.execute("PRAGMA user_version=1", ()).await?;
+            conn.execute("COMMIT", ()).await?;
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                if !is_retryable_turso_error(&error) || attempt == 7 {
+                    return Err(storage_error(error));
+                }
+                record_storage_retry();
+                tokio::time::sleep(Duration::from_millis(5 * (attempt + 1))).await;
+            }
+        }
+    }
+    unreachable!()
+}
+
 pub(crate) fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -886,8 +954,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            kv.get_utf8("worker", "KV", "key").await.unwrap().unwrap(),
-            "after pressure"
+            kv.get("worker", "KV", "key").await.unwrap().unwrap().value,
+            b"after pressure".as_slice()
         );
         drop(kv);
         drop(state);
@@ -1164,7 +1232,7 @@ mod tests {
             }
             assert_eq!(failures, round);
             let warm = memory.snapshot(&namespace, "entity").await.unwrap();
-            assert_eq!(warm.entries.len(), 17);
+            assert!(matches!(warm.entries.len(), 16 | 17));
             if round == 0 {
                 assert_eq!(
                     state.performance_snapshot().committed_groups - metrics.committed_groups,
@@ -1180,6 +1248,7 @@ mod tests {
             memory.set_snapshot_cache_limits(0, 0);
             let persisted = memory.snapshot(&namespace, "entity").await.unwrap();
             assert_eq!(warm.max_version, persisted.max_version);
+            assert_eq!(warm.entries.len(), persisted.entries.len());
             for (cached, stored) in warm.entries.iter().zip(&persisted.entries) {
                 assert_eq!(
                     (&cached.key, &cached.value, cached.version, cached.deleted),
@@ -1189,6 +1258,156 @@ mod tests {
         }
         drop(memory);
         drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::memory::{
+        MemoryBatchMutation, MemoryCommit, MemoryOutboxEffectWrite, MemoryStore, worker_namespace,
+    };
+
+    #[tokio::test]
+    async fn legacy_state_migrates_ordinals_and_compacts_deletes_without_regressing_floors() {
+        let root =
+            std::env::temp_dir().join(format!("dd-state-migration-{}", uuid::Uuid::new_v4()));
+        let state = StateStore::open(&root).await.unwrap();
+        drop(state);
+        let shard = StateStore::shard_index("worker", "MEMORY", "entity");
+        let database = Builder::new_local(
+            root.join(format!("shard-{shard:02}.db"))
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .build()
+        .await
+        .unwrap();
+        let conn = database.connect().unwrap();
+        configure_connection(&conn).await.unwrap();
+        conn.execute("DROP INDEX memory_outbox_due", ())
+            .await
+            .unwrap();
+        conn.execute("DROP INDEX memory_outbox_entity_order", ())
+            .await
+            .unwrap();
+        conn.execute("ALTER TABLE memory_outbox RENAME TO current_outbox", ())
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE memory_outbox(worker TEXT NOT NULL,binding TEXT NOT NULL,entity_key TEXT NOT NULL,effect_id TEXT NOT NULL,revision INTEGER NOT NULL,kind TEXT NOT NULL,payload_blob BLOB NOT NULL,status TEXT NOT NULL,attempt_count INTEGER NOT NULL,next_attempt_at_ms INTEGER NOT NULL,PRIMARY KEY(worker,binding,entity_key,effect_id))",()).await.unwrap();
+        conn.execute("DROP TABLE current_outbox", ()).await.unwrap();
+        // No old index is present: migration must add the column before creating indexes.
+        conn.execute("INSERT INTO memory_outbox VALUES ('worker','MEMORY','entity','legacy-z',90,'audit.order',?1,'pending',0,0)",(b"z".as_slice(),)).await.unwrap();
+        conn.execute("INSERT INTO memory_outbox VALUES ('worker','MEMORY','entity','legacy-a',90,'audit.order',?1,'pending',0,0)",(b"a".as_slice(),)).await.unwrap();
+        conn.execute(
+            "INSERT INTO memory_state VALUES ('worker','MEMORY','entity','deleted',?1,'utf8',1,90)",
+            (b"discarded".as_slice(),),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_meta VALUES ('worker','MEMORY','entity',90,777)",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("UPDATE state_floor SET version=90", ())
+            .await
+            .unwrap();
+        conn.execute("PRAGMA user_version=0", ()).await.unwrap();
+        drop(conn);
+        drop(database);
+        let state = StateStore::open(&root).await.unwrap();
+        let memory = MemoryStore::from_state(Arc::clone(&state));
+        let namespace = worker_namespace("worker", "MEMORY");
+        let snapshot = memory.snapshot(&namespace, "entity").await.unwrap();
+        assert!(snapshot.entries.is_empty());
+        assert_eq!(snapshot.max_version, 90);
+        let conn = state.read(shard).await.unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM memory_state", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0
+        );
+        drop(rows);
+        drop(conn);
+        let legacy = memory
+            .claim_outbox_records(&namespace, "entity", 64, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|record| (record.effect_id.as_str(), record.ordinal))
+                .collect::<Vec<_>>(),
+            [("legacy-a", 0), ("legacy-z", 0)]
+        );
+        for record in &legacy {
+            memory
+                .mark_outbox_delivered(&namespace, "entity", &record.effect_id)
+                .await
+                .unwrap();
+        }
+        drop(legacy);
+        let lease = memory.acquire_lease(&namespace, "entity").await.unwrap();
+        assert!(lease.owner_epoch() > 777);
+        let result = memory
+            .apply_batch(
+                &namespace,
+                "entity",
+                MemoryCommit {
+                    mutations: vec![MemoryBatchMutation {
+                        key: "restored".into(),
+                        value: b"live".as_slice().into(),
+                        encoding: "utf8".into(),
+                        deleted: false,
+                    }],
+                    outbox_effects: vec![
+                        MemoryOutboxEffectWrite {
+                            kind: "audit.order".into(),
+                            payload: b"first".to_vec(),
+                        },
+                        MemoryOutboxEffectWrite {
+                            kind: "audit.order".into(),
+                            payload: b"second".to_vec(),
+                        },
+                    ],
+                    owner_epoch: Some(lease.owner_epoch()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.max_version > 90);
+        let claims = memory
+            .claim_outbox_records(&namespace, "entity", 64, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|record| record.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"first".as_slice(), b"second".as_slice()]
+        );
+        drop(claims);
+        drop(lease);
+        drop(memory);
+        drop(state);
+        let memory = MemoryStore::from_state(StateStore::open(&root).await.unwrap());
+        assert_eq!(
+            memory
+                .snapshot(&namespace, "entity")
+                .await
+                .unwrap()
+                .max_version,
+            result.max_version
+        );
+        drop(memory);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

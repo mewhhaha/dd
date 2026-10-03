@@ -243,8 +243,8 @@ async fn undeployed_worker_names_release_their_schedulers() {
 #[tokio::test]
 #[serial]
 async fn redeployment_survives_the_previous_scheduler_retiring() {
-    let root = std::env::temp_dir().join(format!("dd-scheduler-redeploy-{}", Uuid::new_v4()));
-    let service = test_service_with_paths(RuntimeConfig::default(), root.clone(), true).await;
+    let store = TestStoreDir::new("dd-scheduler-redeploy");
+    let service = test_service_with_store(RuntimeConfig::default(), store.clone(), true).await;
     for index in 0..12 {
         service
             .deploy(
@@ -264,7 +264,4 @@ async fn redeployment_survives_the_previous_scheduler_retiring() {
             .expect("worker should undeploy");
     }
     service.shutdown().await.expect("runtime should stop");
-    tokio::fs::remove_dir_all(root)
-        .await
-        .expect("test store should be removed");
 }

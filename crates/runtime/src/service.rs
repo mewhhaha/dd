@@ -79,9 +79,9 @@ type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
 type AssetCatalogSnapshot = Arc<ArcSwap<HashMap<String, Arc<AssetCatalogEntry>>>>;
 pub(crate) use self::control::{RuntimeCommand, RuntimeFastCommandSender};
 pub use self::facade::{
-    InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug, MemoryShardDebug,
-    PublicRouteAssetResolution, RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig,
-    RuntimeReadiness, RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig,
+    FrontCacheDeployment, InvokeRequestBodyReceiver, MemoryOutboxDebug, MemorySchedulerDebug,
+    MemoryShardDebug, PublicRouteAssetResolution, RuntimeAdminSnapshot, RuntimeCheckpointResult,
+    RuntimeConfig, RuntimeReadiness, RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig,
     RuntimeStorageConfig, RuntimeWorkerStatus, WebSocketFrameLease, WebSocketFrameOutput,
     WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate, WorkerDebugRequest, WorkerStats,
     WorkerStreamBody, WorkerStreamOutput,
@@ -135,6 +135,7 @@ impl AssetCatalog {
 #[derive(Clone, Debug)]
 struct AssetCatalogEntry {
     worker_name: String,
+    deployment_id: String,
     generation: u64,
     assets: Arc<AssetBundle>,
     public: bool,

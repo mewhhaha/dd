@@ -22,8 +22,7 @@ CREATE TABLE IF NOT EXISTS memory_commands (
 );
 CREATE TABLE IF NOT EXISTS memory_outbox (
  worker TEXT NOT NULL, binding TEXT NOT NULL, entity_key TEXT NOT NULL, effect_id TEXT NOT NULL,
- revision INTEGER NOT NULL, kind TEXT NOT NULL, payload_blob BLOB NOT NULL, status TEXT NOT NULL,
+ revision INTEGER NOT NULL, ordinal INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL, payload_blob BLOB NOT NULL, status TEXT NOT NULL,
  attempt_count INTEGER NOT NULL, next_attempt_at_ms INTEGER NOT NULL,
  PRIMARY KEY(worker, binding, entity_key, effect_id)
 );
-CREATE INDEX IF NOT EXISTS memory_outbox_due ON memory_outbox(status, next_attempt_at_ms, revision, effect_id);

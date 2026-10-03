@@ -123,7 +123,12 @@ async fn run_scenario(scenario: Scenario) -> Result<(), String> {
                 let invoke_started = Instant::now();
                 match scenario.label {
                     "get-utf8" => {
-                        let _ = store.get_utf8("worker-a", "MY_KV", "hot").await?;
+                        let value = store.get("worker-a", "MY_KV", "hot").await?;
+                        let _ = value.filter(|value| value.encoding == "utf8").map(|value| {
+                            std::str::from_utf8(&value.value)
+                                .expect("seeded UTF-8 benchmark value")
+                                .to_owned()
+                        });
                     }
                     "set-utf8" => {
                         store.put("worker-a", "MY_KV", "hot", "1").await?;

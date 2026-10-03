@@ -1,38 +1,72 @@
 use super::*;
 
-pub(crate) async fn test_service(config: RuntimeConfig) -> RuntimeService {
-    let store_dir = format!("/tmp/dd-store-{}", Uuid::new_v4());
-    RuntimeService::start_with_service_config(RuntimeServiceConfig {
-        runtime: config,
-        storage: RuntimeStorageConfig {
-            store_dir: PathBuf::from(&store_dir),
-            memory_outbox_max_concurrent_shards: 8,
-            memory_snapshot_cache_max_entries: 4096,
-            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
-            worker_store_enabled: false,
-        },
-    })
-    .await
-    .expect("service should start")
+#[derive(Clone)]
+pub(crate) struct TestStoreDir(Arc<TestStorePath>);
+
+struct TestStorePath(PathBuf);
+
+impl TestStoreDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).expect("test store directory should be created");
+        Self(Arc::new(TestStorePath(path)))
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0.0
+    }
 }
 
-pub(crate) async fn test_service_with_paths(
+impl Drop for TestStorePath {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("failed to remove test store {}: {error}", self.0.display());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TestRuntime {
+    // Drop the service first: its lifetime owner joins the runtime thread and
+    // releases shard writers before the last directory owner removes files.
+    service: RuntimeService,
+    store: TestStoreDir,
+}
+
+impl std::ops::Deref for TestRuntime {
+    type Target = RuntimeService;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
+impl TestRuntime {
+    pub(crate) fn store_path(&self) -> &std::path::Path {
+        self.store.path()
+    }
+}
+
+pub(crate) async fn test_service(config: RuntimeConfig) -> TestRuntime {
+    test_service_with_store(config, TestStoreDir::new("dd-store"), false).await
+}
+
+pub(crate) async fn test_service_with_store(
     config: RuntimeConfig,
-    store_dir: PathBuf,
+    store: TestStoreDir,
     worker_store_enabled: bool,
-) -> RuntimeService {
-    RuntimeService::start_with_service_config(RuntimeServiceConfig {
+) -> TestRuntime {
+    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
         runtime: config,
         storage: RuntimeStorageConfig {
-            store_dir: store_dir.clone(),
-            memory_outbox_max_concurrent_shards: 8,
-            memory_snapshot_cache_max_entries: 4096,
-            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
+            store_dir: store.path().to_path_buf(),
             worker_store_enabled,
+            ..RuntimeStorageConfig::default()
         },
     })
     .await
-    .expect("service should start")
+    .expect("service should start");
+    TestRuntime { service, store }
 }
 
 pub(crate) async fn invoke_with_timeout_and_dump(

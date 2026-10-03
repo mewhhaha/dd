@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -273,6 +273,158 @@ try {
     plugins: [ddVitePlugin({ deploymentConfig: { input: pathToFileURL(join(root, "dd.json")) } })],
   }, "build");
   assert(urlInputConfig.environments["config_check_worker"], "file URL config inputs must resolve successfully");
+
+  const inputConfig = JSON.parse(await readFile(join(root, "dd.json"), "utf8"));
+  for (const input of [inputConfig, () => inputConfig, async () => inputConfig]) {
+    const inlineConfig = await resolveConfig({
+      root, configFile: false, logLevel: "silent",
+      plugins: [ddVitePlugin({ deploymentConfig: { input } })],
+    }, "build");
+    assert(inlineConfig.environments.config_check_worker, "object and function config inputs must resolve successfully");
+  }
+  const partialConfig = { name: "partial-config-worker", entrypoint: "src/worker.ts", config: { public: true } };
+  for (const input of [partialConfig, () => partialConfig, async () => partialConfig]) {
+    const inlineConfig = await resolveConfig({
+      root, configFile: false, logLevel: "silent",
+      plugins: [ddVitePlugin({ deploymentConfig: { input } })],
+    }, "build");
+    assert(inlineConfig.environments.partial_config_worker, "inline configs may omit the schema version");
+  }
+  const invalidInputFile = join(root, "invalid-input.json");
+  for (const [invalid, expectedError] of [
+    [{ ...inputConfig, publik: true }, /unknown field publik/],
+    [{ ...inputConfig, schema_version: 99 }, /schema_version must equal 1/],
+    [{ ...inputConfig, config: { public: "invalid" } }, /public must be a boolean/],
+    [{ ...inputConfig, server_modules: "invalid" }, /server_modules must be an array/],
+    [{ ...inputConfig, $schema: 42 }, /\$schema.*string/],
+    [{ ...inputConfig, name: "" }, /name.*non-empty string/],
+    [{ ...inputConfig, entrypoint: null }, /entrypoint.*non-empty string/],
+    [{ ...inputConfig, base_url: "relative/path" }, /absolute URI/],
+    [{ ...inputConfig, baseUrl: 42 }, /baseUrl.*string/],
+    [{ ...inputConfig, assets_dir: false }, /assets_dir.*string/],
+    [{ ...inputConfig, temporary: "true" }, /temporary must be a boolean/],
+    [{ ...inputConfig, asset_excludes: [99] }, /asset_excludes.*array of strings/],
+    [{ ...inputConfig, asset_excludes: null }, /asset_excludes.*array of strings/],
+    [{ ...inputConfig, server_modules: [{ path: "private/helper.js", type: "Unknown" }] }, /unsupported module type/],
+    [{ ...inputConfig, server_modules: [{ type: "ESModule" }] }, /path.*non-empty string/],
+    [{ ...inputConfig, server_modules: [{ path: "private/helper.js" }] }, /exactly one of type or kind/],
+    [{ ...inputConfig, server_modules: [{ path: "private/helper.js", type: "ESModule", kind: "Text" }] }, /exactly one of type or kind/],
+    [{ ...inputConfig, server_modules: [{ path: "private/helper.js", type: "ESModule", file: false }] }, /file.*string/],
+    [{ ...inputConfig, bindings: [{ type: "memory", binding: "" }] }, /binding.*non-empty string/],
+    [{ ...inputConfig, bindings: [{ type: "service", binding: "SERVICE", service: "" }] }, /service.*non-empty string/],
+    [{ ...inputConfig, internal: { trace: { worker: "" } } }, /worker.*non-empty string/],
+    [{ ...inputConfig, internal: { trace: { worker: "trace", path: "relative" } } }, /path must start with/],
+    [[], /expected an object/],
+  ]) {
+    await writeFile(invalidInputFile, JSON.stringify(invalid));
+    for (const input of [invalidInputFile, pathToFileURL(invalidInputFile), invalid, () => invalid, async () => invalid]) {
+      await assert.rejects(resolveConfig({
+        root, configFile: false, logLevel: "silent",
+        plugins: [ddVitePlugin({ deploymentConfig: { input } })],
+      }, "build"), expectedError);
+    }
+  }
+  for (const incomplete of [
+    { schema_version: 1 },
+    { schema_version: 1, name: "required-name" },
+    { schema_version: 1, entrypoint: "src/worker.ts" },
+  ]) {
+    await writeFile(invalidInputFile, JSON.stringify(incomplete));
+    for (const input of [invalidInputFile, pathToFileURL(invalidInputFile)]) {
+      await assert.rejects(resolveConfig({
+        root, configFile: false, logLevel: "silent",
+        plugins: [ddVitePlugin({ deploymentConfig: { input } })],
+      }, "build"), /name.*non-empty string|entrypoint.*non-empty string/);
+    }
+  }
+  for (const settings of [
+    { assetExcludes: [99] },
+    { serverModules: [{ path: "private/helper.js", type: "Unknown" }] },
+  ]) {
+    await assert.rejects(async () => resolveConfig({
+      root, configFile: false, logLevel: "silent",
+      plugins: [ddVitePlugin({ deploymentConfig: settings })],
+    }, "build"), /array of strings|unsupported module type/);
+  }
+  for (const [settings, expectedError] of [
+    [{ config: { bindings: "invalid" } }, /bindings must be an array/],
+    [{ auxiliaryWorkers: [{ name: "auxiliary", source: "export default {};", config: { public: null } }] }, /public must be a boolean/],
+    [{ auxiliaryWorkers: [{ name: "auxiliary", source: "export default {};", config: { bindings: "invalid" } }] }, /bindings must be an array/],
+  ]) {
+    await assert.rejects(resolveConfig({
+      root, configFile: false, logLevel: "silent",
+      plugins: [ddVitePlugin({
+        auxiliaryWorkers: [{ name: "auxiliary", source: "export default {};" }],
+        ...settings,
+      })],
+    }, "serve"), expectedError, "auxiliary workers must not hide malformed runtime config");
+  }
+  for (const input of [() => null, async () => undefined]) {
+    await assert.rejects(resolveConfig({
+      root, configFile: false, logLevel: "silent",
+      plugins: [ddVitePlugin({ deploymentConfig: { input } })],
+    }, "build"), /expected an object/);
+  }
+  console.log("dd-vite: file, URL, object, sync and async config inputs validate consistently");
+
+  for (const [label, settings] of [
+    ["disabled", false],
+    ["disabled-option", { enabled: false, input: "dd.json" }],
+    ["custom", { output: "metadata/deploy.json", entrypoint: "bundle/main.js" }],
+  ]) {
+    const outDir = `options-${label}`;
+    await buildApp({
+      root, configFile: false, logLevel: "silent",
+      build: { outDir, rollupOptions: { input: join(root, "src/client.ts") } },
+      plugins: [ddVitePlugin({
+        middleware: false,
+        deploymentConfig: settings,
+        auxiliaryWorkers: [{
+          name: "auth", entry: join(root, "src/worker.ts"),
+          deployment: { output: "metadata/auth.json", entrypoint: "bundle/auth.js" },
+        }],
+      })],
+    });
+    const optionsManifest = JSON.parse(await readFile(join(root, outDir, "dd.workers.json"), "utf8"));
+    for (const record of optionsManifest.workers) {
+      const artifact = await readFile(join(root, outDir, record.worker), "utf8");
+      assert(artifact, "the manifest must point to the actual configured worker artifact");
+      if (label !== "custom") {
+        assert.equal(record.deployConfig, undefined, "disabled deployment output must not advertise missing config files");
+        assert.deepEqual(await readdir(join(root, outDir, record.outDir)), record.role === "entry" ? ["worker.js"] : ["bundle"]);
+        continue;
+      }
+      assert(record.deployConfig.includes("/metadata/"));
+      const configPath = join(root, outDir, record.deployConfig);
+      const configured = JSON.parse(await readFile(configPath, "utf8"));
+      assert.equal(configured.entrypoint, record.role === "entry" ? "../bundle/main.js" : "../bundle/auth.js");
+      if (record.role === "entry") {
+        assert.equal(configured.assets_dir, "../../client");
+        assert.equal(configured.server_modules.length, privateModules.length);
+      }
+      if (process.env.DD_CLI_BIN) {
+        const { stdout } = await runFile(process.env.DD_CLI_BIN, ["package-deploy-config", configPath, "--allow-outside-config-root"]);
+        const request = JSON.parse(stdout);
+        assert.equal(request.source, artifact, "CLI packaging must resolve custom entrypoint relative to its config directory");
+        if (record.role === "entry") {
+          assert.equal(request.server_modules.length, privateModules.length);
+          for (const [index, module] of request.server_modules.entries()) {
+            assert.deepEqual(Buffer.from(module.content_base64, "base64"), privateModules[index].bytes);
+          }
+        }
+      }
+    }
+  }
+  for (const settings of [
+    { output: "../escape.json" },
+    { entrypoint: "../escape.js" },
+    { output: "worker.js" },
+  ]) {
+    await assert.rejects(resolveConfig({
+      root, configFile: false, logLevel: "silent",
+      plugins: [ddVitePlugin({ deploymentConfig: settings })],
+    }, "build"), /relative path|different files/);
+  }
 
   await buildApp({
     root,

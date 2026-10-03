@@ -4,6 +4,16 @@ use serde::Serialize;
 use tracing::info;
 
 pub(super) const RUNTIME_FAST_COMMAND_CHANNEL_CAPACITY: usize = 4096;
+const MAX_ACCEPTED_DEPLOYMENTS: usize = 64;
+
+#[derive(Clone)]
+pub struct FrontCacheDeployment(Arc<AssetCatalogEntry>);
+
+impl FrontCacheDeployment {
+    pub fn namespace(&self) -> String {
+        format!("front:{}:{}", self.0.worker_name, self.0.deployment_id)
+    }
+}
 
 enum DeploymentPersistence {
     Insert,
@@ -109,6 +119,7 @@ fn default_global_isolate_budget() -> usize {
 pub struct RuntimeStorageConfig {
     pub store_dir: PathBuf,
     pub memory_outbox_max_concurrent_shards: usize,
+    pub memory_outbox_max_claimed_bytes: usize,
     pub memory_snapshot_cache_max_entries: usize,
     pub memory_snapshot_cache_max_bytes: usize,
     pub worker_store_enabled: bool,
@@ -119,7 +130,10 @@ impl Default for RuntimeStorageConfig {
         let store_dir = PathBuf::from("./store");
         Self {
             store_dir,
-            memory_outbox_max_concurrent_shards: default_memory_outbox_parallelism(32),
+            memory_outbox_max_concurrent_shards: default_memory_outbox_parallelism(
+                ::storage::state::STATE_SHARDS,
+            ),
+            memory_outbox_max_claimed_bytes: ::storage::memory::DEFAULT_OUTBOX_CLAIM_BYTE_LIMIT,
             memory_snapshot_cache_max_entries: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES,
             memory_snapshot_cache_max_bytes: DEFAULT_MEMORY_SNAPSHOT_CACHE_MAX_BYTES,
             worker_store_enabled: !cfg!(test),
@@ -127,12 +141,12 @@ impl Default for RuntimeStorageConfig {
     }
 }
 
-fn default_memory_outbox_parallelism(namespace_shards: usize) -> usize {
+fn default_memory_outbox_parallelism(shard_count: usize) -> usize {
     let cpus = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .max(1);
-    namespace_shards.max(1).min(cpus).clamp(1, 8)
+    shard_count.max(1).min(cpus).clamp(1, 8)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -237,6 +251,8 @@ pub struct RuntimeAdminSnapshot {
     pub memory_snapshot_cache_hits: u64,
     pub memory_snapshot_cache_misses: u64,
     pub memory_snapshot_cache_evictions: u64,
+    pub memory_outbox_claimed_bytes: usize,
+    pub memory_outbox_max_claimed_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -252,9 +268,8 @@ pub struct RuntimeReadiness {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RuntimeCheckpointResult {
-    pub kv: bool,
+    pub state_shards: usize,
     pub cache: bool,
-    pub memory_databases: usize,
     pub control: bool,
 }
 
@@ -691,7 +706,7 @@ pub struct RuntimeService {
     cancel_sender: RuntimeCancellationSender,
     fast_sender: RuntimeCommandSender,
     asset_catalog: AssetCatalog,
-    kv_store: KvStore,
+    state_store: Arc<::storage::state::StateStore>,
     pub(super) memory_store: MemoryStore,
     cache_store: CacheStore,
     request_body_budget: Arc<tokio::sync::Semaphore>,
@@ -700,6 +715,7 @@ pub struct RuntimeService {
     deployment_validator: Arc<super::deployment::DeploymentValidator>,
     deployment_admission: Arc<tokio::sync::Semaphore>,
     deployment_order: Arc<tokio::sync::Mutex<()>>,
+    deployment_stopping: tokio::sync::watch::Sender<bool>,
     temporary_worker_ttl: Duration,
     pub(super) _module_registry: crate::module_registry::ModuleRegistry,
     storage: RuntimeStorageConfig,
@@ -766,7 +782,8 @@ impl RuntimeService {
             runtime.kv_read_cache_max_entries,
             runtime.kv_read_cache_max_bytes,
         );
-        let mut memory_store = MemoryStore::from_state(state_store);
+        let mut memory_store = MemoryStore::from_state(Arc::clone(&state_store));
+        memory_store.set_outbox_claim_byte_limit(storage.memory_outbox_max_claimed_bytes)?;
         memory_store.set_snapshot_cache_limits(
             storage.memory_snapshot_cache_max_entries,
             storage.memory_snapshot_cache_max_bytes,
@@ -840,15 +857,16 @@ impl RuntimeService {
             cancel_sender,
             fast_sender,
             asset_catalog,
-            kv_store,
+            state_store,
             memory_store,
             cache_store,
             request_body_budget,
             request_body_chunk_bytes,
             control_store,
             deployment_validator,
-            deployment_admission: Arc::new(tokio::sync::Semaphore::new(64)),
+            deployment_admission: Arc::new(tokio::sync::Semaphore::new(MAX_ACCEPTED_DEPLOYMENTS)),
             deployment_order: Arc::new(tokio::sync::Mutex::new(())),
+            deployment_stopping: tokio::sync::watch::channel(false).0,
             temporary_worker_ttl,
             _module_registry: module_registry,
             storage,
@@ -940,13 +958,7 @@ impl RuntimeService {
         &self,
         worker: Option<&str>,
     ) -> Result<Vec<common::DeploymentSummary>> {
-        Ok(self
-            .control_store
-            .list_deployments(worker)
-            .await?
-            .iter()
-            .map(ControlDeployment::summary)
-            .collect())
+        self.control_store.list_deployments(worker).await
     }
 
     pub async fn deployment(&self, deployment_id: &str) -> Result<common::DeploymentDetails> {
@@ -958,13 +970,13 @@ impl RuntimeService {
     }
 
     pub async fn undeploy(&self, worker_name: String) -> Result<()> {
-        let admission = Arc::clone(&self.deployment_admission)
-            .try_acquire_owned()
-            .map_err(|_| PlatformError::overloaded("deployment queue is full (64 requests)"))?;
+        let admission = self.admit_deployment()?;
         let service = self.clone();
         tokio::spawn(async move {
             let _admission = admission;
-            let _order = service.deployment_order.lock().await;
+            let _order = service
+                .deployment_phase(async { Ok(service.deployment_order.lock().await) })
+                .await?;
             if service.storage.worker_store_enabled
                 && !service
                     .control_store
@@ -1133,14 +1145,14 @@ impl RuntimeService {
         &self,
         request: DeployWithConfigRequest,
     ) -> Result<String> {
-        let admission = Arc::clone(&self.deployment_admission)
-            .try_acquire_owned()
-            .map_err(|_| PlatformError::overloaded("deployment queue is full (64 requests)"))?;
+        let admission = self.admit_deployment()?;
         let service = self.clone();
         // Once accepted, finish persistence and publication even if the client disconnects.
         tokio::spawn(async move {
             let _admission = admission;
-            let _order = service.deployment_order.lock().await;
+            let _order = service
+                .deployment_phase(async { Ok(service.deployment_order.lock().await) })
+                .await?;
             let DeployWithConfigRequest {
                 worker_name,
                 source,
@@ -1184,8 +1196,7 @@ impl RuntimeService {
                 &prepared.server_modules,
             )?;
             service
-                .deployment_validator
-                .validate(source, modules)
+                .deployment_phase(service.deployment_validator.validate(source, modules))
                 .await?;
             let expires_at_ms = if temporary {
                 let ttl_ms = i64::try_from(service.temporary_worker_ttl.as_millis())
@@ -1532,10 +1543,12 @@ impl RuntimeService {
             restore_failures,
             readiness,
             storage_retry_count: crate::turso_util::storage_retry_count(),
-            state_storage: self.memory_store.state_performance_snapshot(),
+            state_storage: self.state_store.performance_snapshot(),
             memory_snapshot_cache_hits: memory_cache.snapshot_hits,
             memory_snapshot_cache_misses: memory_cache.snapshot_misses,
             memory_snapshot_cache_evictions: memory_cache.snapshot_evictions,
+            memory_outbox_claimed_bytes: self.memory_store.outbox_claimed_bytes(),
+            memory_outbox_max_claimed_bytes: self.storage.memory_outbox_max_claimed_bytes,
         }
     }
 
@@ -1559,10 +1572,14 @@ impl RuntimeService {
     }
 
     pub async fn is_quiescent(&self) -> bool {
+        if self.deployment_admission.available_permits() != MAX_ACCEPTED_DEPLOYMENTS {
+            return false;
+        }
         let worker_names = self.asset_catalog.worker_names();
         let expected = worker_names.len();
         let workers = self.worker_statuses(worker_names).await;
-        workers.len() == expected
+        self.deployment_admission.available_permits() == MAX_ACCEPTED_DEPLOYMENTS
+            && workers.len() == expected
             && self
                 .memory_store
                 .state_performance_snapshot()
@@ -1599,25 +1616,21 @@ impl RuntimeService {
     }
 
     pub async fn readiness(&self) -> RuntimeReadiness {
-        let (control, kv, cache, memory, restore_failures) = tokio::join!(
+        let (control, state, cache, restore_failures) = tokio::join!(
             self.control_store.health_check(),
-            self.kv_store.health_check(),
+            self.state_store.health_check(),
             self.cache_store.health_check(),
-            self.memory_store.health_check(),
             self.control_store.restore_failures(),
         );
         let mut failed_components = Vec::new();
         if control.is_err() {
             failed_components.push("control".to_string());
         }
-        if kv.is_err() {
-            failed_components.push("kv".to_string());
+        if state.is_err() {
+            failed_components.push("state".to_string());
         }
         if cache.is_err() {
             failed_components.push("cache".to_string());
-        }
-        if memory.is_err() {
-            failed_components.push("memory".to_string());
         }
         if restore_failures.is_err() {
             failed_components.push("restoration_diagnostics".to_string());
@@ -1629,10 +1642,9 @@ impl RuntimeService {
         let restore_failure_count = restore_failures
             .as_ref()
             .map_or(0, |failures| failures.len());
-        let storage_ready = control.is_ok() && kv.is_ok() && cache.is_ok() && memory.is_ok();
-        // Each component health check also verifies its current migration
-        // version, so migration readiness is intentionally conservative when
-        // any store cannot be inspected.
+        let storage_ready = control.is_ok() && state.is_ok() && cache.is_ok();
+        // Opening stores verifies their schema. Readiness also requires all
+        // physical stores to remain accessible after startup.
         let migrations_ready = storage_ready;
         let worker_restoration_ready = restore_failures.is_ok() && restore_failure_count == 0;
         RuntimeReadiness {
@@ -1648,13 +1660,11 @@ impl RuntimeService {
 
     pub async fn checkpoint(&self) -> Result<RuntimeCheckpointResult> {
         self.control_store.checkpoint().await?;
-        self.kv_store.checkpoint().await?;
+        self.state_store.checkpoint().await?;
         self.cache_store.checkpoint().await?;
-        let memory_databases = self.memory_store.checkpoint_all_databases().await?;
         Ok(RuntimeCheckpointResult {
-            kv: true,
+            state_shards: ::storage::state::STATE_SHARDS,
             cache: true,
-            memory_databases,
             control: true,
         })
     }
@@ -1665,10 +1675,20 @@ impl RuntimeService {
             .is_some_and(|entry| entry.worker_name == worker_name && entry.public)
     }
 
-    pub fn worker_cache_enabled(&self, worker_name: &str) -> bool {
+    pub fn front_cache_namespace(&self, worker_name: &str) -> Option<String> {
+        self.front_cache_deployment(worker_name)
+            .map(|deployment| deployment.namespace())
+    }
+
+    pub fn front_cache_deployment(&self, worker_name: &str) -> Option<FrontCacheDeployment> {
+        let entry = self.asset_catalog.get(worker_name)?;
+        entry.cache_enabled.then_some(FrontCacheDeployment(entry))
+    }
+
+    pub fn front_cache_deployment_is_current(&self, deployment: &FrontCacheDeployment) -> bool {
         self.asset_catalog
-            .get(worker_name)
-            .is_some_and(|entry| entry.worker_name == worker_name && entry.cache_enabled)
+            .get(&deployment.0.worker_name)
+            .is_some_and(|entry| Arc::ptr_eq(&entry, &deployment.0))
     }
 
     pub fn resolve_asset(
@@ -1783,10 +1803,64 @@ impl RuntimeService {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.close_deployment_admission();
+        self.deployment_stopping.send_replace(true);
+        // Cancel queued validations, but allow transactions that have already
+        // started persistence to finish publication before stopping the runtime.
+        // Validation threads retain their slots until V8 actually exits.
+        while self.deployment_admission.available_permits() != MAX_ACCEPTED_DEPLOYMENTS
+            || self.deployment_validator.slots.available_permits() != 1
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // Use the fast control lane so shutdown is not queued behind a full
         // request/deploy channel once the bounded drain deadline has elapsed.
         self.shutdown.start(self.fast_sender.clone());
         self.shutdown.wait().await
+    }
+
+    pub fn close_deployment_admission(&self) {
+        self.deployment_admission.close();
+    }
+
+    pub fn active_deployment_operations(&self) -> usize {
+        MAX_ACCEPTED_DEPLOYMENTS - self.deployment_admission.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(super) fn deployment_validation_active(&self) -> bool {
+        self.deployment_validator.slots.available_permits() == 0
+    }
+
+    fn admit_deployment(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.deployment_admission)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => {
+                    PlatformError::overloaded("runtime is shutting down")
+                }
+                tokio::sync::TryAcquireError::NoPermits => {
+                    PlatformError::overloaded("deployment queue is full (64 requests)")
+                }
+            })
+    }
+
+    async fn deployment_phase<T>(
+        &self,
+        phase: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let mut stopping = self.deployment_stopping.subscribe();
+        tokio::select! {
+            biased;
+            _ = async {
+                while !*stopping.borrow_and_update() {
+                    if stopping.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => Err(PlatformError::overloaded("runtime is shutting down")),
+            result = phase => result,
+        }
     }
 
     #[cfg(test)]

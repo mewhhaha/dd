@@ -120,6 +120,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     .await;
 
     state.operations.begin_shutdown();
+    state.runtime.close_deployment_admission();
     let drain_timeout = Duration::from_secs(20);
     let drain_started_at = std::time::Instant::now();
     let requests_drained = state.operations.wait_for_drain(drain_timeout).await;

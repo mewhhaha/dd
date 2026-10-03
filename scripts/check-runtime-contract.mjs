@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { buildGeneratedDeploymentConfig, normalizeRuntimeConfig } from "../packages/dd-vite/src/vite/config.js";
+import { buildGeneratedDeploymentConfig, normalizeRuntimeConfig, resolveDeploymentRuntimeConfig } from "../packages/dd-vite/src/vite/config.js";
 import { parseConfigEnv } from "../benchmarks/lib/runner-config.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -11,12 +11,18 @@ for (const scenario of cases) {
   if (scenario.reject) {
     assert.throws(() => normalizeRuntimeConfig(scenario.input, scenario.name), undefined, scenario.name);
   } else {
-    assert.deepEqual(normalizeRuntimeConfig(scenario.input, scenario.name), scenario.expected, scenario.name);
-    for (const [source, config] of Object.entries({
+    if (!scenario.deployment) assert.deepEqual(normalizeRuntimeConfig(scenario.input, scenario.name), scenario.expected, scenario.name);
+    const inputs = scenario.deployment ? {
+      mixed: { base: scenario.deployment, options: {} },
+      pluginOverride: { base: scenario.deployment, options: { config: {} } },
+    } : {
       nested: { base: { config: scenario.input }, options: {} },
       topLevel: { base: scenario.input, options: {} },
       plugin: { base: {}, options: { config: scenario.input } },
-    })) {
+    };
+    for (const [source, config] of Object.entries(inputs)) {
+      const expected = source === "pluginOverride" ? normalizeRuntimeConfig({}) : scenario.expected;
+      assert.deepEqual(normalizeRuntimeConfig(resolveDeploymentRuntimeConfig(config.base, config.options.config)), expected, `${source}: ${scenario.name}: dev config`);
       const deployment = await buildGeneratedDeploymentConfig({
         ...config,
         workerName: "contract",
@@ -24,25 +30,30 @@ for (const scenario of cases) {
         configFile: "dd.deploy.json",
         assetsDir: false,
       });
-      assert.deepEqual(normalizeRuntimeConfig(deployment.config), scenario.expected, `${source}: ${scenario.name}`);
+      assert.deepEqual(normalizeRuntimeConfig(deployment.config), expected, `${source}: ${scenario.name}`);
     }
   }
 }
 
 const retired = /(?:\b(?:DdDynamicWorker\w*|DynamicWorker\w*|DynamicHostRpc\w*|HostRpc\w*|RpcTarget|WebTransport(?:Session)?|DynamicDeployRequest|DynamicDeployResponse)\b|\bop_dynamic_\w+|\bop_memory_transport_\w+|type:\s*["']dynamic["']|\/v1\/dynamic\/deploy)/;
-const paths = [
-  "packages/dd-vite/src/index.d.ts",
-  "crates/common/src/lib.rs",
-  "crates/cli/src/main.rs",
-  "crates/api/src/handlers/routing.rs",
-  "crates/runtime/src/ops.rs",
-  "crates/runtime/js/bootstrap.js",
-];
-for (const name of await readdir(join(root, "crates/runtime/js/execute_worker"))) {
-  if (name.endsWith(".js")) paths.push(`crates/runtime/js/execute_worker/${name}`);
+async function implementationFiles(directory) {
+  const entries = await readdir(join(root, directory), { withFileTypes: true });
+  const paths = await Promise.all(entries.map(async entry => {
+    if (entry.name === "tests" || entry.name === "vendor" || /(?:_tests|\.test)\./.test(entry.name)) return [];
+    const path = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) return implementationFiles(path);
+    return /\.(?:rs|js|ts)$/.test(entry.name) && entry.name !== "tests.rs" ? [path] : [];
+  }));
+  return paths.flat();
 }
+const paths = (await Promise.all([
+  "crates/common/src", "crates/cli/src", "crates/api/src", "crates/runtime/src",
+  "crates/storage/src", "crates/runtime/js/execute_worker", "packages/dd-vite/src",
+].map(implementationFiles))).flat().sort();
+paths.push("crates/runtime/js/bootstrap.js");
+const sources = new Map(await Promise.all(paths.map(async path => [path, await readFile(join(root, path), "utf8")])));
 for (const path of paths) {
-  const match = retired.exec(await readFile(join(root, path), "utf8"));
+  const match = retired.exec(sources.get(path));
   assert.equal(match?.[0], undefined, `${path} exposes a retired runtime API`);
 }
 const schema = JSON.parse(await readFile(join(root, "schema/dd.schema.json"), "utf8"));
@@ -53,9 +64,6 @@ for (const path of ["Cargo.toml", "Cargo.lock", "deploy/fly/Dockerfile"]) {
 const obsoleteConfig = /\b(?:db_url|memory_namespace_shards|memory_databases_dir|memory_connections|memory_database_cache_max_entries|cache_db_url|memory_rpc|DD_BENCH_(?:MATRIX_)?MEMORY_NAMESPACE_SHARDS|DD_(?:BENCH_)?MEMORY_DB_\w+)\b/;
 for (const path of [
   ...paths,
-  "crates/runtime/src/service.rs",
-  "crates/runtime/src/service/model.rs",
-  "crates/api/src/main.rs",
   "README.md",
   "docs/development.md",
   "benchmarks/README.md",
@@ -95,6 +103,7 @@ for (const name of await readdir(join(root, "examples"))) {
   if (!name.endsWith(".js")) continue;
   assert.doesNotMatch(await readFile(join(root, "examples", name), "utf8"), retiredMemory, name);
 }
-const metricSource = await readFile(join(root, "crates/storage/src/memory.rs"), "utf8");
-assert.doesNotMatch(metricSource, /\b(?:JsHydrateKeys|JsCacheHit|JsCacheMiss|JsCacheStale|OpRead|OpVersionIfNewer|StoreReaderPoolWait|StoreWriterLaneWait|RuntimeAtomic\w+)\b/);
+for (const path of paths.filter(path => path.startsWith("crates/storage/src/memory") || path.startsWith("crates/runtime/js/execute_worker"))) {
+  assert.doesNotMatch(sources.get(path), /\b(?:JsHydrateFull|JsHydrateKeys|JsCacheHit|JsCacheMiss|JsCacheStale|js_hydrate_full|OpRead|OpVersionIfNewer|StoreReaderPoolWait|StoreWriterLaneWait|RuntimeAtomic\w+)\b/, path);
+}
 console.log(`Runtime contract passed: ${cases.length} shared config cases, ${paths.length} public surface files, and source coherence checks.`);

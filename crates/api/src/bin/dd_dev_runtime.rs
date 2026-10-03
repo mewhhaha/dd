@@ -58,23 +58,9 @@ enum CommandResult {
         url: String,
     },
     Stats {
-        stats: Option<WorkerStatsEnvelope>,
+        stats: Option<Box<WorkerStats>>,
     },
     Shutdown,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkerStatsEnvelope {
-    generation: u64,
-    public: bool,
-    queued: usize,
-    busy: usize,
-    inflight_total: usize,
-    wait_until_total: usize,
-    isolates_total: usize,
-    spawn_count: u64,
-    reuse_count: u64,
-    scale_down_count: u64,
 }
 
 #[tokio::main]
@@ -109,6 +95,8 @@ async fn main() -> Result<(), String> {
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             memory_outbox_max_concurrent_shards: 8,
+            memory_outbox_max_claimed_bytes: RuntimeStorageConfig::default()
+                .memory_outbox_max_claimed_bytes,
             memory_snapshot_cache_max_entries: 4096,
             memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: false,
@@ -184,7 +172,15 @@ async fn run_stdio(service: RuntimeService) -> Result<(), String> {
             }
             Err(error) => {
                 let response = ResponseEnvelope {
-                    id: String::new(),
+                    id: serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default(),
                     ok: false,
                     result: None,
                     error: Some(ErrorEnvelope {
@@ -254,7 +250,7 @@ async fn handle_command(
             .await
         }
         DevCommand::Stats { name } => Ok(CommandResult::Stats {
-            stats: service.stats(name).await.map(WorkerStatsEnvelope::from),
+            stats: service.stats(name).await.map(Box::new),
         }),
         DevCommand::Shutdown => Ok(CommandResult::Shutdown),
     };
@@ -289,22 +285,5 @@ fn error_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::StorageUnavailable => "storage_unavailable",
         ErrorKind::Runtime => "runtime",
         ErrorKind::Internal => "internal",
-    }
-}
-
-impl From<WorkerStats> for WorkerStatsEnvelope {
-    fn from(stats: WorkerStats) -> Self {
-        Self {
-            generation: stats.generation,
-            public: stats.public,
-            queued: stats.queued,
-            busy: stats.busy,
-            inflight_total: stats.inflight_total,
-            wait_until_total: stats.wait_until_total,
-            isolates_total: stats.isolates_total,
-            spawn_count: stats.spawn_count,
-            reuse_count: stats.reuse_count,
-            scale_down_count: stats.scale_down_count,
-        }
     }
 }

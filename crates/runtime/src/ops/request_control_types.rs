@@ -26,8 +26,37 @@ pub struct TestAsyncReplyEvent {
 
 #[derive(Clone, Default)]
 pub struct PendingReplies {
-    pub(crate) entries: Arc<StdMutex<HashSet<String>>>,
+    pub(crate) entries: Arc<StdMutex<HashMap<String, oneshot::Sender<()>>>>,
     pub(crate) next_id: Arc<AtomicU64>,
+}
+
+pub struct PendingReplyCancellation {
+    reply: oneshot::Receiver<()>,
+    parent_canceled: Arc<AtomicBool>,
+    parent_notify: Arc<Notify>,
+}
+
+impl PendingReplyCancellation {
+    pub(crate) fn is_canceled(&mut self) -> bool {
+        self.parent_canceled.load(Ordering::Acquire)
+            || !matches!(
+                self.reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            )
+    }
+
+    pub(crate) async fn cancelled(mut self) {
+        let parent = self.parent_notify.notified();
+        tokio::pin!(parent);
+        parent.as_mut().enable();
+        if self.parent_canceled.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            _ = &mut parent => {},
+            _ = &mut self.reply => {},
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -168,16 +197,30 @@ impl Default for RequestControlInbox {
 }
 
 impl PendingReplies {
-    pub fn allocate(&self) -> String {
+    pub(crate) fn allocate(
+        &self,
+        parent_canceled: Arc<AtomicBool>,
+        parent_notify: Arc<Notify>,
+    ) -> (String, PendingReplyCancellation) {
         let reply_id = format!("reply-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let (cancel, reply) = oneshot::channel();
         let mut entries = self.entries.lock().expect("pending reply lock poisoned");
-        entries.insert(reply_id.clone());
-        reply_id
+        entries.insert(reply_id.clone(), cancel);
+        (
+            reply_id,
+            PendingReplyCancellation {
+                reply,
+                parent_canceled,
+                parent_notify,
+            },
+        )
     }
 
     pub fn cancel(&self, reply_id: &str) {
         let mut entries = self.entries.lock().expect("pending reply lock poisoned");
-        entries.remove(reply_id);
+        if let Some(cancel) = entries.remove(reply_id) {
+            let _ = cancel.send(());
+        }
     }
 
     pub(crate) fn finish_into(
@@ -187,7 +230,7 @@ impl PendingReplies {
         inbox: &RequestControlInbox,
     ) {
         let mut entries = self.entries.lock().expect("pending reply lock poisoned");
-        if entries.remove(&reply_id) {
+        if entries.remove(&reply_id).is_some() {
             inbox.push_reply(payload.into_delivery(reply_id));
         }
     }

@@ -1,6 +1,6 @@
 use super::*;
 
-async fn deploy_read_worker(body: &str) -> RuntimeService {
+async fn deploy_read_worker(body: &str) -> TestRuntime {
     let service = test_service(RuntimeConfig::default()).await;
     service.deploy_with_config(
         "read-contract".into(),

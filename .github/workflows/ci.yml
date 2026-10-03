@@ -83,6 +83,8 @@ jobs:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked -p dd_server --no-default-features --features websocket --bin dd_dev_runtime
+      - run: node scripts/check-dd-vite-lifecycle.mjs
+      - run: node scripts/check-dd-vite-reload.mjs
       - run: cargo build --locked -p cli
       - run: DD_CLI_BIN=target/debug/cli pnpm check:dd-vite-config
       - run: node scripts/check-dd-dev-transport.mjs

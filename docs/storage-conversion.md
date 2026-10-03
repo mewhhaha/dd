@@ -133,3 +133,16 @@ with a required atomic callback and explicitly measures that API change.
 The baseline's 16 namespace memory shards and the candidate's 32 shared state
 shards remain part of the architectural comparison. Pool keys avoid pretending
 that old and new shard selectors describe the same physical placement.
+
+Memory deletion history remains represented by the entity's `max_version`,
+`owner_epoch`, and shard version floor. Conversion verifies the imported logical
+row hashes before compacting deleted memory rows; active snapshots contain only
+live rows. The conversion report therefore records the verified source rows,
+including tombstones that are removed after verification.
+
+State stores keep routing format 2 and upgrade their SQL schema on open. The
+outbox migration adds a persisted effect ordinal. Historical rows receive ordinal
+zero and retain deterministic `(revision, effect_id)` ordering: their original
+positions were hashed into the IDs and cannot be recovered. Effects committed
+after the upgrade preserve their staged order, and deferred predecessors block
+later effects for the same entity and selected effect kinds.

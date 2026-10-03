@@ -1,4 +1,5 @@
 use super::*;
+use runtime::FrontCacheDeployment;
 pub(crate) async fn handle_dev_worker_request<B>(
     state: AppState,
     request: Request<B>,
@@ -202,10 +203,10 @@ async fn invoke_worker_from_body_stream(
         };
         tracing::debug!(request_id = %request_id, "invoke request accepted");
 
-        if state.runtime.worker_cache_enabled(&worker_name)
-            && is_front_cacheable_request(&invocation, request_body_stream.is_some())
+        if is_front_cacheable_request(&invocation, request_body_stream.is_some())
+            && let Some(cache_deployment) = state.runtime.front_cache_deployment(&worker_name)
         {
-            let cache_request = front_cache_request(&worker_name, &invocation);
+            let cache_request = front_cache_request(cache_deployment.namespace(), &invocation);
             match state.runtime.cache_match(cache_request.clone()).await? {
                 CacheLookup::Fresh(response) => {
                     return build_front_cached_response(response, &method, "HIT");
@@ -216,6 +217,7 @@ async fn invoke_worker_from_body_stream(
                         worker_name.clone(),
                         invocation.clone(),
                         cache_request,
+                        cache_deployment,
                     )
                     .await;
                     return build_front_cached_response(response, &method, "STALE");
@@ -227,7 +229,13 @@ async fn invoke_worker_from_body_stream(
                         .await
                     {
                         Ok(output) if output.status < 500 => {
-                            maybe_store_front_cache(&state, &cache_request, &output).await;
+                            maybe_store_front_cache(
+                                &state,
+                                &cache_request,
+                                &cache_deployment,
+                                &output,
+                            )
+                            .await;
                             build_front_origin_response(output, &method, "MISS")
                         }
                         Ok(_) | Err(_) => build_front_cached_response(stale, &method, "STALE"),
@@ -238,7 +246,8 @@ async fn invoke_worker_from_body_stream(
                         .runtime
                         .invoke_with_request_body(worker_name, invocation, request_body_stream)
                         .await?;
-                    maybe_store_front_cache(&state, &cache_request, &output).await;
+                    maybe_store_front_cache(&state, &cache_request, &cache_deployment, &output)
+                        .await;
                     return build_front_origin_response(output, &method, "MISS");
                 }
             }
@@ -262,9 +271,9 @@ fn is_front_cacheable_request(invocation: &WorkerInvocation, has_body_stream: bo
         })
 }
 
-fn front_cache_request(worker_name: &str, invocation: &WorkerInvocation) -> CacheRequest {
+fn front_cache_request(cache_name: String, invocation: &WorkerInvocation) -> CacheRequest {
     CacheRequest {
-        cache_name: format!("front:{worker_name}"),
+        cache_name,
         method: invocation.method.clone(),
         url: invocation.url.clone(),
         headers: invocation.headers.clone(),
@@ -305,8 +314,128 @@ fn front_response_is_cacheable(output: &WorkerOutput) -> bool {
         })
 }
 
-async fn maybe_store_front_cache(state: &AppState, request: &CacheRequest, output: &WorkerOutput) {
-    if request.method != "GET" || !front_response_is_cacheable(output) {
+#[cfg(test)]
+mod cache_activation_tests {
+    use super::*;
+    use common::{DeployCacheConfig, DeployConfig};
+    use runtime::{RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig};
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn cache_fill_racing_with_rollback_cannot_poison_the_reactivated_deployment() {
+        let root = std::env::temp_dir().join(format!("dd-cache-rollback-{}", Uuid::new_v4()));
+        let runtime = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+            storage: RuntimeStorageConfig {
+                store_dir: root.clone(),
+                worker_store_enabled: true,
+                ..RuntimeStorageConfig::default()
+            },
+            ..RuntimeServiceConfig::default()
+        })
+        .await
+        .unwrap();
+        let deploy_tokens =
+            crate::deploy_tokens::DeployTokenStore::from_control_store(runtime.control_store());
+        let state = AppState::new(
+            runtime,
+            deploy_tokens,
+            1024 * 1024,
+            "example.com".into(),
+            None,
+        );
+        let config = DeployConfig {
+            cache: DeployCacheConfig { enabled: true },
+            ..DeployConfig::default()
+        };
+        let source = |body| {
+            format!(
+                "export default {{ fetch() {{ return new Response('{body}', {{ headers: {{ 'cache-control': 'public, max-age=60' }} }}); }} }};"
+            )
+        };
+        let deployment_id = state
+            .runtime
+            .deploy_with_config("cache-race".into(), source("a"), config.clone())
+            .await
+            .unwrap();
+        let selected = state.runtime.front_cache_deployment("cache-race").unwrap();
+        let invocation = WorkerInvocation {
+            method: "GET".into(),
+            url: "https://cache-race.example.com/".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            request_id: "cache-race".into(),
+        };
+        let cache_request = front_cache_request(selected.namespace(), &invocation);
+        state
+            .runtime
+            .deploy_with_config("cache-race".into(), source("b"), config)
+            .await
+            .unwrap();
+        let other_output = state
+            .runtime
+            .invoke("cache-race".into(), invocation.clone())
+            .await
+            .unwrap();
+        state
+            .runtime
+            .rollback("cache-race".into(), deployment_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.runtime.front_cache_namespace("cache-race").unwrap(),
+            selected.namespace()
+        );
+        // The lookup selected A, origin dispatch reached B, and rollback has
+        // restored A's namespace before the delayed cache fill is attempted.
+        maybe_store_front_cache(&state, &cache_request, &selected, &other_output).await;
+        assert!(matches!(
+            state
+                .runtime
+                .cache_match(cache_request.clone())
+                .await
+                .unwrap(),
+            CacheLookup::Miss
+        ));
+        let current = state.runtime.front_cache_deployment("cache-race").unwrap();
+        let output = state
+            .runtime
+            .invoke("cache-race".into(), invocation)
+            .await
+            .unwrap();
+        maybe_store_front_cache(&state, &cache_request, &current, &output).await;
+        // A scheduler can also restart its numeric generation after undeploy.
+        state.runtime.undeploy("cache-race".into()).await.unwrap();
+        state
+            .runtime
+            .rollback("cache-race".into(), deployment_id)
+            .await
+            .unwrap();
+        maybe_store_front_cache(&state, &cache_request, &current, &other_output).await;
+        let CacheLookup::Fresh(cached) = state.runtime.cache_match(cache_request).await.unwrap()
+        else {
+            panic!("the valid A response must remain cached");
+        };
+        assert_eq!(cached.body, "a");
+        state.runtime.shutdown().await.unwrap();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+async fn maybe_store_front_cache(
+    state: &AppState,
+    request: &CacheRequest,
+    deployment: &FrontCacheDeployment,
+    output: &WorkerOutput,
+) {
+    // Origin dispatch follows worker name after an awaited lookup. Retain the
+    // exact catalog entry so a redeploy/rollback cannot fill the earlier cache
+    // with a response from another activation, even if its numeric generation repeats.
+    if request.method != "GET"
+        || !front_response_is_cacheable(output)
+        || !state.runtime.front_cache_deployment_is_current(deployment)
+    {
         return;
     }
     let _ = state
@@ -327,8 +456,9 @@ async fn spawn_front_cache_revalidation(
     worker_name: String,
     mut invocation: WorkerInvocation,
     mut cache_request: CacheRequest,
+    cache_deployment: FrontCacheDeployment,
 ) {
-    let key = format!("{worker_name}:{}", cache_request.url);
+    let key = format!("{}:{}", cache_request.cache_name, cache_request.url);
     if !state
         .front_cache_revalidations
         .lock()
@@ -346,7 +476,7 @@ async fn spawn_front_cache_revalidation(
     }
     tokio::spawn(async move {
         if let Ok(output) = state.runtime.invoke(worker_name, invocation).await {
-            maybe_store_front_cache(&state, &cache_request, &output).await;
+            maybe_store_front_cache(&state, &cache_request, &cache_deployment, &output).await;
         }
         state.front_cache_revalidations.lock().await.remove(&key);
     });
