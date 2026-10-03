@@ -72,7 +72,7 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
 
     return {
       bodyText: await appPage.locator("body").innerText(),
-      consoleErrors,
+      consoleErrors: [...consoleErrors],
       detailButtonTopAfterAdd,
       detailButtonTopBeforeAdd,
       detailScrollAfterAdd,
@@ -81,8 +81,8 @@ const runReactRouterAddToCartFlows = defineBrowserCommand(async ({ context }) =>
       homeScrollAfterAdd,
       homeScrollBeforeAdd,
       homeUrl,
-      manifestStatuses,
-      pageErrors,
+      manifestStatuses: [...manifestStatuses],
+      pageErrors: [...pageErrors],
     };
   } finally {
     await appPage.close();

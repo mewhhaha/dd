@@ -45,8 +45,8 @@ const runRscAddToCartFlow = defineBrowserCommand(async ({ context }) => {
 
     return {
       bodyText: await appPage.locator("body").innerText(),
-      consoleErrors,
-      pageErrors,
+      consoleErrors: [...consoleErrors],
+      pageErrors: [...pageErrors],
       url: appPage.url(),
     };
   } finally {
