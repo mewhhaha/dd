@@ -15,7 +15,7 @@
     "check:worker-js": "node scripts/check-worker-js.mjs",
     "generate:runtime-types": "node scripts/generate-runtime-types.mjs",
     "browser:vite-examples": "pnpm --filter './examples/vite-react-router' --filter './examples/vite-react-router-rsc' browser",
-    "smoke:vite-examples": "pnpm --filter './examples/vite-*' smoke",
+    "smoke:vite-examples": "pnpm --workspace-concurrency=1 --filter './examples/vite-*' smoke",
     "typecheck:vite-examples": "pnpm --filter './examples/vite-*' typecheck",
     "check:js": "eslint packages/dd-vite/src scripts"
   },

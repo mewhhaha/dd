@@ -150,8 +150,8 @@ function cacheKey(name) {
 async function writeAll(env, name, value) {
   const opened = await cache();
   await Promise.all([
-    env.SMOKE_KV.put(name, value, { durability: "committed" }),
-    memory(env).write(name, value),
+    env.SMOKE_KV.put(name, value),
+    memory(env).atomic((tx) => tx.put(name, value)),
     opened.put(cacheKey(name), new Response(value, {
       headers: [["cache-control", "public, max-age=3600"]],
     })),
@@ -162,7 +162,7 @@ async function readAll(env, name) {
   const opened = await cache();
   const [kv, durable, cached] = await Promise.all([
     env.SMOKE_KV.get(name),
-    memory(env).read(name),
+    memory(env).read((snapshot) => snapshot.get(name)),
     opened.match(cacheKey(name)),
   ]);
   return { kv, memory: durable, cache: cached ? await cached.text() : null };
