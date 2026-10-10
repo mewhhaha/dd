@@ -15,7 +15,7 @@ const eslint = new ESLint({
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "script",
-      globals: { ...globals.browser, Deno: "readonly", RuntimeHttpClient: "readonly" },
+      globals: { ...globals.browser, Deno: "readonly" },
     },
     rules: {
       "no-undef": "error",

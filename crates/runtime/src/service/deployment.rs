@@ -2,7 +2,7 @@ use crate::engine::{load_worker_source, new_runtime_from_snapshot_with_heap_limi
 use crate::module_registry::ModuleRegistry;
 use crate::ops::WorkerSource;
 use common::{PlatformError, Result};
-use deno_core::v8::IsolateHandle;
+use dd_v8::v8::IsolateHandle;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Semaphore, oneshot};

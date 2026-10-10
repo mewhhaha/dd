@@ -1,6 +1,6 @@
 # dd
 
-`dd` runs JavaScript workers on one machine using Rust, Deno/V8 isolates, and durable local storage.
+`dd` runs JavaScript workers on one machine using Rust, V8 isolates, and durable local storage.
 
 Public traffic is routed by host name, so `hello.example.com` can map to worker `hello`. KV stores structured values. Keyed memory provides ordered transactions that commit state and emitted effects together. Both are private to a worker and binding.
 

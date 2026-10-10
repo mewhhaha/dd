@@ -59,12 +59,14 @@ Runtime response declarations are generated from the serialized Rust structs.
 After changing those structs, run `pnpm generate:runtime-types`; `just check-js`
 verifies that the checked-in declarations match.
 
-Snapshot-ready Deno JavaScript sources are checked in under
-`crates/runtime/js/vendor/lazy` and hash-checked during the runtime build.
-The runtime loads those upstream implementations through Deno's lazy extension
-API; local adapters live under `crates/runtime/js/compat/dd_deno_runtime`.
-After updating the locked Deno crates, run `just refresh-deno-sources` and commit
-the refreshed `lazy/` tree with `manifest.txt`.
+The JavaScript runtime is `crates/dd_v8`, dd's embedding of V8 through
+`rusty_v8`: isolates, startup snapshots, ops, ES modules, and the event loop.
+The web platform layer (`URL`, `fetch`'s classes, streams, encoding, events,
+Web Crypto) runs on it. Its JavaScript lives under `crates/runtime/js/vendor`
+(ported from Deno, MIT) and `crates/runtime/js/web`, its ops under
+`crates/runtime/src/web`, and `crates/runtime/js/core` holds the `core` object
+those scripts are written against. These files are dd's own code; edit them in
+place.
 
 Optional tracing env:
 
@@ -353,19 +355,6 @@ just build-dd-runtime-package
 
 That writes the binary into the matching `packages/dd-runtime-*/bin` directory.
 The `dev-runtime` profile favors package size over peak execution performance.
-
-## Patch workflow
-
-Patched crate overrides live under `./patched-crates` and are checked-in build input. A fresh clone should build with normal Cargo commands without a bootstrap step.
-
-Patch files under `./patches` are audit and refresh artifacts. Keep them in sync when the vendored crate changes.
-
-```bash
-just patch deno_crypto
-just patch-save deno_crypto 0.273.0
-just patch-refresh deno_crypto 0.273.0
-just patch-refresh deno_tls 0.246.0
-```
 
 ## Library embedding
 

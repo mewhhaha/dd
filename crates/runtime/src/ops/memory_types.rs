@@ -402,7 +402,7 @@ pub(crate) struct MemorySocketCloseResult {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct MemoryReadValue {
-    pub(crate) value: deno_core::serde_v8::ToJsBuffer,
+    pub(crate) value: dd_v8::ToJsBuffer,
     pub(crate) encoding: String,
 }
 

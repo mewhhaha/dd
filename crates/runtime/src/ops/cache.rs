@@ -25,13 +25,11 @@ pub(crate) struct CachePutResult {
     error: String,
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_cache_match(
     state: Rc<RefCell<OpState>>,
-    #[string] cache_name: String,
-    #[string] method: String,
-    #[string] url: String,
+    cache_name: String,
+    method: String,
+    url: String,
     headers_handle: u32,
     bypass_stale: bool,
 ) -> CacheMatchResult {
@@ -114,13 +112,12 @@ fn cache_match_hit_result(
     }
 }
 
-#[deno_core::op2]
-#[serde]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn op_cache_put(
     state: Rc<RefCell<OpState>>,
-    #[string] cache_name: String,
-    #[string] method: String,
-    #[string] url: String,
+    cache_name: String,
+    method: String,
+    url: String,
     request_headers_handle: u32,
     response_status: u16,
     response_headers_handle: u32,
@@ -167,13 +164,11 @@ pub(crate) async fn op_cache_put(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_cache_delete(
     state: Rc<RefCell<OpState>>,
-    #[string] cache_name: String,
-    #[string] method: String,
-    #[string] url: String,
+    cache_name: String,
+    method: String,
+    url: String,
     headers_handle: u32,
 ) -> CacheDeleteResult {
     let headers = state
@@ -210,12 +205,11 @@ fn scoped_cache_name(state: &Rc<RefCell<OpState>>, cache_name: &str) -> String {
     format!("worker:{worker}:{}", cache_name.trim())
 }
 
-#[deno_core::op2(fast)]
 pub(crate) fn op_emit_cache_revalidate(
     state: &mut OpState,
-    #[string] cache_name: String,
-    #[string] method: String,
-    #[string] url: String,
+    cache_name: String,
+    method: String,
+    url: String,
     headers_handle: u32,
 ) {
     let headers = state

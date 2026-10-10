@@ -7,85 +7,68 @@ use crate::module_registry::{
 use crate::ops::{
     WorkerDeploymentPayload, WorkerRequestPayload, WorkerSource, clear_request_invocation,
     clear_worker_deployment_config, register_request_invocation, register_worker_deployment_config,
-    runtime_extension,
 };
 use crate::service::MemoryExecutionCall;
 use base64::Engine;
 use common::{PlatformError, Result, WorkerInvocation};
-use deno_core::{
-    Extension, JsRuntime, JsRuntimeForSnapshot, ModuleCodeBytes, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, PollEventLoopOptions,
-    RequestedModuleType, ResolutionKind, RuntimeOptions, resolve_import, v8, v8_set_flags,
+use dd_v8::{
+    JsRuntime, ModuleCode, ModuleLoader, ModuleSource, ModuleType, OpDecl, RuntimeOptions, v8,
 };
-use deno_crypto::deno_crypto as deno_crypto_ext;
-use deno_error::JsErrorBox;
-use deno_fetch::Options as DenoFetchOptions;
-use deno_web::{BlobStore, InMemoryBroadcastChannel};
 use std::borrow::Cow;
+use std::future::poll_fn;
 use std::mem;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
+use url::Url;
 
-include!(concat!(env!("OUT_DIR"), "/dd_deno_js_extension.rs"));
-
+const PRIMORDIALS_JS: &str = include_str!("../js/core/00_primordials.js");
+const CORE_JS: &str = include_str!("../js/core/core.js");
+const WEB_INIT_JS: &str = include_str!("../js/web/init.js");
 const NODE_ASYNC_HOOKS_SOURCE: &str =
     include_str!("../../../packages/dd-vite/src/shims/node_async_hooks.js");
 
-static CONFIGURED_V8_FLAGS: OnceLock<Vec<String>> = OnceLock::new();
 static BOOTSTRAP_SNAPSHOT: OnceLock<Result<Box<[u8]>>> = OnceLock::new();
 
+/// Every op, in the order the bootstrap snapshot and the runtimes restored
+/// from it both create them.
+fn runtime_ops() -> Vec<OpDecl> {
+    let mut ops = dd_v8::builtins::ops();
+    ops.extend(crate::web::ops());
+    ops.extend(crate::ops::runtime_ops());
+    ops
+}
+
+/// Builds (once per process) the snapshot every isolate starts from: the
+/// web layer and dd's bootstrap globals, evaluated and captured.
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     BOOTSTRAP_SNAPSHOT
         .get_or_init(|| {
-            let mut runtime = JsRuntimeForSnapshot::new(RuntimeOptions {
-                extensions: runtime_extensions(),
-                module_loader: Some(Rc::new(RuntimeModuleLoader::default())),
-                create_params: Some(runtime_create_params(0)),
+            let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
+                ops: runtime_ops(),
                 ..Default::default()
-            });
+            })
+            .map_err(runtime_error)?;
+            runtime
+                .execute_script("ext:core/00_primordials.js", PRIMORDIALS_JS)
+                .map_err(runtime_error)?;
+            runtime
+                .execute_with_ops("ext:core/core.js", CORE_JS)
+                .map_err(runtime_error)?;
+            runtime
+                .execute_script("ext:dd/web/init.js", WEB_INIT_JS)
+                .map_err(runtime_error)?;
             runtime
                 .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
                 .map_err(runtime_error)?;
-            let snapshot = runtime.snapshot();
-            Ok(snapshot)
+            runtime.snapshot().map_err(runtime_error)
         })
         .as_deref()
         .map_err(Clone::clone)
 }
 
 pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
-    let normalized = flags
-        .iter()
-        .map(|flag| flag.trim())
-        .filter(|flag| !flag.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-
-    if let Some(existing) = CONFIGURED_V8_FLAGS.get() {
-        if existing != &normalized {
-            return Err(PlatformError::internal(format!(
-                "v8 flags were already initialized as {:?}; cannot reinitialize with {:?}",
-                existing, normalized
-            )));
-        }
-        return Ok(());
-    }
-
-    let mut argv = Vec::with_capacity(normalized.len() + 1);
-    argv.push("dd-runtime".to_string());
-    argv.extend(normalized.iter().cloned());
-    let leftovers = v8_set_flags(argv);
-    if leftovers.len() > 1 {
-        return Err(PlatformError::internal(format!(
-            "unsupported v8 flags: {:?}",
-            &leftovers[1..]
-        )));
-    }
-
-    let _ = CONFIGURED_V8_FLAGS.set(normalized);
-    Ok(())
+    dd_v8::set_flags(flags).map_err(PlatformError::internal)
 }
 
 #[cfg(test)]
@@ -177,10 +160,8 @@ pub fn install_worker_deployment_config(
 
 pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
     let entrypoints = {
-        let context = runtime.main_context();
-        deno_core::scope!(scope, runtime);
-        let context = v8::Local::new(scope, context);
-        let global = context.global(scope);
+        dd_v8::scope!(scope, runtime);
+        let global = scope.get_current_context().global(scope);
         let install_worker_deployment_handle =
             global_function(scope, global, "__dd_install_worker_deployment_handle")?;
         let execute_worker_handle = global_function(scope, global, "__dd_execute_worker_handle")?;
@@ -304,7 +285,7 @@ pub fn drain_request_control_queue(runtime: &mut JsRuntime) -> Result<()> {
 
 pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()> {
     let mut cx = Context::from_waker(waker);
-    match runtime.poll_event_loop(&mut cx, PollEventLoopOptions::default()) {
+    match runtime.poll_event_loop(&mut cx) {
         Poll::Ready(Ok(())) | Poll::Pending => Ok(()),
         Poll::Ready(Err(error)) => Err(runtime_error(error)),
     }
@@ -316,20 +297,18 @@ fn new_runtime(
     max_heap_bytes: usize,
     module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
-    let create_params = Some(runtime_create_params(max_heap_bytes));
-    let mut runtime = JsRuntime::try_new(RuntimeOptions {
-        extensions: runtime_extensions(),
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+        ops: runtime_ops(),
         module_loader: Some(Rc::new(RuntimeModuleLoader {
             module_registry: module_registry.clone(),
         })),
         startup_snapshot: Some(startup_snapshot),
-        create_params,
-        ..Default::default()
+        max_heap_bytes,
     })
     .map_err(runtime_error)?;
     if max_heap_bytes > 0 {
         let isolate = runtime.v8_isolate().thread_safe_handle();
-        runtime.add_near_heap_limit_callback(move |current_limit, _| {
+        runtime.set_near_heap_limit_callback(move |current_limit, _| {
             isolate.terminate_execution();
             // V8 needs headroom to unwind after termination instead of aborting the process.
             current_limit.saturating_add(16 * 1024 * 1024)
@@ -340,25 +319,11 @@ fn new_runtime(
     Ok(runtime)
 }
 
-fn runtime_create_params(max_heap_bytes: usize) -> v8::CreateParams {
-    JsRuntime::init_platform(None);
-    let heap = v8::cppgc::Heap::create(
-        v8::V8::get_current_platform(),
-        v8::cppgc::HeapCreateParams::default(),
-    );
-    let params = v8::CreateParams::default().cpp_heap(heap);
-    if max_heap_bytes > 0 {
-        params.heap_limits(0, max_heap_bytes)
-    } else {
-        params
-    }
-}
-
 fn set_code_generation_from_strings(runtime: &mut JsRuntime, allow: bool) {
-    let context = runtime.main_context();
-    deno_core::scope!(scope, runtime);
-    let context = v8::Local::new(scope, context);
-    context.set_allow_generation_from_strings(allow);
+    dd_v8::scope!(scope, runtime);
+    scope
+        .get_current_context()
+        .set_allow_generation_from_strings(allow);
 }
 
 fn call_cached_u32_function(
@@ -368,12 +333,11 @@ fn call_cached_u32_function(
     select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
 ) -> Result<()> {
     let function = cached_entrypoint(runtime, select);
-    let context = runtime.main_context();
-    deno_core::scope!(scope, runtime);
-    let context = v8::Local::new(scope, context);
-    let global = context.global(scope);
+    dd_v8::scope!(scope, runtime);
+    let global = scope.get_current_context().global(scope);
     let function = v8::Local::new(scope, function.as_ref());
     let arg = v8::Integer::new_from_unsigned(scope, arg).into();
+    v8::tc_scope!(let scope, scope);
     function
         .call(scope, global.into(), &[arg])
         .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
@@ -386,11 +350,10 @@ fn call_cached_noarg_function(
     select: impl FnOnce(&RuntimeEntrypoints) -> Rc<v8::Global<v8::Function>>,
 ) -> Result<()> {
     let function = cached_entrypoint(runtime, select);
-    let context = runtime.main_context();
-    deno_core::scope!(scope, runtime);
-    let context = v8::Local::new(scope, context);
-    let global = context.global(scope);
+    dd_v8::scope!(scope, runtime);
+    let global = scope.get_current_context().global(scope);
     let function = v8::Local::new(scope, function.as_ref());
+    v8::tc_scope!(let scope, scope);
     function
         .call(scope, global.into(), &[])
         .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
@@ -424,160 +387,119 @@ fn global_function<'scope>(
     Ok(function)
 }
 
-fn runtime_extensions() -> Vec<Extension> {
-    vec![
-        without_esm(deno_webidl::deno_webidl::init()),
-        without_esm(deno_web::deno_web::init(
-            Arc::new(BlobStore::default()),
-            None,
-            false,
-            InMemoryBroadcastChannel::default(),
-        )),
-        without_esm(deno_fetch::deno_fetch::init(DenoFetchOptions::default())),
-        without_esm(deno_crypto_ext::init(None)),
-        dd_deno_js::init(),
-        runtime_extension(),
-    ]
-}
-
-fn without_esm(extension: Extension) -> Extension {
-    let lazy_loaded_js_files = extension
-        .lazy_loaded_js_files
-        .iter()
-        .map(|source| {
-            dd_embedded_lazy_js_source(source.specifier).unwrap_or_else(|| source.clone())
-        })
-        .collect();
-    Extension {
-        js_files: Cow::Borrowed(&[]),
-        lazy_loaded_js_files: Cow::Owned(lazy_loaded_js_files),
-        lazy_loaded_esm_files: Cow::Borrowed(&[]),
-        esm_files: Cow::Borrowed(&[]),
-        esm_entry_point: None,
-        ..extension
-    }
-}
-
 #[derive(Default)]
 struct RuntimeModuleLoader {
     module_registry: ModuleRegistry,
 }
 
 impl ModuleLoader for RuntimeModuleLoader {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: &str,
-        _kind: ResolutionKind,
-    ) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
+    fn resolve(&self, specifier: &str, referrer: &str) -> std::result::Result<String, String> {
         if referrer.starts_with("dd-module:")
             && !specifier.starts_with("//")
             && !has_url_scheme(specifier)
         {
-            return resolve_dd_module_import(specifier, referrer);
+            return resolve_dd_module_import(specifier, referrer).map(String::from);
         }
-        resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
+        resolve_import(specifier, referrer).map(String::from)
     }
 
     fn load(
         &self,
-        module_specifier: &ModuleSpecifier,
-        _maybe_referrer: Option<&deno_core::ModuleLoadReferrer>,
-        options: deno_core::ModuleLoadOptions,
-    ) -> ModuleLoadResponse {
-        ModuleLoadResponse::Sync(match module_specifier.scheme() {
-            "dd-module" => load_dd_module(
-                &self.module_registry,
-                module_specifier,
-                options.requested_module_type,
-            ),
-            "node" if module_specifier.as_str() == "node:async_hooks" => Ok(ModuleSource::new(
+        name: &str,
+        requested_type: ModuleType,
+    ) -> std::result::Result<ModuleSource, String> {
+        let specifier = Url::parse(name).map_err(|error| error.to_string())?;
+        match specifier.scheme() {
+            "dd-module" => load_dd_module(&self.module_registry, &specifier, requested_type),
+            "node" if specifier.as_str() == "node:async_hooks" => Ok(ModuleSource::new(
                 ModuleType::JavaScript,
-                ModuleSourceCode::String(NODE_ASYNC_HOOKS_SOURCE.to_string().into()),
-                module_specifier,
-                None,
+                ModuleCode::String(NODE_ASYNC_HOOKS_SOURCE.to_string()),
             )),
-            _ => Err(JsErrorBox::generic(format!(
-                "runtime module loader does not support: {module_specifier}"
-            ))),
-        })
+            _ => Err(format!(
+                "runtime module loader does not support: {specifier}"
+            )),
+        }
     }
 }
 
-fn resolve_dd_module_import(
-    specifier: &str,
-    referrer: &str,
-) -> std::result::Result<ModuleSpecifier, JsErrorBox> {
-    let referrer = ModuleSpecifier::parse(referrer).map_err(JsErrorBox::from_err)?;
+/// Resolves an import the way a browser does: an absolute URL as is, a path
+/// starting with `/`, `./` or `../` against the referrer, anything else
+/// (a bare specifier) is an error.
+fn resolve_import(specifier: &str, referrer: &str) -> std::result::Result<Url, String> {
+    match Url::parse(specifier) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            if !(specifier.starts_with('/')
+                || specifier.starts_with("./")
+                || specifier.starts_with("../"))
+            {
+                let from = if referrer.is_empty() {
+                    String::new()
+                } else {
+                    format!(" from \"{referrer}\"")
+                };
+                return Err(format!(
+                    "Relative import path \"{specifier}\" not prefixed with / or ./ or ../{from}"
+                ));
+            }
+            let base = Url::parse(referrer).map_err(|error| {
+                format!("invalid referrer {referrer:?} for import {specifier:?}: {error}")
+            })?;
+            base.join(specifier)
+                .map_err(|error| format!("invalid import {specifier:?}: {error}"))
+        }
+        Err(error) => Err(format!("invalid import {specifier:?}: {error}")),
+    }
+}
+
+fn resolve_dd_module_import(specifier: &str, referrer: &str) -> std::result::Result<Url, String> {
+    let referrer = Url::parse(referrer).map_err(|error| error.to_string())?;
     let (graph_id, referrer_path) = dd_module_parts(&referrer)?;
-    let module_path =
-        resolve_module_path(&referrer_path, specifier).map_err(JsErrorBox::generic)?;
+    let module_path = resolve_module_path(&referrer_path, specifier)?;
     let encoded_path = module_path
         .split('/')
         .map(percent_encode_path_segment)
         .collect::<Vec<_>>()
         .join("/");
-    ModuleSpecifier::parse(&format!("dd-module://graph/{graph_id}/{encoded_path}"))
-        .map_err(JsErrorBox::from_err)
+    Url::parse(&format!("dd-module://graph/{graph_id}/{encoded_path}"))
+        .map_err(|error| error.to_string())
 }
 
 fn load_dd_module(
     module_registry: &ModuleRegistry,
-    module_specifier: &ModuleSpecifier,
-    requested_module_type: RequestedModuleType,
-) -> std::result::Result<ModuleSource, JsErrorBox> {
-    let (graph_id, module_path) = dd_module_parts(module_specifier)?;
+    specifier: &Url,
+    requested_type: ModuleType,
+) -> std::result::Result<ModuleSource, String> {
+    let (graph_id, module_path) = dd_module_parts(specifier)?;
     let module = module_registry
         .module(&graph_id, &module_path)
-        .ok_or_else(|| {
-            JsErrorBox::generic(format!(
-                "module graph {graph_id} does not contain module: {module_path}"
-            ))
-        })?;
-    let module_type = deno_module_type(module.kind);
-    if requested_module_type != module_type.clone() {
-        return Err(JsErrorBox::generic(format!(
-            "requested module type {requested_module_type} does not match {module_type} module: {module_path}"
-        )));
+        .ok_or_else(|| format!("module graph {graph_id} does not contain module: {module_path}"))?;
+    let module_type = module_type(module.kind);
+    if requested_type != module_type {
+        return Err(format!(
+            "requested module type {requested_type} does not match {module_type} module: {module_path}"
+        ));
     }
     let code = match module.kind {
-        RuntimeModuleKind::JavaScript => ModuleSourceCode::String(
-            String::from_utf8(module.code.as_ref().to_vec())
-                .map_err(|error| {
-                    JsErrorBox::generic(format!(
-                        "JavaScript module is not valid UTF-8: {module_path}: {error}"
-                    ))
-                })?
-                .into(),
-        ),
-        RuntimeModuleKind::Wasm => {
-            ModuleSourceCode::String(compiled_wasm_module_source(module.code.as_ref()))
-        }
-        RuntimeModuleKind::Json | RuntimeModuleKind::Text => ModuleSourceCode::String(
-            String::from_utf8(module.code.as_ref().to_vec())
-                .map_err(|error| {
-                    JsErrorBox::generic(format!(
-                        "text module is not valid UTF-8: {module_path}: {error}"
-                    ))
-                })?
-                .into(),
-        ),
-        RuntimeModuleKind::Bytes => ModuleSourceCode::Bytes(ModuleCodeBytes::Arc(module.code)),
+        RuntimeModuleKind::Wasm => ModuleCode::String(compiled_wasm_module_source(&module.code)),
+        RuntimeModuleKind::JavaScript
+        | RuntimeModuleKind::Json
+        | RuntimeModuleKind::Text
+        | RuntimeModuleKind::Bytes => ModuleCode::Bytes(module.code),
     };
-    Ok(ModuleSource::new(module_type, code, module_specifier, None))
+    Ok(ModuleSource::new(module_type, code))
 }
 
-fn deno_module_type(kind: RuntimeModuleKind) -> ModuleType {
+fn module_type(kind: RuntimeModuleKind) -> ModuleType {
     match kind {
-        RuntimeModuleKind::JavaScript => ModuleType::JavaScript,
-        RuntimeModuleKind::Wasm => ModuleType::JavaScript,
+        RuntimeModuleKind::JavaScript | RuntimeModuleKind::Wasm => ModuleType::JavaScript,
         RuntimeModuleKind::Json => ModuleType::Json,
         RuntimeModuleKind::Text => ModuleType::Text,
         RuntimeModuleKind::Bytes => ModuleType::Bytes,
     }
 }
 
-fn compiled_wasm_module_source(bytes: &[u8]) -> deno_core::ModuleCodeString {
+fn compiled_wasm_module_source(bytes: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     format!(
         r#"
@@ -590,44 +512,34 @@ for (let index = 0; index < binary.length; index += 1) {{
 export default new WebAssembly.Module(bytes);
 "#
     )
-    .into()
 }
 
-fn dd_module_parts(
-    module_specifier: &ModuleSpecifier,
-) -> std::result::Result<(String, String), JsErrorBox> {
-    if module_specifier.scheme() != "dd-module" {
-        return Err(JsErrorBox::generic(format!(
-            "expected dd-module module URL, got {module_specifier}"
-        )));
+fn dd_module_parts(specifier: &Url) -> std::result::Result<(String, String), String> {
+    if specifier.scheme() != "dd-module" {
+        return Err(format!("expected dd-module module URL, got {specifier}"));
     }
-    if module_specifier.host_str() != Some("graph") {
-        return Err(JsErrorBox::generic(format!(
-            "expected dd-module://graph module URL, got {module_specifier}"
-        )));
+    if specifier.host_str() != Some("graph") {
+        return Err(format!(
+            "expected dd-module://graph module URL, got {specifier}"
+        ));
     }
-    let path = module_specifier.path().trim_start_matches('/');
+    let path = specifier.path().trim_start_matches('/');
     let (graph_id, module_path) = path.split_once('/').ok_or_else(|| {
-        JsErrorBox::generic(format!(
-            "dd-module module URL is missing graph id or module path: {module_specifier}"
-        ))
+        format!("dd-module module URL is missing graph id or module path: {specifier}")
     })?;
     let graph_id = graph_id.trim();
     if graph_id.is_empty()
         || graph_id.len() > 128
         || !graph_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(JsErrorBox::generic(format!(
-            "invalid dd-module graph id in module URL: {module_specifier}"
-        )));
+        return Err(format!(
+            "invalid dd-module graph id in module URL: {specifier}"
+        ));
     }
-    let bytes = percent_decode(module_path).map_err(JsErrorBox::generic)?;
-    let path = String::from_utf8(bytes).map_err(|error| {
-        JsErrorBox::generic(format!("invalid UTF-8 in dd-module module path: {error}"))
-    })?;
-    normalize_module_path(&path)
-        .map(|path| (graph_id.to_string(), path))
-        .map_err(JsErrorBox::generic)
+    let bytes = percent_decode(module_path)?;
+    let path = String::from_utf8(bytes)
+        .map_err(|error| format!("invalid UTF-8 in dd-module module path: {error}"))?;
+    normalize_module_path(&path).map(|path| (graph_id.to_string(), path))
 }
 
 fn has_url_scheme(value: &str) -> bool {
@@ -747,33 +659,30 @@ fn decode_hex_digit(value: u8) -> std::result::Result<u8, String> {
     }
 }
 
+/// Loads and evaluates a module, then runs one turn of the event loop so an
+/// error its evaluation left behind (an unhandled rejection) fails the load.
 async fn evaluate_module(
     runtime: &mut JsRuntime,
     specifier: &str,
     source: &str,
     is_main: bool,
 ) -> Result<()> {
-    let specifier = ModuleSpecifier::parse(specifier)
-        .map_err(|error| PlatformError::runtime(error.to_string()))?;
     let module_id = if is_main {
-        runtime
-            .load_main_es_module_from_code(&specifier, source.to_string())
-            .await
-            .map_err(runtime_error)?
+        runtime.load_main_module(specifier, Some(source.to_string()))
     } else {
-        runtime
-            .load_side_es_module_from_code(&specifier, source.to_string())
-            .await
-            .map_err(runtime_error)?
-    };
-
-    let evaluation = runtime.mod_evaluate(module_id);
+        runtime.load_side_module(specifier, Some(source.to_string()))
+    }
+    .map_err(runtime_error)?;
     runtime
-        .run_event_loop(PollEventLoopOptions::default())
+        .evaluate_module(module_id)
         .await
         .map_err(runtime_error)?;
-    evaluation.await.map_err(runtime_error)?;
-    Ok(())
+    poll_fn(|cx| match runtime.poll_event_loop(cx) {
+        Poll::Ready(result) => Poll::Ready(result),
+        Poll::Pending => Poll::Ready(Ok(())),
+    })
+    .await
+    .map_err(runtime_error)
 }
 
 fn runtime_error(error: impl std::fmt::Display) -> PlatformError {
@@ -785,20 +694,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    async fn resolve_with_event_loop(
-        js_runtime: &mut JsRuntime,
-        value: deno_core::v8::Global<deno_core::v8::Value>,
-    ) -> std::result::Result<deno_core::v8::Global<deno_core::v8::Value>, deno_core::error::CoreError>
-    {
-        let promise = {
-            deno_core::scope!(scope, js_runtime);
-            JsRuntime::scoped_resolve(scope, value)
-        };
-        js_runtime
-            .with_event_loop_promise(promise, PollEventLoopOptions::default())
-            .await
-    }
-
     fn simple_worker_source() -> &'static str {
         r#"
         export default {
@@ -809,31 +704,21 @@ mod tests {
         "#
     }
 
+    fn string(runtime: &mut JsRuntime, value: v8::Global<v8::Value>) -> String {
+        dd_v8::scope!(scope, runtime);
+        let value = v8::Local::new(scope, value);
+        value
+            .to_string(scope)
+            .expect("value should stringify")
+            .to_rust_string_lossy(scope)
+    }
+
     #[tokio::test]
     #[serial]
     async fn bootstrap_snapshot_builds() {
         let _ = build_bootstrap_snapshot()
             .await
             .expect("bootstrap snapshot should build");
-    }
-
-    #[test]
-    fn bootstrap_extensions_do_not_depend_on_build_tree_files() {
-        for extension in runtime_extensions() {
-            for source in extension.js_files.iter().chain(
-                extension
-                    .lazy_loaded_js_files
-                    .iter()
-                    .chain(extension.esm_files.iter())
-                    .chain(extension.lazy_loaded_esm_files.iter()),
-            ) {
-                assert!(
-                    source.is_runtime_loadable(),
-                    "extension {} requires unavailable build-tree source {source:?}",
-                    extension.name
-                );
-            }
-        }
     }
 
     #[tokio::test]
@@ -848,7 +733,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn deno_fetch_classes_work_from_bootstrap_snapshot() {
+    fn fetch_classes_work_from_bootstrap_snapshot() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -883,100 +768,33 @@ mod tests {
             )
             .expect("fetch classes should construct");
 
-        let request_url = js_runtime
-            .execute_script("<dd:test>", "globalThis.__dd_test_request.url")
-            .expect("request url should execute");
-        let response_text_promise = js_runtime
-            .execute_script("<dd:test>", "globalThis.__dd_test_response.text()")
-            .expect("response.text should execute");
-        let response_content_type = js_runtime
-            .execute_script(
-                "<dd:test>",
-                "globalThis.__dd_test_response.headers.get('content-type')",
-            )
-            .expect("response content-type should execute");
-        let header_value = js_runtime
-            .execute_script("<dd:test>", "globalThis.__dd_test_headers.get('x-dd')")
-            .expect("headers get should execute");
-        let form_value = js_runtime
-            .execute_script("<dd:test>", "globalThis.__dd_test_form_data.get('name')")
-            .expect("formdata get should execute");
-        let ctor_match = js_runtime
-            .execute_script("<dd:test>", "globalThis.__dd_test_ctor_match")
-            .expect("constructor match should execute");
-        runtime
-            .block_on(async {
-                js_runtime
-                    .run_event_loop(PollEventLoopOptions::default())
-                    .await
-            })
-            .expect("event loop should run");
-        let request_url = runtime
-            .block_on(resolve_with_event_loop(&mut js_runtime, request_url))
-            .expect("request url should resolve");
-        let response_text = runtime
-            .block_on(resolve_with_event_loop(
-                &mut js_runtime,
-                response_text_promise,
-            ))
-            .expect("response text should resolve");
-        let response_content_type = runtime
-            .block_on(resolve_with_event_loop(
-                &mut js_runtime,
-                response_content_type,
-            ))
-            .expect("response content-type should resolve");
-        let header_value = runtime
-            .block_on(resolve_with_event_loop(&mut js_runtime, header_value))
-            .expect("header value should resolve");
-        let form_value = runtime
-            .block_on(resolve_with_event_loop(&mut js_runtime, form_value))
-            .expect("form value should resolve");
-        let ctor_match = runtime
-            .block_on(resolve_with_event_loop(&mut js_runtime, ctor_match))
-            .expect("constructor match should resolve");
-        {
-            deno_core::scope!(scope, js_runtime);
-            let request_url = request_url
-                .open(scope)
-                .to_string(scope)
-                .expect("request url should stringify")
-                .to_rust_string_lossy(scope);
-            let response_text = response_text
-                .open(scope)
-                .to_string(scope)
-                .expect("response text should stringify")
-                .to_rust_string_lossy(scope);
-            let response_content_type = response_content_type
-                .open(scope)
-                .to_string(scope)
-                .expect("content type should stringify")
-                .to_rust_string_lossy(scope);
-            let header_value = header_value
-                .open(scope)
-                .to_string(scope)
-                .expect("header value should stringify")
-                .to_rust_string_lossy(scope);
-            let form_value = form_value
-                .open(scope)
-                .to_string(scope)
-                .expect("form value should stringify")
-                .to_rust_string_lossy(scope);
-            let ctor_match = ctor_match
-                .open(scope)
-                .to_string(scope)
-                .expect("constructor match should stringify")
-                .to_rust_string_lossy(scope);
-            assert_eq!(request_url, "http://example.com/test");
-            assert_eq!(response_text, r#"{"ok":true}"#);
-            assert_eq!(response_content_type, "application/json");
-            assert_eq!(header_value, "ok");
-            assert_eq!(form_value, "value");
-            assert_eq!(
-                ctor_match,
-                r#"{"fetch":true,"request":true,"headers":true,"response":true,"formData":true}"#
-            );
-        }
+        let mut eval = |source: &str| {
+            let value = js_runtime
+                .execute_script("<dd:test>", source)
+                .expect("script should execute");
+            let value = runtime
+                .block_on(js_runtime.resolve(value))
+                .expect("value should resolve");
+            string(&mut js_runtime, value)
+        };
+        assert_eq!(
+            eval("globalThis.__dd_test_request.url"),
+            "http://example.com/test"
+        );
+        assert_eq!(
+            eval("globalThis.__dd_test_response.text()"),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(
+            eval("globalThis.__dd_test_response.headers.get('content-type')"),
+            "application/json"
+        );
+        assert_eq!(eval("globalThis.__dd_test_headers.get('x-dd')"), "ok");
+        assert_eq!(eval("globalThis.__dd_test_form_data.get('name')"), "value");
+        assert_eq!(
+            eval("globalThis.__dd_test_ctor_match"),
+            r#"{"fetch":true,"request":true,"headers":true,"response":true,"formData":true}"#
+        );
     }
 
     #[test]
@@ -1014,23 +832,10 @@ mod tests {
                 "#,
             )
             .expect("direct worker fetch should execute");
-        runtime
-            .block_on(async {
-                js_runtime
-                    .run_event_loop(PollEventLoopOptions::default())
-                    .await
-            })
-            .expect("event loop should run");
         let response_value = runtime
-            .block_on(resolve_with_event_loop(&mut js_runtime, response_promise))
+            .block_on(js_runtime.resolve(response_promise))
             .expect("response promise should resolve");
-        deno_core::scope!(scope, js_runtime);
-        let response_json = response_value
-            .open(scope)
-            .to_string(scope)
-            .expect("response should stringify")
-            .to_rust_string_lossy(scope);
-        assert_eq!(response_json, "200");
+        assert_eq!(string(&mut js_runtime, response_value), "200");
     }
 
     #[test]
@@ -1056,19 +861,159 @@ mod tests {
             .expect("worker should load into runtime");
 
         let response_value = js_runtime
+            .execute_script("<dd:test>", r#"String(new Response("ok").status)"#)
+            .expect("response constructor should execute");
+        assert_eq!(string(&mut js_runtime, response_value), "200");
+    }
+
+    #[test]
+    #[serial]
+    fn web_crypto_covers_common_algorithms() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        let result = js_runtime
             .execute_script(
                 "<dd:test>",
                 r#"
-                String(new Response("ok").status)
+                (async () => {
+                  const subtle = crypto.subtle;
+                  const data = new TextEncoder().encode("dd");
+                  const results = [];
+
+                  const ed = await subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+                  const edSignature = await subtle.sign("Ed25519", ed.privateKey, data);
+                  results.push(await subtle.verify("Ed25519", ed.publicKey, edSignature, data));
+                  const edSpki = await subtle.exportKey("spki", ed.publicKey);
+                  const edPublic = await subtle.importKey("spki", edSpki, "Ed25519", true, ["verify"]);
+                  results.push(await subtle.verify("Ed25519", edPublic, edSignature, data));
+                  const edPkcs8 = await subtle.exportKey("pkcs8", ed.privateKey);
+                  await subtle.importKey("pkcs8", edPkcs8, "Ed25519", true, ["sign"]);
+                  const edJwk = await subtle.exportKey("jwk", ed.privateKey);
+                  results.push(edJwk.crv === "Ed25519" && typeof edJwk.x === "string");
+
+                  const alice = await subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+                  const bob = await subtle.generateKey({ name: "X25519" }, true, ["deriveBits"]);
+                  const aliceShared = new Uint8Array(await subtle.deriveBits({ name: "X25519", public: bob.publicKey }, alice.privateKey, 256));
+                  const bobShared = new Uint8Array(await subtle.deriveBits({ name: "X25519", public: alice.publicKey }, bob.privateKey, 256));
+                  results.push(aliceShared.length === 32 && aliceShared.every((byte, index) => byte === bobShared[index]));
+                  const xSpki = await subtle.exportKey("spki", alice.publicKey);
+                  await subtle.importKey("spki", xSpki, { name: "X25519" }, true, []);
+
+                  const rsa = await subtle.generateKey(
+                    { name: "RSASSA-PKCS1-v1_5", modulusLength: 1024, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+                    true,
+                    ["sign", "verify"],
+                  );
+                  const rsaSignature = await subtle.sign("RSASSA-PKCS1-v1_5", rsa.privateKey, data);
+                  results.push(await subtle.verify("RSASSA-PKCS1-v1_5", rsa.publicKey, rsaSignature, data));
+
+                  const password = await subtle.importKey("raw", data, "PBKDF2", false, ["deriveBits"]);
+                  const pbkdf2 = await subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: data, iterations: 1000 }, password, 256);
+                  results.push(pbkdf2.byteLength === 32);
+                  const ikm = await subtle.importKey("raw", data, "HKDF", false, ["deriveBits"]);
+                  const hkdf = await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: data, info: data }, ikm, 128);
+                  results.push(hkdf.byteLength === 16);
+
+                  const kek = await subtle.generateKey({ name: "AES-KW", length: 128 }, true, ["wrapKey", "unwrapKey"]);
+                  const aes = await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+                  const wrapped = await subtle.wrapKey("raw", aes, kek, "AES-KW");
+                  const unwrapped = await subtle.unwrapKey("raw", wrapped, kek, "AES-KW", "AES-GCM", true, ["encrypt"]);
+                  results.push(unwrapped.algorithm.length === 256);
+
+                  const jwk = await subtle.exportKey("jwk", aes);
+                  const reimported = await subtle.importKey("jwk", jwk, "AES-GCM", true, ["decrypt"]);
+                  const iv = new Uint8Array(12);
+                  const ciphertext = await subtle.encrypt({ name: "AES-GCM", iv }, aes, data);
+                  results.push(new TextDecoder().decode(await subtle.decrypt({ name: "AES-GCM", iv }, reimported, ciphertext)) === "dd");
+
+                  const other = await subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+                  try {
+                    await subtle.decrypt({ name: "AES-GCM", iv }, other, ciphertext);
+                    results.push("decrypt with the wrong key succeeded");
+                  } catch (error) {
+                    results.push(error instanceof DOMException && error.name === "OperationError");
+                  }
+
+                  return results.join(",");
+                })()
                 "#,
             )
-            .expect("response constructor should execute");
-        deno_core::scope!(scope, js_runtime);
-        let response_value = response_value
-            .open(scope)
-            .to_string(scope)
-            .expect("response should stringify")
-            .to_rust_string_lossy(scope);
-        assert_eq!(response_value, "200");
+            .expect("crypto script should run");
+        let result = runtime
+            .block_on(js_runtime.resolve(result))
+            .expect("crypto script should resolve");
+        assert_eq!(
+            string(&mut js_runtime, result),
+            "true,true,true,true,true,true,true,true,true,true"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn webassembly_streaming_compiles_responses() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        // (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+        let result = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                (async () => {
+                  const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,3,2,1,0,7,7,1,3,97,100,100,0,0,10,9,1,7,0,32,0,32,1,106,11]);
+                  const wasm = (body) => new Response(body, { headers: { "content-type": "application/wasm" } });
+                  const { instance } = await WebAssembly.instantiateStreaming(wasm(bytes));
+                  const module = await WebAssembly.compileStreaming(Promise.resolve(wasm(bytes)));
+                  let rejected = "no";
+                  try {
+                    await WebAssembly.compileStreaming(new Response(bytes));
+                  } catch (error) {
+                    rejected = error.message;
+                  }
+                  return [instance.exports.add(19, 23), module instanceof WebAssembly.Module, rejected].join("|");
+                })()
+                "#,
+            )
+            .expect("wasm script should run");
+        let result = runtime
+            .block_on(js_runtime.resolve(result))
+            .expect("wasm script should resolve");
+        assert_eq!(
+            string(&mut js_runtime, result),
+            "42|true|Invalid WebAssembly content type"
+        );
+    }
+
+    #[test]
+    fn bare_imports_need_a_relative_prefix() {
+        assert_eq!(
+            resolve_import("./b.js", "file:///dd/a.js")
+                .unwrap()
+                .as_str(),
+            "file:///dd/b.js"
+        );
+        assert_eq!(
+            resolve_import("https://example.com/x.js", "file:///dd/a.js")
+                .unwrap()
+                .as_str(),
+            "https://example.com/x.js"
+        );
+        assert_eq!(
+            resolve_import("lodash", "file:///dd/a.js").unwrap_err(),
+            "Relative import path \"lodash\" not prefixed with / or ./ or ../ from \"file:///dd/a.js\""
+        );
     }
 }

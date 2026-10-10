@@ -6,7 +6,6 @@ pub(crate) struct ResponseChunkEmitResult {
     error: String,
 }
 
-#[deno_core::op2(fast)]
 pub(crate) fn op_emit_completion_ok(
     state: &mut OpState,
     completion_handle: u32,
@@ -39,12 +38,7 @@ pub(crate) fn op_emit_completion_ok(
     );
 }
 
-#[deno_core::op2(fast)]
-pub(crate) fn op_emit_completion_error(
-    state: &mut OpState,
-    completion_handle: u32,
-    #[string] error: String,
-) {
+pub(crate) fn op_emit_completion_error(state: &mut OpState, completion_handle: u32, error: String) {
     let Some(context) = active_request_context_for_completion(state, completion_handle) else {
         return;
     };
@@ -88,7 +82,6 @@ fn emit_completion_result(
     );
 }
 
-#[deno_core::op2(fast)]
 pub(crate) fn op_emit_wait_until_done(state: &mut OpState, completion_handle: u32) -> bool {
     let Some(context) = state
         .borrow_mut::<ActiveRequestContextHandles>()
@@ -113,7 +106,6 @@ pub(crate) fn op_emit_wait_until_done(state: &mut OpState, completion_handle: u3
     true
 }
 
-#[deno_core::op2(fast)]
 pub(crate) fn op_emit_response_start(
     state: &mut OpState,
     completion_handle: u32,
@@ -149,12 +141,10 @@ impl AsRef<[u8]> for BufferedResponseChunk {
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_emit_response_chunk(
     state: Rc<RefCell<OpState>>,
     completion_handle: u32,
-    #[buffer] chunk: JsBuffer,
+    chunk: JsBuffer,
 ) -> ResponseChunkEmitResult {
     let result = async {
         let (context, limits, canceled, canceled_notify) = {

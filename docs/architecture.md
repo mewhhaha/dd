@@ -1,6 +1,6 @@
 # Runtime architecture
 
-`dd_server` owns a Deno/V8 runtime service and local Turso storage. Its public
+`dd_server` owns a V8 runtime service and local Turso storage. Its public
 HTTP endpoint and the native development binary use the same Hyper streaming
 and WebSocket implementation. Development stdio carries deployment and control
 messages; worker requests travel over loopback HTTP.

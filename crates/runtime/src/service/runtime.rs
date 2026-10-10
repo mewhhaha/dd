@@ -950,7 +950,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
 }
 
 pub(super) async fn handle_isolate_command(
-    js_runtime: &mut deno_core::JsRuntime,
+    js_runtime: &mut dd_v8::JsRuntime,
     event_tx: &RuntimeEventSender,
     worker_name: &str,
     generation: u64,
@@ -1136,7 +1136,7 @@ pub(super) async fn handle_isolate_command(
 }
 
 async fn handle_isolate_command_or_fail(
-    js_runtime: &mut deno_core::JsRuntime,
+    js_runtime: &mut dd_v8::JsRuntime,
     event_tx: &RuntimeEventSender,
     worker_name: &str,
     generation: u64,

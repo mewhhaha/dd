@@ -1,12 +1,10 @@
 use super::*;
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_lease_acquire(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
+    binding: String,
+    key: String,
 ) -> MemoryLeaseResult {
     let result = async {
         if binding.is_empty() || key.is_empty() || binding.len() + key.len() > 1024 {
@@ -93,13 +91,11 @@ pub(crate) fn clear_memory_read_handles(state: &mut OpState, request_context_han
         .clear_owner(request_context_handle);
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_read_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
+    binding: String,
+    key: String,
 ) -> MemoryBeginResult {
     let mut storage_failure = false;
     let result = async {
@@ -175,7 +171,6 @@ pub(super) async fn op_memory_read_begin(
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_read_close(state: &mut OpState, read_handle: u32) {
     state.borrow_mut::<MemoryReadHandles>().remove(read_handle);
 }
@@ -197,12 +192,10 @@ fn memory_snapshot_record(
     })
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_read_get(
     state: &mut OpState,
     read_handle: u32,
-    #[string] key: String,
+    key: String,
 ) -> MemoryGetResult {
     let Some(read) = state.borrow::<MemoryReadHandles>().get(read_handle) else {
         return MemoryGetResult {
@@ -218,12 +211,10 @@ pub(super) fn op_memory_read_get(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_read_keys(
     state: &mut OpState,
     read_handle: u32,
-    #[string] prefix: String,
+    prefix: String,
 ) -> MemoryKeysResult {
     let Some(read) = state.borrow::<MemoryReadHandles>().get(read_handle) else {
         return MemoryKeysResult {
@@ -422,29 +413,26 @@ fn memory_output_bytes_insert(
         .insert(request_context_handle, value, max_owner_bytes)
 }
 
-#[deno_core::op2]
-#[buffer]
 pub(super) fn op_memory_bytes_take(
     state: &mut OpState,
     request_context_handle: u32,
     handle: u32,
-) -> Vec<u8> {
+) -> dd_v8::ToJsBuffer {
     if request_context_handle == 0 || handle == 0 {
-        return Vec::new();
+        return Vec::new().into();
     }
     memory_bytes_for_handle_state(state, request_context_handle, handle)
         .map(|value| value.to_vec())
         .unwrap_or_default()
+        .into()
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_batch_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
+    binding: String,
+    key: String,
     command_handle: u32,
 ) -> MemoryBeginResult {
     if request_context_handle == 0 {
@@ -545,7 +533,6 @@ pub(super) async fn op_memory_batch_begin(
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_batch_close(state: &mut OpState, batch_handle: u32) {
     if batch_handle != 0 {
         let _ = state
@@ -554,7 +541,6 @@ pub(super) fn op_memory_batch_close(state: &mut OpState, batch_handle: u32) {
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_batch_accept(state: &mut OpState, batch_handle: u32) -> bool {
     let Some(batch) = state
         .borrow_mut::<MemoryBatchHandles>()
@@ -566,14 +552,12 @@ pub(super) fn op_memory_batch_accept(state: &mut OpState, batch_handle: u32) -> 
     true
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_batch_mutation(
     state: &mut OpState,
     batch_handle: u32,
-    #[string] key: String,
-    #[buffer] value: &[u8],
-    #[string] encoding: String,
+    key: String,
+    value: JsBuffer,
+    encoding: String,
     deleted: bool,
 ) -> MemoryBatchMutationResult {
     let Some(batch) = state
@@ -587,7 +571,7 @@ pub(super) fn op_memory_batch_mutation(
     };
     let next = MemoryBatchMutation {
         key,
-        value: Bytes::copy_from_slice(value),
+        value: Bytes::from(value.into_vec()),
         encoding,
         deleted,
     };
@@ -603,12 +587,10 @@ pub(super) fn op_memory_batch_mutation(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_batch_get(
     state: &mut OpState,
     batch_handle: u32,
-    #[string] key: String,
+    key: String,
 ) -> MemoryGetResult {
     let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
         return MemoryGetResult {
@@ -633,12 +615,10 @@ pub(super) fn op_memory_batch_get(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_batch_keys(
     state: &mut OpState,
     batch_handle: u32,
-    #[string] prefix: String,
+    prefix: String,
 ) -> MemoryKeysResult {
     let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
         return MemoryKeysResult {
@@ -672,12 +652,11 @@ pub(super) fn op_memory_batch_keys(
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_batch_effect(
     state: &mut OpState,
     batch_handle: u32,
-    #[string] kind: String,
-    #[buffer] payload: &[u8],
+    kind: String,
+    payload: JsBuffer,
 ) -> bool {
     let Some(batch) = state
         .borrow_mut::<MemoryBatchHandles>()
@@ -695,11 +674,10 @@ pub(super) fn op_memory_batch_effect(
     .is_ok()
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_batch_command_result(
     state: &mut OpState,
     batch_handle: u32,
-    #[buffer] value: &[u8],
+    value: JsBuffer,
 ) -> bool {
     let Some(batch) = state
         .borrow_mut::<MemoryBatchHandles>()
@@ -777,10 +755,9 @@ fn memory_scope_for_payload_with_epoch(
     ))
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_profile_record_js(
     state: &mut OpState,
-    #[string] metric: String,
+    metric: String,
     duration_us: u32,
     items: u32,
 ) {
@@ -794,8 +771,6 @@ pub(super) fn op_memory_profile_record_js(
     store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_profile_take(state: &mut OpState) -> MemoryProfileResult {
     let store = state.borrow::<MemoryStore>().clone();
     MemoryProfileResult {
@@ -805,7 +780,6 @@ pub(super) fn op_memory_profile_take(state: &mut OpState) -> MemoryProfileResult
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_profile_reset(state: &mut OpState) {
     let store = state.borrow::<MemoryStore>().clone();
     store.reset_profile();
@@ -863,8 +837,6 @@ fn close_memory_command_for_committed_batch(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_batch_apply(
     state: Rc<RefCell<OpState>>,
     batch_handle: u32,
@@ -976,15 +948,13 @@ pub(super) async fn op_memory_batch_apply(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_command_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] idempotency_key: String,
+    binding: String,
+    key: String,
+    idempotency_key: String,
 ) -> MemoryCommandBeginResult {
     if request_context_handle == 0 {
         return MemoryCommandBeginResult {
@@ -1109,23 +1079,20 @@ pub(super) async fn op_memory_command_begin(
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_command_close(state: &mut OpState, handle: u32) {
     if handle != 0 {
         let _ = state.borrow_mut::<MemoryCommandHandles>().remove(handle);
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_socket_send(
     state: Rc<RefCell<OpState>>,
     memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] message_kind: String,
-    #[buffer] message: JsBuffer,
+    handle: String,
+    binding: String,
+    key: String,
+    message_kind: String,
+    message: JsBuffer,
 ) -> MemorySocketSendResult {
     let message = message.as_ref().to_vec();
     if handle.trim().is_empty() {
@@ -1184,16 +1151,14 @@ pub(super) async fn op_memory_socket_send(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_memory_socket_close(
     state: Rc<RefCell<OpState>>,
     memory_scope_handle: u32,
-    #[string] handle: String,
-    #[string] binding: String,
-    #[string] key: String,
+    handle: String,
+    binding: String,
+    key: String,
     code: u16,
-    #[string] reason: String,
+    reason: String,
 ) -> MemorySocketCloseResult {
     if handle.trim().is_empty() {
         return MemorySocketCloseResult {
@@ -1240,13 +1205,11 @@ pub(super) async fn op_memory_socket_close(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_memory_socket_list(
     state: Rc<RefCell<OpState>>,
     memory_scope_handle: u32,
-    #[string] binding: String,
-    #[string] key: String,
+    binding: String,
+    key: String,
 ) -> MemorySocketListResult {
     let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
     {

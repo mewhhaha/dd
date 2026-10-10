@@ -94,14 +94,11 @@ pub(super) fn request_owner_for_request(
     )
 }
 
-#[deno_core::op2(fast)]
-pub(super) fn op_request_reply_cancel(state: &mut OpState, #[string] reply_id: String) {
+pub(super) fn op_request_reply_cancel(state: &mut OpState, reply_id: String) {
     let pending = state.borrow::<PendingReplies>().clone();
     pending.cancel(reply_id.trim());
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_request_control_take(state: &mut OpState) -> Vec<RequestControlItem> {
     let inbox = state.borrow::<RequestControlInbox>().clone();
     let mut batch = inbox.take_batch();
@@ -122,15 +119,13 @@ pub(super) fn op_request_control_take(state: &mut OpState) -> Vec<RequestControl
     batch
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_test_async_reply_start(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     delay_ms: f64,
     ok: bool,
-    #[string] value: String,
-    #[string] error: String,
+    value: String,
+    error: String,
 ) -> PendingReplyStartResult {
     let delay_ms = if delay_ms.is_finite() && delay_ms > 0.0 {
         delay_ms.trunc() as u64
@@ -169,20 +164,17 @@ pub(super) fn op_test_async_reply_start(
     reply_start_ok(reply_id)
 }
 
-#[deno_core::op2(fast)]
-pub(super) fn op_test_async_reply_cancel(state: &mut OpState, #[string] reply_id: String) {
+pub(super) fn op_test_async_reply_cancel(state: &mut OpState, reply_id: String) {
     let replies = state.borrow::<TestAsyncReplies>().clone();
     replies.cancel(reply_id.trim());
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_service_binding_fetch_start(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
-    #[string] binding: String,
-    #[string] method: String,
-    #[string] url: String,
+    binding: String,
+    method: String,
+    url: String,
     headers_handle: u32,
     body_handle: u32,
 ) -> PendingReplyStartResult {

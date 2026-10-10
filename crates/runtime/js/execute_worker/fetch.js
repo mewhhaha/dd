@@ -102,6 +102,77 @@
 
   const abortErrorForSignal = (signal) => signal.reason;
 
+  const {
+    fromInnerResponse,
+    newInnerResponse,
+    nullBodyStatus,
+  } = Deno.core.loadExtScript("ext:deno_fetch/23_response.js");
+  const { InnerBody } = Deno.core.loadExtScript("ext:deno_fetch/22_body.js");
+
+  const hostFetchBody = (bodyHandle) => new ReadableStream({
+    async pull(controller) {
+      const chunk = await callOp("op_http_response_read", bodyHandle);
+      if (chunk === null) {
+        controller.close();
+      } else {
+        controller.enqueue(chunk);
+      }
+    },
+    cancel() {
+      callOp("op_http_response_close", bodyHandle);
+    },
+  }, { highWaterMark: 0 });
+
+  // One request through the pinned client `clientHandle`, as a Response.
+  // Aborting rejects at once; a response that arrives after that has its
+  // body released.
+  const sendHostFetch = async (
+    requestContextHandle,
+    clientHandle,
+    method,
+    url,
+    headers,
+    body,
+    signal,
+  ) => {
+    const headersHandle = callOp("op_http_store_prepared_headers", headers);
+    const bodyHandle = body ? callOp("op_http_store_prepared_body", body) : 0;
+    const sent = callOp(
+      "op_http_fetch",
+      requestContextHandle,
+      clientHandle,
+      method,
+      url,
+      Math.max(0, Math.trunc(Number(headersHandle ?? 0) || 0)),
+      Math.max(0, Math.trunc(Number(bodyHandle ?? 0) || 0)),
+    );
+    let fetched;
+    try {
+      fetched = await raceAbortSignal(sent, signal);
+    } catch (error) {
+      void sent.then((late) => {
+        if (late?.body_handle > 0) {
+          callOp("op_http_response_close", late.body_handle);
+        }
+      }, () => undefined);
+      throw error;
+    }
+    if (!fetched || fetched.ok !== true) {
+      throw new TypeError(String(fetched?.error ?? "host fetch failed"));
+    }
+    const inner = newInnerResponse(fetched.status, fetched.status_text);
+    inner.headerList = fetched.headers;
+    inner.urlList = [url];
+    if (fetched.body_handle > 0) {
+      if (nullBodyStatus(fetched.status) || method === "HEAD") {
+        callOp("op_http_response_close", fetched.body_handle);
+      } else {
+        inner.body = new InnerBody(hostFetchBody(fetched.body_handle));
+      }
+    }
+    return fromInnerResponse(inner, "immutable");
+  };
+
   const raceAbortSignal = (promise, signal) => {
     if (!signal) {
       return promise;
@@ -138,16 +209,6 @@
         if (typeof globalThis.__dd_host_fetch === "function") {
           return;
         }
-        const rawFetch = globalThis.__dd_raw_host_fetch ?? globalThis.fetch;
-        if (typeof rawFetch !== "function") {
-          throw new TypeError("fetch is not available in this runtime");
-        }
-        Object.defineProperty(globalThis, "__dd_raw_host_fetch", {
-          value: rawFetch,
-          enumerable: false,
-          configurable: true,
-          writable: true,
-        });
         const scopedFetch = async (inputValue, initValue = undefined) => {
           const run = async () => {
             const current = currentRequestContext();
@@ -199,24 +260,17 @@
               : "follow";
             let redirectsRemaining = HOST_FETCH_MAX_REDIRECTS;
             for (;;) {
-              const client = clientRid > 0 ? new RuntimeHttpClient(clientRid) : undefined;
+              const clientHandle = clientRid;
               clientRid = 0;
-              let response;
-              try {
-                response = await raceAbortSignal(
-                  rawFetch(new Request(url, {
-                    method,
-                    headers,
-                    body,
-                    signal,
-                    redirect: "manual",
-                    client,
-                  })),
-                  signal,
-                );
-              } finally {
-                client?.close();
-              }
+              const response = await sendHostFetch(
+                current.requestContextHandle,
+                clientHandle,
+                method,
+                url,
+                headers,
+                body,
+                signal,
+              );
               if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(response.status)) {
                 return response;
               }

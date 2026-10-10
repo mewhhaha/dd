@@ -18,10 +18,6 @@ RUN apt-get update \
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
-COPY scripts ./scripts
-COPY patches ./patches
-RUN ./scripts/patch-crate.sh deno_crypto
-RUN ./scripts/patch-crate.sh deno_tls
 COPY crates ./crates
 COPY packages/dd-vite/src/shims ./packages/dd-vite/src/shims
 

@@ -38,12 +38,10 @@ pub(crate) struct KvListResult {
     error: String,
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_get_value(
     state: Rc<RefCell<OpState>>,
-    #[string] binding: String,
-    #[string] key: String,
+    binding: String,
+    key: String,
 ) -> KvGetValueResult {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let started = Instant::now();
@@ -85,10 +83,9 @@ pub(crate) async fn op_kv_get_value(
     result
 }
 
-#[deno_core::op2(fast)]
 pub(crate) fn op_kv_profile_record_js(
     state: &mut OpState,
-    #[string] metric: String,
+    metric: String,
     duration_us: u32,
     items: u32,
 ) {
@@ -100,8 +97,6 @@ pub(crate) fn op_kv_profile_record_js(
     store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) fn op_kv_profile_take(state: &mut OpState) -> KvProfileResult {
     let store = state.borrow::<KvStore>().clone();
     KvProfileResult {
@@ -111,19 +106,16 @@ pub(crate) fn op_kv_profile_take(state: &mut OpState) -> KvProfileResult {
     }
 }
 
-#[deno_core::op2(fast)]
 pub(crate) fn op_kv_profile_reset(state: &mut OpState) {
     let store = state.borrow::<KvStore>().clone();
     store.reset_profile();
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_put(
     state: Rc<RefCell<OpState>>,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] value: String,
+    binding: String,
+    key: String,
+    value: String,
 ) -> KvOpResult {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
@@ -141,14 +133,12 @@ pub(crate) async fn op_kv_put(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_put_value_bytes(
     state: Rc<RefCell<OpState>>,
-    #[string] binding: String,
-    #[string] key: String,
-    #[string] encoding: String,
-    #[buffer] value: JsBuffer,
+    binding: String,
+    key: String,
+    encoding: String,
+    value: JsBuffer,
 ) -> KvOpResult {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let value = Bytes::copy_from_slice(value.as_ref());
@@ -170,12 +160,10 @@ pub(crate) async fn op_kv_put_value_bytes(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
-    #[string] binding: String,
-    #[string] key: String,
+    binding: String,
+    key: String,
 ) -> KvOpResult {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
@@ -193,12 +181,10 @@ pub(crate) async fn op_kv_delete(
     }
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_kv_list(
     state: Rc<RefCell<OpState>>,
-    #[string] binding: String,
-    #[string] prefix: String,
+    binding: String,
+    prefix: String,
     limit: u32,
 ) -> KvListResult {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();

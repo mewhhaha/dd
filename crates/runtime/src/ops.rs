@@ -8,8 +8,7 @@ use crate::memory::{
 use crate::service::MemoryExecutionCall;
 use bytes::Bytes;
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
-use deno_core::{JsBuffer, OpState};
-use deno_permissions::{PermissionsContainer, RuntimePermissionDescriptorParser};
+use dd_v8::{JsBuffer, OpDecl, OpState, op_async, op_sync};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -18,7 +17,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sys_traits::impls::RealSys;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 #[path = "ops/cache.rs"]
@@ -196,90 +194,82 @@ pub(crate) fn current_time_boundary() -> TimeBoundary {
     TimeBoundary { now_ms, perf_ms }
 }
 
-#[deno_core::op2]
-async fn op_sleep(millis: u32) {
+async fn op_sleep(_state: Rc<RefCell<OpState>>, millis: u32) {
     tokio::time::sleep(Duration::from_millis(u64::from(millis))).await;
 }
 
-#[deno_core::op2]
-#[serde]
-fn op_time_boundary_now() -> TimeBoundary {
+fn op_time_boundary_now(_state: &mut OpState) -> TimeBoundary {
     current_time_boundary()
 }
 
-deno_core::extension!(
-    dd_runtime_ops,
-    ops = [
-        op_sleep,
-        op_time_boundary_now,
-        op_kv_get_value,
-        op_kv_profile_record_js,
-        op_kv_profile_take,
-        op_kv_profile_reset,
-        op_kv_put,
-        op_kv_put_value_bytes,
-        op_kv_delete,
-        op_kv_list,
-        op_cache_match,
-        op_cache_put,
-        op_cache_delete,
-        op_http_prepare,
-        op_http_check_url,
-        op_request_reply_cancel,
-        op_request_control_take,
-        op_test_async_reply_start,
-        op_test_async_reply_cancel,
-        op_service_binding_fetch_start,
-        op_request_invocation_descriptor,
-        op_take_worker_deployment_config,
-        op_request_wait_until_register,
-        op_request_body_read,
-        op_request_body_cancel,
-        op_request_context_close,
-        op_request_context_cancel,
-        op_memory_request_scope_close,
-        op_memory_lease_acquire,
-        op_memory_profile_record_js,
-        op_memory_profile_take,
-        op_memory_profile_reset,
-        op_memory_bytes_take,
-        op_memory_read_begin,
-        op_memory_read_close,
-        op_memory_read_get,
-        op_memory_read_keys,
-        op_memory_batch_begin,
-        op_memory_batch_close,
-        op_memory_batch_accept,
-        op_memory_batch_mutation,
-        op_memory_batch_get,
-        op_memory_batch_keys,
-        op_memory_batch_effect,
-        op_memory_batch_command_result,
-        op_memory_batch_apply,
-        op_memory_command_begin,
-        op_memory_command_close,
-        op_memory_socket_send,
-        op_memory_socket_close,
-        op_memory_socket_list,
-        op_emit_completion_ok,
-        op_emit_completion_error,
-        op_emit_wait_until_done,
-        op_emit_response_start,
-        op_emit_response_chunk,
-        op_http_store_prepared_body,
-        op_http_take_prepared_body,
-        op_http_store_prepared_headers,
-        op_http_take_prepared_headers,
-        op_emit_cache_revalidate
-    ],
-    state = |state| {
-        let parser = Arc::new(RuntimePermissionDescriptorParser::new(RealSys));
-        state.put(PermissionsContainer::allow_all(parser));
-    }
-);
-
-pub fn runtime_extension() -> deno_core::Extension {
-    dd_runtime_ops::init()
+/// dd's host ops: request and response plumbing, KV, memory, and cache.
+pub(crate) fn runtime_ops() -> Vec<OpDecl> {
+    vec![
+        op_async!(op_sleep),
+        op_sync!(op_time_boundary_now),
+        op_async!(op_kv_get_value),
+        op_sync!(op_kv_profile_record_js),
+        op_sync!(op_kv_profile_take),
+        op_sync!(op_kv_profile_reset),
+        op_async!(op_kv_put),
+        op_async!(op_kv_put_value_bytes),
+        op_async!(op_kv_delete),
+        op_async!(op_kv_list),
+        op_async!(op_cache_match),
+        op_async!(op_cache_put),
+        op_async!(op_cache_delete),
+        op_async!(op_http_prepare),
+        op_async!(op_http_check_url),
+        op_async!(op_http_fetch),
+        op_async!(op_http_response_read),
+        op_sync!(op_http_response_close),
+        op_sync!(op_request_reply_cancel),
+        op_sync!(op_request_control_take),
+        op_sync!(op_test_async_reply_start),
+        op_sync!(op_test_async_reply_cancel),
+        op_sync!(op_service_binding_fetch_start),
+        op_sync!(op_request_invocation_descriptor),
+        op_sync!(op_take_worker_deployment_config),
+        op_sync!(op_request_wait_until_register),
+        op_async!(op_request_body_read),
+        op_sync!(op_request_body_cancel),
+        op_sync!(op_request_context_close),
+        op_sync!(op_request_context_cancel),
+        op_sync!(op_memory_request_scope_close),
+        op_async!(op_memory_lease_acquire),
+        op_sync!(op_memory_profile_record_js),
+        op_sync!(op_memory_profile_take),
+        op_sync!(op_memory_profile_reset),
+        op_sync!(op_memory_bytes_take),
+        op_async!(op_memory_read_begin),
+        op_sync!(op_memory_read_close),
+        op_sync!(op_memory_read_get),
+        op_sync!(op_memory_read_keys),
+        op_async!(op_memory_batch_begin),
+        op_sync!(op_memory_batch_close),
+        op_sync!(op_memory_batch_accept),
+        op_sync!(op_memory_batch_mutation),
+        op_sync!(op_memory_batch_get),
+        op_sync!(op_memory_batch_keys),
+        op_sync!(op_memory_batch_effect),
+        op_sync!(op_memory_batch_command_result),
+        op_async!(op_memory_batch_apply),
+        op_async!(op_memory_command_begin),
+        op_sync!(op_memory_command_close),
+        op_async!(op_memory_socket_send),
+        op_async!(op_memory_socket_close),
+        op_sync!(op_memory_socket_list),
+        op_sync!(op_emit_completion_ok),
+        op_sync!(op_emit_completion_error),
+        op_sync!(op_emit_wait_until_done),
+        op_sync!(op_emit_response_start),
+        op_async!(op_emit_response_chunk),
+        op_sync!(op_http_store_prepared_body),
+        op_sync!(op_http_take_prepared_body),
+        op_sync!(op_http_store_prepared_headers),
+        op_sync!(op_http_take_prepared_headers),
+        op_sync!(op_emit_cache_revalidate),
+    ]
 }
 
 pub fn register_request_body_stream(

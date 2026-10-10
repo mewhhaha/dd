@@ -3,6 +3,7 @@ members = [
   "crates/api",
   "crates/cli",
   "crates/common",
+  "crates/dd_v8",
   "crates/init",
   "crates/runtime",
   "crates/storage",
@@ -18,7 +19,6 @@ version = "0.1.0"
 [workspace.dependencies]
 arc-swap = "1.9.2"
 base64 = "0.23.1"
-deno_core = "0.412.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 simd-json = { version = "0.18.1", features = ["serde_impl"] }
@@ -33,10 +33,6 @@ opentelemetry = "0.33.0"
 opentelemetry_sdk = { version = "0.33.0", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
-
-[patch.crates-io]
-deno_crypto = { path = "patched-crates/deno_crypto" }
-deno_tls = { path = "patched-crates/deno_tls" }
 
 [profile.dev-runtime]
 inherits = "release"

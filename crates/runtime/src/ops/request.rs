@@ -1,7 +1,5 @@
 use super::*;
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_request_invocation_descriptor(
     state: &mut OpState,
     request_handle: u32,
@@ -11,8 +9,6 @@ pub(super) fn op_request_invocation_descriptor(
         .take_descriptor(request_handle)
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) fn op_take_worker_deployment_config(
     state: &mut OpState,
     deployment_handle: u32,
@@ -22,8 +18,6 @@ pub(super) fn op_take_worker_deployment_config(
         .remove(deployment_handle)
 }
 
-#[deno_core::op2]
-#[serde]
 pub(super) async fn op_request_body_read(
     state: Rc<RefCell<OpState>>,
     stream_handle: u32,
@@ -114,7 +108,6 @@ pub(super) async fn op_request_body_read(
     }
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_request_wait_until_register(state: &mut OpState, completion_handle: u32) -> u32 {
     state
         .borrow_mut::<ActiveRequestContextHandles>()
@@ -123,22 +116,18 @@ pub(super) fn op_request_wait_until_register(state: &mut OpState, completion_han
         .min(u32::MAX as usize) as u32
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_request_body_cancel(state: &mut OpState, stream_handle: u32) {
     clear_request_body_stream(state, stream_handle);
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_request_context_close(state: &mut OpState, request_context_handle: u32) {
     clear_request_secret_context(state, request_context_handle);
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_request_context_cancel(state: &mut OpState, request_context_handle: u32) {
     cancel_request_secret_context(state, request_context_handle);
 }
 
-#[deno_core::op2(fast)]
 pub(super) fn op_memory_request_scope_close(state: &mut OpState, memory_scope_handle: u32) {
     clear_memory_request_scope(state, memory_scope_handle);
 }

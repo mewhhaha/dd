@@ -1533,7 +1533,7 @@ pub(super) struct IsolateHandle {
     pub(super) slot_starting: Arc<AtomicBool>,
     pub(super) id: u64,
     pub(super) sender: mpsc::Sender<IsolateCommand>,
-    pub(super) v8_handle: Arc<StdMutex<Option<deno_core::v8::IsolateHandle>>>,
+    pub(super) v8_handle: Arc<StdMutex<Option<dd_v8::v8::IsolateHandle>>>,
     pub(super) request_control_inbox: crate::ops::RequestControlInbox,
     pub(super) startup: IsolateStartup,
     pub(super) internal_rescue: bool,

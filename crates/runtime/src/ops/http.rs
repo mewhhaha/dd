@@ -1,6 +1,6 @@
 use super::*;
-use deno_fetch::dns::{Resolve, Resolver, Resolving};
-use hyper_util::client::legacy::connect::dns::Name;
+use dd_v8::{OpError, ToJsBuffer};
+use reqwest::dns::{Name, Resolve, Resolving};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -70,9 +70,10 @@ impl Resolve for PinnedDnsResolver {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "pinned DNS client cannot resolve a different host",
-                ));
+                )
+                .into());
             }
-            Ok(addresses.into_iter())
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
@@ -226,31 +227,224 @@ async fn resolve_egress_target(
     Ok(ResolvedEgressTarget { host, addresses })
 }
 
+/// Builds a client that can only reach the validated addresses of the
+/// validated host. Every fetch gets its own client and connection pool, so
+/// no connection made under one request's egress rules serves another.
 fn install_pinned_http_client(
     state: &Rc<RefCell<OpState>>,
     target: ResolvedEgressTarget,
 ) -> std::result::Result<u32, String> {
-    let (mut options, permissions) = {
-        let state = state.borrow();
-        (
-            state.borrow::<deno_fetch::Options>().clone(),
-            state.borrow::<PermissionsContainer>().clone(),
-        )
-    };
-    options.resolver = Resolver::custom(Arc::new(PinnedDnsResolver {
-        host: target.host,
-        addresses: target.addresses,
-    }));
-    let client = deno_fetch::create_client_from_options(&options, Some(permissions))
+    let client = reqwest::Client::builder()
+        .dns_resolver(Arc::new(PinnedDnsResolver {
+            host: target.host,
+            addresses: target.addresses,
+        }))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
         .map_err(|error| format!("failed to create pinned host fetch client: {error}"))?;
-    let rid = state
+    let mut state = state.borrow_mut();
+    if !state.has::<HttpClients>() {
+        state.put(HttpClients::default());
+    }
+    Ok(state.borrow_mut::<HttpClients>().insert(client))
+}
+
+/// Pinned clients waiting for the fetch they were made for.
+#[derive(Default)]
+pub(crate) struct HttpClients {
+    next: u32,
+    clients: HashMap<u32, reqwest::Client>,
+}
+
+impl HttpClients {
+    fn insert(&mut self, client: reqwest::Client) -> u32 {
+        loop {
+            self.next = self.next.wrapping_add(1);
+            if self.next != 0 && !self.clients.contains_key(&self.next) {
+                self.clients.insert(self.next, client);
+                return self.next;
+            }
+        }
+    }
+}
+
+/// Response bodies of host fetches, read chunk by chunk from JavaScript.
+#[derive(Default)]
+pub(crate) struct HttpResponseBodies {
+    next: u32,
+    bodies: HashMap<u32, reqwest::Response>,
+}
+
+impl HttpResponseBodies {
+    fn insert(&mut self, response: reqwest::Response) -> u32 {
+        loop {
+            self.next = self.next.wrapping_add(1);
+            if self.next != 0 && !self.bodies.contains_key(&self.next) {
+                self.bodies.insert(self.next, response);
+                return self.next;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct HttpFetchResult {
+    ok: bool,
+    status: u16,
+    status_text: String,
+    headers: Vec<(String, String)>,
+    body_handle: u32,
+    error: String,
+}
+
+impl HttpFetchResult {
+    fn failed(error: String) -> Self {
+        Self {
+            ok: false,
+            status: 0,
+            status_text: String::new(),
+            headers: Vec::new(),
+            body_handle: 0,
+            error,
+        }
+    }
+}
+
+/// Sends a host fetch through the pinned client from `op_http_prepare` or
+/// `op_http_check_url`. Redirects are left to JavaScript, which revalidates
+/// each hop.
+pub(crate) async fn op_http_fetch(
+    state: Rc<RefCell<OpState>>,
+    request_context_handle: u32,
+    client_handle: u32,
+    method: String,
+    url: String,
+    headers_handle: u32,
+    body_handle: u32,
+) -> HttpFetchResult {
+    match send_http_fetch(
+        &state,
+        request_context_handle,
+        client_handle,
+        &method,
+        &url,
+        headers_handle,
+        body_handle,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => HttpFetchResult::failed(error),
+    }
+}
+
+async fn send_http_fetch(
+    state: &Rc<RefCell<OpState>>,
+    request_context_handle: u32,
+    client_handle: u32,
+    method: &str,
+    url: &str,
+    headers_handle: u32,
+    body_handle: u32,
+) -> std::result::Result<HttpFetchResult, String> {
+    let (client, headers, body) = {
+        let mut op_state = state.borrow_mut();
+        let client = op_state
+            .try_borrow_mut::<HttpClients>()
+            .and_then(|clients| clients.clients.remove(&client_handle));
+        let headers = op_state
+            .borrow_mut::<HttpPreparedHeaders>()
+            .take(headers_handle)
+            .unwrap_or_default();
+        let body = op_state
+            .borrow_mut::<HttpPreparedBodies>()
+            .take(body_handle)
+            .unwrap_or_default();
+        (client, headers, body)
+    };
+    let client = client.ok_or_else(|| "host fetch client is unavailable".to_string())?;
+    let (_, canceled, canceled_notify) = http_fetch_context(state, request_context_handle)?;
+
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|error| format!("invalid host fetch method: {error}"))?;
+    let mut request = client.request(method, url);
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| format!("invalid host fetch header name {name:?}: {error}"))?;
+        let value = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|error| format!("invalid host fetch header value: {error}"))?;
+        request = request.header(name, value);
+    }
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    let canceled_wait = canceled_notify.notified();
+    if canceled.load(Ordering::SeqCst) {
+        return Err("host fetch request canceled".to_string());
+    }
+    let response = tokio::select! {
+        response = request.send() => response.map_err(|error| format!("host fetch failed: {error}"))?,
+        _ = canceled_wait => return Err("host fetch request canceled".to_string()),
+    };
+
+    let status = response.status();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let body_handle = {
+        let mut op_state = state.borrow_mut();
+        if !op_state.has::<HttpResponseBodies>() {
+            op_state.put(HttpResponseBodies::default());
+        }
+        op_state.borrow_mut::<HttpResponseBodies>().insert(response)
+    };
+    Ok(HttpFetchResult {
+        ok: true,
+        status: status.as_u16(),
+        status_text: status.canonical_reason().unwrap_or_default().to_string(),
+        headers,
+        body_handle,
+        error: String::new(),
+    })
+}
+
+/// The next chunk of a host fetch response body, or `null` at its end.
+pub(crate) async fn op_http_response_read(
+    state: Rc<RefCell<OpState>>,
+    body_handle: u32,
+) -> std::result::Result<Option<ToJsBuffer>, OpError> {
+    let response = state
         .borrow_mut()
-        .resource_table
-        .add(deno_fetch::HttpClientResource {
-            client,
-            allow_host: false,
-        });
-    Ok(rid)
+        .try_borrow_mut::<HttpResponseBodies>()
+        .and_then(|bodies| bodies.bodies.remove(&body_handle));
+    let Some(mut response) = response else {
+        return Ok(None);
+    };
+    let chunk = response.chunk().await.map_err(|error| {
+        OpError::type_error(format!("error reading a host fetch body: {error}"))
+    })?;
+    if let Some(chunk) = &chunk {
+        if let Some(bodies) = state.borrow_mut().try_borrow_mut::<HttpResponseBodies>() {
+            bodies.bodies.insert(body_handle, response);
+        }
+        return Ok(Some(chunk.to_vec().into()));
+    }
+    Ok(None)
+}
+
+pub(crate) fn op_http_response_close(state: &mut OpState, body_handle: u32) {
+    if let Some(bodies) = state.try_borrow_mut::<HttpResponseBodies>() {
+        bodies.bodies.remove(&body_handle);
+    }
 }
 
 fn normalized_egress_host(url: &reqwest::Url) -> Option<String> {
@@ -299,13 +493,11 @@ fn http_fetch_context(
     context.ok_or_else(|| "host fetch context is unavailable (request likely canceled)".to_string())
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_http_prepare(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
-    #[string] method: String,
-    #[string] url: String,
+    method: String,
+    url: String,
     headers_handle: u32,
     body_handle: u32,
 ) -> HttpPrepareResult {
@@ -360,33 +552,28 @@ pub(crate) async fn op_http_prepare(
     }
 }
 
-#[deno_core::op2]
-#[buffer]
-pub(crate) fn op_http_take_prepared_body(state: &mut OpState, body_handle: u32) -> Vec<u8> {
+pub(crate) fn op_http_take_prepared_body(state: &mut OpState, body_handle: u32) -> ToJsBuffer {
     state
         .borrow_mut::<HttpPreparedBodies>()
         .take(body_handle)
         .map(|body| body.to_vec())
         .unwrap_or_default()
+        .into()
 }
 
-#[deno_core::op2]
-pub(crate) fn op_http_store_prepared_body(state: &mut OpState, #[buffer] body: JsBuffer) -> u32 {
+pub(crate) fn op_http_store_prepared_body(state: &mut OpState, body: JsBuffer) -> u32 {
     state
         .borrow_mut::<HttpPreparedBodies>()
         .insert(Bytes::copy_from_slice(body.as_ref()))
 }
 
-#[deno_core::op2]
 pub(crate) fn op_http_store_prepared_headers(
     state: &mut OpState,
-    #[serde] headers: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
 ) -> u32 {
     state.borrow_mut::<HttpPreparedHeaders>().insert(headers)
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) fn op_http_take_prepared_headers(
     state: &mut OpState,
     headers_handle: u32,
@@ -397,12 +584,10 @@ pub(crate) fn op_http_take_prepared_headers(
         .unwrap_or_default()
 }
 
-#[deno_core::op2]
-#[serde]
 pub(crate) async fn op_http_check_url(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
-    #[string] url: String,
+    url: String,
 ) -> HttpUrlCheckResult {
     match check_http_fetch_url(&state, request_context_handle, &url).await {
         Ok((url, client_rid)) => HttpUrlCheckResult {
