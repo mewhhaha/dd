@@ -57,6 +57,10 @@ fn op_pairs(_state: &mut OpState, pairs: Vec<(String, String)>) -> usize {
     pairs.len()
 }
 
+fn op_present(_state: &mut OpState, values: Vec<Option<u32>>) -> usize {
+    values.iter().flatten().count()
+}
+
 async fn op_ready(_state: Rc<RefCell<OpState>>, value: u32) -> u32 {
     value + 1
 }
@@ -86,6 +90,7 @@ fn test_ops() -> Vec<OpDecl> {
         op_sync!(op_bytes),
         op_sync!(op_fail),
         op_sync!(op_pairs),
+        op_sync!(op_present),
         op_async!(op_ready),
         op_async!(op_sleep),
         op_async!(op_later),
@@ -705,4 +710,44 @@ async fn async_context_follows_continuations_and_timers_cancel() {
     .await
     .unwrap();
     assert_eq!(result, "outer,false,true");
+}
+
+#[test]
+fn op_arguments_copy_within_a_budget() {
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+        ops: test_ops(),
+        max_op_argument_bytes: 4 << 20,
+        ..Default::default()
+    })
+    .expect("runtime");
+    runtime
+        .execute_with_ops("<ops>", "globalThis.ops = ops;")
+        .expect("expose ops");
+    let refused = |runtime: &mut JsRuntime, call: &str| {
+        let source = format!(r#"try {{ {call}; "accepted" }} catch (error) {{ error.message }}"#);
+        eval(runtime, &source)
+    };
+    eval(&mut runtime, r#"globalThis.big = "x".repeat(1 << 20); 0"#);
+    // One string referenced ten times copies ten times.
+    assert!(
+        refused(
+            &mut runtime,
+            "ops.op_pairs(Array.from({ length: 10 }, () => [big, big]))"
+        )
+        .contains("too large"),
+    );
+    assert_eq!(eval(&mut runtime, "ops.op_pairs([[big, big]])"), "1");
+    // Every hole of a sparse array is a value.
+    assert!(refused(&mut runtime, "ops.op_present(new Array(2 ** 32 - 1))").contains("too large"));
+    assert_eq!(eval(&mut runtime, "ops.op_present([1, , 3])"), "2");
+    assert!(
+        refused(&mut runtime, "ops.op_sum_bytes(new Uint8Array(5 << 20))").contains("too large")
+    );
+    assert_eq!(
+        eval(
+            &mut runtime,
+            "ops.op_sum_bytes(new Uint8Array(3 << 20).fill(1))"
+        ),
+        (3 << 20).to_string()
+    );
 }

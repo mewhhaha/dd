@@ -12,11 +12,23 @@
 
 use serde::de::{self, DeserializeSeed, IntoDeserializer, Visitor};
 use serde::ser::{self, Serialize};
+use std::cell::Cell;
 use std::fmt;
+use std::rc::Rc;
 
 const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 const MIN_SAFE_INTEGER: i64 = -MAX_SAFE_INTEGER;
 const MAX_DEPTH: usize = 128;
+
+/// The most a single op argument may copy into Rust, unless the runtime sets
+/// its own. Rust memory sits outside the V8 heap limit, and a small value
+/// can expand when copied: a string referenced a thousand times copies a
+/// thousand times, and each hole of a sparse array becomes an element.
+pub const DEFAULT_MAX_OP_ARGUMENT_BYTES: usize = 256 * 1024 * 1024;
+
+/// What each value read from JavaScript costs against the budget, on top
+/// of the bytes of its strings and buffers.
+const VALUE_COST: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(String);
@@ -90,10 +102,18 @@ pub fn from_v8<'s, T: de::DeserializeOwned>(
     scope: &v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
 ) -> Result<T> {
+    let budget = Cell::new(
+        scope
+            .get_slot::<Rc<crate::runtime::RuntimeState>>()
+            .map_or(DEFAULT_MAX_OP_ARGUMENT_BYTES, |state| {
+                state.max_op_argument_bytes
+            }),
+    );
     T::deserialize(Deserializer {
         scope,
         input: value,
         depth: 0,
+        budget: &budget,
     })
 }
 
@@ -486,6 +506,8 @@ struct Deserializer<'a, 's, 'i> {
     scope: &'a v8::PinScope<'s, 'i>,
     input: v8::Local<'s, v8::Value>,
     depth: usize,
+    /// Bytes this conversion may still copy.
+    budget: &'a Cell<usize>,
 }
 
 impl<'a, 's, 'i> Deserializer<'a, 's, 'i> {
@@ -493,11 +515,22 @@ impl<'a, 's, 'i> Deserializer<'a, 's, 'i> {
         if self.depth >= MAX_DEPTH {
             return Err(Error("value is nested too deeply".to_string()));
         }
+        self.charge(VALUE_COST)?;
         Ok(Self {
             scope: self.scope,
             input,
             depth: self.depth + 1,
+            budget: self.budget,
         })
+    }
+
+    fn charge(&self, bytes: usize) -> Result<()> {
+        let left = self.budget.get();
+        if bytes > left {
+            return Err(Error("value is too large to pass to the host".to_string()));
+        }
+        self.budget.set(left - bytes);
+        Ok(())
     }
 
     fn number(&self) -> Result<f64> {
@@ -542,11 +575,23 @@ impl<'a, 's, 'i> Deserializer<'a, 's, 'i> {
     fn string(&self) -> Result<String> {
         let string = v8::Local::<v8::String>::try_from(self.input)
             .map_err(|_| Error::expected("string", self.input))?;
-        Ok(string.to_rust_string_lossy(self.scope))
+        // At least one byte per UTF-16 unit; the exact size once converted.
+        self.charge(string.length())?;
+        let converted = string.to_rust_string_lossy(self.scope);
+        self.charge(converted.len().saturating_sub(string.length()))?;
+        Ok(converted)
     }
 
-    fn bytes(&self) -> Option<Vec<u8>> {
-        crate::builtins::buffer_bytes(self.input)
+    fn bytes(&self) -> Result<Option<Vec<u8>>> {
+        let length = if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(self.input) {
+            view.byte_length()
+        } else if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(self.input) {
+            buffer.byte_length()
+        } else {
+            return Ok(None);
+        };
+        self.charge(length)?;
+        Ok(crate::builtins::buffer_bytes(self.input))
     }
 }
 
@@ -588,7 +633,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_, '_, '_> {
             visitor.visit_string(self.string()?)
         } else if input.is_array() {
             self.deserialize_seq(visitor)
-        } else if let Some(bytes) = self.bytes() {
+        } else if let Some(bytes) = self.bytes()? {
             visitor.visit_byte_buf(bytes)
         } else if input.is_object() {
             self.deserialize_map(visitor)
@@ -635,7 +680,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_, '_, '_> {
     }
 
     fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        match self.bytes() {
+        match self.bytes()? {
             Some(bytes) => visitor.visit_byte_buf(bytes),
             None if self.input.is_array() => self.deserialize_seq(visitor),
             None => Err(Error::expected("an array buffer or view", self.input)),
@@ -679,7 +724,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_, '_, '_> {
                 length: array.length(),
             });
         }
-        if let Some(bytes) = self.bytes() {
+        if let Some(bytes) = self.bytes()? {
             return visitor.visit_seq(de::value::SeqDeserializer::new(bytes.into_iter()));
         }
         Err(Error::expected("array", self.input))

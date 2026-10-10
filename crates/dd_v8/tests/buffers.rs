@@ -4,7 +4,8 @@
 
 mod common;
 
-use common::{assert_checks, assert_checks_async, runtime};
+use common::{assert_checks, assert_checks_async, runtime, runtime_with};
+use dd_v8::RuntimeOptions;
 
 /// Builds the cases. Each `make()` returns a fresh value plus what a byte copy
 /// of it must read (`bytes`, undefined for non-buffers), what a typed op that
@@ -357,7 +358,11 @@ fn in_place_writes_stay_inside_the_view() {
 /// (aborting the process) on any view of 2 GiB or more.
 #[test]
 fn views_of_two_gib_or_more_copy_without_aborting() {
-    let mut runtime = runtime();
+    // Room to copy past 2 GiB; the default budget refuses such a view first.
+    let mut runtime = runtime_with(RuntimeOptions {
+        max_op_argument_bytes: 3 << 30,
+        ..Default::default()
+    });
     assert_checks(
         &mut runtime,
         r#"

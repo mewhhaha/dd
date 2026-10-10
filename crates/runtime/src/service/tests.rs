@@ -718,6 +718,45 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn op_arguments_cannot_expand_past_the_copy_budget() {
+    let service = test_service(RuntimeConfig::default()).await;
+    service
+        .deploy(
+            "expanding".to_string(),
+            r#"
+export default {
+  fetch() {
+    // 1 MiB of string, referenced 300 times: copying it would take 600 MiB.
+    const big = "x".repeat(1 << 20);
+    const params = new URLSearchParams();
+    for (let i = 0; i < 300; i++) params.append(big, big);
+    try {
+      params.toString();
+      return new Response("copied");
+    } catch (error) {
+      return new Response(`refused: ${error.message}`);
+    }
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+    let output = service
+        .invoke("expanding".to_string(), test_invocation())
+        .await
+        .expect("the worker survives the refused copy");
+    let body = String::from_utf8(output.body.to_vec()).expect("utf8");
+    assert!(
+        body.starts_with("refused:") && body.contains("too large"),
+        "{body}"
+    );
+    service.shutdown().await.expect("service should shut down");
+}
+
+#[tokio::test]
+#[serial]
 async fn deployed_workers_reach_no_runtime_internals() {
     // test_service exposes the internals; a default service must not.
     let store = TestStoreDir::new("dd-internals");

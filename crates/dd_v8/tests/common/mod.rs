@@ -227,13 +227,14 @@ globalThis.report = () => {
 "#;
 
 pub fn runtime() -> JsRuntime {
+    runtime_with(RuntimeOptions::default())
+}
+
+/// A test runtime built from `options`, with the test ops added.
+pub fn runtime_with(options: RuntimeOptions) -> JsRuntime {
     let mut ops = dd_v8::builtins::ops();
     ops.extend(test_ops());
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        ops,
-        ..Default::default()
-    })
-    .expect("runtime");
+    let mut runtime = JsRuntime::new(RuntimeOptions { ops, ..options }).expect("runtime");
     runtime
         .execute_with_ops("<ops>", "globalThis.ops = ops;")
         .expect("expose ops");

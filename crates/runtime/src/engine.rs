@@ -96,6 +96,18 @@ pub struct IsolatePolicy {
     /// Expose `globalThis.__dd_internals`, the bootstrap object with every
     /// op. For the runtime's own tests and benchmarks only.
     pub expose_internals: bool,
+    /// The most one op argument may copy out of JavaScript (see
+    /// [`op_argument_budget`]); 0 keeps dd_v8's default.
+    pub max_op_argument_bytes: usize,
+}
+
+/// What one op argument may copy into Rust: room for the largest request or
+/// response body the runtime accepts, and never less than dd_v8's default.
+pub fn op_argument_budget(max_request_body_bytes: usize, max_response_body_bytes: usize) -> usize {
+    dd_v8::serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES
+        .max(max_request_body_bytes)
+        .max(max_response_body_bytes)
+        .saturating_add(1024 * 1024)
 }
 
 pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
@@ -348,6 +360,7 @@ fn new_runtime(
         })),
         startup_snapshot: Some(startup_snapshot),
         max_heap_bytes,
+        max_op_argument_bytes: policy.max_op_argument_bytes,
     })
     .map_err(runtime_error)?;
     if max_heap_bytes > 0 {

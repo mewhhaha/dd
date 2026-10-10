@@ -37,6 +37,9 @@ pub struct RuntimeOptions {
     pub startup_snapshot: Option<&'static [u8]>,
     /// The V8 heap limit; 0 keeps V8's default.
     pub max_heap_bytes: usize,
+    /// The most one op argument may copy into Rust; 0 keeps
+    /// [`serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES`].
+    pub max_op_argument_bytes: usize,
 }
 
 /// An async op waiting on its future.
@@ -73,6 +76,7 @@ impl Future for PendingOp {
 /// Runtime state the V8 callbacks reach through the isolate's slot.
 pub(crate) struct RuntimeState {
     pub(crate) op_state: Rc<RefCell<OpState>>,
+    pub(crate) max_op_argument_bytes: usize,
     pub(crate) ops: Vec<OpDecl>,
     pub(crate) pending_ops: RefCell<FuturesUnordered<PendingOp>>,
     pub(crate) waker: Arc<AtomicWaker>,
@@ -183,6 +187,7 @@ impl JsRuntime {
             module_loader,
             startup_snapshot,
             max_heap_bytes,
+            max_op_argument_bytes,
         } = options;
         let mut params = v8::CreateParams::default();
         if max_heap_bytes > 0 {
@@ -210,6 +215,10 @@ impl JsRuntime {
         let isolate_key = platform::isolate_key(&isolate);
         let tasks = platform::register_isolate(isolate_key, Arc::clone(&waker));
         let state = Rc::new(RuntimeState {
+            max_op_argument_bytes: match max_op_argument_bytes {
+                0 => serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES,
+                bytes => bytes,
+            },
             op_state: Rc::new(RefCell::new(OpState::new(Arc::clone(&waker)))),
             ops,
             pending_ops: RefCell::new(FuturesUnordered::new()),

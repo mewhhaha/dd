@@ -837,6 +837,10 @@ impl RuntimeService {
                 allow_code_generation: runtime.debug_code_generation,
                 unscoped_fetch: runtime.dev_unscoped_fetch,
                 expose_internals: runtime.expose_internals,
+                max_op_argument_bytes: crate::engine::op_argument_budget(
+                    runtime.max_request_body_bytes,
+                    runtime.max_response_body_bytes,
+                ),
             },
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
         });
