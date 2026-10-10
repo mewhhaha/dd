@@ -5,6 +5,7 @@ mod debug;
 mod deployment;
 mod dispatch;
 mod facade;
+mod inspector;
 mod isolate;
 mod lifecycle;
 mod model;
@@ -86,6 +87,8 @@ pub use self::facade::{
     WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate, WorkerDebugRequest, WorkerStats,
     WorkerStreamBody, WorkerStreamOutput,
 };
+use self::inspector::InspectorRegistry;
+pub use self::inspector::{InspectorMode, InspectorSession, InspectorTarget};
 
 #[derive(Clone)]
 struct AssetCatalog {

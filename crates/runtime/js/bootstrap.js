@@ -4,6 +4,10 @@
 // `__bootstrap.dd` stays private to the runtime.
 const { core, dd } = __bootstrap;
 
+// V8's own console, which V8 installs in every context (the snapshot's
+// included), taken before dd's replaces it. Only DevTools sees its calls.
+const inspectorConsole = globalThis.console;
+
 const {
   AbortController: DenoAbortController,
   AbortSignal: DenoAbortSignal,
@@ -353,13 +357,28 @@ function ensureAsyncContextGlobal() {
 
 // Each console call is formatted here and handed to the host as one line,
 // tagged with the request it ran under; console.time reads the same frozen
-// clock as performance.now.
+// clock as performance.now. Each method is op_call_console bound to V8's
+// method of the same name and dd's: while a DevTools session is attached it
+// hands the call to V8's console too, so DevTools shows inspectable values
+// at the caller's location (the native op adds no stack frame).
 function ensureConsoleGlobal() {
   const { createConsole } = core.loadExtScript("ext:deno_web/01_console.js");
-  define("console", createConsole(
+  const console = createConsole(
     (level, message) => core.ops.op_console_write(level, message, activeRuntimeRequestId()),
     () => frozenPerfMs,
-  ));
+  );
+  if (inspectorConsole !== null && typeof inspectorConsole === "object") {
+    for (const name of Object.keys(console)) {
+      const inspectorMethod = inspectorConsole[name];
+      if (typeof inspectorMethod !== "function") {
+        continue;
+      }
+      const method = core.ops.op_call_console.bind(console, inspectorMethod, console[name]);
+      Object.defineProperty(method, "name", { value: name, configurable: true });
+      console[name] = method;
+    }
+  }
+  define("console", console);
 }
 
 function ensureCryptoGlobals() {

@@ -668,6 +668,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         deployment_config,
         policy,
         console,
+        inspector,
         kv_store,
         memory_store,
         cache_store,
@@ -743,10 +744,26 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             }
                         };
 
-                        {
-                            let handle = js_runtime.v8_isolate().thread_safe_handle();
-                            *thread_v8_handle.lock().expect("v8 handle mutex poisoned") = Some(handle);
-                        }
+                        // The inspector comes before any worker code runs,
+                        // so breakpoints in top-level code hold.
+                        let _inspector_target = match &inspector {
+                            Some(registry) => match js_runtime
+                                .enable_inspector(&format!("{worker_name} (isolate {isolate_id})"))
+                            {
+                                Ok(handle) => Some(registry.register(&worker_name, generation, isolate_id, handle)),
+                                Err(error) => {
+                                    let _ = event_tx.send(RuntimeEvent::IsolateFailed {
+                                        worker_name: worker_name.clone(),
+                                        generation,
+                                        isolate_id,
+                                        error: PlatformError::runtime(error.to_string()),
+                                    }).await;
+                                    return;
+                                }
+                            },
+                            None => None,
+                        };
+                        *thread_v8_handle.lock().expect("v8 handle mutex poisoned") = Some(js_runtime.handle());
 
                         {
                             let event_sender = {
@@ -794,6 +811,9 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             op_state.put(crate::ops::TestAsyncReplies::default());
                             op_state.put(thread_request_control_inbox.clone());
                             op_state.put(RuntimeFastCommandSender(runtime_fast_sender.clone()));
+                        }
+                        if inspector.as_ref().is_some_and(InspectorRegistry::wait_for_debugger) {
+                            js_runtime.wait_for_debugger();
                         }
                         if !snapshot_preloaded
                             && let Err(error) =

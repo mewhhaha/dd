@@ -920,6 +920,7 @@ impl WorkerManager {
             deployment_config,
             policy,
             console: self.console.clone(),
+            inspector: self.inspector.clone(),
             kv_store,
             memory_store,
             cache_store,

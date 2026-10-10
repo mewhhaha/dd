@@ -73,6 +73,10 @@ pub struct RuntimeConfig {
     /// object, every op included. Only the runtime's own tests and
     /// benchmarks set this, to reach behind the worker API.
     pub expose_internals: bool,
+    /// Chrome DevTools debugging of worker isolates. Only the local
+    /// development runtime turns it on; production never creates an
+    /// inspector.
+    pub inspector: InspectorMode,
     pub kv_profile_enabled: bool,
     pub memory_profile_enabled: bool,
     pub temporary_worker_ttl: Duration,
@@ -111,6 +115,7 @@ impl Default for RuntimeConfig {
             debug_code_generation: false,
             dev_unscoped_fetch: false,
             expose_internals: false,
+            inspector: InspectorMode::Off,
             kv_profile_enabled: false,
             memory_profile_enabled: false,
             temporary_worker_ttl: Duration::from_secs(60 * 60),
@@ -714,6 +719,7 @@ impl Drop for RuntimeServiceLifetime {
 pub struct RuntimeService {
     sender: RuntimeCommandSender,
     console: crate::ops::WorkerConsoleSink,
+    inspector: Option<InspectorRegistry>,
     cancel_sender: RuntimeCancellationSender,
     fast_sender: RuntimeCommandSender,
     asset_catalog: AssetCatalog,
@@ -850,6 +856,7 @@ impl RuntimeService {
         ));
         let request_body_chunk_bytes = runtime.max_buffered_request_bytes.min(64 * 1024);
         let console = crate::ops::WorkerConsoleSink::new();
+        let inspector = InspectorRegistry::new(runtime.inspector);
         let runtime_thread = spawn_runtime_thread(RuntimeThreadStart {
             admission,
             routes,
@@ -860,6 +867,7 @@ impl RuntimeService {
             asset_catalog: asset_catalog.clone(),
             bootstrap_snapshot,
             console: console.clone(),
+            inspector: inspector.clone(),
             kv_store: kv_store.clone(),
             memory_store: memory_store.clone(),
             cache_store: cache_store.clone(),
@@ -876,6 +884,7 @@ impl RuntimeService {
         let service = Self {
             sender,
             console,
+            inspector,
             cancel_sender,
             fast_sender,
             asset_catalog,
@@ -1521,6 +1530,15 @@ impl RuntimeService {
     /// Every worker `console` call from now on. Output is also logged as
     /// `dd::worker` tracing events; a receiver that falls more than 1024
     /// lines behind skips the oldest.
+    /// The worker isolates a debugger can attach to now; always empty unless
+    /// the service runs with an [`InspectorMode`] other than `Off`.
+    pub fn inspector_targets(&self) -> Vec<InspectorTarget> {
+        self.inspector
+            .as_ref()
+            .map(InspectorRegistry::targets)
+            .unwrap_or_default()
+    }
+
     pub fn subscribe_console(&self) -> tokio::sync::broadcast::Receiver<crate::WorkerConsoleLine> {
         self.console.0.subscribe()
     }

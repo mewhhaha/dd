@@ -14,9 +14,10 @@ pub use kv::KvStore;
 pub use memory::{MemoryBatchMutation, MemoryStore};
 pub use ops::{WorkerConsoleLevel, WorkerConsoleLine};
 pub use service::{
-    FrontCacheDeployment, InvokeRequestBodyReceiver, PublicRouteAssetResolution,
-    RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness,
-    RuntimeRestoreFailure, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
-    RuntimeWorkerStatus, WebSocketFrameLease, WebSocketFrameOutput, WebSocketOpen, WorkerDebugDump,
-    WorkerDebugIsolate, WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
+    FrontCacheDeployment, InspectorMode, InspectorSession, InspectorTarget,
+    InvokeRequestBodyReceiver, PublicRouteAssetResolution, RuntimeAdminSnapshot,
+    RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness, RuntimeRestoreFailure,
+    RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, RuntimeWorkerStatus,
+    WebSocketFrameLease, WebSocketFrameOutput, WebSocketOpen, WorkerDebugDump, WorkerDebugIsolate,
+    WorkerDebugRequest, WorkerStats, WorkerStreamBody, WorkerStreamOutput,
 };

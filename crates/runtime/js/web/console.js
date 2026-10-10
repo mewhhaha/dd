@@ -878,12 +878,18 @@ function createConsole(write, now) {
     const text = indent === "" ? message : `${indent}${StringPrototypeReplaceAll(message, "\n", `\n${indent}`)}`;
     write(level, text);
   };
+  // The trace starts below `trace` itself; the runtime may wrap the console
+  // method, so it is named here rather than read off the console.
   const stackTrace = () => {
     const holder = {};
-    ErrorCaptureStackTrace(holder, console.trace);
+    ErrorCaptureStackTrace(holder, trace);
     const stack = typeof holder.stack === "string" ? holder.stack : "";
     const firstNewline = StringPrototypeIndexOf(stack, "\n");
     return firstNewline === -1 ? "" : StringPrototypeSlice(stack, firstNewline);
+  };
+  const trace = (...args) => {
+    const message = args.length === 0 ? "Trace" : `Trace: ${formatArgs(args)}`;
+    print(LEVEL_ERROR, `${message}${stackTrace()}`);
   };
   const console = {
     log: (...args) => print(LEVEL_INFO, formatArgs(args)),
@@ -893,10 +899,7 @@ function createConsole(write, now) {
     error: (...args) => print(LEVEL_ERROR, formatArgs(args)),
     dirxml: (...args) => print(LEVEL_INFO, formatArgs(args)),
     dir: (value, options = undefined) => print(LEVEL_INFO, inspect(value, options)),
-    trace: (...args) => {
-      const message = args.length === 0 ? "Trace" : `Trace: ${formatArgs(args)}`;
-      print(LEVEL_ERROR, `${message}${stackTrace()}`);
-    },
+    trace,
     assert: (condition = false, ...args) => {
       if (condition) {
         return;

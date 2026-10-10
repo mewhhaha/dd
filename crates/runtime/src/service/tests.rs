@@ -29,6 +29,8 @@ mod examples;
 #[path = "tests/fixtures.rs"]
 mod fixtures;
 mod host_fetch;
+#[path = "tests/inspector.rs"]
+mod inspector;
 #[path = "tests/memory.rs"]
 mod memory;
 #[path = "tests/memory_contract.rs"]

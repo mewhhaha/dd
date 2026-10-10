@@ -190,6 +190,7 @@ impl WorkerManager {
         let WorkerManagerInit {
             bootstrap_snapshot,
             console,
+            inspector,
             kv_store,
             memory_store,
             memory_outbox_drain_sender,
@@ -214,6 +215,7 @@ impl WorkerManager {
             memory_outbox_drain_sender,
             cache_store,
             console,
+            inspector,
             asset_catalog,
             workers: HashMap::new(),
             queue_counters: RuntimeQueueCounters::default(),

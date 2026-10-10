@@ -580,6 +580,7 @@ pub(super) async fn run_runtime_coordinator(start: RuntimeThreadStart) {
         asset_catalog,
         bootstrap_snapshot,
         console,
+        inspector,
         kv_store,
         memory_store,
         cache_store,
@@ -600,6 +601,7 @@ pub(super) async fn run_runtime_coordinator(start: RuntimeThreadStart) {
     let init = WorkerManagerInit {
         bootstrap_snapshot,
         console,
+        inspector,
         kv_store,
         memory_store,
         memory_outbox_drain_sender,
