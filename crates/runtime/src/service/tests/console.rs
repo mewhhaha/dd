@@ -157,3 +157,58 @@ export default {
     );
     service.shutdown().await.expect("runtime shuts down");
 }
+
+#[tokio::test]
+#[serial]
+async fn worker_console_prints_huge_arrays_without_listing_every_index() {
+    let service = test_service(RuntimeConfig::default()).await;
+    let mut console = service.subscribe_console();
+    service
+        .deploy(
+            "huge-console".into(),
+            r#"
+export default {
+  fetch() {
+    const huge = new Array(10_000_000).fill("x");
+    huge.label = "named";
+    console.log(huge);
+    console.table(huge);
+    return new Response("ok");
+  },
+};
+"#
+            .into(),
+        )
+        .await
+        .expect("worker deploys");
+    let output = service
+        .invoke("huge-console".into(), test_invocation())
+        .await
+        .expect("worker responds");
+    assert_eq!(output.body, b"ok");
+    let log = timeout(Duration::from_secs(5), console.recv())
+        .await
+        .expect("console.log arrives")
+        .expect("console open");
+    assert!(
+        log.message
+            .ends_with("... 9999900 more items,\n  label: 'named'\n]"),
+        "{}",
+        log.message.chars().rev().take(120).collect::<String>()
+    );
+    let table = timeout(Duration::from_secs(5), console.recv())
+        .await
+        .expect("console.table arrives")
+        .expect("console open");
+    // A thousand rows outgrow one console line, which is cut at 16 KiB.
+    assert!(
+        table.message.starts_with("┌"),
+        "{}",
+        table.message.chars().take(80).collect::<String>()
+    );
+    assert!(
+        table.message.ends_with(" more bytes]"),
+        "table output is cut, not all 10M rows"
+    );
+    service.shutdown().await.expect("runtime shuts down");
+}

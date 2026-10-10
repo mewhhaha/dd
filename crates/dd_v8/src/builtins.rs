@@ -26,6 +26,7 @@ pub fn ops() -> Vec<OpDecl> {
         op_raw!(op_queue_microtask),
         op_raw!(op_promise_state),
         op_raw!(op_proxy_details),
+        op_raw!(op_own_non_index_keys),
         op_raw!(op_is_any_array_buffer),
         op_raw!(op_is_array_buffer),
         op_raw!(op_is_array_buffer_view),
@@ -586,6 +587,34 @@ fn op_proxy_details<'s>(
     };
     let entries = [proxy.get_target(scope), proxy.get_handler(scope)];
     rv.set(v8::Array::new_with_elements(scope, &entries).into());
+}
+
+/// `op_own_non_index_keys(object)`: the object's own enumerable string and
+/// symbol keys, without its integer indices. Listing an array's keys any
+/// other way creates a string per element, which for a large array exhausts
+/// the heap inside one builtin, where V8 cannot recover.
+fn op_own_non_index_keys<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    rv: &mut v8::ReturnValue<'s, v8::Value>,
+) {
+    let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        throw_type_error(scope, "op_own_non_index_keys requires an object");
+        return;
+    };
+    // `get_own_property_names` ignores the index filter; this honours it.
+    let keys = object.get_property_names(
+        scope,
+        v8::GetPropertyNamesArgs {
+            mode: v8::KeyCollectionMode::OwnOnly,
+            property_filter: v8::PropertyFilter::ONLY_ENUMERABLE,
+            index_filter: v8::IndexFilter::SkipIndices,
+            key_conversion: v8::KeyConversionMode::KeepNumbers,
+        },
+    );
+    if let Some(keys) = keys {
+        rv.set(keys.into());
+    }
 }
 
 macro_rules! type_checks {

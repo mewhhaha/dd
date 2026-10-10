@@ -81,7 +81,10 @@ const {
   TypedArrayPrototypeGetSymbolToStringTag,
   Uint8Array,
 } = primordials;
-const { op_promise_state, op_proxy_details } = core.ops;
+const { op_own_non_index_keys, op_promise_state, op_proxy_details } = core.ops;
+
+// console.table prints at most this many rows of an array.
+const TABLE_MAX_ROWS = 1000;
 
 const privateCustomInspect = SymbolFor("Deno.privateCustomInspect");
 const denoCustomInspect = SymbolFor("Deno.customInspect");
@@ -283,32 +286,19 @@ function prefix(name, tag, fallback, size = "") {
 }
 
 function ownKeys(value, skipIndices) {
+  if (skipIndices) {
+    // Listing indices would create a string per element.
+    return op_own_non_index_keys(value);
+  }
   const keys = [];
   const all = ReflectOwnKeys(value);
   for (let i = 0; i < all.length; i++) {
     const key = all[i];
-    if (!ObjectPrototypePropertyIsEnumerable(value, key)) {
-      continue;
+    if (ObjectPrototypePropertyIsEnumerable(value, key)) {
+      ArrayPrototypePush(keys, key);
     }
-    if (skipIndices && typeof key === "string" && isIndex(key)) {
-      continue;
-    }
-    ArrayPrototypePush(keys, key);
   }
   return keys;
-}
-
-function isIndex(key) {
-  if (key.length === 0 || key.length > 10) {
-    return false;
-  }
-  for (let i = 0; i < key.length; i++) {
-    const code = StringPrototypeCharCodeAt(key, i);
-    if (code < 48 || code > 57) {
-      return false;
-    }
-  }
-  return key === "0" || key[0] !== "0";
 }
 
 function formatProperty(ctx, value, key, recurseTimes) {
@@ -761,7 +751,33 @@ function formatJson(value) {
   }
 }
 
+/** An object's own enumerable keys for console.table, as
+ * `[keys, omitted]`: at most TABLE_MAX_ROWS of an array's indices (never all
+ * of them), then its other keys; `omitted` counts the indices left out. */
+function tableKeys(value) {
+  if (!ArrayIsArray(value) && !core.isTypedArray(value)) {
+    const keys = ownKeys(value, false);
+    return keys.length > TABLE_MAX_ROWS
+      ? [ArrayPrototypeSlice(keys, 0, TABLE_MAX_ROWS), keys.length - TABLE_MAX_ROWS]
+      : [keys, 0];
+  }
+  const keys = [];
+  const length = ArrayIsArray(value) ? value.length : TypedArrayPrototypeGetLength(value);
+  const limit = Math_min(length, TABLE_MAX_ROWS);
+  for (let i = 0; i < limit; i++) {
+    if (ObjectPrototypeHasOwnProperty(value, i)) {
+      ArrayPrototypePush(keys, `${i}`);
+    }
+  }
+  const named = ownKeys(value, true);
+  for (let i = 0; i < named.length; i++) {
+    ArrayPrototypePush(keys, named[i]);
+  }
+  return [keys, length - limit];
+}
+
 function formatTable(data, properties) {
+  let omittedRows = 0;
   const rows = [];
   const columns = [];
   const addColumn = (name) => {
@@ -774,7 +790,7 @@ function formatTable(data, properties) {
   const addRow = (index, value) => {
     const row = { __proto__: null, "(index)": index };
     if (value !== null && typeof value === "object" && !core.isNativeError(value)) {
-      const keys = properties ?? ownKeys(value, false);
+      const keys = properties ?? tableKeys(value)[0];
       for (let i = 0; i < keys.length; i++) {
         const key = keys[i];
         if (typeof key === "symbol") {
@@ -805,12 +821,14 @@ function formatTable(data, properties) {
     let i = 0;
     SetPrototypeForEach(data, (value) => addRow(`${i++}`, value));
   } else {
-    const keys = ownKeys(data, false);
+    const listed = tableKeys(data);
+    const keys = listed[0];
     for (let i = 0; i < keys.length; i++) {
       if (typeof keys[i] === "string") {
         addRow(keys[i], data[keys[i]]);
       }
     }
+    omittedRows = listed[1];
   }
   const headers = ArrayPrototypeConcat([indexHeader], columns);
   if (hasValues) {
@@ -836,6 +854,9 @@ function formatTable(data, properties) {
     ArrayPrototypePush(out, renderRow(table[i]));
   }
   ArrayPrototypePush(out, line("└", "┴", "┘"));
+  if (omittedRows > 0) {
+    ArrayPrototypePush(out, `... ${omittedRows} more row${omittedRows > 1 ? "s" : ""}`);
+  }
   return ArrayPrototypeJoin(out, "\n");
 }
 
