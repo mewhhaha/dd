@@ -32,6 +32,7 @@ export class DdRuntimeClient {
       timeoutMs: DEFAULT_TIMEOUT_MS,
       closeTimeoutMs: DEFAULT_CLOSE_TIMEOUT_MS,
       allowCodeGeneration: true,
+      onConsole: printWorkerConsole,
       ...options,
     };
   }
@@ -256,6 +257,17 @@ export class DdRuntimeClient {
   }
 
   #handleLine(line) {
+    if (isConsoleEventLine(line)) {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        this.#stderr = `${this.#stderr}${line}\n`.slice(-16_384);
+        return;
+      }
+      this.options.onConsole?.(event);
+      return;
+    }
     if (!isRuntimeProtocolLine(line)) {
       this.#stderr = `${this.#stderr}${line}\n`.slice(-16_384);
       return;
@@ -321,6 +333,22 @@ async function terminateChild(child) {
 
 function isRuntimeProtocolLine(line) {
   return line.startsWith('{"id":');
+}
+
+function isConsoleEventLine(line) {
+  return line.startsWith('{"event":"console"');
+}
+
+/** The default destination for worker console output: this process's
+ * stdout, or stderr for warnings and errors, each line tagged with the worker. */
+export function printWorkerConsole({ worker, level, message }) {
+  const stream = level === "error" || level === "warn" ? process.stderr : process.stdout;
+  stream.write(`${formatWorkerConsole(worker, message)}\n`);
+}
+
+export function formatWorkerConsole(worker, message) {
+  const tag = worker ? `[dd:${worker}]` : "[dd]";
+  return `${tag} ${String(message).replaceAll("\n", `\n${" ".repeat(tag.length + 1)}`)}`;
 }
 
 export async function bundleWorkerEntry(entry, options = {}) {

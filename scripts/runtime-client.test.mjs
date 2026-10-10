@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { createDdRuntime } from "../packages/dd-vite/src/runtime.js";
+import { createDdRuntime, formatWorkerConsole } from "../packages/dd-vite/src/runtime.js";
 
 let root;
 let binary;
@@ -32,6 +32,9 @@ setInterval(() => {}, 1000);
 createInterface({ input: process.stdin }).on("line", line => {
   const command = JSON.parse(line);
   if (command.op === "hang") return;
+  if (command.op === "log") {
+    process.stdout.write(JSON.stringify({ event: "console", worker: "app", request_id: "req-1", level: "warn", message: "careful\\nnow" }) + "\\n");
+  }
   if (command.op === "break_stdin") {
     process.stdin.pause();
     require("node:fs").closeSync(0);
@@ -51,8 +54,8 @@ after(async () => {
   }
 });
 
-function client() {
-  const runtime = createDdRuntime({ binary, timeoutMs: 2_000, closeTimeoutMs: 20 });
+function client(options = {}) {
+  const runtime = createDdRuntime({ binary, timeoutMs: 2_000, closeTimeoutMs: 20, ...options });
   clients.add(runtime);
   return runtime;
 }
@@ -96,4 +99,14 @@ test("a broken subprocess input rejects pending work and remains tracked for tea
   await pending;
   await runtime.close();
   assert.equal(isAlive(pid), false);
+});
+
+test("worker console events reach onConsole instead of the protocol", async () => {
+  const events = [];
+  const runtime = client({ onConsole: event => events.push(event) });
+  await runtime.request({ op: "log" });
+  assert.deepEqual(events, [
+    { event: "console", worker: "app", request_id: "req-1", level: "warn", message: "careful\nnow" },
+  ]);
+  assert.equal(formatWorkerConsole("app", "careful\nnow"), "[dd:app] careful\n         now");
 });

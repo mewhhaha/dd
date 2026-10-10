@@ -667,6 +667,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         module_registry,
         deployment_config,
         policy,
+        console,
         kv_store,
         memory_store,
         cache_store,
@@ -774,6 +775,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             op_state.put(memory_store.clone());
                             op_state.put(cache_store.clone());
                             op_state.put(crate::ops::WorkerCacheNamespace(worker_name.clone()));
+                            op_state.put(console.clone());
                             op_state.put(open_handle_registry.clone());
                             op_state.put(crate::ops::HttpPreparedBodies::default());
                             op_state.put(crate::ops::HttpPreparedHeaders::default());

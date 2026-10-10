@@ -12,7 +12,7 @@ import { rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { bundleWorkerEntry, createDdRuntime } from "./runtime.js";
+import { bundleWorkerEntry, createDdRuntime, formatWorkerConsole, printWorkerConsole } from "./runtime.js";
 import { createWorkerTestRuntime } from "./vitest.js";
 import {
   arrayOfStrings,
@@ -473,9 +473,32 @@ export function ddVitePlugin(options = {}) {
     }
   }
 
+  // Worker console output goes through Vite's logger once Vite has resolved
+  // its config, so it shares the terminal's formatting with Vite's own lines.
+  function runtimeOptions() {
+    return {
+      onConsole: (event) => {
+        const logger = resolvedConfig?.logger;
+        if (!logger) {
+          printWorkerConsole(event);
+          return;
+        }
+        const text = formatWorkerConsole(event.worker, event.message);
+        if (event.level === "error") {
+          logger.error(text, { timestamp: true });
+        } else if (event.level === "warn") {
+          logger.warn(text, { timestamp: true });
+        } else {
+          logger.info(text, { timestamp: true });
+        }
+      },
+      ...options.runtimeOptions,
+    };
+  }
+
   async function ensureDeployed() {
     if (runtimeClosed) throw new Error("dd Vite runtime is closed");
-    runtime ??= createDdRuntime(options.runtimeOptions);
+    runtime ??= createDdRuntime(runtimeOptions());
     const workers = await resolvedWorkers();
     const moduleRunnerMode = workers.some(worker => usesViteModuleRunner(worker));
     if (deployment && deploymentRuntimeGeneration === runtime.generation && deploymentModuleRunnerMode === moduleRunnerMode) {
@@ -497,7 +520,7 @@ export function ddVitePlugin(options = {}) {
         }
         if (ownsRuntime) {
           await runtime?.close().catch(() => {});
-          runtime = createDdRuntime(options.runtimeOptions);
+          runtime = createDdRuntime(runtimeOptions());
         }
         return deployAll();
       })

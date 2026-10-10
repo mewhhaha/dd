@@ -351,6 +351,17 @@ function ensureAsyncContextGlobal() {
   }));
 }
 
+// Each console call is formatted here and handed to the host as one line,
+// tagged with the request it ran under; console.time reads the same frozen
+// clock as performance.now.
+function ensureConsoleGlobal() {
+  const { createConsole } = core.loadExtScript("ext:deno_web/01_console.js");
+  define("console", createConsole(
+    (level, message) => core.ops.op_console_write(level, message, activeRuntimeRequestId()),
+    () => frozenPerfMs,
+  ));
+}
+
 function ensureCryptoGlobals() {
   define("Crypto", Crypto);
   define("CryptoKey", DenoCryptoKey);
@@ -553,6 +564,7 @@ ensureEncodingGlobals();
 ensureStructuredCloneGlobal();
 ensureAsyncContextGlobal();
 ensureCryptoGlobals();
+ensureConsoleGlobal();
 define("DOMException", DOMException);
 define("Event", Event);
 define("EventTarget", EventTarget);

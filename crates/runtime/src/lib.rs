@@ -12,6 +12,7 @@ mod web;
 pub use cache::{CacheLookup, CacheRequest, CacheResponse};
 pub use kv::KvStore;
 pub use memory::{MemoryBatchMutation, MemoryStore};
+pub use ops::{WorkerConsoleLevel, WorkerConsoleLine};
 pub use service::{
     FrontCacheDeployment, InvokeRequestBodyReceiver, PublicRouteAssetResolution,
     RuntimeAdminSnapshot, RuntimeCheckpointResult, RuntimeConfig, RuntimeReadiness,

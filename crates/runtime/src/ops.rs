@@ -21,6 +21,8 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
 #[path = "ops/cache.rs"]
 mod cache_ops;
+#[path = "ops/console.rs"]
+mod console_ops;
 #[path = "ops/http.rs"]
 mod http_ops;
 #[path = "ops/kv.rs"]
@@ -41,6 +43,9 @@ mod request_types;
 mod response_ops;
 
 use self::cache_ops::*;
+pub(crate) use self::console_ops::WorkerConsoleSink;
+use self::console_ops::op_console_write;
+pub use self::console_ops::{WorkerConsoleLevel, WorkerConsoleLine};
 pub(crate) use self::http_ops::UnscopedFetch;
 use self::http_ops::*;
 use self::kv_ops::*;
@@ -206,6 +211,7 @@ fn op_time_boundary_now(_state: &mut OpState) -> TimeBoundary {
 /// dd's host ops: request and response plumbing, KV, memory, and cache.
 pub(crate) fn runtime_ops() -> Vec<OpDecl> {
     vec![
+        op_sync!(op_console_write),
         op_async!(op_sleep),
         op_sync!(op_time_boundary_now),
         op_async!(op_kv_get_value),

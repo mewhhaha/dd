@@ -225,3 +225,12 @@ dd-vite's `node:async_hooks` shim uses). The development runtime adds
 `__dd_raw_host_fetch`; the runtime's tests and benchmarks set
 `RuntimeConfig::expose_internals` to reach the bootstrap object as
 `__dd_internals`.
+
+Worker `console` output is formatted in JavaScript (`js/web/console.js`, the
+Node/Deno `util.inspect` conventions) and handed to the host one call at a
+time. The host logs it as a `dd::worker` tracing event carrying the worker
+name and runtime request id, cut at 16 KiB, and passes it to
+`RuntimeService::subscribe_console` subscribers. The development runtime
+forwards those as `{"event":"console",...}` lines, which dd-vite prints
+through Vite's logger. Deployment validation evaluates a module without
+logging, so top-level output appears once.

@@ -915,6 +915,7 @@ impl WorkerManager {
             module_registry: self.module_registry.clone(),
             deployment_config,
             policy,
+            console: self.console.clone(),
             kv_store,
             memory_store,
             cache_store,

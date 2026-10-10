@@ -1,13 +1,14 @@
 use common::{DeployConfig, ErrorKind, PlatformError};
 use runtime::{
-    RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, WorkerStats,
+    RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, WorkerConsoleLine,
+    WorkerStats,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -47,6 +48,20 @@ struct ResponseEnvelope<T: Serialize> {
 struct ErrorEnvelope {
     kind: &'static str,
     message: String,
+}
+
+/// A worker console call, written as `{"event":"console", ...}` so the
+/// client can tell it from command responses (which start with `{"id":`).
+#[derive(Debug, Serialize)]
+struct ConsoleEvent {
+    event: &'static str,
+    #[serde(flatten)]
+    line: WorkerConsoleLine,
+}
+
+enum Outgoing {
+    Response(ResponseEnvelope<CommandResult>),
+    Console(ConsoleEvent),
 }
 
 #[derive(Debug, Serialize)]
@@ -119,17 +134,52 @@ async fn main() -> Result<(), String> {
     result.and(shutdown_result).and(cleanup_result)
 }
 
+async fn forward_console(
+    mut console: broadcast::Receiver<WorkerConsoleLine>,
+    sender: mpsc::Sender<Outgoing>,
+) {
+    loop {
+        let line = match console.recv().await {
+            Ok(line) => line,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => WorkerConsoleLine {
+                worker: String::new(),
+                request_id: String::new(),
+                level: runtime::WorkerConsoleLevel::Warn,
+                message: format!("dd: {skipped} console lines dropped while the client lagged"),
+            },
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let event = ConsoleEvent {
+            event: "console",
+            line,
+        };
+        if sender.send(Outgoing::Console(event)).await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn run_stdio(service: RuntimeService) -> Result<(), String> {
     let mut listeners = HashMap::<String, SocketAddr>::new();
     let mut servers = JoinSet::new();
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
-    let (response_tx, mut response_rx) = mpsc::channel::<ResponseEnvelope<CommandResult>>(128);
+    let (response_tx, mut response_rx) = mpsc::channel::<Outgoing>(128);
+    let console_forwarder = tokio::spawn(forward_console(
+        service.subscribe_console(),
+        response_tx.clone(),
+    ));
     let writer = tokio::spawn(async move {
         let mut stdout = io::stdout();
-        while let Some(response) = response_rx.recv().await {
-            let is_shutdown = matches!(response.result, Some(CommandResult::Shutdown));
-            let line = serde_json::to_string(&response).map_err(|error| error.to_string())?;
+        while let Some(outgoing) = response_rx.recv().await {
+            let (line, is_shutdown) = match outgoing {
+                Outgoing::Response(response) => (
+                    serde_json::to_string(&response),
+                    matches!(response.result, Some(CommandResult::Shutdown)),
+                ),
+                Outgoing::Console(event) => (serde_json::to_string(&event), false),
+            };
+            let line = line.map_err(|error| error.to_string())?;
             stdout
                 .write_all(line.as_bytes())
                 .await
@@ -164,7 +214,11 @@ async fn run_stdio(service: RuntimeService) -> Result<(), String> {
                 let stop_reading = matches!(&request.command, DevCommand::Shutdown);
                 let response =
                     handle_command(&service, &mut listeners, &mut servers, request).await;
-                if response_tx.send(response).await.is_err() {
+                if response_tx
+                    .send(Outgoing::Response(response))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 if stop_reading {
@@ -189,13 +243,18 @@ async fn run_stdio(service: RuntimeService) -> Result<(), String> {
                         message: format!("invalid command JSON: {error}"),
                     }),
                 };
-                if response_tx.send(response).await.is_err() {
+                if response_tx
+                    .send(Outgoing::Response(response))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         }
     }
 
+    console_forwarder.abort();
     drop(response_tx);
     writer.await.map_err(|error| error.to_string())?
 }

@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+#[path = "tests/console.rs"]
+mod console;
 #[path = "tests/deployment_drain.rs"]
 mod deployment_drain;
 #[path = "tests/egress.rs"]

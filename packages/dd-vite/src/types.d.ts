@@ -176,6 +176,18 @@ export interface DdRuntimeOptions {
   timeoutMs?: number;
   closeTimeoutMs?: number;
   allowCodeGeneration?: boolean;
+  /** Receives every worker `console` call. Defaults to printing it on this
+   * process's stdout (stderr for warnings and errors). */
+  onConsole?: (event: DdWorkerConsoleEvent) => void;
+}
+
+export interface DdWorkerConsoleEvent {
+  event: "console";
+  worker: string;
+  /** The runtime request the call ran under; empty outside a request. */
+  request_id: string;
+  level: "debug" | "info" | "warn" | "error";
+  message: string;
 }
 
 export interface DdWorkerBundleOptions {

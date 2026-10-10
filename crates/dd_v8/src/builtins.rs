@@ -24,6 +24,8 @@ pub fn ops() -> Vec<OpDecl> {
         op_raw!(op_get_async_context),
         op_raw!(op_set_async_context),
         op_raw!(op_queue_microtask),
+        op_raw!(op_promise_state),
+        op_raw!(op_proxy_details),
         op_raw!(op_is_any_array_buffer),
         op_raw!(op_is_array_buffer),
         op_raw!(op_is_array_buffer_view),
@@ -533,6 +535,45 @@ fn op_queue_microtask<'s>(
         Ok(callback) => scope.enqueue_microtask(callback),
         Err(_) => throw_type_error(scope, "queueMicrotask requires a function"),
     }
+}
+
+/// `op_promise_state(promise)`: `[0]` while pending, `[1, value]` once
+/// fulfilled, `[2, reason]` once rejected, for inspecting a promise without
+/// awaiting it.
+fn op_promise_state<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    rv: &mut v8::ReturnValue<'s, v8::Value>,
+) {
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(args.get(0)) else {
+        throw_type_error(scope, "op_promise_state requires a promise");
+        return;
+    };
+    let state = match promise.state() {
+        v8::PromiseState::Pending => 0,
+        v8::PromiseState::Fulfilled => 1,
+        v8::PromiseState::Rejected => 2,
+    };
+    let mut entries = vec![v8::Integer::new(scope, state).into()];
+    if state != 0 {
+        entries.push(promise.result(scope));
+    }
+    rv.set(v8::Array::new_with_elements(scope, &entries).into());
+}
+
+/// `op_proxy_details(value)`: `[target, handler]` for a proxy (both null once
+/// revoked) and null otherwise, so inspection never runs a proxy's traps.
+fn op_proxy_details<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    rv: &mut v8::ReturnValue<'s, v8::Value>,
+) {
+    let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(args.get(0)) else {
+        rv.set_null();
+        return;
+    };
+    let entries = [proxy.get_target(scope), proxy.get_handler(scope)];
+    rv.set(v8::Array::new_with_elements(scope, &entries).into());
 }
 
 macro_rules! type_checks {

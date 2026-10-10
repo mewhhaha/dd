@@ -713,6 +713,7 @@ impl Drop for RuntimeServiceLifetime {
 #[derive(Clone)]
 pub struct RuntimeService {
     sender: RuntimeCommandSender,
+    console: crate::ops::WorkerConsoleSink,
     cancel_sender: RuntimeCancellationSender,
     fast_sender: RuntimeCommandSender,
     asset_catalog: AssetCatalog,
@@ -844,6 +845,7 @@ impl RuntimeService {
             runtime.max_buffered_request_bytes,
         ));
         let request_body_chunk_bytes = runtime.max_buffered_request_bytes.min(64 * 1024);
+        let console = crate::ops::WorkerConsoleSink::new();
         let runtime_thread = spawn_runtime_thread(RuntimeThreadStart {
             admission,
             routes,
@@ -853,6 +855,7 @@ impl RuntimeService {
             runtime_fast_sender: fast_sender.clone(),
             asset_catalog: asset_catalog.clone(),
             bootstrap_snapshot,
+            console: console.clone(),
             kv_store: kv_store.clone(),
             memory_store: memory_store.clone(),
             cache_store: cache_store.clone(),
@@ -868,6 +871,7 @@ impl RuntimeService {
         });
         let service = Self {
             sender,
+            console,
             cancel_sender,
             fast_sender,
             asset_catalog,
@@ -1508,6 +1512,13 @@ impl RuntimeService {
                 "runtime websocket close channel closed",
             ))
         })
+    }
+
+    /// Every worker `console` call from now on. Output is also logged as
+    /// `dd::worker` tracing events; a receiver that falls more than 1024
+    /// lines behind skips the oldest.
+    pub fn subscribe_console(&self) -> tokio::sync::broadcast::Receiver<crate::WorkerConsoleLine> {
+        self.console.0.subscribe()
     }
 
     pub async fn stats(&self, worker_name: String) -> Option<WorkerStats> {
