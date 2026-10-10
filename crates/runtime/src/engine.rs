@@ -67,6 +67,16 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
         .map_err(Clone::clone)
 }
 
+/// What a worker's isolate may do beyond the defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IsolatePolicy {
+    /// Allow `eval` and `new Function`.
+    pub allow_code_generation: bool,
+    /// Expose `globalThis.__dd_raw_host_fetch`, a fetch outside any request
+    /// and egress rule. For the local development runtime only.
+    pub unscoped_fetch: bool,
+}
+
 pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
     dd_v8::set_flags(flags).map_err(PlatformError::internal)
 }
@@ -77,12 +87,11 @@ pub async fn validate_worker(
     source: &str,
     allow_code_generation: bool,
 ) -> Result<()> {
-    let mut runtime = new_runtime(
-        bootstrap_snapshot,
+    let policy = IsolatePolicy {
         allow_code_generation,
-        0,
-        ModuleRegistry::default(),
-    )?;
+        ..IsolatePolicy::default()
+    };
+    let mut runtime = new_runtime(bootstrap_snapshot, policy, 0, ModuleRegistry::default())?;
     load_worker(&mut runtime, source).await
 }
 
@@ -92,21 +101,20 @@ pub fn new_runtime_from_snapshot(
     allow_code_generation: bool,
     module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
-    new_runtime(startup_snapshot, allow_code_generation, 0, module_registry)
+    let policy = IsolatePolicy {
+        allow_code_generation,
+        ..IsolatePolicy::default()
+    };
+    new_runtime(startup_snapshot, policy, 0, module_registry)
 }
 
 pub fn new_runtime_from_snapshot_with_heap_limit(
     startup_snapshot: &'static [u8],
-    allow_code_generation: bool,
+    policy: IsolatePolicy,
     max_heap_bytes: usize,
     module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
-    new_runtime(
-        startup_snapshot,
-        allow_code_generation,
-        max_heap_bytes,
-        module_registry,
-    )
+    new_runtime(startup_snapshot, policy, max_heap_bytes, module_registry)
 }
 
 pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
@@ -293,7 +301,7 @@ pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()
 
 fn new_runtime(
     startup_snapshot: &'static [u8],
-    allow_code_generation: bool,
+    policy: IsolatePolicy,
     max_heap_bytes: usize,
     module_registry: ModuleRegistry,
 ) -> Result<JsRuntime> {
@@ -315,7 +323,23 @@ fn new_runtime(
         });
     }
     runtime.op_state().borrow_mut().put(module_registry);
-    set_code_generation_from_strings(&mut runtime, allow_code_generation);
+    set_code_generation_from_strings(&mut runtime, policy.allow_code_generation);
+    if policy.unscoped_fetch {
+        runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::ops::UnscopedFetch);
+        runtime
+            .execute_script(
+                "<dd:unscoped-fetch>",
+                r#"Object.defineProperty(globalThis, "__dd_raw_host_fetch", {
+                  value: globalThis.__dd_deno_runtime.unscopedFetch,
+                  configurable: true,
+                  writable: true,
+                });"#,
+            )
+            .map_err(runtime_error)?;
+    }
     Ok(runtime)
 }
 
@@ -994,6 +1018,81 @@ mod tests {
         assert_eq!(
             string(&mut js_runtime, result),
             "42|true|Invalid WebAssembly content type"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unscoped_fetch_is_a_development_runtime_capability() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let _entered = runtime.enter();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\nmodules",
+                )
+                .expect("respond");
+        });
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let source = format!(
+            r#"
+            const body = await globalThis.__dd_raw_host_fetch("http://{address}/module").then((response) => response.text());
+            export default {{ fetch() {{ return new Response(body); }} }};
+            "#
+        );
+
+        let dev = IsolatePolicy {
+            unscoped_fetch: true,
+            ..IsolatePolicy::default()
+        };
+        let mut js_runtime =
+            new_runtime_from_snapshot_with_heap_limit(snapshot, dev, 0, ModuleRegistry::default())
+                .expect("dev runtime should start");
+        runtime
+            .block_on(load_worker(&mut js_runtime, &source))
+            .expect("module evaluation should fetch from the dev server");
+        let body = js_runtime
+            .execute_script(
+                "<dd:test>",
+                "Promise.resolve(globalThis.__dd_worker.fetch(new Request('http://worker/'))).then((response) => response.text())",
+            )
+            .expect("worker fetch should run");
+        let body = runtime
+            .block_on(js_runtime.resolve(body))
+            .expect("worker fetch should resolve");
+        assert_eq!(string(&mut js_runtime, body), "modules");
+        server.join().expect("server thread");
+        drop(js_runtime);
+
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start");
+        let refused = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                typeof globalThis.__dd_raw_host_fetch === "undefined"
+                  ? globalThis.__dd_deno_runtime.unscopedFetch("http://127.0.0.1:9/").then(() => "fetched", (error) => error.message)
+                  : "exposed"
+                "#,
+            )
+            .expect("probe should run");
+        let refused = runtime
+            .block_on(js_runtime.resolve(refused))
+            .expect("probe should resolve");
+        assert_eq!(
+            string(&mut js_runtime, refused),
+            "fetch outside a request is only available in the development runtime"
         );
     }
 

@@ -65,6 +65,10 @@ pub struct RuntimeConfig {
     pub kv_read_cache_max_bytes: usize,
     pub v8_flags: Vec<String>,
     pub debug_code_generation: bool,
+    /// Give workers `globalThis.__dd_raw_host_fetch`, which fetches outside
+    /// any request and egress rule. Only the local development runtime sets
+    /// this, for dd-vite's dev module loading.
+    pub dev_unscoped_fetch: bool,
     pub kv_profile_enabled: bool,
     pub memory_profile_enabled: bool,
     pub temporary_worker_ttl: Duration,
@@ -101,6 +105,7 @@ impl Default for RuntimeConfig {
             kv_read_cache_max_bytes: 16 * 1024 * 1024,
             v8_flags: Vec::new(),
             debug_code_generation: false,
+            dev_unscoped_fetch: false,
             kv_profile_enabled: false,
             memory_profile_enabled: false,
             temporary_worker_ttl: Duration::from_secs(60 * 60),
@@ -822,7 +827,10 @@ impl RuntimeService {
             snapshot: bootstrap_snapshot,
             max_heap_bytes: runtime.max_isolate_heap_bytes,
             timeout: runtime.isolate_startup_timeout,
-            allow_code_generation: runtime.debug_code_generation,
+            policy: crate::engine::IsolatePolicy {
+                allow_code_generation: runtime.debug_code_generation,
+                unscoped_fetch: runtime.dev_unscoped_fetch,
+            },
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let temporary_worker_ttl = runtime.temporary_worker_ttl;

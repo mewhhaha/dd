@@ -11,7 +11,7 @@ pub(super) struct DeploymentValidator {
     pub(super) snapshot: &'static [u8],
     pub(super) max_heap_bytes: usize,
     pub(super) timeout: Duration,
-    pub(super) allow_code_generation: bool,
+    pub(super) policy: crate::engine::IsolatePolicy,
     pub(super) slots: Arc<Semaphore>,
 }
 
@@ -45,7 +45,7 @@ impl DeploymentValidator {
             .map_err(|_| PlatformError::internal("deployment validator is closed"))?;
         let snapshot = self.snapshot;
         let max_heap_bytes = self.max_heap_bytes;
-        let allow_code_generation = self.allow_code_generation;
+        let policy = self.policy;
         let timeout = self.timeout;
         let state = Arc::new(Mutex::new(ValidationState::default()));
         let cancellation = ValidationCancellation(Arc::clone(&state));
@@ -64,7 +64,7 @@ impl DeploymentValidator {
                     executor.block_on(async {
                         let mut runtime = new_runtime_from_snapshot_with_heap_limit(
                             snapshot,
-                            allow_code_generation,
+                            policy,
                             max_heap_bytes,
                             modules,
                         )?;

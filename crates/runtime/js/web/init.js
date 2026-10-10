@@ -37,6 +37,65 @@ const { FormData } = core.loadExtScript("ext:deno_fetch/21_formdata.js");
 const { Request } = core.loadExtScript("ext:deno_fetch/23_request.js");
 const { Response } = core.loadExtScript("ext:deno_fetch/23_response.js");
 
+const {
+  fromInnerResponse,
+  newInnerResponse,
+  nullBodyStatus,
+} = core.loadExtScript("ext:deno_fetch/23_response.js");
+const { InnerBody } = core.loadExtScript("ext:deno_fetch/22_body.js");
+const {
+  op_http_fetch_unscoped,
+  op_http_response_close,
+  op_http_response_read,
+} = core.ops;
+
+// A Response for a host fetch result, its body read from Rust as it arrives.
+function hostFetchResponse(fetched, url, method) {
+  const inner = newInnerResponse(fetched.status, fetched.status_text);
+  inner.headerList = fetched.headers;
+  inner.urlList = [url];
+  const bodyHandle = fetched.body_handle;
+  if (bodyHandle > 0) {
+    if (nullBodyStatus(fetched.status) || method === "HEAD") {
+      op_http_response_close(bodyHandle);
+    } else {
+      inner.body = new InnerBody(new ReadableStream({
+        async pull(controller) {
+          const chunk = await op_http_response_read(bodyHandle);
+          if (chunk === null) {
+            controller.close();
+          } else {
+            controller.enqueue(chunk);
+          }
+        },
+        cancel() {
+          op_http_response_close(bodyHandle);
+        },
+      }, { highWaterMark: 0 }));
+    }
+  }
+  return fromInnerResponse(inner, "immutable");
+}
+
+// fetch with no request scope or egress rule. The op refuses it outside the
+// development runtime, which exposes it as __dd_raw_host_fetch for dd-vite.
+async function unscopedFetch(input, init = undefined) {
+  const request = new Request(input, init);
+  const body = request.body === null
+    ? new Uint8Array()
+    : new Uint8Array(await request.arrayBuffer());
+  const fetched = await op_http_fetch_unscoped(
+    request.method,
+    request.url,
+    [...request.headers],
+    body,
+  );
+  if (fetched?.ok !== true) {
+    throw new TypeError(String(fetched?.error ?? "host fetch failed"));
+  }
+  return hostFetchResponse(fetched, request.url, request.method);
+}
+
 // WebAssembly.compileStreaming and instantiateStreaming hand their Response
 // here; its body goes to V8's streaming compiler chunk by chunk.
 const {
@@ -126,6 +185,9 @@ const ddRuntime = {
   reportError,
   structuredClone,
 };
+
+Object.defineProperty(ddRuntime, "hostFetchResponse", { value: hostFetchResponse });
+Object.defineProperty(ddRuntime, "unscopedFetch", { value: unscopedFetch });
 
 Object.defineProperty(ddRuntime, "crypto", {
   get: () => cryptoRuntime.crypto,

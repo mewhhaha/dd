@@ -41,6 +41,7 @@ mod request_types;
 mod response_ops;
 
 use self::cache_ops::*;
+pub(crate) use self::http_ops::UnscopedFetch;
 use self::http_ops::*;
 use self::kv_ops::*;
 use self::memory_ops::*;
@@ -221,6 +222,7 @@ pub(crate) fn runtime_ops() -> Vec<OpDecl> {
         op_async!(op_http_prepare),
         op_async!(op_http_check_url),
         op_async!(op_http_fetch),
+        op_async!(op_http_fetch_unscoped),
         op_async!(op_http_response_read),
         op_sync!(op_http_response_close),
         op_sync!(op_request_reply_cancel),

@@ -1467,7 +1467,7 @@ pub(super) struct IsolateThreadStart {
     pub(super) source: crate::ops::WorkerSource,
     pub(super) module_registry: crate::module_registry::ModuleRegistry,
     pub(super) deployment_config: Arc<crate::ops::WorkerDeploymentPayload>,
-    pub(super) allow_code_generation: bool,
+    pub(super) policy: crate::engine::IsolatePolicy,
     pub(super) kv_store: KvStore,
     pub(super) memory_store: MemoryStore,
     pub(super) cache_store: CacheStore,

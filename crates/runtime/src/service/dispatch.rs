@@ -905,7 +905,10 @@ impl WorkerManager {
             )));
         };
         let reservation = admission.reservation;
-        let allow_code_generation = self.config.debug_code_generation;
+        let policy = crate::engine::IsolatePolicy {
+            allow_code_generation: self.config.debug_code_generation,
+            unscoped_fetch: self.config.dev_unscoped_fetch,
+        };
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();
@@ -926,7 +929,7 @@ impl WorkerManager {
             source,
             module_registry: self.module_registry.clone(),
             deployment_config,
-            allow_code_generation,
+            policy,
             kv_store,
             memory_store,
             cache_store,

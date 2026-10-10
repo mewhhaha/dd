@@ -90,6 +90,7 @@ async fn main() -> Result<(), String> {
             idle_ttl: Duration::from_secs(10),
             scale_tick: Duration::from_millis(50),
             debug_code_generation: allow_code_generation,
+            dev_unscoped_fetch: true,
             ..RuntimeConfig::default()
         },
         storage: RuntimeStorageConfig {

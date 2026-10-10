@@ -666,7 +666,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
         source,
         module_registry,
         deployment_config,
-        allow_code_generation,
+        policy,
         kv_store,
         memory_store,
         cache_store,
@@ -726,7 +726,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                         let pending_isolate_events = Rc::new(RefCell::new(VecDeque::<RuntimeEvent>::new()));
                         let mut js_runtime = match new_runtime_from_snapshot_with_heap_limit(
                             snapshot,
-                            allow_code_generation,
+                            policy,
                             execution_limits.max_isolate_heap_bytes,
                             module_registry,
                         ) {

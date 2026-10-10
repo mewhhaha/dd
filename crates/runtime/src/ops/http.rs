@@ -365,7 +365,63 @@ async fn send_http_fetch(
     };
     let client = client.ok_or_else(|| "host fetch client is unavailable".to_string())?;
     let (_, canceled, canceled_notify) = http_fetch_context(state, request_context_handle)?;
+    send_fetch(
+        state,
+        &client,
+        method,
+        url,
+        headers,
+        body,
+        Some((canceled, canceled_notify)),
+    )
+    .await
+}
 
+/// Marks a runtime whose workers may fetch outside any request and egress
+/// rule. Only the local development runtime grants it, so dd-vite can load
+/// modules from its dev server while a worker module evaluates.
+pub(crate) struct UnscopedFetch;
+
+/// A fetch with no request scope and no egress check. Refused unless the
+/// runtime holds [`UnscopedFetch`].
+pub(crate) async fn op_http_fetch_unscoped(
+    state: Rc<RefCell<OpState>>,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: JsBuffer,
+) -> HttpFetchResult {
+    if !state.borrow().has::<UnscopedFetch>() {
+        return HttpFetchResult::failed(
+            "fetch outside a request is only available in the development runtime".to_string(),
+        );
+    }
+    let client = match reqwest::Client::builder().no_proxy().build() {
+        Ok(client) => client,
+        Err(error) => return HttpFetchResult::failed(format!("host fetch client: {error}")),
+    };
+    send_fetch(
+        &state,
+        &client,
+        &method,
+        &url,
+        headers,
+        Bytes::from(body.into_vec()),
+        None,
+    )
+    .await
+    .unwrap_or_else(HttpFetchResult::failed)
+}
+
+async fn send_fetch(
+    state: &Rc<RefCell<OpState>>,
+    client: &reqwest::Client,
+    method: &str,
+    url: &str,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+    cancellation: Option<(Arc<AtomicBool>, Arc<Notify>)>,
+) -> std::result::Result<HttpFetchResult, String> {
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|error| format!("invalid host fetch method: {error}"))?;
     let mut request = client.request(method, url);
@@ -380,14 +436,20 @@ async fn send_http_fetch(
         request = request.body(body);
     }
 
-    let canceled_wait = canceled_notify.notified();
-    if canceled.load(Ordering::SeqCst) {
-        return Err("host fetch request canceled".to_string());
+    let response = match cancellation {
+        Some((canceled, canceled_notify)) => {
+            let canceled_wait = canceled_notify.notified();
+            if canceled.load(Ordering::SeqCst) {
+                return Err("host fetch request canceled".to_string());
+            }
+            tokio::select! {
+                response = request.send() => response,
+                _ = canceled_wait => return Err("host fetch request canceled".to_string()),
+            }
+        }
+        None => request.send().await,
     }
-    let response = tokio::select! {
-        response = request.send() => response.map_err(|error| format!("host fetch failed: {error}"))?,
-        _ = canceled_wait => return Err("host fetch request canceled".to_string()),
-    };
+    .map_err(|error| format!("host fetch failed: {error}"))?;
 
     let status = response.status();
     let headers = response

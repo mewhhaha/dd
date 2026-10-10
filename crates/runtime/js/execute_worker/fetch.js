@@ -102,26 +102,7 @@
 
   const abortErrorForSignal = (signal) => signal.reason;
 
-  const {
-    fromInnerResponse,
-    newInnerResponse,
-    nullBodyStatus,
-  } = Deno.core.loadExtScript("ext:deno_fetch/23_response.js");
-  const { InnerBody } = Deno.core.loadExtScript("ext:deno_fetch/22_body.js");
-
-  const hostFetchBody = (bodyHandle) => new ReadableStream({
-    async pull(controller) {
-      const chunk = await callOp("op_http_response_read", bodyHandle);
-      if (chunk === null) {
-        controller.close();
-      } else {
-        controller.enqueue(chunk);
-      }
-    },
-    cancel() {
-      callOp("op_http_response_close", bodyHandle);
-    },
-  }, { highWaterMark: 0 });
+  const { hostFetchResponse } = globalThis.__dd_deno_runtime;
 
   // One request through the pinned client `clientHandle`, as a Response.
   // Aborting rejects at once; a response that arrives after that has its
@@ -160,17 +141,7 @@
     if (!fetched || fetched.ok !== true) {
       throw new TypeError(String(fetched?.error ?? "host fetch failed"));
     }
-    const inner = newInnerResponse(fetched.status, fetched.status_text);
-    inner.headerList = fetched.headers;
-    inner.urlList = [url];
-    if (fetched.body_handle > 0) {
-      if (nullBodyStatus(fetched.status) || method === "HEAD") {
-        callOp("op_http_response_close", fetched.body_handle);
-      } else {
-        inner.body = new InnerBody(hostFetchBody(fetched.body_handle));
-      }
-    }
-    return fromInnerResponse(inner, "immutable");
+    return hostFetchResponse(fetched, url, method);
   };
 
   const raceAbortSignal = (promise, signal) => {
