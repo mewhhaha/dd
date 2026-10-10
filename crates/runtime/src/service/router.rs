@@ -886,6 +886,13 @@ async fn run_worker_scheduler(
                 }
             }
             while let Ok(command) = cancellation_receiver.try_recv() {
+                // The coordinator sends Shutdown only once it has stopped
+                // taking commands, so it cannot take this one back; a
+                // scheduler with no workers left has nothing more to stop.
+                if let RuntimeCommand::Shutdown { reply } = command {
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
                 if let Err(error) = manager.runtime_fast_sender.coordinator.send(command).await {
                     error.0.reject(PlatformError::internal(
                         "runtime stopped before cancellation was rerouted",
