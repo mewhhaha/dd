@@ -12,7 +12,7 @@ import { rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { bundleWorkerEntry, createDdRuntime, formatWorkerConsole, printWorkerConsole } from "./runtime.js";
+import { bundleWorkerEntry, createDdRuntime, formatInspectorEvent, formatWorkerConsole, printWorkerConsole } from "./runtime.js";
 import { createWorkerTestRuntime } from "./vitest.js";
 import {
   arrayOfStrings,
@@ -473,10 +473,21 @@ export function ddVitePlugin(options = {}) {
     }
   }
 
-  // Worker console output goes through Vite's logger once Vite has resolved
-  // its config, so it shares the terminal's formatting with Vite's own lines.
+  // Worker console output and DevTools hints go through Vite's logger once
+  // Vite has resolved its config, so they share the terminal's formatting
+  // with Vite's own lines.
   function runtimeOptions() {
     return {
+      inspect: options.inspect,
+      onInspector: (event) => {
+        const text = formatInspectorEvent(event);
+        const logger = resolvedConfig?.logger;
+        if (logger) {
+          logger.info(text, { timestamp: true });
+        } else {
+          process.stderr.write(`${text}\n`);
+        }
+      },
       onConsole: (event) => {
         const logger = resolvedConfig?.logger;
         if (!logger) {

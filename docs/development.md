@@ -356,6 +356,60 @@ just build-dd-runtime-package
 That writes the binary into the matching `packages/dd-runtime-*/bin` directory.
 The `dev-runtime` profile favors package size over peak execution performance.
 
+### Debugging workers
+
+The development runtime can serve Chrome DevTools for every worker isolate:
+breakpoints, stepping, scopes, the console with inspectable objects, and
+pausing a busy loop. Turn it on in the Vite plugin:
+
+```js
+export default defineConfig({
+  plugins: [dd({ inspect: true })],
+});
+```
+
+`inspect: true` listens on `127.0.0.1:9229`; `inspect: "127.0.0.1:9339"` picks
+another address. The same option works on `createDdRuntime({ inspect: true })`,
+and the runtime itself takes `dd_dev_runtime --stdio --inspect[=[host:]port]`.
+Vite's log then shows where the debugger listens and, as each worker isolate
+starts, a `devtools://` URL that opens DevTools on it.
+
+To attach, open `chrome://inspect` in Chrome. Each isolate is listed as
+`<worker> (isolate <n>)`; click **inspect**. **Open dedicated DevTools for
+Node** keeps one window that reattaches by itself whenever a new isolate
+starts. For an address other than `127.0.0.1:9229`, add it under **Configure**
+first. Pasting a printed `devtools://` URL into the address bar works too. The
+endpoints are Chrome's usual ones: `/json/list` (one target per isolate, with a
+random WebSocket path), `/json/version`, and the WebSocket itself.
+
+While inspecting, the runtime keeps one isolate per worker running, so the
+isolate you attached to is the one that serves requests, and it drops the
+request wall-time, queue-wait and startup limits, so a request paused at a
+breakpoint waits for you instead of being terminated. A redeploy starts a new
+isolate, which is a new target; DevTools keeps breakpoints by script URL and
+sets them again when it reattaches. Inline workers appear as
+`file:///dd/worker.js`, module graphs under `dd-module://graph/...`; bundling
+with `sourcemap: "inline"` lets DevTools show the original sources.
+
+Console calls still print in the terminal. While a DevTools session is
+attached they also appear in DevTools at the worker's call site, with objects
+you can expand; calls from before you attached are not replayed.
+
+Top-level module code runs as soon as an isolate starts, before you can set a
+breakpoint. `dd_dev_runtime --inspect-wait` holds each isolate's worker
+evaluation until a debugger attaches and lets it run: DevTools does so right
+after setting its breakpoints, so breakpoints it remembers by URL hold in
+top-level code too. Stopping the runtime still ends a paused or waiting
+isolate; after a redeploy, a request paused in the old isolate finishes once
+you resume it.
+
+The inspector runs any code it is sent. It binds to loopback by default and
+refuses a host name that resolves anywhere else; listening beyond this machine
+takes an explicit IP address (`--inspect=0.0.0.0:9229`) and prints a warning.
+Requests whose `Host` is not an IP address or `localhost` are refused, which
+keeps web pages from reaching it through DNS rebinding. `dd_server` never
+creates an inspector.
+
 ## Library embedding
 
 `dd_server` can run as library through `dd_server::run(ServerConfig { ... })`. Runtime/storage config lives in typed Rust config, not env wiring. See:

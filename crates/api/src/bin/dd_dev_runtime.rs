@@ -1,7 +1,7 @@
 use common::{DeployConfig, ErrorKind, PlatformError};
 use runtime::{
-    RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig, WorkerConsoleLine,
-    WorkerStats,
+    InspectorMode, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
+    WorkerConsoleLine, WorkerStats,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,9 +59,35 @@ struct ConsoleEvent {
     line: WorkerConsoleLine,
 }
 
+/// Where DevTools attaches, written as `{"event":"inspector", ...}`: once
+/// for the listener, then once per worker isolate with its own URLs.
+#[derive(Debug, Serialize)]
+struct InspectorEvent {
+    event: &'static str,
+    address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isolate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devtools: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    websocket: Option<String>,
+}
+
 enum Outgoing {
     Response(ResponseEnvelope<CommandResult>),
     Console(ConsoleEvent),
+    #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
+    Inspector(InspectorEvent),
+}
+
+/// A paused isolate holds its request; this stands in for "no limit".
+const INSPECT_TIME_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+struct Inspect {
+    address: SocketAddr,
+    wait: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,33 +107,82 @@ enum CommandResult {
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let mut allow_code_generation = false;
+    let mut inspect = None;
     for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--allow-code-generation" => allow_code_generation = true,
-            "--stdio" => {}
-            "--help" | "-h" => {
+        let (flag, value) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        match (flag, value) {
+            ("--allow-code-generation", None) => allow_code_generation = true,
+            ("--stdio", None) => {}
+            ("--inspect" | "--inspect-wait", value) => {
+                inspect = Some(Inspect {
+                    address: inspect_address(value.unwrap_or_default())?,
+                    wait: flag == "--inspect-wait",
+                });
+            }
+            ("--help" | "-h", None) => {
                 eprintln!(
-                    "Usage: dd_dev_runtime --stdio [--allow-code-generation]\n\nReads deploy/control JSON commands on stdin. Deploy returns a loopback HTTP URL for streaming requests and WebSockets."
+                    "Usage: dd_dev_runtime --stdio [--allow-code-generation] [--inspect[=[host:]port]] [--inspect-wait[=[host:]port]]\n\nReads deploy/control JSON commands on stdin. Deploy returns a loopback HTTP URL for streaming requests and WebSockets.\n\n--inspect serves Chrome DevTools for every worker isolate (default 127.0.0.1:9229; see chrome://inspect). --inspect-wait also holds each isolate's worker code until a debugger attaches and lets it run."
                 );
                 return Ok(());
             }
-            other => return Err(format!("unknown argument: {other}")),
+            _ => return Err(format!("unknown argument: {arg}")),
         }
+    }
+    let inspector_listener = match &inspect {
+        Some(inspect) => {
+            if !inspect.address.ip().is_loopback() {
+                eprintln!(
+                    "dd: the inspector on {} can be reached from other machines, and whoever reaches it can run code in your workers",
+                    inspect.address
+                );
+            }
+            Some(
+                tokio::net::TcpListener::bind(inspect.address)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to bind the inspector to {}: {error}",
+                            inspect.address
+                        )
+                    })?,
+            )
+        }
+        None => None,
+    };
+
+    let mut runtime = RuntimeConfig {
+        min_isolates: 0,
+        max_global_isolates: 4,
+        max_isolates: 4,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(10),
+        scale_tick: Duration::from_millis(50),
+        debug_code_generation: allow_code_generation,
+        dev_unscoped_fetch: true,
+        ..RuntimeConfig::default()
+    };
+    if let Some(inspect) = &inspect {
+        runtime.inspector = if inspect.wait {
+            InspectorMode::Wait
+        } else {
+            InspectorMode::On
+        };
+        // One isolate per worker, kept up, so breakpoints land in the isolate
+        // DevTools is attached to; and no time limit kills an isolate paused
+        // at one.
+        runtime.min_isolates = 1;
+        runtime.max_isolates = 1;
+        runtime.request_wall_timeout = INSPECT_TIME_LIMIT;
+        runtime.max_queue_wait = INSPECT_TIME_LIMIT;
+        runtime.isolate_startup_timeout = INSPECT_TIME_LIMIT;
     }
 
     let store_dir = std::env::temp_dir().join(format!("dd-dev-runtime-{}", Uuid::new_v4()));
     let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
-        runtime: RuntimeConfig {
-            min_isolates: 0,
-            max_global_isolates: 4,
-            max_isolates: 4,
-            max_inflight_per_isolate: 4,
-            idle_ttl: Duration::from_secs(10),
-            scale_tick: Duration::from_millis(50),
-            debug_code_generation: allow_code_generation,
-            dev_unscoped_fetch: true,
-            ..RuntimeConfig::default()
-        },
+        runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
             memory_outbox_max_concurrent_shards: 8,
@@ -121,7 +196,7 @@ async fn main() -> Result<(), String> {
     .await
     .map_err(|error| error.to_string())?;
 
-    let result = run_stdio(service.clone()).await;
+    let result = run_stdio(service.clone(), inspector_listener).await;
     let shutdown_result = service.shutdown().await.map_err(|error| error.to_string());
     let cleanup_result = tokio::fs::remove_dir_all(&store_dir)
         .await
@@ -159,7 +234,99 @@ async fn forward_console(
     }
 }
 
-async fn run_stdio(service: RuntimeService) -> Result<(), String> {
+#[cfg(feature = "websocket")]
+fn inspect_address(value: &str) -> Result<SocketAddr, String> {
+    dd_server::inspector::inspect_address(value)
+}
+
+#[cfg(not(feature = "websocket"))]
+fn inspect_address(_value: &str) -> Result<SocketAddr, String> {
+    Err(NO_INSPECTOR.into())
+}
+
+#[cfg(not(feature = "websocket"))]
+const NO_INSPECTOR: &str =
+    "this dd_dev_runtime was built without the websocket feature, which --inspect needs";
+
+/// Serves DevTools on `listener`, announcing it and then every worker
+/// isolate as it starts.
+#[cfg(feature = "websocket")]
+fn spawn_inspector(
+    listener: tokio::net::TcpListener,
+    service: RuntimeService,
+    sender: mpsc::Sender<Outgoing>,
+    servers: &mut JoinSet<common::Result<()>>,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read the inspector address: {error}"))?
+        .to_string();
+    servers.spawn(dd_server::inspector::serve_inspector(
+        listener,
+        service.clone(),
+    ));
+    Ok(tokio::spawn(async move {
+        let announce = |worker: Option<String>, isolate: Option<u64>, id: Option<Uuid>| {
+            let socket = id.map(|id| format!("{address}/{id}"));
+            InspectorEvent {
+                event: "inspector",
+                address: address.clone(),
+                worker,
+                isolate,
+                devtools: socket.as_ref().map(|socket| {
+                    format!(
+                        "devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws={socket}"
+                    )
+                }),
+                websocket: socket.map(|socket| format!("ws://{socket}")),
+            }
+        };
+        if sender
+            .send(Outgoing::Inspector(announce(None, None, None)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        // Isolates start and retire on their own threads; polling here, in
+        // the development runtime only, keeps the runtime's API a listing.
+        let mut announced = std::collections::HashSet::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            tick.tick().await;
+            let targets = service.inspector_targets();
+            announced.retain(|id| targets.iter().any(|target| target.id == *id));
+            for target in targets {
+                if !announced.insert(target.id) {
+                    continue;
+                }
+                let event = announce(
+                    Some(target.worker),
+                    Some(target.isolate_id),
+                    Some(target.id),
+                );
+                if sender.send(Outgoing::Inspector(event)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(not(feature = "websocket"))]
+fn spawn_inspector(
+    _listener: tokio::net::TcpListener,
+    _service: RuntimeService,
+    _sender: mpsc::Sender<Outgoing>,
+    _servers: &mut JoinSet<common::Result<()>>,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    Err(NO_INSPECTOR.into())
+}
+
+async fn run_stdio(
+    service: RuntimeService,
+    inspector_listener: Option<tokio::net::TcpListener>,
+) -> Result<(), String> {
     let mut listeners = HashMap::<String, SocketAddr>::new();
     let mut servers = JoinSet::new();
     let stdin = BufReader::new(io::stdin());
@@ -169,6 +336,15 @@ async fn run_stdio(service: RuntimeService) -> Result<(), String> {
         service.subscribe_console(),
         response_tx.clone(),
     ));
+    let inspector_announcer = match inspector_listener {
+        Some(listener) => Some(spawn_inspector(
+            listener,
+            service.clone(),
+            response_tx.clone(),
+            &mut servers,
+        )?),
+        None => None,
+    };
     let writer = tokio::spawn(async move {
         let mut stdout = io::stdout();
         while let Some(outgoing) = response_rx.recv().await {
@@ -178,6 +354,7 @@ async fn run_stdio(service: RuntimeService) -> Result<(), String> {
                     matches!(response.result, Some(CommandResult::Shutdown)),
                 ),
                 Outgoing::Console(event) => (serde_json::to_string(&event), false),
+                Outgoing::Inspector(event) => (serde_json::to_string(&event), false),
             };
             let line = line.map_err(|error| error.to_string())?;
             stdout
@@ -255,6 +432,9 @@ async fn run_stdio(service: RuntimeService) -> Result<(), String> {
     }
 
     console_forwarder.abort();
+    if let Some(announcer) = inspector_announcer {
+        announcer.abort();
+    }
     drop(response_tx);
     writer.await.map_err(|error| error.to_string())?
 }

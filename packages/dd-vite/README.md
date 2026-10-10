@@ -87,6 +87,11 @@ export default defineConfig({
 });
 ```
 
+`inspect: true` (or `inspect: "host:port"`) lets Chrome DevTools debug the
+workers: open `chrome://inspect`, or one of the `devtools://` URLs the plugin
+logs as worker isolates start. See "Debugging workers" in the repository's
+`docs/development.md`.
+
 Advanced integrations can set `mount` to place the worker behind a subpath.
 Options such as `name`, `entry`, `config`, `viteEnvironment`, and
 `deploymentConfig` apply to the entry worker directly at the top level of

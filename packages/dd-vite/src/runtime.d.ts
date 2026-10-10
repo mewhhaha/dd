@@ -1,4 +1,4 @@
-import type { DdDeployConfig, DdRuntimeCommandResult, DdRuntimeDeployResult, DdRuntimeOptions, DdRuntimeStatsResult, DdWorkerBundleOptions, DdWorkerConsoleEvent } from "./types.js";
+import type { DdDeployConfig, DdInspectorEvent, DdRuntimeCommandResult, DdRuntimeDeployResult, DdRuntimeOptions, DdRuntimeStatsResult, DdWorkerBundleOptions, DdWorkerConsoleEvent } from "./types.js";
 
 export type * from "./types.js";
 
@@ -20,6 +20,7 @@ export class DdRuntimeClient {
 export function createDdRuntime(options?: DdRuntimeOptions): DdRuntimeClient;
 export function printWorkerConsole(event: DdWorkerConsoleEvent): void;
 export function formatWorkerConsole(worker: string, message: string): string;
+export function formatInspectorEvent(event: DdInspectorEvent): string;
 export function bundleWorkerEntry(
   entry: string | URL,
   options?: DdWorkerBundleOptions,

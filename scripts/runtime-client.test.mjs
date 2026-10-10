@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { createDdRuntime, formatWorkerConsole } from "../packages/dd-vite/src/runtime.js";
+import { createDdRuntime, formatInspectorEvent, formatWorkerConsole } from "../packages/dd-vite/src/runtime.js";
 
 let root;
 let binary;
@@ -35,11 +35,14 @@ createInterface({ input: process.stdin }).on("line", line => {
   if (command.op === "log") {
     process.stdout.write(JSON.stringify({ event: "console", worker: "app", request_id: "req-1", level: "warn", message: "careful\\nnow" }) + "\\n");
   }
+  if (command.op === "inspect") {
+    process.stdout.write(JSON.stringify({ event: "inspector", address: "127.0.0.1:9339", worker: "app", isolate: 1, devtools: "devtools://devtools/bundled/js_app.html?ws=127.0.0.1:9339/id", websocket: "ws://127.0.0.1:9339/id" }) + "\\n");
+  }
   if (command.op === "break_stdin") {
     process.stdin.pause();
     require("node:fs").closeSync(0);
   }
-  process.stdout.write(JSON.stringify({ id: command.id, ok: true, result: { pid: process.pid } }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: command.id, ok: true, result: { pid: process.pid, args: process.argv.slice(2) } }) + "\\n");
 });
 `);
   await chmod(binary, 0o755);
@@ -109,4 +112,24 @@ test("worker console events reach onConsole instead of the protocol", async () =
     { event: "console", worker: "app", request_id: "req-1", level: "warn", message: "careful\nnow" },
   ]);
   assert.equal(formatWorkerConsole("app", "careful\nnow"), "[dd:app] careful\n         now");
+});
+
+test("inspect becomes the runtime's --inspect flag and its events reach onInspector", async () => {
+  const events = [];
+  const runtime = client({ inspect: "127.0.0.1:9339", onInspector: event => events.push(event) });
+  const { pid, args } = await runtime.request({ op: "inspect" });
+  pids.add(pid);
+  assert.ok(args.includes("--inspect=127.0.0.1:9339"), args.join(" "));
+  assert.deepEqual(events.map(event => event.worker), ["app"]);
+  assert.equal(
+    formatInspectorEvent(events[0]),
+    "[dd:app] DevTools for isolate 1: devtools://devtools/bundled/js_app.html?ws=127.0.0.1:9339/id",
+  );
+  assert.match(formatInspectorEvent({ event: "inspector", address: "127.0.0.1:9229" }), /chrome:\/\/inspect/);
+
+  const plain = client({ inspect: true });
+  const { pid: plainPid, args: plainArgs } = await plain.request({ op: "ping" });
+  pids.add(plainPid);
+  assert.ok(plainArgs.includes("--inspect"), plainArgs.join(" "));
+  await assert.rejects(client({ inspect: 9229 }).request({ op: "ping" }), /inspect must be true or a "host:port" string/);
 });

@@ -33,6 +33,7 @@ export class DdRuntimeClient {
       closeTimeoutMs: DEFAULT_CLOSE_TIMEOUT_MS,
       allowCodeGeneration: true,
       onConsole: printWorkerConsole,
+      onInspector: printInspectorEvent,
       ...options,
     };
   }
@@ -268,6 +269,17 @@ export class DdRuntimeClient {
       this.options.onConsole?.(event);
       return;
     }
+    if (isInspectorEventLine(line)) {
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        this.#stderr = `${this.#stderr}${line}\n`.slice(-16_384);
+        return;
+      }
+      this.options.onInspector?.(event);
+      return;
+    }
     if (!isRuntimeProtocolLine(line)) {
       this.#stderr = `${this.#stderr}${line}\n`.slice(-16_384);
       return;
@@ -339,11 +351,29 @@ function isConsoleEventLine(line) {
   return line.startsWith('{"event":"console"');
 }
 
+function isInspectorEventLine(line) {
+  return line.startsWith('{"event":"inspector"');
+}
+
 /** The default destination for worker console output: this process's
  * stdout, or stderr for warnings and errors, each line tagged with the worker. */
 export function printWorkerConsole({ worker, level, message }) {
   const stream = level === "error" || level === "warn" ? process.stderr : process.stdout;
   stream.write(`${formatWorkerConsole(worker, message)}\n`);
+}
+
+function printInspectorEvent(event) {
+  process.stderr.write(`${formatInspectorEvent(event)}\n`);
+}
+
+/** How to attach Chrome DevTools: for the listener, where to find it; for a
+ * worker isolate, the DevTools URL that opens it. */
+export function formatInspectorEvent({ address, worker, isolate, devtools }) {
+  if (!worker) {
+    const configure = address === "127.0.0.1:9229" ? "" : ` (add ${address} under "Discover network targets" first)`;
+    return `[dd] Debugger listening on ${address}. Open chrome://inspect in Chrome${configure} to debug worker isolates.`;
+  }
+  return `[dd:${worker}] DevTools for isolate ${isolate}: ${devtools}`;
 }
 
 export function formatWorkerConsole(worker, message) {
@@ -399,6 +429,10 @@ function runtimeCommand(options) {
   if (options.allowCodeGeneration !== false) {
     args.push("--allow-code-generation");
   }
+  const inspect = inspectArgument(options.inspect);
+  if (inspect) {
+    args.push(inspect);
+  }
   if (options.binary) {
     return { command: options.binary, args, cwd: options.cwd ?? process.cwd() };
   }
@@ -436,6 +470,19 @@ function runtimeCommand(options) {
   throw new Error(
     "No dd dev runtime binary found. Install @mewhhaha/dd, set DD_DEV_RUNTIME_BIN, or run inside a dd source checkout.",
   );
+}
+
+function inspectArgument(inspect) {
+  if (inspect == null || inspect === false) {
+    return undefined;
+  }
+  if (inspect === true) {
+    return "--inspect";
+  }
+  if (typeof inspect === "string" && inspect.trim() !== "") {
+    return `--inspect=${inspect.trim()}`;
+  }
+  throw new TypeError('dd runtime option inspect must be true or a "host:port" string');
 }
 
 function packagedRuntimeBinary() {

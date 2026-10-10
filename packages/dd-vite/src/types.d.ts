@@ -176,9 +176,29 @@ export interface DdRuntimeOptions {
   timeoutMs?: number;
   closeTimeoutMs?: number;
   allowCodeGeneration?: boolean;
+  /** Serves Chrome DevTools for every worker isolate: `true` on
+   * 127.0.0.1:9229, or a `"host:port"` (a host name must be loopback). */
+  inspect?: DdInspectOption;
   /** Receives every worker `console` call. Defaults to printing it on this
    * process's stdout (stderr for warnings and errors). */
   onConsole?: (event: DdWorkerConsoleEvent) => void;
+  /** Receives where DevTools attaches: once for the listener, then once per
+   * worker isolate. Defaults to printing it on this process's stderr. */
+  onInspector?: (event: DdInspectorEvent) => void;
+}
+
+export type DdInspectOption = boolean | string;
+
+export interface DdInspectorEvent {
+  event: "inspector";
+  /** The inspector's `host:port`. */
+  address: string;
+  /** Set for a worker isolate, with the URLs that debug it. */
+  worker?: string;
+  isolate?: number;
+  /** Paste into Chrome's address bar to open DevTools on the isolate. */
+  devtools?: string;
+  websocket?: string;
 }
 
 export interface DdWorkerConsoleEvent {
@@ -266,6 +286,10 @@ export interface DdGeneratedDeploymentConfigOptions {
 }
 
 export interface DdVitePluginOptions extends DdWorkerRuntimeOptions {
+  /** Debug workers in Chrome DevTools: `true` serves the inspector on
+   * 127.0.0.1:9229, a `"host:port"` string elsewhere. Ignored with a
+   * `runtime` of your own. */
+  inspect?: DdInspectOption;
   mount?: string;
   middleware?: boolean;
   environment?: boolean;

@@ -3,6 +3,8 @@ mod deploy_tokens;
 mod handlers;
 #[cfg(test)]
 mod handlers_runtime_tests;
+#[cfg(feature = "websocket")]
+pub mod inspector;
 mod state;
 mod trace_health;
 
