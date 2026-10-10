@@ -408,6 +408,26 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 - real HTTP/1 server benchmark: `cargo run -p dd_server --bin bench_http_server --release`
 - public naming guard: `bash scripts/check_public_memory_naming.sh`
 
+### Fuzzing dd_v8
+
+`crates/dd_v8` is the only path from worker JavaScript into Rust, so it has
+cargo-fuzz targets in `crates/dd_v8/fuzz` (a separate crate, outside the
+workspace). Install `cargo-fuzz` and a nightly toolchain, then run one:
+
+```bash
+just fuzz-dd-v8 deserialize                       # bytes into op_deserialize, storage and message mode
+just fuzz-dd-v8 serde_roundtrip                   # arbitrary Rust values through serde_v8 and V8's serializer
+just fuzz-dd-v8 js_values -- -max_total_time=300  # a byte grammar of JS values and buffers fed to every op
+```
+
+The corpus lands in `crates/dd_v8/fuzz/corpus/<target>` and crashing inputs in
+`crates/dd_v8/fuzz/artifacts/<target>`; both are ignored. Pass
+`-detect_leaks=0` if LeakSanitizer reports V8's process-lifetime allocations.
+The first build downloads rusty_v8's static library again; set
+`RUSTY_V8_ARCHIVE` to an existing `librusty_v8.a` of the same version to skip
+that. The deterministic edge cases the fuzzers grew out of run in normal CI:
+`cargo test -p dd_v8`.
+
 ## Fly helpers
 
 - proxy private port: `just fly-proxy <app>`

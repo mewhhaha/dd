@@ -8,6 +8,8 @@ members = [
   "crates/runtime",
   "crates/storage",
 ]
+# cargo-fuzz builds the fuzz crate on its own, with sanitizer flags.
+exclude = ["crates/dd_v8/fuzz"]
 resolver = "2"
 
 [workspace.package]

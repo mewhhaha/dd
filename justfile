@@ -116,6 +116,10 @@ check-js:
   node --check packages/dd-vite/src/vitest-environment.js
   pnpm --filter dd-vite-hono-example exec tsc -p ../../scripts/kv-contract.tsconfig.json
 
+# Fuzz one dd_v8 target (deserialize, serde_roundtrip or js_values) with cargo-fuzz on nightly; args after `--` go to libFuzzer.
+fuzz-dd-v8 target *args:
+  cd crates/dd_v8 && cargo +nightly fuzz run {{target}} {{args}}
+
 # Verify acknowledged state mutations across forced server termination in a disposable store.
 check-state-crash:
   cargo build --locked -p dd_server --bin dd_server
