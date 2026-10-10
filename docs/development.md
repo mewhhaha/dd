@@ -461,6 +461,52 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 - keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`
 - real HTTP/1 server benchmark: `cargo run -p dd_server --bin bench_http_server --release`
 - public naming guard: `bash scripts/check_public_memory_naming.sh`
+- web-platform-tests: `just wpt` (see below)
+
+## Web platform tests
+
+`just wpt` runs [web-platform-tests](https://github.com/web-platform-tests/wpt)
+for the web APIs workers get (streams, fetch's classes, URL, URLPattern,
+encoding, Web Crypto, events and abort, Blob and File, structuredClone,
+atob, hr-time, console) and compares the results with
+`wpt/expectations.json`. CI runs it in the `wpt` job.
+
+- `wpt/WPT_SHA` pins the WPT commit. `scripts/wpt/fetch.sh` makes a shallow,
+  blob-less, sparse checkout of that commit into `.cache/wpt` (gitignored;
+  `WPT_DIR` overrides it) and does nothing when the checkout is already there.
+  The runner refuses a checkout at any other commit, so the pin is the only
+  thing that changes test inputs. Nothing in the checkout is executed except
+  as test input.
+- `wpt/config.json` lists the directories to run and the files to skip, each
+  with its reason: tests that need wptserve or XMLHttpRequest, and the few
+  that crash or never finish because of a known bug.
+- The runner (`crates/runtime/src/bin/wpt`) runs every `.any.js` file that
+  wptserve would also run in a worker, and every `.worker.js` file, in a
+  fresh worker isolate configured as production configures one (no `eval`, no
+  internals). It loads them as wptserve's classic worker wrapper does:
+  testharness.js, the `// META: script=` includes, the test, `done()`, once per
+  `// META: variant=`. The per-file timeout is 10 s (60 s for
+  `// META: timeout=long`), tripled in debug builds. `.window.js` tests need a
+  document and are not run.
+- The test isolate gets a `location` and, for `.worker.js` files,
+  `importScripts`, since tests are written against a served page. A test's
+  `fetch` of a `.json` or `.idl` data file is answered from the checkout;
+  every other fetch, and every fetch in `fetch/`'s own tests, is dd's.
+
+`wpt/expectations.json` records, for every file run (and variant), how many
+subtests it has, how many pass, and the names of those that do not (left
+out when none passes), plus `"harness": "fail"` when the harness itself did
+not finish. Every difference fails the run: a subtest that fails without
+being listed, a listed one that now passes or no longer exists, and a change
+in either count, so the expectations stay current. After a change that fixes
+(or breaks) conformance on purpose, regenerate and commit them:
+
+```bash
+just wpt --update
+just wpt streams/piping -v      # one directory, with every failure's message
+```
+
+Bumping the pin is the same: edit `wpt/WPT_SHA`, then `just wpt --update`.
 
 ### Fuzzing dd_v8
 

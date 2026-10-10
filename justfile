@@ -120,6 +120,12 @@ check-js:
 fuzz-dd-v8 target *args:
   cd crates/dd_v8 && cargo +nightly fuzz run {{target}} {{args}}
 
+# Run the web-platform-tests against the worker runtime, fetching the pinned checkout first if it is missing.
+# Arguments go to the runner: path filters, --update, --jobs N, -v.
+wpt *args:
+  bash scripts/wpt/fetch.sh
+  cargo run --locked -p runtime --bin wpt -- {{args}}
+
 # Verify acknowledged state mutations across forced server termination in a disposable store.
 check-state-crash:
   cargo build --locked -p dd_server --bin dd_server

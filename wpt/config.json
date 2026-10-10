@@ -1,0 +1,31 @@
+{
+  "areas": [
+    "streams",
+    "fetch/api/headers",
+    "fetch/api/request",
+    "fetch/api/response",
+    "fetch/api/body",
+    "url",
+    "urlpattern",
+    "encoding",
+    "WebCryptoAPI",
+    "dom/abort",
+    "dom/events",
+    "FileAPI",
+    "html/webappapis/atob",
+    "html/webappapis/microtask-queuing",
+    "html/webappapis/structured-clone",
+    "hr-time",
+    "console"
+  ],
+  "skip": {
+    "WebCryptoAPI/derive_bits_keys/derived_bits_length.https.any.js": "never finishes: PBKDF2 deriveBits with length -8 takes it as 4294967288 bits instead of throwing, and derives half a gigabyte in a blocking thread nothing can cancel",
+    "console/console-log-large-array.any.js": "aborts the process: console.log of a 10M-element array calls Reflect.ownKeys on it, which exhausts the isolate heap inside one builtin, and V8 treats that as fatal",
+    "FileAPI/file/send-file-formdata*": "posts files to a wptserve echo endpoint",
+    "FileAPI/url/url-with-xhr.any.js": "tests blob URLs through XMLHttpRequest, which dd does not have",
+    "encoding/replacement-encodings.any.js": "decodes wptserve responses through XMLHttpRequest",
+    "encoding/unsupported-encodings.any.js": "decodes wptserve responses through XMLHttpRequest",
+    "fetch/api/headers/headers-no-cors.any.js": "loads its test data from wptserve with fetch",
+    "fetch/api/request/request-cache-*": "needs wptserve's caching endpoints"
+  }
+}

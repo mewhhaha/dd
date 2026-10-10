@@ -2,6 +2,7 @@ mod assets;
 
 use storage::control as control_store;
 pub(crate) use storage::{cache, json, kv, memory, turso_util};
+pub mod conformance;
 mod engine;
 mod module_registry;
 mod ops;

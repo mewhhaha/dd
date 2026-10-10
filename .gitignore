@@ -17,3 +17,6 @@ packages/dd-runtime-*/bin/dd_dev_runtime.exe
 
 # Benchmark sampler output is generated locally. Keep durable summaries in Markdown.
 benchmarks/results/*.json
+
+# Web-platform-tests checkout fetched by scripts/wpt/fetch.sh.
+/.cache/

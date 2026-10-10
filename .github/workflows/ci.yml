@@ -42,6 +42,27 @@ jobs:
       - run: cargo build --locked -p dd_server --bin dd_server
       - run: python3 scripts/verify-durable-state.py
 
+  wpt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Read the WPT pin
+        id: wpt-pin
+        run: echo "sha=$(tr -d '[:space:]' < wpt/WPT_SHA)" >> "$GITHUB_OUTPUT"
+      # The checkout depends only on the pin and the sparse list in fetch.sh.
+      - name: Cache the WPT checkout
+        uses: actions/cache@v5
+        with:
+          path: .cache/wpt
+          key: wpt-${{ steps.wpt-pin.outputs.sha }}-${{ hashFiles('scripts/wpt/fetch.sh') }}
+      - run: bash scripts/wpt/fetch.sh
+      - run: cargo build --locked -p runtime --bin wpt
+      - run: target/debug/wpt
+
   javascript:
     runs-on: ubuntu-latest
     steps:
