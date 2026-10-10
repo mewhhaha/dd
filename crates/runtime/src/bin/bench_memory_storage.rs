@@ -344,6 +344,7 @@ async fn main() -> Result<(), String> {
         BenchArgAction::Run => {}
     }
 
+    let _store_cleanup = StoreCleanup;
     let mode = env_mode_checked()?;
     let profile_enabled = env_flag("DD_BENCH_PROFILE_MEMORY");
     let options = bench_options_from_env();

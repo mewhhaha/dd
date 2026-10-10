@@ -16,10 +16,30 @@ pub(super) struct BenchPaths {
     pub(super) store_dir: PathBuf,
 }
 
+/// Every store root this process created; [`StoreCleanup`] removes them.
+static STORE_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 pub(super) fn bench_paths(tag: &str) -> BenchPaths {
     let root = std::env::temp_dir().join(format!("dd-bench-{tag}-{}", Uuid::new_v4()));
+    STORE_ROOTS
+        .lock()
+        .expect("store roots lock")
+        .push(root.clone());
     BenchPaths {
         store_dir: root.join("store"),
+    }
+}
+
+/// Removes the benchmark's stores when `main` returns, error paths included.
+/// Each run used to leave its store behind in the temp directory.
+pub(super) struct StoreCleanup;
+
+impl Drop for StoreCleanup {
+    fn drop(&mut self) {
+        let roots = std::mem::take(&mut *STORE_ROOTS.lock().expect("store roots lock"));
+        for root in roots {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
 
