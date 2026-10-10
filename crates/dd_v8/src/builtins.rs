@@ -346,6 +346,11 @@ impl v8::ValueDeserializerImpl for Delegate<'_> {
         if !deserializer.read_uint32(&mut index) {
             return None;
         }
+        // V8 forbids JavaScript while it deserializes and aborts the process
+        // if any runs. Besides the reviver itself, reading `type` and looking
+        // it up can run getters and `toString` that scripts define on
+        // `Object.prototype`, and the host object list can hold accessors.
+        v8::allow_javascript_execution_scope!(let scope, scope);
         if index == u32::MAX {
             if let Some(deserializers) = self.deserializers
                 && let Some(description) = deserializer.read_value(scope.get_current_context())
@@ -355,7 +360,6 @@ impl v8::ValueDeserializerImpl for Delegate<'_> {
                 let revive = deserializers.get(scope, kind)?;
                 if let Ok(revive) = v8::Local::<v8::Function>::try_from(revive) {
                     let receiver = v8::null(scope).into();
-                    v8::allow_javascript_execution_scope!(let scope, scope);
                     let revived = revive.call(scope, receiver, &[description])?;
                     return revived.to_object(scope);
                 }

@@ -1135,6 +1135,47 @@ mod tests {
         );
     }
 
+    /// A branded object whose description has no `type` makes the
+    /// deserializer read `type` through Object.prototype. With a getter
+    /// there, that ran JavaScript inside V8's no-JavaScript deserializer
+    /// scope, which V8 answers by aborting the process.
+    #[test]
+    #[serial]
+    fn structured_clone_survives_scripts_run_by_the_deserializer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        let result = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                const branded = { [Symbol.for("Deno.core.hostObject")]() { return {}; } };
+                Object.defineProperty(Object.prototype, "type", { configurable: true, get() { return "Blob"; } });
+                let outcome;
+                try {
+                  outcome = typeof structuredClone([branded]);
+                } catch (error) {
+                  outcome = error.name;
+                } finally {
+                  delete Object.prototype.type;
+                }
+                outcome
+                "#,
+            )
+            .expect("structuredClone should not abort");
+        let outcome = string(&mut js_runtime, result);
+        assert!(
+            ["object", "TypeError", "DataCloneError"].contains(&outcome.as_str()),
+            "{outcome}"
+        );
+    }
+
     #[test]
     #[serial]
     fn webassembly_streaming_compiles_responses() {
