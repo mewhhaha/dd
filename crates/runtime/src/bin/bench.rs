@@ -727,6 +727,8 @@ export default {
         let seed = start_service_with_paths(runtime.clone(), &paths.store_dir).await?;
         seed.deploy(worker_name.clone(), source.to_string()).await?;
         seed.shutdown().await?;
+        // The service holds the state directory's lock until it is dropped.
+        drop(seed);
 
         let startup_started = Instant::now();
         let restored = start_service_with_paths(runtime.clone(), &paths.store_dir).await?;
@@ -736,6 +738,7 @@ export default {
         restored.invoke(worker_name, invocation("/", idx)).await?;
         first_invoke.push(invoke_started.elapsed());
         restored.shutdown().await?;
+        drop(restored);
 
         let _ = tokio::fs::remove_dir_all(paths.root).await;
     }
