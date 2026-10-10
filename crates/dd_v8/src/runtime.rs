@@ -163,10 +163,10 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    /// Terminates the JavaScript running on the runtime's thread. A thread
-    /// the debugger holds at a breakpoint, or one waiting for a debugger, is
-    /// let go first, and the inspector stops pausing for good. Returns false
-    /// once the isolate is gone.
+    /// Terminates the JavaScript running on the runtime's thread, letting go
+    /// of a thread the debugger holds at a breakpoint or one waiting for a
+    /// debugger; the inspector stops pausing for good. Returns false once the
+    /// isolate is gone.
     pub fn terminate_execution(&self) -> bool {
         let terminated = self.isolate.terminate_execution();
         if let Some(inspector) = self.inspector.get() {
