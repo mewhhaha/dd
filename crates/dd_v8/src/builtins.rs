@@ -646,8 +646,10 @@ async fn op_timer_sleep(state: Rc<RefCell<OpState>>, id: u32, millis: f64) -> bo
     } else {
         0.0
     };
+    // Finite delays past `Duration::MAX` (about 1.8e22 ms) wait forever.
+    let delay = Duration::try_from_secs_f64(millis / 1000.0).unwrap_or(Duration::MAX);
     let fired = tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs_f64(millis / 1000.0)) => true,
+        _ = tokio::time::sleep(delay) => true,
         _ = cancelled => false,
     };
     if let Some(timers) = state.borrow_mut().try_borrow_mut::<Timers>() {
