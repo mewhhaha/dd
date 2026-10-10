@@ -6463,13 +6463,12 @@
     "The prototype chain must be correct"
   ] },
   "console/console-label-conversion.any.js": { "subtests": 10, "pass": 10 },
+  "console/console-log-large-array.any.js": { "subtests": 1, "pass": 1 },
   "console/console-log-symbol.any.js": { "subtests": 1, "pass": 1 },
   "console/console-namespace-object-class-string.any.js": { "subtests": 4, "pass": 4 },
   "console/console-tests-historical.any.js": { "subtests": 3, "pass": 3 },
-  "console/idlharness.any.js": { "subtests": 28, "pass": 25, "fail": [
-    "console namespace: [[Prototype]] is Object.prototype",
-    "console namespace: operation dir(optional any, optional object?)",
-    "console namespace: operation table(optional any, optional sequence<DOMString>)"
+  "console/idlharness.any.js": { "subtests": 28, "pass": 27, "fail": [
+    "console namespace: [[Prototype]] is Object.prototype"
   ] },
   "dom/abort/AbortSignal.any.js": { "subtests": 2, "pass": 2 },
   "dom/abort/abort-signal-any.any.js": { "subtests": 14, "pass": 14 },
