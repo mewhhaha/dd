@@ -7,15 +7,15 @@
   const MEMORY_RUNTIME_EFFECT_VERSION = 1;
 
   const writeMemoryEffectU16 = (target, offset, value) => {
-    const normalized = Math.max(0, Math.min(0xffff, Math.trunc(Number(value ?? 0) || 0)));
+    const normalized = MathMax(0, MathMin(0xffff, MathTrunc(Number(value ?? 0) || 0)));
     target[offset] = (normalized >>> 8) & 0xff;
     target[offset + 1] = normalized & 0xff;
     return offset + 2;
   };
 
   const writeMemoryEffectU32 = (target, offset, value) => {
-    const normalized = Math.trunc(Number(value ?? 0) || 0);
-    if (!Number.isFinite(normalized) || normalized < 0 || normalized > 0xffffffff) {
+    const normalized = MathTrunc(Number(value ?? 0) || 0);
+    if (!NumberIsFinite(normalized) || normalized < 0 || normalized > 0xffffffff) {
       throw new Error("memory runtime effect field is too large");
     }
     target[offset] = (normalized >>> 24) & 0xff;
@@ -27,17 +27,17 @@
 
   const writeMemoryEffectBytes = (target, offset, value) => {
     const bytes = toArrayBytes(value);
-    offset = writeMemoryEffectU32(target, offset, bytes.byteLength);
-    target.set(bytes, offset);
-    return offset + bytes.byteLength;
+    offset = writeMemoryEffectU32(target, offset, byteLength(bytes));
+    TypedArrayPrototypeSet(target, bytes, offset);
+    return offset + byteLength(bytes);
   };
 
-  const memoryEffectStringBytes = (value) => toUtf8Bytes(String(value ?? ""));
+  const memoryEffectStringBytes = (value) => toBytes(String(value ?? ""));
 
   const encodeMemorySocketSendEffect = (handle, payload) => {
     const handleBytes = memoryEffectStringBytes(handle);
     const messageBytes = toArrayBytes(payload.value);
-    const out = new Uint8Array(10 + handleBytes.byteLength + messageBytes.byteLength);
+    const out = new Uint8Array(10 + byteLength(handleBytes) + byteLength(messageBytes));
     let offset = 0;
     out[offset] = MEMORY_RUNTIME_EFFECT_VERSION;
     offset += 1;
@@ -51,7 +51,7 @@
   const encodeMemoryCloseEffect = (handle, code, reason) => {
     const handleBytes = memoryEffectStringBytes(handle);
     const reasonBytes = memoryEffectStringBytes(reason);
-    const out = new Uint8Array(11 + handleBytes.byteLength + reasonBytes.byteLength);
+    const out = new Uint8Array(11 + byteLength(handleBytes) + byteLength(reasonBytes));
     let offset = 0;
     out[offset] = MEMORY_RUNTIME_EFFECT_VERSION;
     offset += 1;
@@ -64,15 +64,17 @@
 
   const encodeSocketSendPayload = (value, kind) => {
     if (kind != null) {
-      const normalizedKind = String(kind).toLowerCase();
+      const normalizedKind = StringPrototypeToLowerCase(String(kind));
       if (normalizedKind === "text") {
         return {
+          __proto__: null,
           kind: "text",
-          value: toUtf8Bytes(String(value)),
+          value: toBytes(String(value)),
         };
       }
       if (normalizedKind === "binary") {
         return {
+          __proto__: null,
           kind: "binary",
           value: toArrayBytes(value),
         };
@@ -81,31 +83,35 @@
     }
     if (isBinaryLike(value)) {
       return {
+        __proto__: null,
         kind: "binary",
         value: toArrayBytes(value),
       };
     }
     return {
+      __proto__: null,
       kind: "text",
-      value: toUtf8Bytes(String(value ?? "")),
+      value: toBytes(String(value ?? "")),
     };
   };
 
   const encodeMemoryStorageValue = (value) => {
     if (typeof value === "string") {
       return {
+        __proto__: null,
         encoding: "utf8",
-        value: toUtf8Bytes(value),
+        value: toBytes(value),
       };
     }
     return {
+      __proto__: null,
       encoding: "v8sc",
-      value: new Uint8Array(core.serialize(value, { forStorage: true })),
+      value: new Uint8Array(core.serialize(value, FOR_STORAGE)),
     };
   };
 
   const takeMemoryBytes = (record) => {
-    const handle = Math.max(0, Math.trunc(Number(record?.value_handle ?? 0) || 0));
+    const handle = toHandle(record?.value_handle);
     if (handle > 0) {
       return callOp("op_memory_bytes_take", activeRequestContextHandle(), handle);
     }
@@ -122,7 +128,7 @@
       return core.decode(bytes);
     }
     if (encoding === "v8sc") {
-      return core.deserialize(bytes, { forStorage: true });
+      return core.deserialize(bytes, FOR_STORAGE);
     }
     throw new Error(`memory storage get unsupported encoding: ${encoding}`);
   };
@@ -130,8 +136,9 @@
   const ensureMemoryStorageState = (entry) => {
     if (!entry.storageState) {
       entry.storageState = {
+        __proto__: null,
         failedError: null,
-        outputGate: Promise.resolve(),
+        outputGate: PromiseResolve(),
       };
     }
     return entry.storageState;
@@ -159,12 +166,12 @@
       entry.memoryKey,
       memoryScopedScopeHandle(entry),
     );
-    for (const handle of socketHandles) {
+    for (let i = 0; i < socketHandles.length; i++) {
       try {
         const result = await callOp(
           "op_memory_socket_close",
           memoryScopedScopeHandle(entry),
-          handle,
+          socketHandles[i],
           entry.binding,
           entry.memoryKey,
           1011,
@@ -172,10 +179,10 @@
         );
         await syncFrozenTime();
         if (result && typeof result === "object" && result.ok === false) {
-          console.warn(String(result.error ?? "memory socket close failed"));
+          consoleWarn(String(result.error ?? "memory socket close failed"));
         }
       } catch (error) {
-        console.warn("memory socket close after storage failure failed", error);
+        consoleWarn("memory socket close after storage failure failed", error);
       }
     }
   };
@@ -185,29 +192,37 @@
     if (storageState.failedError) {
       throw storageState.failedError;
     }
-    const failure = error instanceof Error ? error : new Error(String(error ?? "memory namespace failed"));
+    const failure = ObjectPrototypeIsPrototypeOf(ErrorPrototype, error)
+      ? error
+      : new Error(String(error ?? "memory namespace failed"));
     storageState.failedError = failure;
     try {
       await closeMemoryResourcesOnFailure(entry);
     } catch (closeError) {
-      console.warn("memory socket cleanup after storage failure failed", closeError);
+      consoleWarn("memory socket cleanup after storage failure failed", closeError);
     }
     throw failure;
   };
 
+  // Runs `callback` once the entry's earlier output has gone out. The gate
+  // itself never rejects.
   const gateMemoryOutput = (entry, callback) => {
     const storageState = ensureMemoryStorageState(entry);
-    const run = async () => {
+    const previous = storageState.outputGate;
+    const gated = (async () => {
+      await previous;
       if (storageState.failedError) {
         throw storageState.failedError;
       }
       return await callback();
-    };
-    const gated = storageState.outputGate.then(run, run);
-    storageState.outputGate = gated.then(
-      () => undefined,
-      () => undefined,
-    );
+    })();
+    storageState.outputGate = (async () => {
+      try {
+        await gated;
+      } catch {
+        // The caller sees the failure; the gate only orders output.
+      }
+    })();
     return gated;
   };
 
@@ -225,9 +240,9 @@
 
 
   const beginMemoryCommand = async (entry, idempotencyKey) => {
-    const normalizedKey = String(idempotencyKey ?? "").trim();
+    const normalizedKey = StringPrototypeTrim(String(idempotencyKey ?? ""));
     if (!normalizedKey) {
-      return { handle: 0, hit: false, value: null };
+      return { __proto__: null, handle: 0, hit: false, value: null };
     }
     const result = await callOp(
       "op_memory_command_begin",
@@ -242,21 +257,22 @@
       throw new Error(String(result?.error ?? "memory command begin failed"));
     }
     return {
-      handle: Math.max(0, Math.trunc(Number(result.handle ?? 0) || 0)),
+      __proto__: null,
+      handle: toHandle(result.handle),
       hit: result.hit === true,
       value: result.hit === true ? takeMemoryBytes(result) : null,
     };
   };
 
   const closeMemoryCommand = (handle) => {
-    const normalizedHandle = Math.max(0, Math.trunc(Number(handle ?? 0) || 0));
+    const normalizedHandle = toHandle(handle);
     if (normalizedHandle > 0) {
       callOp("op_memory_command_close", normalizedHandle);
     }
   };
 
   const createMemoryTxn = async (entry, commandHandle) => {
-    const started = performance.now();
+    const started = frozenPerfNow();
     const result = await callOp(
       "op_memory_batch_begin",
       activeRequestContextHandle(),
@@ -273,12 +289,12 @@
       }
       throw error;
     }
-    recordMemoryProfile("js_txn_begin", performance.now() - started, 1);
-    return { entry, batchHandle: result.handle };
+    recordMemoryProfile("js_txn_begin", frozenPerfNow() - started, 1);
+    return { __proto__: null, entry, batchHandle: result.handle };
   };
 
   const closeMemoryBatch = (handle) => {
-    const normalizedHandle = Math.max(0, Math.trunc(Number(handle ?? 0) || 0));
+    const normalizedHandle = toHandle(handle);
     if (normalizedHandle > 0) {
       callOp("op_memory_batch_close", normalizedHandle);
     }
@@ -335,14 +351,14 @@
     if (!txn) {
       return;
     }
-    const started = performance.now();
+    const started = frozenPerfNow();
     const result = await callOp("op_memory_batch_apply", txn.batchHandle);
     await syncFrozenTime();
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory transaction commit failed"));
     }
     if (result.read_only === true || result.applied !== true) {
-      recordMemoryProfile("js_read_only_commit", performance.now() - started, 1);
+      recordMemoryProfile("js_read_only_commit", frozenPerfNow() - started, 1);
       return;
     }
     if (result.output_gate_required === true) {
@@ -350,24 +366,44 @@
     }
     recordMemoryProfile(
       "js_txn_commit",
-      performance.now() - started,
+      frozenPerfNow() - started,
       result.mutation_count + 1,
     );
   };
 
 
-  const memoryStorageKey = (key) => String(key).toWellFormed();
+  const memoryStorageKey = (key) => StringPrototypeToWellFormed(String(key));
 
   const compareMemoryKeys = (left, right) => {
-    const order = left.localeCompare(right);
+    const order = StringPrototypeLocaleCompare(left, right);
     if (order !== 0 || left === right) return order;
     // Match SQL's binary ordering for distinct keys with equal collation.
-    const leftBytes = toUtf8Bytes(left);
-    const rightBytes = toUtf8Bytes(right);
-    for (let index = 0; index < Math.min(leftBytes.length, rightBytes.length); index++) {
+    const leftBytes = toBytes(left);
+    const rightBytes = toBytes(right);
+    const leftLength = TypedArrayPrototypeGetLength(leftBytes);
+    const rightLength = TypedArrayPrototypeGetLength(rightBytes);
+    for (let index = 0; index < MathMin(leftLength, rightLength); index++) {
       if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
     }
-    return leftBytes.length - rightBytes.length;
+    return leftLength - rightLength;
+  };
+
+  // The first `limit` of `keys` in key order, each with what `read` gives
+  // for it.
+  const listMemoryEntries = (keys, limit, read) => {
+    const sorted = ArrayPrototypeSort(keys, compareMemoryKeys);
+    const entries = [];
+    for (let i = 0; i < sorted.length && i < limit; i++) {
+      ArrayPrototypePush(entries, { key: sorted[i], value: read(sorted[i]) });
+    }
+    return entries;
+  };
+
+  const memoryListLimit = (options) => {
+    const limitInput = Number(options?.limit ?? 100);
+    return NumberIsFinite(limitInput)
+      ? MathMax(1, MathMin(1000, MathTrunc(limitInput)))
+      : 100;
   };
 
   const createMemoryStorageBinding = (entry, txn) => {
@@ -375,12 +411,13 @@
       if (
         options
         && typeof options === "object"
-        && Object.keys(options).length > 0
+        && ObjectKeys(options).length > 0
       ) {
         throw new Error(`memory atomic ${operation} options are unsupported`);
       }
     };
     return {
+      __proto__: null,
       get(key, options = {}) {
         rejectStorageOptions("get", options);
         const storageState = ensureMemoryStorageState(entry);
@@ -393,6 +430,7 @@
           return null;
         }
         return {
+          __proto__: null,
           value: decodeMemoryStorageValue(record),
         };
       },
@@ -404,13 +442,13 @@
         }
         const normalizedKey = memoryStorageKey(key);
         const encoded = encodeMemoryStorageValue(value);
-        const record = {
+        addMemoryBatchMutation(txn, {
+          __proto__: null,
           key: normalizedKey,
           value: encoded.value,
           encoding: encoded.encoding,
           deleted: false,
-        };
-        addMemoryBatchMutation(txn, record);
+        });
       },
       delete(key, options = {}) {
         rejectStorageOptions("delete", options);
@@ -419,13 +457,13 @@
           throw storageState.failedError;
         }
         const normalizedKey = memoryStorageKey(key);
-        const record = {
+        addMemoryBatchMutation(txn, {
+          __proto__: null,
           key: normalizedKey,
           value: new Uint8Array(),
           encoding: "utf8",
           deleted: true,
-        };
-        addMemoryBatchMutation(txn, record);
+        });
       },
       list(options = {}) {
         const storageState = ensureMemoryStorageState(entry);
@@ -433,14 +471,11 @@
           throw storageState.failedError;
         }
         const prefix = memoryStorageKey(options?.prefix ?? "");
-        const limitInput = Number(options?.limit ?? 100);
-        const limit = Number.isFinite(limitInput)
-          ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
-          : 100;
-        return memoryTxnKeys(txn, prefix)
-          .sort(compareMemoryKeys)
-          .slice(0, limit)
-          .map(key => ({ key, value: decodeMemoryStorageValue(memoryTxnReadRecord(txn, key)) }));
+        return listMemoryEntries(
+          memoryTxnKeys(txn, prefix),
+          memoryListLimit(options),
+          (key) => decodeMemoryStorageValue(memoryTxnReadRecord(txn, key)),
+        );
       },
     };
   };

@@ -226,6 +226,19 @@ dd-vite's `node:async_hooks` shim uses). The development runtime adds
 `RuntimeConfig::expose_internals` to reach the bootstrap object as
 `__dd_internals`.
 
+Worker code still shares the context, and may replace any global or
+built-in method, so the runtime's scripts use only what they captured while
+the snapshot was built: built-ins from `primordials`, the web classes from
+`dd.web` and their uncurried methods from `dd.webPrimordials` (named like
+primordials: `ResponsePrototypeGetHeaders`), and the frozen clock, timers and
+console through closures `bootstrap.js` leaves on `dd`. They iterate with index
+loops or `SafeArrayIterator`, never through `Array.prototype[Symbol.iterator]`,
+and give their own records and option dictionaries null prototypes.
+`just check-js` fails if `bootstrap.js`, `web/init.js` or the execute-worker
+bundle names a global. What this cannot cover (species lookups, properties
+added to `Object.prototype`, values the worker hands over) is listed at the top
+of `execute_worker/core.js`.
+
 Worker `console` output is formatted in JavaScript (`js/web/console.js`, the
 Node/Deno `util.inspect` conventions) and handed to the host one call at a
 time. The host logs it as a `dd::worker` tracing event carrying the worker

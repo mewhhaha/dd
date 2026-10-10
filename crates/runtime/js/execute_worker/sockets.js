@@ -3,21 +3,53 @@
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "socket values failed"));
     }
-    return result.handles.map(String);
+    const listed = result.handles;
+    const handles = [];
+    for (let i = 0; i < listed.length; i++) {
+      ArrayPrototypePush(handles, String(listed[i]));
+    }
+    return handles;
   };
 
-  const createMemorySocketRuntime = (entry, { allowSocketAccept, handles }) => {
-    let openHandles = handles === undefined ? null : new Set(handles.map(String));
+  // Whether a Connection header value lists the `upgrade` token.
+  const hasUpgradeToken = (connection) => {
+    let start = 0;
+    for (;;) {
+      const comma = StringPrototypeIndexOf(connection, ",", start);
+      const end = comma === -1 ? connection.length : comma;
+      const token = StringPrototypeToLowerCase(
+        StringPrototypeTrim(StringPrototypeSlice(connection, start, end)),
+      );
+      if (token === "upgrade") {
+        return true;
+      }
+      if (comma === -1) {
+        return false;
+      }
+      start = comma + 1;
+    }
+  };
+
+  const createMemorySocketRuntime = (entry, options) => {
+    const { allowSocketAccept, handles } = options;
+    let openHandles = null;
+    if (handles !== undefined) {
+      openHandles = new SafeSet();
+      for (let i = 0; i < handles.length; i++) {
+        openHandles.add(String(handles[i]));
+      }
+    }
     const loadOpenHandles = () => {
-      openHandles ??= new Set(listMemorySocketHandles(
+      openHandles ??= new SafeSet(listMemorySocketHandles(
         entry.binding,
         entry.memoryKey,
         memoryScopedScopeHandle(entry),
       ));
       return openHandles;
     };
-    const upgradeAccepted = { used: false };
+    const upgradeAccepted = { __proto__: null, used: false };
     const sockets = {
+      __proto__: null,
       accept(request) {
         if (!allowSocketAccept) {
           throw new Error("state.sockets.accept is only available during a keyed memory request");
@@ -25,34 +57,35 @@
         if (upgradeAccepted.used) {
           throw new Error("state.sockets.accept can only be called once per request");
         }
-        if (!(request instanceof Request)) {
+        if (!ObjectPrototypeIsPrototypeOf(RequestPrototype, request)) {
           throw new Error("state.sockets.accept requires a Request");
         }
-        const connection = String(request.headers.get("connection") ?? "");
-        const upgrade = String(request.headers.get("upgrade") ?? "");
-        const hasUpgrade = connection
-          .split(",")
-          .map((value) => value.trim().toLowerCase())
-          .includes("upgrade");
-        if (!hasUpgrade || upgrade.toLowerCase() !== "websocket") {
+        const requestHeaders = RequestPrototypeGetHeaders(request);
+        const connection = String(HeadersPrototypeGet(requestHeaders, "connection") ?? "");
+        const upgrade = String(HeadersPrototypeGet(requestHeaders, "upgrade") ?? "");
+        if (!hasUpgradeToken(connection) || StringPrototypeToLowerCase(upgrade) !== "websocket") {
           throw new Error("state.sockets.accept requires a websocket upgrade request");
         }
-        const sessionId = String(request.headers.get(INTERNAL_WS_SESSION_HEADER) ?? "").trim();
+        const sessionId = StringPrototypeTrim(
+          String(HeadersPrototypeGet(requestHeaders, INTERNAL_WS_SESSION_HEADER) ?? ""),
+        );
         if (!sessionId) {
           throw new Error("state.sockets.accept missing runtime websocket session metadata");
         }
         const handle = sessionId;
         const headers = new Headers();
-        headers.set(INTERNAL_WS_ACCEPT_HEADER, "1");
-        headers.set(INTERNAL_WS_SESSION_HEADER, sessionId);
-        headers.set(INTERNAL_WS_HANDLE_HEADER, handle);
-        headers.set(INTERNAL_WS_BINDING_HEADER, entry.binding);
-        headers.set(INTERNAL_WS_KEY_HEADER, entry.memoryKey);
+        HeadersPrototypeSet(headers, INTERNAL_WS_ACCEPT_HEADER, "1");
+        HeadersPrototypeSet(headers, INTERNAL_WS_SESSION_HEADER, sessionId);
+        HeadersPrototypeSet(headers, INTERNAL_WS_HANDLE_HEADER, handle);
+        HeadersPrototypeSet(headers, INTERNAL_WS_BINDING_HEADER, entry.binding);
+        HeadersPrototypeSet(headers, INTERNAL_WS_KEY_HEADER, entry.memoryKey);
         upgradeAccepted.used = true;
         loadOpenHandles().add(handle);
         return {
+          __proto__: null,
           handle,
           response: {
+            __proto__: null,
             __dd_websocket_accept: true,
             status: 101,
             headers,
@@ -61,14 +94,15 @@
         };
       },
       values() {
-        return Array.from(loadOpenHandles());
+        return ArrayFrom(loadOpenHandles());
       },
     };
 
     return {
+      __proto__: null,
       sockets,
       listOpenHandles() {
-        return Array.from(loadOpenHandles());
+        return ArrayFrom(loadOpenHandles());
       },
     };
   };
@@ -84,7 +118,7 @@
         throw new Error("memory transaction is outside its synchronous callback");
       }
     };
-    return Object.freeze({
+    return ObjectFreeze({
       id: createMemoryId(entry.binding, entry.memoryKey),
       get(key, options) {
         assertActive();
@@ -102,9 +136,9 @@
       },
       list(options) {
         assertActive();
-        return storage.list(options).map(({ key, value }) => ({ key, value }));
+        return storage.list(options);
       },
-      sockets: Object.freeze({
+      sockets: ObjectFreeze({
         values() {
           assertActive();
           return socketRuntime.sockets.values();
@@ -120,26 +154,31 @@
       }),
       emit(kind, payload = null) {
         assertActive();
-        const normalizedKind = String(kind ?? "").trim();
+        const normalizedKind = StringPrototypeTrim(String(kind ?? ""));
         if (!normalizedKind) {
           throw new Error("state.emit(kind, payload) requires a non-empty kind");
         }
         stageMemoryTxnEffect(
           txn,
           normalizedKind,
-          toUtf8Bytes(JSON.stringify(payload ?? null)),
+          toBytes(JSONStringify(payload ?? null)),
         );
       },
       accept(request) {
         assertActive();
         const accepted = socketRuntime.sockets.accept(request);
         markMemoryBatchAccepted(txn);
+        const response = new Response(accepted.response.body ?? null, {
+          __proto__: null,
+          status: accepted.response.status ?? 101,
+        });
+        appendHeaderPairs(
+          ResponsePrototypeGetHeaders(response),
+          headerPairs(accepted.response.headers),
+        );
         return {
           handle: accepted.handle,
-          response: new Response(accepted.response.body ?? null, {
-            status: accepted.response.status ?? 101,
-            headers: accepted.response.headers ?? [],
-          }),
+          response,
         };
       },
     });
@@ -156,10 +195,10 @@
   const ensureMemoryEntry = (binding, memoryKey) => {
     const current = currentRequestContext(false)?.memoryEntry;
     if (current?.binding === binding && current.memoryKey === memoryKey) return current;
-    return { binding, memoryKey };
+    return { __proto__: null, binding, memoryKey };
   };
 
-  const createMemoryStubSocketApi = (bindingName, memoryKey) => Object.freeze({
+  const createMemoryStubSocketApi = (bindingName, memoryKey) => ObjectFreeze({
     async values() {
       const localRuntime = currentLocalSocketRuntime(bindingName, memoryKey);
       if (localRuntime) {

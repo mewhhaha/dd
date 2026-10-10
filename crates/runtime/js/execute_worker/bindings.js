@@ -5,13 +5,11 @@
     if (!result || typeof result !== "object" || result.boundary_changed !== true) {
       return;
     }
-    const boundary = normalizeBoundaryValue({
+    applyBoundary({
+      __proto__: null,
       nowMs: result.boundary_now_ms,
       perfMs: result.boundary_perf_ms,
     });
-    if (boundary && typeof dd.setTime === "function") {
-      dd.setTime(boundary.nowMs, boundary.perfMs);
-    }
   };
 
   const invokeServiceBindingFetch = async (
@@ -47,30 +45,27 @@
         }
       },
       30_000,
-      { syncTime: false, signal },
+      { __proto__: null, syncTime: false, signal },
     );
     if (!result || typeof result !== "object" || result.ok === false) {
       applyRequestReplyBoundary(result);
       throw new Error(formatRequestFailure("service binding fetch failed", result));
     }
     applyRequestReplyBoundary(result);
-    const replyHeadersHandle = Math.max(0, Math.trunc(Number(result.headers_handle ?? 0) || 0));
-    const replyBodyHandle = Math.max(0, Math.trunc(Number(result.body_handle ?? 0) || 0));
-    const body = callOp("op_http_take_prepared_body", replyBodyHandle);
+    const body = callOp("op_http_take_prepared_body", toHandle(result.body_handle));
     const status = Number(result.status ?? 200);
     const nullBody = request.method === "HEAD" || status === 204 || status === 205 || status === 304;
-    const response = new Response(nullBody ? null : body, {
-      status,
-      headers: callOp("op_http_take_prepared_headers", replyHeadersHandle),
-    });
+    const headers = callOp("op_http_take_prepared_headers", toHandle(result.headers_handle));
+    const response = new Response(nullBody ? null : body, { __proto__: null, status });
+    appendHeaderPairs(ResponsePrototypeGetHeaders(response), ArrayIsArray(headers) ? headers : []);
     return response;
   };
 
-  const createServiceBinding = (bindingName, targetWorker) => Object.freeze({
+  const createServiceBinding = (bindingName, targetWorker) => ObjectFreeze({
     worker: targetWorker,
     async fetch(inputValue, initValue = undefined) {
       const request = await normalizeFetchInput(inputValue, initValue, true);
-      return invokeServiceBindingFetch(
+      return await invokeServiceBindingFetch(
         bindingName,
         targetWorker,
         request,
@@ -80,21 +75,16 @@
     },
   });
 
-  const requestReplyWaiters = () => (dd.requestReplyWaiters ??= new Map());
-  const requestReplyReady = () => (dd.requestReplyReady ??= new Map());
-  const requestReplyCanceled = () => (dd.requestReplyCanceled ??= new Map());
-  const requestReplyNow = () => (
-    globalThis.performance && typeof globalThis.performance.now === "function"
-      ? globalThis.performance.now()
-      : Date.now()
-  );
+  const requestReplyWaiters = () => (dd.requestReplyWaiters ??= new SafeMap());
+  const requestReplyReady = () => (dd.requestReplyReady ??= new SafeMap());
+  const requestReplyCanceled = () => (dd.requestReplyCanceled ??= new SafeMap());
 
-  const sweepRequestReplyCanceled = (canceled, now = requestReplyNow()) => {
-    for (const [replyId, expiresAt] of canceled.entries()) {
-      if (expiresAt > now && canceled.size <= REQUEST_CANCELED_REPLY_MAX_ENTRIES) {
+  const sweepRequestReplyCanceled = (canceled, now = frozenPerfNow()) => {
+    for (const entry of canceled.entries()) {
+      if (entry[1] > now && canceled.size <= REQUEST_CANCELED_REPLY_MAX_ENTRIES) {
         break;
       }
-      canceled.delete(replyId);
+      canceled.delete(entry[0]);
     }
     while (canceled.size > REQUEST_CANCELED_REPLY_MAX_ENTRIES) {
       const oldest = canceled.keys().next();
@@ -106,18 +96,18 @@
   };
 
   const discardRequestReplyHandles = (payload) => {
-    const headersHandle = Math.max(0, Math.trunc(Number(payload?.headers_handle ?? 0) || 0));
+    const headersHandle = toHandle(payload?.headers_handle);
     if (headersHandle > 0) {
       callOp("op_http_take_prepared_headers", headersHandle);
     }
-    const bodyHandle = Math.max(0, Math.trunc(Number(payload?.body_handle ?? 0) || 0));
+    const bodyHandle = toHandle(payload?.body_handle);
     if (bodyHandle > 0) {
       callOp("op_http_take_prepared_body", bodyHandle);
     }
   };
 
   const deliverRequestReply = (payload) => {
-    const replyId = String(payload?.reply_id ?? "").trim();
+    const replyId = StringPrototypeTrim(String(payload?.reply_id ?? ""));
     if (!replyId) {
       return;
     }
@@ -145,10 +135,10 @@
     if (ready.has(replyId)) {
       const payload = ready.get(replyId);
       ready.delete(replyId);
-      return Promise.resolve(payload);
+      return PromiseResolve(payload);
     }
     return new Promise((resolve, reject) => {
-      requestReplyWaiters().set(replyId, { resolve, reject });
+      requestReplyWaiters().set(replyId, { __proto__: null, resolve, reject });
     });
   };
 
@@ -157,7 +147,7 @@
       return;
     }
     const canceled = requestReplyCanceled();
-    const now = requestReplyNow();
+    const now = frozenPerfNow();
     sweepRequestReplyCanceled(canceled, now);
     canceled.set(replyId, now + REQUEST_CANCELED_REPLY_TTL_MS);
     sweepRequestReplyCanceled(canceled, now);
@@ -178,14 +168,14 @@
 
   const awaitRequestReply = async (label, startOp, timeoutMs = 5_000, options = undefined) => {
     const signal = options?.signal;
-    if (signal?.aborted) {
+    if (signal && AbortSignalPrototypeGetAborted(signal)) {
       throw abortErrorForSignal(signal);
     }
     const started = startOp();
     if (!started || typeof started !== "object" || started.ok === false) {
       throw new Error(String(started?.error ?? `${label} failed to start`));
     }
-    const replyId = String(started.reply_id ?? "").trim();
+    const replyId = StringPrototypeTrim(String(started.reply_id ?? ""));
     if (!replyId) {
       throw new Error(`${label} missing reply id`);
     }
@@ -202,10 +192,10 @@
       const aborted = new Promise((_, reject) => {
         if (!signal) return;
         onAbort = () => reject(abortErrorForSignal(signal));
-        signal.addEventListener("abort", onAbort, { once: true });
-        if (signal.aborted) onAbort();
+        AbortSignalPrototypeAddEventListener(signal, "abort", onAbort, ONCE);
+        if (AbortSignalPrototypeGetAborted(signal)) onAbort();
       });
-      const result = await Promise.race([reply, timeoutError, aborted]);
+      const result = await SafePromiseRace([reply, timeoutError, aborted]);
       if (options?.syncTime !== false) {
         await syncFrozenTime();
       }
@@ -215,7 +205,7 @@
       throw error;
     } finally {
       clearTimeout(timeoutId);
-      if (onAbort) signal.removeEventListener("abort", onAbort);
+      if (onAbort) AbortSignalPrototypeRemoveEventListener(signal, "abort", onAbort);
     }
   };
 
@@ -225,7 +215,7 @@
         return result.error;
       }
       try {
-        return JSON.stringify(result);
+        return JSONStringify(result);
       } catch {
         return fallback;
       }
@@ -236,10 +226,11 @@
   const drainRequestControlQueue = async () => {
     for (;;) {
       const batch = callOp("op_request_control_take");
-      if (!Array.isArray(batch) || batch.length === 0) {
+      if (!ArrayIsArray(batch) || batch.length === 0) {
         return;
       }
-        for (const item of batch) {
+      for (let i = 0; i < batch.length; i++) {
+        const item = batch[i];
         if (item?.kind === "reply") {
           deliverRequestReply(item.payload);
         }
@@ -251,11 +242,11 @@
   dd.awaitRequestReply = awaitRequestReply;
 
   const getSharedEnv = () => {
-    const cache = dd.sharedEnvCache ??= new WeakMap();
+    const cache = dd.sharedEnvCache ??= new SafeWeakMap();
     const cacheableWorker = worker && (typeof worker === "object" || typeof worker === "function")
       ? worker
       : null;
-    const fallbackCache = dd.sharedEnvFallbackCache ??= new Map();
+    const fallbackCache = dd.sharedEnvFallbackCache ??= new SafeMap();
     const cached = cacheableWorker
       ? cache.get(cacheableWorker)
       : fallbackCache.get(workerName);
@@ -266,7 +257,8 @@
     const defineLazyValue = (target, propertyName, factory) => {
       let initialized = false;
       let cachedValue;
-      Object.defineProperty(target, propertyName, {
+      ObjectDefineProperty(target, propertyName, {
+        __proto__: null,
         enumerable: true,
         configurable: true,
         get() {
@@ -278,14 +270,18 @@
         },
       });
     };
-    for (const [envName, bindingName] of kvBindingsConfig) {
+    for (let i = 0; i < kvBindingsConfig.length; i++) {
+      const envName = kvBindingsConfig[i][0];
+      const bindingName = kvBindingsConfig[i][1];
       if (!envName) {
         continue;
       }
       defineLazyValue(env, envName, () => createKvBinding(bindingName));
     }
 
-    for (const [envName, targetWorker] of serviceBindingsConfig) {
+    for (let i = 0; i < serviceBindingsConfig.length; i++) {
+      const envName = serviceBindingsConfig[i][0];
+      const targetWorker = serviceBindingsConfig[i][1];
       if (!envName || !targetWorker) {
         continue;
       }
@@ -296,14 +292,15 @@
       );
     }
 
-    for (const bindingName of memoryBindingsConfig) {
+    for (let i = 0; i < memoryBindingsConfig.length; i++) {
+      const bindingName = memoryBindingsConfig[i];
       if (!bindingName) {
         continue;
       }
       defineLazyValue(env, bindingName, () => createMemoryNamespace(bindingName));
     }
 
-    Object.freeze(env);
+    ObjectFreeze(env);
     if (cacheableWorker) {
       cache.set(cacheableWorker, env);
     } else {
@@ -323,7 +320,11 @@
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
     try {
       txn = await createMemoryTxn(entry, commandHandle);
-      const socketRuntime = createMemorySocketRuntime(entry, { allowSocketAccept: true });
+      const socketRuntime = createMemorySocketRuntime(entry, {
+        __proto__: null,
+        allowSocketAccept: true,
+        handles: undefined,
+      });
       const scopedState = createMemoryAtomicState(entry, txn, socketRuntime);
       current.memoryEntry = entry;
       current.socketRuntimeProvider = () => socketRuntime;
@@ -332,6 +333,7 @@
       try {
         value = withMemoryTxnScope(
           {
+            __proto__: null,
             binding: entry.binding,
             memoryKey: entry.memoryKey,
             state: scopedState,
@@ -357,19 +359,20 @@
   };
 
   const buildWakeEvent = (memoryCall, stub) => {
-    const kind = String(memoryCall.kind ?? "").trim();
+    const kind = StringPrototypeTrim(String(memoryCall.kind ?? ""));
     const event = {
       type: kind,
       binding: String(memoryCall.binding ?? ""),
       key: String(memoryCall.key ?? ""),
     };
-    Object.defineProperty(event, "stub", {
+    ObjectDefineProperty(event, "stub", {
+      __proto__: null,
       value: stub,
       enumerable: false,
       configurable: true,
       writable: false,
     });
-    if ("handle" in memoryCall) {
+    if (ObjectHasOwn(memoryCall, "handle")) {
       event.handle = String(memoryCall.handle ?? "");
     }
     if (kind === "message") {
@@ -389,19 +392,21 @@
     if (!memoryCall || typeof memoryCall !== "object") {
       throw new Error("memory invoke config is missing");
     }
-    const binding = String(memoryCall.binding ?? "").trim();
-    const memoryKey = String(memoryCall.key ?? "").trim();
+    const binding = StringPrototypeTrim(String(memoryCall.binding ?? ""));
+    const memoryKey = StringPrototypeTrim(String(memoryCall.key ?? ""));
     if (!binding || !memoryKey) {
       throw new Error("memory invoke requires binding and key");
     }
-    if (!Object.prototype.hasOwnProperty.call(env, binding)) {
+    if (!ObjectHasOwn(env, binding)) {
       throw new Error(`memory binding not declared for worker: ${binding}`);
     }
     const entry = ensureMemoryEntry(binding, memoryKey);
     const kind = String(memoryCall.kind ?? "");
     const socketRuntime = createMemorySocketRuntime(entry, {
+      __proto__: null,
       allowSocketAccept: false,
-      handles: memoryCall.socket_handles,
+      // The host leaves the list out when it is empty.
+      handles: ObjectHasOwn(memoryCall, "socket_handles") ? memoryCall.socket_handles : undefined,
     });
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
@@ -418,9 +423,9 @@
           throw new Error("worker does not define wake(event, env)");
         }
         const event = buildWakeEvent(memoryCall, createMemoryStub(binding, memoryKey));
-        await wakeMethod.call(worker, event, env);
+        await ReflectApply(wakeMethod, worker, [event, env]);
         await gateMemoryOutput(entry, async () => undefined);
-        return new Response(null, { status: 204 });
+        return new Response(null, { __proto__: null, status: 204 });
       }
       throw new Error(`unsupported memory invoke kind: ${kind}`);
     } finally {
@@ -448,15 +453,10 @@
     }
   };
 
-  const storeResponseHeaders = (headers) => {
-    return Math.max(
-      0,
-      Math.trunc(Number(callOp(
-        "op_http_store_prepared_headers",
-        Array.isArray(headers) ? headers : [],
-      ) ?? 0) || 0),
-    );
-  };
+  const storeResponseHeaders = (headers) => toHandle(callOp(
+    "op_http_store_prepared_headers",
+    ArrayIsArray(headers) ? headers : [],
+  ));
 
   const emitResponseStart = async (status, headersHandle) => {
     await syncFrozenTime();
@@ -470,7 +470,7 @@
 
   const emitResponseChunk = async (chunk) => {
     await syncFrozenTime();
-    const bytes = toByteChunk(chunk);
+    const bytes = toBytes(chunk);
     const result = await callOp(
       "op_emit_response_chunk",
       requestContext.completionHandle,
@@ -485,59 +485,63 @@
   const waitForWaitUntils = async () => {
     // The scheduler enforces the deadline from another thread, including while
     // JavaScript is stuck in a CPU loop. Include work registered by earlier work.
+    const promises = requestContext.waitUntilPromises;
     let completed = 0;
-    while (completed < requestContext.waitUntilPromises.length) {
-      const batch = requestContext.waitUntilPromises.slice(completed);
+    while (completed < promises.length) {
+      const batch = [];
+      for (let i = completed; i < promises.length; i++) {
+        ArrayPrototypePush(batch, promises[i]);
+      }
       completed += batch.length;
-      await Promise.allSettled(batch);
+      await SafePromiseAllSettled(batch);
     }
   };
 
+  const errorText = (error) => String((error && (error.stack || error.message)) || error);
+
   function trackWaitUntil(promise) {
     callOp("op_request_wait_until_register", requestContext.completionHandle);
-    const tracked = Promise.resolve(promise).then(
-      async (value) => {
-        await syncFrozenTime();
-        return { ok: true, value };
-      },
-      async (error) => {
+    const tracked = (async () => {
+      let value;
+      try {
+        value = await promise;
+      } catch (error) {
         await syncFrozenTime();
         try {
-          console.warn(
-            "waitUntil promise rejected",
-            String((error && (error.stack || error.message)) || error),
-          );
+          consoleWarn("waitUntil promise rejected", errorText(error));
         } catch {
           // Ignore logging failures in isolate userland.
         }
-        return { ok: false, error: String((error && (error.stack || error.message)) || error) };
-      },
-    );
-    requestContext.waitUntilPromises.push(tracked);
+        return { ok: false, error: errorText(error) };
+      }
+      await syncFrozenTime();
+      return { ok: true, value };
+    })();
+    ArrayPrototypePush(requestContext.waitUntilPromises, tracked);
     return tracked;
   }
 
-  asyncContext.run(requestContext, () => (async () => {
+  const handled = asyncContext.run(requestContext, () => (async () => {
     try {
       await syncFrozenTime();
       installHostFetch();
+      const requestSignal = AbortControllerPrototypeGetSignal(requestContext.controller);
       const requestBody = hasRequestBodyStream
         ? createRequestBodyStream()
-        : input.body?.length
+        : byteLength(input.body) > 0
           ? new Uint8Array(input.body)
           : undefined;
-      const requestHeaders = new Headers(input.headers);
       const request = new Request(input.url, {
+        __proto__: null,
         method: String(input.method || "GET"),
-        headers: requestHeaders,
         body: requestBody,
-        signal: requestContext.controller.signal,
+        signal: requestSignal,
       });
-      const workerRequest = request;
+      appendHeaderPairs(RequestPrototypeGetHeaders(request), input.headers);
       const env = getSharedEnv();
       const ctx = {
         requestId: input.request_id,
-        signal: requestContext.controller.signal,
+        signal: requestSignal,
         waitUntil(promise) {
           return trackWaitUntil(promise);
         },
@@ -548,78 +552,89 @@
       };
 
       const response = memoryCallConfig
-          ? await invokeMemoryCall(memoryCallConfig, workerRequest, env)
-          : await worker.fetch(workerRequest, env, ctx);
+          ? await invokeMemoryCall(memoryCallConfig, request, env)
+          : await worker.fetch(request, env, ctx);
       await syncFrozenTime();
 
-      const isWebSocketAcceptResponse = Boolean(
-        response
-          && typeof response === "object"
-          && response.__dd_websocket_accept === true,
-      );
-      if (!(response instanceof Response) && !isWebSocketAcceptResponse) {
+      const isResponse = ObjectPrototypeIsPrototypeOf(ResponsePrototype, response);
+      const isWebSocketAcceptResponse = !isResponse
+        && response !== null
+        && typeof response === "object"
+        && response.__dd_websocket_accept === true;
+      if (!isResponse && !isWebSocketAcceptResponse) {
         throw new Error("Worker fetch() must return a Response");
       }
 
-      const responseHeaders = isWebSocketAcceptResponse
-        ? new Headers(response.headers ?? [])
-        : response.headers;
+      let responseHeaders;
+      if (!isWebSocketAcceptResponse) {
+        responseHeaders = ResponsePrototypeGetHeaders(response);
+      } else if (ObjectPrototypeIsPrototypeOf(HeadersPrototype, response.headers)) {
+        responseHeaders = response.headers;
+      } else {
+        responseHeaders = new Headers(response.headers ?? undefined);
+      }
       const status = isWebSocketAcceptResponse
         ? Number(response.status ?? 101)
-        : response.status;
-      const headers = Array.from(responseHeaders.entries());
+        : ResponsePrototypeGetStatus(response);
+      const headers = headerPairs(responseHeaders);
       const bodyChunks = streamResponse ? null : [];
       let bodyLength = 0;
       if (streamResponse) {
         await emitResponseStart(status, storeResponseHeaders(headers));
       }
-      if (!isWebSocketAcceptResponse && response.body && input.method === "HEAD") {
+      const responseBody = isWebSocketAcceptResponse ? null : ResponsePrototypeGetBody(response);
+      if (responseBody !== null && input.method === "HEAD") {
         // A HEAD reply exposes the same headers but must not consume a producer.
-        void response.body.cancel().catch(() => undefined);
-      } else if (!isWebSocketAcceptResponse && response.body) {
-        const reader = response.body.getReader();
+        ignoreRejection(ReadableStreamPrototypeCancel(responseBody));
+      } else if (responseBody !== null) {
+        const reader = ReadableStreamPrototypeGetReader(responseBody);
         // An aborted request stops reading its body, so a producer waiting
         // for more data cannot keep it, or its isolate, alive.
-        const { signal } = requestContext.controller;
+        const signal = requestSignal;
         const cancelOnAbort = () => {
-          void reader.cancel(signal.reason).catch(() => undefined);
+          ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(
+            reader,
+            AbortSignalPrototypeGetReason(signal),
+          ));
         };
-        signal.addEventListener("abort", cancelOnAbort, { once: true });
+        AbortSignalPrototypeAddEventListener(signal, "abort", cancelOnAbort, ONCE);
         try {
-          if (signal.aborted) {
-            throw signal.reason;
+          if (AbortSignalPrototypeGetAborted(signal)) {
+            throw AbortSignalPrototypeGetReason(signal);
           }
           while (true) {
-            const { done, value } = await reader.read();
+            const { done, value } = await ReadableStreamDefaultReaderPrototypeRead(reader);
             if (done) {
               break;
             }
-            const chunk = toByteChunk(value);
-            if (chunk.length === 0) {
+            const chunk = toBytes(value);
+            const chunkLength = byteLength(chunk);
+            if (chunkLength === 0) {
               continue;
             }
             if (streamResponse) {
               await emitResponseChunk(chunk);
             } else {
-              if (bodyLength + chunk.byteLength > maxResponseBodyBytes) {
+              if (bodyLength + chunkLength > maxResponseBodyBytes) {
                 throw new Error(`response body exceeded max_response_body_bytes (${maxResponseBodyBytes} bytes)`);
               }
-              bodyChunks.push(chunk);
-              bodyLength += chunk.byteLength;
+              ArrayPrototypePush(bodyChunks, chunk);
+              bodyLength += chunkLength;
             }
           }
         } catch (error) {
           // Start cancellation without letting an uncooperative cancel callback
           // delay the size-limit failure delivered to the caller.
-          void reader.cancel(error).catch(() => undefined);
+          ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(reader, error));
           throw error;
         } finally {
-          signal.removeEventListener("abort", cancelOnAbort);
-          reader.releaseLock();
+          AbortSignalPrototypeRemoveEventListener(signal, "abort", cancelOnAbort);
+          ReadableStreamDefaultReaderPrototypeReleaseLock(reader);
         }
       }
 
       const result = {
+        __proto__: null,
         status,
         headersHandle: streamResponse ? 0 : storeResponseHeaders(headers),
         bodyHandle: 0,
@@ -645,30 +660,33 @@
         );
       }
     }
-  })())
-    .then(async (result) => {
+  })());
+  // Report the outcome, then wait out waitUntil work. A failure while
+  // reporting success is reported as the request's error.
+  (async () => {
+    try {
+      const result = await handled;
       callOp(
         "op_emit_completion_ok",
         requestContext.completionHandle,
         Number(result.status ?? 200),
-        Math.max(0, Math.trunc(Number(result.headersHandle ?? 0) || 0)),
-        Math.max(0, Math.trunc(Number(result.bodyHandle ?? 0) || 0)),
+        toHandle(result.headersHandle),
+        toHandle(result.bodyHandle),
       );
 
       await waitForWaitUntils();
       await emitWaitUntilDone();
-    })
-    .catch(async (error) => {
-      const message = String((error && (error.stack || error.message)) || error);
+    } catch (error) {
       callOp(
         "op_emit_completion_error",
         requestContext.completionHandle,
-        message,
+        errorText(error),
       );
 
       await waitForWaitUntils();
       await emitWaitUntilDone();
-    });
+    }
+  })();
 };
 
 // Takes the worker module's namespace once it has evaluated.
@@ -692,41 +710,24 @@ dd.executeWorkerHandle = (requestHandle) => {
   if (descriptor === null || descriptor === undefined) {
     throw new Error(`Request handle ${requestHandle} is unavailable`);
   }
-  const requestHeadersHandle = Math.max(
-    0,
-    Math.trunc(Number(descriptor.request_headers_handle ?? 0) || 0),
+  const headers = core.ops.op_http_take_prepared_headers(
+    toHandle(descriptor.request_headers_handle),
   );
-  const requestBodyHandle = Math.max(
-    0,
-    Math.trunc(Number(descriptor.request_body_handle ?? 0) || 0),
-  );
-  const headers = core.ops.op_http_take_prepared_headers(requestHeadersHandle);
-  const body = core.ops.op_http_take_prepared_body(requestBodyHandle);
+  const body = core.ops.op_http_take_prepared_body(toHandle(descriptor.request_body_handle));
   const payload = {
+    __proto__: null,
     request_id: String(descriptor.request_id ?? ""),
-    request_context_handle: Math.max(
-      0,
-      Math.trunc(Number(descriptor.request_context_handle ?? 0) || 0),
-    ),
-    completion_handle: Math.max(
-      0,
-      Math.trunc(Number(descriptor.completion_handle ?? 0) || 0),
-    ),
-    memory_request_scope_handle: Math.max(
-      0,
-      Math.trunc(Number(descriptor.memory_request_scope_handle ?? 0) || 0),
-    ),
+    request_context_handle: toHandle(descriptor.request_context_handle),
+    completion_handle: toHandle(descriptor.completion_handle),
+    memory_request_scope_handle: toHandle(descriptor.memory_request_scope_handle),
     memory_call: descriptor.memory_call ?? null,
-    request_body_stream_handle: Math.max(
-      0,
-      Math.trunc(Number(descriptor.request_body_stream_handle ?? 0) || 0),
-    ),
+    request_body_stream_handle: toHandle(descriptor.request_body_stream_handle),
     stream_response: descriptor.stream_response === true,
     max_response_body_bytes: descriptor.max_response_body_bytes,
     max_request_body_bytes: descriptor.max_request_body_bytes,
     method: String(descriptor.method ?? "GET"),
     url: String(descriptor.url ?? ""),
-    headers: Array.isArray(headers) ? headers : [],
+    headers: ArrayIsArray(headers) ? headers : [],
     input_request_id: String(descriptor.input_request_id ?? ""),
     body,
   };
@@ -738,45 +739,55 @@ dd.installWorkerDeploymentHandle = (deploymentHandle) => {
   if (payload === null || payload === undefined) {
     throw new Error(`Worker deployment handle ${deploymentHandle} is unavailable`);
   }
-  const normalizeBindingPairs = (input) => Object.freeze(
-    (Array.isArray(input) ? input : [])
-      .map((entry) => {
-        const envName = Array.isArray(entry)
-          ? String(entry[0] ?? "").trim()
-          : String(entry ?? "").trim();
-        const bindingName = Array.isArray(entry)
-          ? String(entry[1] ?? entry[0] ?? "").trim()
-          : envName;
-        return Object.freeze([envName, bindingName || envName]);
-      })
-      .filter(([envName]) => envName.length > 0),
-  );
-  const normalizeNames = (input) => Object.freeze(
-    (Array.isArray(input) ? input : [])
-      .map((entry) => String(entry ?? "").trim())
-      .filter((entry) => entry.length > 0),
-  );
-  const normalizeServiceBindings = (input) => Object.freeze(
-    (Array.isArray(input) ? input : [])
-      .map((entry) => {
-        if (Array.isArray(entry)) {
-          return Object.freeze([
-            String(entry[0] ?? "").trim(),
-            String(entry[1] ?? "").trim(),
-          ]);
-        }
-        if (entry && typeof entry === "object") {
-          return Object.freeze([
-            String(entry.binding ?? "").trim(),
-            String(entry.service ?? "").trim(),
-          ]);
-        }
-        return Object.freeze(["", ""]);
-      })
-      .filter(([envName, targetWorker]) => envName.length > 0 && targetWorker.length > 0),
-  );
+  const listOf = (input) => (ArrayIsArray(input) ? input : []);
+  const trimmed = (value) => StringPrototypeTrim(String(value ?? ""));
+  const normalizeBindingPairs = (input) => {
+    const entries = listOf(input);
+    const pairs = [];
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const envName = trimmed(ArrayIsArray(entry) ? entry[0] : entry);
+      const bindingName = ArrayIsArray(entry) ? trimmed(entry[1] ?? entry[0]) : envName;
+      if (envName.length > 0) {
+        ArrayPrototypePush(pairs, ObjectFreeze([envName, bindingName || envName]));
+      }
+    }
+    return ObjectFreeze(pairs);
+  };
+  const normalizeNames = (input) => {
+    const entries = listOf(input);
+    const names = [];
+    for (let i = 0; i < entries.length; i++) {
+      const name = trimmed(entries[i]);
+      if (name.length > 0) {
+        ArrayPrototypePush(names, name);
+      }
+    }
+    return ObjectFreeze(names);
+  };
+  const normalizeServiceBindings = (input) => {
+    const entries = listOf(input);
+    const pairs = [];
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      let envName = "";
+      let targetWorker = "";
+      if (ArrayIsArray(entry)) {
+        envName = trimmed(entry[0]);
+        targetWorker = trimmed(entry[1]);
+      } else if (entry && typeof entry === "object") {
+        envName = trimmed(entry.binding);
+        targetWorker = trimmed(entry.service);
+      }
+      if (envName.length > 0 && targetWorker.length > 0) {
+        ArrayPrototypePush(pairs, ObjectFreeze([envName, targetWorker]));
+      }
+    }
+    return ObjectFreeze(pairs);
+  };
 
-  dd.workerDeployment = Object.freeze({
+  dd.workerDeployment = ObjectFreeze({
+    __proto__: null,
     worker_name: String(payload.worker_name ?? ""),
     kv_bindings: normalizeBindingPairs(payload.kv_bindings),
     memory_bindings: normalizeNames(payload.memory_bindings),
@@ -789,11 +800,11 @@ dd.drainRequestControlQueueHandle = () => {
   if (typeof drain !== "function") {
     return;
   }
-  void Promise.resolve(drain()).catch(() => undefined);
+  ignoreRejection(PromiseResolve(drain()));
 };
 
 dd.abortWorkerRequestHandle = (requestContextHandle) => {
-  const handle = Math.max(0, Math.trunc(Number(requestContextHandle ?? 0) || 0));
+  const handle = toHandle(requestContextHandle);
   if (handle === 0) {
     return false;
   }
@@ -821,7 +832,7 @@ dd.abortWorkerRequestHandle = (requestContextHandle) => {
     }
   }
   if (inflight?.controller) {
-    inflight.controller.abort(new Error("Request aborted by caller"));
+    AbortControllerPrototypeAbort(inflight.controller, new Error("Request aborted by caller"));
   }
   return true;
 };

@@ -1,14 +1,48 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
+import { isArrayBuffer, isDataView, isMap, isSet } from "node:util/types";
 import { deserialize, serialize } from "node:v8";
 import { runInThisContext } from "node:vm";
 
-const source = await readFile(new URL("../crates/runtime/js/execute_worker/memory_results.js", import.meta.url), "utf8");
+// The unit runs inside the execute-worker bundle, where it names primordials,
+// the captured web classes and their uncurried methods (web/init.js). Here
+// those come from the runtime's own primordials and Node's web classes.
+const read = (path) => readFile(new URL(`../crates/runtime/js/${path}`, import.meta.url), "utf8");
+runInThisContext(await read("core/00_primordials.js"), { filename: "00_primordials.js" });
+const { primordials } = globalThis.__bootstrap;
+delete globalThis.__bootstrap;
+const scope = { Request, Response };
+for (const name of Reflect.ownKeys(primordials)) scope[name] = primordials[name];
+for (const [name, prototype] of [["Headers", Headers.prototype], ["Request", Request.prototype], ["Response", Response.prototype]]) {
+  scope[`${name}Prototype`] = prototype;
+  for (const key of Reflect.ownKeys(prototype)) {
+    if (typeof key !== "string" || key === "constructor") continue;
+    const suffix = `${key[0].toUpperCase()}${key.slice(1)}`;
+    const { get, value } = Object.getOwnPropertyDescriptor(prototype, key);
+    if (get) scope[`${name}PrototypeGet${suffix}`] = primordials.uncurryThis(get);
+    if (typeof value === "function") scope[`${name}Prototype${suffix}`] = primordials.uncurryThis(value);
+  }
+}
+scope.headerPairs = (headers) => [...headers];
+scope.appendHeaderPairs = (headers, pairs) => {
+  for (const [name, value] of pairs) headers.append(name, value);
+  return headers;
+};
+scope.core = {
+  encode: (text) => new TextEncoder().encode(text),
+  serialize,
+  deserialize: (bytes) => deserialize(Buffer.from(bytes)),
+  isArrayBuffer,
+  isDataView,
+  isMap,
+  isSet,
+};
+const names = Object.keys(scope).filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
 const { encodeMemoryCommandResult, decodeMemoryCommandResult } = runInThisContext(
-  `(core) => {\n${source}\nreturn { encodeMemoryCommandResult, decodeMemoryCommandResult }; }`,
+  `({ ${names.join(", ")} }) => {\n${await read("execute_worker/memory_results.js")}\nreturn { encodeMemoryCommandResult, decodeMemoryCommandResult }; }`,
   { filename: "memory_results.js" },
-)({ serialize, deserialize: bytes => deserialize(Buffer.from(bytes)) });
+)(scope);
 
 test("new results preserve user properties that match old web value records", async () => {
   const plain = { __dd_rpc_type: "response", status: 200, headers: [], body: [] };

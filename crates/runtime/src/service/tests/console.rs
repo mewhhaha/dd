@@ -108,12 +108,6 @@ export default {
     const value = { list: [1, 2], map: new Map([[1, 2]]) };
     const rows = [{ a: 1 }];
     const boom = () => { throw new Error("sabotaged"); };
-    const saved = [
-      [Array.prototype, "push"], [Array.prototype, "join"], [Array.prototype, "map"],
-      [Array.prototype, Symbol.iterator], [Object, "keys"], [Object, "getOwnPropertyDescriptor"],
-      [Reflect, "ownKeys"], [String.prototype, "replaceAll"], [Map.prototype, "forEach"],
-      [globalThis, "JSON"],
-    ].map(([target, key]) => [target, key, target[key]]);
     Array.prototype.push = boom;
     Array.prototype.join = boom;
     Array.prototype.map = boom;
@@ -128,7 +122,8 @@ export default {
     console.table(rows);
     console.group("g");
     console.log("a\nb");
-    for (let i = 0; i < saved.length; i++) saved[i][0][saved[i][1]] = saved[i][2];
+    // The built-ins stay replaced: the runtime's request machinery must
+    // deliver this response regardless.
     return new Response("ok");
   },
 };

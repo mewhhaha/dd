@@ -2,7 +2,49 @@
 // snapshot is built, with the bootstrap object as `__bootstrap`. What it
 // defines on globalThis is the worker-visible platform; what it puts on
 // `__bootstrap.dd` stays private to the runtime.
-const { core, dd } = __bootstrap;
+//
+// Everything here runs on primordials, the web classes as init.js captured
+// them and their prototype methods from `dd.webPrimordials`, so worker code
+// that replaces globals or built-in methods cannot change how timers, the
+// frozen clock, base64, async context or the cache behave.
+const { core, dd, primordials } = __bootstrap;
+
+const {
+  ArrayIsArray,
+  ArrayFrom,
+  Boolean,
+  Date,
+  DateNow,
+  Error,
+  FunctionPrototypeBind,
+  MapPrototypeForEach,
+  MathCeil,
+  MathFloor,
+  MathMin,
+  Number,
+  NumberIsFinite,
+  ObjectDefineProperty,
+  ObjectFreeze,
+  ObjectKeys,
+  ObjectPrototypeIsPrototypeOf,
+  PromisePrototypeThen,
+  PromiseResolve,
+  ReflectApply,
+  RegExpPrototypeSymbolReplace,
+  SafeMap,
+  SafeRegExp,
+  String,
+  StringFromCharCode,
+  StringPrototypeCharCodeAt,
+  StringPrototypeIndexOf,
+  StringPrototypePadEnd,
+  StringPrototypeSlice,
+  StringPrototypeTrim,
+  Symbol,
+  TypeError,
+  Uint8Array,
+  globalThis,
+} = primordials;
 
 // V8's own console, which V8 installs in every context (the snapshot's
 // included), taken before dd's replaces it. Only DevTools sees its calls.
@@ -55,8 +97,22 @@ const {
   structuredClone: denoStructuredClone,
 } = dd.web;
 
+const {
+  HeadersPrototype,
+  RequestPrototype,
+  RequestPrototypeGetHeaders,
+  RequestPrototypeGetMethod,
+  RequestPrototypeGetUrl,
+  ResponsePrototype,
+  ResponsePrototypeArrayBuffer,
+  ResponsePrototypeGetHeaders,
+  ResponsePrototypeGetStatus,
+} = dd.webPrimordials;
+const { appendHeaderPairs, headerPairs } = dd;
+
 const define = (name, value, enumerable = false) => {
-  Object.defineProperty(globalThis, name, {
+  ObjectDefineProperty(globalThis, name, {
+    __proto__: null,
     value,
     enumerable,
     configurable: true,
@@ -84,11 +140,7 @@ const RuntimeReadableStream = requireRuntimeFunction("ReadableStream", DenoReada
 const RuntimeWritableStream = requireRuntimeFunction("WritableStream", DenoWritableStream);
 const RuntimeTransformStream = requireRuntimeFunction("TransformStream", DenoTransformStream);
 
-const textEncoder = new DenoTextEncoder();
-const textDecoder = new DenoTextDecoder("utf-8");
-
-const createAbortError = (reason) => reason ?? new Error("Aborted");
-let frozenNowMs = Date.now();
+let frozenNowMs = DateNow();
 let frozenPerfMs = globalThis.performance?.now?.() ?? 0;
 
 function ensureAbortGlobals() {
@@ -98,15 +150,18 @@ function ensureAbortGlobals() {
 
 function setFrozenTime(nowMs, perfMs = nowMs) {
   const nextNowMs = Number(nowMs);
-  if (Number.isFinite(nextNowMs)) {
+  if (NumberIsFinite(nextNowMs)) {
     frozenNowMs = nextNowMs;
   }
   const nextPerfMs = Number(perfMs);
-  if (Number.isFinite(nextPerfMs)) {
+  if (NumberIsFinite(nextPerfMs)) {
     frozenPerfMs = nextPerfMs;
   }
 }
 
+// Workers see the clock frozen between I/O boundaries through Date.now and
+// performance.now. The runtime reads the same clock through dd.frozenNow and
+// dd.frozenPerfNow, never through those globals.
 function ensureFrozenTimeGlobals() {
   Date.now = () => frozenNowMs;
 
@@ -124,34 +179,31 @@ function ensureFrozenTimeGlobals() {
   }
 }
 
-const RequestCtor = RuntimeRequest;
-const ResponseCtor = RuntimeResponse;
-
 function runtimeOp(name, ...args) {
   const op = core.ops[name];
   if (typeof op !== "function") {
     return undefined;
   }
-  return op(...args);
+  return ReflectApply(op, undefined, args);
 }
 
 function ensureTimerGlobals() {
   let nextTimerId = 1;
-  const timers = new Map();
+  const timers = new SafeMap();
 
   const clampDelay = (value) => {
     const parsed = Number(value);
-    if (!Number.isFinite(parsed) || parsed < 0) {
+    if (!NumberIsFinite(parsed) || parsed < 0) {
       return 0;
     }
-    return Math.floor(parsed);
+    return MathFloor(parsed);
   };
 
   const runCallback = (callback, args) => {
     try {
-      callback(...args);
+      ReflectApply(callback, undefined, args);
     } catch (error) {
-      Promise.resolve().then(() => {
+      PromisePrototypeThen(PromiseResolve(), () => {
         throw error;
       });
     }
@@ -160,7 +212,7 @@ function ensureTimerGlobals() {
   const sleepWithBoundarySync = async (delayMs) => {
     let remaining = delayMs;
     while (remaining > 0) {
-      const step = Math.min(remaining, 0x7fffffff);
+      const step = MathMin(remaining, 0x7fffffff);
       await runtimeOp("op_sleep", step);
       await syncFrozenTimeBoundary();
       remaining -= step;
@@ -173,6 +225,7 @@ function ensureTimerGlobals() {
     }
     const id = nextTimerId++;
     const state = {
+      __proto__: null,
       canceled: false,
       delay: clampDelay(delay),
       repeat: Boolean(repeat),
@@ -213,9 +266,13 @@ function ensureTimerGlobals() {
     (callback, delay = 0, ...args) => schedule(callback, delay, args, true),
   );
   define("clearInterval", (id) => cancel(id));
+  // The runtime's own timeouts, on the same clock as the worker's.
+  dd.setTimeout = (callback, delay) => schedule(callback, delay, [], false);
+  dd.clearTimeout = cancel;
 }
 
 const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_WHITESPACE = new SafeRegExp("\\s+", "g");
 
 function ensureEncodingGlobals() {
   define("TextEncoder", DenoTextEncoder);
@@ -229,17 +286,17 @@ function ensureEncodingGlobals() {
       let output = "";
       let i = 0;
       while (i < input.length) {
-        const a = input.charCodeAt(i++);
-        const b = input.charCodeAt(i++);
-        const c = input.charCodeAt(i++);
-        if (a > 0xff || (Number.isFinite(b) && b > 0xff) || (Number.isFinite(c) && c > 0xff)) {
+        const a = StringPrototypeCharCodeAt(input, i++);
+        const b = StringPrototypeCharCodeAt(input, i++);
+        const c = StringPrototypeCharCodeAt(input, i++);
+        if (a > 0xff || (NumberIsFinite(b) && b > 0xff) || (NumberIsFinite(c) && c > 0xff)) {
           throw new TypeError("btoa input must be Latin1");
         }
         const triplet = (a << 16) | ((b || 0) << 8) | (c || 0);
         output += BASE64_ALPHABET[(triplet >> 18) & 0x3f];
         output += BASE64_ALPHABET[(triplet >> 12) & 0x3f];
-        output += Number.isFinite(b) ? BASE64_ALPHABET[(triplet >> 6) & 0x3f] : "=";
-        output += Number.isFinite(c) ? BASE64_ALPHABET[triplet & 0x3f] : "=";
+        output += NumberIsFinite(b) ? BASE64_ALPHABET[(triplet >> 6) & 0x3f] : "=";
+        output += NumberIsFinite(c) ? BASE64_ALPHABET[triplet & 0x3f] : "=";
       }
       return output;
     });
@@ -247,32 +304,31 @@ function ensureEncodingGlobals() {
 
   if (globalThis.atob === undefined) {
     define("atob", (value) => {
-      const input = String(value).replace(/\s+/g, "");
+      const input = RegExpPrototypeSymbolReplace(BASE64_WHITESPACE, String(value), "");
       if (input.length % 4 === 1) {
         throw new TypeError("Invalid base64 input");
       }
-      const padded = input.padEnd(Math.ceil(input.length / 4) * 4, "=");
+      const padded = StringPrototypePadEnd(input, MathCeil(input.length / 4) * 4, "=");
+      const sextets = [0, 0, 0, 0];
       let output = "";
       for (let i = 0; i < padded.length; i += 4) {
-        const chars = padded.slice(i, i + 4);
-        const sextets = chars.split("").map((char) => {
-          if (char === "=") {
-            return 0;
-          }
-          const idx = BASE64_ALPHABET.indexOf(char);
+        const chars = StringPrototypeSlice(padded, i, i + 4);
+        for (let j = 0; j < 4; j++) {
+          const char = chars[j];
+          const idx = char === "=" ? 0 : StringPrototypeIndexOf(BASE64_ALPHABET, char);
           if (idx === -1) {
             throw new TypeError("Invalid base64 input");
           }
-          return idx;
-        });
+          sextets[j] = idx;
+        }
         const triplet =
           (sextets[0] << 18) | (sextets[1] << 12) | (sextets[2] << 6) | sextets[3];
-        output += String.fromCharCode((triplet >> 16) & 0xff);
+        output += StringFromCharCode((triplet >> 16) & 0xff);
         if (chars[2] !== "=") {
-          output += String.fromCharCode((triplet >> 8) & 0xff);
+          output += StringFromCharCode((triplet >> 8) & 0xff);
         }
         if (chars[3] !== "=") {
-          output += String.fromCharCode(triplet & 0xff);
+          output += StringFromCharCode(triplet & 0xff);
         }
       }
       return output;
@@ -295,20 +351,27 @@ function ensureAsyncContextGlobal() {
   const frameFor = (context) => context?.[asyncContextFrame] === true
     ? context
     : {
+      __proto__: null,
       [asyncContextFrame]: true,
       requestStore: context ?? null,
-      asyncLocalStores: new Map(),
+      asyncLocalStores: new SafeMap(),
     };
   const derivedFrame = (context) => {
     const frame = frameFor(context);
+    const asyncLocalStores = new SafeMap();
+    MapPrototypeForEach(frame.asyncLocalStores, (store, storage) => {
+      asyncLocalStores.set(storage, store);
+    });
     return {
+      __proto__: null,
       [asyncContextFrame]: true,
       requestStore: frame.requestStore,
-      asyncLocalStores: new Map(frame.asyncLocalStores),
+      asyncLocalStores,
     };
   };
 
   const asyncContext = {
+    __proto__: null,
     getStore() {
       return frameFor(getAsyncContext()).requestStore;
     },
@@ -327,7 +390,7 @@ function ensureAsyncContextGlobal() {
       frame.requestStore = store ?? null;
       setAsyncContext(frame);
       try {
-        return callback(...args);
+        return ReflectApply(callback, undefined, args);
       } finally {
         setAsyncContext(previous);
       }
@@ -349,7 +412,7 @@ function ensureAsyncContextGlobal() {
       frame.asyncLocalStores.set(storage, store);
       setAsyncContext(frame);
       try {
-        return callback(...args);
+        return ReflectApply(callback, undefined, args);
       } finally {
         setAsyncContext(previous);
       }
@@ -361,7 +424,7 @@ function ensureAsyncContextGlobal() {
     },
   };
   dd.asyncContext = asyncContext;
-  define("__dd_async_context", Object.freeze({
+  define("__dd_async_context", ObjectFreeze({
     getAsyncLocalStore: asyncContext.getAsyncLocalStore,
     enterWithAsyncLocalStore: asyncContext.enterWithAsyncLocalStore,
     runWithAsyncLocalStore: asyncContext.runWithAsyncLocalStore,
@@ -374,7 +437,9 @@ function ensureAsyncContextGlobal() {
 // clock as performance.now. Each method is op_call_console bound to V8's
 // method of the same name and dd's: while a DevTools session is attached it
 // hands the call to V8's console too, so DevTools shows inspectable values
-// at the caller's location (the native op adds no stack frame).
+// at the caller's location (the native op adds no stack frame). The runtime
+// logs its own warnings through the console as created, whatever worker code
+// does to the global.
 function ensureConsoleGlobal() {
   const { createConsole } = core.loadExtScript("ext:deno_web/01_console.js");
   const console = createConsole(
@@ -382,24 +447,33 @@ function ensureConsoleGlobal() {
     () => frozenPerfMs,
   );
   if (inspectorConsole !== null && typeof inspectorConsole === "object") {
-    for (const name of Object.keys(console)) {
+    const names = ObjectKeys(console);
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
       const inspectorMethod = inspectorConsole[name];
       if (typeof inspectorMethod !== "function") {
         continue;
       }
-      const method = core.ops.op_call_console.bind(console, inspectorMethod, console[name]);
-      Object.defineProperty(method, "name", { value: name, configurable: true });
+      const method = FunctionPrototypeBind(
+        core.ops.op_call_console,
+        console,
+        inspectorMethod,
+        console[name],
+      );
+      ObjectDefineProperty(method, "name", { __proto__: null, value: name, configurable: true });
       console[name] = method;
     }
   }
   define("console", console);
+  dd.consoleWarn = console.warn;
 }
 
 function ensureCryptoGlobals() {
   define("Crypto", Crypto);
   define("CryptoKey", DenoCryptoKey);
   define("SubtleCrypto", SubtleCrypto);
-  Object.defineProperty(globalThis, "crypto", {
+  ObjectDefineProperty(globalThis, "crypto", {
+    __proto__: null,
     get() {
       return dd.web.crypto;
     },
@@ -413,18 +487,18 @@ function normalizeTimeBoundaryValue(value) {
     return null;
   }
   if (typeof value === "number") {
-    return { nowMs: value, perfMs: value };
+    return { __proto__: null, nowMs: value, perfMs: value };
   }
-  if (Array.isArray(value)) {
-    const [nowMs, perfMs = nowMs] = value;
-    return { nowMs, perfMs };
+  if (ArrayIsArray(value)) {
+    const nowMs = value[0];
+    return { __proto__: null, nowMs, perfMs: value[1] === undefined ? nowMs : value[1] };
   }
   if (typeof value === "object") {
     const nowMs =
       value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
     const perfMs =
       value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
-    return { nowMs, perfMs };
+    return { __proto__: null, nowMs, perfMs };
   }
   return null;
 }
@@ -454,15 +528,41 @@ function activeCacheBypassStale() {
     : false;
 }
 
+const toRequest = (request) => ObjectPrototypeIsPrototypeOf(RequestPrototype, request)
+  ? request
+  : new RuntimeRequest(request);
+
+// The status, header pairs and body of what cache.put was given: a Response,
+// or an object shaped like one, read through its own methods.
+async function cachedResponseParts(response) {
+  if (ObjectPrototypeIsPrototypeOf(ResponsePrototype, response)) {
+    return {
+      __proto__: null,
+      bytes: new Uint8Array(await ResponsePrototypeArrayBuffer(response)),
+      headers: headerPairs(ResponsePrototypeGetHeaders(response)),
+      status: ResponsePrototypeGetStatus(response),
+    };
+  }
+  if (typeof response?.arrayBuffer !== "function") {
+    throw new TypeError("cache.put expects a Response");
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const headers = ObjectPrototypeIsPrototypeOf(HeadersPrototype, response.headers)
+    ? headerPairs(response.headers)
+    : ArrayFrom(response.headers.entries());
+  return { __proto__: null, bytes, headers, status: Number(response.status ?? 200) };
+}
+
 class Cache {
   constructor(name = "default") {
     this.name = String(name || "default");
   }
 
-  async match(request, options = {}) {
-    const _ = options;
-    const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
-    const requestHeaders = Array.from(normalizedRequest.headers.entries());
+  async match(request, _options = undefined) {
+    const normalizedRequest = toRequest(request);
+    const method = RequestPrototypeGetMethod(normalizedRequest);
+    const url = RequestPrototypeGetUrl(normalizedRequest);
+    const requestHeaders = headerPairs(RequestPrototypeGetHeaders(normalizedRequest));
     const requestHeadersHandle = runtimeOp(
       "op_http_store_prepared_headers",
       requestHeaders,
@@ -470,8 +570,8 @@ class Cache {
     const result = await runtimeOp(
       "op_cache_match",
       this.name,
-      normalizedRequest.method,
-      normalizedRequest.url,
+      method,
+      url,
       Number(requestHeadersHandle ?? 0),
       activeCacheBypassStale(),
     );
@@ -492,8 +592,8 @@ class Cache {
       runtimeOp(
         "op_emit_cache_revalidate",
         this.name,
-        normalizedRequest.method,
-        normalizedRequest.url,
+        method,
+        url,
         Number(revalidateHeadersHandle ?? 0),
       );
       await syncFrozenTimeBoundary();
@@ -507,36 +607,30 @@ class Cache {
       "op_http_take_prepared_headers",
       Number(result.headers_handle ?? 0),
     );
-    return new ResponseCtor(body, {
+    const response = new RuntimeResponse(body, {
+      __proto__: null,
       status: Number(result.status ?? 200),
-      headers: Array.isArray(headers) ? headers : [],
     });
+    appendHeaderPairs(ResponsePrototypeGetHeaders(response), ArrayIsArray(headers) ? headers : []);
+    return response;
   }
 
   async put(request, response) {
-    const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
-    if (!(response instanceof ResponseCtor) && typeof response?.arrayBuffer !== "function") {
-      throw new TypeError("cache.put expects a Response");
-    }
-    const bodyHandle = runtimeOp(
-      "op_http_store_prepared_body",
-      new Uint8Array(await response.arrayBuffer()),
-    );
+    const normalizedRequest = toRequest(request);
+    const parts = await cachedResponseParts(response);
+    const bodyHandle = runtimeOp("op_http_store_prepared_body", parts.bytes);
     const requestHeadersHandle = runtimeOp(
       "op_http_store_prepared_headers",
-      Array.from(normalizedRequest.headers.entries()),
+      headerPairs(RequestPrototypeGetHeaders(normalizedRequest)),
     );
-    const responseHeadersHandle = runtimeOp(
-      "op_http_store_prepared_headers",
-      Array.from(response.headers.entries()),
-    );
+    const responseHeadersHandle = runtimeOp("op_http_store_prepared_headers", parts.headers);
     const result = await runtimeOp(
       "op_cache_put",
       this.name,
-      normalizedRequest.method,
-      normalizedRequest.url,
+      RequestPrototypeGetMethod(normalizedRequest),
+      RequestPrototypeGetUrl(normalizedRequest),
       Number(requestHeadersHandle ?? 0),
-      Number(response.status ?? 200),
+      Number(parts.status ?? 200),
       Number(responseHeadersHandle ?? 0),
       Number(bodyHandle ?? 0),
     );
@@ -546,18 +640,17 @@ class Cache {
     }
   }
 
-  async delete(request, options = {}) {
-    const _ = options;
-    const normalizedRequest = request instanceof RequestCtor ? request : new RequestCtor(request);
+  async delete(request, _options = undefined) {
+    const normalizedRequest = toRequest(request);
     const headersHandle = runtimeOp(
       "op_http_store_prepared_headers",
-      Array.from(normalizedRequest.headers.entries()),
+      headerPairs(RequestPrototypeGetHeaders(normalizedRequest)),
     );
     const result = await runtimeOp(
       "op_cache_delete",
       this.name,
-      normalizedRequest.method,
-      normalizedRequest.url,
+      RequestPrototypeGetMethod(normalizedRequest),
+      RequestPrototypeGetUrl(normalizedRequest),
       Number(headersHandle ?? 0),
     );
     await syncFrozenTimeBoundary();
@@ -569,23 +662,24 @@ class Cache {
 }
 
 class CacheStorage {
+  #named = new SafeMap();
+
   constructor() {
     this.default = new Cache("default");
-    this._named = new Map();
-    this._named.set("default", this.default);
+    this.#named.set("default", this.default);
   }
 
   async open(name) {
-    const normalized = String(name ?? "").trim();
+    const normalized = StringPrototypeTrim(String(name ?? ""));
     if (!normalized) {
       throw new TypeError("caches.open(name) requires a non-empty cache name");
     }
-    const existing = this._named.get(normalized);
+    const existing = this.#named.get(normalized);
     if (existing) {
       return existing;
     }
     const cache = new Cache(normalized);
-    this._named.set(normalized, cache);
+    this.#named.set(normalized, cache);
     return cache;
   }
 }
@@ -640,3 +734,5 @@ if (typeof denoFetch === "function") {
 }
 define("caches", new CacheStorage());
 dd.setTime = setFrozenTime;
+dd.frozenNow = () => frozenNowMs;
+dd.frozenPerfNow = () => frozenPerfMs;

@@ -1079,6 +1079,57 @@ mod tests {
         );
     }
 
+    /// The runtime's scripts take built-ins from primordials and web methods
+    /// from `dd.webPrimordials` by name; a misspelt name would stay undefined
+    /// until the code path using it runs.
+    #[test]
+    #[serial]
+    fn runtime_scripts_capture_only_names_that_exist() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from bootstrap snapshot");
+        let sources = serde_json::to_string(&[
+            include_str!("../js/web/console.js"),
+            WEB_INIT_JS,
+            BOOTSTRAP_JS,
+            EXECUTE_WORKER_JS,
+        ])
+        .expect("sources serialize");
+        let missing = execute_internal(
+            &mut js_runtime,
+            &format!(
+                r#"
+                const {{ dd, primordials }} = __bootstrap;
+                const capture = /const \{{([^}}]*)\}} = (primordials|dd\.webPrimordials);/g;
+                const missing = [];
+                let checked = 0;
+                for (const source of {sources}) {{
+                  for (const [, list, from] of source.matchAll(capture)) {{
+                    const target = from === "primordials" ? primordials : dd.webPrimordials;
+                    for (const entry of list.split(",")) {{
+                      const name = entry.split(":")[0].trim();
+                      if (!name) continue;
+                      checked++;
+                      if (target[name] === undefined) missing.push(name);
+                    }}
+                  }}
+                }}
+                return JSON.stringify({{ missing, enough: checked > 200 }});
+                "#
+            ),
+        );
+        assert_eq!(
+            string(&mut js_runtime, missing),
+            r#"{"missing":[],"enough":true}"#
+        );
+    }
+
     #[test]
     #[serial]
     fn direct_worker_fetch_works_after_loading_worker_into_runtime() {

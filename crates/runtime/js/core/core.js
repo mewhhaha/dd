@@ -9,6 +9,7 @@
 const { primordials } = globalThis.__bootstrap;
 delete globalThis.__bootstrap;
 const {
+  ArrayPrototypePush,
   Error,
   MapPrototypeDelete,
   MapPrototypeGet,
@@ -16,9 +17,12 @@ const {
   MapPrototypeSet,
   ObjectFreeze,
   PromiseReject,
+  Number,
   ReflectApply,
   RegExpPrototypeExec,
   SafeMap,
+  SafeRegExp,
+  String,
   StringPrototypeSplit,
   Symbol,
   SymbolFor,
@@ -147,7 +151,8 @@ function cancelTimer(id) {
   }
 }
 
-const STACK_FRAME = /^\s*at (?:.*? \()?(.+):(\d+):(\d+)\)?$/;
+const STACK_FRAME = new SafeRegExp("^\\s*at (?:.*? \\()?(.+):(\\d+):(\\d+)\\)?$");
+const NEWLINE = new SafeRegExp("\n");
 
 /** The parts of an error the web layer's error reporting reads. */
 function destructureError(error) {
@@ -164,11 +169,11 @@ function destructureError(error) {
     exceptionMessage = "Uncaught (unprintable error)";
   }
   const frames = [];
-  const lines = StringPrototypeSplit(stack, "\n");
+  const lines = StringPrototypeSplit(stack, NEWLINE);
   for (let i = 1; i < lines.length; i++) {
     const match = RegExpPrototypeExec(STACK_FRAME, lines[i]);
     if (match !== null) {
-      frames.push({
+      ArrayPrototypePush(frames, {
         fileName: match[1],
         lineNumber: Number(match[2]),
         columnNumber: Number(match[3]),

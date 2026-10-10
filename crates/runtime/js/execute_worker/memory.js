@@ -1,4 +1,4 @@
-  const createMemoryStub = (namespace, memoryKey) => Object.freeze({
+  const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
     id: createMemoryId(namespace, memoryKey),
     binding: namespace,
     sockets: createMemoryStubSocketApi(namespace, memoryKey),
@@ -9,7 +9,7 @@
       if (typeof callback !== "function" || callback.constructor?.name === "AsyncFunction") {
         throw new Error("memory read requires a synchronous callback");
       }
-      const context = { ...currentRequestContext() };
+      const context = { __proto__: null, ...currentRequestContext() };
       return asyncContext.run(context, async () => {
         const result = await callOp(
           "op_memory_read_begin", activeRequestContextHandle(), namespace, memoryKey,
@@ -25,24 +25,23 @@
         const assertActive = () => {
           if (!active) throw new Error("memory snapshot is outside its synchronous callback");
         };
-        const snapshot = Object.freeze({
+        const readSnapshotValue = (key) => {
+          const record = callOp("op_memory_read_get", result.handle, memoryStorageKey(key));
+          if (!record.ok) throw new Error(record.error);
+          return record.record ? decodeMemoryStorageValue(record.record) : null;
+        };
+        const snapshot = ObjectFreeze({
           get(key) {
             assertActive();
-            const record = callOp("op_memory_read_get", result.handle, memoryStorageKey(key));
-            if (!record.ok) throw new Error(record.error);
-            return record.record ? decodeMemoryStorageValue(record.record) : null;
+            return readSnapshotValue(key);
           },
           list(options = {}) {
             assertActive();
             const prefix = memoryStorageKey(options?.prefix ?? "");
-            const limitInput = Number(options?.limit ?? 100);
-            const limit = Number.isFinite(limitInput)
-              ? Math.max(1, Math.min(1000, Math.trunc(limitInput)))
-              : 100;
+            const limit = memoryListLimit(options);
             const keys = callOp("op_memory_read_keys", result.handle, prefix);
             if (!keys.ok) throw new Error(keys.error);
-            return keys.keys.sort(compareMemoryKeys).slice(0, limit)
-              .map(key => ({ key, value: snapshot.get(key) }));
+            return listMemoryEntries(keys.keys, limit, readSnapshotValue);
           },
         });
         try {
@@ -50,7 +49,7 @@
           let value;
           try {
             value = withMemoryTxnScope(
-              { binding: namespace, memoryKey, state: snapshot },
+              { __proto__: null, binding: namespace, memoryKey, state: snapshot },
               () => callback(snapshot),
             );
           } finally {
@@ -77,10 +76,13 @@
       if (typeof idempotencyKey !== "string" || idempotencyKey.length > 512) {
         throw new Error("memory atomic idempotencyKey must be a string of at most 512 characters");
       }
-      if (Object.keys(options).some((key) => key !== "idempotencyKey")) {
-        throw new Error("memory atomic accepts only the idempotencyKey option");
+      const optionKeys = ObjectKeys(options);
+      for (let i = 0; i < optionKeys.length; i++) {
+        if (optionKeys[i] !== "idempotencyKey") {
+          throw new Error("memory atomic accepts only the idempotencyKey option");
+        }
       }
-      const context = { ...currentRequestContext() };
+      const context = { __proto__: null, ...currentRequestContext() };
       return asyncContext.run(context, async () => {
         const lease = await callOp("op_memory_lease_acquire", activeRequestContextHandle(), namespace, memoryKey);
         if (!lease?.handle) {
@@ -119,9 +121,9 @@
     return "";
   };
 
-  const createMemoryNamespace = (bindingName) => Object.freeze({
+  const createMemoryNamespace = (bindingName) => ObjectFreeze({
     idFromName(name) {
-      const key = String(name ?? "").trim();
+      const key = StringPrototypeTrim(String(name ?? ""));
       if (!key) {
         throw new Error("memory idFromName requires a non-empty name");
       }
@@ -138,7 +140,7 @@
           `memory id belongs to namespace ${String(id.__dd_memory_binding)}, not ${bindingName}`,
         );
       }
-      const memoryKey = memoryIdKey(id).trim();
+      const memoryKey = StringPrototypeTrim(memoryIdKey(id));
       if (!memoryKey) {
         throw new Error("memory namespace get() requires a valid memory id");
       }

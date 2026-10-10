@@ -1,60 +1,81 @@
+  const abortErrorForSignal = (signal) => AbortSignalPrototypeGetReason(signal);
+
   const readFetchBody = async (request, signal, label) => {
-    if (signal.aborted) {
+    if (AbortSignalPrototypeGetAborted(signal)) {
       const error = abortErrorForSignal(signal);
-      void request.body?.cancel(error).catch(() => undefined);
+      const body = RequestPrototypeGetBody(request);
+      if (body !== null) {
+        ignoreRejection(ReadableStreamPrototypeCancel(body, error));
+      }
       throw error;
     }
-    if (!request.body) return new Uint8Array();
-    const reader = request.body.getReader();
-    const cancel = (error) => { void reader.cancel(error).catch(() => undefined); };
+    const body = RequestPrototypeGetBody(request);
+    if (!body) return new Uint8Array();
+    const reader = ReadableStreamPrototypeGetReader(body);
+    const cancel = (error) => {
+      ignoreRejection(ReadableStreamDefaultReaderPrototypeCancel(reader, error));
+    };
     const onAbort = () => cancel(abortErrorForSignal(signal));
     const chunks = [];
     let length = 0;
     try {
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) throw abortErrorForSignal(signal);
+      AbortSignalPrototypeAddEventListener(signal, "abort", onAbort, ONCE);
+      if (AbortSignalPrototypeGetAborted(signal)) throw abortErrorForSignal(signal);
       for (;;) {
-        const { value, done } = await raceAbortSignal(reader.read(), signal);
+        const { value, done } = await raceAbortSignal(
+          ReadableStreamDefaultReaderPrototypeRead(reader),
+          signal,
+        );
         if (done) break;
-        const chunk = toByteChunk(value);
-        if (chunk.byteLength === 0) continue;
-        if (length + chunk.byteLength > maxRequestBodyBytes) {
+        const chunk = toBytes(value);
+        const chunkLength = byteLength(chunk);
+        if (chunkLength === 0) continue;
+        if (length + chunkLength > maxRequestBodyBytes) {
           throw new Error(`${label} request body exceeded max_request_body_bytes (${maxRequestBodyBytes} bytes)`);
         }
-        chunks.push(chunk);
-        length += chunk.byteLength;
+        ArrayPrototypePush(chunks, chunk);
+        length += chunkLength;
       }
       return concatByteChunks(chunks, length);
     } catch (error) {
       cancel(error);
       throw error;
     } finally {
-      signal.removeEventListener("abort", onAbort);
-      reader.releaseLock();
+      AbortSignalPrototypeRemoveEventListener(signal, "abort", onAbort);
+      ReadableStreamDefaultReaderPrototypeReleaseLock(reader);
     }
   };
 
   const normalizeFetchInput = async (inputValue, initValue, service = false) => {
-    const input = inputValue instanceof Request
+    const input = ObjectPrototypeIsPrototypeOf(RequestPrototype, inputValue)
       ? inputValue
-      : new URL(String(inputValue ?? (service ? "/" : "")), service ? "http://worker" : undefined);
+      : URLPrototypeGetHref(new URL(
+        String(inputValue ?? (service ? "/" : "")),
+        service ? "http://worker" : undefined,
+      ));
     const request = new Request(input, initValue);
-    if (!["http:", "https:"].includes(new URL(request.url).protocol)) {
+    const url = RequestPrototypeGetUrl(request);
+    const protocol = URLPrototypeGetProtocol(new URL(url));
+    if (protocol !== "http:" && protocol !== "https:") {
       throw new TypeError("fetch requires an http(s) URL in this runtime");
     }
-    const signal = AbortSignal.any([request.signal, currentRequestContext().controller.signal]);
+    const signal = AbortSignalAny(new SafeArrayIterator([
+      RequestPrototypeGetSignal(request),
+      AbortControllerPrototypeGetSignal(currentRequestContext().controller),
+    ]));
     const body = await readFetchBody(request, signal, service ? "service" : "host fetch");
     return {
-      method: request.method,
-      url: request.url,
-      headers: Array.from(request.headers.entries()),
+      __proto__: null,
+      method: RequestPrototypeGetMethod(request),
+      url,
+      headers: headerPairs(RequestPrototypeGetHeaders(request)),
       body,
       signal,
-      redirect: request.redirect,
+      redirect: RequestPrototypeGetRedirect(request),
     };
   };
 
-  const HOST_FETCH_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+  const HOST_FETCH_REDIRECT_STATUSES = new SafeSet([301, 302, 303, 307, 308]);
   const HOST_FETCH_MAX_REDIRECTS = 10;
 
   const rewriteMethodForRedirect = (status, method) => {
@@ -67,22 +88,31 @@
     return method;
   };
 
-  const stripRedirectBodyHeaders = (headers) => headers.filter(([name]) => {
-    const lower = String(name || "").toLowerCase();
-    return lower !== "content-type"
-      && lower !== "content-length"
-      && lower !== "content-encoding"
-      && lower !== "content-language"
-      && lower !== "content-location"
-      && lower !== "transfer-encoding";
-  });
+  // The header pairs whose lowercased name `drop` does not reject.
+  const keepHeaderPairs = (headers, drop) => {
+    const kept = [];
+    for (let i = 0; i < headers.length; i++) {
+      if (!drop(StringPrototypeToLowerCase(String(headers[i][0] || "")))) {
+        ArrayPrototypePush(kept, headers[i]);
+      }
+    }
+    return kept;
+  };
 
-  const stripCrossOriginRedirectHeaders = (headers) => headers.filter(([name]) => {
-    const lower = String(name || "").toLowerCase();
-    return lower !== "authorization"
-      && lower !== "proxy-authorization"
-      && lower !== "cookie";
-  });
+  const stripRedirectBodyHeaders = (headers) => keepHeaderPairs(headers, (lower) => (
+    lower === "content-type"
+      || lower === "content-length"
+      || lower === "content-encoding"
+      || lower === "content-language"
+      || lower === "content-location"
+      || lower === "transfer-encoding"
+  ));
+
+  const stripCrossOriginRedirectHeaders = (headers) => keepHeaderPairs(headers, (lower) => (
+    lower === "authorization"
+      || lower === "proxy-authorization"
+      || lower === "cookie"
+  ));
 
   const checkHostFetchUrl = async (requestContextHandle, url) => {
     const checked = await callOp(
@@ -95,14 +125,11 @@
       throw new Error(String(checked?.error ?? "host fetch URL check failed"));
     }
     return {
+      __proto__: null,
       url: String(checked.url || url),
-      clientRid: Math.max(0, Math.trunc(Number(checked.client_rid ?? 0) || 0)),
+      clientRid: toHandle(checked.client_rid),
     };
   };
-
-  const abortErrorForSignal = (signal) => signal.reason;
-
-  const { hostFetchResponse } = dd;
 
   // One request through the pinned client `clientHandle`, as a Response.
   // Aborting rejects at once; a response that arrives after that has its
@@ -124,18 +151,18 @@
       clientHandle,
       method,
       url,
-      Math.max(0, Math.trunc(Number(headersHandle ?? 0) || 0)),
-      Math.max(0, Math.trunc(Number(bodyHandle ?? 0) || 0)),
+      toHandle(headersHandle),
+      toHandle(bodyHandle),
     );
     let fetched;
     try {
       fetched = await raceAbortSignal(sent, signal);
     } catch (error) {
-      void sent.then((late) => {
+      PromisePrototypeThen(sent, (late) => {
         if (late?.body_handle > 0) {
           callOp("op_http_response_close", late.body_handle);
         }
-      }, () => undefined);
+      }, noop);
       throw error;
     }
     if (!fetched || fetched.ok !== true) {
@@ -148,9 +175,9 @@
     if (!signal) {
       return promise;
     }
-    if (signal.aborted) {
-      void promise.catch(() => undefined);
-      return Promise.reject(abortErrorForSignal(signal));
+    if (AbortSignalPrototypeGetAborted(signal)) {
+      ignoreRejection(promise);
+      return PromiseReject(abortErrorForSignal(signal));
     }
     return new Promise((resolve, reject) => {
       const onAbort = () => {
@@ -158,10 +185,11 @@
         reject(abortErrorForSignal(signal));
       };
       const cleanup = () => {
-        signal.removeEventListener("abort", onAbort);
+        AbortSignalPrototypeRemoveEventListener(signal, "abort", onAbort);
       };
-      signal.addEventListener("abort", onAbort, { once: true });
-      promise.then(
+      AbortSignalPrototypeAddEventListener(signal, "abort", onAbort, ONCE);
+      PromisePrototypeThen(
+        promise,
         (value) => {
           cleanup();
           resolve(value);
@@ -174,6 +202,7 @@
     });
   };
 
+  // The global fetch (web/init.js) calls dd.hostFetch.
   if (typeof dd.installHostFetch !== "function") {
     dd.installHostFetch = function installHostFetch() {
         if (typeof dd.hostFetch === "function") {
@@ -196,8 +225,8 @@
               current.requestContextHandle,
               normalized.method,
               normalized.url,
-              Math.max(0, Math.trunc(Number(normalizedHeadersHandle ?? 0) || 0)),
-              Math.max(0, Math.trunc(Number(normalizedBodyHandle ?? 0) || 0)),
+              toHandle(normalizedHeadersHandle),
+              toHandle(normalizedBodyHandle),
             );
             await syncFrozenTime();
             if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
@@ -206,22 +235,19 @@
             const signal = normalized.signal;
             let method = String(prepared.method || "GET");
             let url = String(prepared.url || normalized.url);
-            let clientRid = Math.max(
-              0,
-              Math.trunc(Number(prepared.client_rid ?? 0) || 0),
-            );
+            let clientRid = toHandle(prepared.client_rid);
             let headers = callOp(
               "op_http_take_prepared_headers",
-              Math.max(0, Math.trunc(Number(prepared.headers_handle ?? 0) || 0)),
+              toHandle(prepared.headers_handle),
             );
-            if (!Array.isArray(headers)) {
+            if (!ArrayIsArray(headers)) {
               headers = [];
             }
             const preparedBodyHandle = Number(prepared.body_handle ?? 0);
             let body = preparedBodyHandle > 0
               ? callOp("op_http_take_prepared_body", preparedBodyHandle)
               : undefined;
-            if (body && body.byteLength === 0) {
+            if (body && byteLength(body) === 0) {
               body = undefined;
             }
             const redirectMode = normalized.redirect === "error"
@@ -241,29 +267,35 @@
                 body,
                 signal,
               );
-              if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(response.status)) {
+              const status = ResponsePrototypeGetStatus(response);
+              if (redirectMode === "manual" || !HOST_FETCH_REDIRECT_STATUSES.has(status)) {
                 return response;
               }
-              const location = response.headers.get("location");
+              const location = HeadersPrototypeGet(ResponsePrototypeGetHeaders(response), "location");
               if (!location) {
                 return response;
               }
-              await response.body?.cancel();
+              const responseBody = ResponsePrototypeGetBody(response);
+              if (responseBody !== null) {
+                await ReadableStreamPrototypeCancel(responseBody);
+              }
               if (redirectMode === "error") {
-                throw new TypeError(`host fetch redirect blocked: ${response.status}`);
+                throw new TypeError(`host fetch redirect blocked: ${status}`);
               }
               if (redirectsRemaining <= 0) {
                 throw new TypeError("host fetch exceeded redirect limit");
               }
-              const nextUrl = new URL(location, response.url || url).toString();
-              const previousOrigin = new URL(url).origin;
+              const nextUrl = URLPrototypeGetHref(
+                new URL(location, ResponsePrototypeGetUrl(response) || url),
+              );
+              const previousOrigin = URLPrototypeGetOrigin(new URL(url));
               const checked = await checkHostFetchUrl(current.requestContextHandle, nextUrl);
-              if (new URL(checked.url).origin !== previousOrigin) {
+              if (URLPrototypeGetOrigin(new URL(checked.url)) !== previousOrigin) {
                 headers = stripCrossOriginRedirectHeaders(headers);
               }
               url = checked.url;
               clientRid = checked.clientRid;
-              const nextMethod = rewriteMethodForRedirect(response.status, method);
+              const nextMethod = rewriteMethodForRedirect(status, method);
               if (nextMethod !== method) {
                 headers = stripRedirectBodyHeaders(headers);
                 body = undefined;
@@ -274,12 +306,11 @@
           };
           const current = currentRequestContext(false);
           if (current?.memoryEntry) {
-            return gateMemoryOutput(current.memoryEntry, run);
+            return await gateMemoryOutput(current.memoryEntry, run);
           }
-          return run();
+          return await run();
         };
         dd.hostFetch = scopedFetch;
-        globalThis.fetch = scopedFetch;
     };
   }
   const installHostFetch = dd.installHostFetch;

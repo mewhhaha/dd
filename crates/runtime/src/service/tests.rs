@@ -28,6 +28,8 @@ mod egress;
 mod examples;
 #[path = "tests/fixtures.rs"]
 mod fixtures;
+#[path = "tests/hardening.rs"]
+mod hardening;
 mod host_fetch;
 #[path = "tests/inspector.rs"]
 mod inspector;
@@ -662,7 +664,10 @@ export default {
       cacheBypassValue: Boolean(cacheBypassGetter?.()),
       rawAvailable: typeof globalThis.__dd_raw_host_fetch === "function",
       rawInstalled: current === globalThis.__dd_raw_host_fetch,
-      wrapperInstalled: current === __dd_internals.dd.hostFetch,
+      // The global stays the web layer's fetch, which calls the request-scoped
+      // host fetch; the runtime writes no worker-visible global per request.
+      wrapperInstalled: current === __dd_internals.dd.web.fetch
+        && typeof __dd_internals.dd.hostFetch === "function",
     });
   },
 };

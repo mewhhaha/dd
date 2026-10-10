@@ -2,7 +2,29 @@
 // the bootstrap snapshot is built, with the bootstrap object as
 // `__bootstrap`, and leaves its classes in `__bootstrap.dd.web`; bootstrap.js
 // decides which of them become globals.
-const { core, dd } = __bootstrap;
+//
+// Like the rest of the runtime's own JavaScript it runs on primordials and
+// on the web classes' methods as captured below, never on what worker code
+// can reach and replace later.
+const { core, dd, primordials } = __bootstrap;
+const {
+  ArrayPrototypePush,
+  ObjectDefineProperty,
+  ObjectFreeze,
+  ObjectGetOwnPropertySymbols,
+  ObjectPrototypeIsPrototypeOf,
+  PromiseReject,
+  ReflectGetOwnPropertyDescriptor,
+  ReflectOwnKeys,
+  String,
+  StringPrototypeSlice,
+  StringPrototypeToLowerCase,
+  StringPrototypeToUpperCase,
+  SymbolPrototypeGetDescription,
+  TypeError,
+  Uint8Array,
+  uncurryThis,
+} = primordials;
 const cryptoRuntime = core.loadExtScript("ext:deno_crypto/00_crypto.js");
 const { Crypto, CryptoKey, SubtleCrypto } = cryptoRuntime;
 const {
@@ -20,7 +42,9 @@ const { AbortController, AbortSignal } = core.loadExtScript("ext:deno_web/03_abo
 const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
 // Ops fail with these classes (WebCrypto above all); throw them as the
 // DOMExceptions they name.
-for (const name of ["DataError", "NotSupportedError", "OperationError", "QuotaExceededError"]) {
+const domExceptionErrors = ["DataError", "NotSupportedError", "OperationError", "QuotaExceededError"];
+for (let i = 0; i < domExceptionErrors.length; i++) {
+  const name = domExceptionErrors[i];
   core.ops.op_register_error_builder(
     `DOMException${name}`,
     (message) => new DOMException(message, name),
@@ -69,6 +93,107 @@ const {
   op_http_response_read,
 } = core.ops;
 
+// Uncurried copies of the web classes' prototype methods and accessors,
+// named the way primordials are (ResponsePrototypeGetHeaders,
+// ReadableStreamDefaultReaderPrototypeRead, ...), with each prototype as
+// `${name}Prototype`. They are taken before any worker code runs, so the
+// runtime's own use of web objects ignores what worker code later does to
+// those prototypes.
+const webPrimordials = { __proto__: null };
+function copyWebPrototype(name, prototype) {
+  webPrimordials[`${name}Prototype`] = prototype;
+  const keys = ReflectOwnKeys(prototype);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (typeof key !== "string" || key === "constructor") {
+      continue;
+    }
+    const suffix = `${StringPrototypeToUpperCase(key[0])}${StringPrototypeSlice(key, 1)}`;
+    const descriptor = ReflectGetOwnPropertyDescriptor(prototype, key);
+    if (descriptor.get !== undefined) {
+      webPrimordials[`${name}PrototypeGet${suffix}`] = uncurryThis(descriptor.get);
+    }
+    if (descriptor.set !== undefined) {
+      webPrimordials[`${name}PrototypeSet${suffix}`] = uncurryThis(descriptor.set);
+    }
+    if (typeof descriptor.value === "function") {
+      webPrimordials[`${name}Prototype${suffix}`] = uncurryThis(descriptor.value);
+    }
+  }
+}
+copyWebPrototype("AbortController", AbortController.prototype);
+// AbortSignal's own addEventListener keeps a dependent signal (one from
+// AbortSignal.any) reachable from its sources while it has abort listeners;
+// EventTarget's would let it be collected before the abort arrives.
+copyWebPrototype("AbortSignal", AbortSignal.prototype);
+copyWebPrototype("Headers", Headers.prototype);
+copyWebPrototype("ReadableStream", ReadableStream.prototype);
+copyWebPrototype("ReadableStreamDefaultController", ReadableStreamDefaultController.prototype);
+copyWebPrototype("ReadableStreamDefaultReader", ReadableStreamDefaultReader.prototype);
+copyWebPrototype("Request", Request.prototype);
+copyWebPrototype("Response", Response.prototype);
+copyWebPrototype("URL", URL.prototype);
+webPrimordials.AbortSignalAny = AbortSignal.any;
+
+// Headers keep their combined, sorted entries (what iterating them yields)
+// behind a symbol-keyed getter on the prototype; take that one too.
+const headersSymbols = ObjectGetOwnPropertySymbols(Headers.prototype);
+for (let i = 0; i < headersSymbols.length; i++) {
+  if (SymbolPrototypeGetDescription(headersSymbols[i]) === "iterable headers") {
+    webPrimordials.HeadersPrototypeGetIterableHeaders = uncurryThis(
+      ReflectGetOwnPropertyDescriptor(Headers.prototype, headersSymbols[i]).get,
+    );
+  }
+}
+if (webPrimordials.HeadersPrototypeGetIterableHeaders === undefined) {
+  throw new TypeError("dd bootstrap cannot find the Headers entries getter");
+}
+ObjectFreeze(webPrimordials);
+
+const {
+  HeadersPrototypeAppend,
+  HeadersPrototypeGet,
+  HeadersPrototypeGetIterableHeaders,
+  ReadableStreamDefaultControllerPrototypeClose,
+  ReadableStreamDefaultControllerPrototypeEnqueue,
+  ReadableStreamDefaultReaderPrototypeRead,
+  ReadableStreamPrototypeGetReader,
+  RequestPrototypeArrayBuffer,
+  RequestPrototypeGetBody,
+  RequestPrototypeGetHeaders,
+  RequestPrototypeGetMethod,
+  RequestPrototypeGetUrl,
+  ResponsePrototype,
+  ResponsePrototypeGetBody,
+  ResponsePrototypeGetHeaders,
+  ResponsePrototypeGetOk,
+  ResponsePrototypeGetStatus,
+  ResponsePrototypeGetUrl,
+} = webPrimordials;
+
+/** `headers`' combined, sorted [name, value] pairs, as new arrays. */
+function headerPairs(headers) {
+  const entries = HeadersPrototypeGetIterableHeaders(headers);
+  const pairs = [];
+  for (let i = 0; i < entries.length; i++) {
+    ArrayPrototypePush(pairs, [entries[i][0], entries[i][1]]);
+  }
+  return pairs;
+}
+
+/**
+ * Appends each [name, value] pair to `headers`. Header lists go into a new
+ * Request or Response this way rather than as its init's `headers`, which
+ * the web layer would iterate through the worker-reachable
+ * Array.prototype[Symbol.iterator].
+ */
+function appendHeaderPairs(headers, pairs) {
+  for (let i = 0; i < pairs.length; i++) {
+    HeadersPrototypeAppend(headers, pairs[i][0], pairs[i][1]);
+  }
+  return headers;
+}
+
 // A Response for a host fetch result, its body read from Rust as it arrives.
 function hostFetchResponse(fetched, url, method) {
   const inner = newInnerResponse(fetched.status, fetched.status_text);
@@ -80,18 +205,19 @@ function hostFetchResponse(fetched, url, method) {
       op_http_response_close(bodyHandle);
     } else {
       inner.body = new InnerBody(new ReadableStream({
+        __proto__: null,
         async pull(controller) {
           const chunk = await op_http_response_read(bodyHandle);
           if (chunk === null) {
-            controller.close();
+            ReadableStreamDefaultControllerPrototypeClose(controller);
           } else {
-            controller.enqueue(chunk);
+            ReadableStreamDefaultControllerPrototypeEnqueue(controller, chunk);
           }
         },
         cancel() {
           op_http_response_close(bodyHandle);
         },
-      }, { highWaterMark: 0 }));
+      }, { __proto__: null, highWaterMark: 0 }));
     }
   }
   return fromInnerResponse(inner, "immutable");
@@ -101,19 +227,21 @@ function hostFetchResponse(fetched, url, method) {
 // development runtime, which exposes it as __dd_raw_host_fetch for dd-vite.
 async function unscopedFetch(input, init = undefined) {
   const request = new Request(input, init);
-  const body = request.body === null
+  const method = RequestPrototypeGetMethod(request);
+  const url = RequestPrototypeGetUrl(request);
+  const body = RequestPrototypeGetBody(request) === null
     ? new Uint8Array()
-    : new Uint8Array(await request.arrayBuffer());
+    : new Uint8Array(await RequestPrototypeArrayBuffer(request));
   const fetched = await op_http_fetch_unscoped(
-    request.method,
-    request.url,
-    [...request.headers],
+    method,
+    url,
+    headerPairs(RequestPrototypeGetHeaders(request)),
     body,
   );
   if (fetched?.ok !== true) {
     throw new TypeError(String(fetched?.error ?? "host fetch failed"));
   }
-  return hostFetchResponse(fetched, request.url, request.method);
+  return hostFetchResponse(fetched, url, method);
 }
 
 // WebAssembly.compileStreaming and instantiateStreaming hand their Response
@@ -128,25 +256,29 @@ const {
 op_set_wasm_streaming_handler(async (source, id) => {
   try {
     const response = await source;
-    if (!(response instanceof Response)) {
+    if (!ObjectPrototypeIsPrototypeOf(ResponsePrototype, response)) {
       throw new TypeError(
         "Failed to execute 'WebAssembly.compileStreaming': Argument 1 is not a Response",
       );
     }
-    const contentType = response.headers.get("Content-Type");
-    if (typeof contentType !== "string" || contentType.toLowerCase() !== "application/wasm") {
+    const contentType = HeadersPrototypeGet(ResponsePrototypeGetHeaders(response), "Content-Type");
+    if (
+      typeof contentType !== "string"
+      || StringPrototypeToLowerCase(contentType) !== "application/wasm"
+    ) {
       throw new TypeError("Invalid WebAssembly content type");
     }
-    if (!response.ok) {
+    if (!ResponsePrototypeGetOk(response)) {
       throw new TypeError(
-        `Failed to receive WebAssembly content: HTTP status code ${response.status}`,
+        `Failed to receive WebAssembly content: HTTP status code ${ResponsePrototypeGetStatus(response)}`,
       );
     }
-    op_wasm_streaming_set_url(id, response.url);
-    if (response.body !== null) {
-      const reader = response.body.getReader();
+    op_wasm_streaming_set_url(id, ResponsePrototypeGetUrl(response));
+    const body = ResponsePrototypeGetBody(response);
+    if (body !== null) {
+      const reader = ReadableStreamPrototypeGetReader(body);
       for (;;) {
-        const { value, done } = await reader.read();
+        const { value, done } = await ReadableStreamDefaultReaderPrototypeRead(reader);
         if (done) {
           break;
         }
@@ -158,7 +290,6 @@ op_set_wasm_streaming_handler(async (source, id) => {
     op_wasm_streaming_abort(id, error);
   }
 });
-const { TypeError } = __bootstrap.primordials;
 
 // Each request installs dd's host fetch (execute_worker/fetch.js), which
 // enforces the worker's egress rules; outside a request there is nothing to
@@ -166,7 +297,7 @@ const { TypeError } = __bootstrap.primordials;
 function fetch(input, init = undefined) {
   const hostFetch = dd.hostFetch;
   if (typeof hostFetch !== "function") {
-    return Promise.reject(new TypeError("fetch is only available while handling a request"));
+    return PromiseReject(new TypeError("fetch is only available while handling a request"));
   }
   return hostFetch(input, init);
 }
@@ -218,11 +349,15 @@ const ddRuntime = {
   structuredClone,
 };
 
-Object.defineProperty(ddRuntime, "crypto", {
+ObjectDefineProperty(ddRuntime, "crypto", {
+  __proto__: null,
   get: () => cryptoRuntime.crypto,
   enumerable: true,
 });
 
 dd.web = ddRuntime;
+dd.webPrimordials = webPrimordials;
+dd.headerPairs = headerPairs;
+dd.appendHeaderPairs = appendHeaderPairs;
 dd.hostFetchResponse = hostFetchResponse;
 dd.unscopedFetch = unscopedFetch;

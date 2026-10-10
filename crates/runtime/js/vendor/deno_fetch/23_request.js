@@ -14,6 +14,7 @@ const {
   PromiseReject,
   PromiseResolve,
   RegExpPrototypeExec,
+  SafeArrayIterator,
   StringPrototypeStartsWith,
   StringPrototypeToUpperCase,
   Symbol,
@@ -526,7 +527,12 @@ class Request {
 
     // 29 & 30.
     if (signal !== null) {
-      this[_signalCache] = createDependentAbortSignal([signal], prefix);
+      // dd: a SafeArrayIterator, so the sequence conversion does not walk
+      // the array through a replaceable Array.prototype[Symbol.iterator].
+      this[_signalCache] = createDependentAbortSignal(
+        new SafeArrayIterator([signal]),
+        prefix,
+      );
     }
 
     // 31.
@@ -677,7 +683,7 @@ class Request {
 
     const materializedSignal = this[_signal];
     const clonedSignal = createDependentAbortSignal(
-      [materializedSignal],
+      new SafeArrayIterator([materializedSignal]),
       prefix,
     );
 
