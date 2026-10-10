@@ -596,7 +596,7 @@ pub(super) async fn run_runtime_coordinator(start: RuntimeThreadStart) {
         event_tx,
         memory_outbox_drain_receiver,
         storage.memory_outbox_max_concurrent_shards,
-        config.scale_tick,
+        memory_outbox_scan_interval(config.scale_tick),
     ));
     let init = WorkerManagerInit {
         bootstrap_snapshot,

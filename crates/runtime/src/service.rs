@@ -73,7 +73,8 @@ use uuid::Uuid;
 use self::config::{DeployBindings, extract_bindings, validate_runtime_config};
 use self::control::RuntimeEvent;
 use self::sessions::{
-    MemoryOutboxDrainSender, memory_outbox_worker_channel, run_memory_outbox_worker,
+    MemoryOutboxDrainSender, memory_outbox_scan_interval, memory_outbox_worker_channel,
+    run_memory_outbox_worker,
 };
 type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
 type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;

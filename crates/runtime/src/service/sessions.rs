@@ -19,6 +19,18 @@ pub(super) fn memory_outbox_worker_channel() -> (MemoryOutboxDrainSender, Memory
     mpsc::channel(MEMORY_OUTBOX_WORKER_CHANNEL_CAPACITY)
 }
 
+/// The shortest interval between periodic outbox scans.
+const MIN_MEMORY_OUTBOX_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often the outbox scans every state shard for due records. It follows
+/// the scheduler's tick (1 s by default) but never runs faster than every
+/// 250 ms: each scan claims on all 32 shards from the coordinator's thread,
+/// and at a 10 ms tick the scans kept that thread busy enough to delay
+/// cancellations and other control traffic by up to a second.
+pub(super) fn memory_outbox_scan_interval(scale_tick: Duration) -> Duration {
+    scale_tick.max(MIN_MEMORY_OUTBOX_SCAN_INTERVAL)
+}
+
 pub(super) async fn run_memory_outbox_worker(
     memory_store: MemoryStore,
     event_tx: RuntimeEventSender,
