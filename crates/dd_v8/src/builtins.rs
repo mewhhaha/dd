@@ -148,9 +148,11 @@ fn throw_range_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 /// Copies the bytes of an `ArrayBuffer` or view.
 pub fn buffer_bytes(value: v8::Local<v8::Value>) -> Option<Vec<u8>> {
     if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
-        let mut bytes = vec![0; view.byte_length()];
-        view.copy_contents(&mut bytes);
-        return Some(bytes);
+        // Not `copy_contents`: rusty_v8 passes its length to V8 as a C `int`
+        // and panics on views of 2 GiB or more. Only small typed arrays live
+        // on the V8 heap and need `storage`; the rest are read in place.
+        let mut storage = [0; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP];
+        return Some(view.get_contents(&mut storage).to_vec());
     }
     let buffer = v8::Local::<v8::ArrayBuffer>::try_from(value).ok()?;
     let store = buffer.get_backing_store();

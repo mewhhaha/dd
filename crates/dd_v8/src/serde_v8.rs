@@ -546,23 +546,7 @@ impl<'a, 's, 'i> Deserializer<'a, 's, 'i> {
     }
 
     fn bytes(&self) -> Option<Vec<u8>> {
-        if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(self.input) {
-            let mut bytes = vec![0; view.byte_length()];
-            view.copy_contents(&mut bytes);
-            return Some(bytes);
-        }
-        if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(self.input) {
-            let store = buffer.get_backing_store();
-            let length = store.byte_length();
-            let Some(data) = store.data() else {
-                return Some(Vec::new());
-            };
-            // SAFETY: the backing store is alive for this borrow and holds
-            // `length` initialized bytes.
-            let slice = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), length) };
-            return Some(slice.to_vec());
-        }
-        None
+        crate::builtins::buffer_bytes(self.input)
     }
 }
 
