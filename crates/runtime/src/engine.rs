@@ -1176,6 +1176,60 @@ mod tests {
         );
     }
 
+    /// The AES-OCB cipher only takes 12-byte nonces, but any nonce of 1 to
+    /// 15 bytes reached `GenericArray::from_slice`, which panicked on the
+    /// blocking thread; `.await.unwrap()` then re-raised the panic on the
+    /// isolate's thread, from plain `crypto.subtle.encrypt` calls.
+    #[test]
+    #[serial]
+    fn web_crypto_aes_ocb_rejects_nonces_it_cannot_use() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        // The script starts async ops before its first await.
+        let _context = runtime.enter();
+        let result = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                (async () => {
+                  const subtle = crypto.subtle;
+                  const data = new TextEncoder().encode("dd");
+                  const key = await subtle.generateKey({ name: "AES-OCB", length: 128 }, false, ["encrypt", "decrypt"]);
+                  const iv = new Uint8Array(12);
+                  const sealed = await subtle.encrypt({ name: "AES-OCB", iv }, key, data);
+                  const results = [new TextDecoder().decode(await subtle.decrypt({ name: "AES-OCB", iv }, key, sealed))];
+                  for (const length of [1, 6, 8, 11, 13, 15]) {
+                    for (const [op, input] of [["encrypt", data], ["decrypt", sealed]]) {
+                      try {
+                        await subtle[op]({ name: "AES-OCB", iv: new Uint8Array(length) }, key, input);
+                        results.push(`${op} with ${length} bytes succeeded`);
+                      } catch (error) {
+                        results.push(error instanceof DOMException ? error.name : String(error));
+                      }
+                    }
+                  }
+                  return results.join(",");
+                })()
+                "#,
+            )
+            .expect("crypto script should run");
+        let result = runtime
+            .block_on(js_runtime.resolve(result))
+            .expect("crypto script should resolve");
+        let expected = std::iter::once("dd")
+            .chain(std::iter::repeat_n("NotSupportedError", 12))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(string(&mut js_runtime, result), expected);
+    }
+
     #[test]
     #[serial]
     fn webassembly_streaming_compiles_responses() {

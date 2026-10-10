@@ -95,6 +95,8 @@ pub enum EncryptError {
     InvalidKeyOrIv,
     #[error("iv length not equal to 12 or 16")]
     InvalidIvLength,
+    #[error("AES-OCB nonces must be 12 bytes")]
+    UnsupportedOcbNonce,
     #[error("invalid counter length. Currently supported 32/64/128 bits")]
     InvalidCounterLength,
     #[error("tried to encrypt too much data")]
@@ -309,9 +311,10 @@ fn encrypt_aes_ocb(
 
     let mut ciphertext = data.to_vec();
 
-    // OCB supports nonce sizes from 1 to 15 bytes (recommended: 12 bytes)
-    if iv.is_empty() || iv.len() > 15 {
-        return Err(EncryptError::InvalidIvLength);
+    // OCB allows nonces of 1 to 15 bytes, but `Ocb3` below takes its default
+    // 12-byte nonce, and `GenericArray::from_slice` panics on any other length.
+    if iv.len() != 12 {
+        return Err(EncryptError::UnsupportedOcbNonce);
     }
 
     let nonce = GenericArray::from_slice(&iv);
@@ -406,6 +409,9 @@ impl From<EncryptError> for OpError {
             EncryptError::InvalidLength => OpError::type_error(message),
             EncryptError::InvalidKeyOrIv => OpError::custom("DOMExceptionOperationError", message),
             EncryptError::InvalidIvLength => OpError::type_error(message),
+            EncryptError::UnsupportedOcbNonce => {
+                OpError::custom("DOMExceptionNotSupportedError", message)
+            }
             EncryptError::InvalidCounterLength => OpError::type_error(message),
             EncryptError::TooMuchData => OpError::custom("DOMExceptionOperationError", message),
             EncryptError::Failed => OpError::custom("DOMExceptionOperationError", message),

@@ -104,6 +104,8 @@ pub enum DecryptError {
     TooMuchData,
     #[error("iv length not equal to 12 or 16")]
     InvalidIvLength,
+    #[error("AES-OCB nonces must be 12 bytes")]
+    UnsupportedOcbNonce,
     #[error("{0}")]
     Rsa(rsa::Error),
 }
@@ -396,9 +398,10 @@ fn decrypt_aes_ocb(
         return Err(DecryptError::InvalidTagLength);
     }
 
-    // OCB supports nonce sizes from 1 to 15 bytes (recommended: 12 bytes)
-    if iv.is_empty() || iv.len() > 15 {
-        return Err(DecryptError::InvalidIvLength);
+    // OCB allows nonces of 1 to 15 bytes, but `Ocb3` below takes its default
+    // 12-byte nonce, and `GenericArray::from_slice` panics on any other length.
+    if iv.len() != 12 {
+        return Err(DecryptError::UnsupportedOcbNonce);
     }
 
     let sep = data.len() - (tag_length / 8);
@@ -452,6 +455,9 @@ impl From<DecryptError> for OpError {
             DecryptError::InvalidKeyOrIv => OpError::custom("DOMExceptionOperationError", message),
             DecryptError::TooMuchData => OpError::custom("DOMExceptionOperationError", message),
             DecryptError::InvalidIvLength => OpError::type_error(message),
+            DecryptError::UnsupportedOcbNonce => {
+                OpError::custom("DOMExceptionNotSupportedError", message)
+            }
             DecryptError::Rsa(..) => OpError::custom("DOMExceptionOperationError", message),
         }
     }
