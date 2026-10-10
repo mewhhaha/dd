@@ -1145,6 +1145,57 @@ mod tests {
 
     #[test]
     #[serial]
+    fn pbkdf2_work_is_bounded_before_it_starts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let _context = runtime.enter();
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        let result = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                (async () => {
+                  const subtle = crypto.subtle;
+                  const key = await subtle.importKey("raw", new Uint8Array(16), "PBKDF2", false, ["deriveBits"]);
+                  const derive = (iterations, length) => subtle
+                    .deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array(16), iterations }, key, length)
+                    .then((bits) => `ok:${bits.byteLength}`, (error) => `${error.name}`);
+                  return [
+                    await derive(600_000, 256),
+                    // -8 converts to 4294967288 bits: half a gigabyte.
+                    await derive(1, -8),
+                    await derive(1, 16 * 1024 * 1024),
+                    await derive(4_000_000_000, 256),
+                    // Four blocks, one iteration past the 50,000,000-round limit.
+                    await derive(12_500_001, 1024),
+                  ].join(",");
+                })()
+                "#,
+            )
+            .expect("derive script should run");
+        let started = std::time::Instant::now();
+        let result = runtime
+            .block_on(js_runtime.resolve(result))
+            .expect("derivations settle");
+        assert_eq!(
+            string(&mut js_runtime, result),
+            "ok:32,OperationError,OperationError,OperationError,OperationError"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "refusals happen before any work: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[serial]
     fn web_crypto_covers_common_algorithms() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

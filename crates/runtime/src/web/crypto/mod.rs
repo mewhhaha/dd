@@ -135,6 +135,8 @@ pub enum CryptoError {
     Der(#[from] rsa::pkcs1::der::Error),
     #[error("Missing argument hash")]
     MissingArgumentHash,
+    #[error("{0}")]
+    DerivationRefused(&'static str),
     #[error("Missing argument saltLength")]
     MissingArgumentSaltLength,
     #[error("unsupported algorithm")]
@@ -522,6 +524,33 @@ pub struct DeriveKeyArg {
     info: Option<JsBuffer>,
 }
 
+/// The most PBKDF2 may derive in one call, in bytes.
+const PBKDF2_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// The most HMAC rounds (iterations times output blocks) one PBKDF2 call
+/// may run: seconds of CPU, far above any real use (OWASP suggests 600,000
+/// iterations for one block). Derivation runs on a blocking thread that
+/// nothing can stop once it starts, so the work is bounded up front.
+const PBKDF2_MAX_ROUNDS: u64 = 50_000_000;
+
+fn pbkdf2_within_limits(
+    output_bytes: usize,
+    hash_bytes: usize,
+    iterations: u32,
+) -> Result<(), CryptoError> {
+    if output_bytes > PBKDF2_MAX_OUTPUT_BYTES {
+        return Err(CryptoError::DerivationRefused(
+            "PBKDF2 length exceeds the runtime's 1 MiB limit",
+        ));
+    }
+    let blocks = output_bytes.div_ceil(hash_bytes) as u64;
+    if blocks.saturating_mul(u64::from(iterations)) > PBKDF2_MAX_ROUNDS {
+        return Err(CryptoError::DerivationRefused(
+            "PBKDF2 iterations times output blocks exceeds the runtime's limit of 50,000,000",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn op_crypto_derive_bits(
     _state: Rc<RefCell<OpState>>,
     args: DeriveKeyArg,
@@ -533,20 +562,24 @@ pub async fn op_crypto_derive_bits(
             Algorithm::Pbkdf2 => {
                 let zero_copy = zero_copy.ok_or_else(not_supported)?;
                 let salt = &*zero_copy;
-                // The caller must validate these cases.
-                assert!(args.length > 0);
-                assert!(args.length.is_multiple_of(8));
+                if args.length == 0 || !args.length.is_multiple_of(8) {
+                    return Err(CryptoError::DerivationRefused(
+                        "PBKDF2 length must be a non-zero multiple of 8",
+                    ));
+                }
 
-                let algorithm = match args.hash.ok_or_else(not_supported)? {
-                    CryptoHash::Sha1 => pbkdf2::PBKDF2_HMAC_SHA1,
-                    CryptoHash::Sha256 => pbkdf2::PBKDF2_HMAC_SHA256,
-                    CryptoHash::Sha384 => pbkdf2::PBKDF2_HMAC_SHA384,
-                    CryptoHash::Sha512 => pbkdf2::PBKDF2_HMAC_SHA512,
+                let (algorithm, hash_bytes) = match args.hash.ok_or_else(not_supported)? {
+                    CryptoHash::Sha1 => (pbkdf2::PBKDF2_HMAC_SHA1, 20),
+                    CryptoHash::Sha256 => (pbkdf2::PBKDF2_HMAC_SHA256, 32),
+                    CryptoHash::Sha384 => (pbkdf2::PBKDF2_HMAC_SHA384, 48),
+                    CryptoHash::Sha512 => (pbkdf2::PBKDF2_HMAC_SHA512, 64),
                 };
 
-                // This will never panic. We have already checked length earlier.
-                let iterations =
-                    NonZeroU32::new(args.iterations.ok_or_else(not_supported)?).unwrap();
+                let iterations = NonZeroU32::new(args.iterations.ok_or_else(not_supported)?)
+                    .ok_or(CryptoError::DerivationRefused(
+                        "PBKDF2 iterations must not be zero",
+                    ))?;
+                pbkdf2_within_limits(args.length / 8, hash_bytes, iterations.get())?;
                 let secret = args.key.data;
                 let mut out = vec![0; args.length / 8];
                 pbkdf2::derive(algorithm, iterations, salt, &secret, &mut out);
@@ -836,6 +869,9 @@ impl From<CryptoError> for OpError {
             CryptoError::JoinError(..) => OpError::new(message),
             CryptoError::Der(..) => OpError::new(message),
             CryptoError::MissingArgumentHash => OpError::type_error(message),
+            CryptoError::DerivationRefused(..) => {
+                OpError::custom("DOMExceptionOperationError", message)
+            }
             CryptoError::MissingArgumentSaltLength => OpError::type_error(message),
             CryptoError::UnsupportedAlgorithm => OpError::type_error(message),
             CryptoError::KeyRejected(..) => OpError::new(message),
