@@ -947,6 +947,38 @@ mod tests {
 
     #[test]
     #[serial]
+    fn workers_get_self_and_every_stream_class() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        let missing = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                [
+                  "ByteLengthQueuingStrategy", "CountQueuingStrategy",
+                  "ReadableByteStreamController", "ReadableStreamBYOBReader",
+                  "ReadableStreamBYOBRequest", "ReadableStreamDefaultController",
+                  "ReadableStreamDefaultReader", "TextDecoderStream", "TextEncoderStream",
+                  "TransformStreamDefaultController", "WritableStreamDefaultController",
+                  "WritableStreamDefaultWriter",
+                ].filter((name) => typeof globalThis[name] !== "function")
+                  .concat(self === globalThis ? [] : ["self"])
+                  .join(",")
+                "#,
+            )
+            .expect("globals probe should run");
+        assert_eq!(string(&mut js_runtime, missing), "");
+    }
+
+    #[test]
+    #[serial]
     fn worker_code_reaches_no_runtime_internals() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

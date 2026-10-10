@@ -26,11 +26,28 @@ for (const name of ["DataError", "NotSupportedError", "OperationError", "QuotaEx
     (message) => new DOMException(message, name),
   );
 }
-const { ReadableStream, TransformStream, WritableStream } = core.loadExtScript(
-  "ext:deno_web/06_streams.js",
-);
+const {
+  ByteLengthQueuingStrategy,
+  CountQueuingStrategy,
+  ReadableByteStreamController,
+  ReadableStream,
+  ReadableStreamBYOBReader,
+  ReadableStreamBYOBRequest,
+  ReadableStreamDefaultController,
+  ReadableStreamDefaultReader,
+  TransformStream,
+  TransformStreamDefaultController,
+  WritableStream,
+  WritableStreamDefaultController,
+  WritableStreamDefaultWriter,
+} = core.loadExtScript("ext:deno_web/06_streams.js");
 const { structuredClone } = core.loadExtScript("ext:deno_web/02_structured_clone.js");
-const { TextDecoder, TextEncoder } = core.loadExtScript("ext:deno_web/08_text_encoding.js");
+const {
+  TextDecoder,
+  TextDecoderStream,
+  TextEncoder,
+  TextEncoderStream,
+} = core.loadExtScript("ext:deno_web/08_text_encoding.js");
 const { Blob, File } = core.loadExtScript("ext:deno_web/09_file.js");
 const { URL, URLSearchParams } = core.loadExtScript("ext:deno_web/00_url.js");
 const { URLPattern } = core.loadExtScript("ext:deno_web/01_urlpattern.js");
@@ -158,7 +175,9 @@ const ddRuntime = {
   AbortController,
   AbortSignal,
   Blob,
+  ByteLengthQueuingStrategy,
   CloseEvent,
+  CountQueuingStrategy,
   Crypto,
   CryptoKey,
   CustomEvent,
@@ -172,17 +191,27 @@ const ddRuntime = {
   MessageEvent,
   ProgressEvent,
   PromiseRejectionEvent,
+  ReadableByteStreamController,
   ReadableStream,
+  ReadableStreamBYOBReader,
+  ReadableStreamBYOBRequest,
+  ReadableStreamDefaultController,
+  ReadableStreamDefaultReader,
   Request,
   Response,
   SubtleCrypto,
   TextDecoder,
+  TextDecoderStream,
   TextEncoder,
+  TextEncoderStream,
   TransformStream,
+  TransformStreamDefaultController,
   URL,
   URLPattern,
   URLSearchParams,
   WritableStream,
+  WritableStreamDefaultController,
+  WritableStreamDefaultWriter,
   fetch,
   performance,
   reportError,

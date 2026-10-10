@@ -12,7 +12,9 @@ const {
   AbortController: DenoAbortController,
   AbortSignal: DenoAbortSignal,
   Blob: DenoBlob,
+  ByteLengthQueuingStrategy,
   CloseEvent,
+  CountQueuingStrategy,
   Crypto,
   CryptoKey: DenoCryptoKey,
   CustomEvent,
@@ -26,17 +28,27 @@ const {
   MessageEvent,
   ProgressEvent,
   PromiseRejectionEvent,
+  ReadableByteStreamController,
   ReadableStream: DenoReadableStream,
+  ReadableStreamBYOBReader,
+  ReadableStreamBYOBRequest,
+  ReadableStreamDefaultController,
+  ReadableStreamDefaultReader,
   Request: DenoRequest,
   Response: DenoResponse,
   SubtleCrypto,
   TextDecoder: DenoTextDecoder,
+  TextDecoderStream,
   TextEncoder: DenoTextEncoder,
+  TextEncoderStream,
   TransformStream: DenoTransformStream,
+  TransformStreamDefaultController,
   URL: DenoURL,
   URLPattern: DenoURLPattern,
   URLSearchParams: DenoURLSearchParams,
   WritableStream: DenoWritableStream,
+  WritableStreamDefaultController,
+  WritableStreamDefaultWriter,
   fetch: denoFetch,
   performance: denoPerformance,
   reportError,
@@ -208,6 +220,8 @@ const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 function ensureEncodingGlobals() {
   define("TextEncoder", DenoTextEncoder);
   define("TextDecoder", DenoTextDecoder);
+  define("TextEncoderStream", TextEncoderStream);
+  define("TextDecoderStream", TextDecoderStream);
 
   if (globalThis.btoa === undefined) {
     define("btoa", (value) => {
@@ -576,6 +590,9 @@ class CacheStorage {
   }
 }
 
+// The global scope names itself `self`, as a service worker's and a
+// Cloudflare Worker's does.
+define("self", globalThis);
 ensureAbortGlobals();
 ensureFrozenTimeGlobals();
 ensureTimerGlobals();
@@ -608,6 +625,16 @@ define("TransformStream", RuntimeTransformStream);
 define("Cache", Cache);
 define("CacheStorage", CacheStorage);
 define("ReadableStream", RuntimeReadableStream);
+define("ReadableStreamDefaultReader", ReadableStreamDefaultReader);
+define("ReadableStreamBYOBReader", ReadableStreamBYOBReader);
+define("ReadableStreamBYOBRequest", ReadableStreamBYOBRequest);
+define("ReadableStreamDefaultController", ReadableStreamDefaultController);
+define("ReadableByteStreamController", ReadableByteStreamController);
+define("WritableStreamDefaultWriter", WritableStreamDefaultWriter);
+define("WritableStreamDefaultController", WritableStreamDefaultController);
+define("TransformStreamDefaultController", TransformStreamDefaultController);
+define("ByteLengthQueuingStrategy", ByteLengthQueuingStrategy);
+define("CountQueuingStrategy", CountQueuingStrategy);
 if (typeof denoFetch === "function") {
   define("fetch", denoFetch);
 }
