@@ -662,11 +662,16 @@ type_checks! {
 /// `inspectorMethod` (a method of V8's own console) while a DevTools session
 /// is attached. Bound to its two methods, it is a console method of its own:
 /// being native, it adds no frame, so DevTools sees the caller's location.
+/// Like the methods it stands for, it is no constructor.
 fn op_call_console<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     rv: &mut v8::ReturnValue<'s, v8::Value>,
 ) {
+    if !args.new_target().is_undefined() {
+        throw_type_error(scope, "console methods are not constructors");
+        return;
+    }
     let (Ok(inspector_method), Ok(method)) = (
         v8::Local::<v8::Function>::try_from(args.get(0)),
         v8::Local::<v8::Function>::try_from(args.get(1)),

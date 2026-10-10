@@ -1,3 +1,10 @@
+//! DevTools sessions driven directly: evaluation, console calls, pausing at
+//! `debugger;` and breakpoints, busy loops, and termination while paused or
+//! waiting for a debugger.
+
+mod common;
+
+use common::{eval, runtime, string};
 use dd_v8::{InspectorHandle, InspectorSession, JsRuntime, RuntimeHandle, RuntimeOptions};
 use serde_json::{Value, json};
 use std::future::poll_fn;
@@ -6,25 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
-
-fn runtime() -> JsRuntime {
-    JsRuntime::new(RuntimeOptions {
-        ops: dd_v8::builtins::ops(),
-        ..Default::default()
-    })
-    .expect("runtime")
-}
-
-fn string(runtime: &mut JsRuntime, value: dd_v8::v8::Global<dd_v8::v8::Value>) -> String {
-    dd_v8::scope!(scope, runtime);
-    let value = dd_v8::v8::Local::new(scope, value);
-    value.to_rust_string_lossy(scope)
-}
-
-fn eval(runtime: &mut JsRuntime, source: &str) -> String {
-    let value = runtime.execute_script("<test>", source).expect("script");
-    string(runtime, value)
-}
 
 /// One turn of the event loop, which dispatches queued inspector messages.
 fn turn(runtime: &mut JsRuntime) {
@@ -68,9 +56,7 @@ async fn notification(session: &mut InspectorSession, method: &str) -> Value {
 #[test]
 fn sessions_evaluate_and_see_console_calls() {
     let mut runtime = runtime();
-    runtime
-        .execute_with_ops("<ops>", "globalThis.ops = ops; globalThis.calls = [];")
-        .expect("expose ops");
+    eval(&mut runtime, "globalThis.calls = []");
     let record = "(...args) => calls.push(args.join(' '))";
     let inspector = runtime.enable_inspector("test context").expect("inspector");
 

@@ -995,6 +995,58 @@ mod tests {
         );
     }
 
+    /// Console methods are `op_call_console` bound to V8's method and dd's.
+    /// Bound functions hide their target and arguments, and no receiver or
+    /// extra argument changes which two functions the op calls.
+    #[test]
+    #[serial]
+    fn console_methods_hide_the_op_they_are_bound_to() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from bootstrap snapshot");
+        let probe = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                (() => {
+                  let called = false;
+                  const spy = () => { called = true; };
+                  console.log.call(spy, spy, spy);
+                  console.log.apply(spy, [spy, spy]);
+                  Reflect.apply(console.log, spy, [spy]);
+                  console.log.bind(spy, spy)(spy);
+                  let constructed;
+                  try {
+                    new console.log(spy);
+                    constructed = "constructed";
+                  } catch (error) {
+                    constructed = error.constructor.name;
+                  }
+                  return JSON.stringify({
+                    called,
+                    constructed,
+                    name: console.log.name,
+                    own: Object.getOwnPropertyNames(console.log).sort(),
+                    prototype: console.log.prototype === undefined,
+                    source: Function.prototype.toString.call(console.log),
+                    proto: Object.getPrototypeOf(console.log) === Function.prototype,
+                  });
+                })()
+                "#,
+            )
+            .expect("probe should run");
+        assert_eq!(
+            string(&mut js_runtime, probe),
+            r#"{"called":false,"constructed":"TypeError","name":"log","own":["length","name"],"prototype":true,"source":"function () { [native code] }","proto":true}"#
+        );
+    }
+
     #[test]
     #[serial]
     fn direct_worker_fetch_works_after_loading_worker_into_runtime() {
