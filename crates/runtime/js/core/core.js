@@ -46,12 +46,19 @@ const {
   op_is_typed_array,
   op_load_ext_script,
   op_print,
+  op_queue_microtask,
   op_serialize,
   op_set_async_context,
   op_structured_clone,
   op_timer_cancel,
   op_timer_sleep,
 } = ops;
+
+// The web layer schedules tee and pipe chunk steps through
+// primordials.queueMicrotask. V8's global queueMicrotask does not exist while
+// the snapshot is built (and worker code may replace it later), so it goes
+// through the op.
+primordials.setQueueMicrotask((callback) => op_queue_microtask(callback));
 
 const extScripts = new SafeMap();
 

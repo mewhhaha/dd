@@ -149,6 +149,9 @@ pub struct JsRuntime {
     heap_limit_callback: Option<*mut HeapLimitCallback>,
     isolate_key: usize,
     isolate: Option<v8::OwnedIsolate>,
+    /// Created by `new_for_snapshot`: V8 aborts unless such an isolate is
+    /// consumed by `create_blob`, even when no snapshot is taken.
+    will_snapshot: bool,
 }
 
 /// Opens a handle scope on `$runtime`'s isolate entered into its context, as
@@ -229,6 +232,7 @@ impl JsRuntime {
             heap_limit_callback: None,
             isolate_key,
             isolate: None,
+            will_snapshot,
         };
         let context = {
             v8::scope!(let scope, &mut isolate);
@@ -685,7 +689,19 @@ impl JsRuntime {
 impl Drop for JsRuntime {
     fn drop(&mut self) {
         self.release_handles();
-        self.isolate.take();
+        let Some(mut isolate) = self.isolate.take() else {
+            return;
+        };
+        if self.will_snapshot {
+            // A snapshot runtime dropped without `snapshot()` (its setup
+            // failed) still has to go through `create_blob`.
+            {
+                v8::scope!(let scope, &mut isolate);
+                let context = v8::Context::new(scope, Default::default());
+                scope.set_default_context(context);
+            }
+            let _ = isolate.create_blob(v8::FunctionCodeHandling::Clear);
+        }
     }
 }
 

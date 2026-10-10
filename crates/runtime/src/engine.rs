@@ -888,6 +888,52 @@ mod tests {
 
     #[test]
     #[serial]
+    fn teed_and_piped_streams_deliver_every_chunk() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from bootstrap snapshot");
+        // Tee and pipe chunk steps run through the web layer's queueMicrotask.
+        let result = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                (async () => {
+                  const bytes = new ReadableStream({
+                    type: "bytes",
+                    start(controller) {
+                      controller.enqueue(new TextEncoder().encode("hello"));
+                      controller.close();
+                    },
+                  });
+                  const [left, right] = bytes.tee();
+                  const teed = await Promise.all([new Response(left).text(), new Response(right).text()]);
+                  const [first, second] = new Response("plain").body.tee();
+                  const plain = await Promise.all([new Response(first).text(), new Response(second).text()]);
+                  const piped = await new Response(
+                    new Response("piped").body.pipeThrough(new TransformStream()),
+                  ).text();
+                  return [...teed, ...plain, piped].join(",");
+                })()
+                "#,
+            )
+            .expect("stream script should run");
+        let result = runtime
+            .block_on(js_runtime.resolve(result))
+            .expect("streams should deliver");
+        assert_eq!(
+            string(&mut js_runtime, result),
+            "hello,hello,plain,plain,piped"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn worker_code_reaches_no_runtime_internals() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

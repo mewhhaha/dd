@@ -23,6 +23,7 @@ pub fn ops() -> Vec<OpDecl> {
         op_raw!(op_structured_clone),
         op_raw!(op_get_async_context),
         op_raw!(op_set_async_context),
+        op_raw!(op_queue_microtask),
         op_raw!(op_is_any_array_buffer),
         op_raw!(op_is_array_buffer),
         op_raw!(op_is_array_buffer_view),
@@ -518,6 +519,20 @@ fn op_set_async_context<'s>(
     _rv: &mut v8::ReturnValue<'s, v8::Value>,
 ) {
     scope.set_continuation_preserved_embedder_data(args.get(0));
+}
+
+/// `op_queue_microtask(callback)`. V8 installs the global `queueMicrotask`
+/// only in contexts that will not be snapshotted, so scripts run while a
+/// snapshot is built schedule microtasks through this op instead.
+fn op_queue_microtask<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    _rv: &mut v8::ReturnValue<'s, v8::Value>,
+) {
+    match v8::Local::<v8::Function>::try_from(args.get(0)) {
+        Ok(callback) => scope.enqueue_microtask(callback),
+        Err(_) => throw_type_error(scope, "queueMicrotask requires a function"),
+    }
 }
 
 macro_rules! type_checks {

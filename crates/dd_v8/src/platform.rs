@@ -22,6 +22,7 @@ const BASE_FLAGS: &str = concat!(
     " --js-source-phase-imports",
     " --js-defer-import-eval",
     " --enable-queue-microtask",
+    " --no-extensible-ro-snapshot",
 );
 
 static INIT: Once = Once::new();

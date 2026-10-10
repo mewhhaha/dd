@@ -573,6 +573,42 @@ fn queue_microtask_is_available() {
     assert_eq!(eval(&mut runtime, "typeof queueMicrotask"), "function");
 }
 
+#[tokio::test]
+async fn snapshot_builds_queue_microtasks_through_the_op() {
+    // V8 leaves the global queueMicrotask out of contexts it will snapshot.
+    let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
+        ops: dd_v8::builtins::ops(),
+        ..Default::default()
+    })
+    .expect("snapshot runtime");
+    runtime
+        .execute_with_ops(
+            "<microtask>",
+            r#"
+            globalThis.ran = [typeof globalThis.queueMicrotask];
+            ops.op_queue_microtask(() => ran.push("ran"));
+            "#,
+        )
+        .expect("queue microtask");
+    runtime.run_event_loop().await.expect("event loop");
+    assert_eq!(eval(&mut runtime, "ran.join()"), "undefined,ran");
+}
+
+#[test]
+fn failed_snapshot_runtimes_drop_cleanly() {
+    let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
+        ops: test_ops(),
+        ..Default::default()
+    })
+    .expect("snapshot runtime");
+    assert!(
+        runtime
+            .execute_script("<broken>", "throw new Error('setup failed')")
+            .is_err()
+    );
+    drop(runtime);
+}
+
 fn builtins_runtime() -> JsRuntime {
     let mut ops = dd_v8::builtins::ops();
     ops.push(op_sync!(op_fail_custom));
