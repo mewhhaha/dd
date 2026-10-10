@@ -587,6 +587,42 @@ fn values_holding_unusable_buffers_fail_to_serialize() {
     );
 }
 
+/// Messages used to drop WebAssembly modules silently: V8 skips a value
+/// whose transfer id the delegate declines without throwing, so
+/// `op_serialize([module, 1])` "succeeded" with bytes no reader accepts.
+#[test]
+fn wasm_modules_refuse_to_serialize() {
+    let mut runtime = runtime();
+    assert_checks(
+        &mut runtime,
+        &format!(
+            "{CORPUS}\n{}",
+            r#"
+            const module = new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+            for (const [label, value] of [
+              ["module", module],
+              ["array", [module, 1]],
+              ["object", { a: module, b: 2 }],
+              ["Map", new Map([[1, module]])],
+              ["error cause", new Error("m", { cause: module })],
+            ]) {
+              for (const forStorage of [false, true]) {
+                const expected = forStorage ? "Wasm modules cannot be stored" : "Wasm modules cannot be cloned";
+                const written = attempt(() => ops.op_serialize(value, undefined, undefined, forStorage));
+                check(written.error instanceof TypeError && written.error.message === expected,
+                  `${label} (${forStorage ? "storage" : "message"}): ${describe(written.error ?? written.value)}`);
+                const seen = [];
+                attempt(() => ops.op_serialize(value, undefined, undefined, forStorage, (message) => seen.push(message)));
+                check(seen.length === 1 && seen[0] === expected, `${label}: the error callback saw ${seen}`);
+              }
+              const cloned = attempt(() => ops.op_structured_clone(value, deserializers));
+              check(cloned.error instanceof TypeError, `${label} clone: ${describe(cloned.error ?? cloned.value)}`);
+            }
+            "#
+        ),
+    );
+}
+
 #[test]
 fn nesting_deep_enough_to_exhaust_the_stack_throws() {
     let mut runtime = runtime();

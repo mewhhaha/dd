@@ -274,10 +274,16 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
         scope: &mut v8::PinScope<'_, '_>,
         _module: v8::Local<v8::WasmModuleObject>,
     ) -> Option<u32> {
-        if self.for_storage {
-            let message = v8::String::new(scope, "Wasm modules cannot be stored")?;
-            self.throw_data_clone_error(scope, message);
-        }
+        // No reader can resolve a transfer id, so modules never serialize.
+        // Returning no id without an exception makes V8 skip the module and
+        // report success, leaving bytes that cannot be read back.
+        let message = if self.for_storage {
+            "Wasm modules cannot be stored"
+        } else {
+            "Wasm modules cannot be cloned"
+        };
+        let message = v8::String::new(scope, message)?;
+        self.throw_data_clone_error(scope, message);
         None
     }
 
