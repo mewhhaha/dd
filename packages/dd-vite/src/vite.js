@@ -50,6 +50,7 @@ import {
   normalizeHotReloadMode,
   normalizeMount,
   nodeRequestToWorkerRequest,
+  clientDisconnected,
   patchViteResolvedUrls,
   rewriteViteDevServerUrls,
   shouldBypassStaticRoutingRequest,
@@ -960,6 +961,11 @@ export function ddVitePlugin(options = {}) {
           const response = await runtime.fetch(workerName, request);
           await writeNodeResponse(res, response);
         } catch (error) {
+          // The abort that follows a client leaving is not a server error;
+          // passing it on would log it and cover the page in Vite's overlay.
+          if (clientDisconnected(req, res)) {
+            return;
+          }
           next(error);
         }
       });

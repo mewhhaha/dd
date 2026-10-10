@@ -498,7 +498,7 @@ impl WorkerManager {
 
         let mut touched_generations = Vec::new();
         let mut abort_commands = Vec::new();
-        let mut retire_isolates = Vec::new();
+        let mut aborted_stream = false;
         let mut matched = false;
         let mut cleared_request_ids = Vec::new();
         let mut websocket_waiters_to_abort = Vec::new();
@@ -525,29 +525,22 @@ impl WorkerManager {
                 }
 
                 for isolate in &mut pool.isolates {
-                    if let Some(pending_reply) = isolate.pending_replies.get(&runtime_request_id) {
+                    // The isolate aborts the request in place: its signal
+                    // fires, its body reads stop and its completion is
+                    // dropped. Concurrent requests on the isolate carry on;
+                    // work that ignores the abort meets the wall-time limit.
+                    if let Some(pending_reply) =
+                        isolate.pending_replies.get_mut(&runtime_request_id)
+                    {
                         if let PendingReplyKind::WebsocketOpen { session_id } = &pending_reply.kind
                         {
                             websocket_waiters_to_abort.push(session_id.clone());
                         }
                         if matches!(&pending_reply.kind, PendingReplyKind::Stream) {
-                            let stream_request_ids = isolate
-                                .pending_replies
-                                .iter()
-                                .filter(|(_, pending)| {
-                                    matches!(&pending.kind, PendingReplyKind::Stream)
-                                })
-                                .map(|(request_id, _)| request_id.clone())
-                                .collect::<Vec<_>>();
-                            retire_isolates.push((*generation, isolate.id, stream_request_ids));
-                        } else {
-                            if let Some(pending_reply) =
-                                isolate.pending_replies.get_mut(&runtime_request_id)
-                            {
-                                pending_reply.canceled = true;
-                            }
-                            abort_commands.push((*generation, isolate.id, isolate.sender.clone()));
+                            aborted_stream = true;
                         }
+                        pending_reply.canceled = true;
+                        abort_commands.push((*generation, isolate.id, isolate.sender.clone()));
                         generation_touched = true;
                         matched = true;
                     }
@@ -588,21 +581,12 @@ impl WorkerManager {
             }
         }
 
-        for (generation, isolate_id, stream_request_ids) in retire_isolates {
-            for request_id in stream_request_ids {
-                self.fail_stream_registration(
-                    &worker_name,
-                    &request_id,
-                    PlatformError::runtime("request was aborted"),
-                );
-            }
-            let failed = self.remove_isolate_by_id(&worker_name, generation, isolate_id);
-            for (request_id, reply) in failed.replies {
-                self.clear_revalidation_for_request(&request_id);
-                let _ = reply.send(Err(PlatformError::runtime(
-                    "streaming request was aborted; isolate retired",
-                )));
-            }
+        if aborted_stream {
+            self.fail_stream_registration(
+                &worker_name,
+                &runtime_request_id,
+                PlatformError::runtime("request was aborted"),
+            );
         }
 
         touched_generations.sort_unstable();

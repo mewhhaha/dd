@@ -335,3 +335,100 @@ async fn dropping_a_completed_undrained_body_releases_the_shared_byte_budget() {
     drop(chunk);
     assert!(waiting.body.recv().await.is_none());
 }
+
+#[tokio::test]
+#[serial]
+async fn aborting_one_stream_leaves_concurrent_streams_and_the_isolate_alone() {
+    let service = test_service(RuntimeConfig {
+        max_isolates: 1,
+        max_inflight_per_isolate: 4,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "streams".into(),
+            r#"
+let canceled = false;
+export default {
+  fetch(request) {
+    const { pathname } = new URL(request.url);
+    if (pathname === "/state") {
+      return new Response(canceled ? "canceled" : "running");
+    }
+    if (pathname === "/idle") {
+      // One chunk, then nothing: a producer waiting for events.
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode("idle")); },
+        cancel() { canceled = true; },
+      }));
+    }
+    let sent = 0;
+    return new Response(new ReadableStream({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        controller.enqueue(new TextEncoder().encode(String(sent)));
+        if (++sent === 3) controller.close();
+      },
+    }));
+  },
+};
+"#
+            .into(),
+        )
+        .await
+        .expect("streaming worker deploys");
+
+    let mut idle = service
+        .invoke_stream("streams".into(), test_invocation_with_path("/idle", "idle"))
+        .await
+        .expect("idle stream starts");
+    let first = timeout(Duration::from_secs(2), idle.body.recv())
+        .await
+        .expect("idle stream sends its first chunk")
+        .expect("idle stream is open")
+        .expect("first chunk is ok");
+    assert_eq!(first.as_ref(), b"idle");
+    let mut sibling = service
+        .invoke_stream(
+            "streams".into(),
+            test_invocation_with_path("/count", "sibling"),
+        )
+        .await
+        .expect("sibling stream starts");
+
+    drop(idle);
+
+    let mut body = Vec::new();
+    while let Some(chunk) = timeout(Duration::from_secs(2), sibling.body.recv())
+        .await
+        .expect("sibling keeps streaming")
+    {
+        body.extend_from_slice(&chunk.expect("sibling chunk is ok"));
+    }
+    assert_eq!(body, b"012");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let state = service
+                .invoke(
+                    "streams".into(),
+                    test_invocation_with_path("/state", "state"),
+                )
+                .await
+                .expect("state request succeeds");
+            if state.body == b"canceled" {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the aborted stream's producer is cancelled");
+    let stats = service
+        .stats("streams".into())
+        .await
+        .expect("worker stats exist");
+    assert_eq!(stats.isolates_total, 1, "the isolate is not retired");
+    service.shutdown().await.expect("runtime shuts down");
+}

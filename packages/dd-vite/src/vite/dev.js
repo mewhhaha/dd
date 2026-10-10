@@ -122,6 +122,12 @@ export function toVitePath(value) {
   return String(value).replace(/\\/g, "/");
 }
 
+// The browser cancelled the request (an aborted fetch, a superseded
+// navigation or revalidation) and closed the connection.
+export function clientDisconnected(req, res) {
+  return Boolean(req.aborted || req.destroyed || res.destroyed);
+}
+
 export function nodeRequestToWorkerRequest(req, originalUrl, mount, workerName, res) {
   const controller = new AbortController();
   req.once("aborted", () => controller.abort());

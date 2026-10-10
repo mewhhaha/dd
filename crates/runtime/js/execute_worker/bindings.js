@@ -578,7 +578,17 @@
         void response.body.cancel().catch(() => undefined);
       } else if (!isWebSocketAcceptResponse && response.body) {
         const reader = response.body.getReader();
+        // An aborted request stops reading its body, so a producer waiting
+        // for more data cannot keep it, or its isolate, alive.
+        const { signal } = requestContext.controller;
+        const cancelOnAbort = () => {
+          void reader.cancel(signal.reason).catch(() => undefined);
+        };
+        signal.addEventListener("abort", cancelOnAbort, { once: true });
         try {
+          if (signal.aborted) {
+            throw signal.reason;
+          }
           while (true) {
             const { done, value } = await reader.read();
             if (done) {
@@ -604,6 +614,7 @@
           void reader.cancel(error).catch(() => undefined);
           throw error;
         } finally {
+          signal.removeEventListener("abort", cancelOnAbort);
           reader.releaseLock();
         }
       }
