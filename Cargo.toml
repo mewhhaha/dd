@@ -36,6 +36,26 @@ opentelemetry_sdk = { version = "0.33.0", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
 
+# Web Crypto's key generation and key derivation are too slow unoptimized
+# (tens of seconds for an RSA key) for debug-build tests and the WPT suite.
+[profile.dev.package.aws-lc-sys]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.p256]
+opt-level = 3
+
+[profile.dev.package.p384]
+opt-level = 3
+
+[profile.dev.package.p521]
+opt-level = 3
+
 [profile.dev-runtime]
 inherits = "release"
 codegen-units = 1
