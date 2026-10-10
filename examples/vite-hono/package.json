@@ -11,12 +11,12 @@
   "dependencies": {
     "@mewhhaha/vite-plugin-dd": "workspace:*",
     "fixi-js": "^0.9.4",
-    "hono": "^4.13.12"
+    "hono": "^4.13.13"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
-    "vite": "^8.3.2"
+    "vite": "^8.3.3"
   }
 }

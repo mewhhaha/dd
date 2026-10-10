@@ -35,7 +35,7 @@
   "peerDependencies": {
     "@react-router/dev": "^8.4.0",
     "@vitejs/plugin-rsc": "^0.5.35",
-    "vite": "^8.3.2",
+    "vite": "^8.3.3",
     "vitest": "^5.0.3"
   },
   "peerDependenciesMeta": {
@@ -56,6 +56,6 @@
     "@mewhhaha/dd": "workspace:*"
   },
   "devDependencies": {
-    "vite": "^8.3.2"
+    "vite": "^8.3.3"
   }
 }

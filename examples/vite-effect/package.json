@@ -12,11 +12,11 @@
     "@mewhhaha/vite-plugin-dd": "workspace:*",
     "@simplewebauthn/browser": "^14.0.0",
     "@simplewebauthn/server": "^14.0.3",
-    "effect": "^4.0.0",
+    "effect": "^4.0.1",
     "itty-router": "^5.0.24"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
-    "vite": "^8.3.2"
+    "vite": "^8.3.3"
   }
 }
