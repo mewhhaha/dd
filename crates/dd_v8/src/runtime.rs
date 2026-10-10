@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::inspector::{Inspector, InspectorHandle};
 use crate::modules::{
     self, DynamicImport, ModuleCode, ModuleId, ModuleLoader, ModuleMap, ModuleType, NoModules,
     PendingEvaluation,
@@ -15,7 +16,7 @@ use std::ffi::c_void;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use v8::MapFnTo;
 
@@ -90,6 +91,7 @@ pub(crate) struct RuntimeState {
     /// Streaming WebAssembly compilations JavaScript is feeding, by id.
     pub(crate) wasm_streams: RefCell<WasmStreams>,
     tasks: Arc<Mutex<Vec<v8::Task>>>,
+    inspector: RefCell<Option<Rc<Inspector>>>,
 }
 
 #[derive(Default)]
@@ -144,6 +146,42 @@ pub fn runtime_op_state(isolate: &v8::Isolate) -> Rc<RefCell<OpState>> {
     Rc::clone(&runtime_state(isolate).op_state)
 }
 
+/// The inspector of the runtime that owns `isolate`, if it has one.
+pub(crate) fn runtime_inspector(isolate: &v8::Isolate) -> Option<Rc<Inspector>> {
+    isolate
+        .get_slot::<Rc<RuntimeState>>()?
+        .inspector
+        .borrow()
+        .clone()
+}
+
+/// Stops a runtime's JavaScript from any thread.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    isolate: v8::IsolateHandle,
+    inspector: Arc<OnceLock<InspectorHandle>>,
+}
+
+impl RuntimeHandle {
+    /// Terminates the JavaScript running on the runtime's thread. A thread
+    /// the debugger holds at a breakpoint, or one waiting for a debugger, is
+    /// let go first, and the inspector stops pausing for good. Returns false
+    /// once the isolate is gone.
+    pub fn terminate_execution(&self) -> bool {
+        let terminated = self.isolate.terminate_execution();
+        if let Some(inspector) = self.inspector.get() {
+            inspector.close();
+        }
+        terminated
+    }
+}
+
+impl std::fmt::Debug for RuntimeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeHandle").finish_non_exhaustive()
+    }
+}
+
 type HeapLimitCallback = Box<dyn FnMut(usize, usize) -> usize>;
 
 /// One isolate with one context, its ops, module map, and event loop.
@@ -153,6 +191,8 @@ pub struct JsRuntime {
     heap_limit_callback: Option<*mut HeapLimitCallback>,
     isolate_key: usize,
     isolate: Option<v8::OwnedIsolate>,
+    /// Filled once the inspector is enabled, for [`RuntimeHandle`]s.
+    inspector_handle: Arc<OnceLock<InspectorHandle>>,
     /// Created by `new_for_snapshot`: V8 aborts unless such an isolate is
     /// consumed by `create_blob`, even when no snapshot is taken.
     will_snapshot: bool,
@@ -232,6 +272,7 @@ impl JsRuntime {
             internals: RefCell::new(None),
             wasm_streams: RefCell::new(WasmStreams::default()),
             tasks,
+            inspector: RefCell::new(None),
         });
         isolate.set_slot(Rc::clone(&state));
 
@@ -241,6 +282,7 @@ impl JsRuntime {
             heap_limit_callback: None,
             isolate_key,
             isolate: None,
+            inspector_handle: Arc::new(OnceLock::new()),
             will_snapshot,
         };
         let context = {
@@ -279,6 +321,49 @@ impl JsRuntime {
 
     pub fn v8_isolate(&mut self) -> &mut v8::OwnedIsolate {
         self.isolate.as_mut().expect("runtime isolate")
+    }
+
+    /// A handle that terminates this runtime's JavaScript from any thread.
+    pub fn handle(&mut self) -> RuntimeHandle {
+        RuntimeHandle {
+            isolate: self.v8_isolate().thread_safe_handle(),
+            inspector: Arc::clone(&self.inspector_handle),
+        }
+    }
+
+    /// Registers the context with a V8 inspector, named `name` in DevTools,
+    /// and returns the handle sessions connect through. Scripts the runtime
+    /// already ran show up too; enable it before the code to debug runs.
+    /// Enabling it again returns the same handle.
+    pub fn enable_inspector(&mut self, name: &str) -> Result<InspectorHandle, Error> {
+        if self.will_snapshot {
+            return Err(Error::new("a snapshot runtime cannot have an inspector"));
+        }
+        if let Some(handle) = self.inspector_handle.get() {
+            return Ok(handle.clone());
+        }
+        let waker = Arc::clone(&self.state.waker);
+        let inspector = {
+            crate::scope!(scope, self);
+            let context = scope.get_current_context();
+            Inspector::new(scope, context, waker, name)
+        };
+        let handle = inspector.handle();
+        *self.state.inspector.borrow_mut() = Some(Rc::new(inspector));
+        let _ = self.inspector_handle.set(handle.clone());
+        Ok(handle)
+    }
+
+    /// Blocks until a DevTools session sends
+    /// `Runtime.runIfWaitingForDebugger` (as DevTools does once it has set
+    /// its breakpoints), answering every message meanwhile. Returns at once
+    /// without an inspector, and when the runtime is terminated.
+    pub fn wait_for_debugger(&mut self) {
+        let inspector = self.state.inspector.borrow().clone();
+        if let Some(inspector) = inspector {
+            crate::scope!(_scope, self);
+            inspector.wait_for_debugger();
+        }
     }
 
     pub fn main_context(&self) -> v8::Global<v8::Context> {
@@ -588,6 +673,10 @@ impl JsRuntime {
         state.waker.register(cx.waker());
         crate::scope!(scope, self);
 
+        let inspector = state.inspector.borrow().clone();
+        if let Some(inspector) = inspector {
+            inspector.poll();
+        }
         let tasks = std::mem::take(&mut *state.tasks.lock().expect("task queue poisoned"));
         for task in tasks {
             task.run();
@@ -685,6 +774,18 @@ impl JsRuntime {
     }
 
     fn release_handles(&mut self) {
+        if let Some(handle) = self.inspector_handle.get() {
+            handle.close();
+        }
+        let inspector = self.state.inspector.borrow_mut().take();
+        if let Some(inspector) = inspector {
+            if let (Some(isolate), Some(context)) = (self.isolate.as_mut(), self.context.as_ref()) {
+                v8::scope!(let scope, isolate);
+                let context = v8::Local::new(scope, context);
+                inspector.context_destroyed(context);
+            }
+            drop(inspector);
+        }
         platform::unregister_isolate(self.isolate_key);
         self.remove_near_heap_limit_callback();
         self.state.clear_handles();

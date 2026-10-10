@@ -1,6 +1,7 @@
 //! Ops every JavaScript layer on top of a runtime needs: structured
 //! serialization, text encoding, value type checks, the async context that
-//! follows promise continuations, cancellable timers, and printing.
+//! follows promise continuations, cancellable timers, printing, and handing
+//! console calls to an attached debugger.
 
 use crate::serde_v8;
 use crate::{OpDecl, OpState, op_async, op_raw, op_sync};
@@ -48,6 +49,7 @@ pub fn ops() -> Vec<OpDecl> {
         op_raw!(op_wasm_streaming_set_url),
         op_raw!(op_wasm_streaming_finish),
         op_raw!(op_wasm_streaming_abort),
+        op_raw!(op_call_console),
         op_sync!(op_print),
         op_async!(op_timer_sleep),
         op_sync!(op_timer_cancel),
@@ -653,6 +655,37 @@ type_checks! {
         || value.is_boolean_object()
         || value.is_big_int_object()
         || value.is_symbol_object(),
+}
+
+/// `op_call_console(inspectorMethod, method, ...args)`: calls `method` with
+/// `args` and returns its result, first handing the same call to
+/// `inspectorMethod` (a method of V8's own console) while a DevTools session
+/// is attached. Bound to its two methods, it is a console method of its own:
+/// being native, it adds no frame, so DevTools sees the caller's location.
+fn op_call_console<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    rv: &mut v8::ReturnValue<'s, v8::Value>,
+) {
+    let (Ok(inspector_method), Ok(method)) = (
+        v8::Local::<v8::Function>::try_from(args.get(0)),
+        v8::Local::<v8::Function>::try_from(args.get(1)),
+    ) else {
+        throw_type_error(scope, "op_call_console needs two functions");
+        return;
+    };
+    let call_args = (2..args.length())
+        .map(|index| args.get(index))
+        .collect::<Vec<_>>();
+    let receiver = args.this().into();
+    let attached =
+        crate::runtime::runtime_inspector(scope).is_some_and(|inspector| inspector.has_sessions());
+    if attached && inspector_method.call(scope, receiver, &call_args).is_none() {
+        return;
+    }
+    if let Some(result) = method.call(scope, receiver, &call_args) {
+        rv.set(result);
+    }
 }
 
 fn op_print(_state: &mut OpState, message: String, is_err: bool) {
