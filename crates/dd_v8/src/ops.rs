@@ -289,7 +289,9 @@ impl<'de> serde::Deserialize<'de> for JsBuffer {
                 self,
                 mut seq: A,
             ) -> Result<JsBuffer, A::Error> {
-                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                // The hint is a JavaScript array's length, which a sparse
+                // array sets to 2^32 - 1 for free; reserve at most 1 MiB.
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 20));
                 while let Some(byte) = seq.next_element::<u8>()? {
                     bytes.push(byte);
                 }
