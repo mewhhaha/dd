@@ -26,6 +26,7 @@ const MAX_OPS_PER_TICK: usize = 1024;
 /// Context data indices of a snapshot.
 const SNAPSHOT_OPS_OBJECT: usize = 0;
 const SNAPSHOT_OP_NAMES: usize = 1;
+const SNAPSHOT_INTERNALS: usize = 2;
 
 #[derive(Default)]
 pub struct RuntimeOptions {
@@ -81,6 +82,7 @@ pub(crate) struct RuntimeState {
     pub(crate) pending_evaluations: RefCell<Vec<PendingEvaluation>>,
     rejections: RefCell<Vec<(v8::Global<v8::Promise>, v8::Global<v8::Value>)>>,
     ops_object: RefCell<Option<v8::Global<v8::Object>>>,
+    internals: RefCell<Option<v8::Global<v8::Value>>>,
     /// Streaming WebAssembly compilations JavaScript is feeding, by id.
     pub(crate) wasm_streams: RefCell<WasmStreams>,
     tasks: Arc<Mutex<Vec<v8::Task>>>,
@@ -108,6 +110,7 @@ impl RuntimeState {
         self.pending_evaluations.borrow_mut().clear();
         self.rejections.borrow_mut().clear();
         self.ops_object.borrow_mut().take();
+        self.internals.borrow_mut().take();
         self.wasm_streams.borrow_mut().streams.clear();
         if let Ok(mut op_state) = self.op_state.try_borrow_mut() {
             *op_state = OpState::new(Arc::clone(&self.waker));
@@ -214,6 +217,7 @@ impl JsRuntime {
             pending_evaluations: RefCell::new(Vec::new()),
             rejections: RefCell::new(Vec::new()),
             ops_object: RefCell::new(None),
+            internals: RefCell::new(None),
             wasm_streams: RefCell::new(WasmStreams::default()),
             tasks,
         });
@@ -239,6 +243,16 @@ impl JsRuntime {
                 None => ops::ops_object(scope, &state.ops),
             };
             *state.ops_object.borrow_mut() = Some(v8::Global::new(scope, ops_object));
+            if restore.is_some() {
+                let internals = scope
+                    .get_context_data_from_snapshot_once::<v8::Value>(SNAPSHOT_INTERNALS)
+                    .map_err(|error| {
+                        Error::new(format!("startup snapshot has no internals: {error:?}"))
+                    })?;
+                if !internals.is_undefined() {
+                    *state.internals.borrow_mut() = Some(v8::Global::new(scope, internals));
+                }
+            }
             v8::Global::new(scope, context)
         };
         runtime.context = Some(context);
@@ -322,29 +336,84 @@ impl JsRuntime {
             .borrow()
             .clone()
             .ok_or_else(|| Error::new("runtime has no ops object"))?;
+        let ops_object = {
+            crate::scope!(scope, self);
+            let ops_object = v8::Local::new(scope, &ops_object);
+            v8::Global::new(scope, v8::Local::<v8::Value>::from(ops_object))
+        };
+        self.execute_function(name, source, &["ops"], &[ops_object])
+    }
+
+    /// Runs `source` as the body of a function with the parameters `params`,
+    /// called with `args`, and returns its result. Nothing the source
+    /// declares becomes global.
+    pub fn execute_function(
+        &mut self,
+        name: &str,
+        source: &str,
+        params: &[&str],
+        args: &[v8::Global<v8::Value>],
+    ) -> Result<v8::Global<v8::Value>, Error> {
         crate::scope!(scope, self);
         v8::tc_scope!(let tc, scope);
         let origin = script_origin(tc, name, false)?;
         let source = v8::String::new(tc, source)
             .ok_or_else(|| Error::new(format!("script is too large: {name}")))?;
         let mut source = v8::script_compiler::Source::new(source, Some(&origin));
-        let parameter = serde_v8::key(tc, "ops");
+        let params = params
+            .iter()
+            .map(|param| serde_v8::key(tc, param))
+            .collect::<Vec<_>>();
         let Some(function) = v8::script_compiler::compile_function(
             tc,
             &mut source,
-            &[parameter],
+            &params,
             &[],
             v8::script_compiler::CompileOptions::NoCompileOptions,
             v8::script_compiler::NoCacheReason::NoReason,
         ) else {
             return Err(Error::from_try_catch(tc, "Uncaught"));
         };
-        let ops_object = v8::Local::new(tc, &ops_object);
+        let args = args
+            .iter()
+            .map(|arg| v8::Local::new(tc, arg))
+            .collect::<Vec<_>>();
         let receiver = v8::undefined(tc).into();
-        match function.call(tc, receiver, &[ops_object.into()]) {
+        match function.call(tc, receiver, &args) {
             Some(value) => Ok(v8::Global::new(tc, value)),
             None => Err(Error::from_try_catch(tc, "Uncaught")),
         }
+    }
+
+    /// Calls `function` with an undefined receiver and returns its result.
+    pub fn call_function(
+        &mut self,
+        function: &v8::Global<v8::Function>,
+        args: &[v8::Global<v8::Value>],
+    ) -> Result<v8::Global<v8::Value>, Error> {
+        crate::scope!(scope, self);
+        v8::tc_scope!(let tc, scope);
+        let function = v8::Local::new(tc, function);
+        let args = args
+            .iter()
+            .map(|arg| v8::Local::new(tc, arg))
+            .collect::<Vec<_>>();
+        let receiver = v8::undefined(tc).into();
+        match function.call(tc, receiver, &args) {
+            Some(value) => Ok(v8::Global::new(tc, value)),
+            None => Err(Error::from_try_catch(tc, "Uncaught")),
+        }
+    }
+
+    /// Keeps `value` as the runtime's internals: the embedder's private
+    /// handle on its own JavaScript, carried through snapshots and reachable
+    /// from no script.
+    pub fn set_internals(&mut self, value: v8::Global<v8::Value>) {
+        *self.state.internals.borrow_mut() = Some(value);
+    }
+
+    pub fn internals(&self) -> Option<v8::Global<v8::Value>> {
+        self.state.internals.borrow().clone()
     }
 
     /// Loads `name` (from `code`, or through the module loader) and its
@@ -568,11 +637,16 @@ impl JsRuntime {
                 .clone()
                 .ok_or_else(|| Error::new("runtime has no ops object"))?;
             let op_names = self.state.ops.iter().map(|op| op.name).collect::<Vec<_>>();
+            let internals = self.internals();
             let (isolate, context) = self.isolate_and_context();
             v8::scope!(let scope, isolate);
             let context = v8::Local::new(scope, context);
             let scope = &mut v8::ContextScope::new(scope, context);
             let ops_object = v8::Local::new(scope, &ops_object);
+            let internals = match internals.as_ref() {
+                Some(internals) => v8::Local::new(scope, internals),
+                None => v8::undefined(scope).into(),
+            };
             let names = op_names
                 .iter()
                 .map(|name| serde_v8::key(scope, name).into())
@@ -582,9 +656,10 @@ impl JsRuntime {
             scope.set_default_context(default_context);
             let ops_index = scope.add_context_data(context, ops_object);
             let names_index = scope.add_context_data(context, names);
+            let internals_index = scope.add_context_data(context, internals);
             debug_assert_eq!(
-                (ops_index, names_index),
-                (SNAPSHOT_OPS_OBJECT, SNAPSHOT_OP_NAMES)
+                (ops_index, names_index, internals_index),
+                (SNAPSHOT_OPS_OBJECT, SNAPSHOT_OP_NAMES, SNAPSHOT_INTERNALS)
             );
             scope.add_context(context);
         }

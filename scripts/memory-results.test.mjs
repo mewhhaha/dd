@@ -6,9 +6,9 @@ import { runInThisContext } from "node:vm";
 
 const source = await readFile(new URL("../crates/runtime/js/execute_worker/memory_results.js", import.meta.url), "utf8");
 const { encodeMemoryCommandResult, decodeMemoryCommandResult } = runInThisContext(
-  `(Deno) => {\n${source}\nreturn { encodeMemoryCommandResult, decodeMemoryCommandResult }; }`,
+  `(core) => {\n${source}\nreturn { encodeMemoryCommandResult, decodeMemoryCommandResult }; }`,
   { filename: "memory_results.js" },
-)({ core: { serialize, deserialize: bytes => deserialize(Buffer.from(bytes)) } });
+)({ serialize, deserialize: bytes => deserialize(Buffer.from(bytes)) });
 
 test("new results preserve user properties that match old web value records", async () => {
   const plain = { __dd_rpc_type: "response", status: 200, headers: [], body: [] };

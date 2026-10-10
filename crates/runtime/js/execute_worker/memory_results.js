@@ -166,7 +166,7 @@
   const encodeMemoryCommandResult = async (value) => {
     const webValues = new Map();
     const encoded = await encodeMemoryCommandValue(value, new Map(), webValues);
-    const payload = new Uint8Array(Deno.core.serialize({ value: encoded, webValues }));
+    const payload = new Uint8Array(core.serialize({ value: encoded, webValues }));
     const bytes = new Uint8Array(5 + payload.byteLength);
     bytes.set(MEMORY_COMMAND_RESULT_MAGIC);
     bytes[4] = MEMORY_COMMAND_RESULT_VERSION;
@@ -177,12 +177,12 @@
   const decodeMemoryCommandResult = (bytes) => {
     const versioned = MEMORY_COMMAND_RESULT_MAGIC.every((byte, index) => bytes[index] === byte);
     if (!versioned) {
-      return decodeMemoryCommandValue(Deno.core.deserialize(bytes), new Map(), undefined);
+      return decodeMemoryCommandValue(core.deserialize(bytes), new Map(), undefined);
     }
     if (bytes[4] !== MEMORY_COMMAND_RESULT_VERSION) {
       throw new Error("unsupported stored memory command result version");
     }
-    const { value, webValues } = Deno.core.deserialize(bytes.subarray(5));
+    const { value, webValues } = core.deserialize(bytes.subarray(5));
     if (!(webValues instanceof Map)) {
       throw new Error("invalid stored memory command result metadata");
     }

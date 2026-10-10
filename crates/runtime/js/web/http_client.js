@@ -1,4 +1,4 @@
-(function () {
+return (function () {
   const { core, primordials } = __bootstrap;
 
   const { internalRidSymbol } = core;

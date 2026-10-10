@@ -1702,7 +1702,7 @@ async function __ddViteImportDev(config) {
     };
   }
   function installDevFetchBridge() {
-    const rawHostFetch = globalThis.__dd_raw_host_fetch ?? globalThis.__dd_deno_runtime?.fetch;
+    const rawHostFetch = globalThis.__dd_raw_host_fetch;
     if (devFetchOrigins.size === 0 || !rawHostFetch || globalThis.fetch?.__ddViteDevFetchBridge) {
       return;
     }
@@ -1844,7 +1844,7 @@ async function __ddViteImportDev(config) {
   }
 
   function hostFetch(input, init) {
-    const rawHostFetch = globalThis.__dd_raw_host_fetch ?? globalThis.__dd_deno_runtime?.fetch ?? globalThis.fetch;
+    const rawHostFetch = globalThis.__dd_raw_host_fetch ?? globalThis.fetch;
     return rawHostFetch(input, init);
   }
 

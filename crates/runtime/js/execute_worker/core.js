@@ -1,6 +1,14 @@
-globalThis.__dd_execute_worker = (payload) => {
+// The execute-worker bundle: the units in units.txt, concatenated by
+// build.rs. It runs once while the bootstrap snapshot is built, as the body
+// of a function whose parameter `__bootstrap` is the runtime's bootstrap
+// object, and leaves its entrypoints on `__bootstrap.dd`, which only the
+// host reaches.
+"use strict";
+const { core, dd } = __bootstrap;
+
+dd.executeWorker = (payload) => {
   const requestId = String(payload?.request_id ?? "");
-  const deploymentConfig = globalThis.__dd_worker_deployment ?? null;
+  const deploymentConfig = dd.workerDeployment ?? null;
   if (!deploymentConfig || typeof deploymentConfig !== "object") {
     throw new Error("Worker deployment config is not installed");
   }
@@ -29,15 +37,15 @@ globalThis.__dd_execute_worker = (payload) => {
   const streamResponse = payload?.stream_response === true;
   const maxResponseBodyBytes = Number(payload?.max_response_body_bytes ?? 0);
   const maxRequestBodyBytes = Number(payload?.max_request_body_bytes ?? 0);
-  const worker = globalThis.__dd_worker;
+  const worker = dd.worker;
 
   if (worker === undefined) {
     throw new Error("Worker is not installed");
   }
 
-  const inflightRequests = globalThis.__dd_inflight_requests ??= new Map();
+  const inflightRequests = dd.inflightRequests ??= new Map();
   const inflightRequestsByContextHandle =
-    globalThis.__dd_inflight_requests_by_context_handle ??= new Map();
+    dd.inflightRequestsByContextHandle ??= new Map();
   const input = {
     method: String(payload?.method ?? "GET"),
     url: String(payload?.url ?? ""),
@@ -55,7 +63,7 @@ globalThis.__dd_execute_worker = (payload) => {
       return normalized === "1" || normalized === "true" || normalized === "yes";
     });
   const controller = new AbortController();
-  const asyncContext = globalThis.__dd_async_context;
+  const asyncContext = dd.asyncContext;
   const requestContext = {
     requestId,
     controller,
@@ -92,7 +100,7 @@ globalThis.__dd_execute_worker = (payload) => {
   }
 
   const callOp = (name, ...args) => {
-    const op = Deno?.core?.ops?.[name];
+    const op = core.ops[name];
     if (typeof op !== "function") {
       return undefined;
     }
@@ -100,7 +108,7 @@ globalThis.__dd_execute_worker = (payload) => {
   };
 
   const recordMemoryProfile = (metric, durationMs, items = 1) => {
-    const op = Deno?.core?.ops?.op_memory_profile_record_js;
+    const op = core.ops.op_memory_profile_record_js;
     if (typeof op !== "function") {
       return;
     }
@@ -118,14 +126,7 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     return scoped;
   };
-  if (typeof globalThis.__dd_get_runtime_request_id !== "function") {
-    Object.defineProperty(globalThis, "__dd_get_runtime_request_id", {
-      value: activeRequestId,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  }
+  dd.runtimeRequestId ??= activeRequestId;
   const activeRequestContextHandle = () => {
     const handle = Math.max(
       0,
@@ -136,25 +137,11 @@ globalThis.__dd_execute_worker = (payload) => {
     }
     return handle;
   };
-  if (typeof globalThis.__dd_get_runtime_request_context_handle !== "function") {
-    Object.defineProperty(globalThis, "__dd_get_runtime_request_context_handle", {
-      value: activeRequestContextHandle,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  }
+  dd.runtimeRequestContextHandle ??= activeRequestContextHandle;
   const activeCacheBypassStale = () => Boolean(
     currentRequestContext(false)?.cacheBypassStale,
   );
-  if (typeof globalThis.__dd_get_cache_bypass_stale !== "function") {
-    Object.defineProperty(globalThis, "__dd_get_cache_bypass_stale", {
-      value: activeCacheBypassStale,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  }
+  dd.cacheBypassStale ??= activeCacheBypassStale;
 
   const memoryScopedScopeHandle = (entry) => {
     const current = currentRequestContext(false);
@@ -230,25 +217,18 @@ globalThis.__dd_execute_worker = (payload) => {
   const syncFrozenTime = async () => {
     const value = await callOp("op_time_boundary_now");
     const boundary = normalizeBoundaryValue(value);
-    if (boundary && typeof globalThis.__dd_set_time === "function") {
-      globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+    if (boundary && typeof dd.setTime === "function") {
+      dd.setTime(boundary.nowMs, boundary.perfMs);
     }
   };
   const syncFrozenTimeNow = () => {
     const value = callOp("op_time_boundary_now");
     const boundary = normalizeBoundaryValue(value);
-    if (boundary && typeof globalThis.__dd_set_time === "function") {
-      globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+    if (boundary && typeof dd.setTime === "function") {
+      dd.setTime(boundary.nowMs, boundary.perfMs);
     }
   };
-  if (typeof globalThis.__dd_sync_time_boundary !== "function") {
-    Object.defineProperty(globalThis, "__dd_sync_time_boundary", {
-      value: syncFrozenTime,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  }
+  dd.syncTimeBoundary ??= syncFrozenTime;
 
   const toUtf8Bytes = (value) => {
     if (value == null) {
@@ -368,11 +348,11 @@ globalThis.__dd_execute_worker = (payload) => {
     const handle = Math.max(0, Math.trunc(Number(valueHandle ?? 0) || 0));
     const bytes = callOp("op_http_take_prepared_body", handle);
     if (encoding === "utf8") {
-      return Deno.core.decode(bytes);
+      return core.decode(bytes);
     }
     if (encoding === "v8sc") {
       try {
-        return Deno.core.deserialize(bytes, { forStorage: true });
+        return core.deserialize(bytes, { forStorage: true });
       } catch (error) {
         throw new Error(`${context} deserialize failed: ${String(error?.message ?? error)}`);
       }
@@ -392,7 +372,7 @@ globalThis.__dd_execute_worker = (payload) => {
       const result = typeof value === "string"
         ? await callOp("op_kv_put", bindingName, normalizedKey, value)
         : await callOp("op_kv_put_value_bytes", bindingName, normalizedKey,
-          "v8sc", new Uint8Array(Deno.core.serialize(value, { forStorage: true })));
+          "v8sc", new Uint8Array(core.serialize(value, { forStorage: true })));
       syncFrozenTimeNow();
       if (!result.ok) throw new Error(`kv put ${normalizedKey}: ${result.error}`);
     },

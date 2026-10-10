@@ -5,7 +5,7 @@
 /// <reference path="../../core/lib.deno_core.d.ts" />
 /// <reference path="../webidl/internal.d.ts" />
 
-(function () {
+return (function () {
 const { core, primordials } = __bootstrap;
 const {
   op_url_get_serialization,

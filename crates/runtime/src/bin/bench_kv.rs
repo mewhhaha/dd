@@ -86,17 +86,17 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_kv_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_kv_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_kv_profile_reset?.();
+      __dd_internals.core.ops.op_kv_profile_reset?.();
       return new Response("ok");
     }
     const requestStart = performance.now();
     const finish = () => {
-      Deno.core.ops.op_kv_profile_record_js?.(
+      __dd_internals.core.ops.op_kv_profile_record_js?.(
         "js_request_total",
         Math.max(0, Math.round((performance.now() - requestStart) * 1000)),
         1,
@@ -207,6 +207,8 @@ async fn main() -> Result<(), String> {
                 scale_tick: Duration::from_secs(1),
                 queue_warn_thresholds: vec![10, 100, 1000],
                 kv_profile_enabled: profile_enabled,
+                // The profile ops are reached through __dd_internals.
+                expose_internals: true,
                 ..RuntimeConfig::default()
             },
         },
@@ -220,6 +222,8 @@ async fn main() -> Result<(), String> {
                 scale_tick: Duration::from_secs(1),
                 queue_warn_thresholds: vec![10, 100, 1000],
                 kv_profile_enabled: profile_enabled,
+                // The profile ops are reached through __dd_internals.
+                expose_internals: true,
                 ..RuntimeConfig::default()
             },
         },

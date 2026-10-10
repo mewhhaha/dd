@@ -238,7 +238,7 @@ export default {
             worker_source: r#"
 export default {
   async fetch() {
-    await Deno.core.ops.op_sleep(5);
+    await new Promise((resolve) => setTimeout(resolve, 5));
     return new Response("ok");
   },
 };
@@ -276,7 +276,7 @@ export default {
     }
 
     if (pathname.startsWith("/api/")) {
-      await Deno.core.ops.op_sleep(8);
+      await new Promise((resolve) => setTimeout(resolve, 8));
       return new Response("{\"ok\":true}", {
         headers: [["content-type", "application/json"]],
       });
@@ -758,7 +758,7 @@ async fn run_scale_up(
         worker_source: r#"
 export default {
   async fetch() {
-    await Deno.core.ops.op_sleep(15);
+    await new Promise((resolve) => setTimeout(resolve, 15));
     return new Response("ok");
   },
 };

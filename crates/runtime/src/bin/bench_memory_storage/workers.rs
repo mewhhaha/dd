@@ -61,12 +61,12 @@ export default {
     const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
     const memory = env.BENCH_MEMORY.get(id);
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
     if (url.pathname === "/seed") {
@@ -101,12 +101,12 @@ export default {
     const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
     const memory = env.BENCH_MEMORY.get(id);
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
     if (url.pathname === "/seed") {
@@ -150,12 +150,12 @@ export default {
     const id = env.BENCH_MEMORY.idFromName(url.searchParams.get("key") ?? "hot");
     const memory = env.BENCH_MEMORY.get(id);
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
     if (url.pathname === "/seed") {
@@ -240,12 +240,12 @@ export default {
     const memory = env.BENCH_MEMORY.get(id);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
     if (url.pathname === "/seed") {
@@ -337,12 +337,12 @@ export default {
     const memory = env.AUTH_STATE.get(id);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
     if (url.pathname === "/seed") {

@@ -805,15 +805,6 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                                 }).await;
                                 return;
                             }
-                        if let Err(error) = cache_runtime_entrypoints(&mut js_runtime) {
-                            let _ = event_tx.send(RuntimeEvent::IsolateFailed {
-                                worker_name: worker_name.clone(),
-                                generation,
-                                isolate_id,
-                                error,
-                            }).await;
-                            return;
-                        }
                         if let Err(error) =
                             install_worker_deployment_config(&mut js_runtime, (*deployment_config).clone())
                         {

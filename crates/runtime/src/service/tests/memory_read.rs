@@ -60,17 +60,17 @@ async fn captured_reads_stay_consistent_when_a_write_commits_before_the_callback
     let service = deploy_read_worker(
         r#"
 await memory.atomic(tx => { tx.put("a", 1); tx.put("b", 1); });
-const begin = Deno.core.ops.op_memory_read_begin;
+const begin = __dd_internals.core.ops.op_memory_read_begin;
 let captured;
 try {
-  Deno.core.ops.op_memory_read_begin = async (...args) => {
+  __dd_internals.core.ops.op_memory_read_begin = async (...args) => {
     const snapshot = await begin(...args);
     await memory.atomic(tx => { tx.put("a", 2); tx.put("b", 2); tx.put("c", 2); });
     return snapshot;
   };
   captured = await memory.read(snapshot => [snapshot.get("a"), snapshot.get("b"), snapshot.list()]);
 } finally {
-  Deno.core.ops.op_memory_read_begin = begin;
+  __dd_internals.core.ops.op_memory_read_begin = begin;
 }
 const committed = await memory.read(snapshot => snapshot.list());
 return Response.json({ captured, committed });
@@ -251,21 +251,21 @@ let captured = 0;
 export default { async fetch(request, env) {
   const path = new URL(request.url).pathname;
   if (path === "/probe") {
-    return Response.json(Deno.core.ops.op_memory_read_get(captured, "missing").ok);
+    return Response.json(__dd_internals.core.ops.op_memory_read_get(captured, "missing").ok);
   }
-  const begin = Deno.core.ops.op_memory_read_begin;
-  const close = Deno.core.ops.op_memory_read_close;
+  const begin = __dd_internals.core.ops.op_memory_read_begin;
+  const close = __dd_internals.core.ops.op_memory_read_close;
   try {
-    Deno.core.ops.op_memory_read_begin = async (...args) => {
+    __dd_internals.core.ops.op_memory_read_begin = async (...args) => {
       const result = await begin(...args);
       captured = result.handle;
       return result;
     };
-    Deno.core.ops.op_memory_read_close = () => {};
+    __dd_internals.core.ops.op_memory_read_close = () => {};
     await env.STATE.get("entity").read(snapshot => snapshot.get("missing"));
   } finally {
-    Deno.core.ops.op_memory_read_begin = begin;
-    Deno.core.ops.op_memory_read_close = close;
+    __dd_internals.core.ops.op_memory_read_begin = begin;
+    __dd_internals.core.ops.op_memory_read_close = close;
   }
   if (path === "/stream") {
     return new Response(new ReadableStream({ start(controller) { controller.enqueue("ready"); } }));

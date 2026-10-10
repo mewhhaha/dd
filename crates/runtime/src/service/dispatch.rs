@@ -908,6 +908,7 @@ impl WorkerManager {
         let policy = crate::engine::IsolatePolicy {
             allow_code_generation: self.config.debug_code_generation,
             unscoped_fetch: self.config.dev_unscoped_fetch,
+            expose_internals: self.config.expose_internals,
         };
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;

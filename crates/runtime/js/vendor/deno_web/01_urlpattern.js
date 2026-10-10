@@ -7,7 +7,7 @@
 /// <reference path="./internal.d.ts" />
 /// <reference path="../../cli/tsc/dts/lib.deno_url.d.ts" />
 
-(function () {
+return (function () {
 const { core, primordials } = __bootstrap;
 const {
   op_urlpattern_parse,

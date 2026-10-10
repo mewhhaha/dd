@@ -5,9 +5,9 @@ export default {
         start(controller) {
           (async () => {
             controller.enqueue("hel");
-            await Deno.core.ops.op_sleep(15);
+            await new Promise((resolve) => setTimeout(resolve, 15));
             controller.enqueue("lo");
-            await Deno.core.ops.op_sleep(15);
+            await new Promise((resolve) => setTimeout(resolve, 15));
             controller.enqueue(" world");
             controller.close();
           })().catch((error) => controller.error(error));

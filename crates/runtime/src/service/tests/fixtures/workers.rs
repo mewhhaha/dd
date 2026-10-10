@@ -15,7 +15,7 @@ pub(crate) fn slow_worker() -> String {
     r#"
 export default {
   async fetch() {
-    await Deno.core.ops.op_sleep(40);
+    await __dd_internals.core.ops.op_sleep(40);
     return new Response("ok");
   },
 };
@@ -34,8 +34,8 @@ function testReplyFailure(error) {
 }
 
 function startTestAsyncReply(runtimeRequestId, options = {}) {
-  return Deno.core.ops.op_test_async_reply_start(
-    Math.max(0, Math.trunc(Number(globalThis.__dd_get_runtime_request_context_handle?.() ?? 0) || 0)),
+  return __dd_internals.core.ops.op_test_async_reply_start(
+    Math.max(0, Math.trunc(Number(__dd_internals.dd.runtimeRequestContextHandle?.() ?? 0) || 0)),
     Math.max(0, Math.trunc(Number(options.delay_ms ?? options.delayMs ?? 0) || 0)),
     options.ok == null ? true : Boolean(options.ok),
     String(options.value ?? ""),
@@ -44,7 +44,7 @@ function startTestAsyncReply(runtimeRequestId, options = {}) {
 }
 
 async function waitTestReply(runtimeRequestId, started, timeoutMs) {
-  const waitReply = globalThis.__dd_await_request_reply;
+  const waitReply = __dd_internals.dd.awaitRequestReply;
   if (typeof waitReply !== "function") {
     throw new Error("request reply helper missing");
   }
@@ -71,20 +71,20 @@ async function waitTestReply(runtimeRequestId, started, timeoutMs) {
     ]);
     if (raced.kind === "actual") {
       if (timeoutReplyId) {
-        Deno.core.ops.op_test_async_reply_cancel(timeoutReplyId);
+        __dd_internals.core.ops.op_test_async_reply_cancel(timeoutReplyId);
       }
       return raced.value;
     }
     if (actualReplyId) {
-      Deno.core.ops.op_test_async_reply_cancel(actualReplyId);
+      __dd_internals.core.ops.op_test_async_reply_cancel(actualReplyId);
     }
     return raced.value;
   } catch (error) {
     if (actualReplyId) {
-      Deno.core.ops.op_test_async_reply_cancel(actualReplyId);
+      __dd_internals.core.ops.op_test_async_reply_cancel(actualReplyId);
     }
     if (timeoutReplyId) {
-      Deno.core.ops.op_test_async_reply_cancel(timeoutReplyId);
+      __dd_internals.core.ops.op_test_async_reply_cancel(timeoutReplyId);
     }
     return testReplyFailure(error);
   }
@@ -101,7 +101,7 @@ function testReplyResponse(result, fallbackStatus = 500) {
 export default {
   async fetch(request, _env, ctx) {
     const url = new URL(request.url);
-    const runtimeRequestId = String(globalThis.__dd_get_runtime_request_id?.() ?? "").trim();
+    const runtimeRequestId = String(__dd_internals.dd.runtimeRequestId?.() ?? "").trim();
 
     if (url.pathname === "/async/immediate") {
       const result = await waitTestReply(
@@ -296,7 +296,7 @@ pub(crate) fn versioned_worker(version: &str, delay_ms: u64) -> String {
         r#"
 export default {{
   async fetch() {{
-    await Deno.core.ops.op_sleep({delay_ms});
+    await __dd_internals.core.ops.op_sleep({delay_ms});
     return new Response("{version}");
   }},
 }};
@@ -308,7 +308,7 @@ pub(crate) fn io_wait_worker() -> String {
     r#"
 export default {
   async fetch() {
-    await Deno.core.ops.op_sleep(50);
+    await __dd_internals.core.ops.op_sleep(50);
     return new Response("ok");
   },
 };
@@ -445,7 +445,7 @@ export default {
       await env.MY_KV.put("obj", { ok: true, n: 7 });
       await env.MY_KV.put("left", "L");
       await env.MY_KV.put("right", "R");
-      const bad = await Deno.core.ops.op_kv_put_value_bytes(
+      const bad = await __dd_internals.core.ops.op_kv_put_value_bytes(
         "MY_KV",
         "broken",
         "v8sc",
@@ -566,13 +566,13 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_kv_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_kv_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
 
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_kv_profile_reset?.();
+      __dd_internals.core.ops.op_kv_profile_reset?.();
       return new Response("ok");
     }
 
@@ -741,16 +741,16 @@ export default {
   async fetch(_request, _env, ctx) {
     counter += 1;
 
-    const bodyHandle = Deno.core.ops.op_http_store_prepared_body(
+    const bodyHandle = __dd_internals.core.ops.op_http_store_prepared_body(
       new Uint8Array([102, 97, 107, 101]),
     );
-    Deno.core.ops.op_emit_completion_ok(
+    __dd_internals.core.ops.op_emit_completion_ok(
       0,
       200,
       0,
       bodyHandle,
     );
-    Deno.core.ops.op_emit_completion_ok(
+    __dd_internals.core.ops.op_emit_completion_ok(
       0,
       200,
       0,
@@ -879,13 +879,13 @@ export default {
     const memory = env.MY_MEMORY.get(id);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
 
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
 
@@ -1275,13 +1275,13 @@ export default {
     const memory = env.MY_MEMORY.get(id);
 
     if (url.pathname === "/__profile") {
-      return new Response(JSON.stringify(Deno.core.ops.op_memory_profile_take?.() ?? null), {
+      return new Response(JSON.stringify(__dd_internals.core.ops.op_memory_profile_take?.() ?? null), {
         headers: [["content-type", "application/json"]],
       });
     }
 
     if (url.pathname === "/__profile_reset") {
-      Deno.core.ops.op_memory_profile_reset?.();
+      __dd_internals.core.ops.op_memory_profile_reset?.();
       return new Response("ok");
     }
 
@@ -1373,7 +1373,7 @@ pub(crate) fn async_context_worker() -> String {
 export default {
   async fetch(request) {
     const url = new URL(request.url);
-    const ctx = globalThis.__dd_async_context;
+    const ctx = __dd_internals.dd.asyncContext;
     if (!ctx) {
       return new Response("missing", { status: 500 });
     }

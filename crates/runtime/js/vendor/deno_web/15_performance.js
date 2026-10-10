@@ -1,6 +1,6 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-(function () {
+return (function () {
 const { core, primordials } = __bootstrap;
 const { op_now, op_time_origin } = core.ops;
 const {

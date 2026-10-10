@@ -165,8 +165,8 @@ export default {
     const room = env.CHAT.get(path === "/other" ? "other" : "failed");
     if (path !== "/fail" && path !== "/reject") return room.atomic(tx => tx.accept(request).response);
 
-    const snapshot = Deno.core.ops.op_memory_batch_begin;
-    Deno.core.ops.op_memory_batch_begin = () => ({
+    const snapshot = __dd_internals.core.ops.op_memory_batch_begin;
+    __dd_internals.core.ops.op_memory_batch_begin = () => ({
       ok: false, storage_failure: path === "/fail",
       error: path === "/fail" ? "injected memory snapshot failure" : "injected memory admission rejection",
     });
@@ -177,7 +177,7 @@ export default {
     } catch (error) {
       return Response.json({ callbackRan, error: error.message });
     } finally {
-      Deno.core.ops.op_memory_batch_begin = snapshot;
+      __dd_internals.core.ops.op_memory_batch_begin = snapshot;
     }
   },
   async wake(event) {

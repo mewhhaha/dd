@@ -9,7 +9,7 @@
 /// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
 /// <reference lib="esnext" />
 
-(function () {
+return (function () {
 const { core, primordials } = __bootstrap;
 const {
   isDataView,

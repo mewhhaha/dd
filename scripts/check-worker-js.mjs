@@ -15,7 +15,7 @@ const eslint = new ESLint({
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "script",
-      globals: { ...globals.browser, Deno: "readonly" },
+      globals: globals.browser,
     },
     rules: {
       "no-undef": "error",
@@ -23,9 +23,14 @@ const eslint = new ESLint({
     },
   },
 });
-const [result] = await eslint.lintText(sources.join("\n"), { filePath: "execute_worker.js" });
+// The bundle runs as the body of a function whose one parameter is the
+// runtime's bootstrap object.
+const [result] = await eslint.lintText(
+  `(function (__bootstrap) {\n${sources.join("\n")}\n})();\n`,
+  { filePath: "execute_worker.js" },
+);
 for (const message of result.messages) {
-  let line = message.line;
+  let line = message.line - 1;
   let index = 0;
   while (index < sources.length - 1 && line > sources[index].split("\n").length) {
     line -= sources[index].split("\n").length;

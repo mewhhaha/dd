@@ -29,7 +29,7 @@ export default {
     const requestId = request.headers.get("x-request-id") ?? String(Date.now());
     ctx.waitUntil(
       (async () => {
-        await Deno.core.ops.op_sleep(20);
+        await new Promise((resolve) => setTimeout(resolve, 20));
         await kv.put(`done:${requestId}`, "1");
       })(),
     );

@@ -26,10 +26,10 @@ export default {
   async fetch(request, env) {
     if (request.method === "GET") {
       if (request.url.endsWith("/profile/reset")) {
-        Deno.core.ops.op_memory_profile_reset();
+        __dd_internals.core.ops.op_memory_profile_reset();
         return Response.json({ ok: true });
       }
-      return Response.json(Deno.core.ops.op_memory_profile_take());
+      return Response.json(__dd_internals.core.ops.op_memory_profile_take());
     }
     const { operation, sequence, entities } = await request.json();
     const results = await Promise.all(entities.map((entity) => {

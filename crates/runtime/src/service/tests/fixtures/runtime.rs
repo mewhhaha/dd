@@ -56,8 +56,12 @@ pub(crate) async fn test_service_with_store(
     store: TestStoreDir,
     worker_store_enabled: bool,
 ) -> TestRuntime {
+    // Test workers reach behind the worker API through __dd_internals.
     let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
-        runtime: config,
+        runtime: RuntimeConfig {
+            expose_internals: true,
+            ..config
+        },
         storage: RuntimeStorageConfig {
             store_dir: store.path().to_path_buf(),
             worker_store_enabled,

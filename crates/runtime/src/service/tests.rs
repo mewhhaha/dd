@@ -400,7 +400,7 @@ const storage = new AsyncLocalStorage();
 
 export default {
   async fetch(request, env, ctx) {
-    const requestId = globalThis.__dd_get_runtime_request_id?.();
+    const requestId = __dd_internals.dd.runtimeRequestId?.();
     const values = await Promise.all([
       storage.run("slow", async () => {
         await ctx.sleep(20);
@@ -418,7 +418,7 @@ export default {
       values,
       entered,
       disabled: storage.getStore() ?? null,
-      requestContextPreserved: globalThis.__dd_get_runtime_request_id?.() === requestId,
+      requestContextPreserved: __dd_internals.dd.runtimeRequestId?.() === requestId,
     });
   },
 };
@@ -461,7 +461,7 @@ async fn isolate_startup_does_not_block_manager_commands() {
         .deploy(
             worker.clone(),
             r#"
-await Deno.core.ops.op_sleep(800);
+await __dd_internals.core.ops.op_sleep(800);
 
 export default {
   async fetch() {
@@ -631,11 +631,11 @@ let firstCacheBypassGetter;
 export default {
   async fetch() {
     const current = globalThis.fetch;
-    const installer = globalThis.__dd_install_host_fetch;
-    const requestIdGetter = globalThis.__dd_get_runtime_request_id;
-    const requestContextHandleGetter = globalThis.__dd_get_runtime_request_context_handle;
-    const syncBoundary = globalThis.__dd_sync_time_boundary;
-    const cacheBypassGetter = globalThis.__dd_get_cache_bypass_stale;
+    const installer = __dd_internals.dd.installHostFetch;
+    const requestIdGetter = __dd_internals.dd.runtimeRequestId;
+    const requestContextHandleGetter = __dd_internals.dd.runtimeRequestContextHandle;
+    const syncBoundary = __dd_internals.dd.syncTimeBoundary;
+    const cacheBypassGetter = __dd_internals.dd.cacheBypassStale;
     const first = firstFetch === undefined;
     if (first) {
       firstFetch = current;
@@ -658,7 +658,7 @@ export default {
       cacheBypassValue: Boolean(cacheBypassGetter?.()),
       rawAvailable: typeof globalThis.__dd_raw_host_fetch === "function",
       rawInstalled: current === globalThis.__dd_raw_host_fetch,
-      wrapperInstalled: current.__dd_host_fetch === true,
+      wrapperInstalled: current === __dd_internals.dd.hostFetch,
     });
   },
 };
@@ -716,6 +716,59 @@ export default {
 
 #[tokio::test]
 #[serial]
+async fn deployed_workers_reach_no_runtime_internals() {
+    // test_service exposes the internals; a default service must not.
+    let store = TestStoreDir::new("dd-internals");
+    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+        runtime: RuntimeConfig::default(),
+        storage: RuntimeStorageConfig {
+            store_dir: store.path().to_path_buf(),
+            ..RuntimeStorageConfig::default()
+        },
+    })
+    .await
+    .expect("service should start");
+    service
+        .deploy(
+            "internals".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return Response.json({
+      internals: typeof __dd_internals,
+      deno: typeof Deno,
+      bootstrap: typeof __bootstrap,
+      ddGlobals: Object.getOwnPropertyNames(globalThis).filter((name) => name.startsWith("__")),
+    });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+    let output = service
+        .invoke(
+            "internals".to_string(),
+            test_invocation_with_path("/", "internals"),
+        )
+        .await
+        .expect("invoke should succeed");
+    let body: Value = serde_json::from_slice(&output.body).expect("body should be json");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "internals": "undefined",
+            "deno": "undefined",
+            "bootstrap": "undefined",
+            "ddGlobals": ["__dd_async_context"],
+        })
+    );
+    service.shutdown().await.expect("service should shut down");
+}
+
+#[tokio::test]
+#[serial]
 async fn overlapping_requests_keep_independent_request_context_handles() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -737,13 +790,13 @@ export default {
     const url = new URL(request.url);
     const label = url.searchParams.get("label");
     const before = {
-      id: globalThis.__dd_get_runtime_request_id?.(),
-      handle: globalThis.__dd_get_runtime_request_context_handle?.(),
+      id: __dd_internals.dd.runtimeRequestId?.(),
+      handle: __dd_internals.dd.runtimeRequestContextHandle?.(),
     };
     await ctx.sleep(Number(url.searchParams.get("delay") ?? "0"));
     const after = {
-      id: globalThis.__dd_get_runtime_request_id?.(),
-      handle: globalThis.__dd_get_runtime_request_context_handle?.(),
+      id: __dd_internals.dd.runtimeRequestId?.(),
+      handle: __dd_internals.dd.runtimeRequestContextHandle?.(),
     };
     return Response.json({ label, before, after });
   },
@@ -1240,7 +1293,7 @@ async fn worker_request_wall_timeout_retires_cooperative_isolate() {
             r#"
 export default {
   async fetch() {
-    await Deno.core.ops.op_sleep(500);
+    await __dd_internals.core.ops.op_sleep(500);
     return new Response("late");
   },
 };
@@ -3150,7 +3203,7 @@ async fn budget_pressure_waits_for_wait_until_before_retiring_an_isolate() {
             r#"
 export default {
   async fetch(_request, _env, ctx) {
-    ctx.waitUntil(Deno.core.ops.op_sleep(150));
+    ctx.waitUntil(__dd_internals.core.ops.op_sleep(150));
     return new Response("queued");
   },
 };

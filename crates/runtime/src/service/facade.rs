@@ -69,6 +69,10 @@ pub struct RuntimeConfig {
     /// any request and egress rule. Only the local development runtime sets
     /// this, for dd-vite's dev module loading.
     pub dev_unscoped_fetch: bool,
+    /// Give workers `globalThis.__dd_internals`: the runtime's bootstrap
+    /// object, every op included. Only the runtime's own tests and
+    /// benchmarks set this, to reach behind the worker API.
+    pub expose_internals: bool,
     pub kv_profile_enabled: bool,
     pub memory_profile_enabled: bool,
     pub temporary_worker_ttl: Duration,
@@ -106,6 +110,7 @@ impl Default for RuntimeConfig {
             v8_flags: Vec::new(),
             debug_code_generation: false,
             dev_unscoped_fetch: false,
+            expose_internals: false,
             kv_profile_enabled: false,
             memory_profile_enabled: false,
             temporary_worker_ttl: Duration::from_secs(60 * 60),
@@ -830,6 +835,7 @@ impl RuntimeService {
             policy: crate::engine::IsolatePolicy {
                 allow_code_generation: runtime.debug_code_generation,
                 unscoped_fetch: runtime.dev_unscoped_fetch,
+                expose_internals: runtime.expose_internals,
             },
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
         });

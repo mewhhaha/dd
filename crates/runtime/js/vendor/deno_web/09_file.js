@@ -10,7 +10,7 @@
 /// <reference path="./internal.d.ts" />
 /// <reference lib="esnext" />
 
-(function () {
+return (function () {
 const { core, primordials } = __bootstrap;
 const {
   isAnyArrayBuffer,

@@ -469,6 +469,8 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
             max_global_isolates: config.available_cpus,
             max_isolates: config.available_cpus,
             memory_profile_enabled: config.profile,
+            // The profile ops are reached through __dd_internals.
+            expose_internals: true,
             v8_flags: config.v8_log.as_ref().map_or_else(Vec::new, |path| {
                 vec!["--prof".into(), format!("--logfile={}", path.display())]
             }),

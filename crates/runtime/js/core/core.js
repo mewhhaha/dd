@@ -1,17 +1,19 @@
 // The runtime's `core` object: the op functions plus the helpers the web
 // layer (vendored from Deno) and dd's own scripts are written against. Runs
 // once while the bootstrap snapshot is built, as the body of a function
-// whose parameter `ops` holds every op function by name.
+// whose parameter `ops` holds every op function by name, and returns the
+// bootstrap object every later runtime script receives as `__bootstrap`.
+// Nothing here is global: worker code reaches no op.
 "use strict";
 
 const { primordials } = globalThis.__bootstrap;
+delete globalThis.__bootstrap;
 const {
   Error,
   MapPrototypeDelete,
   MapPrototypeGet,
   MapPrototypeHas,
   MapPrototypeSet,
-  ObjectDefineProperty,
   ObjectFreeze,
   PromiseReject,
   ReflectApply,
@@ -58,7 +60,7 @@ function loadExtScript(specifier) {
   if (MapPrototypeHas(extScripts, specifier)) {
     return MapPrototypeGet(extScripts, specifier);
   }
-  const exports = op_load_ext_script(specifier);
+  const exports = op_load_ext_script(specifier, bootstrap);
   MapPrototypeSet(extScripts, specifier, exports);
   return exports;
 }
@@ -252,12 +254,8 @@ const core = {
   createCancelHandle: noResources,
 };
 
-globalThis.__bootstrap.core = core;
-globalThis.__bootstrap.internals = {};
-ObjectDefineProperty(globalThis, "Deno", {
-  __proto__: null,
-  value: { core },
-  configurable: true,
-  writable: true,
-  enumerable: false,
-});
+// `internals` is shared by the vendored web scripts; `dd` holds the state
+// dd's own runtime scripts share, and is what the host keeps as the
+// runtime's internals.
+const bootstrap = { core, primordials, internals: {}, dd: {} };
+return bootstrap;

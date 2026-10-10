@@ -1,3 +1,9 @@
+// dd's worker globals over the web layer. Runs once while the bootstrap
+// snapshot is built, with the bootstrap object as `__bootstrap`. What it
+// defines on globalThis is the worker-visible platform; what it puts on
+// `__bootstrap.dd` stays private to the runtime.
+const { core, dd } = __bootstrap;
+
 const {
   AbortController: DenoAbortController,
   AbortSignal: DenoAbortSignal,
@@ -31,7 +37,7 @@ const {
   performance: denoPerformance,
   reportError,
   structuredClone: denoStructuredClone,
-} = globalThis.__dd_deno_runtime ?? {};
+} = dd.web;
 
 const define = (name, value, enumerable = false) => {
   Object.defineProperty(globalThis, name, {
@@ -44,7 +50,7 @@ const define = (name, value, enumerable = false) => {
 
 const requireRuntimeFunction = (name, value) => {
   if (typeof value !== "function") {
-    throw new Error(`dd bootstrap missing required Deno runtime global: ${name}`);
+    throw new Error(`dd bootstrap is missing the web class ${name}`);
   }
   return value;
 };
@@ -106,7 +112,7 @@ const RequestCtor = RuntimeRequest;
 const ResponseCtor = RuntimeResponse;
 
 function runtimeOp(name, ...args) {
-  const op = Deno?.core?.ops?.[name];
+  const op = core.ops[name];
   if (typeof op !== "function") {
     return undefined;
   }
@@ -260,17 +266,14 @@ function ensureStructuredCloneGlobal() {
   define("structuredClone", denoStructuredClone);
 }
 
+// The request a continuation belongs to, and the stores of AsyncLocalStorage
+// instances, ride V8's continuation-preserved data. Workers get only the
+// AsyncLocalStorage half, as __dd_async_context, which dd-vite's
+// node:async_hooks shim builds on; the request half is the runtime's.
 function ensureAsyncContextGlobal() {
-  const core = globalThis.Deno?.core;
   const asyncContextFrame = Symbol("dd.asyncContextFrame");
-  const getAsyncContext = typeof core?.getAsyncContext === "function"
-    ? () => core.getAsyncContext()
-    : () => globalThis.__dd_fallback_async_context ?? null;
-  const setAsyncContext = typeof core?.setAsyncContext === "function"
-    ? (value) => core.setAsyncContext(value ?? null)
-    : (value) => {
-      globalThis.__dd_fallback_async_context = value ?? null;
-    };
+  const getAsyncContext = () => core.getAsyncContext();
+  const setAsyncContext = (value) => core.setAsyncContext(value ?? null);
   const frameFor = (context) => context?.[asyncContextFrame] === true
     ? context
     : {
@@ -287,7 +290,7 @@ function ensureAsyncContextGlobal() {
     };
   };
 
-  define("__dd_async_context", {
+  const asyncContext = {
     getStore() {
       return frameFor(getAsyncContext()).requestStore;
     },
@@ -299,7 +302,7 @@ function ensureAsyncContextGlobal() {
     },
     run(store, callback, ...args) {
       if (typeof callback !== "function") {
-        throw new TypeError("__dd_async_context.run(store, callback) requires a function");
+        throw new TypeError("asyncContext.run(store, callback) requires a function");
       }
       const previous = getAsyncContext() ?? null;
       const frame = derivedFrame(previous);
@@ -338,7 +341,14 @@ function ensureAsyncContextGlobal() {
       frame.asyncLocalStores.delete(storage);
       setAsyncContext(frame);
     },
-  });
+  };
+  dd.asyncContext = asyncContext;
+  define("__dd_async_context", Object.freeze({
+    getAsyncLocalStore: asyncContext.getAsyncLocalStore,
+    enterWithAsyncLocalStore: asyncContext.enterWithAsyncLocalStore,
+    runWithAsyncLocalStore: asyncContext.runWithAsyncLocalStore,
+    disableAsyncLocalStore: asyncContext.disableAsyncLocalStore,
+  }));
 }
 
 function ensureCryptoGlobals() {
@@ -347,7 +357,7 @@ function ensureCryptoGlobals() {
   define("SubtleCrypto", SubtleCrypto);
   Object.defineProperty(globalThis, "crypto", {
     get() {
-      return globalThis.__dd_deno_runtime.crypto;
+      return dd.web.crypto;
     },
     enumerable: false,
     configurable: true,
@@ -376,27 +386,27 @@ function normalizeTimeBoundaryValue(value) {
 }
 
 async function syncFrozenTimeBoundary() {
-  if (typeof globalThis.__dd_sync_time_boundary === "function") {
-    await globalThis.__dd_sync_time_boundary();
+  if (typeof dd.syncTimeBoundary === "function") {
+    await dd.syncTimeBoundary();
     return;
   }
 
   const boundaryRaw = await runtimeOp("op_time_boundary_now");
   const boundary = normalizeTimeBoundaryValue(boundaryRaw);
-  if (boundary && typeof globalThis.__dd_set_time === "function") {
-    globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+  if (boundary) {
+    setFrozenTime(boundary.nowMs, boundary.perfMs);
   }
 }
 
 function activeRuntimeRequestId() {
-  return typeof globalThis.__dd_get_runtime_request_id === "function"
-    ? String(globalThis.__dd_get_runtime_request_id() ?? "")
+  return typeof dd.runtimeRequestId === "function"
+    ? String(dd.runtimeRequestId() ?? "")
     : "";
 }
 
 function activeCacheBypassStale() {
-  return typeof globalThis.__dd_get_cache_bypass_stale === "function"
-    ? Boolean(globalThis.__dd_get_cache_bypass_stale())
+  return typeof dd.cacheBypassStale === "function"
+    ? Boolean(dd.cacheBypassStale())
     : false;
 }
 
@@ -571,4 +581,4 @@ if (typeof denoFetch === "function") {
   define("fetch", denoFetch);
 }
 define("caches", new CacheStorage());
-define("__dd_set_time", setFrozenTime);
+dd.setTime = setFrozenTime;

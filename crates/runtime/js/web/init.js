@@ -1,5 +1,8 @@
-(function () {
-const { core } = globalThis.__bootstrap;
+// The web platform layer as the runtime's scripts see it. Runs once while
+// the bootstrap snapshot is built, with the bootstrap object as
+// `__bootstrap`, and leaves its classes in `__bootstrap.dd.web`; bootstrap.js
+// decides which of them become globals.
+const { core, dd } = __bootstrap;
 const cryptoRuntime = core.loadExtScript("ext:deno_crypto/00_crypto.js");
 const { Crypto, CryptoKey, SubtleCrypto } = cryptoRuntime;
 const {
@@ -144,7 +147,7 @@ const { TypeError } = __bootstrap.primordials;
 // enforces the worker's egress rules; outside a request there is nothing to
 // fetch under.
 function fetch(input, init = undefined) {
-  const hostFetch = globalThis.__dd_host_fetch;
+  const hostFetch = dd.hostFetch;
   if (typeof hostFetch !== "function") {
     return Promise.reject(new TypeError("fetch is only available while handling a request"));
   }
@@ -186,17 +189,11 @@ const ddRuntime = {
   structuredClone,
 };
 
-Object.defineProperty(ddRuntime, "hostFetchResponse", { value: hostFetchResponse });
-Object.defineProperty(ddRuntime, "unscopedFetch", { value: unscopedFetch });
-
 Object.defineProperty(ddRuntime, "crypto", {
   get: () => cryptoRuntime.crypto,
   enumerable: true,
 });
 
-Object.defineProperty(globalThis, "__dd_deno_runtime", {
-  value: ddRuntime,
-  configurable: true,
-  writable: true,
-});
-})();
+dd.web = ddRuntime;
+dd.hostFetchResponse = hostFetchResponse;
+dd.unscopedFetch = unscopedFetch;

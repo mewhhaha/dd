@@ -3,7 +3,7 @@
 // @ts-check
 /// <reference path="../../core/internal.d.ts" />
 
-(function () {
+return (function () {
 const { core, primordials } = __bootstrap;
 const {
   ArrayPrototypePush,

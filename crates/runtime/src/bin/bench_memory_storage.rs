@@ -359,6 +359,8 @@ async fn main() -> Result<(), String> {
         scale_tick: env_duration_ms("DD_BENCH_SCALE_TICK_MS", 1_000),
         queue_warn_thresholds: vec![10, 100, 1000],
         memory_profile_enabled: profile_enabled,
+        // The profile ops are reached through __dd_internals.
+        expose_internals: true,
         ..RuntimeConfig::default()
     };
     let selected_storage_only = mode.as_deref() == Some("storage-write-memory-wide");

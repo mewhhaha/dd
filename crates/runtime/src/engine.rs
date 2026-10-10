@@ -1,5 +1,6 @@
 use crate::assets::{
-    BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, INSTALL_SPECIFIER, WORKER_SPECIFIER, install_worker_js,
+    BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, EXECUTE_WORKER_JS, EXECUTE_WORKER_SPECIFIER,
+    WORKER_SPECIFIER,
 };
 use crate::module_registry::{
     ModuleRegistry, RuntimeModuleKind, normalize_module_path, resolve_module_path,
@@ -12,7 +13,8 @@ use crate::service::MemoryExecutionCall;
 use base64::Engine;
 use common::{PlatformError, Result, WorkerInvocation};
 use dd_v8::{
-    JsRuntime, ModuleCode, ModuleLoader, ModuleSource, ModuleType, OpDecl, RuntimeOptions, v8,
+    JsRuntime, ModuleCode, ModuleId, ModuleLoader, ModuleSource, ModuleType, OpDecl,
+    RuntimeOptions, v8,
 };
 use std::borrow::Cow;
 use std::future::poll_fn;
@@ -40,7 +42,14 @@ fn runtime_ops() -> Vec<OpDecl> {
 }
 
 /// Builds (once per process) the snapshot every isolate starts from: the
-/// web layer and dd's bootstrap globals, evaluated and captured.
+/// web layer, dd's worker globals and its request machinery, evaluated and
+/// captured.
+///
+/// Every runtime script runs as the body of a function, so nothing it
+/// declares is global. core.js returns the bootstrap object (the ops, the
+/// web layer's shared state, and dd's own under `dd`); each later script
+/// receives it as its `__bootstrap` parameter, and the snapshot keeps it as
+/// the runtime's internals, where only the host reaches it.
 pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
     BOOTSTRAP_SNAPSHOT
         .get_or_init(|| {
@@ -52,15 +61,24 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
             runtime
                 .execute_script("ext:core/00_primordials.js", PRIMORDIALS_JS)
                 .map_err(runtime_error)?;
-            runtime
+            let bootstrap = runtime
                 .execute_with_ops("ext:core/core.js", CORE_JS)
                 .map_err(runtime_error)?;
-            runtime
-                .execute_script("ext:dd/web/init.js", WEB_INIT_JS)
-                .map_err(runtime_error)?;
-            runtime
-                .execute_script(BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS)
-                .map_err(runtime_error)?;
+            for (name, source) in [
+                ("ext:dd/web/init.js", WEB_INIT_JS),
+                (BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS),
+                (EXECUTE_WORKER_SPECIFIER, EXECUTE_WORKER_JS),
+            ] {
+                runtime
+                    .execute_function(
+                        name,
+                        source,
+                        &["__bootstrap"],
+                        std::slice::from_ref(&bootstrap),
+                    )
+                    .map_err(runtime_error)?;
+            }
+            runtime.set_internals(bootstrap);
             runtime.snapshot().map_err(runtime_error)
         })
         .as_deref()
@@ -75,6 +93,9 @@ pub struct IsolatePolicy {
     /// Expose `globalThis.__dd_raw_host_fetch`, a fetch outside any request
     /// and egress rule. For the local development runtime only.
     pub unscoped_fetch: bool,
+    /// Expose `globalThis.__dd_internals`, the bootstrap object with every
+    /// op. For the runtime's own tests and benchmarks only.
+    pub expose_internals: bool,
 }
 
 pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
@@ -118,9 +139,20 @@ pub fn new_runtime_from_snapshot_with_heap_limit(
 }
 
 pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
-    evaluate_module(runtime, WORKER_SPECIFIER, source, false).await?;
-    let install_code = install_worker_js();
-    evaluate_module(runtime, INSTALL_SPECIFIER, &install_code, true).await
+    let module_id = evaluate_module(runtime, WORKER_SPECIFIER, source).await?;
+    let namespace = runtime.module_namespace(module_id).map_err(runtime_error)?;
+    let namespace = {
+        dd_v8::scope!(scope, runtime);
+        let namespace = v8::Local::new(scope, namespace);
+        v8::Global::new(scope, v8::Local::<v8::Value>::from(namespace))
+    };
+    let install = cached_entrypoint(runtime, |entrypoints| {
+        Rc::clone(&entrypoints.install_worker)
+    });
+    runtime
+        .call_function(&install, &[namespace])
+        .map_err(runtime_error)?;
+    Ok(())
 }
 
 pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) -> Result<()> {
@@ -133,7 +165,9 @@ pub async fn load_worker_source(runtime: &mut JsRuntime, source: &WorkerSource) 
     load_worker(runtime, source.as_ref()).await
 }
 
+/// The functions on the runtime's internals (`__bootstrap.dd`) the host calls.
 struct RuntimeEntrypoints {
+    install_worker: Rc<v8::Global<v8::Function>>,
     install_worker_deployment_handle: Rc<v8::Global<v8::Function>>,
     execute_worker_handle: Rc<v8::Global<v8::Function>>,
     abort_worker_request_handle: Rc<v8::Global<v8::Function>>,
@@ -152,7 +186,7 @@ pub fn install_worker_deployment_config(
 
     match call_cached_u32_function(
         runtime,
-        "__dd_install_worker_deployment_handle",
+        "installWorkerDeploymentHandle",
         deployment_handle,
         |entrypoints| Rc::clone(&entrypoints.install_worker_deployment_handle),
     ) {
@@ -166,31 +200,35 @@ pub fn install_worker_deployment_config(
     }
 }
 
-pub fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
+fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
+    let internals = runtime
+        .internals()
+        .ok_or_else(|| PlatformError::runtime("the bootstrap snapshot has no runtime internals"))?;
     let entrypoints = {
         dd_v8::scope!(scope, runtime);
-        let global = scope.get_current_context().global(scope);
-        let install_worker_deployment_handle =
-            global_function(scope, global, "__dd_install_worker_deployment_handle")?;
-        let execute_worker_handle = global_function(scope, global, "__dd_execute_worker_handle")?;
-        let abort_worker_request_handle =
-            global_function(scope, global, "__dd_abort_worker_request_handle")?;
-        let drain_request_control_queue =
-            global_function(scope, global, "__dd_drain_request_control_queue_handle")?;
+        let internals = v8::Local::new(scope, internals);
+        let dd = v8::Local::<v8::Object>::try_from(internals)
+            .ok()
+            .and_then(|internals| {
+                let key = v8::String::new(scope, "dd")?;
+                internals.get(scope, key.into())
+            })
+            .and_then(|dd| v8::Local::<v8::Object>::try_from(dd).ok())
+            .ok_or_else(|| PlatformError::runtime("the runtime internals have no dd object"))?;
         RuntimeEntrypoints {
-            install_worker_deployment_handle: Rc::new(v8::Global::new(
+            install_worker: internal_function(scope, dd, "installWorker")?,
+            install_worker_deployment_handle: internal_function(
                 scope,
-                install_worker_deployment_handle,
-            )),
-            execute_worker_handle: Rc::new(v8::Global::new(scope, execute_worker_handle)),
-            abort_worker_request_handle: Rc::new(v8::Global::new(
+                dd,
+                "installWorkerDeploymentHandle",
+            )?,
+            execute_worker_handle: internal_function(scope, dd, "executeWorkerHandle")?,
+            abort_worker_request_handle: internal_function(scope, dd, "abortWorkerRequestHandle")?,
+            drain_request_control_queue: internal_function(
                 scope,
-                abort_worker_request_handle,
-            )),
-            drain_request_control_queue: Rc::new(v8::Global::new(
-                scope,
-                drain_request_control_queue,
-            )),
+                dd,
+                "drainRequestControlQueueHandle",
+            )?,
         }
     };
     let op_state = runtime.op_state();
@@ -257,7 +295,7 @@ pub fn dispatch_worker_request(
 
     match call_cached_u32_function(
         runtime,
-        "__dd_execute_worker_handle",
+        "executeWorkerHandle",
         request_handle,
         |entrypoints| Rc::clone(&entrypoints.execute_worker_handle),
     ) {
@@ -277,18 +315,16 @@ pub fn abort_worker_request_handle(
 ) -> Result<()> {
     call_cached_u32_function(
         runtime,
-        "__dd_abort_worker_request_handle",
+        "abortWorkerRequestHandle",
         request_context_handle,
         |entrypoints| Rc::clone(&entrypoints.abort_worker_request_handle),
     )
 }
 
 pub fn drain_request_control_queue(runtime: &mut JsRuntime) -> Result<()> {
-    call_cached_noarg_function(
-        runtime,
-        "__dd_drain_request_control_queue_handle",
-        |entrypoints| Rc::clone(&entrypoints.drain_request_control_queue),
-    )
+    call_cached_noarg_function(runtime, "drainRequestControlQueueHandle", |entrypoints| {
+        Rc::clone(&entrypoints.drain_request_control_queue)
+    })
 }
 
 pub fn pump_event_loop_once(runtime: &mut JsRuntime, waker: &Waker) -> Result<()> {
@@ -324,23 +360,43 @@ fn new_runtime(
     }
     runtime.op_state().borrow_mut().put(module_registry);
     set_code_generation_from_strings(&mut runtime, policy.allow_code_generation);
+    cache_runtime_entrypoints(&mut runtime)?;
     if policy.unscoped_fetch {
         runtime
             .op_state()
             .borrow_mut()
             .put(crate::ops::UnscopedFetch);
-        runtime
-            .execute_script(
-                "<dd:unscoped-fetch>",
-                r#"Object.defineProperty(globalThis, "__dd_raw_host_fetch", {
-                  value: globalThis.__dd_deno_runtime.unscopedFetch,
-                  configurable: true,
-                  writable: true,
-                });"#,
-            )
-            .map_err(runtime_error)?;
+        expose_global(
+            &mut runtime,
+            "<dd:unscoped-fetch>",
+            "__dd_raw_host_fetch",
+            "__bootstrap.dd.unscopedFetch",
+        )?;
+    }
+    if policy.expose_internals {
+        expose_global(
+            &mut runtime,
+            "<dd:internals>",
+            "__dd_internals",
+            "__bootstrap",
+        )?;
     }
     Ok(runtime)
+}
+
+/// Defines `globalThis[name]` as `value`, an expression over the runtime's
+/// internals (`__bootstrap`).
+fn expose_global(runtime: &mut JsRuntime, script: &str, name: &str, value: &str) -> Result<()> {
+    let internals = runtime
+        .internals()
+        .ok_or_else(|| PlatformError::runtime("the bootstrap snapshot has no runtime internals"))?;
+    let source = format!(
+        "Object.defineProperty(globalThis, {name:?}, {{ value: {value}, configurable: true, writable: true }});"
+    );
+    runtime
+        .execute_function(script, &source, &["__bootstrap"], &[internals])
+        .map_err(runtime_error)?;
+    Ok(())
 }
 
 fn set_code_generation_from_strings(runtime: &mut JsRuntime, allow: bool) {
@@ -358,13 +414,13 @@ fn call_cached_u32_function(
 ) -> Result<()> {
     let function = cached_entrypoint(runtime, select);
     dd_v8::scope!(scope, runtime);
-    let global = scope.get_current_context().global(scope);
     let function = v8::Local::new(scope, function.as_ref());
     let arg = v8::Integer::new_from_unsigned(scope, arg).into();
     v8::tc_scope!(let scope, scope);
+    let receiver = v8::undefined(scope).into();
     function
-        .call(scope, global.into(), &[arg])
-        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+        .call(scope, receiver, &[arg])
+        .ok_or_else(|| PlatformError::runtime(format!("runtime entrypoint {name} threw")))?;
     Ok(())
 }
 
@@ -375,12 +431,12 @@ fn call_cached_noarg_function(
 ) -> Result<()> {
     let function = cached_entrypoint(runtime, select);
     dd_v8::scope!(scope, runtime);
-    let global = scope.get_current_context().global(scope);
     let function = v8::Local::new(scope, function.as_ref());
     v8::tc_scope!(let scope, scope);
+    let receiver = v8::undefined(scope).into();
     function
-        .call(scope, global.into(), &[])
-        .ok_or_else(|| PlatformError::runtime(format!("global runtime entrypoint {name} threw")))?;
+        .call(scope, receiver, &[])
+        .ok_or_else(|| PlatformError::runtime(format!("runtime entrypoint {name} threw")))?;
     Ok(())
 }
 
@@ -393,22 +449,20 @@ fn cached_entrypoint(
     select(op_state.borrow::<RuntimeEntrypoints>())
 }
 
-fn global_function<'scope>(
+fn internal_function<'scope>(
     scope: &mut v8::PinScope<'scope, '_>,
-    global: v8::Local<'scope, v8::Object>,
+    dd: v8::Local<'scope, v8::Object>,
     name: &str,
-) -> Result<v8::Local<'scope, v8::Function>> {
-    let name_value = v8::String::new(scope, name)
+) -> Result<Rc<v8::Global<v8::Function>>> {
+    let key = v8::String::new(scope, name)
         .ok_or_else(|| PlatformError::runtime("failed to allocate V8 function name"))?;
-    let value = global.get(scope, name_value.into()).ok_or_else(|| {
-        PlatformError::runtime(format!("global runtime entrypoint {name} is unavailable"))
-    })?;
-    let function = v8::Local::<v8::Function>::try_from(value).map_err(|_| {
-        PlatformError::runtime(format!(
-            "global runtime entrypoint {name} is not a function"
-        ))
-    })?;
-    Ok(function)
+    let function = dd
+        .get(scope, key.into())
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+        .ok_or_else(|| {
+            PlatformError::runtime(format!("runtime entrypoint {name} is not a function"))
+        })?;
+    Ok(Rc::new(v8::Global::new(scope, function)))
 }
 
 #[derive(Default)]
@@ -689,14 +743,10 @@ async fn evaluate_module(
     runtime: &mut JsRuntime,
     specifier: &str,
     source: &str,
-    is_main: bool,
-) -> Result<()> {
-    let module_id = if is_main {
-        runtime.load_main_module(specifier, Some(source.to_string()))
-    } else {
-        runtime.load_side_module(specifier, Some(source.to_string()))
-    }
-    .map_err(runtime_error)?;
+) -> Result<ModuleId> {
+    let module_id = runtime
+        .load_side_module(specifier, Some(source.to_string()))
+        .map_err(runtime_error)?;
     runtime
         .evaluate_module(module_id)
         .await
@@ -706,7 +756,8 @@ async fn evaluate_module(
         Poll::Pending => Poll::Ready(Ok(())),
     })
     .await
-    .map_err(runtime_error)
+    .map_err(runtime_error)?;
+    Ok(module_id)
 }
 
 fn runtime_error(error: impl std::fmt::Display) -> PlatformError {
@@ -726,6 +777,15 @@ mod tests {
           }
         };
         "#
+    }
+
+    /// Runs `source` as a function body with the runtime's internals as
+    /// `__bootstrap`, as the runtime's own scripts see them.
+    fn execute_internal(runtime: &mut JsRuntime, source: &str) -> v8::Global<v8::Value> {
+        let internals = runtime.internals().expect("runtime internals");
+        runtime
+            .execute_function("<dd:test>", source, &["__bootstrap"], &[internals])
+            .expect("internal script should run")
     }
 
     fn string(runtime: &mut JsRuntime, value: v8::Global<v8::Value>) -> String {
@@ -780,17 +840,26 @@ mod tests {
                 globalThis.__dd_test_headers = new Headers([["x-dd", "ok"]]);
                 globalThis.__dd_test_form_data = new FormData();
                 globalThis.__dd_test_form_data.append("name", "value");
-                globalThis.__dd_test_ctor_match = JSON.stringify({
-                  fetch: typeof globalThis.fetch === "function"
-                    && globalThis.fetch === globalThis.__dd_deno_runtime.fetch,
-                  request: globalThis.Request === globalThis.__dd_deno_runtime.Request,
-                  headers: globalThis.Headers === globalThis.__dd_deno_runtime.Headers,
-                  response: globalThis.Response === globalThis.__dd_deno_runtime.Response,
-                  formData: globalThis.FormData === globalThis.__dd_deno_runtime.FormData,
-                });
                 "#,
             )
             .expect("fetch classes should construct");
+        let ctor_match = execute_internal(
+            &mut js_runtime,
+            r#"
+            const { web } = __bootstrap.dd;
+            return JSON.stringify({
+              fetch: typeof globalThis.fetch === "function" && globalThis.fetch === web.fetch,
+              request: globalThis.Request === web.Request,
+              headers: globalThis.Headers === web.Headers,
+              response: globalThis.Response === web.Response,
+              formData: globalThis.FormData === web.FormData,
+            });
+            "#,
+        );
+        assert_eq!(
+            string(&mut js_runtime, ctor_match),
+            r#"{"fetch":true,"request":true,"headers":true,"response":true,"formData":true}"#
+        );
 
         let mut eval = |source: &str| {
             let value = js_runtime
@@ -815,9 +884,55 @@ mod tests {
         );
         assert_eq!(eval("globalThis.__dd_test_headers.get('x-dd')"), "ok");
         assert_eq!(eval("globalThis.__dd_test_form_data.get('name')"), "value");
+    }
+
+    #[test]
+    #[serial]
+    fn worker_code_reaches_no_runtime_internals() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from bootstrap snapshot");
+        let source = r#"
+            const probes = {
+              Deno: typeof Deno,
+              __bootstrap: typeof __bootstrap,
+              core: typeof core,
+              ops: typeof ops,
+              dd: typeof dd,
+              primordials: typeof primordials,
+              internals: typeof internals,
+              runtimeOp: typeof runtimeOp,
+              define: typeof define,
+            };
+            const leaked = Object.keys(probes).filter((name) => probes[name] !== "undefined");
+            const ddGlobals = Object.getOwnPropertyNames(globalThis)
+              .filter((name) => name.startsWith("__"));
+            const asyncContext = Object.keys(globalThis.__dd_async_context).sort();
+            export default {
+              fetch() {
+                return Response.json({ leaked, ddGlobals, asyncContext });
+              },
+            };
+        "#;
+        runtime
+            .block_on(load_worker(&mut js_runtime, source))
+            .expect("worker should load");
+        let body = execute_internal(
+            &mut js_runtime,
+            "return Promise.resolve(__bootstrap.dd.worker.fetch(new Request('http://worker/'))).then((response) => response.text())",
+        );
+        let body = runtime
+            .block_on(js_runtime.resolve(body))
+            .expect("worker fetch should resolve");
         assert_eq!(
-            eval("globalThis.__dd_test_ctor_match"),
-            r#"{"fetch":true,"request":true,"headers":true,"response":true,"formData":true}"#
+            string(&mut js_runtime, body),
+            r#"{"leaked":[],"ddGlobals":["__dd_async_context"],"asyncContext":["disableAsyncLocalStore","enterWithAsyncLocalStore","getAsyncLocalStore","runWithAsyncLocalStore"]}"#
         );
     }
 
@@ -843,19 +958,14 @@ mod tests {
             .block_on(load_worker(&mut js_runtime, simple_worker_source()))
             .expect("worker should load into runtime");
 
-        let response_promise = js_runtime
-            .execute_script(
-                "<dd:test>",
-                r#"
-                globalThis.__dd_test_direct_fetch = globalThis.__dd_worker.fetch(
-                  new Request("http://worker/"),
-                  {},
-                  { waitUntil() {} },
-                );
-                globalThis.__dd_test_direct_fetch.then((response) => String(response.status));
-                "#,
-            )
-            .expect("direct worker fetch should execute");
+        let response_promise = execute_internal(
+            &mut js_runtime,
+            r#"
+            return __bootstrap.dd.worker
+              .fetch(new Request("http://worker/"), {}, { waitUntil() {} })
+              .then((response) => String(response.status));
+            "#,
+        );
         let response_value = runtime
             .block_on(js_runtime.resolve(response_promise))
             .expect("response promise should resolve");
@@ -1062,12 +1172,10 @@ mod tests {
         runtime
             .block_on(load_worker(&mut js_runtime, &source))
             .expect("module evaluation should fetch from the dev server");
-        let body = js_runtime
-            .execute_script(
-                "<dd:test>",
-                "Promise.resolve(globalThis.__dd_worker.fetch(new Request('http://worker/'))).then((response) => response.text())",
-            )
-            .expect("worker fetch should run");
+        let body = execute_internal(
+            &mut js_runtime,
+            "return Promise.resolve(__bootstrap.dd.worker.fetch(new Request('http://worker/'))).then((response) => response.text())",
+        );
         let body = runtime
             .block_on(js_runtime.resolve(body))
             .expect("worker fetch should resolve");
@@ -1077,16 +1185,14 @@ mod tests {
 
         let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
             .expect("runtime should start");
-        let refused = js_runtime
-            .execute_script(
-                "<dd:test>",
-                r#"
-                typeof globalThis.__dd_raw_host_fetch === "undefined"
-                  ? globalThis.__dd_deno_runtime.unscopedFetch("http://127.0.0.1:9/").then(() => "fetched", (error) => error.message)
-                  : "exposed"
-                "#,
-            )
-            .expect("probe should run");
+        let refused = execute_internal(
+            &mut js_runtime,
+            r#"
+            return typeof globalThis.__dd_raw_host_fetch === "undefined"
+              ? __bootstrap.dd.unscopedFetch("http://127.0.0.1:9/").then(() => "fetched", (error) => error.message)
+              : "exposed";
+            "#,
+        );
         let refused = runtime
             .block_on(js_runtime.resolve(refused))
             .expect("probe should resolve");

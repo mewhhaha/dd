@@ -212,3 +212,16 @@ The worker JavaScript source order lives in
 read that same list; `just check-js` checks the assembled scope for undefined and
 unused bindings. Native operations are organized by KV, cache, HTTP, response,
 memory and request control responsibilities.
+
+The runtime's own JavaScript (`core/core.js`, the web layer, `bootstrap.js` and
+the execute-worker bundle) runs once while the bootstrap snapshot is built, each
+script as the body of a function. `core.js` returns the bootstrap object (the
+ops, the web layer's shared state and dd's request machinery under `dd`); every
+later script receives it as its `__bootstrap` parameter, and the snapshot keeps
+it as the runtime's internals, which only the host reads. Nothing these scripts
+declare is global, so worker code reaches no op: it sees the web platform
+globals, its bindings and `__dd_async_context` (the AsyncLocalStorage half that
+dd-vite's `node:async_hooks` shim uses). The development runtime adds
+`__dd_raw_host_fetch`; the runtime's tests and benchmarks set
+`RuntimeConfig::expose_internals` to reach the bootstrap object as
+`__dd_internals`.

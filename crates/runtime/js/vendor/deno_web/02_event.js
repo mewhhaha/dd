@@ -5,7 +5,7 @@
 // parts still exists.  This means you will observe a lot of strange structures
 // and impossible logic branches based on what Deno currently supports.
 
-(function () {
+return (function () {
 const { core, internals, primordials } = __bootstrap;
 const {
   ArrayPrototypeIncludes,

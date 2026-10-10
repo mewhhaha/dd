@@ -6,7 +6,7 @@
 
 /// <reference path="../../core/internal.d.ts" />
 
-(function () {
+return (function () {
 const { core, internals, primordials } = __bootstrap;
 const {
   isArrayBuffer,

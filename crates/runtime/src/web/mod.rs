@@ -88,8 +88,9 @@ use time::*;
 use url_parse::*;
 use urlpattern::*;
 
-/// `op_load_ext_script(specifier)`: runs one of [`EXT_SCRIPTS`] and returns
-/// its completion value. `core.loadExtScript` caches the result.
+/// `op_load_ext_script(specifier, bootstrap)`: runs one of [`EXT_SCRIPTS`]
+/// as the body of a function whose parameter `__bootstrap` is `bootstrap`
+/// and returns what it returns. `core.loadExtScript` caches the result.
 fn op_load_ext_script<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
@@ -102,9 +103,10 @@ fn op_load_ext_script<'s>(
         scope.throw_exception(error);
         return;
     };
-    let (Some(name), Some(source)) = (
+    let (Some(name), Some(source), Some(parameter)) = (
         v8::String::new(scope, &specifier),
         v8::String::new(scope, source),
+        v8::String::new(scope, "__bootstrap"),
     ) else {
         return;
     };
@@ -121,10 +123,19 @@ fn op_load_ext_script<'s>(
         false,
         None,
     );
-    let Some(script) = v8::Script::compile(scope, source, Some(&origin)) else {
+    let mut source = v8::script_compiler::Source::new(source, Some(&origin));
+    let Some(function) = v8::script_compiler::compile_function(
+        scope,
+        &mut source,
+        &[parameter],
+        &[],
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::NoReason,
+    ) else {
         return;
     };
-    if let Some(exports) = script.run(scope) {
+    let receiver = v8::undefined(scope).into();
+    if let Some(exports) = function.call(scope, receiver, &[args.get(1)]) {
         rv.set(exports);
     }
 }

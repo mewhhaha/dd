@@ -18,8 +18,8 @@ use crate::cache::{CacheConfig, CacheLookup, CacheRequest, CacheResponse, CacheS
 use crate::control_store::{ControlDeployment, ControlStore};
 use crate::engine::{
     WorkerDispatchRequest, abort_worker_request_handle, build_bootstrap_snapshot,
-    cache_runtime_entrypoints, dispatch_worker_request, drain_request_control_queue,
-    ensure_v8_flags, install_worker_deployment_config, new_runtime_from_snapshot_with_heap_limit,
+    dispatch_worker_request, drain_request_control_queue, ensure_v8_flags,
+    install_worker_deployment_config, new_runtime_from_snapshot_with_heap_limit,
     pump_event_loop_once,
 };
 use crate::kv::KvStore;

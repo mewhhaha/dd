@@ -318,6 +318,64 @@ fn snapshots_keep_globals_and_ops() {
     assert!(mismatch.is_err());
 }
 
+#[test]
+fn internals_stay_private_through_snapshots() {
+    static SNAPSHOT: OnceLock<Box<[u8]>> = OnceLock::new();
+    let snapshot = SNAPSHOT.get_or_init(|| {
+        let mut runtime = JsRuntime::new_for_snapshot(RuntimeOptions {
+            ops: test_ops(),
+            ..Default::default()
+        })
+        .expect("snapshot runtime");
+        let internals = runtime
+            .execute_with_ops(
+                "<internals>",
+                "const secret = 'kept'; return { add: (a, b) => ops.op_add(a, b), secret };",
+            )
+            .expect("internals");
+        runtime
+            .execute_function(
+                "<uses internals>",
+                "globalThis.exported = typeof internals.add;",
+                &["internals"],
+                std::slice::from_ref(&internals),
+            )
+            .expect("function");
+        runtime.set_internals(internals);
+        runtime.snapshot().expect("snapshot")
+    });
+    let mut runtime = JsRuntime::new(RuntimeOptions {
+        ops: test_ops(),
+        startup_snapshot: Some(snapshot),
+        ..Default::default()
+    })
+    .expect("restored runtime");
+    assert_eq!(
+        eval(
+            &mut runtime,
+            "`${exported}:${typeof secret}:${typeof internals}:${typeof ops}`"
+        ),
+        "function:undefined:undefined:undefined"
+    );
+    let internals = runtime.internals().expect("restored internals");
+    let sum = runtime
+        .execute_function(
+            "<call>",
+            "return `${internals.secret}:${internals.add(20, 22)}`;",
+            &["internals"],
+            &[internals],
+        )
+        .expect("call internals");
+    assert_eq!(string(&mut runtime, sum), "kept:42");
+
+    let fresh = JsRuntime::new(RuntimeOptions {
+        ops: test_ops(),
+        ..Default::default()
+    })
+    .expect("fresh runtime");
+    assert!(fresh.internals().is_none());
+}
+
 struct MapLoader(HashMap<&'static str, (ModuleType, &'static str)>);
 
 impl ModuleLoader for MapLoader {

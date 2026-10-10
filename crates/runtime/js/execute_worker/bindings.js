@@ -9,8 +9,8 @@
       nowMs: result.boundary_now_ms,
       perfMs: result.boundary_perf_ms,
     });
-    if (boundary && typeof globalThis.__dd_set_time === "function") {
-      globalThis.__dd_set_time(boundary.nowMs, boundary.perfMs);
+    if (boundary && typeof dd.setTime === "function") {
+      dd.setTime(boundary.nowMs, boundary.perfMs);
     }
   };
 
@@ -80,9 +80,9 @@
     },
   });
 
-  const requestReplyWaiters = () => (globalThis.__dd_request_reply_waiters ??= new Map());
-  const requestReplyReady = () => (globalThis.__dd_request_reply_ready ??= new Map());
-  const requestReplyCanceled = () => (globalThis.__dd_request_reply_canceled ??= new Map());
+  const requestReplyWaiters = () => (dd.requestReplyWaiters ??= new Map());
+  const requestReplyReady = () => (dd.requestReplyReady ??= new Map());
+  const requestReplyCanceled = () => (dd.requestReplyCanceled ??= new Map());
   const requestReplyNow = () => (
     globalThis.performance && typeof globalThis.performance.now === "function"
       ? globalThis.performance.now()
@@ -247,15 +247,15 @@
     }
   };
 
-  globalThis.__dd_drain_request_control_queue = drainRequestControlQueue;
-  globalThis.__dd_await_request_reply = awaitRequestReply;
+  dd.drainRequestControlQueue = drainRequestControlQueue;
+  dd.awaitRequestReply = awaitRequestReply;
 
   const getSharedEnv = () => {
-    const cache = globalThis.__dd_shared_env_cache ??= new WeakMap();
+    const cache = dd.sharedEnvCache ??= new WeakMap();
     const cacheableWorker = worker && (typeof worker === "object" || typeof worker === "function")
       ? worker
       : null;
-    const fallbackCache = globalThis.__dd_shared_env_fallback_cache ??= new Map();
+    const fallbackCache = dd.sharedEnvFallbackCache ??= new Map();
     const cached = cacheableWorker
       ? cache.get(cacheableWorker)
       : fallbackCache.get(workerName);
@@ -374,7 +374,7 @@
     }
     if (kind === "message") {
       const raw = toArrayBytes(memoryCall.data);
-      event.data = memoryCall.is_text === true ? Deno.core.decode(raw) : raw;
+      event.data = memoryCall.is_text === true ? core.decode(raw) : raw;
       event.isText = memoryCall.is_text === true;
       event.type = "socketmessage";
     } else if (kind === "close") {
@@ -629,7 +629,7 @@
       }
       inflightRequests.delete(requestId);
       if (requestContextHandle > 0) {
-        globalThis.__dd_inflight_requests_by_context_handle?.delete(
+        dd.inflightRequestsByContextHandle?.delete(
           requestContextHandle,
         );
       }
@@ -660,9 +660,24 @@
     });
 };
 
-globalThis.__dd_execute_worker_handle = (requestHandle) => {
+// Takes the worker module's namespace once it has evaluated.
+dd.installWorker = (workerModule) => {
+  const worker = workerModule.default;
+  if (worker === undefined) {
+    throw new Error("Worker must export default");
+  }
+  if (typeof worker !== "object" || worker === null) {
+    throw new Error("Default export must be an object");
+  }
+  if (typeof worker.fetch !== "function") {
+    throw new Error("Default export must define fetch(request, env, ctx)");
+  }
+  dd.worker = worker;
+};
+
+dd.executeWorkerHandle = (requestHandle) => {
   const handle = Number(requestHandle);
-  const descriptor = Deno.core.ops.op_request_invocation_descriptor(handle);
+  const descriptor = core.ops.op_request_invocation_descriptor(handle);
   if (descriptor === null || descriptor === undefined) {
     throw new Error(`Request handle ${requestHandle} is unavailable`);
   }
@@ -674,8 +689,8 @@ globalThis.__dd_execute_worker_handle = (requestHandle) => {
     0,
     Math.trunc(Number(descriptor.request_body_handle ?? 0) || 0),
   );
-  const headers = Deno.core.ops.op_http_take_prepared_headers(requestHeadersHandle);
-  const body = Deno.core.ops.op_http_take_prepared_body(requestBodyHandle);
+  const headers = core.ops.op_http_take_prepared_headers(requestHeadersHandle);
+  const body = core.ops.op_http_take_prepared_body(requestBodyHandle);
   const payload = {
     request_id: String(descriptor.request_id ?? ""),
     request_context_handle: Math.max(
@@ -704,11 +719,11 @@ globalThis.__dd_execute_worker_handle = (requestHandle) => {
     input_request_id: String(descriptor.input_request_id ?? ""),
     body,
   };
-  return globalThis.__dd_execute_worker(payload);
+  return dd.executeWorker(payload);
 };
 
-globalThis.__dd_install_worker_deployment_handle = (deploymentHandle) => {
-  const payload = Deno.core.ops.op_take_worker_deployment_config(Number(deploymentHandle));
+dd.installWorkerDeploymentHandle = (deploymentHandle) => {
+  const payload = core.ops.op_take_worker_deployment_config(Number(deploymentHandle));
   if (payload === null || payload === undefined) {
     throw new Error(`Worker deployment handle ${deploymentHandle} is unavailable`);
   }
@@ -750,7 +765,7 @@ globalThis.__dd_install_worker_deployment_handle = (deploymentHandle) => {
       .filter(([envName, targetWorker]) => envName.length > 0 && targetWorker.length > 0),
   );
 
-  globalThis.__dd_worker_deployment = Object.freeze({
+  dd.workerDeployment = Object.freeze({
     worker_name: String(payload.worker_name ?? ""),
     kv_bindings: normalizeBindingPairs(payload.kv_bindings),
     memory_bindings: normalizeNames(payload.memory_bindings),
@@ -758,39 +773,39 @@ globalThis.__dd_install_worker_deployment_handle = (deploymentHandle) => {
   });
 };
 
-globalThis.__dd_drain_request_control_queue_handle = () => {
-  const drain = globalThis.__dd_drain_request_control_queue;
+dd.drainRequestControlQueueHandle = () => {
+  const drain = dd.drainRequestControlQueue;
   if (typeof drain !== "function") {
     return;
   }
   void Promise.resolve(drain()).catch(() => undefined);
 };
 
-globalThis.__dd_abort_worker_request_handle = (requestContextHandle) => {
+dd.abortWorkerRequestHandle = (requestContextHandle) => {
   const handle = Math.max(0, Math.trunc(Number(requestContextHandle ?? 0) || 0));
   if (handle === 0) {
     return false;
   }
-  const inflightRequests = globalThis.__dd_inflight_requests_by_context_handle;
+  const inflightRequests = dd.inflightRequestsByContextHandle;
   const inflight = inflightRequests?.get(handle);
   if (!inflight) {
     return false;
   }
   if (inflight?.requestBodyStreamHandle > 0) {
     try {
-      Deno.core.ops.op_request_body_cancel(inflight.requestBodyStreamHandle);
+      core.ops.op_request_body_cancel(inflight.requestBodyStreamHandle);
     } catch {
     }
   }
   if (inflight?.requestContextHandle > 0) {
     try {
-      Deno.core.ops.op_request_context_cancel(inflight.requestContextHandle);
+      core.ops.op_request_context_cancel(inflight.requestContextHandle);
     } catch {
     }
   }
   if (inflight?.memoryRequestScopeHandle > 0) {
     try {
-      Deno.core.ops.op_memory_request_scope_close(inflight.memoryRequestScopeHandle);
+      core.ops.op_memory_request_scope_close(inflight.memoryRequestScopeHandle);
     } catch {
     }
   }

@@ -100,7 +100,7 @@
     }
     return {
       encoding: "v8sc",
-      value: new Uint8Array(Deno.core.serialize(value, { forStorage: true })),
+      value: new Uint8Array(core.serialize(value, { forStorage: true })),
     };
   };
 
@@ -119,10 +119,10 @@
     const encoding = String(record.encoding ?? "utf8");
     const bytes = takeMemoryBytes(record);
     if (encoding === "utf8") {
-      return Deno.core.decode(bytes);
+      return core.decode(bytes);
     }
     if (encoding === "v8sc") {
-      return Deno.core.deserialize(bytes, { forStorage: true });
+      return core.deserialize(bytes, { forStorage: true });
     }
     throw new Error(`memory storage get unsupported encoding: ${encoding}`);
   };

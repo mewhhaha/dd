@@ -3,7 +3,7 @@
 // dd's stand-in for Deno's console module. Workers print through V8's
 // built-in console, so the web layer only needs the helper that decorates
 // objects for inspection.
-(function () {
+return (function () {
 const { primordials } = __bootstrap;
 const {
   ObjectDefineProperty,

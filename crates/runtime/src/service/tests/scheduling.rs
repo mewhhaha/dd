@@ -18,7 +18,7 @@ async fn wait_until_cpu_loop_releases_global_capacity_at_native_deadline() {
             r#"
 export default {
   fetch(_request, _env, ctx) {
-    ctx.waitUntil(Deno.core.ops.op_sleep(50).then(() => { while (true) {} }));
+    ctx.waitUntil(__dd_internals.core.ops.op_sleep(50).then(() => { while (true) {} }));
     return new Response("returned");
   },
 };

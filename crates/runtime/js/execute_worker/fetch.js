@@ -102,7 +102,7 @@
 
   const abortErrorForSignal = (signal) => signal.reason;
 
-  const { hostFetchResponse } = globalThis.__dd_deno_runtime;
+  const { hostFetchResponse } = dd;
 
   // One request through the pinned client `clientHandle`, as a Response.
   // Aborting rejects at once; a response that arrives after that has its
@@ -174,10 +174,9 @@
     });
   };
 
-  if (typeof globalThis.__dd_install_host_fetch !== "function") {
-    Object.defineProperty(globalThis, "__dd_install_host_fetch", {
-      value: function installHostFetch() {
-        if (typeof globalThis.__dd_host_fetch === "function") {
+  if (typeof dd.installHostFetch !== "function") {
+    dd.installHostFetch = function installHostFetch() {
+        if (typeof dd.hostFetch === "function") {
           return;
         }
         const scopedFetch = async (inputValue, initValue = undefined) => {
@@ -279,18 +278,8 @@
           }
           return run();
         };
-        Object.defineProperty(scopedFetch, "__dd_host_fetch", { value: true });
-        Object.defineProperty(globalThis, "__dd_host_fetch", {
-          value: scopedFetch,
-          enumerable: false,
-          configurable: true,
-          writable: true,
-        });
+        dd.hostFetch = scopedFetch;
         globalThis.fetch = scopedFetch;
-      },
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
+    };
   }
-  const installHostFetch = globalThis.__dd_install_host_fetch;
+  const installHostFetch = dd.installHostFetch;
