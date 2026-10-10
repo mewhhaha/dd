@@ -18,7 +18,6 @@ const {
   Error,
   FunctionPrototypeBind,
   MapPrototypeForEach,
-  MathCeil,
   MathFloor,
   MathMin,
   Number,
@@ -30,16 +29,12 @@ const {
   PromisePrototypeThen,
   PromiseResolve,
   ReflectApply,
-  RegExpPrototypeSymbolReplace,
   SafeMap,
-  SafeRegExp,
   String,
   StringFromCharCode,
   StringPrototypeCharCodeAt,
-  StringPrototypeIndexOf,
-  StringPrototypePadEnd,
-  StringPrototypeSlice,
   StringPrototypeTrim,
+  TypedArrayPrototypeSubarray,
   Symbol,
   TypeError,
   Uint8Array,
@@ -192,9 +187,12 @@ function ensureTimerGlobals() {
   const timers = new SafeMap();
 
   const clampDelay = (value) => {
+    // At least 1 ms, as in Node: a 0 delay would run the callback as a
+    // microtask, ahead of work already queued, and setInterval(fn, 0) would
+    // never let the event loop turn.
     const parsed = Number(value);
-    if (!NumberIsFinite(parsed) || parsed < 0) {
-      return 0;
+    if (!NumberIsFinite(parsed) || parsed < 1) {
+      return 1;
     }
     return MathFloor(parsed);
   };
@@ -271,69 +269,45 @@ function ensureTimerGlobals() {
   dd.clearTimeout = cancel;
 }
 
-const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const BASE64_WHITESPACE = new SafeRegExp("\\s+", "g");
-
 function ensureEncodingGlobals() {
   define("TextEncoder", DenoTextEncoder);
   define("TextDecoder", DenoTextDecoder);
   define("TextEncoderStream", TextEncoderStream);
   define("TextDecoderStream", TextDecoderStream);
 
-  if (globalThis.btoa === undefined) {
-    define("btoa", (value) => {
-      const input = String(value);
-      let output = "";
-      let i = 0;
-      while (i < input.length) {
-        const a = StringPrototypeCharCodeAt(input, i++);
-        const b = StringPrototypeCharCodeAt(input, i++);
-        const c = StringPrototypeCharCodeAt(input, i++);
-        if (a > 0xff || (NumberIsFinite(b) && b > 0xff) || (NumberIsFinite(c) && c > 0xff)) {
-          throw new TypeError("btoa input must be Latin1");
-        }
-        const triplet = (a << 16) | ((b || 0) << 8) | (c || 0);
-        output += BASE64_ALPHABET[(triplet >> 18) & 0x3f];
-        output += BASE64_ALPHABET[(triplet >> 12) & 0x3f];
-        output += NumberIsFinite(b) ? BASE64_ALPHABET[(triplet >> 6) & 0x3f] : "=";
-        output += NumberIsFinite(c) ? BASE64_ALPHABET[triplet & 0x3f] : "=";
+  // HTML's forgiving base64 (the encoding ops implement it). Both throw an
+  // InvalidCharacterError DOMException for input they cannot take.
+  define("btoa", function btoa(data) {
+    if (arguments.length === 0) {
+      throw new TypeError("btoa requires 1 argument");
+    }
+    const input = String(data);
+    const bytes = new Uint8Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const code = StringPrototypeCharCodeAt(input, i);
+      if (code > 0xff) {
+        throw new DOMException("btoa input must be Latin1", "InvalidCharacterError");
       }
-      return output;
-    });
-  }
-
-  if (globalThis.atob === undefined) {
-    define("atob", (value) => {
-      const input = RegExpPrototypeSymbolReplace(BASE64_WHITESPACE, String(value), "");
-      if (input.length % 4 === 1) {
-        throw new TypeError("Invalid base64 input");
-      }
-      const padded = StringPrototypePadEnd(input, MathCeil(input.length / 4) * 4, "=");
-      const sextets = [0, 0, 0, 0];
-      let output = "";
-      for (let i = 0; i < padded.length; i += 4) {
-        const chars = StringPrototypeSlice(padded, i, i + 4);
-        for (let j = 0; j < 4; j++) {
-          const char = chars[j];
-          const idx = char === "=" ? 0 : StringPrototypeIndexOf(BASE64_ALPHABET, char);
-          if (idx === -1) {
-            throw new TypeError("Invalid base64 input");
-          }
-          sextets[j] = idx;
-        }
-        const triplet =
-          (sextets[0] << 18) | (sextets[1] << 12) | (sextets[2] << 6) | sextets[3];
-        output += StringFromCharCode((triplet >> 16) & 0xff);
-        if (chars[2] !== "=") {
-          output += StringFromCharCode((triplet >> 8) & 0xff);
-        }
-        if (chars[3] !== "=") {
-          output += StringFromCharCode(triplet & 0xff);
-        }
-      }
-      return output;
-    });
-  }
+      bytes[i] = code;
+    }
+    return core.ops.op_base64_encode_from_buffer(bytes, 0, bytes.length);
+  });
+  define("atob", function atob(data) {
+    if (arguments.length === 0) {
+      throw new TypeError("atob requires 1 argument");
+    }
+    let bytes;
+    try {
+      bytes = core.ops.op_base64_decode(String(data));
+    } catch {
+      throw new DOMException("atob input is not valid base64", "InvalidCharacterError");
+    }
+    let output = "";
+    for (let i = 0; i < bytes.length; i += 8192) {
+      output += ReflectApply(StringFromCharCode, undefined, TypedArrayPrototypeSubarray(bytes, i, i + 8192));
+    }
+    return output;
+  });
 }
 
 function ensureStructuredCloneGlobal() {

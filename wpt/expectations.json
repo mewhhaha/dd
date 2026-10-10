@@ -6525,10 +6525,7 @@
   "encoding/iso-2022-jp-decoder.any.js": { "subtests": 38, "pass": 38 },
   "encoding/legacy-mb-schinese/gb18030/gb18030-decoder.any.js": { "subtests": 275, "pass": 275 },
   "encoding/legacy-mb-schinese/gbk/gbk-decoder.any.js": { "subtests": 82, "pass": 82 },
-  "encoding/streams/backpressure.any.js": { "subtests": 4, "pass": 2, "fail": [
-    "additional writes should wait for backpressure to be relieved for class TextDecoderStream",
-    "additional writes should wait for backpressure to be relieved for class TextEncoderStream"
-  ] },
+  "encoding/streams/backpressure.any.js": { "subtests": 4, "pass": 4 },
   "encoding/streams/decode-attributes.any.js": { "subtests": 28, "pass": 28 },
   "encoding/streams/decode-bad-chunks.any.js": { "subtests": 5, "pass": 5 },
   "encoding/streams/decode-ignore-bom.any.js": { "subtests": 12, "pass": 12 },
@@ -6845,88 +6842,12 @@
     "Attempt to inject {done: false, value: bye} via Object.prototype.then.",
     "intercepting arraybuffer to text conversion via Object.prototype.then should not be possible"
   ] },
-  "hr-time/basic.any.js": { "subtests": 5, "pass": 3, "fail": [
-    "High resolution time has approximately the right relative magnitude",
-    "self.performance.now() returns a positive number"
-  ] },
+  "hr-time/basic.any.js": { "subtests": 5, "pass": 5 },
   "hr-time/idlharness.any.js": { "subtests": 12, "pass": 11, "fail": [
     "idl_test setup"
   ] },
-  "hr-time/monotonic-clock.any.js": { "subtests": 2, "pass": 1, "fail": [
-    "self.performance.now() returns a positive number"
-  ] },
-  "html/webappapis/atob/base64.any.js": { "subtests": 380, "pass": 310, "fail": [
-    "atob(\" abcd===\")",
-    "atob(\"--\")",
-    "atob(\"..\")",
-    "atob(\"/\")",
-    "atob(\"////A\")",
-    "atob(\"=\")",
-    "atob(\"==\")",
-    "atob(\"===\")",
-    "atob(\"====\")",
-    "atob(\"=====\")",
-    "atob(\"=a\")",
-    "atob(\"=a=\")",
-    "atob(\"A\")",
-    "atob(\"AAAA/\")",
-    "atob(\"\\0nonsense\")",
-    "atob(\"__\")",
-    "atob(\"a\")",
-    "atob(\"a=\")",
-    "atob(\"a==\")",
-    "atob(\"a===\")",
-    "atob(\"a====\")",
-    "atob(\"a=====\")",
-    "atob(\"a=b\")",
-    "atob(\"a=b=\")",
-    "atob(\"ab=\")",
-    "atob(\"ab===\")",
-    "atob(\"ab====\")",
-    "atob(\"ab=====\")",
-    "atob(\"ab=c\")",
-    "atob(\"ab=c=\")",
-    "atob(\"ab\\vcd\")",
-    "atob(\"abc==\")",
-    "atob(\"abc===\")",
-    "atob(\"abc====\")",
-    "atob(\"abc=====\")",
-    "atob(\"abc=d\")",
-    "atob(\"abc=d=\")",
-    "atob(\"abcd ===\")",
-    "atob(\"abcd=\")",
-    "atob(\"abcd==\")",
-    "atob(\"abcd=== \")",
-    "atob(\"abcd===\")",
-    "atob(\"abcd====\")",
-    "atob(\"abcd=====\")",
-    "atob(\"abcd\\0nonsense\")",
-    "atob(\"abcde\")",
-    "atob(\"abcde=\")",
-    "atob(\"abcde==\")",
-    "atob(\"abcde===\")",
-    "atob(\"abcde====\")",
-    "atob(\"abcde=====\")",
-    "atob(\"ab cd\")",
-    "atob(\"ab　cd\")",
-    "atob(\"ab、cd\")",
-    "atob(\"~~\")",
-    "atob(\"𐀀\")",
-    "atob(-0)",
-    "atob(-Infinity)",
-    "atob(0)",
-    "atob(1.5)",
-    "atob(7)",
-    "atob(false)",
-    "atob(undefined)",
-    "btoa(\"\\ufffe\") must raise INVALID_CHARACTER_ERR",
-    "btoa(\"\\uffff\") must raise INVALID_CHARACTER_ERR",
-    "btoa(\"Ā\") must raise INVALID_CHARACTER_ERR",
-    "btoa(\"ā\") must raise INVALID_CHARACTER_ERR",
-    "btoa(\"עברית\") must raise INVALID_CHARACTER_ERR",
-    "btoa(\"✐\") must raise INVALID_CHARACTER_ERR",
-    "btoa(\"𐀀\") must raise INVALID_CHARACTER_ERR"
-  ] },
+  "hr-time/monotonic-clock.any.js": { "subtests": 2, "pass": 2 },
+  "html/webappapis/atob/base64.any.js": { "subtests": 380, "pass": 380 },
   "html/webappapis/microtask-queuing/queue-microtask-exceptions.any.js": { "subtests": 1, "pass": 0 },
   "html/webappapis/microtask-queuing/queue-microtask.any.js": { "subtests": 5, "pass": 5 },
   "html/webappapis/structured-clone/structured-clone.any.js": { "subtests": 137, "pass": 118, "fail": [
@@ -6953,9 +6874,7 @@
   "streams/idlharness.any.js": { "subtests": 4, "pass": 3, "fail": [
     "idl_test setup"
   ] },
-  "streams/piping/abort.any.js": { "subtests": 33, "pass": 32, "fail": [
-    "pipeTo on a teed readable byte stream should only be aborted when both branches are aborted"
-  ] },
+  "streams/piping/abort.any.js": { "subtests": 33, "pass": 33 },
   "streams/piping/close-propagation-backward.any.js": { "subtests": 16, "pass": 16 },
   "streams/piping/close-propagation-forward.any.js": { "subtests": 30, "pass": 30 },
   "streams/piping/error-propagation-backward.any.js": { "subtests": 36, "pass": 36 },
@@ -6996,43 +6915,23 @@
   "streams/readable-streams/owning-type-video-frame.tentative.any.js": { "subtests": 5, "pass": 0 },
   "streams/readable-streams/owning-type.tentative.any.js": { "subtests": 5, "pass": 0 },
   "streams/readable-streams/patched-global.any.js": { "subtests": 5, "pass": 5 },
-  "streams/readable-streams/reentrant-strategies.any.js": { "subtests": 10, "pass": 9, "fail": [
-    "pipeTo() inside size() should behave as expected"
-  ] },
+  "streams/readable-streams/reentrant-strategies.any.js": { "subtests": 10, "pass": 10 },
   "streams/readable-streams/tee.any.js": { "subtests": 26, "pass": 26 },
   "streams/readable-streams/templated.any.js": { "subtests": 91, "pass": 91 },
   "streams/transferable/transform-stream-members.any.js": { "subtests": 4, "pass": 4 },
-  "streams/transform-streams/backpressure.any.js": { "subtests": 14, "pass": 12, "fail": [
-    "blocking transform() should cause backpressure",
-    "writes should resolve as soon as transform completes"
-  ] },
+  "streams/transform-streams/backpressure.any.js": { "subtests": 14, "pass": 14 },
   "streams/transform-streams/cancel.any.js": { "subtests": 11, "pass": 10, "fail": [
     "readable.cancel() and a parallel writable.close() should reject if a transformer.cancel() calls controller.error()"
   ] },
-  "streams/transform-streams/errors.any.js": { "subtests": 21, "pass": 20, "fail": [
-    "abort should set the close reason for the writable when it happens before cancel during underlying sink write, but cancel should still succeed"
-  ] },
-  "streams/transform-streams/flush.any.js": { "subtests": 6, "pass": 4, "fail": [
-    "TransformStream flush is called after all queued writes finish, once the writable is closed",
-    "closing the writable side should call transformer.flush() and a parallel readable.cancel() should not reject"
-  ] },
-  "streams/transform-streams/general.any.js": { "subtests": 26, "pass": 25, "fail": [
-    "it should be possible to call transform() synchronously"
-  ] },
+  "streams/transform-streams/errors.any.js": { "subtests": 21, "pass": 21 },
+  "streams/transform-streams/flush.any.js": { "subtests": 6, "pass": 6 },
+  "streams/transform-streams/general.any.js": { "subtests": 26, "pass": 26 },
   "streams/transform-streams/lipfuzz.any.js": { "subtests": 20, "pass": 20 },
   "streams/transform-streams/patched-global.any.js": { "subtests": 2, "pass": 2 },
   "streams/transform-streams/properties.any.js": { "subtests": 6, "pass": 6 },
-  "streams/transform-streams/reentrant-strategies.any.js": { "subtests": 11, "pass": 8, "fail": [
-    "read() inside of size() should work",
-    "synchronous writer.write() inside size() should work",
-    "writer.write() inside size() should work"
-  ] },
-  "streams/transform-streams/strategies.any.js": { "subtests": 10, "pass": 9, "fail": [
-    "readableStrategy highWaterMark should work"
-  ] },
-  "streams/transform-streams/terminate.any.js": { "subtests": 6, "pass": 5, "fail": [
-    "controller.terminate() should prevent remaining chunks from being processed"
-  ] },
+  "streams/transform-streams/reentrant-strategies.any.js": { "subtests": 11, "pass": 11 },
+  "streams/transform-streams/strategies.any.js": { "subtests": 10, "pass": 10 },
+  "streams/transform-streams/terminate.any.js": { "subtests": 6, "pass": 6 },
   "streams/writable-streams/aborting.any.js": { "subtests": 65, "pass": 65 },
   "streams/writable-streams/bad-strategies.any.js": { "subtests": 7, "pass": 7 },
   "streams/writable-streams/bad-underlying-sinks.any.js": { "subtests": 14, "pass": 14 },

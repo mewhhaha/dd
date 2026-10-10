@@ -184,6 +184,7 @@ struct RuntimeEntrypoints {
     execute_worker_handle: Rc<v8::Global<v8::Function>>,
     abort_worker_request_handle: Rc<v8::Global<v8::Function>>,
     drain_request_control_queue: Rc<v8::Global<v8::Function>>,
+    set_time: Rc<v8::Global<v8::Function>>,
 }
 
 pub fn install_worker_deployment_config(
@@ -241,6 +242,7 @@ fn cache_runtime_entrypoints(runtime: &mut JsRuntime) -> Result<()> {
                 dd,
                 "drainRequestControlQueueHandle",
             )?,
+            set_time: internal_function(scope, dd, "setTime")?,
         }
     };
     let op_state = runtime.op_state();
@@ -374,6 +376,7 @@ fn new_runtime(
     runtime.op_state().borrow_mut().put(module_registry);
     set_code_generation_from_strings(&mut runtime, policy.allow_code_generation);
     cache_runtime_entrypoints(&mut runtime)?;
+    sync_isolate_clock(&mut runtime)?;
     if policy.unscoped_fetch {
         runtime
             .op_state()
@@ -395,6 +398,25 @@ fn new_runtime(
         )?;
     }
     Ok(runtime)
+}
+
+/// Sets the worker's frozen clock to now. The snapshot keeps the clock as it
+/// read while the snapshot was built, so without this `Date.now()` and
+/// `performance.now()` would report that moment until the first timer or
+/// I/O boundary.
+fn sync_isolate_clock(runtime: &mut JsRuntime) -> Result<()> {
+    let boundary = crate::ops::current_time_boundary();
+    let set_time = cached_entrypoint(runtime, |entrypoints| Rc::clone(&entrypoints.set_time));
+    dd_v8::scope!(scope, runtime);
+    let set_time = v8::Local::new(scope, set_time.as_ref());
+    let now = v8::Number::new(scope, boundary.now_ms as f64).into();
+    let perf = v8::Number::new(scope, boundary.perf_ms).into();
+    v8::tc_scope!(let scope, scope);
+    let receiver = v8::undefined(scope).into();
+    set_time
+        .call(scope, receiver, &[now, perf])
+        .ok_or_else(|| PlatformError::runtime("runtime entrypoint setTime threw"))?;
+    Ok(())
 }
 
 /// Defines `globalThis[name]` as `value`, an expression over the runtime's
@@ -1192,6 +1214,82 @@ mod tests {
             .execute_script("<dd:test>", r#"String(new Response("ok").status)"#)
             .expect("response constructor should execute");
         assert_eq!(string(&mut js_runtime, response_value), "200");
+    }
+
+    #[test]
+    #[serial]
+    fn a_new_isolate_reads_the_current_time() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        // Let the snapshot's own clock reading fall well behind.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis();
+        let value = js_runtime
+            .execute_script(
+                "<dd:test>",
+                &format!("JSON.stringify([Math.abs(Date.now() - {wall_ms}) < 500, performance.now() > 0])"),
+            )
+            .expect("clock script should run");
+        assert_eq!(string(&mut js_runtime, value), "[true,true]");
+    }
+
+    #[test]
+    #[serial]
+    fn zero_delay_timers_are_tasks_and_base64_follows_html() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime should build");
+        let snapshot = runtime
+            .block_on(build_bootstrap_snapshot())
+            .expect("bootstrap snapshot should build");
+        let _context = runtime.enter();
+        let mut js_runtime = new_runtime_from_snapshot(snapshot, false, ModuleRegistry::default())
+            .expect("runtime should start from snapshot");
+        let result = js_runtime
+            .execute_script(
+                "<dd:test>",
+                r#"
+                (async () => {
+                  const order = [];
+                  setTimeout(() => order.push("timeout"), 0);
+                  queueMicrotask(() => order.push("microtask"));
+                  Promise.resolve().then(() => order.push("then"));
+                  await new Promise((resolve) => setTimeout(resolve, 5));
+                  // A zero-delay interval must let the event loop turn.
+                  let ticks = 0;
+                  const interval = setInterval(() => ticks++, 0);
+                  await new Promise((resolve) => setTimeout(resolve, 20));
+                  clearInterval(interval);
+                  const error = (f) => { try { f(); return "none"; } catch (e) { return `${e.name}`; } };
+                  return JSON.stringify({
+                    order,
+                    intervalYields: ticks > 0 && ticks < 100,
+                    atob: [atob("aGk="), atob(" aG k "), atob("YQ")],
+                    btoa: [btoa("hi"), btoa("é")],
+                    errors: [error(() => atob("a")), error(() => atob("a=b")), error(() => btoa("€")), error(() => atob())],
+                  });
+                })()
+                "#,
+            )
+            .expect("timer script should run");
+        let result = runtime
+            .block_on(js_runtime.resolve(result))
+            .expect("timers settle");
+        assert_eq!(
+            string(&mut js_runtime, result),
+            r#"{"order":["microtask","then","timeout"],"intervalYields":true,"atob":["hi","hi","a"],"btoa":["aGk=","6Q=="],"errors":["InvalidCharacterError","InvalidCharacterError","InvalidCharacterError","TypeError"]}"#
+        );
     }
 
     #[test]
