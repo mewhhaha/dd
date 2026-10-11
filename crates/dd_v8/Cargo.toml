@@ -6,7 +6,7 @@ publish = false
 version.workspace = true
 
 [dependencies]
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-util.workspace = true
 serde.workspace = true
 tokio = { workspace = true }
 v8 = "152.2.0"

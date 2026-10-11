@@ -20,16 +20,15 @@ tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 uuid.workspace = true
 reqwest = { workspace = true, features = ["brotli", "deflate", "gzip"] }
-getrandom = "0.4.3"
 base64.workspace = true
-bytes = "1.12.1"
-futures-util = "0.3.34"
+bytes.workspace = true
+futures-util.workspace = true
 sha2 = "0.11.0"
 mime_guess = "2.0.5"
 regex = "1.13.1"
 encoding_rs = "0.8.35"
 rustls = "0.23.45"
-url = { version = "2.5.8", features = ["expose_internals"] }
+url = { workspace = true, features = ["expose_internals"] }
 urlpattern = "=0.4.2"
 # WebCrypto, ported from deno_crypto 0.253 with the versions it was written for.
 aes = "0.8.4"
@@ -64,4 +63,4 @@ default = []
 otel = ["dep:tracing-opentelemetry", "dep:opentelemetry"]
 
 [dev-dependencies]
-serial_test = "4.0.1"
+serial_test.workspace = true
