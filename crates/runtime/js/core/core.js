@@ -85,29 +85,6 @@ function registerCloneableResource(name, deserialize) {
   cloneableDeserializers[name] = deserialize;
 }
 
-class BadResource extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "BadResource";
-  }
-}
-
-class Interrupted extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "Interrupted";
-  }
-}
-
-// dd has no resource table; streams backed by one cannot exist.
-function noResources() {
-  throw new BadResource("Bad resource ID");
-}
-
-async function noResourcesAsync() {
-  noResources();
-}
-
 let nextTimerId = 1;
 const activeTimers = new SafeMap();
 
@@ -186,10 +163,6 @@ const core = {
   ops,
   loadExtScript,
   build,
-  BadResource,
-  BadResourcePrototype: BadResource.prototype,
-  Interrupted,
-  InterruptedPrototype: Interrupted.prototype,
   hostObjectBrand,
   registerCloneableResource,
   encode: (text) => op_encode(text),
@@ -234,8 +207,6 @@ const core = {
   cancelTimer,
   refTimer: () => {},
   unrefTimer: () => {},
-  refOpPromise: () => {},
-  unrefOpPromise: () => {},
   destructureError,
   // An exception nothing handled ends the event loop, as an unhandled
   // rejection does.
@@ -243,14 +214,6 @@ const core = {
     PromiseReject(error);
   },
   print: (message, isErr = false) => op_print(message, isErr),
-  close: noResources,
-  tryClose: () => {},
-  read: noResourcesAsync,
-  readAll: noResourcesAsync,
-  write: noResourcesAsync,
-  writeAll: noResourcesAsync,
-  cancelRead: noResources,
-  createCancelHandle: noResources,
 };
 
 // `internals` is shared by the vendored web scripts; `dd` holds the state

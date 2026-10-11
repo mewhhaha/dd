@@ -7,26 +7,13 @@
 /// <reference lib="esnext" />
 
 return (function () {
-const { core, internals, primordials } = __bootstrap;
+const { core, primordials } = __bootstrap;
 const {
   isAnyArrayBuffer,
   isArrayBuffer,
   isSharedArrayBuffer,
   isTypedArray,
 } = core;
-const {
-  // TODO(mmastrac): use readAll
-  op_read_all,
-  op_pipe,
-  op_readable_stream_resource_allocate,
-  op_readable_stream_resource_allocate_sized,
-  op_readable_stream_resource_await_close,
-  op_readable_stream_resource_close,
-  op_readable_stream_resource_get_sink,
-  op_readable_stream_resource_write_buf,
-  op_readable_stream_resource_write_error,
-  op_readable_stream_resource_write_sync,
-} = core.ops;
 const {
   ArrayBuffer,
   ArrayBufferIsView,
@@ -57,19 +44,16 @@ const {
   ObjectPrototypeIsPrototypeOf,
   ObjectSetPrototypeOf,
   Promise,
-  PromisePrototypeCatch,
   PromisePrototypeThen,
   PromiseReject,
   PromiseResolve,
   RangeError,
   ReflectApply,
   ReflectHas,
-  SafeFinalizationRegistry,
   SafePromiseAll,
   SafeWeakMap,
   // TODO(lucacasonato): add SharedArrayBuffer to primordials
   // SharedArrayBufferPrototype,
-  String,
   Symbol,
   SymbolAsyncIterator,
   SymbolFor,
@@ -429,66 +413,6 @@ function cloneAsUint8Array(O) {
   }
 }
 
-/**
- * Coerce an ArrayBuffer or ArrayBufferView into a Uint8Array view over the
- * same underlying memory (no copy). Used by resource-backed underlying sinks
- * which need to forward bytes to a native op regardless of the user-provided
- * view type. Throws TypeError for anything else.
- * @param {unknown} O
- * @returns {Uint8Array}
- */
-function bufferSourceAsUint8Array(O) {
-  if (isTypedArray(O)) {
-    return new Uint8Array(
-      TypedArrayPrototypeGetBuffer(/** @type {Uint8Array} */ (O)),
-      TypedArrayPrototypeGetByteOffset(/** @type {Uint8Array} */ (O)),
-      TypedArrayPrototypeGetByteLength(/** @type {Uint8Array} */ (O)),
-    );
-  }
-  if (ArrayBufferIsView(O)) {
-    return new Uint8Array(
-      DataViewPrototypeGetBuffer(/** @type {DataView} */ (O)),
-      DataViewPrototypeGetByteOffset(/** @type {DataView} */ (O)),
-      DataViewPrototypeGetByteLength(/** @type {DataView} */ (O)),
-    );
-  }
-  if (isAnyArrayBuffer(O)) {
-    return new Uint8Array(/** @type {ArrayBuffer} */ (O));
-  }
-  throw new TypeError(
-    "Expected ArrayBuffer or ArrayBufferView for write chunk",
-  );
-}
-
-/**
- * Byte length of an ArrayBuffer or ArrayBufferView. Throws TypeError otherwise.
- * @param {unknown} O
- * @returns {number}
- */
-function bufferSourceByteLength(O) {
-  if (isTypedArray(O)) {
-    return TypedArrayPrototypeGetByteLength(/** @type {Uint8Array} */ (O));
-  }
-  if (ArrayBufferIsView(O)) {
-    return DataViewPrototypeGetByteLength(/** @type {DataView} */ (O));
-  }
-  if (isAnyArrayBuffer(O)) {
-    return ArrayBufferPrototypeGetByteLength(/** @type {ArrayBuffer} */ (O));
-  }
-  throw new TypeError(
-    "Expected ArrayBuffer or ArrayBufferView for write chunk",
-  );
-}
-
-// Using SymbolFor to make globally available. This is used by `node:stream`
-// to interop with the web streams API.
-const _isClosedPromise = SymbolFor("nodejs.webstream.isClosedPromise");
-// Set on a stream to a function that errors its controller. `node:stream`'s
-// `addAbortSignal` uses this to abort a web stream from an AbortSignal.
-const _controllerErrorFunction = SymbolFor(
-  "nodejs.webstream.controllerErrorFunction",
-);
-
 const _abortAlgorithm = Symbol("[[abortAlgorithm]]");
 const _abortSteps = Symbol("[[AbortSteps]]");
 const _autoAllocateChunkSize = Symbol("[[autoAllocateChunkSize]]");
@@ -794,7 +718,6 @@ function initializeReadableStream(stream) {
   stream[_state] = "readable";
   stream[_reader] = stream[_storedError] = undefined;
   stream[_disturbed] = false;
-  stream[_isClosedPromise] = new Deferred();
 }
 
 /**
@@ -874,7 +797,6 @@ function initializeWritableStream(stream) {
       undefined;
   stream[_writeRequests] = new Queue();
   stream[_backpressure] = false;
-  stream[_isClosedPromise] = new Deferred();
 }
 
 /**
@@ -928,489 +850,11 @@ function isReadableStreamDisturbed(stream) {
   return stream[_disturbed];
 }
 
-/**
- * @param {Error | string | undefined} error
- * @returns {string}
- */
-function extractStringErrorFromError(error) {
-  if (typeof error == "string") {
-    return error;
-  }
-  const message = error?.message;
-  const stringMessage = typeof message == "string" ? message : String(message);
-  return stringMessage;
-}
-
-// We don't want to leak resources associated with our sink, even if something bad happens
-const READABLE_STREAM_SOURCE_REGISTRY = new SafeFinalizationRegistry(
-  (external) => {
-    op_readable_stream_resource_close(external);
-  },
-);
-
-class ResourceStreamResourceSink {
-  external;
-  constructor(external) {
-    this.external = external;
-    READABLE_STREAM_SOURCE_REGISTRY.register(this, external, this);
-  }
-  close() {
-    if (this.external === undefined) {
-      return;
-    }
-    READABLE_STREAM_SOURCE_REGISTRY.unregister(this);
-    op_readable_stream_resource_close(this.external);
-    this.external = undefined;
-  }
-}
-
-/**
- * @param {ReadableStreamDefaultReader<Uint8Array>} reader
- * @param {any} sink
- * @param {Uint8Array} chunk
- */
-async function readableStreamWriteChunkFn(reader, sink, chunk) {
-  // Empty Uint8Array chunk. Re-read.
-  if (
-    TypedArrayPrototypeGetSymbolToStringTag(chunk) === "Uint8Array" &&
-    TypedArrayPrototypeGetByteLength(chunk) == 0
-  ) {
-    return true;
-  }
-
-  const res = op_readable_stream_resource_write_sync(sink.external, chunk);
-  if (res == 0) {
-    // Closed
-    await reader.cancel("resource closed");
-    sink.close();
-
-    return false;
-  } else if (res == 1) {
-    return true;
-  } else if (res == 2) {
-    // Full. If the channel is full, we perform an async await until we can write, and then return
-    // to a synchronous loop.
-    if (
-      await op_readable_stream_resource_write_buf(
-        sink.external,
-        chunk,
-      )
-    ) {
-      return true;
-    } else {
-      await reader.cancel("resource closed");
-      sink.close();
-
-      return false;
-    }
-  }
-}
-
-/**
- * @param {ReadableStreamDefaultReader<Uint8Array>} reader
- * @param {any} sink
- * @param {((error: unknown) => void) | undefined} onError
- */
-async function readableStreamReadFn(reader, sink, onError) {
-  let loop = true;
-
-  // The read request, its handlers, and the write continuation are hoisted
-  // out of the loop and allocated once per stream instead of once per
-  // chunk; the per-iteration state travels through the `reentrant`,
-  // `hasChunk`, `gotChunk`, and `promise` slots, which is safe because
-  // exactly one read is in flight per iteration.
-  let reentrant = true;
-  let hasChunk = false;
-  let gotChunk = undefined;
-  /** @type {Deferred<boolean>} */
-  let promise;
-
-  const onWriteFulfilled = (loop) => promise.resolve(loop);
-  const onWriteRejected = (e) => promise.reject(e);
-
-  const readRequest = {
-    chunkSteps(chunk) {
-      // If the read completed synchronously, write the chunk after
-      // reentrancy ends.
-      if (reentrant) {
-        hasChunk = true;
-        gotChunk = chunk;
-      } else {
-        PromisePrototypeThen(
-          readableStreamWriteChunkFn(reader, sink, chunk),
-          onWriteFulfilled,
-          onWriteRejected,
-        );
-      }
-    },
-    closeSteps() {
-      sink.close();
-      promise.resolve(false);
-    },
-    errorSteps(error) {
-      // Surface the original error (with its stack) to the owner of the
-      // resource before we flatten it to a string for the Rust side. Without
-      // this hook the error is otherwise swallowed: it is converted to a
-      // plain message, pushed into the channel and used only to abort the
-      // underlying transport, so e.g. a throwing `TransformStream` feeding a
-      // `Deno.serve` response body would fail with nothing implicating the
-      // faulty callback. See https://github.com/denoland/deno/issues/19867.
-      if (onError !== undefined) {
-        onError(error);
-      }
-      const success = op_readable_stream_resource_write_error(
-        sink.external,
-        extractStringErrorFromError(error),
-      );
-      // We don't cancel the reader if there was an error reading. We'll let the downstream
-      // consumer close the resource after it receives the error.
-      if (!success) {
-        PromisePrototypeThen(
-          reader.cancel("resource closed"),
-          () => {
-            sink.close();
-            promise.resolve(false);
-          },
-          onWriteRejected,
-        );
-      } else {
-        sink.close();
-        promise.resolve(false);
-      }
-    },
-  };
-
-  while (loop) {
-    // The ops here look like op_write_all/op_close, but we're not actually writing to a
-    // real resource.
-    reentrant = true;
-    hasChunk = false;
-    gotChunk = undefined;
-    promise = new Deferred();
-    readableStreamDefaultReaderRead(reader, readRequest);
-    reentrant = false;
-    if (hasChunk) {
-      PromisePrototypeThen(
-        readableStreamWriteChunkFn(reader, sink, gotChunk),
-        onWriteFulfilled,
-        onWriteRejected,
-      );
-    }
-
-    loop = await promise.promise;
-  }
-}
-
-/**
- * Create a new resource that wraps a ReadableStream. The resource will support
- * read operations, and those read operations will be fed by the output of the
- * ReadableStream source.
- * @param {ReadableStream<Uint8Array>} stream
- * @param {number | undefined} length
- * @param {((error: unknown) => void) | undefined} onError Invoked with the
- *   original error (including its stack) if the stream errors while being
- *   drained into the resource. Lets the owner report an otherwise swallowed
- *   error before it is flattened to a string for the transport.
- * @returns {number}
- */
-function resourceForReadableStream(stream, length, onError) {
-  const reader = acquireReadableStreamDefaultReader(stream);
-
-  // Allocate the resource
-  const rid = typeof length == "number"
-    ? op_readable_stream_resource_allocate_sized(length)
-    : op_readable_stream_resource_allocate();
-
-  // Close the Reader we get from the ReadableStream when the resource is closed, ignoring any errors
-  PromisePrototypeCatch(
-    PromisePrototypeThen(
-      op_readable_stream_resource_await_close(rid),
-      () => {
-        PromisePrototypeCatch(reader.cancel("resource closed"), () => {});
-      },
-    ),
-    () => {},
-  );
-
-  // This allocation is freed when readableStreamReadFn is completed
-  const sink = new ResourceStreamResourceSink(
-    op_readable_stream_resource_get_sink(rid),
-  );
-
-  // Trigger the first read
-  PromisePrototypeCatch(readableStreamReadFn(reader, sink, onError), (err) => {
-    if (sink.external !== undefined) {
-      op_readable_stream_resource_write_error(
-        sink.external,
-        extractStringErrorFromError(err),
-      );
-      sink.close();
-    }
-    PromisePrototypeCatch(reader.cancel(err), () => {});
-    if (onError !== undefined) {
-      onError(err);
-    }
-  });
-
-  return rid;
-}
-
-const DEFAULT_CHUNK_SIZE = 64 * 1024; // 64 KiB
-
-// A finalization registry to clean up underlying resources that are GC'ed.
-const RESOURCE_REGISTRY = new SafeFinalizationRegistry((resource) => {
-  if (typeof resource === "number") {
-    core.tryClose(resource);
-  } else {
-    core.tryClose(resource.rid);
-    resource.onClose();
-  }
-});
-
-const _readAll = Symbol("[[readAll]]");
-const _original = Symbol("[[original]]");
-
-/**
- * If the error thrown while reading from / writing to a resource-backed stream
- * is a terse "Bad resource ID" error, replace it with a clearer message
- * explaining that the stream's underlying resource was closed or consumed.
- *
- * @param {unknown} e The error thrown by the underlying read/write op.
- * @returns {unknown} The (possibly annotated) error to surface to the stream.
- */
-function annotateResourceStreamError(e) {
-  if (
-    ObjectPrototypeIsPrototypeOf(core.BadResourcePrototype, e) &&
-    e.message === "Bad resource ID"
-  ) {
-    e.message = "The stream's underlying resource was closed or consumed";
-  }
-  return e;
-}
-
-/**
- * Create a new ReadableStream object that is backed by a resource that
- * implements reading operations. This object contains enough metadata to
- * allow callers to access the underlying resource if needed.
- *
- * @param {number} rid The resource ID to read from.
- * @param {boolean=} autoClose If the resource should be auto-closed when the stream closes. Defaults to true.
- * @param {function(*)=} cfn A custom stream constructor.
- * @param {function(*, *)=} onError A custom resource read error handler.
- * @param {function()=} onClose Called when the resource is no longer owned by the stream.
- * @returns {ReadableStream<Uint8Array>}
- */
-function readableStreamForRid(
-  rid,
-  autoClose = true,
-  cfn,
-  onError,
-  onClose,
-) {
-  const stream = cfn ? cfn(_brand) : new ReadableStream(_brand);
-  stream[_resourceBacking] = { rid, autoClose };
-
-  const tryClose = () => {
-    if (!autoClose) return;
-    RESOURCE_REGISTRY.unregister(stream);
-    core.tryClose(rid);
-    if (onClose !== undefined) {
-      const callback = onClose;
-      onClose = undefined;
-      callback();
-    }
-  };
-
-  const cancelRead = () => {
-    core.cancelRead(rid);
-  };
-
-  if (autoClose) {
-    RESOURCE_REGISTRY.register(
-      stream,
-      onClose === undefined ? rid : { __proto__: null, rid, onClose },
-      stream,
-    );
-  }
-
-  const underlyingSource = {
-    type: "bytes",
-    async pull(controller) {
-      const v = controller.byobRequest.view;
-      try {
-        if (controller[_readAll] === true) {
-          // fast path for tee'd streams consuming body
-          const chunk = await core.readAll(rid);
-          if (TypedArrayPrototypeGetByteLength(chunk) > 0) {
-            controller.enqueue(chunk);
-          }
-          controller.close();
-          tryClose();
-          return;
-        }
-
-        const bytesRead = await core.read(rid, v);
-        if (bytesRead === 0) {
-          tryClose();
-          controller.close();
-          controller.byobRequest.respond(0);
-        } else {
-          controller.byobRequest.respond(bytesRead);
-        }
-      } catch (e) {
-        const error = annotateResourceStreamError(e);
-        if (onError) {
-          onError(controller, error);
-        } else {
-          controller.error(error);
-        }
-        tryClose();
-      }
-    },
-    cancel() {
-      cancelRead();
-      tryClose();
-    },
-    autoAllocateChunkSize: DEFAULT_CHUNK_SIZE,
-  };
-  initializeReadableStream(stream);
-  setUpReadableByteStreamControllerFromUnderlyingSource(
-    stream,
-    underlyingSource,
-    underlyingSource,
-    0,
-  );
-  return stream;
-}
-
-const promiseSymbol = SymbolFor("__promise");
-const _isUnref = Symbol("isUnref");
-/**
- * Create a new ReadableStream object that is backed by a resource that
- * implements reading operations. This readable stream supports being
- * refed and unrefed by calling `readableStreamForRidUnrefableRef` and
- * `readableStreamForRidUnrefableUnref` on it. Unrefable streams are not
- * compatible with fast-path resource-backed streams.
- *
- * @param {number} rid The resource ID to read from.
- * @param constructor A class that extends ReadableStream.
- * @returns {ReadableStream<Uint8Array>}
- */
-function readableStreamForRidUnrefable(rid, constructor = ReadableStream) {
-  const stream = new constructor(_brand);
-  stream[promiseSymbol] = undefined;
-  stream[_isUnref] = false;
-  stream[_resourceBackingUnrefable] = { rid, autoClose: true };
-  const underlyingSource = {
-    type: "bytes",
-    async pull(controller) {
-      const v = controller.byobRequest.view;
-      try {
-        const promise = core.read(rid, v);
-        stream[promiseSymbol] = promise;
-        if (stream[_isUnref]) core.unrefOpPromise(promise);
-        const bytesRead = await promise;
-        stream[promiseSymbol] = undefined;
-        if (bytesRead === 0) {
-          core.tryClose(rid);
-          controller.close();
-          controller.byobRequest.respond(0);
-        } else {
-          controller.byobRequest.respond(bytesRead);
-        }
-      } catch (e) {
-        controller.error(annotateResourceStreamError(e));
-        core.tryClose(rid);
-      }
-    },
-    cancel() {
-      core.tryClose(rid);
-    },
-    autoAllocateChunkSize: DEFAULT_CHUNK_SIZE,
-  };
-  initializeReadableStream(stream);
-  setUpReadableByteStreamControllerFromUnderlyingSource(
-    stream,
-    underlyingSource,
-    underlyingSource,
-    0,
-  );
-  return stream;
-}
-
-function readableStreamIsUnrefable(stream) {
-  return ReflectHas(stream, _isUnref);
-}
-
-function readableStreamForRidUnrefableRef(stream) {
-  if (!readableStreamIsUnrefable(stream)) {
-    throw new TypeError("Not an unrefable stream");
-  }
-  stream[_isUnref] = false;
-  if (stream[promiseSymbol] !== undefined) {
-    core.refOpPromise(stream[promiseSymbol]);
-  }
-}
-
-function readableStreamForRidUnrefableUnref(stream) {
-  if (!readableStreamIsUnrefable(stream)) {
-    throw new TypeError("Not an unrefable stream");
-  }
-  stream[_isUnref] = true;
-  if (stream[promiseSymbol] !== undefined) {
-    core.unrefOpPromise(stream[promiseSymbol]);
-  }
-}
-
-function getReadableStreamResourceBacking(stream) {
-  return stream[_resourceBacking];
-}
-
-function getReadableStreamResourceBackingUnrefable(stream) {
-  return stream[_resourceBackingUnrefable];
-}
-
 async function readableStreamCollectIntoUint8Array(stream) {
-  const resourceBacking = getReadableStreamResourceBacking(stream) ||
-    getReadableStreamResourceBackingUnrefable(stream);
   const reader = acquireReadableStreamDefaultReader(stream);
-
-  if (resourceBacking && !isReadableStreamDisturbed(stream)) {
-    // fast path, read whole body in a single op call
-    try {
-      readableStreamDisturb(stream);
-      const promise = op_read_all(resourceBacking.rid);
-      if (readableStreamIsUnrefable(stream)) {
-        stream[promiseSymbol] = promise;
-        if (stream[_isUnref]) core.unrefOpPromise(promise);
-      }
-      const buf = await promise;
-      stream[promiseSymbol] = undefined;
-      readableStreamThrowIfErrored(stream);
-      readableStreamClose(stream);
-      return buf;
-    } catch (err) {
-      readableStreamThrowIfErrored(stream);
-      readableStreamError(stream, err);
-      throw err;
-    } finally {
-      if (resourceBacking.autoClose) {
-        core.tryClose(resourceBacking.rid);
-      }
-    }
-  }
-
-  // slow path
   /** @type {Uint8Array[]} */
   const chunks = [];
   let totalLength = 0;
-
-  // tee'd stream
-  if (stream[_original]) {
-    // One of the branches is consuming the stream
-    // signal controller.pull that we can consume it in a single op
-    stream[_original][_controller][_readAll] = true;
-  }
 
   // Pump the stream with a single persistent read request instead of a
   // reader.read() loop: no Deferred, no {value, done} result object, and
@@ -1469,127 +913,6 @@ async function readableStreamCollectIntoUint8Array(stream) {
     offset += TypedArrayPrototypeGetByteLength(chunk);
   }
   return finalBuffer;
-}
-
-/**
- * Create a new Writable object that is backed by a Resource that implements
- * `Resource::write` / `Resource::write_all`. This object contains enough
- * metadata to allow callers to bypass the JavaScript WritableStream
- * implementation and write directly to the underlying resource if they so
- * choose.
- *
- * @param {number} rid The resource ID to write to.
- * @param {boolean=} autoClose If the resource should be auto-closed when the stream closes. Defaults to true.
- * @param {function(*)=} cfn A custom stream constructor.
- * @param {{ bufferSize?: number, onClose?: function() }=} options Additional stream options.
- * @returns {ReadableStream<Uint8Array>}
- */
-function writableStreamForRid(rid, autoClose = true, cfn, options) {
-  const stream = cfn ? cfn(_brand) : new WritableStream(_brand);
-  stream[_resourceBacking] = { rid, autoClose };
-  let onClose = options?.onClose;
-
-  const tryClose = () => {
-    if (!autoClose) return;
-    RESOURCE_REGISTRY.unregister(stream);
-    core.tryClose(rid);
-    if (onClose !== undefined) {
-      const callback = onClose;
-      onClose = undefined;
-      callback();
-    }
-  };
-
-  if (autoClose) {
-    RESOURCE_REGISTRY.register(
-      stream,
-      onClose === undefined ? rid : { __proto__: null, rid, onClose },
-      stream,
-    );
-  }
-
-  const bufferSize = options?.bufferSize ?? 0;
-  let buffer = null;
-  let bufferOffset = 0;
-
-  async function flushBuffer() {
-    if (bufferOffset > 0) {
-      const toWrite = TypedArrayPrototypeSlice(buffer, 0, bufferOffset);
-      bufferOffset = 0;
-      await core.writeAll(rid, toWrite);
-    }
-  }
-
-  const underlyingSink = {
-    async write(chunk, controller) {
-      try {
-        const view = bufferSourceAsUint8Array(chunk);
-        if (bufferSize > 0) {
-          const chunkLen = TypedArrayPrototypeGetByteLength(view);
-          // Large chunks: flush buffer then write directly
-          if (chunkLen >= bufferSize) {
-            await flushBuffer();
-            await core.writeAll(rid, view);
-            return;
-          }
-
-          // Lazily allocate buffer
-          if (buffer === null) {
-            buffer = new Uint8Array(bufferSize);
-          }
-
-          // If chunk won't fit, flush first
-          if (bufferOffset + chunkLen > bufferSize) {
-            await flushBuffer();
-          }
-
-          // Copy chunk into buffer
-          TypedArrayPrototypeSet(buffer, view, bufferOffset);
-          bufferOffset += chunkLen;
-        } else {
-          await core.writeAll(rid, view);
-        }
-      } catch (e) {
-        controller.error(annotateResourceStreamError(e));
-        tryClose();
-        // Re-throw so writer.write() rejects with this specific error
-        // rather than resolving successfully and only failing subsequent
-        // writes via the now-errored controller.
-        throw e;
-      }
-    },
-    async close() {
-      try {
-        await flushBuffer();
-      } catch {
-        // ignore errors on flush during close
-      }
-      tryClose();
-    },
-    abort() {
-      bufferOffset = 0;
-      tryClose();
-    },
-  };
-
-  const highWaterMark = bufferSize > 0 ? bufferSize : 1;
-  const sizeAlgorithm = bufferSize > 0
-    ? (chunk) => bufferSourceByteLength(chunk)
-    : () => 1;
-
-  initializeWritableStream(stream);
-  setUpWritableStreamDefaultControllerFromUnderlyingSink(
-    stream,
-    underlyingSink,
-    underlyingSink,
-    highWaterMark,
-    sizeAlgorithm,
-  );
-  return stream;
-}
-
-function getWritableStreamResourceBacking(stream) {
-  return stream[_resourceBacking];
 }
 
 /*
@@ -2104,7 +1427,6 @@ function readableStreamCancel(stream, reason) {
 function readableStreamClose(stream) {
   assert(stream[_state] === "readable");
   stream[_state] = "closed";
-  stream[_isClosedPromise].resolve(undefined);
   /** @type {ReadableStreamDefaultReader<R> | undefined} */
   const reader = stream[_reader];
   if (!reader) {
@@ -3024,8 +2346,6 @@ function readableStreamError(stream, e) {
   assert(stream[_state] === "readable");
   stream[_state] = "errored";
   stream[_storedError] = e;
-  stream[_isClosedPromise].reject(e);
-  setPromiseIsHandledToTrue(stream[_isClosedPromise].promise);
   /** @type {ReadableStreamDefaultReader<R> | undefined} */
   const reader = stream[_reader];
   if (reader === undefined) {
@@ -3132,108 +2452,6 @@ function readableStreamHasDefaultReader(stream) {
 }
 
 /**
- * Fast path for `readableStreamPipeTo` when both the source and the sink are
- * backed by a `deno_core::Resource`. The entire byte pump happens in Rust via
- * `op_pipe`, avoiding a copy of every chunk into and back out of JavaScript.
- * Close / abort / cancel semantics are handled here to match the generic
- * algorithm.
- *
- * When a `signal` is supplied it is wired to a `deno_core` cancel handle so an
- * abort mid-pump unblocks `op_pipe` promptly; the aborted transfer then tears
- * down both ends with `signal.reason`, honoring the prevent* flags.
- *
- * @param {ReadableStream} source
- * @param {WritableStream} dest
- * @param {{ rid: number }} srcBacking
- * @param {{ rid: number }} dstBacking
- * @param {boolean} preventClose
- * @param {boolean} preventAbort
- * @param {boolean} preventCancel
- * @param {AbortSignal=} signal
- */
-async function fastPipeTo(
-  source,
-  dest,
-  srcBacking,
-  dstBacking,
-  preventClose,
-  preventAbort,
-  preventCancel,
-  signal,
-) {
-  // Lock both streams for the duration of the transfer, matching the
-  // preconditions of the generic algorithm. We never issue reads/writes
-  // through these handles; the byte pump happens entirely in `op_pipe`.
-  const reader = acquireReadableStreamDefaultReader(source);
-  const writer = acquireWritableStreamDefaultWriter(dest);
-  source[_disturbed] = true;
-
-  // Wire the abort signal (if any) to a cancel handle that `op_pipe` races its
-  // reads/writes against. The caller guarantees `signal` is not already aborted.
-  let cancelRid;
-  let abortHandler;
-  if (signal !== undefined) {
-    cancelRid = core.createCancelHandle();
-    abortHandler = () => core.tryClose(cancelRid);
-    signal[add](abortHandler);
-  }
-
-  try {
-    await op_pipe(srcBacking.rid, dstBacking.rid, cancelRid);
-  } catch (e) {
-    // On abort, propagate the signal's reason (matching the generic algorithm);
-    // otherwise surface the underlying resource error. We can't tell from here
-    // whether the read (source) or write (sink) side failed, so we tear down
-    // both ends, subject to the prevent* flags.
-    const error = signal !== undefined && signal.aborted
-      ? signal.reason
-      : annotateResourceStreamError(e);
-    if (preventAbort === false) {
-      try {
-        await writableStreamDefaultWriterAbort(writer, error);
-      } catch { /* keep the original error */ }
-    }
-    if (preventCancel === false) {
-      try {
-        await readableStreamCancel(source, error);
-      } catch { /* keep the original error */ }
-    }
-    writableStreamDefaultWriterRelease(writer);
-    readableStreamDefaultReaderRelease(reader);
-    throw error;
-  } finally {
-    if (signal !== undefined) {
-      signal[remove](abortHandler);
-      // `op_pipe` consumes the handle, but close defensively in case it errored
-      // out before reaching that point. `tryClose` is a no-op if already gone.
-      core.tryClose(cancelRid);
-    }
-  }
-
-  // The source reached EOF and every chunk has been flushed to the sink. Close
-  // the sink (unless preventClose); if that rejects (e.g. the sink errors
-  // during its flush/close) we must still release both ends and cancel the
-  // source so its underlying resource is not leaked, matching the generic
-  // algorithm's `finalize`, which always releases both ends. The close error is
-  // rethrown after cleanup.
-  let closeError;
-  if (preventClose === false) {
-    try {
-      await writableStreamDefaultWriterClose(writer);
-    } catch (e) {
-      closeError = e;
-    }
-  }
-  writableStreamDefaultWriterRelease(writer);
-  // Close the source, releasing its underlying resource (honors autoClose).
-  await readableStreamCancel(source, undefined);
-  readableStreamDefaultReaderRelease(reader);
-  if (closeError !== undefined) {
-    throw closeError;
-  }
-}
-
-/**
  * @template T
  * @param {ReadableStream<T>} source
  * @param {WritableStream<T>} dest
@@ -3263,32 +2481,6 @@ function readableStreamPipeTo(
   );
   assert(!isReadableStreamLocked(source));
   assert(!isWritableStreamLocked(dest));
-
-  // Fast path: when both ends are resource-backed, offload the whole streaming
-  // operation to Rust. An `AbortSignal` is supported via a cancel handle, but
-  // an already-aborted one is left to the slow path so its synchronous teardown
-  // matches the spec exactly. Both streams must also be in their active state:
-  // an already closed or errored stream carries spec-mandated behavior (a
-  // specific stored error, or closing the destination when the source is
-  // already closed) that only the slow path below implements.
-  const srcBacking = getReadableStreamResourceBacking(source);
-  const dstBacking = getWritableStreamResourceBacking(dest);
-  if (
-    srcBacking && dstBacking &&
-    (signal === undefined || !signal.aborted) &&
-    source[_state] === "readable" && dest[_state] === "writable"
-  ) {
-    return fastPipeTo(
-      source,
-      dest,
-      srcBacking,
-      dstBacking,
-      preventClose,
-      preventAbort,
-      preventCancel,
-      signal,
-    );
-  }
 
   // We use acquireReadableStreamDefaultReader even in case of ReadableByteStreamController
   // as the spec allows us, and the only reason to use BYOBReader is to do some smart things
@@ -4234,9 +3426,6 @@ function readableByteStreamTee(stream) {
     cancel2Algorithm,
   );
 
-  branch1[_original] = stream;
-  branch2[_original] = stream;
-
   forwardReaderError(reader);
   return [branch1, branch2];
 }
@@ -4275,8 +3464,6 @@ function setUpReadableByteStreamController(
   controller[_autoAllocateChunkSize] = autoAllocateChunkSize;
   controller[_pendingPullIntos] = new Queue();
   stream[_controller] = controller;
-  stream[_controllerErrorFunction] = (error) =>
-    readableByteStreamControllerError(controller, error);
   const startResult = startAlgorithm(controller);
   const startPromise = PromiseResolve(startResult);
   uponPromise(
@@ -4441,8 +3628,6 @@ function setUpReadableStreamDefaultController(
   controller[_pullAlgorithm] = pullAlgorithm;
   controller[_cancelAlgorithm] = cancelAlgorithm;
   stream[_controller] = controller;
-  stream[_controllerErrorFunction] = (error) =>
-    readableStreamDefaultControllerError(controller, error);
   const startResult = startAlgorithm(controller);
   const startPromise = PromiseResolve(startResult);
   uponPromise(startPromise, () => {
@@ -4553,11 +3738,6 @@ function setUpTransformStreamDefaultController(
   assert(stream[_controller] === undefined);
   controller[_stream] = stream;
   stream[_controller] = controller;
-  // `node:stream`'s `addAbortSignal` treats a `TransformStream` as a web stream
-  // (see `isWebStream`) and aborts it via this function; erroring the transform
-  // errors both its readable and writable sides.
-  stream[_controllerErrorFunction] = (error) =>
-    transformStreamError(stream, error);
   controller[_transformAlgorithm] = transformAlgorithm;
   controller[_flushAlgorithm] = flushAlgorithm;
   controller[_cancelAlgorithm] = cancelAlgorithm;
@@ -4673,8 +3853,6 @@ function setUpWritableStreamDefaultController(
   assert(stream[_controller] === undefined);
   controller[_stream] = stream;
   stream[_controller] = controller;
-  stream[_controllerErrorFunction] = (error) =>
-    writableStreamDefaultControllerErrorIfNeeded(controller, error);
   resetQueue(controller);
   controller[_signal] = newSignal();
   controller[_started] = false;
@@ -5609,7 +4787,6 @@ function writableStreamFinishInFlightClose(stream) {
   if (writer !== undefined) {
     writer[_closedPromise].resolve(undefined);
   }
-  stream[_isClosedPromise].resolve?.();
   assert(stream[_pendingAbortRequest] === undefined);
   assert(stream[_storedError] === undefined);
 }
@@ -5690,9 +4867,6 @@ function writableStreamRejectCloseAndClosedPromiseIfNeeded(stream) {
     stream[_closeRequest].reject(stream[_storedError]);
     stream[_closeRequest] = undefined;
   }
-
-  stream[_isClosedPromise].reject(stream[_storedError]);
-  setPromiseIsHandledToTrue(stream[_isClosedPromise].promise);
 
   const writer = stream[_writer];
   if (writer !== undefined) {
@@ -6014,10 +5188,6 @@ function initializeCountSizeFunction(globalObject) {
   WeakMapPrototypeSet(countSizeFunctionWeakMap, globalObject, size);
 }
 
-const _resourceBacking = Symbol("[[resourceBacking]]");
-// This distinction exists to prevent unrefable streams being used in
-// regular fast streams that are unaware of refability
-const _resourceBackingUnrefable = Symbol("[[resourceBackingUnrefable]]");
 /** @template R */
 class ReadableStream {
   /** @type {ReadableStreamDefaultController | ReadableByteStreamController} */
@@ -6032,10 +5202,6 @@ class ReadableStream {
   [_state];
   /** @type {any} */
   [_storedError];
-  /** @type {{ rid: number, autoClose: boolean } | null} */
-  [_resourceBacking] = null;
-  /** @type {Deferred<void>} */
-  [_isClosedPromise];
 
   [core.hostObjectBrand] = "ReadableStream";
 
@@ -7906,147 +7072,6 @@ webidl.converters["async_sequence<any>"] = webidl.createAsyncSequenceConverter(
   webidl.converters.any,
 );
 
-internals.resourceForReadableStream = resourceForReadableStream;
-internals.readableStreamForRid = readableStreamForRid;
-internals.writableStreamForRid = writableStreamForRid;
-
-const kNodeWebStreamsState = SymbolFor("nodejs.webstreams.kState");
-const kNodeWebStreamsType = SymbolFor("nodejs.webstreams.kType");
-const kNodeMessagingTransfer = SymbolFor("nodejs.messaging.kTransfer");
-
-function createReadableStreamStateView(stream) {
-  return {
-    get disturbed() {
-      return stream[_disturbed];
-    },
-    get reader() {
-      return stream[_reader];
-    },
-    get state() {
-      return stream[_state];
-    },
-    get storedError() {
-      return stream[_storedError];
-    },
-    get controller() {
-      return stream[_controller];
-    },
-  };
-}
-
-function createReadableStreamDefaultReaderStateView(reader) {
-  return {
-    get closedPromise() {
-      return reader[_closedPromise]?.promise;
-    },
-    get readRequests() {
-      return reader[_readRequests];
-    },
-    get stream() {
-      return reader[_stream];
-    },
-  };
-}
-
-function createReadableStreamBYOBReaderStateView(reader) {
-  return {
-    get closedPromise() {
-      return reader[_closedPromise]?.promise;
-    },
-    get readIntoRequests() {
-      return reader[_readIntoRequests];
-    },
-    get stream() {
-      return reader[_stream];
-    },
-  };
-}
-
-function createReadableStreamDefaultControllerStateView(controller) {
-  return {
-    get cancelAlgorithm() {
-      return controller[_cancelAlgorithm];
-    },
-    get closeRequested() {
-      return controller[_closeRequested];
-    },
-    get desiredSize() {
-      return readableStreamDefaultControllerGetDesiredSize(controller);
-    },
-    get pullAlgorithm() {
-      return controller[_pullAlgorithm];
-    },
-    get pulling() {
-      return controller[_pulling];
-    },
-    get pullAgain() {
-      return controller[_pullAgain];
-    },
-    get queue() {
-      return controller[_queue];
-    },
-    get queueTotalSize() {
-      return controller[_queueTotalSize];
-    },
-    get sizeAlgorithm() {
-      return controller[_strategySizeAlgorithm];
-    },
-    get started() {
-      return controller[_started];
-    },
-    get stream() {
-      return controller[_stream];
-    },
-  };
-}
-
-function createReadableByteStreamControllerStateView(controller) {
-  return {
-    get autoAllocateChunkSize() {
-      return controller[_autoAllocateChunkSize];
-    },
-    get byobRequest() {
-      return controller[_byobRequest];
-    },
-    get cancelAlgorithm() {
-      return controller[_cancelAlgorithm];
-    },
-    get closeRequested() {
-      return controller[_closeRequested];
-    },
-    get desiredSize() {
-      return readableByteStreamControllerGetDesiredSize(controller);
-    },
-    get pendingPullIntos() {
-      return controller[_pendingPullIntos];
-    },
-    set pendingPullIntos(value) {
-      controller[_pendingPullIntos] = value;
-    },
-    get pullAlgorithm() {
-      return controller[_pullAlgorithm];
-    },
-    get pulling() {
-      return controller[_pulling];
-    },
-    get pullAgain() {
-      return controller[_pullAgain];
-    },
-    get queue() {
-      return controller[_queue];
-    },
-    get queueTotalSize() {
-      return controller[_queueTotalSize];
-    },
-    get started() {
-      return controller[_started];
-    },
-    get stream() {
-      return controller[_stream];
-    },
-  };
-}
-
 function isReadableStreamBYOBRequest(value) {
   return !(typeof value !== "object" || value === null || !value[_view]);
 }
@@ -8082,116 +7107,9 @@ const setUpReadableByteStreamControllerFromSource =
 const setUpReadableStreamDefaultControllerFromSource =
   setUpReadableStreamDefaultControllerFromUnderlyingSource;
 
-ObjectDefineProperty(ReadableStreamPrototype, kNodeWebStreamsState, {
-  __proto__: null,
-  configurable: true,
-  get() {
-    return createReadableStreamStateView(this);
-  },
-});
-ObjectDefineProperty(ReadableStreamPrototype, kNodeWebStreamsType, {
-  __proto__: null,
-  configurable: true,
-  value: "ReadableStream",
-});
-ObjectDefineProperty(ReadableStreamPrototype, kNodeMessagingTransfer, {
-  __proto__: null,
-  configurable: true,
-  value() {
-    if (!isReadableStream(this)) {
-      const error = new TypeError(
-        'Value of "this" must be of type ReadableStream',
-      );
-      error.code = "ERR_INVALID_THIS";
-      throw error;
-    }
-  },
-});
-ObjectDefineProperty(
-  ReadableStreamDefaultReaderPrototype,
-  kNodeWebStreamsState,
-  {
-    __proto__: null,
-    configurable: true,
-    get() {
-      return createReadableStreamDefaultReaderStateView(this);
-    },
-  },
-);
-ObjectDefineProperty(
-  ReadableStreamDefaultReaderPrototype,
-  kNodeWebStreamsType,
-  {
-    __proto__: null,
-    configurable: true,
-    value: "ReadableStreamDefaultReader",
-  },
-);
-ObjectDefineProperty(ReadableStreamBYOBReaderPrototype, kNodeWebStreamsState, {
-  __proto__: null,
-  configurable: true,
-  get() {
-    return createReadableStreamBYOBReaderStateView(this);
-  },
-});
-ObjectDefineProperty(ReadableStreamBYOBReaderPrototype, kNodeWebStreamsType, {
-  __proto__: null,
-  configurable: true,
-  value: "ReadableStreamBYOBReader",
-});
-ObjectDefineProperty(
-  ReadableStreamDefaultControllerPrototype,
-  kNodeWebStreamsState,
-  {
-    __proto__: null,
-    configurable: true,
-    get() {
-      return createReadableStreamDefaultControllerStateView(this);
-    },
-  },
-);
-ObjectDefineProperty(
-  ReadableStreamDefaultControllerPrototype,
-  kNodeWebStreamsType,
-  {
-    __proto__: null,
-    configurable: true,
-    value: "ReadableStreamDefaultController",
-  },
-);
-ObjectDefineProperty(
-  ReadableByteStreamControllerPrototype,
-  kNodeWebStreamsState,
-  {
-    __proto__: null,
-    configurable: true,
-    get() {
-      return createReadableByteStreamControllerStateView(this);
-    },
-  },
-);
-ObjectDefineProperty(
-  ReadableByteStreamControllerPrototype,
-  kNodeWebStreamsType,
-  {
-    __proto__: null,
-    configurable: true,
-    value: "ReadableByteStreamController",
-  },
-);
-ObjectDefineProperty(ReadableStreamBYOBRequestPrototype, kNodeWebStreamsType, {
-  __proto__: null,
-  configurable: true,
-  value: "ReadableStreamBYOBRequest",
-});
-
 return {
-  _isClosedPromise,
   // Non-Public
   _state,
-  kNodeWebStreamsState,
-  kNodeWebStreamsType,
-  kNodeMessagingTransfer,
   // Exposed in global runtime scope
   acquireReadableStreamDefaultReader,
   ByteLengthQueuingStrategy,
@@ -8201,9 +7119,7 @@ return {
   createReadableStream,
   Deferred,
   errorReadableStream,
-  getReadableStreamResourceBacking,
   getReadableStreamStoredError,
-  getWritableStreamResourceBacking,
   isReadableByteStreamController,
   isReadableStream,
   isReadableStreamBYOBReader,
@@ -8255,10 +7171,6 @@ return {
   ReadableStreamDefaultReader,
   readableStreamDisturb,
   readableStreamError,
-  readableStreamForRid,
-  readableStreamForRidUnrefable,
-  readableStreamForRidUnrefableRef,
-  readableStreamForRidUnrefableUnref,
   readableStreamGetNumReadIntoRequests,
   readableStreamGetNumReadRequests,
   readableStreamHasBYOBReader,
@@ -8269,7 +7181,6 @@ return {
   readableStreamPipeTo,
   readableStreamTee,
   readableStreamThrowIfErrored,
-  resourceForReadableStream,
   setUpReadableByteStreamController,
   setUpReadableByteStreamControllerFromSource,
   setUpReadableStreamBYOBReader,
@@ -8282,6 +7193,5 @@ return {
   writableStreamClose,
   WritableStreamDefaultController,
   WritableStreamDefaultWriter,
-  writableStreamForRid,
 };
 })();
