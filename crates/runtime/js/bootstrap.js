@@ -22,6 +22,7 @@ const {
   MathMin,
   Number,
   NumberIsFinite,
+  ObjectCreate,
   ObjectDefineProperty,
   ObjectFreeze,
   ObjectKeys,
@@ -104,6 +105,33 @@ const {
   ResponsePrototypeGetStatus,
 } = dd.webPrimordials;
 const { appendHeaderPairs, headerPairs } = dd;
+
+// Records built per call. Each constructor's prototype is RECORD, an empty
+// object with a null prototype, so nothing worker code adds to
+// Object.prototype reads through into them; a `{ __proto__: null }` literal
+// would do the same, but V8 builds those as slow dictionary-mode objects.
+const RECORD = ObjectFreeze(ObjectCreate(null));
+const record = (constructor) => {
+  constructor.prototype = RECORD;
+  return constructor;
+};
+const TimerState = record(function TimerState(delay, repeat) {
+  this.canceled = false;
+  this.delay = delay;
+  this.repeat = repeat;
+});
+const TimeBoundary = record(function TimeBoundary(nowMs, perfMs) {
+  this.nowMs = nowMs;
+  this.perfMs = perfMs;
+});
+const CachedResponseParts = record(function CachedResponseParts(bytes, headers, status) {
+  this.bytes = bytes;
+  this.headers = headers;
+  this.status = status;
+});
+const ResponseInit = record(function ResponseInit(status) {
+  this.status = status;
+});
 
 const define = (name, value, enumerable = false) => {
   ObjectDefineProperty(globalThis, name, {
@@ -222,12 +250,7 @@ function ensureTimerGlobals() {
       throw new TypeError("Timer callback must be a function");
     }
     const id = nextTimerId++;
-    const state = {
-      __proto__: null,
-      canceled: false,
-      delay: clampDelay(delay),
-      repeat: Boolean(repeat),
-    };
+    const state = new TimerState(clampDelay(delay), Boolean(repeat));
     timers.set(id, state);
 
     (async () => {
@@ -322,27 +345,32 @@ function ensureAsyncContextGlobal() {
   const asyncContextFrame = Symbol("dd.asyncContextFrame");
   const getAsyncContext = () => core.getAsyncContext();
   const setAsyncContext = (value) => core.setAsyncContext(value ?? null);
-  const frameFor = (context) => context?.[asyncContextFrame] === true
-    ? context
-    : {
-      __proto__: null,
-      [asyncContextFrame]: true,
-      requestStore: context ?? null,
-      asyncLocalStores: new SafeMap(),
-    };
+  // A frame's map is never changed once the frame is current: each change
+  // goes into a copy, in a new frame, so frames that only swap the request
+  // store share their parent's map.
+  const AsyncContextFrame = record(function AsyncContextFrame(requestStore, asyncLocalStores) {
+    this[asyncContextFrame] = true;
+    this.requestStore = requestStore;
+    this.asyncLocalStores = asyncLocalStores;
+  });
+  const noAsyncLocalStores = new SafeMap();
+  const emptyFrame = new AsyncContextFrame(null, noAsyncLocalStores);
+  const frameFor = (context) => {
+    if (context == null) return emptyFrame;
+    return context[asyncContextFrame] === true
+      ? context
+      : new AsyncContextFrame(context, noAsyncLocalStores);
+  };
   const derivedFrame = (context) => {
     const frame = frameFor(context);
     const asyncLocalStores = new SafeMap();
     MapPrototypeForEach(frame.asyncLocalStores, (store, storage) => {
       asyncLocalStores.set(storage, store);
     });
-    return {
-      __proto__: null,
-      [asyncContextFrame]: true,
-      requestStore: frame.requestStore,
-      asyncLocalStores,
-    };
+    return new AsyncContextFrame(frame.requestStore, asyncLocalStores);
   };
+  const withRequestStore = (context, store) =>
+    new AsyncContextFrame(store ?? null, frameFor(context).asyncLocalStores);
 
   const asyncContext = {
     __proto__: null,
@@ -350,9 +378,7 @@ function ensureAsyncContextGlobal() {
       return frameFor(getAsyncContext()).requestStore;
     },
     enterWith(store) {
-      const frame = derivedFrame(getAsyncContext());
-      frame.requestStore = store ?? null;
-      setAsyncContext(frame);
+      setAsyncContext(withRequestStore(getAsyncContext(), store));
       return store ?? null;
     },
     run(store, callback, ...args) {
@@ -360,9 +386,7 @@ function ensureAsyncContextGlobal() {
         throw new TypeError("asyncContext.run(store, callback) requires a function");
       }
       const previous = getAsyncContext() ?? null;
-      const frame = derivedFrame(previous);
-      frame.requestStore = store ?? null;
-      setAsyncContext(frame);
+      setAsyncContext(withRequestStore(previous, store));
       try {
         return ReflectApply(callback, undefined, args);
       } finally {
@@ -461,18 +485,18 @@ function normalizeTimeBoundaryValue(value) {
     return null;
   }
   if (typeof value === "number") {
-    return { __proto__: null, nowMs: value, perfMs: value };
+    return new TimeBoundary(value, value);
   }
   if (ArrayIsArray(value)) {
     const nowMs = value[0];
-    return { __proto__: null, nowMs, perfMs: value[1] === undefined ? nowMs : value[1] };
+    return new TimeBoundary(nowMs, value[1] === undefined ? nowMs : value[1]);
   }
   if (typeof value === "object") {
     const nowMs =
       value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
     const perfMs =
       value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
-    return { __proto__: null, nowMs, perfMs };
+    return new TimeBoundary(nowMs, perfMs);
   }
   return null;
 }
@@ -510,12 +534,11 @@ const toRequest = (request) => ObjectPrototypeIsPrototypeOf(RequestPrototype, re
 // or an object shaped like one, read through its own methods.
 async function cachedResponseParts(response) {
   if (ObjectPrototypeIsPrototypeOf(ResponsePrototype, response)) {
-    return {
-      __proto__: null,
-      bytes: new Uint8Array(await ResponsePrototypeArrayBuffer(response)),
-      headers: headerPairs(ResponsePrototypeGetHeaders(response)),
-      status: ResponsePrototypeGetStatus(response),
-    };
+    return new CachedResponseParts(
+      new Uint8Array(await ResponsePrototypeArrayBuffer(response)),
+      headerPairs(ResponsePrototypeGetHeaders(response)),
+      ResponsePrototypeGetStatus(response),
+    );
   }
   if (typeof response?.arrayBuffer !== "function") {
     throw new TypeError("cache.put expects a Response");
@@ -524,7 +547,7 @@ async function cachedResponseParts(response) {
   const headers = ObjectPrototypeIsPrototypeOf(HeadersPrototype, response.headers)
     ? headerPairs(response.headers)
     : ArrayFrom(response.headers.entries());
-  return { __proto__: null, bytes, headers, status: Number(response.status ?? 200) };
+  return new CachedResponseParts(bytes, headers, Number(response.status ?? 200));
 }
 
 class Cache {
@@ -581,10 +604,7 @@ class Cache {
       "op_http_take_prepared_headers",
       Number(result.headers_handle ?? 0),
     );
-    const response = new RuntimeResponse(body, {
-      __proto__: null,
-      status: Number(result.status ?? 200),
-    });
+    const response = new RuntimeResponse(body, new ResponseInit(Number(result.status ?? 200)));
     appendHeaderPairs(ResponsePrototypeGetHeaders(response), ArrayIsArray(headers) ? headers : []);
     return response;
   }

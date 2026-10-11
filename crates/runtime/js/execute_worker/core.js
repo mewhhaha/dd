@@ -12,10 +12,10 @@
 // global the bundle names. Index loops and SafeArrayIterator stand in for
 // spread, for...of and array destructuring; header lists go into Requests
 // and Responses through appendHeaderPairs; the records and option
-// dictionaries the bundle builds have null prototypes. Promises are awaited,
-// never returned from an async function or a `then` callback, since
-// resolving one promise with another looks up the replaceable
-// Promise.prototype.then.
+// dictionaries the bundle builds never reach Object.prototype (see RECORD
+// below). Promises are awaited, never returned from an async function or a
+// `then` callback, since resolving one promise with another looks up the
+// replaceable Promise.prototype.then.
 //
 // What stays open, by the nature of sharing a context with worker code:
 // - Species. `then` and `await` on a native promise read its `constructor`;
@@ -162,6 +162,179 @@ const STREAM_PULL_ON_READ = ObjectFreeze({ __proto__: null, highWaterMark: 0 });
 /** A handle number from an op result or descriptor: a non-negative integer. */
 const toHandle = (value) => MathMax(0, MathTrunc(Number(value ?? 0) || 0));
 
+// The records and option dictionaries built per request. Each constructor's
+// prototype is RECORD, an empty object with a null prototype, so nothing
+// worker code adds to Object.prototype reads through into them. A
+// `{ __proto__: null }` literal would do the same, but V8 builds those as
+// dictionary-mode objects, several times slower to create and to read.
+// They are declared here, outside dd.executeWorker, so that every request
+// shares one constructor, and so one shape, per kind of record.
+const RECORD = ObjectFreeze(ObjectCreate(null));
+const record = (constructor) => {
+  constructor.prototype = RECORD;
+  return constructor;
+};
+const TimeBoundary = record(function TimeBoundary(nowMs, perfMs) {
+  this.nowMs = nowMs;
+  this.perfMs = perfMs;
+});
+const RequestInput = record(function RequestInput(method, url, headers, body, requestId) {
+  this.method = method;
+  this.url = url;
+  this.headers = headers;
+  this.body = body;
+  this.request_id = requestId;
+});
+// What dd.executeWorkerHandle reads from a request's invocation descriptor.
+const WorkerInvocation = record(function WorkerInvocation(descriptor, headers, body) {
+  this.request_id = String(descriptor.request_id ?? "");
+  this.request_context_handle = toHandle(descriptor.request_context_handle);
+  this.completion_handle = toHandle(descriptor.completion_handle);
+  this.memory_request_scope_handle = toHandle(descriptor.memory_request_scope_handle);
+  this.memory_call = descriptor.memory_call ?? null;
+  this.request_body_stream_handle = toHandle(descriptor.request_body_stream_handle);
+  this.stream_response = descriptor.stream_response === true;
+  this.max_response_body_bytes = descriptor.max_response_body_bytes;
+  this.max_request_body_bytes = descriptor.max_request_body_bytes;
+  this.method = String(descriptor.method ?? "GET");
+  this.url = String(descriptor.url ?? "");
+  this.headers = ArrayIsArray(headers) ? headers : [];
+  this.input_request_id = String(descriptor.input_request_id ?? "");
+  this.body = body;
+});
+// The store asyncContext carries for a request. memory.js runs each memory
+// call under a copy with its own memory scope.
+const RequestContext = record(function RequestContext(
+  requestId,
+  controller,
+  requestContextHandle,
+  completionHandle,
+  memoryRequestScopeHandle,
+  requestBodyStreamHandle,
+  cacheBypassStale,
+) {
+  this.requestId = requestId;
+  this.controller = controller;
+  this.waitUntilPromises = [];
+  this.requestContextHandle = requestContextHandle;
+  this.completionHandle = completionHandle;
+  this.memoryRequestScopeHandle = memoryRequestScopeHandle;
+  this.requestBodyStreamHandle = requestBodyStreamHandle;
+  this.memoryEntry = null;
+  this.memoryTxnScope = null;
+  this.socketRuntimeProvider = null;
+  this.cacheBypassStale = cacheBypassStale;
+});
+const copyRequestContext = (context) => {
+  const copy = new RequestContext(
+    context.requestId,
+    context.controller,
+    context.requestContextHandle,
+    context.completionHandle,
+    context.memoryRequestScopeHandle,
+    context.requestBodyStreamHandle,
+    context.cacheBypassStale,
+  );
+  copy.waitUntilPromises = context.waitUntilPromises;
+  copy.memoryEntry = context.memoryEntry;
+  copy.memoryTxnScope = context.memoryTxnScope;
+  copy.socketRuntimeProvider = context.socketRuntimeProvider;
+  return copy;
+};
+const InflightRequest = record(function InflightRequest(
+  controller,
+  requestContextHandle,
+  memoryRequestScopeHandle,
+  requestBodyStreamHandle,
+) {
+  this.controller = controller;
+  this.requestContextHandle = requestContextHandle;
+  this.memoryRequestScopeHandle = memoryRequestScopeHandle;
+  this.requestBodyStreamHandle = requestBodyStreamHandle;
+});
+// What the request's fetch handler settled with, as stored host handles.
+const WorkerResult = record(function WorkerResult(status, headersHandle, bodyHandle) {
+  this.status = status;
+  this.headersHandle = headersHandle;
+  this.bodyHandle = bodyHandle;
+});
+// Init dictionaries for the Requests and Responses the runtime makes. An
+// undefined member reads as absent.
+const RequestInit = record(function RequestInit(method, body, signal) {
+  this.method = method;
+  this.body = body;
+  this.signal = signal;
+});
+const ResponseInit = record(function ResponseInit(status, statusText) {
+  this.status = status;
+  this.statusText = statusText;
+});
+const ReplyWaitOptions = record(function ReplyWaitOptions(syncTime, signal) {
+  this.syncTime = syncTime;
+  this.signal = signal;
+});
+const ReplyWaiter = record(function ReplyWaiter(resolve, reject) {
+  this.resolve = resolve;
+  this.reject = reject;
+});
+// A worker's fetch, normalized and with its body read.
+const NormalizedFetch = record(function NormalizedFetch(method, url, headers, body, signal, redirect) {
+  this.method = method;
+  this.url = url;
+  this.headers = headers;
+  this.body = body;
+  this.signal = signal;
+  this.redirect = redirect;
+});
+const CheckedFetchUrl = record(function CheckedFetchUrl(url, clientRid) {
+  this.url = url;
+  this.clientRid = clientRid;
+});
+// A memory key's state for the request; storageState is made on first use.
+const MemoryEntry = record(function MemoryEntry(binding, memoryKey) {
+  this.binding = binding;
+  this.memoryKey = memoryKey;
+  this.storageState = null;
+});
+const MemoryStorageState = record(function MemoryStorageState() {
+  this.failedError = null;
+  this.outputGate = PromiseResolve();
+});
+const MemoryTxn = record(function MemoryTxn(entry, batchHandle) {
+  this.entry = entry;
+  this.batchHandle = batchHandle;
+});
+const MemoryTxnScope = record(function MemoryTxnScope(binding, memoryKey, state) {
+  this.binding = binding;
+  this.memoryKey = memoryKey;
+  this.state = state;
+});
+const MemoryCommand = record(function MemoryCommand(handle, hit, value) {
+  this.handle = handle;
+  this.hit = hit;
+  this.value = value;
+});
+// A stored value as an encoding name and its bytes: "utf8" for strings,
+// "v8sc" for structured clones.
+const EncodedValue = record(function EncodedValue(encoding, value) {
+  this.encoding = encoding;
+  this.value = value;
+});
+// What storage.get returns to the worker for a key that is present.
+const MemoryGetResult = record(function MemoryGetResult(value) {
+  this.value = value;
+});
+const SocketPayload = record(function SocketPayload(kind, value) {
+  this.kind = kind;
+  this.value = value;
+});
+const DataProperty = record(function DataProperty(value) {
+  this.value = value;
+  this.enumerable = true;
+  this.writable = true;
+  this.configurable = true;
+});
+
 const callOp = (name, ...args) => {
   const op = core.ops[name];
   if (typeof op !== "function") {
@@ -189,18 +362,18 @@ const normalizeBoundaryValue = (value) => {
     return null;
   }
   if (typeof value === "number") {
-    return { __proto__: null, nowMs: value, perfMs: value };
+    return new TimeBoundary(value, value);
   }
   if (ArrayIsArray(value)) {
     const nowMs = value[0];
-    return { __proto__: null, nowMs, perfMs: value[1] === undefined ? nowMs : value[1] };
+    return new TimeBoundary(nowMs, value[1] === undefined ? nowMs : value[1]);
   }
   if (typeof value === "object") {
     const nowMs =
       value.nowMs ?? value.now_ms ?? value.now ?? value.wallMs ?? value.wall_ms;
     const perfMs =
       value.perfMs ?? value.perf_ms ?? value.perf ?? value.monotonicMs ?? value.monotonic_ms ?? nowMs;
-    return { __proto__: null, nowMs, perfMs };
+    return new TimeBoundary(nowMs, perfMs);
   }
   return null;
 };
@@ -373,31 +546,25 @@ dd.executeWorker = (payload) => {
   const inflightRequests = dd.inflightRequests ??= new SafeMap();
   const inflightRequestsByContextHandle =
     dd.inflightRequestsByContextHandle ??= new SafeMap();
-  const input = {
-    __proto__: null,
-    method: String(payload?.method ?? "GET"),
-    url: String(payload?.url ?? ""),
-    headers: ArrayIsArray(payload?.headers) ? payload.headers : [],
-    body: isUint8Array(payload?.body) ? payload.body : new Uint8Array(),
-    request_id: String(payload?.input_request_id ?? ""),
-  };
+  const input = new RequestInput(
+    String(payload?.method ?? "GET"),
+    String(payload?.url ?? ""),
+    ArrayIsArray(payload?.headers) ? payload.headers : [],
+    isUint8Array(payload?.body) ? payload.body : new Uint8Array(),
+    String(payload?.input_request_id ?? ""),
+  );
   const cacheBypassStale = hasCacheBypassStaleHeader(input.headers);
   const controller = new AbortController();
   const asyncContext = dd.asyncContext;
-  const requestContext = {
-    __proto__: null,
+  const requestContext = new RequestContext(
     requestId,
     controller,
-    waitUntilPromises: [],
     requestContextHandle,
     completionHandle,
     memoryRequestScopeHandle,
     requestBodyStreamHandle,
-    memoryEntry: null,
-    memoryTxnScope: null,
-    socketRuntimeProvider: null,
     cacheBypassStale,
-  };
+  );
 
   const currentRequestContext = (required = true) => {
     const current = asyncContext?.getStore?.() ?? null;
@@ -407,13 +574,12 @@ dd.executeWorker = (payload) => {
     return current;
   };
 
-  const inflightRequest = {
-    __proto__: null,
+  const inflightRequest = new InflightRequest(
     controller,
     requestContextHandle,
     memoryRequestScopeHandle,
     requestBodyStreamHandle,
-  };
+  );
   inflightRequests.set(requestId, inflightRequest);
   if (requestContextHandle > 0) {
     inflightRequestsByContextHandle.set(requestContextHandle, inflightRequest);

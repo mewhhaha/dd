@@ -194,6 +194,8 @@ function appendHeaderPairs(headers, pairs) {
   return headers;
 }
 
+const STREAM_PULL_ON_READ = ObjectFreeze({ __proto__: null, highWaterMark: 0 });
+
 // A Response for a host fetch result, its body read from Rust as it arrives.
 function hostFetchResponse(fetched, url, method) {
   const inner = newInnerResponse(fetched.status, fetched.status_text);
@@ -217,7 +219,7 @@ function hostFetchResponse(fetched, url, method) {
         cancel() {
           op_http_response_close(bodyHandle);
         },
-      }, { __proto__: null, highWaterMark: 0 }));
+      }, STREAM_PULL_ON_READ));
     }
   }
   return fromInnerResponse(inner, "immutable");

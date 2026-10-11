@@ -24,6 +24,17 @@ for (const [name, prototype] of [["Headers", Headers.prototype], ["Request", Req
     if (typeof value === "function") scope[`${name}Prototype${suffix}`] = primordials.uncurryThis(value);
   }
 }
+// The record constructors execute_worker/core.js defines for the bundle.
+scope.RECORD = Object.freeze(Object.create(null));
+scope.RequestInit = function RequestInit(method, body, signal) {
+  Object.assign(this, { method, body, signal });
+};
+scope.ResponseInit = function ResponseInit(status, statusText) {
+  Object.assign(this, { status, statusText });
+};
+scope.DataProperty = function DataProperty(value) {
+  Object.assign(this, { value, enumerable: true, writable: true, configurable: true });
+};
 scope.headerPairs = (headers) => [...headers];
 scope.appendHeaderPairs = (headers, pairs) => {
   for (const [name, value] of pairs) headers.append(name, value);

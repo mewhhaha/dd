@@ -5,11 +5,7 @@
     if (!result || typeof result !== "object" || result.boundary_changed !== true) {
       return;
     }
-    applyBoundary({
-      __proto__: null,
-      nowMs: result.boundary_now_ms,
-      perfMs: result.boundary_perf_ms,
-    });
+    applyBoundary(new TimeBoundary(result.boundary_now_ms, result.boundary_perf_ms));
   };
 
   const invokeServiceBindingFetch = async (
@@ -45,7 +41,7 @@
         }
       },
       30_000,
-      { __proto__: null, syncTime: false, signal },
+      new ReplyWaitOptions(false, signal),
     );
     if (!result || typeof result !== "object" || result.ok === false) {
       applyRequestReplyBoundary(result);
@@ -56,7 +52,7 @@
     const status = Number(result.status ?? 200);
     const nullBody = request.method === "HEAD" || status === 204 || status === 205 || status === 304;
     const headers = callOp("op_http_take_prepared_headers", toHandle(result.headers_handle));
-    const response = new Response(nullBody ? null : body, { __proto__: null, status });
+    const response = new Response(nullBody ? null : body, new ResponseInit(status, undefined));
     appendHeaderPairs(ResponsePrototypeGetHeaders(response), ArrayIsArray(headers) ? headers : []);
     return response;
   };
@@ -138,7 +134,7 @@
       return PromiseResolve(payload);
     }
     return new Promise((resolve, reject) => {
-      requestReplyWaiters().set(replyId, { __proto__: null, resolve, reject });
+      requestReplyWaiters().set(replyId, new ReplyWaiter(resolve, reject));
     });
   };
 
@@ -320,11 +316,7 @@
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
     try {
       txn = await createMemoryTxn(entry, commandHandle);
-      const socketRuntime = createMemorySocketRuntime(entry, {
-        __proto__: null,
-        allowSocketAccept: true,
-        handles: undefined,
-      });
+      const socketRuntime = createMemorySocketRuntime(entry, true, undefined);
       const scopedState = createMemoryAtomicState(entry, txn, socketRuntime);
       current.memoryEntry = entry;
       current.socketRuntimeProvider = () => socketRuntime;
@@ -332,12 +324,7 @@
       let value;
       try {
         value = withMemoryTxnScope(
-          {
-            __proto__: null,
-            binding: entry.binding,
-            memoryKey: entry.memoryKey,
-            state: scopedState,
-          },
+          new MemoryTxnScope(entry.binding, entry.memoryKey, scopedState),
           () => callback(scopedState),
         );
       } finally {
@@ -402,12 +389,12 @@
     }
     const entry = ensureMemoryEntry(binding, memoryKey);
     const kind = String(memoryCall.kind ?? "");
-    const socketRuntime = createMemorySocketRuntime(entry, {
-      __proto__: null,
-      allowSocketAccept: false,
+    const socketRuntime = createMemorySocketRuntime(
+      entry,
+      false,
       // The host leaves the list out when it is empty.
-      handles: ObjectHasOwn(memoryCall, "socket_handles") ? memoryCall.socket_handles : undefined,
-    });
+      ObjectHasOwn(memoryCall, "socket_handles") ? memoryCall.socket_handles : undefined,
+    );
     const current = currentRequestContext();
     const previousMemoryEntry = current.memoryEntry;
     const previousSocketRuntimeProvider = current.socketRuntimeProvider;
@@ -425,7 +412,7 @@
         const event = buildWakeEvent(memoryCall, createMemoryStub(binding, memoryKey));
         await ReflectApply(wakeMethod, worker, [event, env]);
         await gateMemoryOutput(entry, async () => undefined);
-        return new Response(null, { __proto__: null, status: 204 });
+        return new Response(null, new ResponseInit(204, undefined));
       }
       throw new Error(`unsupported memory invoke kind: ${kind}`);
     } finally {
@@ -531,12 +518,10 @@
         : byteLength(input.body) > 0
           ? new Uint8Array(input.body)
           : undefined;
-      const request = new Request(input.url, {
-        __proto__: null,
-        method: String(input.method || "GET"),
-        body: requestBody,
-        signal: requestSignal,
-      });
+      const request = new Request(
+        input.url,
+        new RequestInit(String(input.method || "GET"), requestBody, requestSignal),
+      );
       appendHeaderPairs(RequestPrototypeGetHeaders(request), input.headers);
       const env = getSharedEnv();
       const ctx = {
@@ -633,12 +618,11 @@
         }
       }
 
-      const result = {
-        __proto__: null,
+      const result = new WorkerResult(
         status,
-        headersHandle: streamResponse ? 0 : storeResponseHeaders(headers),
-        bodyHandle: 0,
-      };
+        streamResponse ? 0 : storeResponseHeaders(headers),
+        0,
+      );
       if (!streamResponse) {
         result.bodyHandle = callOp(
           "op_http_store_prepared_body",
@@ -714,24 +698,7 @@ dd.executeWorkerHandle = (requestHandle) => {
     toHandle(descriptor.request_headers_handle),
   );
   const body = core.ops.op_http_take_prepared_body(toHandle(descriptor.request_body_handle));
-  const payload = {
-    __proto__: null,
-    request_id: String(descriptor.request_id ?? ""),
-    request_context_handle: toHandle(descriptor.request_context_handle),
-    completion_handle: toHandle(descriptor.completion_handle),
-    memory_request_scope_handle: toHandle(descriptor.memory_request_scope_handle),
-    memory_call: descriptor.memory_call ?? null,
-    request_body_stream_handle: toHandle(descriptor.request_body_stream_handle),
-    stream_response: descriptor.stream_response === true,
-    max_response_body_bytes: descriptor.max_response_body_bytes,
-    max_request_body_bytes: descriptor.max_request_body_bytes,
-    method: String(descriptor.method ?? "GET"),
-    url: String(descriptor.url ?? ""),
-    headers: ArrayIsArray(headers) ? headers : [],
-    input_request_id: String(descriptor.input_request_id ?? ""),
-    body,
-  };
-  return dd.executeWorker(payload);
+  return dd.executeWorker(new WorkerInvocation(descriptor, headers, body));
 };
 
 dd.installWorkerDeploymentHandle = (deploymentHandle) => {

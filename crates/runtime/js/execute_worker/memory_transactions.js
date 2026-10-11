@@ -66,48 +66,24 @@
     if (kind != null) {
       const normalizedKind = StringPrototypeToLowerCase(String(kind));
       if (normalizedKind === "text") {
-        return {
-          __proto__: null,
-          kind: "text",
-          value: toBytes(String(value)),
-        };
+        return new SocketPayload("text", toBytes(String(value)));
       }
       if (normalizedKind === "binary") {
-        return {
-          __proto__: null,
-          kind: "binary",
-          value: toArrayBytes(value),
-        };
+        return new SocketPayload("binary", toArrayBytes(value));
       }
       throw new Error(`WebSocket(handle).send unsupported kind: ${kind}`);
     }
     if (isBinaryLike(value)) {
-      return {
-        __proto__: null,
-        kind: "binary",
-        value: toArrayBytes(value),
-      };
+      return new SocketPayload("binary", toArrayBytes(value));
     }
-    return {
-      __proto__: null,
-      kind: "text",
-      value: toBytes(String(value ?? "")),
-    };
+    return new SocketPayload("text", toBytes(String(value ?? "")));
   };
 
   const encodeMemoryStorageValue = (value) => {
     if (typeof value === "string") {
-      return {
-        __proto__: null,
-        encoding: "utf8",
-        value: toBytes(value),
-      };
+      return new EncodedValue("utf8", toBytes(value));
     }
-    return {
-      __proto__: null,
-      encoding: "v8sc",
-      value: new Uint8Array(core.serialize(value, FOR_STORAGE)),
-    };
+    return new EncodedValue("v8sc", new Uint8Array(core.serialize(value, FOR_STORAGE)));
   };
 
   const takeMemoryBytes = (record) => {
@@ -135,11 +111,7 @@
 
   const ensureMemoryStorageState = (entry) => {
     if (!entry.storageState) {
-      entry.storageState = {
-        __proto__: null,
-        failedError: null,
-        outputGate: PromiseResolve(),
-      };
+      entry.storageState = new MemoryStorageState();
     }
     return entry.storageState;
   };
@@ -242,7 +214,7 @@
   const beginMemoryCommand = async (entry, idempotencyKey) => {
     const normalizedKey = StringPrototypeTrim(String(idempotencyKey ?? ""));
     if (!normalizedKey) {
-      return { __proto__: null, handle: 0, hit: false, value: null };
+      return new MemoryCommand(0, false, null);
     }
     const result = await callOp(
       "op_memory_command_begin",
@@ -256,12 +228,11 @@
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory command begin failed"));
     }
-    return {
-      __proto__: null,
-      handle: toHandle(result.handle),
-      hit: result.hit === true,
-      value: result.hit === true ? takeMemoryBytes(result) : null,
-    };
+    return new MemoryCommand(
+      toHandle(result.handle),
+      result.hit === true,
+      result.hit === true ? takeMemoryBytes(result) : null,
+    );
   };
 
   const closeMemoryCommand = (handle) => {
@@ -290,7 +261,7 @@
       throw error;
     }
     recordMemoryProfile("js_txn_begin", frozenPerfNow() - started, 1);
-    return { __proto__: null, entry, batchHandle: result.handle };
+    return new MemoryTxn(entry, result.handle);
   };
 
   const closeMemoryBatch = (handle) => {
@@ -333,14 +304,14 @@
     );
   };
 
-  const addMemoryBatchMutation = (txn, mutation) => {
+  const addMemoryBatchMutation = (txn, key, value, encoding, deleted) => {
     const result = callOp(
       "op_memory_batch_mutation",
       txn.batchHandle,
-      mutation.key,
-      toArrayBytes(mutation.value),
-      mutation.encoding,
-      mutation.deleted === true,
+      key,
+      toArrayBytes(value),
+      encoding,
+      deleted,
     );
     if (!result || typeof result !== "object" || result.ok === false) {
       throw new Error(String(result?.error ?? "memory batch mutation failed"));
@@ -429,10 +400,7 @@
         if (!record) {
           return null;
         }
-        return {
-          __proto__: null,
-          value: decodeMemoryStorageValue(record),
-        };
+        return new MemoryGetResult(decodeMemoryStorageValue(record));
       },
       put(key, value, options = {}) {
         rejectStorageOptions("set", options);
@@ -442,13 +410,7 @@
         }
         const normalizedKey = memoryStorageKey(key);
         const encoded = encodeMemoryStorageValue(value);
-        addMemoryBatchMutation(txn, {
-          __proto__: null,
-          key: normalizedKey,
-          value: encoded.value,
-          encoding: encoded.encoding,
-          deleted: false,
-        });
+        addMemoryBatchMutation(txn, normalizedKey, encoded.value, encoded.encoding, false);
       },
       delete(key, options = {}) {
         rejectStorageOptions("delete", options);
@@ -457,13 +419,7 @@
           throw storageState.failedError;
         }
         const normalizedKey = memoryStorageKey(key);
-        addMemoryBatchMutation(txn, {
-          __proto__: null,
-          key: normalizedKey,
-          value: new Uint8Array(),
-          encoding: "utf8",
-          deleted: true,
-        });
+        addMemoryBatchMutation(txn, normalizedKey, new Uint8Array(), "utf8", true);
       },
       list(options = {}) {
         const storageState = ensureMemoryStorageState(entry);

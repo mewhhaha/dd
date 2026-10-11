@@ -35,7 +35,7 @@
       return false;
     }
     const proto = ObjectGetPrototypeOf(value);
-    return proto === ObjectPrototype || proto === null;
+    return proto === ObjectPrototype || proto === null || proto === RECORD;
   };
 
   const isGetOrHead = (method) => {
@@ -169,11 +169,13 @@
     if (kind === "request") {
       const method = String(value.method || "GET");
       const bodyBytes = toArrayBytes(value.body);
-      const init = { __proto__: null, method };
-      if (!(TypedArrayPrototypeGetByteLength(bodyBytes) === 0 && isGetOrHead(method))) {
-        init.body = bodyBytes;
-      }
-      const request = new Request(String(value.url || "http://worker/"), init);
+      const body = TypedArrayPrototypeGetByteLength(bodyBytes) === 0 && isGetOrHead(method)
+        ? undefined
+        : bodyBytes;
+      const request = new Request(
+        String(value.url || "http://worker/"),
+        new RequestInit(method, body, undefined),
+      );
       appendHeaderPairs(
         RequestPrototypeGetHeaders(request),
         ArrayIsArray(value.headers) ? value.headers : [],
@@ -187,11 +189,7 @@
       const body = (TypedArrayPrototypeGetByteLength(bodyBytes) === 0 && isNullBodyStatus(status))
         ? null
         : bodyBytes;
-      const response = new Response(body, {
-        __proto__: null,
-        status,
-        statusText: value.statusText ?? "",
-      });
+      const response = new Response(body, new ResponseInit(status, value.statusText ?? ""));
       appendHeaderPairs(
         ResponsePrototypeGetHeaders(response),
         ArrayIsArray(value.headers) ? value.headers : [],
@@ -203,11 +201,11 @@
     references.set(value, out);
     const entries = ObjectEntries(value);
     for (let i = 0; i < entries.length; i++) {
-      ObjectDefineProperty(out, entries[i][0], {
-        __proto__: null,
-        value: decodeMemoryCommandValue(entries[i][1], references, webValues),
-        enumerable: true, writable: true, configurable: true,
-      });
+      ObjectDefineProperty(
+        out,
+        entries[i][0],
+        new DataProperty(decodeMemoryCommandValue(entries[i][1], references, webValues)),
+      );
     }
     return out;
   };

@@ -30,8 +30,7 @@
     }
   };
 
-  const createMemorySocketRuntime = (entry, options) => {
-    const { allowSocketAccept, handles } = options;
+  const createMemorySocketRuntime = (entry, allowSocketAccept, handles) => {
     let openHandles = null;
     if (handles !== undefined) {
       openHandles = new SafeSet();
@@ -47,14 +46,14 @@
       ));
       return openHandles;
     };
-    const upgradeAccepted = { __proto__: null, used: false };
+    let upgradeAccepted = false;
     const sockets = {
       __proto__: null,
       accept(request) {
         if (!allowSocketAccept) {
           throw new Error("state.sockets.accept is only available during a keyed memory request");
         }
-        if (upgradeAccepted.used) {
+        if (upgradeAccepted) {
           throw new Error("state.sockets.accept can only be called once per request");
         }
         if (!ObjectPrototypeIsPrototypeOf(RequestPrototype, request)) {
@@ -79,7 +78,7 @@
         HeadersPrototypeSet(headers, INTERNAL_WS_HANDLE_HEADER, handle);
         HeadersPrototypeSet(headers, INTERNAL_WS_BINDING_HEADER, entry.binding);
         HeadersPrototypeSet(headers, INTERNAL_WS_KEY_HEADER, entry.memoryKey);
-        upgradeAccepted.used = true;
+        upgradeAccepted = true;
         loadOpenHandles().add(handle);
         return {
           __proto__: null,
@@ -168,10 +167,10 @@
         assertActive();
         const accepted = socketRuntime.sockets.accept(request);
         markMemoryBatchAccepted(txn);
-        const response = new Response(accepted.response.body ?? null, {
-          __proto__: null,
-          status: accepted.response.status ?? 101,
-        });
+        const response = new Response(
+          accepted.response.body ?? null,
+          new ResponseInit(accepted.response.status ?? 101, undefined),
+        );
         appendHeaderPairs(
           ResponsePrototypeGetHeaders(response),
           headerPairs(accepted.response.headers),
@@ -195,7 +194,7 @@
   const ensureMemoryEntry = (binding, memoryKey) => {
     const current = currentRequestContext(false)?.memoryEntry;
     if (current?.binding === binding && current.memoryKey === memoryKey) return current;
-    return { __proto__: null, binding, memoryKey };
+    return new MemoryEntry(binding, memoryKey);
   };
 
   const createMemoryStubSocketApi = (bindingName, memoryKey) => ObjectFreeze({

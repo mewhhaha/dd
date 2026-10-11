@@ -64,15 +64,14 @@
       AbortControllerPrototypeGetSignal(currentRequestContext().controller),
     ]));
     const body = await readFetchBody(request, signal, service ? "service" : "host fetch");
-    return {
-      __proto__: null,
-      method: RequestPrototypeGetMethod(request),
+    return new NormalizedFetch(
+      RequestPrototypeGetMethod(request),
       url,
-      headers: headerPairs(RequestPrototypeGetHeaders(request)),
+      headerPairs(RequestPrototypeGetHeaders(request)),
       body,
       signal,
-      redirect: RequestPrototypeGetRedirect(request),
-    };
+      RequestPrototypeGetRedirect(request),
+    );
   };
 
   const HOST_FETCH_REDIRECT_STATUSES = new SafeSet([301, 302, 303, 307, 308]);
@@ -124,11 +123,7 @@
     if (!checked || typeof checked !== "object" || checked.ok === false) {
       throw new Error(String(checked?.error ?? "host fetch URL check failed"));
     }
-    return {
-      __proto__: null,
-      url: String(checked.url || url),
-      clientRid: toHandle(checked.client_rid),
-    };
+    return new CheckedFetchUrl(String(checked.url || url), toHandle(checked.client_rid));
   };
 
   // One request through the pinned client `clientHandle`, as a Response.

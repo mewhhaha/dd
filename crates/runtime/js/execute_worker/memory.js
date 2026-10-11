@@ -9,7 +9,7 @@
       if (typeof callback !== "function" || callback.constructor?.name === "AsyncFunction") {
         throw new Error("memory read requires a synchronous callback");
       }
-      const context = { __proto__: null, ...currentRequestContext() };
+      const context = copyRequestContext(currentRequestContext());
       return asyncContext.run(context, async () => {
         const result = await callOp(
           "op_memory_read_begin", activeRequestContextHandle(), namespace, memoryKey,
@@ -49,7 +49,7 @@
           let value;
           try {
             value = withMemoryTxnScope(
-              { __proto__: null, binding: namespace, memoryKey, state: snapshot },
+              new MemoryTxnScope(namespace, memoryKey, snapshot),
               () => callback(snapshot),
             );
           } finally {
@@ -82,7 +82,7 @@
           throw new Error("memory atomic accepts only the idempotencyKey option");
         }
       }
-      const context = { __proto__: null, ...currentRequestContext() };
+      const context = copyRequestContext(currentRequestContext());
       return asyncContext.run(context, async () => {
         const lease = await callOp("op_memory_lease_acquire", activeRequestContextHandle(), namespace, memoryKey);
         if (!lease?.handle) {
