@@ -118,7 +118,7 @@ const ensureMemoryStorageState = (entry) => {
 
 const memoryTxnReadRecord = (txn, key) => op_memory_batch_get(txn.batchHandle, key);
 
-const memoryTxnKeys = (txn, prefix) => op_memory_batch_keys(txn.batchHandle, prefix);
+const memoryTxnKeys = (txn, prefix) => op_memory_batch_list(txn.batchHandle, prefix);
 
 // Memory ops throw errors of this class when storage itself failed, and the
 // runtime then fails the whole memory entry (failMemoryEntry), not just the
@@ -200,7 +200,7 @@ const gateMemoryOutput = (entry, callback) => {
 };
 
 const stageMemoryTxnEffect = (txn, kind, payload) => {
-  op_memory_batch_effect(txn.batchHandle, kind, toArrayBytes(payload));
+  op_memory_batch_emit(txn.batchHandle, kind, toArrayBytes(payload));
 };
 
 
@@ -286,11 +286,11 @@ const setMemoryBatchCommandResult = (txn, value) => {
   if (!txn) {
     return;
   }
-  op_memory_batch_command_result(txn.batchHandle, toArrayBytes(value));
+  op_memory_batch_command_result_set(txn.batchHandle, toArrayBytes(value));
 };
 
 const addMemoryBatchMutation = (txn, key, value, encoding, deleted) => {
-  op_memory_batch_mutation(
+  op_memory_batch_write(
     txn.batchHandle,
     key,
     toArrayBytes(value),

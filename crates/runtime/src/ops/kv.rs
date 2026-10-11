@@ -15,7 +15,7 @@ pub(crate) struct KvListItem {
 }
 
 /// The value stored under `key`, or `null` when there is none.
-pub(crate) async fn op_kv_get_value(
+pub(crate) async fn op_kv_get(
     state: Rc<RefCell<OpState>>,
     binding: String,
     key: String,
@@ -41,7 +41,7 @@ pub(crate) async fn op_kv_get_value(
     result
 }
 
-pub(crate) fn op_kv_profile_record_js(
+pub(crate) fn op_kv_profile_record(
     state: &mut OpState,
     metric: String,
     duration_us: u32,
@@ -80,7 +80,7 @@ pub(crate) async fn op_kv_put(
     Ok(())
 }
 
-pub(crate) async fn op_kv_put_value_bytes(
+pub(crate) async fn op_kv_put_bytes(
     state: Rc<RefCell<OpState>>,
     binding: String,
     key: String,

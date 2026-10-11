@@ -15,7 +15,7 @@ pub(crate) fn slow_worker() -> String {
     r#"
 export default {
   async fetch() {
-    await __dd_internals.core.ops.op_sleep(40);
+    await __dd_internals.core.ops.op_time_sleep(40);
     return new Response("ok");
   },
 };
@@ -284,7 +284,7 @@ pub(crate) fn versioned_worker(version: &str, delay_ms: u64) -> String {
         r#"
 export default {{
   async fetch() {{
-    await __dd_internals.core.ops.op_sleep({delay_ms});
+    await __dd_internals.core.ops.op_time_sleep({delay_ms});
     return new Response("{version}");
   }},
 }};
@@ -296,7 +296,7 @@ pub(crate) fn io_wait_worker() -> String {
     r#"
 export default {
   async fetch() {
-    await __dd_internals.core.ops.op_sleep(50);
+    await __dd_internals.core.ops.op_time_sleep(50);
     return new Response("ok");
   },
 };
@@ -433,7 +433,7 @@ export default {
       await env.MY_KV.put("obj", { ok: true, n: 7 });
       await env.MY_KV.put("left", "L");
       await env.MY_KV.put("right", "R");
-      await __dd_internals.core.ops.op_kv_put_value_bytes(
+      await __dd_internals.core.ops.op_kv_put_bytes(
         "MY_KV",
         "broken",
         "v8sc",
@@ -726,16 +726,16 @@ export default {
   async fetch(_request, _env, ctx) {
     counter += 1;
 
-    const bodyHandle = __dd_internals.core.ops.op_http_store_prepared_body(
+    const bodyHandle = __dd_internals.core.ops.op_http_body_store(
       new Uint8Array([102, 97, 107, 101]),
     );
-    __dd_internals.core.ops.op_emit_completion_ok(
+    __dd_internals.core.ops.op_response_complete(
       0,
       200,
       0,
       bodyHandle,
     );
-    __dd_internals.core.ops.op_emit_completion_ok(
+    __dd_internals.core.ops.op_response_complete(
       0,
       200,
       0,

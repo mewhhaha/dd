@@ -69,7 +69,7 @@ try {
   const value = key => core.deserialize(
     core.ops.op_memory_read_get(read, key).value, { forStorage: true },
   );
-  const keys = core.ops.op_memory_read_keys(read, "");
+  const keys = core.ops.op_memory_read_list(read, "");
   captured = [value("a"), value("b"), keys.map(key => ({ key, value: value(key) }))];
 } finally {
   core.ops.op_memory_read_close(read);

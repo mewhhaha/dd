@@ -122,7 +122,7 @@ const stripCrossOriginRedirectHeaders = (headers) => keepHeaderPairs(headers, (l
 const checkHostFetchUrl = async (requestContextHandle, url) => {
   let checked;
   try {
-    checked = await op_http_check_url(requestContextHandle, url);
+    checked = await op_http_url_check(requestContextHandle, url);
   } finally {
     await syncFrozenTime();
   }
@@ -142,8 +142,8 @@ const sendHostFetch = async (
   body,
   signal,
 ) => {
-  const headersHandle = op_http_store_prepared_headers(headers);
-  const bodyHandle = body ? op_http_store_prepared_body(body) : 0;
+  const headersHandle = op_http_headers_store(headers);
+  const bodyHandle = body ? op_http_body_store(body) : 0;
   const sent = op_http_fetch(
     requestContextHandle,
     clientHandle,
@@ -201,8 +201,8 @@ const raceAbortSignal = (promise, signal) => {
 // redirects the way its redirect mode asks.
 const scopedFetch = async (current, inputValue, initValue) => {
   const normalized = await normalizeFetchInput(inputValue, initValue);
-  const normalizedHeadersHandle = op_http_store_prepared_headers(normalized.headers);
-  const normalizedBodyHandle = op_http_store_prepared_body(normalized.body);
+  const normalizedHeadersHandle = op_http_headers_store(normalized.headers);
+  const normalizedBodyHandle = op_http_body_store(normalized.body);
   let prepared;
   try {
     prepared = await op_http_prepare(
@@ -219,13 +219,13 @@ const scopedFetch = async (current, inputValue, initValue) => {
   let method = String(prepared.method || "GET");
   let url = String(prepared.url || normalized.url);
   let clientRid = toHandle(prepared.client_rid);
-  let headers = op_http_take_prepared_headers(toHandle(prepared.headers_handle));
+  let headers = op_http_headers_take(toHandle(prepared.headers_handle));
   if (!ArrayIsArray(headers)) {
     headers = [];
   }
   const preparedBodyHandle = Number(prepared.body_handle ?? 0);
   let body = preparedBodyHandle > 0
-    ? op_http_take_prepared_body(preparedBodyHandle)
+    ? op_http_body_take(preparedBodyHandle)
     : undefined;
   if (body && byteLength(body) === 0) {
     body = undefined;

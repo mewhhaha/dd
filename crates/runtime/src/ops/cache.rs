@@ -137,7 +137,7 @@ fn scoped_cache_name(state: &Rc<RefCell<OpState>>, cache_name: &str) -> String {
     format!("worker:{worker}:{}", cache_name.trim())
 }
 
-pub(crate) fn op_emit_cache_revalidate(
+pub(crate) fn op_cache_revalidate(
     state: &mut OpState,
     cache_name: String,
     method: String,

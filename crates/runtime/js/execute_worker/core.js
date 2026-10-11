@@ -169,57 +169,57 @@ const {
   syncTimeBoundaryNow: syncFrozenTimeNow,
 } = dd;
 const {
-  op_emit_completion_error,
-  op_emit_completion_ok,
-  op_emit_response_chunk,
-  op_emit_response_start,
-  op_emit_wait_until_done,
-  op_http_check_url,
+  op_http_body_store,
+  op_http_body_take,
   op_http_fetch,
+  op_http_headers_store,
+  op_http_headers_take,
   op_http_prepare,
   op_http_response_close,
-  op_http_store_prepared_body,
-  op_http_store_prepared_headers,
-  op_http_take_prepared_body,
-  op_http_take_prepared_headers,
+  op_http_url_check,
   op_kv_delete,
-  op_kv_get_value,
+  op_kv_get,
   op_kv_list,
   op_kv_put,
-  op_kv_put_value_bytes,
+  op_kv_put_bytes,
   op_memory_batch_accept,
   op_memory_batch_apply,
   op_memory_batch_begin,
   op_memory_batch_close,
-  op_memory_batch_command_result,
-  op_memory_batch_effect,
+  op_memory_batch_command_result_set,
+  op_memory_batch_emit,
   op_memory_batch_get,
-  op_memory_batch_keys,
-  op_memory_batch_mutation,
+  op_memory_batch_list,
+  op_memory_batch_write,
   op_memory_bytes_take,
   op_memory_command_begin,
   op_memory_command_close,
   op_memory_lease_acquire,
-  op_memory_profile_record_js,
+  op_memory_profile_record,
   op_memory_read_begin,
   op_memory_read_close,
   op_memory_read_get,
-  op_memory_read_keys,
+  op_memory_read_list,
   op_memory_request_scope_close,
   op_memory_socket_close,
   op_memory_socket_list,
   op_register_error_builder,
-  op_request_body_cancel,
+  op_request_body_close,
   op_request_body_read,
   op_request_context_cancel,
   op_request_context_close,
   op_request_control_take,
-  op_request_invocation_descriptor,
+  op_request_invocation_take,
   op_request_reply_cancel,
+  op_request_wait_until_finish,
   op_request_wait_until_register,
+  op_response_complete,
+  op_response_fail,
+  op_response_start,
+  op_response_write,
   op_service_binding_fetch_start,
-  op_sleep,
-  op_take_worker_deployment_config,
+  op_time_sleep,
+  op_worker_deployment_take,
 } = core.ops;
 
 const noop = () => undefined;
@@ -376,7 +376,7 @@ const DataProperty = record(function DataProperty(value) {
 });
 
 const recordMemoryProfile = (metric, durationMs, items = 1) => {
-  op_memory_profile_record_js(
+  op_memory_profile_record(
     String(metric),
     MathMax(0, MathRound(Number(durationMs ?? 0) * 1000)),
     MathMax(1, MathTrunc(Number(items ?? 1) || 1)),
@@ -504,7 +504,7 @@ const concatByteChunks = (chunks, totalLength) => {
 const isBinaryLike = (value) => core.isArrayBuffer(value) || ArrayBufferIsView(value);
 
 const decodeStoredValue = (encoding, valueHandle, context) => {
-  const bytes = op_http_take_prepared_body(toHandle(valueHandle));
+  const bytes = op_http_body_take(toHandle(valueHandle));
   if (encoding === "utf8") {
     return core.decode(bytes);
   }
@@ -524,7 +524,7 @@ const decodeStoredValue = (encoding, valueHandle, context) => {
 // value that cannot be serialized, leaves the clock alone.
 const createKvBinding = (bindingName) => ObjectFreeze({
   async get(key) {
-    const pending = op_kv_get_value(bindingName, String(key));
+    const pending = op_kv_get(bindingName, String(key));
     let value;
     try {
       value = await pending;
@@ -537,7 +537,7 @@ const createKvBinding = (bindingName) => ObjectFreeze({
     const normalizedKey = String(key);
     const pending = typeof value === "string"
       ? op_kv_put(bindingName, normalizedKey, value)
-      : op_kv_put_value_bytes(bindingName, normalizedKey,
+      : op_kv_put_bytes(bindingName, normalizedKey,
         "v8sc", new Uint8Array(core.serialize(value, FOR_STORAGE)));
     try {
       await pending;
@@ -610,7 +610,7 @@ const createRequestBodyStream = (handle) => new ReadableStream({
     ReadableStreamDefaultControllerPrototypeEnqueue(controller, chunk);
   },
   async cancel() {
-    await op_request_body_cancel(handle);
+    await op_request_body_close(handle);
     await syncFrozenTime();
   },
 }, STREAM_PULL_ON_READ);

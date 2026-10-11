@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn op_emit_completion_ok(
+pub(crate) fn op_response_complete(
     state: &mut OpState,
     completion_handle: u32,
     status: u16,
@@ -32,7 +32,7 @@ pub(crate) fn op_emit_completion_ok(
     );
 }
 
-pub(crate) fn op_emit_completion_error(state: &mut OpState, completion_handle: u32, error: String) {
+pub(crate) fn op_response_fail(state: &mut OpState, completion_handle: u32, error: String) {
     let Some(context) = active_request_context_for_completion(state, completion_handle) else {
         return;
     };
@@ -73,7 +73,7 @@ fn emit_completion_result(
     );
 }
 
-pub(crate) fn op_emit_wait_until_done(state: &mut OpState, completion_handle: u32) -> bool {
+pub(crate) fn op_request_wait_until_finish(state: &mut OpState, completion_handle: u32) -> bool {
     let Some(context) = state
         .borrow_mut::<ActiveRequestContextHandles>()
         .mark_wait_until_done(completion_handle)
@@ -94,7 +94,7 @@ pub(crate) fn op_emit_wait_until_done(state: &mut OpState, completion_handle: u3
     true
 }
 
-pub(crate) fn op_emit_response_start(
+pub(crate) fn op_response_start(
     state: &mut OpState,
     completion_handle: u32,
     status: u16,
@@ -129,7 +129,7 @@ impl AsRef<[u8]> for BufferedResponseChunk {
     }
 }
 
-pub(crate) async fn op_emit_response_chunk(
+pub(crate) async fn op_response_write(
     state: Rc<RefCell<OpState>>,
     completion_handle: u32,
     chunk: JsBuffer,

@@ -1,7 +1,7 @@
 use super::*;
 use dd_v8::ToJsBuffer;
 
-pub(super) fn op_request_invocation_descriptor(
+pub(super) fn op_request_invocation_take(
     state: &mut OpState,
     request_handle: u32,
 ) -> Option<WorkerRequestPayload> {
@@ -10,7 +10,7 @@ pub(super) fn op_request_invocation_descriptor(
         .remove(request_handle)
 }
 
-pub(super) fn op_take_worker_deployment_config(
+pub(super) fn op_worker_deployment_take(
     state: &mut OpState,
     deployment_handle: u32,
 ) -> Option<WorkerDeploymentPayload> {
@@ -81,7 +81,7 @@ pub(super) fn op_request_wait_until_register(state: &mut OpState, completion_han
         .min(u32::MAX as usize) as u32
 }
 
-pub(super) fn op_request_body_cancel(state: &mut OpState, stream_handle: u32) {
+pub(super) fn op_request_body_close(state: &mut OpState, stream_handle: u32) {
     clear_request_body_stream(state, stream_handle);
 }
 

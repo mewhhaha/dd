@@ -197,7 +197,7 @@ pub(super) fn op_memory_read_get(
     Ok(memory_snapshot_record(&read.snapshot, &key))
 }
 
-pub(super) fn op_memory_read_keys(
+pub(super) fn op_memory_read_list(
     state: &mut OpState,
     read_handle: u32,
     prefix: String,
@@ -528,7 +528,7 @@ pub(super) fn op_memory_batch_accept(
     Ok(())
 }
 
-pub(super) fn op_memory_batch_mutation(
+pub(super) fn op_memory_batch_write(
     state: &mut OpState,
     batch_handle: u32,
     key: String,
@@ -566,7 +566,7 @@ pub(super) fn op_memory_batch_get(
     )
 }
 
-pub(super) fn op_memory_batch_keys(
+pub(super) fn op_memory_batch_list(
     state: &mut OpState,
     batch_handle: u32,
     prefix: String,
@@ -593,7 +593,7 @@ pub(super) fn op_memory_batch_keys(
     Ok(keys.into_iter().map(str::to_owned).collect())
 }
 
-pub(super) fn op_memory_batch_effect(
+pub(super) fn op_memory_batch_emit(
     state: &mut OpState,
     batch_handle: u32,
     kind: String,
@@ -610,7 +610,7 @@ pub(super) fn op_memory_batch_effect(
     .map_err(js_error)
 }
 
-pub(super) fn op_memory_batch_command_result(
+pub(super) fn op_memory_batch_command_result_set(
     state: &mut OpState,
     batch_handle: u32,
     value: JsBuffer,
@@ -686,7 +686,7 @@ fn memory_scope_for_payload_with_epoch(
     ))
 }
 
-pub(super) fn op_memory_profile_record_js(
+pub(super) fn op_memory_profile_record(
     state: &mut OpState,
     metric: String,
     duration_us: u32,

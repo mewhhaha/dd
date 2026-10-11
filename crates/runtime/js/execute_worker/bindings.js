@@ -23,7 +23,7 @@ const invokeServiceBindingFetch = async (
       let bodyHandle = 0;
       try {
         headersHandle = storeResponseHeaders(request.headers);
-        bodyHandle = op_http_store_prepared_body(request.body);
+        bodyHandle = op_http_body_store(request.body);
         return op_service_binding_fetch_start(
           requestContextHandle,
           bindingName,
@@ -35,8 +35,8 @@ const invokeServiceBindingFetch = async (
       } finally {
         // The start op consumes these handles; a thrown preparation/start op
         // must release any handles that it did not consume.
-        if (headersHandle > 0) op_http_take_prepared_headers(headersHandle);
-        if (bodyHandle > 0) op_http_take_prepared_body(bodyHandle);
+        if (headersHandle > 0) op_http_headers_take(headersHandle);
+        if (bodyHandle > 0) op_http_body_take(bodyHandle);
       }
     },
     30_000,
@@ -47,10 +47,10 @@ const invokeServiceBindingFetch = async (
     throw new Error(formatRequestFailure("service binding fetch failed", result));
   }
   applyRequestReplyBoundary(result);
-  const body = op_http_take_prepared_body(toHandle(result.body_handle));
+  const body = op_http_body_take(toHandle(result.body_handle));
   const status = Number(result.status ?? 200);
   const nullBody = request.method === "HEAD" || status === 204 || status === 205 || status === 304;
-  const headers = op_http_take_prepared_headers(toHandle(result.headers_handle));
+  const headers = op_http_headers_take(toHandle(result.headers_handle));
   const response = new Response(nullBody ? null : body, new ResponseInit(status, undefined));
   appendHeaderPairs(ResponsePrototypeGetHeaders(response), ArrayIsArray(headers) ? headers : []);
   return response;
@@ -97,11 +97,11 @@ const sweepRequestReplyCanceled = (now = frozenPerfNow()) => {
 const discardRequestReplyHandles = (payload) => {
   const headersHandle = toHandle(payload?.headers_handle);
   if (headersHandle > 0) {
-    op_http_take_prepared_headers(headersHandle);
+    op_http_headers_take(headersHandle);
   }
   const bodyHandle = toHandle(payload?.body_handle);
   if (bodyHandle > 0) {
-    op_http_take_prepared_body(bodyHandle);
+    op_http_body_take(bodyHandle);
   }
 };
 
@@ -404,7 +404,7 @@ const invokeMemoryCall = async (memoryCall, env, worker) => {
 
 const emitWaitUntilDone = async (requestContext) => {
   await syncFrozenTime();
-  const emitted = op_emit_wait_until_done(
+  const emitted = op_request_wait_until_finish(
     requestContext.completionHandle,
   );
   if (emitted === false) {
@@ -420,13 +420,13 @@ const emitWaitUntilDone = async (requestContext) => {
   }
 };
 
-const storeResponseHeaders = (headers) => toHandle(op_http_store_prepared_headers(
+const storeResponseHeaders = (headers) => toHandle(op_http_headers_store(
   ArrayIsArray(headers) ? headers : [],
 ));
 
 const emitResponseStart = async (requestContext, status, headersHandle) => {
   await syncFrozenTime();
-  op_emit_response_start(
+  op_response_start(
     requestContext.completionHandle,
     status,
     headersHandle,
@@ -436,7 +436,7 @@ const emitResponseStart = async (requestContext, status, headersHandle) => {
 const emitResponseChunk = async (requestContext, chunk) => {
   await syncFrozenTime();
   const bytes = toBytes(chunk);
-  await op_emit_response_chunk(requestContext.completionHandle, bytes);
+  await op_response_write(requestContext.completionHandle, bytes);
   return bytes;
 };
 
@@ -481,7 +481,7 @@ const trackWaitUntil = (requestContext, promise) => {
 
 // ctx.sleep, the same for every request.
 async function sleep(millis) {
-  await op_sleep(Number(millis) || 0);
+  await op_time_sleep(Number(millis) || 0);
   await syncFrozenTime();
 }
 
@@ -608,7 +608,7 @@ const respond = async (requestContext, invocation, worker, deployment) => {
       0,
     );
     if (!streamResponse) {
-      result.bodyHandle = op_http_store_prepared_body(
+      result.bodyHandle = op_http_body_store(
         concatByteChunks(bodyChunks, bodyLength),
       );
     }
@@ -616,7 +616,7 @@ const respond = async (requestContext, invocation, worker, deployment) => {
   } finally {
     if (requestContext.requestBodyStreamHandle > 0) {
       try {
-        await op_request_body_cancel(requestContext.requestBodyStreamHandle);
+        await op_request_body_close(requestContext.requestBodyStreamHandle);
       } catch {
       }
     }
@@ -631,7 +631,7 @@ const respond = async (requestContext, invocation, worker, deployment) => {
 const reportOutcome = async (requestContext, handled) => {
   try {
     const result = await handled;
-    op_emit_completion_ok(
+    op_response_complete(
       requestContext.completionHandle,
       Number(result.status ?? 200),
       toHandle(result.headersHandle),
@@ -641,7 +641,7 @@ const reportOutcome = async (requestContext, handled) => {
     await waitForWaitUntils(requestContext);
     await emitWaitUntilDone(requestContext);
   } catch (error) {
-    op_emit_completion_error(
+    op_response_fail(
       requestContext.completionHandle,
       errorText(error),
     );
@@ -698,14 +698,14 @@ dd.installWorker = (workerModule) => {
 
 dd.executeWorkerHandle = (requestHandle) => {
   const handle = Number(requestHandle);
-  const descriptor = op_request_invocation_descriptor(handle);
+  const descriptor = op_request_invocation_take(handle);
   if (descriptor === null || descriptor === undefined) {
     throw new Error(`Request handle ${requestHandle} is unavailable`);
   }
-  const headers = op_http_take_prepared_headers(
+  const headers = op_http_headers_take(
     toHandle(descriptor.request_headers_handle),
   );
-  const body = op_http_take_prepared_body(toHandle(descriptor.request_body_handle));
+  const body = op_http_body_take(toHandle(descriptor.request_body_handle));
   executeWorker(new WorkerInvocation(descriptor, headers, body));
 };
 
@@ -742,7 +742,7 @@ const serviceBindingPairs = (input) => {
 };
 
 dd.installWorkerDeploymentHandle = (deploymentHandle) => {
-  const payload = op_take_worker_deployment_config(Number(deploymentHandle));
+  const payload = op_worker_deployment_take(Number(deploymentHandle));
   if (payload === null || payload === undefined) {
     throw new Error(`Worker deployment handle ${deploymentHandle} is unavailable`);
   }
@@ -769,7 +769,7 @@ dd.abortWorkerRequestHandle = (requestContextHandle) => {
   }
   if (inflight.requestBodyStreamHandle > 0) {
     try {
-      op_request_body_cancel(inflight.requestBodyStreamHandle);
+      op_request_body_close(inflight.requestBodyStreamHandle);
     } catch {
     }
   }

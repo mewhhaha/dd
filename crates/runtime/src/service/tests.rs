@@ -467,7 +467,7 @@ async fn isolate_startup_does_not_block_manager_commands() {
         .deploy(
             worker.clone(),
             r#"
-await __dd_internals.core.ops.op_sleep(800);
+await __dd_internals.core.ops.op_time_sleep(800);
 
 export default {
   async fetch() {
@@ -1338,7 +1338,7 @@ async fn worker_request_wall_timeout_retires_cooperative_isolate() {
             r#"
 export default {
   async fetch() {
-    await __dd_internals.core.ops.op_sleep(500);
+    await __dd_internals.core.ops.op_time_sleep(500);
     return new Response("late");
   },
 };
@@ -3248,7 +3248,7 @@ async fn budget_pressure_waits_for_wait_until_before_retiring_an_isolate() {
             r#"
 export default {
   async fetch(_request, _env, ctx) {
-    ctx.waitUntil(__dd_internals.core.ops.op_sleep(150));
+    ctx.waitUntil(__dd_internals.core.ops.op_time_sleep(150));
     return new Response("queued");
   },
 };

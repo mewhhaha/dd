@@ -267,7 +267,7 @@ pub(crate) struct HttpFetchResponse {
 }
 
 /// Sends a host fetch through the pinned client from `op_http_prepare` or
-/// `op_http_check_url`. Redirects are left to JavaScript, which revalidates
+/// `op_http_url_check`. Redirects are left to JavaScript, which revalidates
 /// each hop. A fetch that gets no response throws a `TypeError`, as the web's
 /// fetch rejects with one.
 pub(crate) async fn op_http_fetch(
@@ -545,7 +545,7 @@ pub(crate) async fn op_http_prepare(
     })
 }
 
-pub(crate) fn op_http_take_prepared_body(state: &mut OpState, body_handle: u32) -> ToJsBuffer {
+pub(crate) fn op_http_body_take(state: &mut OpState, body_handle: u32) -> ToJsBuffer {
     state
         .borrow_mut::<HttpPreparedBodies>()
         .take(body_handle)
@@ -554,20 +554,17 @@ pub(crate) fn op_http_take_prepared_body(state: &mut OpState, body_handle: u32) 
         .into()
 }
 
-pub(crate) fn op_http_store_prepared_body(state: &mut OpState, body: JsBuffer) -> u32 {
+pub(crate) fn op_http_body_store(state: &mut OpState, body: JsBuffer) -> u32 {
     state
         .borrow_mut::<HttpPreparedBodies>()
         .insert(Bytes::copy_from_slice(body.as_ref()))
 }
 
-pub(crate) fn op_http_store_prepared_headers(
-    state: &mut OpState,
-    headers: Vec<(String, String)>,
-) -> u32 {
+pub(crate) fn op_http_headers_store(state: &mut OpState, headers: Vec<(String, String)>) -> u32 {
     state.borrow_mut::<HttpPreparedHeaders>().insert(headers)
 }
 
-pub(crate) fn op_http_take_prepared_headers(
+pub(crate) fn op_http_headers_take(
     state: &mut OpState,
     headers_handle: u32,
 ) -> Vec<(String, String)> {
@@ -577,7 +574,7 @@ pub(crate) fn op_http_take_prepared_headers(
         .unwrap_or_default()
 }
 
-pub(crate) async fn op_http_check_url(
+pub(crate) async fn op_http_url_check(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     url: String,

@@ -38,7 +38,7 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
           assertActive();
           const prefix = memoryStorageKey(options?.prefix ?? "");
           const limit = memoryListLimit(options);
-          return listMemoryEntries(op_memory_read_keys(readHandle, prefix), limit, readSnapshotValue);
+          return listMemoryEntries(op_memory_read_list(readHandle, prefix), limit, readSnapshotValue);
         },
       });
       try {

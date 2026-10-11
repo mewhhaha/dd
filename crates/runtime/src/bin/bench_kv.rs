@@ -92,7 +92,7 @@ export default {
     }
     const requestStart = performance.now();
     const finish = () => {
-      __dd_internals.core.ops.op_kv_profile_record_js?.(
+      __dd_internals.core.ops.op_kv_profile_record?.(
         "js_request_total",
         Math.max(0, Math.round((performance.now() - requestStart) * 1000)),
         1,

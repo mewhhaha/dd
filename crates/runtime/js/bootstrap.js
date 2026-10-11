@@ -111,15 +111,15 @@ const {
   op_cache_delete,
   op_cache_match,
   op_cache_put,
+  op_cache_revalidate,
   op_call_console,
   op_console_write,
-  op_emit_cache_revalidate,
-  op_http_store_prepared_body,
-  op_http_store_prepared_headers,
-  op_http_take_prepared_body,
-  op_http_take_prepared_headers,
-  op_sleep,
-  op_time_boundary_now,
+  op_http_body_store,
+  op_http_body_take,
+  op_http_headers_store,
+  op_http_headers_take,
+  op_time_now,
+  op_time_sleep,
 } = core.ops;
 
 // The records and option dictionaries the runtime builds per call, here and
@@ -221,18 +221,18 @@ function ensureFrozenTimeGlobals() {
   }
 }
 
-// Moves the frozen clock to the host's, as op_time_boundary_now reads it at
+// Moves the frozen clock to the host's, as op_time_now reads it at
 // an I/O boundary. The execute-worker bundle syncs through these too.
 function applyTimeBoundary(boundary) {
   setFrozenTime(boundary.now_ms, boundary.perf_ms);
 }
 
 async function syncFrozenTimeBoundary() {
-  applyTimeBoundary(await op_time_boundary_now());
+  applyTimeBoundary(await op_time_now());
 }
 
 function syncFrozenTimeBoundaryNow() {
-  applyTimeBoundary(op_time_boundary_now());
+  applyTimeBoundary(op_time_now());
 }
 
 function ensureTimerGlobals() {
@@ -264,7 +264,7 @@ function ensureTimerGlobals() {
     let remaining = delayMs;
     while (remaining > 0) {
       const step = MathMin(remaining, 0x7fffffff);
-      await op_sleep(step);
+      await op_time_sleep(step);
       await syncFrozenTimeBoundary();
       remaining -= step;
     }
@@ -544,7 +544,7 @@ class Cache {
       this.name,
       method,
       url,
-      op_http_store_prepared_headers(requestHeaders),
+      op_http_headers_store(requestHeaders),
       dd.cacheBypassStale(),
     );
     // The cache ops throw what storage failed with; the frozen clock syncs
@@ -561,17 +561,17 @@ class Cache {
     }
 
     if (result.should_revalidate === true) {
-      op_emit_cache_revalidate(
+      op_cache_revalidate(
         this.name,
         method,
         url,
-        op_http_store_prepared_headers(requestHeaders),
+        op_http_headers_store(requestHeaders),
       );
       await syncFrozenTimeBoundary();
     }
 
-    const body = op_http_take_prepared_body(Number(result.body_handle ?? 0));
-    const headers = op_http_take_prepared_headers(Number(result.headers_handle ?? 0));
+    const body = op_http_body_take(Number(result.body_handle ?? 0));
+    const headers = op_http_headers_take(Number(result.headers_handle ?? 0));
     const response = new RuntimeResponse(
       body,
       new ResponseInit(Number(result.status ?? 200), undefined),
@@ -583,11 +583,11 @@ class Cache {
   async put(request, response) {
     const normalizedRequest = toRequest(request);
     const parts = await cachedResponseParts(response);
-    const bodyHandle = op_http_store_prepared_body(parts.bytes);
-    const requestHeadersHandle = op_http_store_prepared_headers(
+    const bodyHandle = op_http_body_store(parts.bytes);
+    const requestHeadersHandle = op_http_headers_store(
       headerPairs(RequestPrototypeGetHeaders(normalizedRequest)),
     );
-    const responseHeadersHandle = op_http_store_prepared_headers(parts.headers);
+    const responseHeadersHandle = op_http_headers_store(parts.headers);
     const pending = op_cache_put(
       this.name,
       RequestPrototypeGetMethod(normalizedRequest),
@@ -610,7 +610,7 @@ class Cache {
       this.name,
       RequestPrototypeGetMethod(normalizedRequest),
       RequestPrototypeGetUrl(normalizedRequest),
-      op_http_store_prepared_headers(headerPairs(RequestPrototypeGetHeaders(normalizedRequest))),
+      op_http_headers_store(headerPairs(RequestPrototypeGetHeaders(normalizedRequest))),
     );
     let deleted;
     try {
