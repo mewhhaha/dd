@@ -134,9 +134,7 @@ pub(crate) fn request_method_forbids_body(method: &Method) -> bool {
     *method == Method::GET || *method == Method::HEAD
 }
 
-pub(crate) fn request_content_length(
-    headers: &HeaderMap,
-) -> std::result::Result<Option<u64>, PlatformError> {
+fn request_content_length(headers: &HeaderMap) -> std::result::Result<Option<u64>, PlatformError> {
     headers
         .get(CONTENT_LENGTH)
         .map(|value| {
@@ -156,9 +154,7 @@ pub(crate) fn request_content_length(
         .transpose()
 }
 
-pub(crate) fn request_headers_declare_body(
-    headers: &HeaderMap,
-) -> std::result::Result<bool, PlatformError> {
+fn request_headers_declare_body(headers: &HeaderMap) -> std::result::Result<bool, PlatformError> {
     if request_content_length(headers)?.is_some_and(|value| value > 0) {
         return Ok(true);
     }

@@ -655,14 +655,14 @@ fn normalize_public_request_scheme(value: &str) -> &'static str {
     }
 }
 
-pub(super) fn worker_asset_path(url: &str) -> Result<String, PlatformError> {
+fn worker_asset_path(url: &str) -> Result<String, PlatformError> {
     let uri: http::Uri = url
         .parse()
         .map_err(|error| PlatformError::internal(format!("invalid worker url {url:?}: {error}")))?;
     Ok(uri.path().to_string())
 }
 
-pub(super) fn request_host_for_matching(headers: &HeaderMap, uri: &http::Uri) -> Option<String> {
+fn request_host_for_matching(headers: &HeaderMap, uri: &http::Uri) -> Option<String> {
     headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())

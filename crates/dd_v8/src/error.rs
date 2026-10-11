@@ -68,7 +68,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-pub(crate) fn describe_exception<'s>(
+fn describe_exception<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     exception: v8::Local<'s, v8::Value>,
 ) -> String {

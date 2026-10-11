@@ -182,7 +182,7 @@ where
     Ok(response)
 }
 
-pub(crate) async fn open_websocket_session_from_parts(
+async fn open_websocket_session_from_parts(
     state: &AppState,
     parts: &http::request::Parts,
     worker_name: String,
@@ -225,7 +225,7 @@ pub(crate) async fn open_websocket_session_from_parts(
         .map_err(|error| PlatformError::bad_request(format!("websocket open failed: {error}")))
 }
 
-pub(crate) async fn handle_websocket_session<S>(
+async fn handle_websocket_session<S>(
     state: AppState,
     socket: WebSocketStream<S>,
     session_id: String,
@@ -485,9 +485,7 @@ where
     Ok(())
 }
 
-pub(crate) fn sanitize_websocket_handshake_headers(
-    headers: Vec<(String, String)>,
-) -> Vec<(String, String)> {
+fn sanitize_websocket_handshake_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
         .filter(|(name, _)| !is_internal_proxy_upgrade_header(name))
