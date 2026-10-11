@@ -31,7 +31,6 @@ impl WorkerManager {
             })
             .collect::<Vec<_>>();
         let deployment_config = Arc::new(crate::ops::WorkerDeploymentPayload {
-            worker_name: worker_name.clone(),
             kv_bindings: bindings.kv.clone(),
             memory_bindings: bindings.memory.clone(),
             service_bindings: service_bindings.clone(),

@@ -56,7 +56,6 @@ pub(crate) type WorkerDeploymentHandles = HandleTable<WorkerDeploymentPayload>;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct WorkerDeploymentPayload {
-    pub(crate) worker_name: String,
     pub(crate) kv_bindings: Vec<String>,
     pub(crate) memory_bindings: Vec<String>,
     pub(crate) service_bindings: Vec<WorkerServiceBindingPayload>,
