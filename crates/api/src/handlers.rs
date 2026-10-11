@@ -216,8 +216,20 @@ use self::websocket::{
     PreparedWebSocketUpgrade, invoke_worker_websocket_private, invoke_worker_websocket_public,
     is_websocket_upgrade, prepare_websocket_upgrade,
 };
+/// Handler unit tests and runtime-backed tests grouped by behavior.
 #[cfg(test)]
 mod tests {
+    mod admin;
+    mod assets;
+    mod cache;
+    mod deployment;
+    mod fixtures;
+    mod invocation;
+    mod routing;
+    #[cfg(feature = "otel")]
+    mod tracing;
+    mod websocket;
+
     use super::util::{append_safe_worker_headers, private_token_matches, validate_worker_name};
     use super::{
         build_public_request_url, parse_invoke_request_uri, parse_worker_from_host, read_json_body,
