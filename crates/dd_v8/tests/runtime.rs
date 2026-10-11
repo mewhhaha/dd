@@ -1,3 +1,6 @@
+mod common;
+
+use common::{eval, eval_async, string};
 use dd_v8::{
     JsBuffer, JsRuntime, ModuleCode, ModuleLoader, ModuleSource, ModuleType, OpDecl, OpError,
     OpState, RuntimeOptions, ToJsBuffer, op_async, op_sync,
@@ -79,6 +82,8 @@ async fn op_reject(_state: Rc<RefCell<OpState>>, message: String) -> Result<(), 
     Err(OpError::type_error(message))
 }
 
+/// This suite's own ops, without the builtins: the snapshot tests need an op
+/// list they control.
 fn test_ops() -> Vec<OpDecl> {
     vec![
         op_sync!(op_add),
@@ -109,25 +114,6 @@ fn runtime() -> JsRuntime {
         .execute_with_ops("<ops>", "globalThis.ops = ops;")
         .expect("expose ops");
     runtime
-}
-
-fn string(runtime: &mut JsRuntime, value: dd_v8::v8::Global<dd_v8::v8::Value>) -> String {
-    dd_v8::scope!(scope, runtime);
-    let value = dd_v8::v8::Local::new(scope, value);
-    value.to_rust_string_lossy(scope)
-}
-
-fn eval(runtime: &mut JsRuntime, source: &str) -> String {
-    let value = runtime
-        .execute_script("<test>", source)
-        .expect("script runs");
-    string(runtime, value)
-}
-
-async fn eval_async(runtime: &mut JsRuntime, source: &str) -> Result<String, dd_v8::Error> {
-    let value = runtime.execute_script("<test>", source)?;
-    let value = runtime.resolve(value).await?;
-    Ok(string(runtime, value))
 }
 
 #[test]
@@ -226,32 +212,24 @@ fn sync_ops_convert_arguments_and_results() {
 #[tokio::test]
 async fn async_ops_resolve_through_the_event_loop() {
     let mut runtime = runtime();
-    assert_eq!(
-        eval_async(&mut runtime, "ops.op_ready(1)").await.unwrap(),
-        "2"
-    );
+    assert_eq!(eval_async(&mut runtime, "ops.op_ready(1)").await, "2");
     assert_eq!(
         eval_async(
             &mut runtime,
             "(async () => { const order = []; const a = ops.op_sleep(20).then(() => order.push('slow')); \
              const b = ops.op_sleep(1).then(() => order.push('fast')); await Promise.all([a, b]); return order.join(); })()"
         )
-        .await
-        .unwrap(),
+        .await,
         "fast,slow"
     );
     runtime.op_state().borrow_mut().put(7u32);
-    assert_eq!(
-        eval_async(&mut runtime, "ops.op_later(5)").await.unwrap(),
-        "7"
-    );
+    assert_eq!(eval_async(&mut runtime, "ops.op_later(5)").await, "7");
     assert_eq!(
         eval_async(
             &mut runtime,
             "ops.op_reject('bad').catch((e) => `${e.constructor.name}:${e.message}`)"
         )
-        .await
-        .unwrap(),
+        .await,
         "TypeError:bad"
     );
     runtime.run_event_loop().await.expect("idle loop finishes");
@@ -484,8 +462,7 @@ async fn modules_load_imports_attributes_and_dynamic_imports() {
             &mut runtime,
             "import('./broken.js').catch((e) => e.message)"
         )
-        .await
-        .unwrap(),
+        .await,
         "broken module"
     );
     assert_eq!(
@@ -493,8 +470,7 @@ async fn modules_load_imports_attributes_and_dynamic_imports() {
             &mut runtime,
             "import('./missing.js').catch((e) => e.message)"
         )
-        .await
-        .unwrap(),
+        .await,
         "no module mem:///missing.js"
     );
 }
@@ -546,8 +522,7 @@ async fn foreground_tasks_finish_async_webassembly() {
         WebAssembly.instantiate(bytes).then(({ instance }) => instance.exports.add(19, 23))
         "#,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(result, "42");
 }
 
@@ -707,8 +682,7 @@ async fn async_context_follows_continuations_and_timers_cancel() {
         })()
         "#,
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(result, "outer,false,true");
 }
 
