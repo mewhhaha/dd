@@ -532,6 +532,6 @@ that. The deterministic edge cases the fuzzers grew out of run in normal CI:
 
 - proxy private port: `just fly-proxy <app>`
 - deploy worker through proxy: `just fly-worker-deploy <name> <file> [flags...]`
-- direct store write helper exists as internal recovery path: `just fly-worker-store-deploy ...`
+- deploy a generated worker config through proxy: `just fly-worker-deploy-config <config> [flags...]`
 
 Canonical operational guide: [deploy/fly/README.md](../deploy/fly/README.md)

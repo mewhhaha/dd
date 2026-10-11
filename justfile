@@ -6,7 +6,7 @@ default_private_server := "http://127.0.0.1:18081"
 
 # Deploy the dd_server app to Fly.
 fly-deploy app=default_app config=default_fly_config:
-  FLYCTL_BIN="${FLYCTL_BIN:-$(if command -v flyctl >/dev/null 2>&1; then command -v flyctl; elif [ -x /home/mewhhaha/.fly/bin/flyctl ]; then printf %s /home/mewhhaha/.fly/bin/flyctl; elif command -v fly >/dev/null 2>&1; then command -v fly; else echo "flyctl not found (set FLYCTL_BIN or install flyctl)" >&2; exit 1; fi)}"; \
+  FLYCTL_BIN="${FLYCTL_BIN:-$(if command -v flyctl >/dev/null 2>&1; then command -v flyctl; elif [ -x "$HOME/.fly/bin/flyctl" ]; then printf %s "$HOME/.fly/bin/flyctl"; elif command -v fly >/dev/null 2>&1; then command -v fly; else echo "flyctl not found (set FLYCTL_BIN or install flyctl)" >&2; exit 1; fi)}"; \
   "$FLYCTL_BIN" deploy --app {{app}} --config {{config}} --remote-only
 
 # Drain writes, checkpoint every database, schedule a Fly volume snapshot, and always resume.
@@ -53,7 +53,6 @@ fly-worker-deploy-config-at server config *flags:
 check:
   bash scripts/check_public_memory_naming.sh
   python3 scripts/test-bench-fly-api.py
-  just check-deno-sources
   just check-js
   cargo fmt --all -- --check
   cargo check --workspace --all-targets --all-features

@@ -7,8 +7,8 @@ REMOTE_PORT="${3:-8081}"
 FLYCTL_BIN="${FLYCTL_BIN:-flyctl}"
 
 if ! command -v "$FLYCTL_BIN" >/dev/null 2>&1; then
-  if [ -x "/home/mewhhaha/.fly/bin/flyctl" ]; then
-    FLYCTL_BIN="/home/mewhhaha/.fly/bin/flyctl"
+  if [ -x "$HOME/.fly/bin/flyctl" ]; then
+    FLYCTL_BIN="$HOME/.fly/bin/flyctl"
   else
     echo "flyctl not found (set FLYCTL_BIN or add flyctl to PATH)" >&2
     exit 1
