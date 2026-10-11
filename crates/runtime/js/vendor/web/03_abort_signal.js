@@ -1,8 +1,5 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// @ts-check
-/// <reference path="../../core/internal.d.ts" />
-
 return (function () {
 const { core, primordials } = __bootstrap;
 const {
@@ -21,10 +18,10 @@ const {
   WeakRefPrototypeDeref,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
-const { assert } = core.loadExtScript("ext:deno_web/00_infra.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
+const { assert } = core.loadExtScript("ext:vendor/web/00_infra.js");
 const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:deno_web/01_console.js",
+  "ext:web/console.js",
 );
 const {
   defineEventHandler,
@@ -32,7 +29,7 @@ const {
   EventTarget,
   listenerCount,
   setIsTrusted,
-} = core.loadExtScript("ext:deno_web/02_event.js");
+} = core.loadExtScript("ext:vendor/web/02_event.js");
 
 const add = Symbol("[[add]]");
 const signalAbort = Symbol("[[signalAbort]]");

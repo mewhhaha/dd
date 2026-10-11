@@ -4,7 +4,6 @@
 // Copyright Domenic Denicola. Licensed under BSD-2-Clause License.
 // Original license at https://github.com/jsdom/webidl-conversions/blob/master/LICENSE.md.
 
-/// <reference path="../../core/internal.d.ts" />
 
 return (function () {
 const { core, primordials } = __bootstrap;

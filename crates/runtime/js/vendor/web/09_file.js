@@ -1,15 +1,5 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// @ts-check
-/// <reference no-default-lib="true" />
-/// <reference path="../../core/lib.deno_core.d.ts" />
-/// <reference path="../../core/internal.d.ts" />
-/// <reference path="../webidl/internal.d.ts" />
-/// <reference path="../web/internal.d.ts" />
-/// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
-/// <reference path="./internal.d.ts" />
-/// <reference lib="esnext" />
-
 return (function () {
 const { core, primordials } = __bootstrap;
 const {
@@ -58,7 +48,7 @@ const {
   Uint8Array,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 // Defer loading the 208 KB `06_streams.js` polyfill: ReadableStream is
 // only constructed inside `Blob.stream()` (see usage below), so we don't
 // need to pay the parse cost at module body time.
@@ -66,7 +56,7 @@ let _readableStream;
 function ReadableStream(...args) {
   return new (_readableStream ??
     (_readableStream =
-      core.loadExtScript("ext:deno_web/06_streams.js").ReadableStream))(
+      core.loadExtScript("ext:vendor/web/06_streams.js").ReadableStream))(
     ...new SafeArrayIterator(args),
   );
 }
@@ -76,14 +66,14 @@ function ReadableStream(...args) {
 let _textDecoderStream;
 function TextDecoderStream(...args) {
   return new (_textDecoderStream ??
-    (_textDecoderStream = core.loadExtScript("ext:deno_web/08_text_encoding.js")
+    (_textDecoderStream = core.loadExtScript("ext:vendor/web/08_text_encoding.js")
       .TextDecoderStream))(
     ...new SafeArrayIterator(args),
   );
 }
-const { URL } = core.loadExtScript("ext:deno_web/00_url.js");
+const { URL } = core.loadExtScript("ext:vendor/web/00_url.js");
 const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:deno_web/01_console.js",
+  "ext:web/console.js",
 );
 
 // TODO(lucacasonato): this needs to not be hardcoded and instead depend on

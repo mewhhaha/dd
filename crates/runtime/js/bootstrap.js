@@ -465,7 +465,7 @@ function ensureAsyncContextGlobal() {
 // logs its own warnings through the console as created, whatever worker code
 // does to the global.
 function ensureConsoleGlobal() {
-  const { createConsole } = core.loadExtScript("ext:deno_web/01_console.js");
+  const { createConsole } = core.loadExtScript("ext:web/console.js");
   const console = createConsole(
     (level, message) => op_console_write(level, message, dd.runtimeRequestId()),
     () => frozenPerfMs,

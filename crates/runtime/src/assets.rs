@@ -1,6 +1,8 @@
 pub const WORKER_SPECIFIER: &str = "file:///dd/worker.js";
-pub const BOOTSTRAP_SPECIFIER: &str = "file:///dd/bootstrap.js";
-pub const EXECUTE_WORKER_SPECIFIER: &str = "file:///dd/execute_worker.js";
+pub const BOOTSTRAP_SPECIFIER: &str = "ext:bootstrap.js";
+/// The units under js/execute_worker run as one script, named for their
+/// directory.
+pub const EXECUTE_WORKER_SPECIFIER: &str = "ext:execute_worker";
 
 pub const BOOTSTRAP_JS: &str = include_str!("../js/bootstrap.js");
 

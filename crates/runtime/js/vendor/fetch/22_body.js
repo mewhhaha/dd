@@ -28,19 +28,19 @@ const {
   WeakMapPrototypeSet,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const {
   parseUrlEncoded,
   URLSearchParamsPrototype,
-} = core.loadExtScript("ext:deno_web/00_url.js");
+} = core.loadExtScript("ext:vendor/web/00_url.js");
 const {
   formDataFromEntries,
   FormDataPrototype,
   formDataToBlob,
   parseFormData,
-} = core.loadExtScript("ext:deno_fetch/21_formdata.js");
-const mimesniff = core.loadExtScript("ext:deno_web/01_mimesniff.js");
-const { BlobPrototype } = core.loadExtScript("ext:deno_web/09_file.js");
+} = core.loadExtScript("ext:vendor/fetch/21_formdata.js");
+const mimesniff = core.loadExtScript("ext:vendor/web/01_mimesniff.js");
+const { BlobPrototype } = core.loadExtScript("ext:vendor/web/09_file.js");
 const {
   createProxy,
   createReadableStream,
@@ -52,9 +52,9 @@ const {
   ReadableStreamPrototype,
   readableStreamTee,
   readableStreamThrowIfErrored,
-} = core.loadExtScript("ext:deno_web/06_streams.js");
+} = core.loadExtScript("ext:vendor/web/06_streams.js");
 const { TextDecoderStream } = core.loadExtScript(
-  "ext:deno_web/08_text_encoding.js",
+  "ext:vendor/web/08_text_encoding.js",
 );
 
 const noop = () => {};

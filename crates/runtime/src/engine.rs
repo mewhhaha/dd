@@ -66,7 +66,7 @@ pub async fn build_bootstrap_snapshot() -> Result<&'static [u8]> {
                 .execute_with_ops("ext:core/core.js", CORE_JS)
                 .map_err(runtime_error)?;
             for (name, source) in [
-                ("ext:dd/web/init.js", WEB_INIT_JS),
+                ("ext:web/init.js", WEB_INIT_JS),
                 (BOOTSTRAP_SPECIFIER, BOOTSTRAP_JS),
                 (EXECUTE_WORKER_SPECIFIER, EXECUTE_WORKER_JS),
             ] {

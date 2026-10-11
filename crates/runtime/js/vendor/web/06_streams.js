@@ -1,11 +1,5 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// @ts-check
-/// <reference path="../webidl/internal.d.ts" />
-/// <reference path="./06_streams_types.d.ts" />
-/// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
-/// <reference lib="esnext" />
-
 return (function () {
 const { core, primordials } = __bootstrap;
 const {
@@ -75,9 +69,9 @@ const {
   queueMicrotask,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { structuredClone } = core.loadExtScript(
-  "ext:deno_web/02_structured_clone.js",
+  "ext:vendor/web/02_structured_clone.js",
 );
 const {
   AbortSignalPrototype,
@@ -85,13 +79,13 @@ const {
   newSignal,
   remove,
   signalAbort,
-} = core.loadExtScript("ext:deno_web/03_abort_signal.js");
+} = core.loadExtScript("ext:vendor/web/03_abort_signal.js");
 
 const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:deno_web/01_console.js",
+  "ext:web/console.js",
 );
 const { assert, AssertionError } = core.loadExtScript(
-  "ext:deno_web/00_infra.js",
+  "ext:vendor/web/00_infra.js",
 );
 
 /** @template T */

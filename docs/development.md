@@ -63,10 +63,13 @@ The JavaScript runtime is `crates/dd_v8`, dd's embedding of V8 through
 `rusty_v8`: isolates, startup snapshots, ops, ES modules, and the event loop.
 The web platform layer (`URL`, `fetch`'s classes, streams, encoding, events,
 Web Crypto) runs on it. Its JavaScript lives under `crates/runtime/js/vendor`
-(ported from Deno, MIT) and `crates/runtime/js/web`, its ops under
-`crates/runtime/src/web`, and `crates/runtime/js/core` holds the `core` object
-those scripts are written against. These files are dd's own code; edit them in
-place.
+(ported from Deno, MIT; its README says from where) and
+`crates/runtime/js/web`, its ops under `crates/runtime/src/web`, and
+`crates/runtime/js/core` holds the `core` object those scripts are written
+against. Each runtime script runs under the specifier `ext:` plus its path
+under `crates/runtime/js`, such as `ext:vendor/web/06_streams.js`; the
+execute-worker units run together as `ext:execute_worker`. These files are
+dd's own code; edit them in place.
 
 Optional tracing env:
 

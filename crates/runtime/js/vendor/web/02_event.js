@@ -40,8 +40,8 @@ const {
   globalThis,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
-const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
+const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
 
 // Lazy-load createFilteredInspectProxy from console to avoid
 // circular dependency at load time. Only needed for custom inspect.
@@ -49,7 +49,7 @@ let _createFilteredInspectProxy;
 function getCreateFilteredInspectProxy() {
   if (!_createFilteredInspectProxy) {
     _createFilteredInspectProxy = core.loadExtScript(
-      "ext:deno_web/01_console.js",
+      "ext:web/console.js",
     ).createFilteredInspectProxy;
   }
   return _createFilteredInspectProxy;

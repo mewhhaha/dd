@@ -2,27 +2,27 @@
 
 return (function () {
 const { core, primordials } = __bootstrap;
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:deno_web/01_console.js",
+  "ext:web/console.js",
 );
 const {
   byteLowerCase,
   HTTP_TAB_OR_SPACE,
   regexMatcher,
   serializeJSValueToJSONString,
-} = core.loadExtScript("ext:deno_web/00_infra.js");
+} = core.loadExtScript("ext:vendor/web/00_infra.js");
 const { extractBody, mixinBody } = core.loadExtScript(
-  "ext:deno_fetch/22_body.js",
+  "ext:vendor/fetch/22_body.js",
 );
-const { extractMimeType } = core.loadExtScript("ext:deno_web/01_mimesniff.js");
-const { URL } = core.loadExtScript("ext:deno_web/00_url.js");
+const { extractMimeType } = core.loadExtScript("ext:vendor/web/01_mimesniff.js");
+const { URL } = core.loadExtScript("ext:vendor/web/00_url.js");
 const {
   fillHeaderList,
   getDecodeSplitHeader,
   guardFromHeaders,
   headersFromHeaderList,
-} = core.loadExtScript("ext:deno_fetch/20_headers.js");
+} = core.loadExtScript("ext:vendor/fetch/20_headers.js");
 const {
   ArrayPrototypeMap,
   ArrayPrototypePush,

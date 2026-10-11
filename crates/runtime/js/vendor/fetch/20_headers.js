@@ -21,7 +21,7 @@ const {
   TypeError,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const {
   byteLowerCase,
   collectHttpQuotedString,
@@ -30,7 +30,7 @@ const {
   HTTP_TAB_OR_SPACE_SUFFIX_RE,
   HTTP_TOKEN_CODE_POINT_RE,
   httpTrim,
-} = core.loadExtScript("ext:deno_web/00_infra.js");
+} = core.loadExtScript("ext:vendor/web/00_infra.js");
 
 const _headerList = Symbol("header list");
 const _lowerNames = Symbol("lowercase header names");

@@ -1,14 +1,5 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// @ts-check
-/// <reference path="../../core/lib.deno_core.d.ts" />
-/// <reference path="../../core/internal.d.ts" />
-/// <reference path="../webidl/internal.d.ts" />
-/// <reference path="../../cli/tsc/dts/lib.deno_fetch.d.ts" />
-/// <reference path="../web/internal.d.ts" />
-/// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
-/// <reference lib="esnext" />
-
 return (function () {
 const { core, primordials } = __bootstrap;
 const {
@@ -45,9 +36,9 @@ const {
   Uint8Array,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:deno_web/01_console.js",
+  "ext:web/console.js",
 );
 
 const decoderStates = new FinalizationRegistry((handle) =>

@@ -12,34 +12,36 @@ mod url_parse;
 mod urlpattern;
 
 macro_rules! ext_scripts {
-    ($($specifier:literal => $path:literal),* $(,)?) => {
+    ($($path:literal),* $(,)?) => {
         /// The web layer's scripts, loaded on first use by
         /// `core.loadExtScript(specifier)`. Each evaluates to its exports.
-        const EXT_SCRIPTS: &[(&str, &str)] = &[$(($specifier, include_str!($path))),*];
+        /// A script's specifier is `ext:` and its path under `js/`.
+        const EXT_SCRIPTS: &[(&str, &str)] =
+            &[$((concat!("ext:", $path), include_str!(concat!("../../js/", $path)))),*];
     };
 }
 
 ext_scripts! {
-    "ext:deno_webidl/00_webidl.js" => "../../js/vendor/deno_webidl/00_webidl.js",
-    "ext:deno_web/00_infra.js" => "../../js/vendor/deno_web/00_infra.js",
-    "ext:deno_web/00_url.js" => "../../js/vendor/deno_web/00_url.js",
-    "ext:deno_web/01_console.js" => "../../js/web/console.js",
-    "ext:deno_web/01_dom_exception.js" => "../../js/vendor/deno_web/01_dom_exception.js",
-    "ext:deno_web/01_mimesniff.js" => "../../js/vendor/deno_web/01_mimesniff.js",
-    "ext:deno_web/01_urlpattern.js" => "../../js/vendor/deno_web/01_urlpattern.js",
-    "ext:deno_web/02_event.js" => "../../js/vendor/deno_web/02_event.js",
-    "ext:deno_web/02_structured_clone.js" => "../../js/vendor/deno_web/02_structured_clone.js",
-    "ext:deno_web/03_abort_signal.js" => "../../js/vendor/deno_web/03_abort_signal.js",
-    "ext:deno_web/06_streams.js" => "../../js/vendor/deno_web/06_streams.js",
-    "ext:deno_web/08_text_encoding.js" => "../../js/vendor/deno_web/08_text_encoding.js",
-    "ext:deno_web/09_file.js" => "../../js/vendor/deno_web/09_file.js",
-    "ext:deno_web/15_performance.js" => "../../js/vendor/deno_web/15_performance.js",
-    "ext:deno_fetch/20_headers.js" => "../../js/vendor/deno_fetch/20_headers.js",
-    "ext:deno_fetch/21_formdata.js" => "../../js/vendor/deno_fetch/21_formdata.js",
-    "ext:deno_fetch/22_body.js" => "../../js/vendor/deno_fetch/22_body.js",
-    "ext:deno_fetch/23_request.js" => "../../js/vendor/deno_fetch/23_request.js",
-    "ext:deno_fetch/23_response.js" => "../../js/vendor/deno_fetch/23_response.js",
-    "ext:deno_crypto/00_crypto.js" => "../../js/vendor/deno_crypto/00_crypto.js",
+    "vendor/webidl/00_webidl.js",
+    "vendor/web/00_infra.js",
+    "vendor/web/00_url.js",
+    "web/console.js",
+    "vendor/web/01_dom_exception.js",
+    "vendor/web/01_mimesniff.js",
+    "vendor/web/01_urlpattern.js",
+    "vendor/web/02_event.js",
+    "vendor/web/02_structured_clone.js",
+    "vendor/web/03_abort_signal.js",
+    "vendor/web/06_streams.js",
+    "vendor/web/08_text_encoding.js",
+    "vendor/web/09_file.js",
+    "vendor/web/15_performance.js",
+    "vendor/fetch/20_headers.js",
+    "vendor/fetch/21_formdata.js",
+    "vendor/fetch/22_body.js",
+    "vendor/fetch/23_request.js",
+    "vendor/fetch/23_response.js",
+    "vendor/crypto/00_crypto.js",
 }
 
 pub(crate) fn ops() -> Vec<OpDecl> {

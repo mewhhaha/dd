@@ -1,11 +1,5 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// @ts-check
-/// <reference path="../../core/lib.deno_core.d.ts" />
-/// <reference path="../../core/internal.d.ts" />
-/// <reference path="../web/internal.d.ts" />
-/// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
-
 return (function () {
 const { core, primordials } = __bootstrap;
 const {
@@ -41,7 +35,7 @@ const {
   Float64Array,
 } = primordials;
 
-const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
 
 const objectCloneMemo = new SafeWeakMap();
 

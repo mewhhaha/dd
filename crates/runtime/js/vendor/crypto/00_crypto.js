@@ -1,11 +1,5 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// @ts-check
-/// <reference path="../../core/internal.d.ts" />
-/// <reference path="../../core/lib.deno_core.d.ts" />
-/// <reference path="../webidl/internal.d.ts" />
-/// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
-
 return (function () {
 const { core, primordials } = __bootstrap;
 const {
@@ -89,11 +83,11 @@ const {
   WeakMapPrototypeSet,
 } = primordials;
 
-const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
+const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:deno_web/01_console.js",
+  "ext:web/console.js",
 );
-const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
+const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
 
 const supportedNamedCurves = ["P-256", "P-384", "P-521"];
 const recognisedUsages = [
