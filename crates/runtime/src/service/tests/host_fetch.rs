@@ -78,8 +78,11 @@ async fn echo_requests(listener: TcpListener, count: usize) {
 async fn host_fetch_encodes_native_body_types_and_honors_request_init_overrides() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    // The limit only stops a lost request from hanging the suite. It also
+    // covers service start and deploy, which a loaded machine can stretch
+    // past a few seconds.
     let server = tokio::spawn(async move {
-        timeout(Duration::from_secs(5), echo_requests(listener, 5))
+        timeout(Duration::from_secs(30), echo_requests(listener, 5))
             .await
             .unwrap();
     });
