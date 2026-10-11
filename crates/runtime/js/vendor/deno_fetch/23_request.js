@@ -1,21 +1,15 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
 return (function () {
-const { core, internals, primordials } = __bootstrap;
+const { core, primordials } = __bootstrap;
 const {
   ArrayPrototypeMap,
   ArrayPrototypeSlice,
   ArrayPrototypeSplice,
-  FunctionPrototypeCall,
-  JSONParse,
-  ObjectDefineProperty,
   ObjectKeys,
   ObjectPrototypeIsPrototypeOf,
-  PromiseReject,
-  PromiseResolve,
   RegExpPrototypeExec,
   SafeArrayIterator,
-  StringPrototypeStartsWith,
   StringPrototypeToUpperCase,
   Symbol,
   SymbolFor,
@@ -34,60 +28,38 @@ const { extractBody, mixinBody } = core.loadExtScript(
   "ext:deno_fetch/22_body.js",
 );
 const { extractMimeType } = core.loadExtScript("ext:deno_web/01_mimesniff.js");
-const { blobFromObjectUrl } = core.loadExtScript("ext:deno_web/09_file.js");
 const {
   fillHeaders,
   getDecodeSplitHeader,
   guardFromHeaders,
   headerListFromHeaders,
   headersFromHeaderList,
-  headersFromHeaderListLazyTarget,
 } = core.loadExtScript("ext:deno_fetch/20_headers.js");
 const {
   createDependentAbortSignal,
   newSignal,
-  signalAbort,
 } = core.loadExtScript("ext:deno_web/03_abort_signal.js");
-const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
 
 const _request = Symbol("request");
 const _headers = Symbol("headers");
-const _getHeaders = Symbol("get headers");
 const _headersCache = Symbol("headers cache");
 const _headersGuard = Symbol("headers guard");
 const _signal = Symbol("signal");
 const _signalCache = Symbol("signalCache");
 const _mimeType = Symbol("mime type");
 const _body = Symbol("body");
-const _url = Symbol("url");
-const _method = Symbol("method");
 const _brand = webidl.brand;
-
-/**
- * @param {(() => string)[]} urlList
- * @param {string[]} urlListProcessed
- */
-function processUrlList(urlList, urlListProcessed) {
-  for (let i = 0; i < urlList.length; i++) {
-    if (urlListProcessed[i] === undefined) {
-      urlListProcessed[i] = urlList[i]();
-    }
-  }
-  return urlListProcessed;
-}
 
 /**
  * Fields named `*Mode`, `mode`, `referrer*`, `integrity`, and `keepalive` are
  * only set on the inner object when the constructor's init bag customized
- * them away from the spec default. Leaving them off the object literal keeps
- * the V8 hidden class for `Deno.serve()`-created requests unchanged. The
- * getters substitute the spec defaults when a field is missing.
+ * them away from the spec default, so most requests share one hidden class.
+ * The getters substitute the spec defaults when a field is missing.
  *
  * @typedef InnerRequest
- * @property {() => string} method
- * @property {() => string} url
- * @property {() => string} currentUrl
- * @property {() => [string, string][]} headerList
+ * @property {string} method
+ * @property {string} url
+ * @property {[string, string][]} headerList
  * @property {null | typeof __window.bootstrap.fetchBody.InnerBody} body
  * @property {undefined | "default" | "no-store" | "reload" | "no-cache" | "force-cache" | "only-if-cached"} [cacheMode]
  * @property {undefined | "omit" | "same-origin" | "include"} [credentialsMode]
@@ -98,78 +70,20 @@ function processUrlList(urlList, urlListProcessed) {
  * @property {"follow" | "error" | "manual"} redirectMode
  * @property {undefined | string} [referrer] "client", "no-referrer", or a serialized URL
  * @property {undefined | "" | "no-referrer" | "no-referrer-when-downgrade" | "same-origin" | "origin" | "strict-origin" | "origin-when-cross-origin" | "strict-origin-when-cross-origin" | "unsafe-url"} [referrerPolicy]
- * @property {number} redirectCount
- * @property {(() => string)[]} urlList
- * @property {string[]} urlListProcessed
- * @property {Blob | null} blobUrlEntry
  */
 
 /**
  * @param {string} method
- * @param {string | () => string} url
- * @param {() => [string, string][]} headerList
- * @param {typeof __window.bootstrap.fetchBody.InnerBody} body
- * @param {boolean} maybeBlob
+ * @param {string} url
  * @returns {InnerRequest}
  */
-function newInnerRequest(method, url, headerList, body, maybeBlob) {
-  let blobUrlEntry = null;
-  if (
-    maybeBlob &&
-    typeof url === "string" &&
-    StringPrototypeStartsWith(url, "blob:")
-  ) {
-    blobUrlEntry = blobFromObjectUrl(url);
-  }
+function newInnerRequest(method, url) {
   return {
-    methodInner: method,
-    get method() {
-      return this.methodInner;
-    },
-    set method(value) {
-      this.methodInner = value;
-    },
-    headerListInner: null,
-    get headerList() {
-      if (this.headerListInner === null) {
-        try {
-          this.headerListInner = headerList();
-        } catch {
-          throw new TypeError("Cannot read headers: request closed");
-        }
-      }
-      return this.headerListInner;
-    },
-    set headerList(value) {
-      this.headerListInner = value;
-    },
-    body,
+    method,
+    url,
+    headerList: [],
+    body: null,
     redirectMode: "follow",
-    redirectCount: 0,
-    urlList: [typeof url === "string" ? () => url : url],
-    urlListProcessed: [],
-    blobUrlEntry,
-    url() {
-      if (this.urlListProcessed[0] === undefined) {
-        try {
-          this.urlListProcessed[0] = this.urlList[0]();
-        } catch {
-          throw new TypeError("cannot read url: request closed");
-        }
-      }
-      return this.urlListProcessed[0];
-    },
-    currentUrl() {
-      const currentIndex = this.urlList.length - 1;
-      if (this.urlListProcessed[currentIndex] === undefined) {
-        try {
-          this.urlListProcessed[currentIndex] = this.urlList[currentIndex]();
-        } catch {
-          throw new TypeError("Cannot read url: request closed");
-        }
-      }
-      return this.urlListProcessed[currentIndex];
-    },
   };
 }
 
@@ -192,34 +106,10 @@ function cloneInnerRequest(request, skipBody = false) {
 
   const cloned = {
     method: request.method,
+    url: request.url,
     headerList,
     body,
     redirectMode: request.redirectMode,
-    redirectCount: request.redirectCount,
-    urlList: [() => request.url()],
-    urlListProcessed: [request.url()],
-    blobUrlEntry: request.blobUrlEntry,
-    url() {
-      if (this.urlListProcessed[0] === undefined) {
-        try {
-          this.urlListProcessed[0] = this.urlList[0]();
-        } catch {
-          throw new TypeError("Cannot read url: request closed");
-        }
-      }
-      return this.urlListProcessed[0];
-    },
-    currentUrl() {
-      const currentIndex = this.urlList.length - 1;
-      if (this.urlListProcessed[currentIndex] === undefined) {
-        try {
-          this.urlListProcessed[currentIndex] = this.urlList[currentIndex]();
-        } catch {
-          throw new TypeError("Cannot read url: request closed");
-        }
-      }
-      return this.urlListProcessed[currentIndex];
-    },
   };
   if (request.cacheMode !== undefined) cloned.cacheMode = request.cacheMode;
   if (request.credentialsMode !== undefined) {
@@ -284,27 +174,16 @@ class Request {
   [_request];
   /** @type {Headers} */
   [_headersCache];
-  [_getHeaders];
   [_headersGuard];
   [_signalCache];
-  [_url];
-  [_method];
 
   /** @type {Headers} */
   get [_headers]() {
     if (this[_headersCache] === undefined) {
-      const getHeaders = this[_getHeaders];
-      if (getHeaders !== undefined && getHeaders !== null) {
-        this[_headersCache] = getHeaders();
-      } else {
-        const inner = this[_request];
-        const guard = this[_headersGuard];
-        if (typeof inner.header !== "function") {
-          this[_headersCache] = headersFromHeaderList(inner.headerList, guard);
-        } else {
-          this[_headersCache] = headersFromHeaderListLazyTarget(inner, guard);
-        }
-      }
+      this[_headersCache] = headersFromHeaderList(
+        this[_request].headerList,
+        this[_headersGuard],
+      );
     }
     return this[_headersCache];
   }
@@ -315,30 +194,13 @@ class Request {
 
   /** @type {AbortSignal} */
   get [_signal]() {
-    const signal = this[_signalCache];
-    // This signal has not been created yet, but the request has already completed
-    if (signal === false) {
-      const signal = newSignal();
-      this[_signalCache] = signal;
-      signal[signalAbort](
-        new DOMException(MESSAGE_REQUEST_CANCELLED, "AbortError"),
-      );
-      return signal;
-    }
-
-    // This signal not been created yet, and the request is still in progress
+    let signal = this[_signalCache];
+    // A request made without a signal gets one that never aborts, on first
+    // use.
     if (signal === undefined) {
-      const signal = newSignal();
+      signal = newSignal();
       this[_signalCache] = signal;
-      this[_request].onCancel?.(() => {
-        signal[signalAbort](
-          new DOMException(MESSAGE_REQUEST_CANCELLED, "AbortError"),
-        );
-      });
-
-      return signal;
     }
-
     return signal;
   }
   get [_mimeType]() {
@@ -383,13 +245,7 @@ class Request {
     // 5.
     if (typeof input === "string") {
       const parsedURL = new URL(input);
-      request = newInnerRequest(
-        "GET",
-        parsedURL.href,
-        () => [],
-        null,
-        true,
-      );
+      request = newInnerRequest("GET", parsedURL.href);
     } else { // 6.
       if (!ObjectPrototypeIsPrototypeOf(RequestPrototype, input)) {
         throw new TypeError("Unreachable");
@@ -397,7 +253,6 @@ class Request {
       const originalReq = input[_request];
       // fold in of step 12 from below
       request = cloneInnerRequest(originalReq, true);
-      request.redirectCount = 0; // reset to 0 - cloneInnerRequest copies the value
       signal = input[_signal];
     }
 
@@ -571,21 +426,12 @@ class Request {
 
   get method() {
     webidl.assertBranded(this, RequestPrototype);
-    if (this[_method]) {
-      return this[_method];
-    }
-    this[_method] = this[_request].method;
-    return this[_method];
+    return this[_request].method;
   }
 
   get url() {
     webidl.assertBranded(this, RequestPrototype);
-    if (this[_url]) {
-      return this[_url];
-    }
-
-    this[_url] = this[_request].url();
-    return this[_url];
+    return this[_request].url;
   }
 
   get headers() {
@@ -688,25 +534,6 @@ class Request {
 webidl.configureInterface(Request);
 const RequestPrototype = Request.prototype;
 mixinBody(RequestPrototype, _body, _mimeType);
-const requestJson = RequestPrototype.json;
-ObjectDefineProperty(RequestPrototype, "json", {
-  __proto__: null,
-  value: function json() {
-    try {
-      webidl.assertBranded(this, RequestPrototype);
-      const text = this[_request].consumeTextBody?.();
-      if (text !== null && text !== undefined) {
-        return PromiseResolve(JSONParse(text));
-      }
-    } catch (error) {
-      return PromiseReject(error);
-    }
-    return FunctionPrototypeCall(requestJson, this);
-  },
-  writable: true,
-  configurable: true,
-  enumerable: true,
-});
 
 webidl.converters["Request"] = webidl.createInterfaceConverter(
   "Request",
@@ -809,64 +636,5 @@ webidl.converters["RequestInit"] = webidl.createDictionaryConverter(
   ],
 );
 
-/**
- * @param {Request} request
- * @returns {InnerRequest}
- */
-function toInnerRequest(request) {
-  return request[_request];
-}
-
-function requestHeadersExposed(request) {
-  return request?.[_headersCache] !== undefined;
-}
-
-function cacheRequestHeaders(request) {
-  if (request?.[_headersCache] !== undefined) {
-    headerListFromHeaders(request[_headersCache]);
-  }
-}
-
-/**
- * @param {InnerRequest} inner
- * @param {"request" | "immutable" | "request-no-cors" | "response" | "none"} guard
- * @returns {Request}
- */
-function fromInnerRequest(inner, guard) {
-  const request = new Request(_brand);
-  request[_request] = inner;
-  request[_headersGuard] = guard;
-  return request;
-}
-
-const MESSAGE_REQUEST_CANCELLED = "The request has been cancelled.";
-
-function abortRequest(request) {
-  if (request[_signalCache] !== undefined) {
-    request[_signal][signalAbort](
-      new DOMException(MESSAGE_REQUEST_CANCELLED, "AbortError"),
-    );
-  } else {
-    request[_signalCache] = false;
-  }
-}
-
-function getCachedAbortSignal(request) {
-  return request[_signalCache];
-}
-
-// For testing
-internals.getCachedAbortSignal = getCachedAbortSignal;
-
-return {
-  abortRequest,
-  cacheRequestHeaders,
-  fromInnerRequest,
-  newInnerRequest,
-  processUrlList,
-  Request,
-  RequestPrototype,
-  requestHeadersExposed,
-  toInnerRequest,
-};
+return { Request };
 })();

@@ -8,7 +8,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use url::Url;
 use uuid::Uuid;
 
 /// A part's bytes and the range of them it covers.
@@ -25,15 +24,9 @@ impl Part {
     }
 }
 
-struct ObjectUrlBlob {
-    media_type: String,
-    parts: Vec<Part>,
-}
-
 #[derive(Default)]
 struct BlobStore {
     parts: HashMap<String, Part>,
-    object_urls: HashMap<String, ObjectUrlBlob>,
 }
 
 fn store(state: &mut OpState) -> &mut BlobStore {
@@ -127,60 +120,8 @@ pub(super) fn op_blob_clone_part(
     })
 }
 
-pub(super) fn op_blob_create_object_url(
-    state: &mut OpState,
-    media_type: String,
-    part_ids: Vec<String>,
-) -> Result<String, OpError> {
-    let store = store(state);
-    let parts = part_ids
-        .iter()
-        .map(|id| store.parts.get(id).cloned().ok_or_else(part_not_found))
-        .collect::<Result<Vec<_>, _>>()?;
-    let url = format!("blob:null/{}", Uuid::new_v4());
-    store
-        .object_urls
-        .insert(url.clone(), ObjectUrlBlob { media_type, parts });
-    Ok(url)
-}
-
-pub(super) fn op_blob_revoke_object_url(state: &mut OpState, url: String) -> Result<(), OpError> {
-    let url = Url::parse(&url).map_err(|error| OpError::new(error.to_string()))?;
-    store(state).object_urls.remove(url.as_str());
-    Ok(())
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ReturnBlob {
-    media_type: String,
-    parts: Vec<ReturnBlobPart>,
-}
-
-pub(super) fn op_blob_from_object_url(
-    state: &mut OpState,
-    url: String,
-) -> Result<Option<ReturnBlob>, OpError> {
-    let mut url = Url::parse(&url).map_err(|error| OpError::new(error.to_string()))?;
-    if url.scheme() != "blob" {
-        return Ok(None);
-    }
-    url.set_fragment(None);
-    let store = store(state);
-    let Some(blob) = store.object_urls.get(url.as_str()) else {
-        return Ok(None);
-    };
-    let media_type = blob.media_type.clone();
-    let parts = blob.parts.clone();
-    let parts = parts
-        .into_iter()
-        .map(|part| {
-            let size = part.len;
-            ReturnBlobPart {
-                uuid: insert(store, part),
-                size,
-            }
-        })
-        .collect();
-    Ok(Some(ReturnBlob { media_type, parts }))
+/// A fresh object URL. Nothing in the runtime resolves object URLs (fetch
+/// reaches only the network), so the blob it names is not kept.
+pub(super) fn op_blob_create_object_url(_state: &mut OpState) -> String {
+    format!("blob:null/{}", Uuid::new_v4())
 }

@@ -37,9 +37,6 @@ const _lowerNames = Symbol("lowercase header names");
 const _iterableHeaders = Symbol("iterable headers");
 const _iterableHeadersCache = Symbol("iterable headers cache");
 const _guard = Symbol("guard");
-const _headerListGetter = Symbol("header list getter");
-const _headerGet = Symbol("header get");
-const _headerTarget = Symbol("header target");
 const _brand = webidl.brand;
 const webidlConverterByteString = webidl.converters.ByteString;
 const webidlConverterSequenceByteString =
@@ -52,10 +49,6 @@ const webidlConverterSequenceByteString =
  * Rebuilt from scratch when the lengths diverge, which catches the
  * `Request` constructor's splice/refill block, which empties `_headerList`
  * without going through `appendHeader` / `set` / `delete`.
- *
- * `initializeAResponse` (`23_response.js`) reads via `ensureLowerNames`
- * directly and pushes to both arrays in lockstep, so its mutation no longer
- * relies on the length-divergence rebuild.
  */
 function ensureLowerNames(headers) {
   let lower = headers[_lowerNames];
@@ -351,9 +344,6 @@ class Headers {
   [_headerList] = [];
   /** @type {string[] | null} parallel to _headerList, lazily populated */
   [_lowerNames] = null;
-  [_headerListGetter] = null;
-  [_headerGet] = null;
-  [_headerTarget] = null;
   /** @type {"immutable" | "request" | "request-no-cors" | "response" | "none"} */
   [_guard];
 
@@ -492,14 +482,6 @@ class Headers {
       name === "authorization" || name === "content-type" ||
       name === "accept" || name === "host"
     ) {
-      const headerGet = this[_headerGet];
-      if (headerGet !== null) {
-        return headerGet(name);
-      }
-      const headerTarget = this[_headerTarget];
-      if (headerTarget !== null) {
-        return headerTarget.header(name);
-      }
       const list = headerListFromHeaders(this);
       return getHeader(list, name);
     }
@@ -507,15 +489,6 @@ class Headers {
 
     if (!checkHeaderNameForHttpTokenCodePoint(name)) {
       throw new TypeError(`Invalid header name: "${name}"`);
-    }
-
-    const headerGet = this[_headerGet];
-    if (headerGet !== null) {
-      return headerGet(name);
-    }
-    const headerTarget = this[_headerTarget];
-    if (headerTarget !== null) {
-      return headerTarget.header(name);
     }
 
     const list = headerListFromHeaders(this);
@@ -699,28 +672,6 @@ function headersFromHeaderList(list, guard) {
   return headers;
 }
 
-function headersFromHeaderListLazy(headerList, guard, getHeader) {
-  const headers = new Headers(_brand);
-  headers[_headerList] = null;
-  headers[_lowerNames] = null;
-  headers[_headerListGetter] = headerList;
-  headers[_headerGet] = getHeader;
-  headers[_headerTarget] = null;
-  headers[_guard] = guard;
-  return headers;
-}
-
-function headersFromHeaderListLazyTarget(target, guard) {
-  const headers = new Headers(_brand);
-  headers[_headerList] = null;
-  headers[_lowerNames] = null;
-  headers[_headerListGetter] = null;
-  headers[_headerGet] = null;
-  headers[_headerTarget] = target;
-  headers[_guard] = guard;
-  return headers;
-}
-
 /**
  * Returns the underlying header list for direct mutation (used by
  * `initializeAResponse` and the `Request` constructor's splice/refill block).
@@ -738,17 +689,7 @@ function headersFromHeaderListLazyTarget(target, guard) {
  * @returns {HeaderList}
  */
 function headerListFromHeaders(headers) {
-  let list = headers[_headerList];
-  if (list === null) {
-    const target = headers[_headerTarget];
-    list = target === null ? headers[_headerListGetter]() : target.headerList;
-    headers[_headerList] = list;
-    headers[_lowerNames] = null;
-    headers[_headerListGetter] = null;
-    headers[_headerGet] = null;
-    headers[_headerTarget] = null;
-  }
-  return list;
+  return headers[_headerList];
 }
 
 /**
@@ -759,26 +700,13 @@ function guardFromHeaders(headers) {
   return headers[_guard];
 }
 
-/**
- * @param {Headers} headers
- * @returns {[string, string][]}
- */
-function headersEntries(headers) {
-  return headers[_iterableHeaders];
-}
-
 return {
   fillHeaderList,
-  ensureLowerNames,
   fillHeaders,
   getDecodeSplitHeader,
-  getHeader,
   guardFromHeaders,
   headerListFromHeaders,
   Headers,
-  headersEntries,
   headersFromHeaderList,
-  headersFromHeaderListLazy,
-  headersFromHeaderListLazyTarget,
 };
 })();

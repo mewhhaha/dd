@@ -69,8 +69,6 @@ pub(crate) fn ops() -> Vec<OpDecl> {
         op_sync!(op_blob_remove_part),
         op_sync!(op_blob_clone_part),
         op_sync!(op_blob_create_object_url),
-        op_sync!(op_blob_revoke_object_url),
-        op_sync!(op_blob_from_object_url),
         op_sync!(op_now),
         op_sync!(op_time_origin),
     ]
