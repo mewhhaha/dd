@@ -47,50 +47,50 @@ const {
 const inspectorConsole = globalThis.console;
 
 const {
-  AbortController: DenoAbortController,
-  AbortSignal: DenoAbortSignal,
-  Blob: DenoBlob,
+  AbortController,
+  AbortSignal,
+  Blob,
   ByteLengthQueuingStrategy,
   CloseEvent,
   CountQueuingStrategy,
   Crypto,
-  CryptoKey: DenoCryptoKey,
+  CryptoKey,
   CustomEvent,
   DOMException,
   ErrorEvent,
   Event,
   EventTarget,
-  File: DenoFile,
-  FormData: DenoFormData,
-  Headers: DenoHeaders,
+  File,
+  FormData,
+  Headers,
   MessageEvent,
   ProgressEvent,
   PromiseRejectionEvent,
   ReadableByteStreamController,
-  ReadableStream: DenoReadableStream,
+  ReadableStream,
   ReadableStreamBYOBReader,
   ReadableStreamBYOBRequest,
   ReadableStreamDefaultController,
   ReadableStreamDefaultReader,
-  Request: DenoRequest,
-  Response: DenoResponse,
+  Request,
+  Response,
   SubtleCrypto,
-  TextDecoder: DenoTextDecoder,
+  TextDecoder,
   TextDecoderStream,
-  TextEncoder: DenoTextEncoder,
+  TextEncoder,
   TextEncoderStream,
-  TransformStream: DenoTransformStream,
+  TransformStream,
   TransformStreamDefaultController,
-  URL: DenoURL,
-  URLPattern: DenoURLPattern,
-  URLSearchParams: DenoURLSearchParams,
-  WritableStream: DenoWritableStream,
+  URL,
+  URLPattern,
+  URLSearchParams,
+  WritableStream,
   WritableStreamDefaultController,
   WritableStreamDefaultWriter,
-  fetch: denoFetch,
-  performance: denoPerformance,
+  fetch,
+  performance,
   reportError,
-  structuredClone: denoStructuredClone,
+  structuredClone,
 } = dd.web;
 
 const {
@@ -169,25 +169,25 @@ const requireRuntimeFunction = (name, value) => {
   return value;
 };
 
-const RuntimeHeaders = requireRuntimeFunction("Headers", DenoHeaders);
-const RuntimeResponse = requireRuntimeFunction("Response", DenoResponse);
-const RuntimeFormData = requireRuntimeFunction("FormData", DenoFormData);
-const RuntimeRequest = requireRuntimeFunction("Request", DenoRequest);
-const RuntimeURL = requireRuntimeFunction("URL", DenoURL);
-const RuntimeURLSearchParams = requireRuntimeFunction("URLSearchParams", DenoURLSearchParams);
-const RuntimeURLPattern = requireRuntimeFunction("URLPattern", DenoURLPattern);
-const RuntimeBlob = requireRuntimeFunction("Blob", DenoBlob);
-const RuntimeFile = requireRuntimeFunction("File", DenoFile);
-const RuntimeReadableStream = requireRuntimeFunction("ReadableStream", DenoReadableStream);
-const RuntimeWritableStream = requireRuntimeFunction("WritableStream", DenoWritableStream);
-const RuntimeTransformStream = requireRuntimeFunction("TransformStream", DenoTransformStream);
+const RuntimeHeaders = requireRuntimeFunction("Headers", Headers);
+const RuntimeResponse = requireRuntimeFunction("Response", Response);
+const RuntimeFormData = requireRuntimeFunction("FormData", FormData);
+const RuntimeRequest = requireRuntimeFunction("Request", Request);
+const RuntimeURL = requireRuntimeFunction("URL", URL);
+const RuntimeURLSearchParams = requireRuntimeFunction("URLSearchParams", URLSearchParams);
+const RuntimeURLPattern = requireRuntimeFunction("URLPattern", URLPattern);
+const RuntimeBlob = requireRuntimeFunction("Blob", Blob);
+const RuntimeFile = requireRuntimeFunction("File", File);
+const RuntimeReadableStream = requireRuntimeFunction("ReadableStream", ReadableStream);
+const RuntimeWritableStream = requireRuntimeFunction("WritableStream", WritableStream);
+const RuntimeTransformStream = requireRuntimeFunction("TransformStream", TransformStream);
 
 let frozenNowMs = DateNow();
 let frozenPerfMs = globalThis.performance?.now?.() ?? 0;
 
 function ensureAbortGlobals() {
-  define("AbortSignal", DenoAbortSignal);
-  define("AbortController", DenoAbortController);
+  define("AbortSignal", AbortSignal);
+  define("AbortController", AbortController);
 }
 
 function setFrozenTime(nowMs, perfMs = nowMs) {
@@ -208,7 +208,7 @@ function ensureFrozenTimeGlobals() {
   Date.now = () => frozenNowMs;
 
   if (globalThis.performance === undefined) {
-    define("performance", denoPerformance);
+    define("performance", performance);
   }
 
   try {
@@ -318,8 +318,8 @@ function ensureTimerGlobals() {
 }
 
 function ensureEncodingGlobals() {
-  define("TextEncoder", DenoTextEncoder);
-  define("TextDecoder", DenoTextDecoder);
+  define("TextEncoder", TextEncoder);
+  define("TextDecoder", TextDecoder);
   define("TextEncoderStream", TextEncoderStream);
   define("TextDecoderStream", TextDecoderStream);
 
@@ -359,7 +359,7 @@ function ensureEncodingGlobals() {
 }
 
 function ensureStructuredCloneGlobal() {
-  define("structuredClone", denoStructuredClone);
+  define("structuredClone", structuredClone);
 }
 
 // The request a continuation belongs to, and the stores of AsyncLocalStorage
@@ -494,7 +494,7 @@ function ensureConsoleGlobal() {
 
 function ensureCryptoGlobals() {
   define("Crypto", Crypto);
-  define("CryptoKey", DenoCryptoKey);
+  define("CryptoKey", CryptoKey);
   define("SubtleCrypto", SubtleCrypto);
   ObjectDefineProperty(globalThis, "crypto", {
     __proto__: null,
@@ -690,7 +690,7 @@ define("WritableStreamDefaultController", WritableStreamDefaultController);
 define("TransformStreamDefaultController", TransformStreamDefaultController);
 define("ByteLengthQueuingStrategy", ByteLengthQueuingStrategy);
 define("CountQueuingStrategy", CountQueuingStrategy);
-define("fetch", denoFetch);
+define("fetch", fetch);
 define("caches", new CacheStorage());
 dd.setTime = setFrozenTime;
 dd.frozenPerfNow = () => frozenPerfMs;
