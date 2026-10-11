@@ -62,7 +62,7 @@ test("environment overrides narrow dimensions and deduplicate values", async () 
   });
   assert.equal(variants.length, 2);
   assert.deepEqual(
-    variants.map((variant) => variant.envOverrides.DD_BENCH_MAX_ISOLATES),
+    variants.map((variant) => variant.envOverrides.DD_BENCH_MAX_ISOLATES_PER_WORKER),
     ["1", "2"],
   );
 });

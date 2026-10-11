@@ -142,14 +142,14 @@ export function expandMatrixVariants(configEnv, processEnv = process.env) {
   validateMarkedMatrixDimension(hasMatrixMarker, "DD_BENCH_MATRIX_ISOLATES", configEnv, processEnv);
   if (isolates.length > 0) {
     validateNoConflictingOverride(processEnv, "DD_BENCH_MIN_ISOLATES", "DD_BENCH_MATRIX_ISOLATES");
-    validateNoConflictingOverride(processEnv, "DD_BENCH_MAX_ISOLATES", "DD_BENCH_MATRIX_ISOLATES");
+    validateNoConflictingOverride(processEnv, "DD_BENCH_MAX_ISOLATES_PER_WORKER", "DD_BENCH_MATRIX_ISOLATES");
     validatePositiveIntegerList(isolates, "DD_BENCH_MATRIX_ISOLATES");
     dimensions.push(
       isolates.map((value) => ({
         label: `isolates=${value}`,
         env: {
           DD_BENCH_MIN_ISOLATES: value,
-          DD_BENCH_MAX_ISOLATES: value,
+          DD_BENCH_MAX_ISOLATES_PER_WORKER: value,
         },
       })),
     );

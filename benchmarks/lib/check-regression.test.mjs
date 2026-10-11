@@ -259,7 +259,7 @@ function config(mode, keys, isolates, throughput, sampleCount, options) {
       DD_BENCH_MODE: mode,
       DD_BENCH_MEMORY_KEY_MODE: keys,
       DD_BENCH_MIN_ISOLATES: String(isolates),
-      DD_BENCH_MAX_ISOLATES: String(isolates),
+      DD_BENCH_MAX_ISOLATES_PER_WORKER: String(isolates),
     },
     samples,
     summaries: [

@@ -758,7 +758,7 @@ async fn run_server_child() -> Result<(), String> {
         worker_store_enabled: false,
     };
     let min_isolates = env_usize_allow_zero("DD_BENCH_MIN_ISOLATES", 8);
-    let max_isolates = env_usize("DD_BENCH_MAX_ISOLATES", 8).max(min_isolates);
+    let max_isolates = env_usize("DD_BENCH_MAX_ISOLATES_PER_WORKER", 8).max(min_isolates);
     let runtime = RuntimeConfig {
         min_isolates,
         max_global_isolates: env_usize(
@@ -878,7 +878,7 @@ fn print_help() {
     println!("  DD_BENCH_REQUESTS       requests per scenario (default 4000)");
     println!("  DD_BENCH_CONCURRENCY    persistent HTTP/1 connections (default 128)");
     println!("  DD_BENCH_MIN_ISOLATES   prewarmed isolates (default 8)");
-    println!("  DD_BENCH_MAX_ISOLATES   isolate limit (default 8)");
+    println!("  DD_BENCH_MAX_ISOLATES_PER_WORKER   isolate limit (default 8)");
     println!("  DD_BENCH_MAX_GLOBAL_ISOLATES global isolate limit (default 2x max)");
     println!("  DD_BENCH_MAX_INFLIGHT   requests per isolate (default 16)");
 }

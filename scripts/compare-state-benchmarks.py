@@ -89,7 +89,7 @@ def run_sample(directory, binary, workload, side, cpus, arguments):
         "DD_BENCH_KEY_SPACE": "256", "DD_BENCH_WIDE_KEY_SPACE": "256",
         "DD_BENCH_MEMORY_KEY_MODE": "pool",
         "DD_BENCH_MIN_ISOLATES": str(arguments.isolates or len(cpus)),
-        "DD_BENCH_MAX_ISOLATES": str(arguments.isolates or len(cpus)),
+        "DD_BENCH_MAX_ISOLATES_PER_WORKER": str(arguments.isolates or len(cpus)),
         "DD_BENCH_MAX_INFLIGHT": str(arguments.inflight),
         "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES": "4096",
         "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES": str(64 * 1024 * 1024),

@@ -206,7 +206,7 @@ function summarizeSamples(samples, env) {
     requests: median(metrics.map((metric) => metric.requests)),
     concurrency: median(metrics.map((metric) => metric.concurrency)),
     isolate_min: numberOrNull(env.DD_BENCH_MIN_ISOLATES),
-    isolate_max: numberOrNull(env.DD_BENCH_MAX_ISOLATES),
+    isolate_max: numberOrNull(env.DD_BENCH_MAX_ISOLATES_PER_WORKER),
     max_inflight: numberOrNull(env.DD_BENCH_MAX_INFLIGHT),
     total_ms: median(metrics.map((metric) => metric.total_ms).filter((value) => value != null)),
     throughput_rps: median(metrics.map((metric) => metric.throughput_rps)),

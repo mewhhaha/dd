@@ -87,7 +87,7 @@ fn env_v8_flags() -> Vec<String> {
 
 fn env_custom_config(max_inflight: usize, v8_flags: &[String]) -> Option<BenchConfig> {
     let min_isolates = env_optional_usize("DD_BENCH_MIN_ISOLATES");
-    let max_isolates = env_optional_usize("DD_BENCH_MAX_ISOLATES");
+    let max_isolates = env_optional_usize("DD_BENCH_MAX_ISOLATES_PER_WORKER");
     let max_isolates = max_isolates.or(min_isolates)?;
     let min_isolates = min_isolates.unwrap_or(max_isolates).min(max_isolates);
     let name = env_name("DD_BENCH_CUSTOM_NAME")
@@ -379,7 +379,7 @@ fn print_help() {
         "  DD_BENCH_PREWARMED_ISOLATES    prewarmed config isolate count (default autoscaling)"
     );
     println!("  DD_BENCH_MIN_ISOLATES          custom config min isolates");
-    println!("  DD_BENCH_MAX_ISOLATES          custom config max isolates");
+    println!("  DD_BENCH_MAX_ISOLATES_PER_WORKER          custom config max isolates");
     println!("  DD_BENCH_CUSTOM_NAME           custom config display name");
     println!("  DD_BENCH_V8_FLAGS              whitespace-separated V8 flags");
 }

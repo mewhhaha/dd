@@ -350,7 +350,7 @@ async fn main() -> Result<(), String> {
         .unwrap_or(1);
     let runtime = RuntimeConfig {
         min_isolates,
-        max_isolates_per_worker: env_usize("DD_BENCH_MAX_ISOLATES", 1),
+        max_isolates_per_worker: env_usize("DD_BENCH_MAX_ISOLATES_PER_WORKER", 1),
         max_inflight_per_isolate: env_usize("DD_BENCH_MAX_INFLIGHT", 1),
         idle_ttl: env_duration_ms("DD_BENCH_IDLE_TTL_MS", 30_000),
         scale_tick: env_duration_ms("DD_BENCH_SCALE_TICK_MS", 1_000),
@@ -378,7 +378,7 @@ async fn main() -> Result<(), String> {
     println!(
         "# runtime min_isolates={} max_isolates={} max_inflight_per_isolate={}",
         min_isolates,
-        env_usize("DD_BENCH_MAX_ISOLATES", 1),
+        env_usize("DD_BENCH_MAX_ISOLATES_PER_WORKER", 1),
         env_usize("DD_BENCH_MAX_INFLIGHT", 1),
     );
 
@@ -519,7 +519,7 @@ fn print_help() {
     println!("  DD_BENCH_REQUESTS              requests per scenario (default 1000)");
     println!("  DD_BENCH_CONCURRENCY           concurrent requests (default 1)");
     println!("  DD_BENCH_MIN_ISOLATES          runtime min isolates (default 1)");
-    println!("  DD_BENCH_MAX_ISOLATES          runtime max isolates (default 1)");
+    println!("  DD_BENCH_MAX_ISOLATES_PER_WORKER          runtime max isolates (default 1)");
     println!("  DD_BENCH_MAX_INFLIGHT          max inflight per isolate (default 1)");
     println!("  DD_BENCH_KEY_SPACE             multikey scenario key space (default 256)");
     println!("  DD_BENCH_WIDE_KEY_SPACE        wide scenario key space (default 256)");

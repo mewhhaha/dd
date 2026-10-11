@@ -193,7 +193,7 @@ function configFixture(mode, keys, isolate, throughputRps, options) {
       DD_BENCH_MODE: mode,
       DD_BENCH_MEMORY_KEY_MODE: keys,
       DD_BENCH_MIN_ISOLATES: String(isolate),
-      DD_BENCH_MAX_ISOLATES: String(isolate),
+      DD_BENCH_MAX_ISOLATES_PER_WORKER: String(isolate),
     },
     samples: [{ sample: 1, status: options.failedSample ? 1 : 0, signal: null }],
     summaries: [
