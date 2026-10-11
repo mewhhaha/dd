@@ -29,16 +29,9 @@ impl WorkerIsolate {
             .await
             .map_err(|error| Error::new(error.to_string()))?;
         let config = RuntimeConfig::default();
-        let policy = IsolatePolicy {
-            max_op_argument_bytes: engine::op_argument_budget(
-                config.max_request_body_bytes,
-                config.max_response_body_bytes,
-            ),
-            ..IsolatePolicy::default()
-        };
         let runtime = engine::new_runtime_from_snapshot_with_heap_limit(
             snapshot,
-            policy,
+            IsolatePolicy::for_config(&config),
             config.max_isolate_heap_bytes,
             ModuleRegistry::default(),
         )

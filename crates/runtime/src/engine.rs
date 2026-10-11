@@ -1,3 +1,4 @@
+use crate::RuntimeConfig;
 use crate::assets::{
     BOOTSTRAP_JS, BOOTSTRAP_SPECIFIER, EXECUTE_WORKER_JS, EXECUTE_WORKER_SPECIFIER,
     WORKER_SPECIFIER,
@@ -101,9 +102,24 @@ pub struct IsolatePolicy {
     pub max_op_argument_bytes: usize,
 }
 
+impl IsolatePolicy {
+    /// The policy a deployed worker's isolates run under with `config`.
+    pub fn for_config(config: &RuntimeConfig) -> Self {
+        Self {
+            allow_code_generation: config.debug_code_generation,
+            unscoped_fetch: config.dev_unscoped_fetch,
+            expose_internals: config.expose_internals,
+            max_op_argument_bytes: op_argument_budget(
+                config.max_request_body_bytes,
+                config.max_response_body_bytes,
+            ),
+        }
+    }
+}
+
 /// What one op argument may copy into Rust: room for the largest request or
 /// response body the runtime accepts, and never less than dd_v8's default.
-pub fn op_argument_budget(max_request_body_bytes: usize, max_response_body_bytes: usize) -> usize {
+fn op_argument_budget(max_request_body_bytes: usize, max_response_body_bytes: usize) -> usize {
     dd_v8::serde_v8::DEFAULT_MAX_OP_ARGUMENT_BYTES
         .max(max_request_body_bytes)
         .max(max_response_body_bytes)

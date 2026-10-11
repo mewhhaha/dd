@@ -889,15 +889,7 @@ impl WorkerManager {
             )));
         };
         let reservation = admission.reservation;
-        let policy = crate::engine::IsolatePolicy {
-            allow_code_generation: self.config.debug_code_generation,
-            unscoped_fetch: self.config.dev_unscoped_fetch,
-            expose_internals: self.config.expose_internals,
-            max_op_argument_bytes: crate::engine::op_argument_budget(
-                self.config.max_request_body_bytes,
-                self.config.max_response_body_bytes,
-            ),
-        };
+        let policy = crate::engine::IsolatePolicy::for_config(&self.config);
         let isolate_id = self.next_isolate_id;
         self.next_isolate_id += 1;
         let kv_store = self.kv_store.clone();

@@ -827,15 +827,7 @@ impl RuntimeService {
             snapshot: bootstrap_snapshot,
             max_heap_bytes: runtime.max_isolate_heap_bytes,
             timeout: runtime.isolate_startup_timeout,
-            policy: crate::engine::IsolatePolicy {
-                allow_code_generation: runtime.debug_code_generation,
-                unscoped_fetch: runtime.dev_unscoped_fetch,
-                expose_internals: runtime.expose_internals,
-                max_op_argument_bytes: crate::engine::op_argument_budget(
-                    runtime.max_request_body_bytes,
-                    runtime.max_response_body_bytes,
-                ),
-            },
+            policy: crate::engine::IsolatePolicy::for_config(&runtime),
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let temporary_worker_ttl = runtime.temporary_worker_ttl;
