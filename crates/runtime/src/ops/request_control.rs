@@ -2,32 +2,6 @@ use super::*;
 
 static SERVICE_FETCH_REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn request_owner_for_scope(
-    state: &Rc<RefCell<OpState>>,
-    request_context_handle: u32,
-    empty_request_context: &'static str,
-    unavailable_scope: &'static str,
-    validate: impl FnOnce(&RequestSecretContext) -> Result<()>,
-) -> Result<(String, u64, u64)> {
-    if request_context_handle == 0 {
-        return Err(PlatformError::bad_request(empty_request_context));
-    }
-    let owner = {
-        let op_state = state.borrow();
-        let contexts = op_state.borrow::<RequestSecretContexts>();
-        let context = contexts
-            .get(request_context_handle)
-            .ok_or_else(|| PlatformError::runtime(unavailable_scope))?;
-        validate(context)?;
-        (
-            context.execution.worker_name.as_ref().to_string(),
-            context.execution.generation,
-            context.isolate_id,
-        )
-    };
-    Ok(owner)
-}
-
 fn reply_start_ok(reply_id: String) -> PendingReplyStartResult {
     PendingReplyStartResult {
         ok: true,
@@ -81,17 +55,26 @@ fn service_binding_owner_for_request(
     ))
 }
 
-pub(super) fn request_owner_for_request(
+#[cfg(test)]
+fn request_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_context_handle: u32,
 ) -> Result<(String, u64, u64)> {
-    request_owner_for_scope(
-        state,
-        request_context_handle,
-        "request context handle must not be empty",
-        "request scope is unavailable",
-        |_| Ok(()),
-    )
+    if request_context_handle == 0 {
+        return Err(PlatformError::bad_request(
+            "request context handle must not be empty",
+        ));
+    }
+    let op_state = state.borrow();
+    let context = op_state
+        .borrow::<RequestSecretContexts>()
+        .get(request_context_handle)
+        .ok_or_else(|| PlatformError::runtime("request scope is unavailable"))?;
+    Ok((
+        context.execution.worker_name.as_ref().to_string(),
+        context.execution.generation,
+        context.isolate_id,
+    ))
 }
 
 pub(super) fn op_request_reply_cancel(state: &mut OpState, reply_id: String) {
@@ -113,12 +96,14 @@ pub(super) fn op_request_control_take(state: &mut OpState) -> Vec<RequestControl
                         state.borrow_mut::<HttpPreparedBodies>().insert(output.body);
                 }
             }
+            #[cfg(test)]
             RequestControlItem::Reply(PushedReplyPayload::TestAsync(_)) => {}
         }
     }
     batch
 }
 
+#[cfg(test)]
 pub(super) fn op_test_async_reply_start(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -164,6 +149,7 @@ pub(super) fn op_test_async_reply_start(
     reply_start_ok(reply_id)
 }
 
+#[cfg(test)]
 pub(super) fn op_test_async_reply_cancel(state: &mut OpState, reply_id: String) {
     let replies = state.borrow::<TestAsyncReplies>().clone();
     replies.cancel(reply_id.trim());

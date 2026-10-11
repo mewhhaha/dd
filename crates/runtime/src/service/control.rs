@@ -143,7 +143,9 @@ pub(super) enum RuntimeEvent {
         payload: CacheRevalidatePayload,
     },
     MemorySocketClose(crate::ops::MemorySocketCloseEvent),
+    #[cfg(test)]
     TestAsyncReply(crate::ops::TestAsyncReplyEvent),
+    #[cfg(test)]
     TestAsyncReplyComplete {
         reply_id: String,
         replies: crate::ops::TestAsyncReplies,
@@ -646,9 +648,11 @@ impl WorkerManager {
             RuntimeEvent::MemorySocketClose(payload) => {
                 self.handle_memory_socket_close(payload, event_tx);
             }
+            #[cfg(test)]
             RuntimeEvent::TestAsyncReply(payload) => {
                 self.handle_test_async_reply(payload, event_tx);
             }
+            #[cfg(test)]
             RuntimeEvent::TestAsyncReplyComplete {
                 reply_id,
                 replies,
@@ -1087,6 +1091,7 @@ impl WorkerManager {
         }
     }
 
+    #[cfg(test)]
     fn handle_test_async_reply(
         &mut self,
         payload: crate::ops::TestAsyncReplyEvent,
@@ -1118,6 +1123,7 @@ impl WorkerManager {
         });
     }
 
+    #[cfg(test)]
     fn complete_test_async_reply(
         &mut self,
         reply_id: String,
@@ -1135,6 +1141,7 @@ impl WorkerManager {
         );
     }
 
+    #[cfg(test)]
     fn enqueue_isolate_reply(
         &mut self,
         worker_name: &str,

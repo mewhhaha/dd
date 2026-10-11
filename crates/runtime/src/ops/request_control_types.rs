@@ -15,6 +15,7 @@ impl WorkerSource {
     }
 }
 
+#[cfg(test)]
 pub struct TestAsyncReplyEvent {
     pub reply_id: String,
     pub replies: TestAsyncReplies,
@@ -59,16 +60,19 @@ impl PendingReplyCancellation {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct TestAsyncReplies {
     pub(crate) entries: Arc<StdMutex<HashMap<String, TestAsyncReplyEntry>>>,
     pub(crate) next_id: Arc<AtomicU64>,
 }
 
+#[cfg(test)]
 pub(crate) struct TestAsyncReplyEntry {
     pub(crate) owner: PendingReplyOwner,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub struct PendingReplyOwner {
     pub worker_name: String,
@@ -87,6 +91,7 @@ pub enum PendingReplyPayload {
 #[serde(untagged)]
 pub enum PushedReplyPayload {
     Fetch(FetchReplyResult),
+    #[cfg(test)]
     TestAsync(TestAsyncReplyResult),
 }
 
@@ -152,6 +157,7 @@ pub(crate) struct PendingReplyStartResult {
     pub(crate) error: String,
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 pub struct TestAsyncReplyResult {
     pub reply_id: String,
@@ -286,6 +292,7 @@ impl PendingReplyPayload {
     }
 }
 
+#[cfg(test)]
 impl TestAsyncReplies {
     pub fn allocate(&self, owner: PendingReplyOwner) -> String {
         let reply_id = format!("tasr-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -322,6 +329,7 @@ impl TestAsyncReplies {
     }
 }
 
+#[cfg(test)]
 pub struct TestAsyncReplyDelivery {
     pub owner: PendingReplyOwner,
     pub payload: TestAsyncReplyResult,

@@ -149,6 +149,7 @@ pub enum IsolateEventPayload {
     },
     CacheRevalidate(CacheRevalidatePayload),
     MemorySocketClose(MemorySocketCloseEvent),
+    #[cfg(test)]
     TestAsyncReply(TestAsyncReplyEvent),
 }
 
@@ -209,7 +210,7 @@ fn op_time_boundary_now(_state: &mut OpState) -> TimeBoundary {
 
 /// dd's host ops: request and response plumbing, KV, memory, and cache.
 pub(crate) fn runtime_ops() -> Vec<OpDecl> {
-    vec![
+    let ops = vec![
         op_sync!(op_console_write),
         op_async!(op_sleep),
         op_sync!(op_time_boundary_now),
@@ -232,8 +233,6 @@ pub(crate) fn runtime_ops() -> Vec<OpDecl> {
         op_sync!(op_http_response_close),
         op_sync!(op_request_reply_cancel),
         op_sync!(op_request_control_take),
-        op_sync!(op_test_async_reply_start),
-        op_sync!(op_test_async_reply_cancel),
         op_sync!(op_service_binding_fetch_start),
         op_sync!(op_request_invocation_descriptor),
         op_sync!(op_take_worker_deployment_config),
@@ -275,7 +274,17 @@ pub(crate) fn runtime_ops() -> Vec<OpDecl> {
         op_sync!(op_http_store_prepared_headers),
         op_sync!(op_http_take_prepared_headers),
         op_sync!(op_emit_cache_revalidate),
-    ]
+    ];
+    // The runtime's tests use these to push replies on a schedule they pick.
+    #[cfg(test)]
+    let ops = ops
+        .into_iter()
+        .chain([
+            op_sync!(op_test_async_reply_start),
+            op_sync!(op_test_async_reply_cancel),
+        ])
+        .collect();
+    ops
 }
 
 pub fn register_request_body_stream(

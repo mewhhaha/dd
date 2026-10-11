@@ -653,6 +653,7 @@ fn runtime_event_from_isolate_payload(
             payload,
         },
         IsolateEventPayload::MemorySocketClose(payload) => RuntimeEvent::MemorySocketClose(payload),
+        #[cfg(test)]
         IsolateEventPayload::TestAsyncReply(payload) => RuntimeEvent::TestAsyncReply(payload),
     }
 }
@@ -807,6 +808,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
                             op_state.put(crate::ops::RequestSecretContexts::default());
                             op_state.put(execution_limits.clone());
                             op_state.put(crate::ops::PendingReplies::default());
+                            #[cfg(test)]
                             op_state.put(crate::ops::TestAsyncReplies::default());
                             op_state.put(thread_request_control_inbox.clone());
                             op_state.put(RuntimeFastCommandSender(runtime_fast_sender.clone()));
