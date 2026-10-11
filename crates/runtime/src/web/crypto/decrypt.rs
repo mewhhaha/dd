@@ -1,14 +1,14 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-use aes::cipher::BlockDecryptMut;
+use aes::cipher::BlockModeDecrypt;
 use aes::cipher::KeyIvInit;
 use aes::cipher::block_padding::Pkcs7;
-use aes_gcm::AeadInPlace;
+use aes_gcm::AeadInOut;
 use aes_gcm::KeyInit;
 use aes_gcm::Nonce;
-use aes_gcm::aead::generic_array::ArrayLength;
-use aes_gcm::aead::generic_array::typenum::U12;
-use aes_gcm::aead::generic_array::typenum::U16;
+use aes_gcm::aead::array::ArraySize;
+use aes_gcm::aead::consts::U12;
+use aes_gcm::aead::consts::U16;
 use aes_gcm::aes::Aes128;
 use aes_gcm::aes::Aes192;
 use aes_gcm::aes::Aes256;
@@ -19,12 +19,13 @@ use ctr::cipher::StreamCipher;
 use dd_v8::JsBuffer;
 use dd_v8::ToJsBuffer;
 use dd_v8::{OpError, OpState};
+use rsa::Oaep;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use serde::Deserialize;
 use sha1::Sha1;
-use sha2_10::Sha256;
-use sha2_10::Sha384;
-use sha2_10::Sha512;
+use sha2::Sha256;
+use sha2::Sha384;
+use sha2::Sha512;
 use sha3::Sha3_256;
 use sha3::Sha3_384;
 use sha3::Sha3_512;
@@ -150,49 +151,17 @@ fn decrypt_rsa_oaep(
     let key = key.as_rsa_private_key()?;
 
     let private_key = rsa::RsaPrivateKey::from_pkcs1_der(key)?;
-    let label = Some(String::from_utf8_lossy(&label).to_string());
 
-    let padding = match hash {
-        ShaHash::Sha1 => rsa::Oaep {
-            digest: Box::<Sha1>::default(),
-            mgf_digest: Box::<Sha1>::default(),
-            label,
-        },
-        ShaHash::Sha256 => rsa::Oaep {
-            digest: Box::<Sha256>::default(),
-            mgf_digest: Box::<Sha256>::default(),
-            label,
-        },
-        ShaHash::Sha384 => rsa::Oaep {
-            digest: Box::<Sha384>::default(),
-            mgf_digest: Box::<Sha384>::default(),
-            label,
-        },
-        ShaHash::Sha512 => rsa::Oaep {
-            digest: Box::<Sha512>::default(),
-            mgf_digest: Box::<Sha512>::default(),
-            label,
-        },
-        ShaHash::Sha3_256 => rsa::Oaep {
-            digest: Box::<Sha3_256>::default(),
-            mgf_digest: Box::<Sha3_256>::default(),
-            label,
-        },
-        ShaHash::Sha3_384 => rsa::Oaep {
-            digest: Box::<Sha3_384>::default(),
-            mgf_digest: Box::<Sha3_384>::default(),
-            label,
-        },
-        ShaHash::Sha3_512 => rsa::Oaep {
-            digest: Box::<Sha3_512>::default(),
-            mgf_digest: Box::<Sha3_512>::default(),
-            label,
-        },
-    };
-
-    private_key
-        .decrypt(padding, data)
-        .map_err(DecryptError::Rsa)
+    match hash {
+        ShaHash::Sha1 => private_key.decrypt(Oaep::<Sha1>::new_with_label(label), data),
+        ShaHash::Sha256 => private_key.decrypt(Oaep::<Sha256>::new_with_label(label), data),
+        ShaHash::Sha384 => private_key.decrypt(Oaep::<Sha384>::new_with_label(label), data),
+        ShaHash::Sha512 => private_key.decrypt(Oaep::<Sha512>::new_with_label(label), data),
+        ShaHash::Sha3_256 => private_key.decrypt(Oaep::<Sha3_256>::new_with_label(label), data),
+        ShaHash::Sha3_384 => private_key.decrypt(Oaep::<Sha3_384>::new_with_label(label), data),
+        ShaHash::Sha3_512 => private_key.decrypt(Oaep::<Sha3_512>::new_with_label(label), data),
+    }
+    .map_err(DecryptError::Rsa)
 }
 
 fn decrypt_aes_cbc(
@@ -212,7 +181,7 @@ fn decrypt_aes_cbc(
                 .map_err(|_| DecryptError::InvalidKeyOrIv)?;
 
             cipher
-                .decrypt_padded_vec_mut::<Pkcs7>(data)
+                .decrypt_padded_vec::<Pkcs7>(data)
                 .map_err(|_| DecryptError::Failed)?
         }
         192 => {
@@ -222,7 +191,7 @@ fn decrypt_aes_cbc(
                 .map_err(|_| DecryptError::InvalidKeyOrIv)?;
 
             cipher
-                .decrypt_padded_vec_mut::<Pkcs7>(data)
+                .decrypt_padded_vec::<Pkcs7>(data)
                 .map_err(|_| DecryptError::Failed)?
         }
         256 => {
@@ -232,7 +201,7 @@ fn decrypt_aes_cbc(
                 .map_err(|_| DecryptError::InvalidKeyOrIv)?;
 
             cipher
-                .decrypt_padded_vec_mut::<Pkcs7>(data)
+                .decrypt_padded_vec::<Pkcs7>(data)
                 .map_err(|_| DecryptError::Failed)?
         }
         _ => unreachable!(),
@@ -246,7 +215,7 @@ fn decrypt_aes_ctr_gen<B>(key: &[u8], counter: &[u8], data: &[u8]) -> Result<Vec
 where
     B: KeyIvInit + StreamCipher,
 {
-    let mut cipher = B::new(key.into(), counter.into());
+    let mut cipher = B::new_from_slices(key, counter).map_err(|_| DecryptError::InvalidKeyOrIv)?;
 
     let mut plaintext = data.to_vec();
     cipher
@@ -256,7 +225,7 @@ where
     Ok(plaintext)
 }
 
-fn decrypt_aes_gcm_gen<N: ArrayLength<u8>>(
+fn decrypt_aes_gcm_gen<N: ArraySize>(
     key: &[u8],
     tag: &aes_gcm::Tag,
     nonce: &[u8],
@@ -264,27 +233,27 @@ fn decrypt_aes_gcm_gen<N: ArrayLength<u8>>(
     additional_data: Vec<u8>,
     plaintext: &mut [u8],
 ) -> Result<(), DecryptError> {
-    let nonce = Nonce::from_slice(nonce);
+    let nonce = <&Nonce<N>>::try_from(nonce).map_err(|_| DecryptError::InvalidIvLength)?;
     match length {
         128 => {
             let cipher = aes_gcm::AesGcm::<Aes128, N>::new_from_slice(key)
                 .map_err(|_| DecryptError::Failed)?;
             cipher
-                .decrypt_in_place_detached(nonce, additional_data.as_slice(), plaintext, tag)
+                .decrypt_inout_detached(nonce, additional_data.as_slice(), plaintext.into(), tag)
                 .map_err(|_| DecryptError::Failed)?
         }
         192 => {
             let cipher = aes_gcm::AesGcm::<Aes192, N>::new_from_slice(key)
                 .map_err(|_| DecryptError::Failed)?;
             cipher
-                .decrypt_in_place_detached(nonce, additional_data.as_slice(), plaintext, tag)
+                .decrypt_inout_detached(nonce, additional_data.as_slice(), plaintext.into(), tag)
                 .map_err(|_| DecryptError::Failed)?
         }
         256 => {
             let cipher = aes_gcm::AesGcm::<Aes256, N>::new_from_slice(key)
                 .map_err(|_| DecryptError::Failed)?;
             cipher
-                .decrypt_in_place_detached(nonce, additional_data.as_slice(), plaintext, tag)
+                .decrypt_inout_detached(nonce, additional_data.as_slice(), plaintext.into(), tag)
                 .map_err(|_| DecryptError::Failed)?
         }
         _ => return Err(DecryptError::InvalidLength),
@@ -347,27 +316,15 @@ fn decrypt_aes_gcm(
     let sep = data.len() - (tag_length / 8);
     let tag = &data[sep..];
 
+    let tag = <&aes_gcm::Tag>::try_from(tag).map_err(|_| DecryptError::InvalidTagLength)?;
+
     // The actual ciphertext, called plaintext because it is reused in place.
     let mut plaintext = data[..sep].to_vec();
 
     // Fixed 96-bit or 128-bit nonce
     match iv.len() {
-        12 => decrypt_aes_gcm_gen::<U12>(
-            key,
-            tag.into(),
-            &iv,
-            length,
-            additional_data,
-            &mut plaintext,
-        )?,
-        16 => decrypt_aes_gcm_gen::<U16>(
-            key,
-            tag.into(),
-            &iv,
-            length,
-            additional_data,
-            &mut plaintext,
-        )?,
+        12 => decrypt_aes_gcm_gen::<U12>(key, tag, &iv, length, additional_data, &mut plaintext)?,
+        16 => decrypt_aes_gcm_gen::<U16>(key, tag, &iv, length, additional_data, &mut plaintext)?,
         _ => return Err(DecryptError::InvalidIvLength),
     }
 
@@ -382,9 +339,8 @@ fn decrypt_aes_ocb(
     additional_data: Option<Vec<u8>>,
     data: &[u8],
 ) -> Result<Vec<u8>, DecryptError> {
-    use aes_gcm::aead::generic_array::GenericArray;
     use ocb3::Ocb3;
-    use ocb3::aead::AeadInPlace as Ocb3AeadInPlace;
+    use ocb3::aead::AeadInOut as Ocb3AeadInOut;
     use ocb3::aead::KeyInit as Ocb3KeyInit;
 
     let key = key.as_secret_key()?;
@@ -399,40 +355,52 @@ fn decrypt_aes_ocb(
     }
 
     // OCB allows nonces of 1 to 15 bytes, but `Ocb3` below takes its default
-    // 12-byte nonce, and `GenericArray::from_slice` panics on any other length.
-    if iv.len() != 12 {
-        return Err(DecryptError::UnsupportedOcbNonce);
-    }
+    // 12-byte nonce.
+    let nonce = <&ocb3::Nonce<U12>>::try_from(iv.as_slice())
+        .map_err(|_| DecryptError::UnsupportedOcbNonce)?;
 
     let sep = data.len() - (tag_length / 8);
-    let tag_bytes = &data[sep..];
+    let tag =
+        <&ocb3::Tag<U16>>::try_from(&data[sep..]).map_err(|_| DecryptError::InvalidTagLength)?;
 
     // The actual ciphertext, called plaintext because it is reused in place.
     let mut plaintext = data[..sep].to_vec();
-
-    let nonce = GenericArray::from_slice(&iv);
-    let tag = GenericArray::from_slice(tag_bytes);
 
     match length {
         128 => {
             let cipher =
                 Ocb3::<aes::Aes128>::new_from_slice(key).map_err(|_| DecryptError::Failed)?;
             cipher
-                .decrypt_in_place_detached(nonce, &additional_data, &mut plaintext, tag)
+                .decrypt_inout_detached(
+                    nonce,
+                    &additional_data,
+                    plaintext.as_mut_slice().into(),
+                    tag,
+                )
                 .map_err(|_| DecryptError::Failed)?;
         }
         192 => {
             let cipher =
                 Ocb3::<aes::Aes192>::new_from_slice(key).map_err(|_| DecryptError::Failed)?;
             cipher
-                .decrypt_in_place_detached(nonce, &additional_data, &mut plaintext, tag)
+                .decrypt_inout_detached(
+                    nonce,
+                    &additional_data,
+                    plaintext.as_mut_slice().into(),
+                    tag,
+                )
                 .map_err(|_| DecryptError::Failed)?;
         }
         256 => {
             let cipher =
                 Ocb3::<aes::Aes256>::new_from_slice(key).map_err(|_| DecryptError::Failed)?;
             cipher
-                .decrypt_in_place_detached(nonce, &additional_data, &mut plaintext, tag)
+                .decrypt_inout_detached(
+                    nonce,
+                    &additional_data,
+                    plaintext.as_mut_slice().into(),
+                    tag,
+                )
                 .map_err(|_| DecryptError::Failed)?;
         }
         _ => return Err(DecryptError::InvalidLength),

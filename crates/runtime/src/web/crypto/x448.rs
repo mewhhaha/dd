@@ -5,14 +5,14 @@ use dd_v8::{JsBuffer, OpError, OpState};
 use ed448_goldilocks::EdwardsScalar;
 use ed448_goldilocks::MontgomeryPoint;
 use ed448_goldilocks::subtle::ConstantTimeEq;
-use elliptic_curve::pkcs8::PrivateKeyInfo;
-use rand::RngCore;
-use rand::rngs::OsRng;
+use elliptic_curve::pkcs8::PrivateKeyInfoRef;
+use rand::Rng;
 use spki::der::Decode;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
+use spki::der::asn1::OctetStringRef;
 
-use super::shared::operation_error;
+use super::shared::{operation_error, os_rng};
 
 #[derive(Debug, thiserror::Error)]
 pub enum X448Error {
@@ -25,7 +25,7 @@ pub enum X448Error {
 /// `[privateKey, publicKey]`.
 pub fn op_crypto_generate_x448_keypair(_state: &mut OpState) -> (ToJsBuffer, ToJsBuffer) {
     let mut pkey = [0u8; 56];
-    OsRng.fill_bytes(&mut pkey);
+    os_rng().fill_bytes(&mut pkey);
 
     // x448(pkey, 5)
     let mut scalar_bytes = [0u8; 57];
@@ -83,16 +83,13 @@ pub fn op_crypto_export_pkcs8_x448(
     _state: &mut OpState,
     pkey: JsBuffer,
 ) -> Result<ToJsBuffer, X448Error> {
-    use rsa::pkcs1::der::Encode;
-
-    let pk_info = rsa::pkcs8::PrivateKeyInfo {
-        public_key: None,
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef {
+    let pk_info = PrivateKeyInfoRef::new(
+        spki::AlgorithmIdentifierRef {
             oid: X448_OID,
             parameters: None,
         },
-        private_key: &pkey, // OCTET STRING
-    };
+        OctetStringRef::new(&pkey)?,
+    );
 
     let mut buf = Vec::new();
     pk_info.encode_to_vec(&mut buf)?;
@@ -118,7 +115,8 @@ pub fn op_crypto_import_spki_x448(_state: &mut OpState, key_data: JsBuffer) -> O
 /// The private key in PKCS#8 `key_data`, or `null` if it is no X448 key.
 pub fn op_crypto_import_pkcs8_x448(_state: &mut OpState, key_data: JsBuffer) -> Option<ToJsBuffer> {
     // 2-3.
-    let pk_info = PrivateKeyInfo::from_der(&key_data).ok()?;
+    let pk_info = PrivateKeyInfoRef::from_der(&key_data).ok()?;
+    let private_key = pk_info.private_key.as_bytes();
     // 4.
     if pk_info.algorithm.oid != X448_OID {
         return None;
@@ -129,10 +127,10 @@ pub fn op_crypto_import_pkcs8_x448(_state: &mut OpState, key_data: JsBuffer) -> 
     }
     // 6.
     // CurvePrivateKey ::= OCTET STRING, two header bytes then 56 key bytes.
-    if pk_info.private_key.len() != 58 {
+    if private_key.len() != 58 {
         return None;
     }
-    Some(pk_info.private_key[2..].to_vec().into())
+    Some(private_key[2..].to_vec().into())
 }
 
 impl From<X448Error> for OpError {

@@ -5,9 +5,10 @@ use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
-use aes_kw::KekAes128;
-use aes_kw::KekAes192;
-use aes_kw::KekAes256;
+use aes_kw::KeyInit;
+use aes_kw::KwAes128;
+use aes_kw::KwAes192;
+use aes_kw::KwAes256;
 use aws_lc_rs::digest;
 use aws_lc_rs::hkdf;
 use aws_lc_rs::hmac::Algorithm as HmacAlgorithm;
@@ -21,15 +22,13 @@ use dd_v8::ToJsBuffer;
 use p256::ecdsa::Signature as P256Signature;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::ecdsa::VerifyingKey as P256VerifyingKey;
-use p256::elliptic_curve::sec1::FromEncodedPoint;
+use p256::elliptic_curve::sec1::FromSec1Point;
 use p256::pkcs8::DecodePrivateKey;
 use p384::ecdsa::Signature as P384Signature;
 use p384::ecdsa::SigningKey as P384SigningKey;
 use p384::ecdsa::VerifyingKey as P384VerifyingKey;
 use rand::Rng;
-use rand::rngs::OsRng;
-use rand::rngs::StdRng;
-use rand::thread_rng;
+use rand::rngs::SysRng;
 use rsa::Pss;
 use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
@@ -41,10 +40,10 @@ use rsa::signature::Verifier;
 use rsa::traits::SignatureScheme;
 use serde::Deserialize;
 use sha1::Sha1;
-use sha2_10::Digest;
-use sha2_10::Sha256;
-use sha2_10::Sha384;
-use sha2_10::Sha512;
+use sha2::Digest;
+use sha2::Sha256;
+use sha2::Sha384;
+use sha2::Sha512;
 use signature::hazmat::PrehashSigner;
 use signature::hazmat::PrehashVerifier;
 use tokio::task::spawn_blocking;
@@ -198,17 +197,11 @@ fn op_crypto_get_random_values<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
     _rv: &mut v8::ReturnValue<'s, v8::Value>,
 ) {
-    let op_state = dd_v8::runtime_op_state(scope);
     let filled = with_buffer_mut(args.get(0), |out| {
         if out.len() > 65536 {
             return Err(CryptoError::ArrayBufferViewLengthExceeded(out.len()));
         }
-        let mut op_state = op_state.borrow_mut();
-        if let Some(seeded_rng) = op_state.try_borrow_mut::<StdRng>() {
-            seeded_rng.fill(out);
-        } else {
-            thread_rng().fill(out);
-        }
+        rand::rng().fill_bytes(out);
         Ok(())
     });
     let error = match filled {
@@ -286,25 +279,25 @@ pub async fn op_crypto_sign_key(
                     .ok_or_else(|| CryptoError::MissingArgumentSaltLength)?
                     as usize;
 
-                let mut rng = OsRng;
+                let mut rng = SysRng;
                 match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
                     CryptoHash::Sha1 => {
-                        let signing_key = Pss::new_with_salt::<Sha1>(salt_len);
+                        let signing_key = Pss::<Sha1>::new_with_salt(salt_len);
                         let hashed = Sha1::digest(data);
                         signing_key.sign(Some(&mut rng), &private_key, &hashed)?
                     }
                     CryptoHash::Sha256 => {
-                        let signing_key = Pss::new_with_salt::<Sha256>(salt_len);
+                        let signing_key = Pss::<Sha256>::new_with_salt(salt_len);
                         let hashed = Sha256::digest(data);
                         signing_key.sign(Some(&mut rng), &private_key, &hashed)?
                     }
                     CryptoHash::Sha384 => {
-                        let signing_key = Pss::new_with_salt::<Sha384>(salt_len);
+                        let signing_key = Pss::<Sha384>::new_with_salt(salt_len);
                         let hashed = Sha384::digest(data);
                         signing_key.sign(Some(&mut rng), &private_key, &hashed)?
                     }
                     CryptoHash::Sha512 => {
-                        let signing_key = Pss::new_with_salt::<Sha512>(salt_len);
+                        let signing_key = Pss::<Sha512>::new_with_salt(salt_len);
                         let hashed = Sha512::digest(data);
                         signing_key.sign(Some(&mut rng), &private_key, &hashed)?
                     }
@@ -322,9 +315,9 @@ pub async fn op_crypto_sign_key(
                         let signing_key = P256SigningKey::from(secret_key);
                         let prehash = match hash {
                             CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                            CryptoHash::Sha256 => sha2_10::Sha256::digest(data).to_vec(),
-                            CryptoHash::Sha384 => sha2_10::Sha384::digest(data).to_vec(),
-                            CryptoHash::Sha512 => sha2_10::Sha512::digest(data).to_vec(),
+                            CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                            CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                            CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
                         };
                         // Sign the prehashed message, producing a raw r||s signature.
                         let signature: P256Signature = signing_key.sign_prehash(&prehash)?;
@@ -336,9 +329,9 @@ pub async fn op_crypto_sign_key(
                         let signing_key = P384SigningKey::from(secret_key);
                         let prehash = match hash {
                             CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                            CryptoHash::Sha256 => sha2_10::Sha256::digest(data).to_vec(),
-                            CryptoHash::Sha384 => sha2_10::Sha384::digest(data).to_vec(),
-                            CryptoHash::Sha512 => sha2_10::Sha512::digest(data).to_vec(),
+                            CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                            CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                            CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
                         };
                         let signature: P384Signature = signing_key.sign_prehash(&prehash)?;
                         signature.to_bytes().to_vec()
@@ -417,22 +410,22 @@ pub async fn op_crypto_verify_key(
 
                 match args.hash.ok_or_else(|| CryptoError::MissingArgumentHash)? {
                     CryptoHash::Sha1 => {
-                        let pss = Pss::new_with_salt::<Sha1>(salt_len);
+                        let pss = Pss::<Sha1>::new_with_salt(salt_len);
                         let hashed = Sha1::digest(data);
                         pss.verify(&public_key, &hashed, signature).is_ok()
                     }
                     CryptoHash::Sha256 => {
-                        let pss = Pss::new_with_salt::<Sha256>(salt_len);
+                        let pss = Pss::<Sha256>::new_with_salt(salt_len);
                         let hashed = Sha256::digest(data);
                         pss.verify(&public_key, &hashed, signature).is_ok()
                     }
                     CryptoHash::Sha384 => {
-                        let pss = Pss::new_with_salt::<Sha384>(salt_len);
+                        let pss = Pss::<Sha384>::new_with_salt(salt_len);
                         let hashed = Sha384::digest(data);
                         pss.verify(&public_key, &hashed, signature).is_ok()
                     }
                     CryptoHash::Sha512 => {
-                        let pss = Pss::new_with_salt::<Sha512>(salt_len);
+                        let pss = Pss::<Sha512>::new_with_salt(salt_len);
                         let hashed = Sha512::digest(data);
                         pss.verify(&public_key, &hashed, signature).is_ok()
                     }
@@ -463,9 +456,9 @@ pub async fn op_crypto_verify_key(
                             Ok(signature) => {
                                 let prehash = match hash {
                                     CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                                    CryptoHash::Sha256 => sha2_10::Sha256::digest(data).to_vec(),
-                                    CryptoHash::Sha384 => sha2_10::Sha384::digest(data).to_vec(),
-                                    CryptoHash::Sha512 => sha2_10::Sha512::digest(data).to_vec(),
+                                    CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                                    CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                                    CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
                                 };
                                 verifying_key.verify_prehash(&prehash, &signature).is_ok()
                             }
@@ -488,9 +481,9 @@ pub async fn op_crypto_verify_key(
                             Ok(signature) => {
                                 let prehash = match hash {
                                     CryptoHash::Sha1 => sha1::Sha1::digest(data).to_vec(),
-                                    CryptoHash::Sha256 => sha2_10::Sha256::digest(data).to_vec(),
-                                    CryptoHash::Sha384 => sha2_10::Sha384::digest(data).to_vec(),
-                                    CryptoHash::Sha512 => sha2_10::Sha512::digest(data).to_vec(),
+                                    CryptoHash::Sha256 => sha2::Sha256::digest(data).to_vec(),
+                                    CryptoHash::Sha384 => sha2::Sha384::digest(data).to_vec(),
+                                    CryptoHash::Sha512 => sha2::Sha512::digest(data).to_vec(),
                                 };
                                 verifying_key.verify_prehash(&prehash, &signature).is_ok()
                             }
@@ -602,16 +595,12 @@ pub async fn op_crypto_derive_bits(
                                 .map_err(|_| CryptoError::DecodePrivateKey)?
                                 .public_key(),
                             KeyType::Public => {
-                                let point = p256::EncodedPoint::from_bytes(public_key.data)
+                                let point = p256::Sec1Point::from_bytes(public_key.data)
                                     .map_err(|_| CryptoError::DecodePrivateKey)?;
 
-                                let pk = p256::PublicKey::from_encoded_point(&point);
-                                // pk is a constant time Option.
-                                if pk.is_some().into() {
-                                    pk.unwrap()
-                                } else {
-                                    return Err(CryptoError::DecodePrivateKey);
-                                }
+                                p256::PublicKey::from_sec1_point(&point)
+                                    .into_option()
+                                    .ok_or(CryptoError::DecodePrivateKey)?
                             }
                             _ => unreachable!(),
                         };
@@ -633,16 +622,12 @@ pub async fn op_crypto_derive_bits(
                                 .map_err(|_| CryptoError::DecodePrivateKey)?
                                 .public_key(),
                             KeyType::Public => {
-                                let point = p384::EncodedPoint::from_bytes(public_key.data)
+                                let point = p384::Sec1Point::from_bytes(public_key.data)
                                     .map_err(|_| CryptoError::DecodePrivateKey)?;
 
-                                let pk = p384::PublicKey::from_encoded_point(&point);
-                                // pk is a constant time Option.
-                                if pk.is_some().into() {
-                                    pk.unwrap()
-                                } else {
-                                    return Err(CryptoError::DecodePrivateKey);
-                                }
+                                p384::PublicKey::from_sec1_point(&point)
+                                    .into_option()
+                                    .ok_or(CryptoError::DecodePrivateKey)?
                             }
                             _ => unreachable!(),
                         };
@@ -698,20 +683,10 @@ fn read_rsa_public_key(key_data: KeyData) -> Result<RsaPublicKey, CryptoError> {
     Ok(public_key)
 }
 
-pub fn op_crypto_random_uuid(state: &mut OpState) -> Result<String, CryptoError> {
-    let maybe_seeded_rng = state.try_borrow_mut::<StdRng>();
-    let uuid = if let Some(seeded_rng) = maybe_seeded_rng {
-        let mut bytes = [0u8; 16];
-        seeded_rng.fill(&mut bytes);
-        fast_uuid_v4(&mut bytes)
-    } else {
-        let mut rng = thread_rng();
-        let mut bytes = [0u8; 16];
-        rng.fill(&mut bytes);
-        fast_uuid_v4(&mut bytes)
-    };
-
-    Ok(uuid)
+pub fn op_crypto_random_uuid(_state: &mut OpState) -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    fast_uuid_v4(&mut bytes)
 }
 
 pub async fn op_crypto_subtle_digest(
@@ -752,10 +727,17 @@ pub fn op_crypto_wrap_key(
                 return Err(CryptoError::DataInvalidSize);
             }
 
-            let wrapped_key = match key.len() {
-                16 => KekAes128::new(key.into()).wrap_vec(&data),
-                24 => KekAes192::new(key.into()).wrap_vec(&data),
-                32 => KekAes256::new(key.into()).wrap_vec(&data),
+            let mut wrapped_key = vec![0; data.len() + 8];
+            match key.len() {
+                16 => KwAes128::new_from_slice(key)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?
+                    .wrap_key(&data, &mut wrapped_key),
+                24 => KwAes192::new_from_slice(key)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?
+                    .wrap_key(&data, &mut wrapped_key),
+                32 => KwAes256::new_from_slice(key)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?
+                    .wrap_key(&data, &mut wrapped_key),
                 _ => return Err(CryptoError::InvalidKeyLength),
             }
             .map_err(|_| CryptoError::EncryptionError)?;
@@ -780,10 +762,18 @@ pub fn op_crypto_unwrap_key(
                 return Err(CryptoError::DataInvalidSize);
             }
 
-            let unwrapped_key = match key.len() {
-                16 => KekAes128::new(key.into()).unwrap_vec(&data),
-                24 => KekAes192::new(key.into()).unwrap_vec(&data),
-                32 => KekAes256::new(key.into()).unwrap_vec(&data),
+            // Unwrapping drops the 8-byte integrity block; shorter input fails below.
+            let mut unwrapped_key = vec![0; data.len().saturating_sub(8)];
+            match key.len() {
+                16 => KwAes128::new_from_slice(key)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?
+                    .unwrap_key(&data, &mut unwrapped_key),
+                24 => KwAes192::new_from_slice(key)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?
+                    .unwrap_key(&data, &mut unwrapped_key),
+                32 => KwAes256::new_from_slice(key)
+                    .map_err(|_| CryptoError::InvalidKeyLength)?
+                    .unwrap_key(&data, &mut unwrapped_key),
                 _ => return Err(CryptoError::InvalidKeyLength),
             }
             .map_err(|_| CryptoError::DecryptionError)?;
@@ -846,9 +836,8 @@ fn fast_uuid_v4(bytes: &mut [u8; 16]) -> String {
 
 #[test]
 fn test_fast_uuid_v4_correctness() {
-    let mut rng = thread_rng();
     let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let uuid = fast_uuid_v4(&mut bytes.clone());
     let uuid_lib = uuid::Builder::from_bytes(bytes)
         .set_variant(uuid::Variant::RFC4122)

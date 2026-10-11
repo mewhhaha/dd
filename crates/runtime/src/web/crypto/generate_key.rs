@@ -4,16 +4,14 @@ use aws_lc_rs::rand::SecureRandom;
 use aws_lc_rs::signature::EcdsaKeyPair;
 use dd_v8::ToJsBuffer;
 use dd_v8::{OpError, OpState};
+use elliptic_curve::Generate;
 use elliptic_curve::pkcs8::EncodePrivateKey;
-use elliptic_curve::rand_core::OsRng;
-use num_traits::FromPrimitive;
-use rsa::BigUint;
+use rsa::BoxedUint;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 
 use super::shared::*;
@@ -39,10 +37,6 @@ pub enum GenerateKeyError {
     #[error("Unsupported algorithm")]
     UnsupportedAlgorithm,
 }
-
-// Allowlist for RSA public exponents.
-static PUB_EXPONENT_1: LazyLock<BigUint> = LazyLock::new(|| BigUint::from_u64(3).unwrap());
-static PUB_EXPONENT_2: LazyLock<BigUint> = LazyLock::new(|| BigUint::from_u64(65537).unwrap());
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", tag = "algorithm")]
@@ -85,15 +79,23 @@ fn generate_key_rsa(
     modulus_length: u32,
     public_exponent: &[u8],
 ) -> Result<Vec<u8>, GenerateKeyError> {
-    let exponent = BigUint::from_bytes_be(public_exponent);
-    if exponent != *PUB_EXPONENT_1 && exponent != *PUB_EXPONENT_2 {
-        return Err(GenerateKeyError::BadPublicExponent);
-    }
+    // Only 3 and 65537 are allowed, written big-endian with any leading zeros.
+    let leading_zeros = public_exponent
+        .iter()
+        .take_while(|byte| **byte == 0)
+        .count();
+    let exponent: u64 = match &public_exponent[leading_zeros..] {
+        [3] => 3,
+        [1, 0, 1] => 65537,
+        _ => return Err(GenerateKeyError::BadPublicExponent),
+    };
 
-    let mut rng = OsRng;
-
-    let private_key = RsaPrivateKey::new_with_exp(&mut rng, modulus_length as usize, &exponent)
-        .map_err(|_| GenerateKeyError::FailedRSAKeyGeneration)?;
+    let private_key = RsaPrivateKey::new_with_exp(
+        &mut os_rng(),
+        modulus_length as usize,
+        BoxedUint::from(exponent),
+    )
+    .map_err(|_| GenerateKeyError::FailedRSAKeyGeneration)?;
 
     let private_key = private_key
         .to_pkcs1_der()
@@ -103,8 +105,8 @@ fn generate_key_rsa(
 }
 
 fn generate_key_ec_p521() -> Result<Vec<u8>, GenerateKeyError> {
-    let mut rng = OsRng;
-    let key = p521::SecretKey::random(&mut rng);
+    let key =
+        p521::SecretKey::try_generate().map_err(|_| GenerateKeyError::FailedECKeyGeneration)?;
     let pkcs8 = key
         .to_pkcs8_der()
         .map_err(|_| GenerateKeyError::FailedECKeyGeneration)?;

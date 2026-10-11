@@ -6,14 +6,14 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use dd_v8::ToJsBuffer;
 use dd_v8::{JsBuffer, OpError, OpState};
-use elliptic_curve::pkcs8::PrivateKeyInfo;
-use rand::RngCore;
-use rand::rngs::OsRng;
+use elliptic_curve::pkcs8::PrivateKeyInfoRef;
+use rand::Rng;
 use spki::der::Decode;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
+use spki::der::asn1::OctetStringRef;
 
-use super::shared::operation_error;
+use super::shared::{operation_error, os_rng};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Ed25519Error {
@@ -30,7 +30,7 @@ pub fn op_crypto_generate_ed25519_keypair(
     _state: &mut OpState,
 ) -> Option<(ToJsBuffer, ToJsBuffer)> {
     let mut pkey = vec![0; 32];
-    OsRng.fill_bytes(&mut pkey);
+    os_rng().fill_bytes(&mut pkey);
     let pair = Ed25519KeyPair::from_seed_unchecked(&pkey).ok()?;
     let pubkey = pair.public_key().as_ref().to_vec();
     Some((pkey.into(), pubkey.into()))
@@ -87,7 +87,8 @@ pub fn op_crypto_import_pkcs8_ed25519(
 ) -> Option<ToJsBuffer> {
     // 2-3.
     // This should probably use OneAsymmetricKey instead
-    let pk_info = PrivateKeyInfo::from_der(&key_data).ok()?;
+    let pk_info = PrivateKeyInfoRef::from_der(&key_data).ok()?;
+    let private_key = pk_info.private_key.as_bytes();
     // 4.
     if pk_info.algorithm.oid != ED25519_OID {
         return None;
@@ -98,10 +99,10 @@ pub fn op_crypto_import_pkcs8_ed25519(
     }
     // 6.
     // CurvePrivateKey ::= OCTET STRING
-    if pk_info.private_key.len() != 34 {
+    if private_key.len() != 34 {
         return None;
     }
-    Some(pk_info.private_key[2..].to_vec().into())
+    Some(private_key[2..].to_vec().into())
 }
 
 pub fn op_crypto_export_spki_ed25519(
@@ -126,18 +127,15 @@ pub fn op_crypto_export_pkcs8_ed25519(
     _state: &mut OpState,
     pkey: JsBuffer,
 ) -> Result<ToJsBuffer, Ed25519Error> {
-    use rsa::pkcs1::der::Encode;
-
     // This should probably use OneAsymmetricKey instead
-    let pk_info = rsa::pkcs8::PrivateKeyInfo {
-        public_key: None,
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef {
+    let pk_info = PrivateKeyInfoRef::new(
+        spki::AlgorithmIdentifierRef {
             // id-Ed25519
             oid: ED25519_OID,
             parameters: None,
         },
-        private_key: &pkey, // OCTET STRING
-    };
+        OctetStringRef::new(&pkey)?,
+    );
 
     let mut buf = Vec::new();
     pk_info.encode_to_vec(&mut buf)?;

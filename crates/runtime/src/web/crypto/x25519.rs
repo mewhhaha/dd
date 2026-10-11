@@ -4,15 +4,16 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use dd_v8::ToJsBuffer;
 use dd_v8::{JsBuffer, OpError, OpState};
-use elliptic_curve::pkcs8::PrivateKeyInfo;
+use elliptic_curve::pkcs8::PrivateKeyInfoRef;
 use elliptic_curve::subtle::ConstantTimeEq;
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::Rng;
 use spki::der::Decode;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
+use spki::der::asn1::OctetStringRef;
+use x25519_dalek::X25519_BASEPOINT_BYTES;
 
-use super::shared::operation_error;
+use super::shared::{operation_error, os_rng};
 
 #[derive(Debug, thiserror::Error)]
 pub enum X25519Error {
@@ -21,14 +22,10 @@ pub enum X25519Error {
     #[error(transparent)]
     Der(#[from] spki::der::Error),
 }
-// u-coordinate of the base point.
-const X25519_BASEPOINT_BYTES: [u8; 32] = [
-    9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-];
 /// `[privateKey, publicKey]`.
 pub fn op_crypto_generate_x25519_keypair(_state: &mut OpState) -> (ToJsBuffer, ToJsBuffer) {
     let mut pkey = [0u8; 32];
-    OsRng.fill_bytes(&mut pkey);
+    os_rng().fill_bytes(&mut pkey);
     // https://www.rfc-editor.org/rfc/rfc7748#section-6.1
     // pubkey = x25519(a, 9) which is constant-time Montgomery ladder.
     //   https://eprint.iacr.org/2014/140.pdf page 4
@@ -94,7 +91,8 @@ pub fn op_crypto_import_pkcs8_x25519(
 ) -> Option<ToJsBuffer> {
     // 2-3.
     // This should probably use OneAsymmetricKey instead
-    let pk_info = PrivateKeyInfo::from_der(&key_data).ok()?;
+    let pk_info = PrivateKeyInfoRef::from_der(&key_data).ok()?;
+    let private_key = pk_info.private_key.as_bytes();
     // 4.
     if pk_info.algorithm.oid != X25519_OID {
         return None;
@@ -105,10 +103,10 @@ pub fn op_crypto_import_pkcs8_x25519(
     }
     // 6.
     // CurvePrivateKey ::= OCTET STRING
-    if pk_info.private_key.len() != 34 {
+    if private_key.len() != 34 {
         return None;
     }
-    Some(pk_info.private_key[2..].to_vec().into())
+    Some(private_key[2..].to_vec().into())
 }
 
 pub fn op_crypto_export_spki_x25519(
@@ -133,18 +131,15 @@ pub fn op_crypto_export_pkcs8_x25519(
     _state: &mut OpState,
     pkey: JsBuffer,
 ) -> Result<ToJsBuffer, X25519Error> {
-    use rsa::pkcs1::der::Encode;
-
     // This should probably use OneAsymmetricKey instead
-    let pk_info = rsa::pkcs8::PrivateKeyInfo {
-        public_key: None,
-        algorithm: rsa::pkcs8::AlgorithmIdentifierRef {
+    let pk_info = PrivateKeyInfoRef::new(
+        spki::AlgorithmIdentifierRef {
             // id-X25519
             oid: X25519_OID,
             parameters: None,
         },
-        private_key: &pkey, // OCTET STRING
-    };
+        OctetStringRef::new(&pkey)?,
+    );
 
     let mut buf = Vec::new();
     pk_info.encode_to_vec(&mut buf)?;

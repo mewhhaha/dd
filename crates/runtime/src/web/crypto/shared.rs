@@ -5,8 +5,10 @@ use std::borrow::Cow;
 
 use dd_v8::JsBuffer;
 use dd_v8::ToJsBuffer;
-use elliptic_curve::sec1::ToEncodedPoint;
+use elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1::EncodeRsaPublicKey;
@@ -40,6 +42,12 @@ pub fn operation_error(message: impl Into<String>) -> OpError {
 
 pub fn quota_exceeded_error(message: impl Into<String>) -> OpError {
     OpError::custom("DOMExceptionQuotaExceededError", message)
+}
+
+/// The operating system's random source, for key material. It panics if the
+/// source fails, since nothing secure could stand in for it.
+pub fn os_rng() -> UnwrapErr<SysRng> {
+    UnwrapErr(SysRng)
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
@@ -143,47 +151,46 @@ impl V8RawKeyData {
         }
     }
 
-    pub fn as_ec_public_key_p256(&self) -> Result<p256::EncodedPoint, SharedError> {
+    pub fn as_ec_public_key_p256(&self) -> Result<p256::Sec1Point, SharedError> {
         match self {
             V8RawKeyData::Public(data) => p256::PublicKey::from_sec1_bytes(data)
-                .map(|p| p.to_encoded_point(false))
+                .map(|p| p.to_sec1_point(false))
                 .map_err(|_| SharedError::ExpectedValidPublicECKey),
             V8RawKeyData::Private(data) => {
                 let signing_key = p256::SecretKey::from_pkcs8_der(data)
                     .map_err(|_| SharedError::ExpectedValidPrivateECKey)?;
-                Ok(signing_key.public_key().to_encoded_point(false))
+                Ok(signing_key.public_key().to_sec1_point(false))
             }
             // Should never reach here.
             V8RawKeyData::Secret(_) => unreachable!(),
         }
     }
 
-    pub fn as_ec_public_key_p384(&self) -> Result<p384::EncodedPoint, SharedError> {
+    pub fn as_ec_public_key_p384(&self) -> Result<p384::Sec1Point, SharedError> {
         match self {
             V8RawKeyData::Public(data) => p384::PublicKey::from_sec1_bytes(data)
-                .map(|p| p.to_encoded_point(false))
+                .map(|p| p.to_sec1_point(false))
                 .map_err(|_| SharedError::ExpectedValidPublicECKey),
             V8RawKeyData::Private(data) => {
                 let signing_key = p384::SecretKey::from_pkcs8_der(data)
                     .map_err(|_| SharedError::ExpectedValidPrivateECKey)?;
-                Ok(signing_key.public_key().to_encoded_point(false))
+                Ok(signing_key.public_key().to_sec1_point(false))
             }
             // Should never reach here.
             V8RawKeyData::Secret(_) => unreachable!(),
         }
     }
 
-    pub fn as_ec_public_key_p521(&self) -> Result<p521::EncodedPoint, SharedError> {
+    pub fn as_ec_public_key_p521(&self) -> Result<p521::Sec1Point, SharedError> {
         match self {
             V8RawKeyData::Public(data) => {
-                // public_key is a serialized EncodedPoint
-                p521::EncodedPoint::from_bytes(data)
-                    .map_err(|_| SharedError::ExpectedValidPublicECKey)
+                // public_key is a serialized SEC1 point
+                p521::Sec1Point::from_bytes(data).map_err(|_| SharedError::ExpectedValidPublicECKey)
             }
             V8RawKeyData::Private(data) => {
                 let signing_key = p521::SecretKey::from_pkcs8_der(data)
                     .map_err(|_| SharedError::ExpectedValidPrivateECKey)?;
-                Ok(signing_key.public_key().to_encoded_point(false))
+                Ok(signing_key.public_key().to_sec1_point(false))
             }
             // Should never reach here.
             V8RawKeyData::Secret(_) => unreachable!(),

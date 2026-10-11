@@ -45,7 +45,10 @@ uuid = { version = "1.26.1", features = ["serde", "v4"] }
 [profile.dev.package.aws-lc-sys]
 opt-level = 3
 
-[profile.dev.package.num-bigint-dig]
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+
+[profile.dev.package.crypto-primes]
 opt-level = 3
 
 [profile.dev.package.rsa]
