@@ -623,29 +623,6 @@ impl MemoryStore {
             .await?;
         Ok(claims.into_iter().map(|claim| claim.record).collect())
     }
-    pub async fn claim_due_outbox_records(
-        &self,
-        limit: usize,
-        lease_for: Duration,
-        kinds: &[&str],
-    ) -> Result<Vec<MemoryOutboxClaim>> {
-        let mut claims = Vec::new();
-        for shard in 0..STATE_SHARDS {
-            if claims.len() >= limit {
-                break;
-            }
-            claims.extend(
-                self.claim_due_outbox_records_for_shard_index(
-                    shard,
-                    limit - claims.len(),
-                    lease_for,
-                    kinds,
-                )
-                .await?,
-            );
-        }
-        Ok(claims)
-    }
     pub async fn claim_due_outbox_records_for_shard_index(
         &self,
         shard_index: usize,
@@ -805,35 +782,6 @@ impl MemoryStore {
         }).await
     }
 
-    pub async fn mark_outbox_delivered(
-        &self,
-        namespace: &str,
-        memory_key: &str,
-        effect_id: &str,
-    ) -> Result<()> {
-        self.apply_outbox_delivery_outcomes(&[MemoryOutboxDeliveryOutcome {
-            namespace: namespace.into(),
-            memory_key: memory_key.into(),
-            effect_id: effect_id.into(),
-            action: MemoryOutboxDeliveryAction::Delivered,
-        }])
-        .await
-    }
-    pub async fn retry_outbox_record(
-        &self,
-        namespace: &str,
-        memory_key: &str,
-        effect_id: &str,
-        retry_after: Duration,
-    ) -> Result<()> {
-        self.apply_outbox_delivery_outcomes(&[MemoryOutboxDeliveryOutcome {
-            namespace: namespace.into(),
-            memory_key: memory_key.into(),
-            effect_id: effect_id.into(),
-            action: MemoryOutboxDeliveryAction::Retry { retry_after },
-        }])
-        .await
-    }
     pub async fn apply_outbox_delivery_outcomes(
         &self,
         outcomes: &[MemoryOutboxDeliveryOutcome],

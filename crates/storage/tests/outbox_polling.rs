@@ -1,6 +1,6 @@
 use std::time::Duration;
 use storage::memory::{MemoryCommit, MemoryOutboxEffectWrite, MemoryStore, worker_namespace};
-use storage::state::StateStore;
+use storage::state::{STATE_SHARDS, StateStore};
 
 #[tokio::test]
 async fn empty_outbox_polling_does_not_commit_state_transactions() {
@@ -8,13 +8,20 @@ async fn empty_outbox_polling_does_not_commit_state_transactions() {
     let state = StateStore::open(&root).await.unwrap();
     let memory = MemoryStore::from_state(state);
     for _ in 0..3 {
-        assert!(
-            memory
-                .claim_due_outbox_records(32, Duration::from_secs(30), &["fetch"])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        for shard in 0..STATE_SHARDS {
+            assert!(
+                memory
+                    .claim_due_outbox_records_for_shard_index(
+                        shard,
+                        32,
+                        Duration::from_secs(30),
+                        &["fetch"]
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
     let snapshot = memory.state_performance_snapshot();
     assert_eq!(
@@ -46,11 +53,17 @@ async fn unmatched_outbox_kinds_do_not_commit_state_transactions() {
         )
         .await
         .unwrap();
+    let shard = StateStore::shard_index("worker", "MEMORY", "entity");
     let committed = memory.state_performance_snapshot().committed_groups;
     for _ in 0..3 {
         assert!(
             memory
-                .claim_due_outbox_records(32, Duration::from_secs(30), &["socket.*"])
+                .claim_due_outbox_records_for_shard_index(
+                    shard,
+                    32,
+                    Duration::from_secs(30),
+                    &["socket.*"]
+                )
                 .await
                 .unwrap()
                 .is_empty()
@@ -61,7 +74,7 @@ async fn unmatched_outbox_kinds_do_not_commit_state_transactions() {
         committed
     );
     let claims = memory
-        .claim_due_outbox_records(32, Duration::from_secs(30), &["audit.*"])
+        .claim_due_outbox_records_for_shard_index(shard, 32, Duration::from_secs(30), &["audit.*"])
         .await
         .unwrap();
     assert_eq!(claims.len(), 1);

@@ -89,14 +89,26 @@ async fn ordinal_order_survives_restart_and_deferred_predecessors_block_successo
         .unwrap();
     assert!(
         memory
-            .claim_due_outbox_records(64, Duration::from_secs(30), &["audit.*"])
+            .claim_due_outbox_records_for_shard_index(
+                StateStore::shard_index("worker", "MEMORY", "entity"),
+                64,
+                Duration::from_secs(30),
+                &["audit.*"]
+            )
             .await
             .unwrap()
             .is_empty(),
         "a deferred retry blocks later effects and revisions"
     );
     memory
-        .retry_outbox_record(&namespace, "entity", &first[1].effect_id, Duration::ZERO)
+        .apply_outbox_delivery_outcomes(&[MemoryOutboxDeliveryOutcome {
+            namespace: namespace.clone(),
+            memory_key: "entity".into(),
+            effect_id: first[1].effect_id.clone(),
+            action: MemoryOutboxDeliveryAction::Retry {
+                retry_after: Duration::ZERO,
+            },
+        }])
         .await
         .unwrap();
     drop(first);

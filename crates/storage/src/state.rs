@@ -1302,7 +1302,8 @@ mod tests {
 mod migration_tests {
     use super::*;
     use crate::memory::{
-        MemoryBatchMutation, MemoryCommit, MemoryOutboxEffectWrite, MemoryStore, worker_namespace,
+        MemoryBatchMutation, MemoryCommit, MemoryOutboxDeliveryAction, MemoryOutboxDeliveryOutcome,
+        MemoryOutboxEffectWrite, MemoryStore, worker_namespace,
     };
     use std::time::Duration;
 
@@ -1383,12 +1384,19 @@ mod migration_tests {
                 .collect::<Vec<_>>(),
             [("legacy-a", 0), ("legacy-z", 0)]
         );
-        for record in &legacy {
-            memory
-                .mark_outbox_delivered(&namespace, "entity", &record.effect_id)
-                .await
-                .unwrap();
-        }
+        let delivered = legacy
+            .iter()
+            .map(|record| MemoryOutboxDeliveryOutcome {
+                namespace: namespace.clone(),
+                memory_key: "entity".into(),
+                effect_id: record.effect_id.clone(),
+                action: MemoryOutboxDeliveryAction::Delivered,
+            })
+            .collect::<Vec<_>>();
+        memory
+            .apply_outbox_delivery_outcomes(&delivered)
+            .await
+            .unwrap();
         drop(legacy);
         let lease = memory.acquire_lease(&namespace, "entity").await.unwrap();
         assert!(lease.owner_epoch() > 777);

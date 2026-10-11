@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use storage::kv::KvStore;
 use storage::memory::{
-    MemoryBatchMutation, MemoryCommandResultWrite, MemoryOutboxEffectWrite, MemoryStore,
-    worker_namespace,
+    MemoryBatchMutation, MemoryCommandResultWrite, MemoryOutboxDeliveryAction,
+    MemoryOutboxDeliveryOutcome, MemoryOutboxEffectWrite, MemoryStore, worker_namespace,
 };
 use storage::state::StateStore;
 
@@ -19,6 +19,27 @@ fn mutation(key: &str, value: &[u8]) -> MemoryBatchMutation {
         encoding: "utf8".into(),
         deleted: false,
     }
+}
+
+fn delivered(namespace: &str, effect_id: &str) -> MemoryOutboxDeliveryOutcome {
+    MemoryOutboxDeliveryOutcome {
+        namespace: namespace.into(),
+        memory_key: "entity".into(),
+        effect_id: effect_id.into(),
+        action: MemoryOutboxDeliveryAction::Delivered,
+    }
+}
+
+/// Folds a hand-built database's WAL into its main file before the converter
+/// reads or copies it.
+async fn checkpoint(database: &turso::Database) {
+    let conn = database.connect().unwrap();
+    let mut rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    let busy = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+    assert_eq!(busy, 0, "checkpoint must not be blocked");
 }
 
 #[tokio::test]
@@ -141,20 +162,21 @@ async fn state_preserves_isolation_tombstones_and_fencing_across_restart() {
             .result,
         b"result"
     );
+    let shard = StateStore::shard_index("alpha", "MEMORY", "entity");
     let claims = memory
-        .claim_due_outbox_records(10, Duration::from_secs(60), &["fetch"])
+        .claim_due_outbox_records_for_shard_index(shard, 10, Duration::from_secs(60), &["fetch"])
         .await
         .unwrap();
     assert_eq!(claims.len(), 1);
     assert_eq!(claims[0].namespace, namespace);
     assert_eq!(claims[0].record.payload, b"effect");
     memory
-        .mark_outbox_delivered(&namespace, "entity", &claims[0].record.effect_id)
+        .apply_outbox_delivery_outcomes(&[delivered(&namespace, &claims[0].record.effect_id)])
         .await
         .unwrap();
     assert!(
         memory
-            .claim_due_outbox_records(10, Duration::ZERO, &["fetch"])
+            .claim_due_outbox_records_for_shard_index(shard, 10, Duration::ZERO, &["fetch"])
             .await
             .unwrap()
             .is_empty()
@@ -442,7 +464,7 @@ async fn effect_commits_refresh_snapshots_but_delivery_maintenance_preserves_the
         applied.max_version
     );
     memory
-        .mark_outbox_delivered(&namespace, "entity", &claims[0].effect_id)
+        .apply_outbox_delivery_outcomes(&[delivered(&namespace, &claims[0].effect_id)])
         .await
         .unwrap();
     assert_eq!(
@@ -514,9 +536,7 @@ async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
     )
     .await
     .unwrap();
-    storage::turso_util::checkpoint_database(&database)
-        .await
-        .unwrap();
+    checkpoint(&database).await;
     drop(conn);
     drop(database);
     let kv_database = turso::Builder::new_local(source.join("dd-kv.db").to_string_lossy().as_ref())
@@ -531,9 +551,7 @@ async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
     )
     .await
     .unwrap();
-    storage::turso_util::checkpoint_database(&kv_database)
-        .await
-        .unwrap();
+    checkpoint(&kv_database).await;
     drop(conn);
     drop(kv_database);
     let before = std::fs::read(source.join("dd-kv.db")).unwrap();
@@ -557,9 +575,7 @@ async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
             .unwrap();
     }
     conn.execute("INSERT INTO deploy_tokens(id,token_hash,created_at_unix,uses,capabilities_json) VALUES ('token','hash',1,7,'{}')", ()).await.unwrap();
-    storage::turso_util::checkpoint_database(&database)
-        .await
-        .unwrap();
+    checkpoint(&database).await;
     drop(conn);
     drop(database);
     drop(control);
@@ -581,7 +597,9 @@ async fn converter_requires_orphan_ownership_and_verifies_legacy_values() {
     let control = storage::control::ControlStore::open(&destination)
         .await
         .unwrap();
-    assert_eq!(control.token_count().await.unwrap(), 1);
+    let tokens = control.list_tokens(0).await.unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].uses, 7);
     assert!(control.list_deployments(None).await.unwrap().is_empty());
     drop(control);
     assert_eq!(report.rows["worker_kv"], 1);

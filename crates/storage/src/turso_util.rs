@@ -12,7 +12,7 @@ const MAX_BUSY_ATTEMPTS: u32 = 8;
 const BUSY_BACKOFF_STEP: Duration = Duration::from_millis(5);
 static STORAGE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 
-pub fn configure_turso_connection(
+pub(crate) fn configure_turso_connection(
     conn: &Connection,
     map_error: impl FnOnce(turso::Error) -> PlatformError,
 ) -> Result<()> {
@@ -24,7 +24,7 @@ pub fn configure_turso_connection(
 ///
 /// Requiring a static SQL string keeps generated selectors and variable-sized
 /// `IN` queries from growing the cache without bound.
-pub async fn query_cached(
+pub(crate) async fn query_cached(
     conn: &Connection,
     sql: &'static str,
     params: impl IntoParams,
@@ -36,7 +36,7 @@ pub async fn query_cached(
 /// Execute using Turso's per-connection prepared-statement cache.
 ///
 /// See [`query_cached`] for why this accepts only static SQL.
-pub async fn execute_cached(
+pub(crate) async fn execute_cached(
     conn: &Connection,
     sql: &'static str,
     params: impl IntoParams,
@@ -45,7 +45,7 @@ pub async fn execute_cached(
     statement.execute(params).await
 }
 
-pub async fn ensure_storage_migration_table(conn: &Connection) -> turso::Result<()> {
+pub(crate) async fn ensure_storage_migration_table(conn: &Connection) -> turso::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dd_storage_schema_migrations (
            component TEXT NOT NULL,
@@ -59,7 +59,10 @@ pub async fn ensure_storage_migration_table(conn: &Connection) -> turso::Result<
     Ok(())
 }
 
-pub async fn storage_schema_version(conn: &Connection, component: &str) -> turso::Result<i64> {
+pub(crate) async fn storage_schema_version(
+    conn: &Connection,
+    component: &str,
+) -> turso::Result<i64> {
     let mut rows = query_cached(
         conn,
         "SELECT COALESCE(MAX(version), 0)
@@ -77,7 +80,7 @@ pub async fn storage_schema_version(conn: &Connection, component: &str) -> turso
     Ok(version)
 }
 
-pub async fn record_storage_schema_version(
+pub(crate) async fn record_storage_schema_version(
     conn: &Connection,
     component: &str,
     version: i64,
@@ -102,7 +105,7 @@ pub async fn record_storage_schema_version(
 /// reads, writes and commits inside it, and rolls back before returning an
 /// error, so a retry re-reads everything the commit depends on, such as a
 /// version floor.
-pub async fn retry_busy<T, E, Fut>(
+pub(crate) async fn retry_busy<T, E, Fut>(
     mut attempt: impl FnMut() -> Fut,
     is_busy: impl Fn(&E) -> bool,
 ) -> std::result::Result<T, E>
@@ -126,7 +129,7 @@ pub fn storage_retry_count() -> u64 {
     STORAGE_RETRY_COUNT.load(Ordering::Relaxed)
 }
 
-pub async fn checkpoint_database(database: &turso::Database) -> turso::Result<()> {
+pub(crate) async fn checkpoint_database(database: &turso::Database) -> turso::Result<()> {
     let conn = database.connect()?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mut rows = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
@@ -141,7 +144,7 @@ pub async fn checkpoint_database(database: &turso::Database) -> turso::Result<()
     Ok(())
 }
 
-pub async fn health_check_database(database: &turso::Database) -> turso::Result<()> {
+pub(crate) async fn health_check_database(database: &turso::Database) -> turso::Result<()> {
     let conn = database.connect()?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     let mut rows = conn.query("SELECT 1", ()).await?;
@@ -154,7 +157,7 @@ pub async fn health_check_database(database: &turso::Database) -> turso::Result<
     Ok(())
 }
 
-pub fn is_retryable_turso_error(error: &turso::Error) -> bool {
+pub(crate) fn is_retryable_turso_error(error: &turso::Error) -> bool {
     matches!(error, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
 }
 

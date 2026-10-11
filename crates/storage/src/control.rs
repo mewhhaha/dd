@@ -586,22 +586,6 @@ impl ControlStore {
         Ok(changed == 1)
     }
 
-    pub async fn token_count(&self) -> Result<usize> {
-        let conn = self.connect().await?;
-        let mut rows = conn
-            .query("SELECT COUNT(*) FROM deploy_tokens", ())
-            .await
-            .map_err(control_error)?;
-        let count = rows
-            .next()
-            .await
-            .map_err(control_error)?
-            .expect("token count row")
-            .get::<i64>(0)
-            .map_err(control_error)?;
-        Ok(count.max(0) as usize)
-    }
-
     pub async fn list_tokens(&self, now: u64) -> Result<Vec<ControlDeployToken>> {
         self.delete_expired_tokens(now).await?;
         let conn = self.connect().await?;
