@@ -1,58 +1,21 @@
 # Benchmark configurations
 
-For a small public API check, use the [bounded Fly case-study runner](FLY-API.md).
-It caps requests and concurrency, verifies responses and counters, and removes
-its temporary workers. Its offered rates are not maximum-throughput results.
-
-The [concurrent snapshot-read report](MEMORY-READ.md) compares `memory.read()`
-with `memory.atomic()` using the same executable and matched concurrent-memory
-workloads. `bench_memory_fanout` accepts `DD_FANOUT_READ_API=atomic|snapshot`;
-only read and verification operations select that API, while seed and write
-operations always use `atomic()`. The paired runner exposes this as
-`--baseline-read-api atomic --candidate-read-api snapshot`. Both sides can use
-the same binary and build record. Raw configurations record the selected API.
-
-The [memory latency follow-up](MEMORY-LATENCY.md) separates read and write
-latency and examines durable commit waits. Use `--requests-per-second N` on
-the paired runner, or `DD_FANOUT_REQUESTS_PER_SECOND=N` on the executable,
-to compare at a scheduled arrival rate. Zero retains the saturated caller
-pool. Fixed-rate latency includes waiting for an available caller, every
-scheduled request drains before verification, and the runner checks the
-completed request count. `measurements.timed.by_operation` reports read and
-write distributions; `dispatch_delay` reports the caller backlog and timer
-delay separately. These modes measure latency and capacity under different
-loads; a capped request rate is not a maximum-throughput result.
-
-The [memory overhead investigation](MEMORY-OVERHEAD.md) records rejected cache
-and JavaScript scheduling changes, including core scaling and workloads that
-exceed the cache. The summarizer also reports whole-process CPU milliseconds
-per completed warmup/timed request, including setup and verification overhead.
-
 The scripts in [`configs/`](configs/) are the canonical commands for the
 workloads we intentionally test. Raw sampler output is generated under
-`benchmarks/results/` and is not committed.
+`benchmarks/results/` and is not committed. The [scaling matrix guide](SCALING.md)
+describes the separate scaling workloads; its historical results do not
+establish performance of the current storage layout.
 
-The [consolidation comparison](COHERENCE.md) records five paired runs for seven
-workloads at 8 and 16 logical CPUs, including resource costs and individual
-threshold misses. The [scaling matrix guide](SCALING.md) describes the separate
-scaling workloads; its historical results do not establish performance of the
-current storage layout.
-
-The [concurrent memory comparison](MEMORY-FANOUT.md) measures workers calling
-multiple independent memories, including core scaling, read/write mixes,
-response validation, and exact state verification after reopening.
-The [memory performance follow-up](MEMORY-FANOUT-FOLLOWUP.md) measures direct
-buffer staging and bounded snapshot reuse against that checkpoint, including
-larger multi-key memories, cache overflow, and core scaling.
-The [native snapshot report](MEMORY-NATIVE-SNAPSHOTS.md) profiles those costs
-and compares reading directly from native transaction snapshots, including
-core scaling, small-memory holdouts, and durable write traffic.
-
-For equivalent durable workloads across the consolidation, use the
-[state comparison build and run instructions](../docs/storage-conversion.md).
-That runner verifies prebuilt binaries against exact source snapshots, including
-working-tree patches. The general sampler below requires clean source trees for
-its commit-to-commit acceptance checks.
+Two paired runners compare a baseline build with a candidate outside the
+sampler: the [state comparison](../docs/storage-conversion.md) for durable KV,
+memory and dispatch workloads, and the
+[concurrent memory comparison](#paired-memory-comparisons). Both verify prebuilt
+binaries against exact source snapshots, including working-tree patches. The
+general sampler below requires clean source trees for its commit-to-commit
+acceptance checks. [Fly public API case studies](#fly-public-api-case-studies)
+measure a deployed app over HTTPS, and
+[what earlier investigations found](#what-earlier-investigations-found)
+summarizes the measurements behind the current memory design.
 
 ## Running benchmarks
 
@@ -274,6 +237,100 @@ worktree before treating medians as release or main-branch evidence.
   frontend and service binding layer.
 - Atomic wide-write workloads verify all distinct written keys.
 
+## Paired memory comparisons
+
+`bench_memory_fanout` measures a worker that calls several independent memories
+with `Promise.all`. It validates every response and the exact stored state
+before shutdown and after reopening. `scripts/compare-memory-fanout.py` runs a
+baseline and a candidate executable in alternating pairs, on CPU sets that take
+distinct physical cores before SMT siblings, with a fresh store for every
+process on a physical disk. It needs Linux CPU affinity and `taskset`, and a
+build record for each executable:
+
+```sh
+python3 scripts/build-state-benchmarks.py --bin bench_memory_fanout \
+  --source /path/to/revision --target-dir /path/to/cargo-target \
+  --output /path/to/new-build-record
+
+python3 scripts/compare-memory-fanout.py \
+  --baseline /path/to/before/bench_memory_fanout \
+  --baseline-record /path/to/before/build-record.json \
+  --candidate /path/to/after/bench_memory_fanout \
+  --candidate-record /path/to/after/build-record.json \
+  --cpu-count 1 --cpu-count 4 --cpu-count 8 \
+  --case mixed:16:256:4096:16:varied --case read:16:256:4096:16:varied \
+  --concurrency 32 --pairs 3 --warmup-ms 2000 --duration-ms 8000 \
+  --output /physical/disk/new-results
+
+python3 scripts/summarize-memory-fanout.py /physical/disk/new-results
+```
+
+Copy each executable out of its target directory before building the next
+revision. The runner rejects builds whose benchmark sources, toolchain, profile
+or Cargo configuration differ, so an older checkout needs the current
+`bench_memory_fanout` sources copied in first. A case is
+`MODE:WIDTH:POPULATION:PAYLOAD_BYTES[:KEYS_PER_ENTITY:PAYLOAD_KIND]`: mode
+`read`, `write` or `mixed`, width 1, 4 or 16 memories per request, and payload
+kind `repeated` or `varied`. The summarizer prints Markdown tables of paired
+medians, latency by operation, cache misses, commit density, whole-process CPU
+milliseconds per request and peak RSS; `--plot` also draws core scaling and
+needs matplotlib.
+
+- `--baseline-read-api atomic --candidate-read-api snapshot` compares
+  `memory.atomic()` with `memory.read()` using one executable and build record
+  on both sides. The executable takes `DD_FANOUT_READ_API=atomic|snapshot`;
+  only read and verification operations use it, while seeding and writes
+  always use `atomic()`.
+- `--requests-per-second N` (`DD_FANOUT_REQUESTS_PER_SECOND`) schedules arrivals
+  at a fixed rate instead of saturating the callers. Latency starts at the
+  scheduled arrival, so waiting for a free caller counts, and every scheduled
+  request drains before verification. `measurements.timed.by_operation` splits
+  read and write latency, and `dispatch_delay` reports the backlog. A capped
+  rate measures latency, not maximum throughput.
+- `--profile` adds native phase timings and thread wait samples, and
+  `--v8-profile` also writes per-isolate V8 logs. Summarize those runs with
+  `python3 scripts/summarize-memory-profile.py RESULTS --output summary.json`.
+  Profiling slows the service, so use it to attribute time, not to compare
+  speed. Native timings are overlapping elapsed waits, not CPU time.
+
+## Fly public API case studies
+
+`scripts/bench-fly-api.py` measures latency through a deployed app's public
+HTTPS endpoint at a small, capped load. It deploys temporary workers through
+the private control plane, undeploys them on success or failure, and never
+calls an external service from a worker. The cases are a durable rate limiter
+(one memory transaction per request), an auth dashboard (a service-binding
+call, a durable session touch and a KV user lookup), and an inventory
+dashboard reading eight memories concurrently
+(`scripts/fly-api-case-studies/inventory.js`).
+
+By default it sends 600 timed requests in ten-second phases at 5 and 15
+requests/s per case, with at most two in flight. It refuses more than 20
+requests/s, phases over 15 seconds or budgets over 1,000 requests, stops on the
+first failed request or once recent p95 exceeds one second, and then checks
+exact durable counters. The target must already run the current storage
+format; the runner does not migrate it.
+
+```sh
+just fly-proxy your-dd-app 18089
+
+python3 scripts/bench-fly-api.py \
+  --public-origin https://your-dd-app.fly.dev \
+  --worker-domain workers.example.com \
+  --private-origin http://127.0.0.1:18089 \
+  --private-token-file /path/to/private-token \
+  --output /path/to/new-results-directory
+```
+
+Repeat `--case rate-limiter`, `--case auth-dashboard` or
+`--case inventory-dashboard` to select cases. Public requests go to the origin
+with the worker's domain in the Host header, so that domain must be configured
+on the app. `results.json` keeps every response's latency and validation, phase
+summaries, source hashes, deployment IDs and cleanup results; the token is
+never written. `python3 scripts/test-bench-fly-api.py`, part of `just check`,
+tests the runner's limits without a network. For a local end-to-end run, point
+both origins at a disposable `dd_server` and pass `--seconds 1 --rate 2`.
+
 ## Broad runtime suite diagnostics
 
 The broad runtime benchmark supports stable listing and filtering:
@@ -336,3 +393,66 @@ Recommended summary workflow:
 The summarizer rejects dirty, incomplete, failed, ambiguous, incompatible, or
 malformed results by default. Use `--allow-dirty` only when deliberately marking
 generated text as non-release evidence.
+
+## What earlier investigations found
+
+These investigations are finished. Their full write-ups, raw tables, charts
+and reproduction notes are in git history; `bc258d7` is the last commit that
+has them, at the paths named below. All of them measured the runtime while it
+still ran on the Deno crates, before the move to rusty_v8 on 2026-10-10, so
+their absolute numbers do not describe the current runtime.
+
+- **Parallel performance review** (`tasks/PARALLEL_PERFORMANCE.md`,
+  2026-06-25). Bounded changes, including a CPU-aware global isolate budget,
+  concurrent outbox shard drains, striped memory locks and pooled readers
+  behind one writer, made memory throughput scale well to 8 isolates before
+  it levelled off on a 16-thread host. Partitioning the worker manager was
+  deferred until a profile shows its loop dominating.
+- **Storage consolidation** (`benchmarks/COHERENCE.md`, `tasks/COHERENCE.md`,
+  2026-09-07). Moving KV and memory into 32 fixed state shards with grouped
+  `FULL` commits passed every paired throughput and p99 gate at 8 and 16 CPUs:
+  durable storage throughput rose 2.1-9.5x and instant responses held at
+  0.99-1.06x. The comparison also found a shutdown deadlock, fixed by dropping
+  queued outbox reply senders before joining the outbox worker. The planned
+  32-CPU run never happened.
+- **Concurrent memory fan-out** (`benchmarks/MEMORY-FANOUT.md`, 2026-09-07).
+  Workers calling 16 memories at once missed the snapshot cache on almost
+  every transaction, because any write invalidated every cached memory on its
+  shard. Writes now invalidate only the memory they change, and one bounded
+  snapshot cache serves the whole store: 8-core mixed throughput rose
+  1.5-2.0x, while all-write and single-memory cases moved less than 10% either
+  way. A shared-lock cache prototype gained at most 7% more and was discarded.
+- **Fan-out follow-up** (`benchmarks/MEMORY-FANOUT-FOLLOWUP.md`, 2026-09-07).
+  Mutations now enter native batches directly, cached snapshots are shared
+  instead of copied, and the writer updates cached snapshots after `COMMIT`
+  rather than dropping them. Larger multi-key memories gained 16-58% at 8
+  cores; a small four-memory mixed case lost 25% and was never explained.
+- **Native snapshots** (`benchmarks/MEMORY-NATIVE-SNAPSHOTS.md`, 2026-09-08).
+  Profiles showed transactions reloading whole snapshots into JavaScript to
+  read 2 of 16 values. Transactions now keep the snapshot in Rust and copy
+  only the values the callback reads, and the isolate's own snapshot cache is
+  gone. Large mixed workloads gained 1.6-2.5x, reads 3x at 8 cores, and peak
+  RSS fell; durable writes were unchanged.
+- **Snapshot reads** (`benchmarks/MEMORY-READ.md`, 2026-09-08).
+  `memory.read()` runs a synchronous callback over one committed snapshot
+  without the lease, idempotency lookup or commit of `atomic()`. Read-heavy
+  throughput rose 1.1-1.8x over reading through `atomic()`, and mixed
+  throughput scaled 4.9x from 1 to 8 cores instead of 3.1x. A per-entity load
+  lock now stops overlapping cold loads from filling the cache out of order.
+- **Memory latency** (`benchmarks/MEMORY-LATENCY.md`, 2026-09-08). At fixed
+  arrival rates, snapshot reads cut hot-entity read p99 from 22.6 to 2.6 ms,
+  but write latency did not improve. Durable `COMMIT`, about 6-12 ms per group
+  on btrfs, and the entity lease held through it dominate writes, so further
+  write work should start by measuring commit cost on the deployment's
+  storage. Only the benchmark changed: it gained fixed-rate arrivals and
+  per-operation latency.
+- **Memory overhead** (`benchmarks/MEMORY-OVERHEAD.md`, 2026-09-08). A
+  concurrent CLOCK snapshot cache, synchronous clock refreshes and
+  request-context reuse showed no reliable gain and were reverted. Two changes
+  stayed: shard routing hashes only when a snapshot needs a SQL load, and the
+  fan-out summarizer reports CPU time per request.
+- **Fly public API** (`benchmarks/FLY-API.md`, `benchmarks/FLY-API-RESULTS.md`,
+  2026-09-08). On one shared Fly CPU, all 600 public HTTPS requests across the
+  three case studies succeeded at 5 and 15 requests/s, with medians of 36-39 ms
+  and p95 under 51 ms. The latency includes TLS and Fly routing, so this shows
+  correct behaviour at a modest load, not capacity.

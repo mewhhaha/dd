@@ -261,10 +261,6 @@ KV and memory share 32 fixed state shards. Deployment records and tokens use `co
 
 See [architecture and resource limits](docs/architecture.md) and [storage conversion](docs/storage-conversion.md).
 
-The [consolidation performance report](benchmarks/COHERENCE.md) records measured
-throughput, latency and resource costs, with validation limits and reproduction
-instructions.
-
 ## Fly
 
 Fly runs one `dd_server` app process. Workers are deployed into that app; they are not separate Fly apps.
@@ -312,8 +308,9 @@ Benchmark configurations and reproducible measurement instructions live in
 [benchmarks/README.md](benchmarks/README.md). Contributor/dev notes live in
 [docs/development.md](docs/development.md).
 
-The [native memory snapshot report](benchmarks/MEMORY-NATIVE-SNAPSHOTS.md)
-covers concurrent memory throughput, core scaling, and storage wait profiles.
+[What earlier investigations found](benchmarks/README.md#what-earlier-investigations-found)
+summarizes the measurements behind the state storage layout and the memory
+design.
 
 ## Reproducible reports
 
