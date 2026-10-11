@@ -1,12 +1,11 @@
 use crate::turso_util::{
     checkpoint_database, configure_turso_connection, ensure_storage_migration_table,
     execute_cached, health_check_database, is_retryable_turso_error, query_cached,
-    record_storage_retry, record_storage_schema_version, retry_turso_busy, storage_schema_version,
+    record_storage_schema_version, retry_busy, storage_schema_version,
 };
 use bytes::Bytes;
 use common::{PlatformError, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,7 +13,8 @@ use tokio::sync::Mutex as AsyncMutex;
 #[cfg(test)]
 use tokio::sync::{Notify, oneshot};
 use turso::Builder;
-use turso::{Connection, Database, transaction::TransactionBehavior};
+use turso::transaction::{Transaction, TransactionBehavior};
+use turso::{Connection, Database};
 use uuid::Uuid;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
@@ -731,104 +731,83 @@ impl CacheStore {
         let headers_json = crate::json::to_string(&response.headers)
             .map_err(|error| PlatformError::runtime(format!("cache error: {error}")))?;
 
-        let mut conn = self.connect().await?;
+        let conn = self.connect().await?;
         let now_ms = epoch_ms_i64()?;
         let expires_at_ms = now_ms + ttl.as_millis() as i64;
         let access_seq = self.next_access_seq();
         let entry_id = Uuid::new_v4().to_string();
         let _mutation_guard = self.mutation_lock.lock().await;
 
-        const MAX_ATTEMPTS: usize = 8;
-        let existing_variant = 'write: {
-            for attempt in 0..MAX_ATTEMPTS {
-                let tx = match conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .await
-                {
-                    Ok(tx) => tx,
-                    Err(error)
-                        if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
-                    {
-                        sleep_cache_retry(attempt).await;
-                        continue;
-                    }
-                    Err(error) => return Err(cache_error_after_retry(error)),
-                };
-                let existing_variant = match self
-                    .load_variant_candidates(
+        let existing_variant = retry_busy(
+            || async {
+                let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+                let written = async {
+                    let existing_variant = self
+                        .load_variant_candidates(
+                            &tx,
+                            &cache_name,
+                            &method,
+                            &request.url,
+                            &vary_headers_json,
+                            &vary_values_json,
+                        )
+                        .await?;
+                    execute_cached(
                         &tx,
-                        &cache_name,
-                        &method,
-                        &request.url,
-                        &vary_headers_json,
-                        &vary_values_json,
+                        "INSERT INTO worker_cache_entries (
+                               id, cache_name, method, url, vary_headers_json, vary_values_json,
+                               status, headers_json, body_blob, body_size,
+                               expires_at_ms, last_access_seq, updated_at_ms
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                             ON CONFLICT(cache_name, method, url, vary_headers_json, vary_values_json)
+                             DO UPDATE SET
+                               status = excluded.status,
+                               headers_json = excluded.headers_json,
+                               body_blob = excluded.body_blob,
+                               body_size = excluded.body_size,
+                               expires_at_ms = excluded.expires_at_ms,
+                               last_access_seq = excluded.last_access_seq,
+                               updated_at_ms = excluded.updated_at_ms",
+                        (
+                            entry_id.as_str(),
+                            cache_name.as_str(),
+                            method.as_str(),
+                            request.url.as_str(),
+                            vary_headers_json.as_str(),
+                            vary_values_json.as_str(),
+                            response.status as i64,
+                            headers_json.as_str(),
+                            response.body.as_ref(),
+                            size_bytes as i64,
+                            expires_at_ms,
+                            access_seq,
+                            now_ms,
+                        ),
                     )
-                    .await
-                {
+                    .await?;
+                    Ok(existing_variant)
+                }
+                .await;
+                let existing_variant = match written {
                     Ok(existing_variant) => existing_variant,
                     Err(error) => {
                         let _ = tx.rollback().await;
                         return Err(error);
                     }
                 };
-                let put_result = execute_cached(
-                    &tx,
-                    "INSERT INTO worker_cache_entries (
-                           id, cache_name, method, url, vary_headers_json, vary_values_json,
-                           status, headers_json, body_blob, body_size,
-                           expires_at_ms, last_access_seq, updated_at_ms
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                         ON CONFLICT(cache_name, method, url, vary_headers_json, vary_values_json)
-                         DO UPDATE SET
-                           status = excluded.status,
-                           headers_json = excluded.headers_json,
-                           body_blob = excluded.body_blob,
-                           body_size = excluded.body_size,
-                           expires_at_ms = excluded.expires_at_ms,
-                           last_access_seq = excluded.last_access_seq,
-                           updated_at_ms = excluded.updated_at_ms",
-                    (
-                        entry_id.as_str(),
-                        cache_name.as_str(),
-                        method.as_str(),
-                        request.url.as_str(),
-                        vary_headers_json.as_str(),
-                        vary_values_json.as_str(),
-                        response.status as i64,
-                        headers_json.as_str(),
-                        response.body.as_ref(),
-                        size_bytes as i64,
-                        expires_at_ms,
-                        access_seq,
-                        now_ms,
-                    ),
-                )
-                .await;
-                if let Err(error) = put_result {
-                    let _ = tx.rollback().await;
-                    if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
-                        sleep_cache_retry(attempt).await;
-                        continue;
-                    }
-                    return Err(cache_error_after_retry(error));
-                }
                 if let Err(error) = tx.commit().await {
                     // A commit error can be ambiguous. Invalidate conservatively
                     // so a prior decoded response cannot outlive a disk commit.
                     self.hot_cache.invalidate_base(&base_key);
                     self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
-                    if is_retryable_turso_error(&error) && attempt + 1 < MAX_ATTEMPTS {
-                        sleep_cache_retry(attempt).await;
-                        continue;
-                    }
-                    return Err(cache_error_after_retry(error));
+                    return Err(error);
                 }
-                break 'write existing_variant;
-            }
-            return Err(PlatformError::storage_unavailable(
-                "cache error: put failed after retries",
-            ));
-        };
+                Ok(existing_variant)
+            },
+            is_retryable_turso_error,
+        )
+        .await
+        .map_err(cache_error_after_retry)?;
         let committed_id = existing_variant
             .first()
             .map(|existing| existing.id.clone())
@@ -952,7 +931,7 @@ impl CacheStore {
         url: &str,
         vary_headers_json: &str,
         vary_values_json: &str,
-    ) -> Result<Vec<CacheDeleteCandidate>> {
+    ) -> turso::Result<Vec<CacheDeleteCandidate>> {
         let mut rows = query_cached(
             conn,
             "SELECT id
@@ -961,13 +940,12 @@ impl CacheStore {
                    AND vary_headers_json = ?4 AND vary_values_json = ?5",
             (cache_name, method, url, vary_headers_json, vary_values_json),
         )
-        .await
-        .map_err(cache_error)?;
+        .await?;
 
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.map_err(cache_error)? {
+        while let Some(row) = rows.next().await? {
             out.push(CacheDeleteCandidate {
-                id: row.get::<String>(0).map_err(cache_error)?,
+                id: row.get::<String>(0)?,
             });
         }
         Ok(out)
@@ -1087,14 +1065,18 @@ impl CacheStore {
     ) -> Result<()> {
         for record in records {
             self.hot_cache.invalidate_ids([record.id.as_str()]);
-            let changed = execute_with_retry(|| {
-                execute_cached(
-                    conn,
-                    "DELETE FROM worker_cache_entries WHERE id = ?1",
-                    (record.id.as_str(),),
-                )
-            })
-            .await?;
+            let changed = retry_busy(
+                || {
+                    execute_cached(
+                        conn,
+                        "DELETE FROM worker_cache_entries WHERE id = ?1",
+                        (record.id.as_str(),),
+                    )
+                },
+                is_retryable_turso_error,
+            )
+            .await
+            .map_err(cache_error_after_retry)?;
             if changed > 0 {
                 self.mutation_epoch.fetch_add(1, Ordering::AcqRel);
             }
@@ -1444,19 +1426,6 @@ fn epoch_ms_i64() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| PlatformError::internal(format!("system clock error: {error}")))?;
     Ok(duration.as_millis() as i64)
-}
-
-async fn execute_with_retry<F, Fut>(execute: F) -> Result<u64>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = std::result::Result<u64, turso::Error>>,
-{
-    retry_turso_busy(execute, cache_error_after_retry).await
-}
-
-async fn sleep_cache_retry(attempt: usize) {
-    record_storage_retry();
-    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
 }
 
 fn cache_error(error: impl std::fmt::Display) -> PlatformError {

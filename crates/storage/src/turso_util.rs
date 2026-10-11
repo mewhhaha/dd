@@ -5,7 +5,11 @@ use std::time::Duration;
 use turso::{Connection, IntoParams, Rows};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
-const MAX_BUSY_RETRY_ATTEMPTS: usize = 8;
+/// Each attempt already waits up to `BUSY_TIMEOUT` inside Turso, so this bounds
+/// how long one unit of work can stall before the store reports itself
+/// unavailable.
+const MAX_BUSY_ATTEMPTS: u32 = 8;
+const BUSY_BACKOFF_STEP: Duration = Duration::from_millis(5);
 static STORAGE_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn configure_turso_connection(
@@ -90,33 +94,32 @@ pub async fn record_storage_schema_version(
     Ok(())
 }
 
-pub async fn retry_turso_busy<F, Fut, T>(
-    mut execute: F,
-    map_error: impl Fn(turso::Error) -> PlatformError,
-) -> Result<T>
+/// Runs `attempt` until it succeeds, fails with an error `is_busy` rejects, or
+/// has run `MAX_BUSY_ATTEMPTS` times, sleeping a little longer before each
+/// retry.
+///
+/// Each call of `attempt` is the whole unit of work. A transaction begins,
+/// reads, writes and commits inside it, and rolls back before returning an
+/// error, so a retry re-reads everything the commit depends on, such as a
+/// version floor.
+pub async fn retry_busy<T, E, Fut>(
+    mut attempt: impl FnMut() -> Fut,
+    is_busy: impl Fn(&E) -> bool,
+) -> std::result::Result<T, E>
 where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = turso::Result<T>>,
+    Fut: Future<Output = std::result::Result<T, E>>,
 {
-    let mut attempt = 0usize;
+    let mut retries = 0;
     loop {
-        match execute().await {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                attempt += 1;
-                if is_retryable_turso_error(&error) && attempt < MAX_BUSY_RETRY_ATTEMPTS {
-                    record_storage_retry();
-                    tokio::time::sleep(Duration::from_millis(5 * attempt as u64)).await;
-                    continue;
-                }
-                return Err(map_error(error));
+        match attempt().await {
+            Err(error) if is_busy(&error) && retries + 1 < MAX_BUSY_ATTEMPTS => {
+                retries += 1;
+                STORAGE_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(BUSY_BACKOFF_STEP * retries).await;
             }
+            result => return result,
         }
     }
-}
-
-pub fn record_storage_retry() {
-    STORAGE_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn storage_retry_count() -> u64 {
@@ -173,5 +176,46 @@ mod tests {
         assert!(!is_retryable_turso_error(&turso::Error::Constraint(
             "conflict".to_string()
         )));
+    }
+
+    #[tokio::test]
+    async fn busy_retries_rerun_the_whole_attempt_within_the_limit() {
+        let attempts = std::cell::Cell::new(0);
+        let recovered = retry_busy(
+            || async {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    return Err(turso::Error::Busy("database is locked".to_string()));
+                }
+                Ok(attempts.get())
+            },
+            is_retryable_turso_error,
+        )
+        .await;
+        assert_eq!(recovered.unwrap(), 3);
+
+        attempts.set(0);
+        let exhausted: turso::Result<()> = retry_busy(
+            || async {
+                attempts.set(attempts.get() + 1);
+                Err(turso::Error::Busy("database is locked".to_string()))
+            },
+            is_retryable_turso_error,
+        )
+        .await;
+        assert!(matches!(exhausted, Err(turso::Error::Busy(_))));
+        assert_eq!(attempts.get(), MAX_BUSY_ATTEMPTS);
+
+        attempts.set(0);
+        let rejected: turso::Result<()> = retry_busy(
+            || async {
+                attempts.set(attempts.get() + 1);
+                Err(turso::Error::Constraint("conflict".to_string()))
+            },
+            is_retryable_turso_error,
+        )
+        .await;
+        assert!(matches!(rejected, Err(turso::Error::Constraint(_))));
+        assert_eq!(attempts.get(), 1);
     }
 }

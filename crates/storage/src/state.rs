@@ -2,6 +2,7 @@ use common::{PlatformError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use turso::{Builder, Connection, Database};
 
@@ -18,8 +19,7 @@ use crate::memory::{
     SnapshotCache,
 };
 use crate::turso_util::{
-    configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached,
-    record_storage_retry,
+    configure_turso_connection, execute_cached, is_retryable_turso_error, query_cached, retry_busy,
 };
 
 pub const STATE_SHARDS: usize = 32;
@@ -750,96 +750,108 @@ async fn commit_group(
     snapshots: &Mutex<SnapshotCache>,
     batch: &[WriteCommand],
 ) -> Result<Vec<WriteOutcome<WriteReply>>> {
-    for attempt in 0..8 {
-        if slot.is_none() {
-            let conn = database.connect().map_err(storage_error)?;
-            configure_connection(&conn).await?;
-            *slot = Some(conn);
-        }
-        let conn = slot.as_ref().expect("state writer connection");
-        let profile = metrics.profile_enabled.load(Ordering::Relaxed);
-        let result: std::result::Result<Vec<WriteOutcome<WriteReply>>, WriteError> = async {
-            let sql_timing = WritePhaseTiming::new(profile, &metrics.sql_us);
-            if profile {
-                metrics.sql_attempts.fetch_add(1, Ordering::Relaxed);
+    // Each attempt takes the connection and returns it unless its rollback
+    // failed, so a retry after a failed rollback starts on a fresh connection.
+    let slot = Cell::from_mut(slot);
+    let attempts = Cell::new(0_u32);
+    let result = retry_busy(
+        || async {
+            if attempts.replace(attempts.get() + 1) > 0 {
+                metrics.busy_retries.fetch_add(1, Ordering::Relaxed);
             }
-            execute_cached(conn, "BEGIN IMMEDIATE", ()).await?;
-            let mut rows = query_cached(
-                conn,
-                "SELECT version FROM state_floor WHERE singleton = 1",
-                (),
-            )
-            .await?;
-            let mut version = rows
-                .next()
-                .await?
-                .expect("state version floor")
-                .get::<i64>(0)?;
-            drop(rows);
-            let mut replies = Vec::with_capacity(batch.len());
-            for command in batch {
-                version = version.checked_add(1).ok_or_else(|| {
-                    PlatformError::runtime(format!("state version exhausted at {version}"))
-                })?;
-                replies.push((command.operation)(conn, version).await?);
+            let owned = match slot.take() {
+                Some(conn) => conn,
+                None => {
+                    let conn = database.connect().map_err(storage_error)?;
+                    configure_connection(&conn).await?;
+                    conn
+                }
+            };
+            let conn = &owned;
+            let profile = metrics.profile_enabled.load(Ordering::Relaxed);
+            let result: std::result::Result<Vec<WriteOutcome<WriteReply>>, WriteError> = async {
+                let sql_timing = WritePhaseTiming::new(profile, &metrics.sql_us);
+                if profile {
+                    metrics.sql_attempts.fetch_add(1, Ordering::Relaxed);
+                }
+                // The floor is read inside the write lock on every attempt, so a
+                // retry numbers its commands after anything committed meanwhile.
+                execute_cached(conn, "BEGIN IMMEDIATE", ()).await?;
+                let mut rows = query_cached(
+                    conn,
+                    "SELECT version FROM state_floor WHERE singleton = 1",
+                    (),
+                )
+                .await?;
+                let mut version = rows
+                    .next()
+                    .await?
+                    .expect("state version floor")
+                    .get::<i64>(0)?;
+                drop(rows);
+                let mut replies = Vec::with_capacity(batch.len());
+                for command in batch {
+                    version = version.checked_add(1).ok_or_else(|| {
+                        PlatformError::runtime(format!("state version exhausted at {version}"))
+                    })?;
+                    replies.push((command.operation)(conn, version).await?);
+                }
+                execute_cached(
+                    conn,
+                    "UPDATE state_floor SET version = ?1 WHERE singleton = 1",
+                    (version,),
+                )
+                .await?;
+                drop(sql_timing);
+                let _commit_timing = WritePhaseTiming::new(profile, &metrics.commit_us);
+                execute_cached(conn, "COMMIT", ()).await?;
+                Ok(replies)
             }
-            execute_cached(
-                conn,
-                "UPDATE state_floor SET version = ?1 WHERE singleton = 1",
-                (version,),
-            )
-            .await?;
-            drop(sql_timing);
-            let _commit_timing = WritePhaseTiming::new(profile, &metrics.commit_us);
-            execute_cached(conn, "COMMIT", ()).await?;
-            Ok(replies)
-        }
-        .await;
-        match result {
-            Ok(replies) => {
-                let _publish_timing = WritePhaseTiming::new(profile, &metrics.snapshot_publish_us);
-                epoch.fetch_add(1, Ordering::AcqRel);
-                let changes = batch
-                    .iter()
-                    .zip(&replies)
-                    .filter_map(|(command, reply)| {
-                        command
-                            .options
-                            .invalidate_memory
-                            .as_ref()
-                            .map(|key| (key, reply.snapshot.as_ref()))
-                    })
-                    .collect::<Vec<_>>();
-                SnapshotCache::publish_committed(snapshots, &changes);
-                metrics.committed_groups.fetch_add(1, Ordering::Relaxed);
-                metrics
-                    .committed_commands
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                return Ok(replies);
-            }
-            Err(error) => {
-                let retry = matches!(&error, WriteError::Database(error) if is_retryable_turso_error(error));
+            .await;
+            if result.is_err() {
                 if execute_cached(conn, "ROLLBACK", ()).await.is_err() {
-                    slot.take();
                     // A failed rollback leaves the commit outcome unknown before a retry.
                     invalidate_memory_snapshots(epoch, snapshots, batch);
                     metrics
                         .discarded_connections
                         .fetch_add(1, Ordering::Relaxed);
-                } else {
-                    metrics.rollbacks.fetch_add(1, Ordering::Relaxed);
+                    return result;
                 }
-                if !retry || attempt == 7 {
-                    invalidate_memory_snapshots(epoch, snapshots, batch);
-                    return Err(error.into());
-                }
-                record_storage_retry();
-                metrics.busy_retries.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(5 * (attempt + 1))).await;
+                metrics.rollbacks.fetch_add(1, Ordering::Relaxed);
             }
+            slot.set(Some(owned));
+            result
+        },
+        |error| matches!(error, WriteError::Database(error) if is_retryable_turso_error(error)),
+    )
+    .await;
+    let replies = match result {
+        Ok(replies) => replies,
+        Err(error) => {
+            invalidate_memory_snapshots(epoch, snapshots, batch);
+            return Err(error.into());
         }
-    }
-    unreachable!("bounded state retry loop returns")
+    };
+    let profile = metrics.profile_enabled.load(Ordering::Relaxed);
+    let _publish_timing = WritePhaseTiming::new(profile, &metrics.snapshot_publish_us);
+    epoch.fetch_add(1, Ordering::AcqRel);
+    let changes = batch
+        .iter()
+        .zip(&replies)
+        .filter_map(|(command, reply)| {
+            command
+                .options
+                .invalidate_memory
+                .as_ref()
+                .map(|key| (key, reply.snapshot.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    SnapshotCache::publish_committed(snapshots, &changes);
+    metrics.committed_groups.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .committed_commands
+        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+    Ok(replies)
 }
 
 pub(crate) async fn configure_connection(conn: &Connection) -> Result<()> {
@@ -880,34 +892,32 @@ async fn migrate_state_schema(conn: &Connection) -> Result<()> {
         ordinal_exists |= row.get::<String>(1).map_err(storage_error)? == "ordinal";
     }
     drop(rows);
-    for attempt in 0..8 {
-        let result: turso::Result<()> = async {
-            conn.execute("BEGIN IMMEDIATE", ()).await?;
-            if !ordinal_exists {
-                // Old effect IDs hashed their position, so historical order cannot be recovered.
-                conn.execute("ALTER TABLE memory_outbox ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0", ()).await?;
-            }
-            conn.execute("CREATE INDEX IF NOT EXISTS memory_outbox_entity_order ON memory_outbox(worker,binding,entity_key,revision,ordinal,effect_id)", ()).await?;
-            conn.execute("DROP INDEX IF EXISTS memory_outbox_due", ()).await?;
-            conn.execute("CREATE INDEX memory_outbox_due ON memory_outbox(status,next_attempt_at_ms,revision,ordinal,effect_id)", ()).await?;
-            conn.execute("DELETE FROM memory_state WHERE deleted<>0", ()).await?;
-            conn.execute("PRAGMA user_version=1", ()).await?;
-            conn.execute("COMMIT", ()).await?;
-            Ok(())
-        }.await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                if !is_retryable_turso_error(&error) || attempt == 7 {
-                    return Err(storage_error(error));
+    retry_busy(
+        || async {
+            let result: turso::Result<()> = async {
+                conn.execute("BEGIN IMMEDIATE", ()).await?;
+                if !ordinal_exists {
+                    // Old effect IDs hashed their position, so historical order cannot be recovered.
+                    conn.execute("ALTER TABLE memory_outbox ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0", ()).await?;
                 }
-                record_storage_retry();
-                tokio::time::sleep(Duration::from_millis(5 * (attempt + 1))).await;
+                conn.execute("CREATE INDEX IF NOT EXISTS memory_outbox_entity_order ON memory_outbox(worker,binding,entity_key,revision,ordinal,effect_id)", ()).await?;
+                conn.execute("DROP INDEX IF EXISTS memory_outbox_due", ()).await?;
+                conn.execute("CREATE INDEX memory_outbox_due ON memory_outbox(status,next_attempt_at_ms,revision,ordinal,effect_id)", ()).await?;
+                conn.execute("DELETE FROM memory_state WHERE deleted<>0", ()).await?;
+                conn.execute("PRAGMA user_version=1", ()).await?;
+                conn.execute("COMMIT", ()).await?;
+                Ok(())
             }
-        }
-    }
-    unreachable!()
+            .await;
+            if result.is_err() {
+                let _ = conn.execute("ROLLBACK", ()).await;
+            }
+            result
+        },
+        is_retryable_turso_error,
+    )
+    .await
+    .map_err(storage_error)
 }
 
 pub(crate) fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -943,6 +953,7 @@ impl MemoryLease {
 mod tests {
     use super::*;
     use crate::memory::{MemoryBatchMutation, MemoryStore, worker_namespace};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn queued_bytes_reject_retryably_and_release_after_commit() {
@@ -1293,6 +1304,7 @@ mod migration_tests {
     use crate::memory::{
         MemoryBatchMutation, MemoryCommit, MemoryOutboxEffectWrite, MemoryStore, worker_namespace,
     };
+    use std::time::Duration;
 
     #[tokio::test]
     async fn legacy_state_migrates_ordinals_and_compacts_deletes_without_regressing_floors() {

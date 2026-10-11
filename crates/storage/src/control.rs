@@ -1,5 +1,5 @@
 use crate::turso_util::{
-    checkpoint_database, configure_turso_connection, is_retryable_turso_error,
+    checkpoint_database, configure_turso_connection, is_retryable_turso_error, retry_busy,
 };
 use common::{
     DeployAsset, DeployConfig, DeployServerModule, DeployTokenCapabilities, DeploymentDetails,
@@ -8,12 +8,12 @@ use common::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use turso::{Builder, Connection, Database, Row, transaction::TransactionBehavior};
+use std::time::{SystemTime, UNIX_EPOCH};
+use turso::transaction::{Transaction, TransactionBehavior};
+use turso::{Builder, Connection, Database, Row};
 
 const CONTROL_SCHEMA_VERSION: i64 = 1;
 const MAX_DEPLOYMENTS_PER_WORKER: i64 = 5;
-const MAX_BUSY_RETRY_ATTEMPTS: usize = 8;
 
 const CONTROL_V1_TABLE_COLUMNS: &[(&str, &[&str])] = &[
     ("control_migrations", &["version", "applied_at_ms"]),
@@ -533,22 +533,24 @@ impl ControlStore {
             Err(error) => (0_i64, Some(error.to_string())),
         };
         let conn = self.connect().await?;
-        retry_execute(|| {
-            let conn = &conn;
-            let error = error.clone();
-            async move {
-                conn.execute(
-                    "INSERT INTO restore_diagnostics(worker_name, deployment_id, ok, error, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(worker_name) DO UPDATE SET
-                       deployment_id = excluded.deployment_id,
-                       ok = excluded.ok,
-                       error = excluded.error,
-                       updated_at_ms = excluded.updated_at_ms",
-                    (worker, deployment_id, ok, error, epoch_ms_i64().map_err(to_turso_error)?),
-                )
-                .await
-            }
+        retry_execute(|| async {
+            conn.execute(
+                "INSERT INTO restore_diagnostics(worker_name, deployment_id, ok, error, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(worker_name) DO UPDATE SET
+                   deployment_id = excluded.deployment_id,
+                   ok = excluded.ok,
+                   error = excluded.error,
+                   updated_at_ms = excluded.updated_at_ms",
+                (
+                    worker,
+                    deployment_id,
+                    ok,
+                    error.clone(),
+                    epoch_ms_i64().map_err(to_turso_error)?,
+                ),
+            )
+            .await
         })
         .await?;
         Ok(())
@@ -580,11 +582,7 @@ impl ControlStore {
 
     pub async fn insert_token(&self, token: &ControlDeployToken) -> Result<bool> {
         let conn = self.connect().await?;
-        let changed = retry_execute(|| {
-            let conn = &conn;
-            async move { insert_token_tx(conn, token).await }
-        })
-        .await?;
+        let changed = retry_execute(|| insert_token_tx(&conn, token)).await?;
         Ok(changed == 1)
     }
 
@@ -662,19 +660,16 @@ impl ControlStore {
 
     pub async fn consume_token(&self, id: &str, now: u64) -> Result<bool> {
         let conn = self.connect().await?;
-        let changed = retry_execute(|| {
-            let conn = &conn;
-            async move {
-                conn.execute(
-                    "UPDATE deploy_tokens
-                     SET uses = uses + 1, last_used_at_unix = ?2
-                     WHERE id = ?1
-                       AND (expires_at_unix IS NULL OR expires_at_unix > ?2)
-                       AND (max_uses IS NULL OR uses < max_uses)",
-                    (id, u64_to_i64(now)?),
-                )
-                .await
-            }
+        let changed = retry_execute(|| async {
+            conn.execute(
+                "UPDATE deploy_tokens
+                 SET uses = uses + 1, last_used_at_unix = ?2
+                 WHERE id = ?1
+                   AND (expires_at_unix IS NULL OR expires_at_unix > ?2)
+                   AND (max_uses IS NULL OR uses < max_uses)",
+                (id, u64_to_i64(now)?),
+            )
+            .await
         })
         .await?;
         Ok(changed == 1)
@@ -683,12 +678,9 @@ impl ControlStore {
     pub async fn delete_token(&self, id: &str, now: u64) -> Result<bool> {
         self.delete_expired_tokens(now).await?;
         let conn = self.connect().await?;
-        let changed = retry_execute(|| {
-            let conn = &conn;
-            async move {
-                conn.execute("DELETE FROM deploy_tokens WHERE id = ?1", (id,))
-                    .await
-            }
+        let changed = retry_execute(|| async {
+            conn.execute("DELETE FROM deploy_tokens WHERE id = ?1", (id,))
+                .await
         })
         .await?;
         Ok(changed > 0)
@@ -696,15 +688,12 @@ impl ControlStore {
 
     async fn delete_expired_tokens(&self, now: u64) -> Result<()> {
         let conn = self.connect().await?;
-        retry_execute(|| {
-            let conn = &conn;
-            async move {
-                conn.execute(
-                    "DELETE FROM deploy_tokens WHERE expires_at_unix IS NOT NULL AND expires_at_unix <= ?1",
-                    (u64_to_i64(now)?,),
-                )
-                .await
-            }
+        retry_execute(|| async {
+            conn.execute(
+                "DELETE FROM deploy_tokens WHERE expires_at_unix IS NOT NULL AND expires_at_unix <= ?1",
+                (u64_to_i64(now)?,),
+            )
+            .await
         })
         .await?;
         Ok(())
@@ -742,55 +731,31 @@ impl ControlStore {
 
     async fn with_write_transaction<T>(
         &self,
-        mut operation: impl for<'a> FnMut(
+        operation: impl for<'a> Fn(
             &'a Connection,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
         >,
     ) -> Result<T> {
-        let mut conn = self.connect().await?;
-        for attempt in 0..MAX_BUSY_RETRY_ATTEMPTS {
-            let tx = match conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .await
-            {
-                Ok(tx) => tx,
-                Err(error)
-                    if is_retryable_turso_error(&error)
-                        && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS =>
-                {
-                    retry_sleep(attempt).await;
-                    continue;
-                }
-                Err(error) => return Err(control_error_after_retry(error)),
-            };
-            match operation(&tx).await {
-                Ok(value) => match tx.commit().await {
-                    Ok(()) => return Ok(value),
-                    Err(error)
-                        if is_retryable_turso_error(&error)
-                            && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS =>
-                    {
-                        retry_sleep(attempt).await;
+        let conn = self.connect().await?;
+        retry_busy(
+            || async {
+                let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).await?;
+                match operation(&tx).await {
+                    Ok(value) => {
+                        tx.commit().await?;
+                        Ok(value)
                     }
-                    Err(error) => return Err(control_error_after_retry(error)),
-                },
-                Err(error)
-                    if is_retryable_turso_error(&error)
-                        && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS =>
-                {
-                    let _ = tx.rollback().await;
-                    retry_sleep(attempt).await;
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
                 }
-                Err(error) => {
-                    let _ = tx.rollback().await;
-                    return Err(control_error_after_retry(error));
-                }
-            }
-        }
-        Err(PlatformError::storage_unavailable(
-            "control database remained busy",
-        ))
+            },
+            is_retryable_turso_error,
+        )
+        .await
+        .map_err(control_error_after_retry)
     }
 }
 
@@ -906,30 +871,13 @@ fn token_from_row(row: &Row) -> Result<ControlDeployToken> {
     })
 }
 
-async fn retry_execute<F, Fut>(mut operation: F) -> Result<u64>
+async fn retry_execute<Fut>(operation: impl FnMut() -> Fut) -> Result<u64>
 where
-    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = turso::Result<u64>>,
 {
-    for attempt in 0..MAX_BUSY_RETRY_ATTEMPTS {
-        match operation().await {
-            Ok(changed) => return Ok(changed),
-            Err(error)
-                if is_retryable_turso_error(&error) && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS =>
-            {
-                retry_sleep(attempt).await;
-            }
-            Err(error) => return Err(control_error_after_retry(error)),
-        }
-    }
-    Err(PlatformError::storage_unavailable(
-        "control database remained busy",
-    ))
-}
-
-async fn retry_sleep(attempt: usize) {
-    crate::turso_util::record_storage_retry();
-    tokio::time::sleep(Duration::from_millis(5 * (attempt + 1) as u64)).await;
+    retry_busy(operation, is_retryable_turso_error)
+        .await
+        .map_err(control_error_after_retry)
 }
 
 fn json_string(value: &impl Serialize) -> turso::Result<String> {
