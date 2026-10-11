@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP="${1:-dd-private-8956e096}"
+APP="${1:?usage: proxy-private-deploy.sh APP [LOCAL_PORT] [REMOTE_PORT]}"
 LOCAL_PORT="${2:-18081}"
 REMOTE_PORT="${3:-8081}"
 FLYCTL_BIN="${FLYCTL_BIN:-flyctl}"
