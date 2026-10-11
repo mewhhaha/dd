@@ -399,3 +399,100 @@ export default {
     wait_for_child_state(&service, 0, 0).await;
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+#[serial]
+async fn private_worker_can_call_private_service_binding() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates_per_worker: 2,
+        max_inflight_per_isolate: 2,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy_with_config(
+            "private-auth".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const body = await request.text();
+    return new Response(
+      JSON.stringify({
+        method: request.method,
+        path: url.pathname,
+        service: request.headers.get("x-service"),
+        body,
+      }),
+      { status: 201, headers: { "x-target-worker": "private-auth" } },
+    );
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                public: false,
+                cache: Default::default(),
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("target deploy should succeed");
+
+    service
+        .deploy_with_config(
+            "private-app".to_string(),
+            r#"
+export default {
+  async fetch(_request, env) {
+    const response = await env.AUTH.fetch("/session", {
+      method: "POST",
+      headers: { "x-service": "app" },
+      body: "hello",
+    });
+    return new Response(
+      `${response.status}|${response.headers.get("x-target-worker")}|${await response.text()}`,
+    );
+  },
+};
+"#
+            .to_string(),
+            DeployConfig {
+                public: false,
+                cache: Default::default(),
+                bindings: vec![DeployBinding::Service {
+                    binding: "AUTH".to_string(),
+                    service: "private-auth".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("caller deploy should succeed");
+
+    assert!(!service.worker_is_public("private-auth"));
+    let public_lookup = service
+        .resolve_public_asset("private-auth", "GET", Some("auth.example.com"), "/", &[])
+        .expect("public lookup should not fail");
+    assert!(public_lookup.is_none());
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "private-app",
+        test_invocation_with_path("/", "service-binding-private"),
+        "service binding invoke",
+    )
+    .await;
+    assert_eq!(output.status, 200);
+    let body = String::from_utf8(output.body).expect("utf8");
+    assert!(body.starts_with("201|private-auth|"), "body was {body}");
+    assert!(body.contains("\"method\":\"POST\""), "body was {body}");
+    assert!(body.contains("\"path\":\"/session\""), "body was {body}");
+    assert!(body.contains("\"service\":\"app\""), "body was {body}");
+    assert!(body.contains("\"body\":\"hello\""), "body was {body}");
+}

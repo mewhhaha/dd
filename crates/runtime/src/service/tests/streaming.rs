@@ -432,3 +432,284 @@ export default {
     assert_eq!(stats.isolates_total, 1, "the isolate is not retired");
     service.shutdown().await.expect("runtime shuts down");
 }
+
+#[tokio::test]
+#[serial]
+async fn invoke_stream_delivers_chunked_response_body() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "streaming".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue("hel");
+        controller.enqueue("lo");
+        controller.close();
+      }
+    }), { status: 201, headers: [["x-mode", "stream"]] });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream("streaming".to_string(), test_invocation())
+        .await
+        .expect("invoke stream should succeed");
+    assert_eq!(output.status, 201);
+    assert!(
+        output
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-mode" && value == "stream")
+    );
+
+    let mut body = Vec::new();
+    while let Some(chunk) = output.body.recv().await {
+        body.extend_from_slice(&chunk.expect("chunk should be ok"));
+    }
+    assert_eq!(String::from_utf8(body).expect("utf8"), "hello");
+}
+
+#[tokio::test]
+#[serial]
+async fn invoke_stream_delivers_binary_response_chunks() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 4,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "binary-streaming".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([0, 255, 1]));
+        controller.enqueue(new Uint8Array([2, 128, 3]));
+        controller.close();
+      }
+    }), { status: 206, headers: [["content-type", "application/octet-stream"]] });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream("binary-streaming".to_string(), test_invocation())
+        .await
+        .expect("invoke stream should succeed");
+    assert_eq!(output.status, 206);
+
+    let mut body = Vec::new();
+    while let Some(chunk) = output.body.recv().await {
+        body.extend_from_slice(&chunk.expect("chunk should be ok"));
+    }
+    assert_eq!(body, vec![0, 255, 1, 2, 128, 3]);
+}
+
+#[tokio::test]
+#[serial]
+async fn invoke_stream_body_drop_cancels_running_request() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        max_queue_wait: Duration::from_secs(5),
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(20),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "drop-stream".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/stream") {
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue("first");
+        }
+      }));
+    }
+    return new Response("ok");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream(
+            "drop-stream".to_string(),
+            test_invocation_with_path("/stream", "drop-stream-start"),
+        )
+        .await
+        .expect("stream should start");
+    let first = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("first chunk should arrive")
+        .expect("body should still be open")
+        .expect("first chunk should be ok");
+    assert_eq!(String::from_utf8(first.to_vec()).expect("utf8"), "first");
+
+    drop(output);
+
+    let followup = timeout(
+        Duration::from_secs(3),
+        service.invoke(
+            "drop-stream".to_string(),
+            test_invocation_with_path("/ok", "drop-stream-followup"),
+        ),
+    )
+    .await
+    .expect("body drop should cancel the stream and free the isolate")
+    .expect("followup invoke should succeed");
+    assert_eq!(String::from_utf8(followup.body).expect("utf8"), "ok");
+}
+
+#[tokio::test]
+#[serial]
+async fn invoke_stream_propagates_response_body_error() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "error-stream".to_string(),
+            r#"
+export default {
+  async fetch() {
+    let count = 0;
+    return new Response(new ReadableStream({
+      pull(controller) {
+        if (count === 0) {
+          count++;
+          controller.enqueue("first");
+          return;
+        }
+        controller.error(new Error("stream failed"));
+      }
+    }));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let mut output = service
+        .invoke_stream("error-stream".to_string(), test_invocation())
+        .await
+        .expect("stream should start");
+    let first = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("first chunk should arrive")
+        .expect("body should still be open")
+        .expect("first chunk should be ok");
+    assert_eq!(String::from_utf8(first.to_vec()).expect("utf8"), "first");
+
+    let error = timeout(Duration::from_secs(2), output.body.recv())
+        .await
+        .expect("stream error should arrive")
+        .expect("body should deliver an error")
+        .expect_err("second body item should be an error");
+    assert!(
+        error.to_string().contains("stream failed"),
+        "stream error should include original message: {error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "streaming-body".to_string(),
+            streaming_request_body_worker(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let (tx, rx) = mpsc::channel(4);
+    let mut request = test_invocation();
+    request.method = "POST".to_string();
+    request.request_id = "streaming-body-request".to_string();
+
+    let invoke_task = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .invoke_with_request_body("streaming-body".to_string(), request, Some(rx))
+                .await
+        })
+    };
+
+    tx.send(Ok(Bytes::from_static(b"hel")))
+        .await
+        .expect("first body chunk should send");
+    tx.send(Ok(Bytes::from_static(b"lo")))
+        .await
+        .expect("second body chunk should send");
+    drop(tx);
+
+    let output = invoke_task
+        .await
+        .expect("join")
+        .expect("invoke should succeed");
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "hello");
+}

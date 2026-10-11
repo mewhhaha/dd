@@ -232,3 +232,114 @@ export default {
     );
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+#[serial]
+async fn host_fetch_is_single_permanent_request_scoped_wrapper() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy(
+            "fetch-wrapper".to_string(),
+            r#"
+let firstFetch;
+let firstHostFetch;
+let firstRequestIdGetter;
+let firstRequestContextHandleGetter;
+let firstSyncBoundary;
+let firstCacheBypassGetter;
+
+export default {
+  async fetch() {
+    const current = globalThis.fetch;
+    const hostFetch = __dd_internals.dd.hostFetch;
+    const requestIdGetter = __dd_internals.dd.runtimeRequestId;
+    const requestContextHandleGetter = __dd_internals.dd.runtimeRequestContextHandle;
+    const syncBoundary = __dd_internals.dd.syncTimeBoundary;
+    const cacheBypassGetter = __dd_internals.dd.cacheBypassStale;
+    const first = firstFetch === undefined;
+    if (first) {
+      firstFetch = current;
+      firstHostFetch = hostFetch;
+      firstRequestIdGetter = requestIdGetter;
+      firstRequestContextHandleGetter = requestContextHandleGetter;
+      firstSyncBoundary = syncBoundary;
+      firstCacheBypassGetter = cacheBypassGetter;
+    }
+    return Response.json({
+      first,
+      sameAsFirst: current === firstFetch,
+      hostFetchSameAsFirst: hostFetch === firstHostFetch,
+      requestIdGetterSameAsFirst: requestIdGetter === firstRequestIdGetter,
+      requestContextHandleGetterSameAsFirst: requestContextHandleGetter === firstRequestContextHandleGetter,
+      syncBoundarySameAsFirst: syncBoundary === firstSyncBoundary,
+      cacheBypassGetterSameAsFirst: cacheBypassGetter === firstCacheBypassGetter,
+      cacheBypassGetterAvailable: typeof cacheBypassGetter === "function",
+      cacheBypassValue: Boolean(cacheBypassGetter?.()),
+      rawAvailable: typeof globalThis.__dd_raw_host_fetch === "function",
+      rawInstalled: current === globalThis.__dd_raw_host_fetch,
+      // The global stays the web layer's fetch, which calls the request-scoped
+      // host fetch; the runtime writes no worker-visible global per request.
+      wrapperInstalled: current === __dd_internals.dd.web.fetch
+        && typeof hostFetch === "function",
+    });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke(
+            "fetch-wrapper".to_string(),
+            test_invocation_with_path("/", "fetch-wrapper-first"),
+        )
+        .await
+        .expect("first invoke should succeed");
+    let second = service
+        .invoke(
+            "fetch-wrapper".to_string(),
+            test_invocation_with_path("/", "fetch-wrapper-second"),
+        )
+        .await
+        .expect("second invoke should succeed");
+
+    let first: Value = serde_json::from_slice(&first.body).expect("first body should be json");
+    let second: Value = serde_json::from_slice(&second.body).expect("second body should be json");
+
+    assert_eq!(first["first"], true);
+    assert_eq!(first["sameAsFirst"], true);
+    assert_eq!(first["hostFetchSameAsFirst"], true);
+    assert_eq!(first["requestIdGetterSameAsFirst"], true);
+    assert_eq!(first["requestContextHandleGetterSameAsFirst"], true);
+    assert_eq!(first["syncBoundarySameAsFirst"], true);
+    assert_eq!(first["cacheBypassGetterSameAsFirst"], true);
+    assert_eq!(first["cacheBypassGetterAvailable"], true);
+    assert_eq!(first["cacheBypassValue"], false);
+    assert_eq!(first["rawAvailable"], false);
+    assert_eq!(first["rawInstalled"], false);
+    assert_eq!(first["wrapperInstalled"], true);
+    assert_eq!(second["first"], false);
+    assert_eq!(second["sameAsFirst"], true);
+    assert_eq!(second["hostFetchSameAsFirst"], true);
+    assert_eq!(second["requestIdGetterSameAsFirst"], true);
+    assert_eq!(second["requestContextHandleGetterSameAsFirst"], true);
+    assert_eq!(second["syncBoundarySameAsFirst"], true);
+    assert_eq!(second["cacheBypassGetterSameAsFirst"], true);
+    assert_eq!(second["cacheBypassGetterAvailable"], true);
+    assert_eq!(second["cacheBypassValue"], false);
+    assert_eq!(second["rawAvailable"], false);
+    assert_eq!(second["rawInstalled"], false);
+    assert_eq!(second["wrapperInstalled"], true);
+}

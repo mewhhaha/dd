@@ -1,6 +1,11 @@
-//! Worker code shares its context with the runtime's request machinery and
-//! may replace any built-in or global. The machinery runs on what it captured
-//! at startup, so requests keep working and keep their own handles.
+//! Worker code is untrusted. Outside a debug runtime it cannot generate code
+//! from strings, it reaches none of the runtime's internals, its op arguments
+//! cannot make the runtime copy past its budget, and its forged completions
+//! are ignored.
+//!
+//! Worker code also shares its context with the runtime's request machinery
+//! and may replace any built-in or global. The machinery runs on what it
+//! captured at startup, so requests keep working and keep their own handles.
 use super::*;
 
 /// Replaces, at module evaluation, the built-ins and globals the request
@@ -451,4 +456,211 @@ export default {
         .expect("streamed request succeeds");
     assert_eq!(output.body, b"echo:streamed");
     service.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test]
+#[serial]
+async fn production_runtime_rejects_string_code_generation() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "production-codegen".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return new Response(String(eval("20 + 1")));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let error = service
+        .invoke(
+            "production-codegen".to_string(),
+            test_invocation_with_path("/", "production-codegen"),
+        )
+        .await
+        .expect_err("production invoke should reject eval");
+    assert_eq!(error.kind(), ErrorKind::Runtime);
+    assert!(
+        error.to_string().contains("Code generation from strings"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn debug_runtime_allows_string_code_generation() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 0,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        debug_code_generation: true,
+        ..RuntimeConfig::default()
+    })
+    .await;
+    service
+        .deploy(
+            "debug-codegen".to_string(),
+            r#"
+export default {
+  async fetch() {
+    const evalValue = eval("20 + 1");
+    const functionValue = new Function("value", "return value + 1")(evalValue);
+    return new Response(String(functionValue));
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    let output = invoke_with_timeout_and_dump(
+        &service,
+        "debug-codegen",
+        test_invocation_with_path("/", "debug-codegen"),
+        "debug code generation",
+    )
+    .await;
+    assert_eq!(String::from_utf8(output.body).expect("utf8"), "22");
+}
+
+#[tokio::test]
+#[serial]
+async fn op_arguments_cannot_expand_past_the_copy_budget() {
+    let service = test_service(RuntimeConfig::default()).await;
+    service
+        .deploy(
+            "expanding".to_string(),
+            r#"
+export default {
+  fetch() {
+    // 1 MiB of string, referenced 300 times: copying it would take 600 MiB.
+    const big = "x".repeat(1 << 20);
+    const params = new URLSearchParams();
+    for (let i = 0; i < 300; i++) params.append(big, big);
+    try {
+      params.toString();
+      return new Response("copied");
+    } catch (error) {
+      return new Response(`refused: ${error.message}`);
+    }
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+    let output = service
+        .invoke("expanding".to_string(), test_invocation())
+        .await
+        .expect("the worker survives the refused copy");
+    let body = String::from_utf8(output.body.to_vec()).expect("utf8");
+    assert!(
+        body.starts_with("refused:") && body.contains("too large"),
+        "{body}"
+    );
+    service.shutdown().await.expect("service should shut down");
+}
+
+#[tokio::test]
+#[serial]
+async fn deployed_workers_reach_no_runtime_internals() {
+    // test_service exposes the internals; a default service must not.
+    let store = TestStoreDir::new("dd-internals");
+    let service = RuntimeService::start(RuntimeServiceConfig {
+        runtime: RuntimeConfig::default(),
+        storage: RuntimeStorageConfig {
+            store_dir: store.path().to_path_buf(),
+            ..RuntimeStorageConfig::default()
+        },
+    })
+    .await
+    .expect("service should start");
+    service
+        .deploy(
+            "internals".to_string(),
+            r#"
+export default {
+  async fetch() {
+    return Response.json({
+      internals: typeof __dd_internals,
+      deno: typeof Deno,
+      bootstrap: typeof __bootstrap,
+      ddGlobals: Object.getOwnPropertyNames(globalThis).filter((name) => name.startsWith("__")),
+    });
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+    let output = service
+        .invoke(
+            "internals".to_string(),
+            test_invocation_with_path("/", "internals"),
+        )
+        .await
+        .expect("invoke should succeed");
+    let body: Value = serde_json::from_slice(&output.body).expect("body should be json");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "internals": "undefined",
+            "deno": "undefined",
+            "bootstrap": "undefined",
+            "ddGlobals": ["__dd_async_context"],
+        })
+    );
+    service.shutdown().await.expect("service should shut down");
+}
+
+#[tokio::test]
+#[serial]
+async fn forged_and_invalid_completion_payloads_are_ignored() {
+    let service = test_service(RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 2,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    })
+    .await;
+
+    service
+        .deploy("malicious".to_string(), malicious_completion_worker())
+        .await
+        .expect("deploy should succeed");
+
+    let first = service
+        .invoke("malicious".to_string(), test_invocation())
+        .await
+        .expect("first invoke should succeed");
+    assert_eq!(String::from_utf8(first.body).expect("utf8"), "1");
+
+    let second = service
+        .invoke("malicious".to_string(), test_invocation())
+        .await
+        .expect("second invoke should succeed");
+    assert_eq!(String::from_utf8(second.body).expect("utf8"), "2");
 }
