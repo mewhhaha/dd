@@ -91,7 +91,7 @@ export default {
             "bench-watchdog-timeout",
             RuntimeConfig {
                 min_isolates: 1,
-                max_isolates: 1,
+                max_isolates_per_worker: 1,
                 max_inflight_per_isolate: 1,
                 idle_ttl: Duration::from_secs(5),
                 scale_tick: Duration::from_millis(50),

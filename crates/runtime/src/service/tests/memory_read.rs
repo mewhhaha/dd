@@ -240,7 +240,7 @@ return Response.json(await memory.read(snapshot => {
 async fn request_completion_and_cancellation_release_unclosed_read_handles() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })

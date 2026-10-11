@@ -4,7 +4,7 @@ use super::*;
 #[serial]
 async fn buffered_response_limit_cancels_endless_producer_before_completion() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_response_body_bytes: 4,
         ..RuntimeConfig::default()
     })
@@ -69,7 +69,7 @@ export default {
 #[serial]
 async fn an_unread_response_does_not_block_other_workers_or_cancellation() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_global_isolates: 2,
         max_buffered_response_bytes: 2 * 1024 * 1024,
         ..RuntimeConfig::default()
@@ -137,7 +137,7 @@ export default {
 #[serial]
 async fn response_byte_budget_bounds_production_and_cancels_waiting_copies() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_buffered_response_bytes: 4096,
         ..RuntimeConfig::default()
     })
@@ -213,7 +213,7 @@ export default {
 #[serial]
 async fn a_full_response_queue_delivers_its_terminal_error_without_blocking_stats() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;
@@ -283,7 +283,7 @@ export default {
 #[serial]
 async fn dropping_a_completed_undrained_body_releases_the_shared_byte_budget() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_buffered_response_bytes: 4,
         ..RuntimeConfig::default()
     })
@@ -340,7 +340,7 @@ async fn dropping_a_completed_undrained_body_releases_the_shared_byte_budget() {
 #[serial]
 async fn aborting_one_stream_leaves_concurrent_streams_and_the_isolate_alone() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         ..RuntimeConfig::default()
     })

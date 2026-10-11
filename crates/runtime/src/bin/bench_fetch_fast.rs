@@ -126,7 +126,7 @@ fn env_custom_config(max_inflight: usize, v8_flags: &[String]) -> Option<BenchCo
         name: leaked_name,
         runtime: RuntimeConfig {
             min_isolates,
-            max_isolates,
+            max_isolates_per_worker: max_isolates,
             max_inflight_per_isolate: max_inflight,
             idle_ttl: Duration::from_secs(30),
             scale_tick: Duration::from_secs(1),
@@ -165,7 +165,7 @@ async fn main() -> Result<(), String> {
             name: "single-isolate",
             runtime: RuntimeConfig {
                 min_isolates: 1,
-                max_isolates: 1,
+                max_isolates_per_worker: 1,
                 max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(60),
                 scale_tick: Duration::from_secs(1),
@@ -177,7 +177,7 @@ async fn main() -> Result<(), String> {
             name: autoscaling_name,
             runtime: RuntimeConfig {
                 min_isolates: 0,
-                max_isolates: autoscaling_isolates,
+                max_isolates_per_worker: autoscaling_isolates,
                 max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
@@ -189,7 +189,7 @@ async fn main() -> Result<(), String> {
             name: prewarmed_name,
             runtime: RuntimeConfig {
                 min_isolates: prewarmed_isolates,
-                max_isolates: prewarmed_isolates,
+                max_isolates_per_worker: prewarmed_isolates,
                 max_inflight_per_isolate: max_inflight,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),

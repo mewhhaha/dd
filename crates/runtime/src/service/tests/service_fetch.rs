@@ -3,7 +3,7 @@ use super::*;
 async fn service_fetch_workers(child: &str, parent: &str) -> TestRuntime {
     let service = test_service(RuntimeConfig {
         max_global_isolates: 2,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 2,
         max_response_body_bytes: 1024,
         max_request_body_bytes: 1024,

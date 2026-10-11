@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
         server_config.runtime.runtime.max_global_isolates = value;
     }
     if let Some(value) = cli.runtime_max_isolates_per_worker {
-        server_config.runtime.runtime.max_isolates = value;
+        server_config.runtime.runtime.max_isolates_per_worker = value;
     }
     if let Some(value) = cli.runtime_max_inflight_per_isolate {
         server_config.runtime.runtime.max_inflight_per_isolate = value;

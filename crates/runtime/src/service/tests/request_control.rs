@@ -5,7 +5,7 @@ use super::*;
 async fn async_reply_immediate_completion_resumes_request() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })
@@ -32,7 +32,7 @@ async fn async_reply_immediate_completion_resumes_request() {
 async fn async_reply_delayed_completion_resumes_after_yield() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })
@@ -59,7 +59,7 @@ async fn async_reply_delayed_completion_resumes_after_yield() {
 async fn async_reply_timeout_surfaces_explicit_error() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })

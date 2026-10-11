@@ -467,7 +467,7 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
     let service_config = RuntimeServiceConfig {
         runtime: RuntimeConfig {
             max_global_isolates: config.available_cpus,
-            max_isolates: config.available_cpus,
+            max_isolates_per_worker: config.available_cpus,
             memory_profile_enabled: config.profile,
             // The profile ops are reached through __dd_internals.
             expose_internals: true,

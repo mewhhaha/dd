@@ -16,7 +16,7 @@ async fn websocket_byte_lease_backpressure(shared_global: bool) {
     let frame_bytes = std::mem::size_of::<crate::service::model::WebSocketOutboundFrame>() + 4;
     let service = test_service(RuntimeConfig {
         max_global_isolates: 2,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_buffered_websocket_bytes: if shared_global {
             frame_bytes
         } else {
@@ -151,7 +151,7 @@ export default {
 async fn only_snapshot_failures_close_live_memory_sockets() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;
@@ -302,7 +302,7 @@ export default {
 async fn socket_snapshots_include_new_accepts_and_refresh_between_transactions() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;
@@ -405,7 +405,7 @@ export default {
 async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -486,7 +486,7 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
 async fn websocket_transaction_can_broadcast_from_a_normal_request() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -562,7 +562,7 @@ async fn websocket_transaction_can_broadcast_from_a_normal_request() {
 async fn websocket_wake_can_list_socket_handles_without_deadlock() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -661,7 +661,7 @@ async fn websocket_wake_can_list_socket_handles_without_deadlock() {
 async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_millis(200),
         scale_tick: Duration::from_millis(50),
@@ -736,7 +736,7 @@ async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
 async fn websocket_session_reaped_when_owner_isolate_fails() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -806,7 +806,7 @@ async fn websocket_session_reaped_when_owner_isolate_fails() {
 async fn redeployment_closes_websockets_and_bounds_generation_retirement() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         request_wall_timeout: Duration::from_millis(300),
         idle_ttl: Duration::from_millis(200),
@@ -894,7 +894,7 @@ async fn redeployment_closes_websockets_and_bounds_generation_retirement() {
 async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -939,7 +939,7 @@ async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
 async fn websocket_message_handler_can_close_handle_backed_socket() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1004,7 +1004,7 @@ async fn websocket_message_handler_can_close_handle_backed_socket() {
 async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1083,7 +1083,7 @@ async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() 
 async fn chat_worker_second_join_and_message_do_not_hang() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1256,7 +1256,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
 async fn chat_worker_refresh_replaces_prior_participant_socket() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1442,7 +1442,7 @@ async fn websocket_backpressure_defers_later_sends_and_close() {
 async fn websocket_ordered_effects(backpressure: bool) {
     let frame_bytes = std::mem::size_of::<crate::service::model::WebSocketOutboundFrame>() + 1;
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_buffered_websocket_bytes: if backpressure {
             frame_bytes
         } else {

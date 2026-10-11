@@ -354,7 +354,7 @@ async fn main() -> Result<(), String> {
         .unwrap_or(1);
     let runtime = RuntimeConfig {
         min_isolates,
-        max_isolates: env_usize("DD_BENCH_MAX_ISOLATES", 1),
+        max_isolates_per_worker: env_usize("DD_BENCH_MAX_ISOLATES", 1),
         max_inflight_per_isolate: env_usize("DD_BENCH_MAX_INFLIGHT", 1),
         idle_ttl: env_duration_ms("DD_BENCH_IDLE_TTL_MS", 30_000),
         scale_tick: env_duration_ms("DD_BENCH_SCALE_TICK_MS", 1_000),

@@ -5,7 +5,7 @@ use super::*;
 async fn wait_until_cpu_loop_releases_global_capacity_at_native_deadline() {
     let service = test_service(RuntimeConfig {
         max_global_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         request_wall_timeout: Duration::from_millis(200),
         scale_tick: Duration::from_millis(10),
         idle_ttl: Duration::from_secs(3600),
@@ -63,7 +63,7 @@ export default {
 async fn a_service_call_to_its_own_worker_can_use_reserved_capacity() {
     let service = test_service(RuntimeConfig {
         max_global_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })
@@ -112,7 +112,7 @@ export default {
 async fn canceling_a_queued_body_releases_the_global_budget_for_another_worker() {
     let service = test_service(RuntimeConfig {
         max_global_isolates: 2,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_global_queued_bytes: 4096,
         ..RuntimeConfig::default()

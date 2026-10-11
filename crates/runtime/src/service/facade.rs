@@ -39,7 +39,7 @@ struct DeployWithConfigRequest {
 pub struct RuntimeConfig {
     pub min_isolates: usize,
     pub max_global_isolates: usize,
-    pub max_isolates: usize,
+    pub max_isolates_per_worker: usize,
     pub max_inflight_per_isolate: usize,
     pub max_queued_requests_per_worker: usize,
     pub reserved_internal_queued_requests_per_worker: usize,
@@ -87,7 +87,7 @@ impl Default for RuntimeConfig {
         Self {
             min_isolates: 0,
             max_global_isolates: default_global_isolate_budget(),
-            max_isolates: default_global_isolate_budget(),
+            max_isolates_per_worker: default_global_isolate_budget(),
             max_inflight_per_isolate: 4,
             max_queued_requests_per_worker: 1024,
             reserved_internal_queued_requests_per_worker: 64,

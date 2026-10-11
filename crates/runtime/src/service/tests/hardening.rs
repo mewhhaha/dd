@@ -197,7 +197,7 @@ async fn request_machinery_survives_replaced_builtins() {
     });
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         request_wall_timeout: Duration::from_secs(10),
         ..RuntimeConfig::default()
     })
@@ -323,7 +323,7 @@ async fn request_machinery_survives_replaced_builtins() {
 #[serial]
 async fn a_worker_response_class_is_not_a_response() {
     let service = test_service(RuntimeConfig {
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;
@@ -375,7 +375,7 @@ export default {
 async fn math_and_number_overrides_do_not_change_op_handles() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         ..RuntimeConfig::default()
     })

@@ -5,7 +5,7 @@ use super::*;
 async fn memory_atomic_does_not_retain_entity_metadata_between_requests() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;

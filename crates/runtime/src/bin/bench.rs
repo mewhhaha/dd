@@ -156,7 +156,7 @@ async fn main() -> Result<(), String> {
             name: "single-isolate",
             runtime: RuntimeConfig {
                 min_isolates: 1,
-                max_isolates: 1,
+                max_isolates_per_worker: 1,
                 max_inflight_per_isolate: 1,
                 idle_ttl: Duration::from_secs(60),
                 scale_tick: Duration::from_secs(1),
@@ -169,7 +169,7 @@ async fn main() -> Result<(), String> {
             runtime: RuntimeConfig {
                 min_isolates: 0,
                 max_global_isolates: 32,
-                max_isolates: 8,
+                max_isolates_per_worker: 8,
                 max_inflight_per_isolate: 4,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
@@ -189,7 +189,7 @@ async fn main() -> Result<(), String> {
             runtime: RuntimeConfig {
                 min_isolates: 0,
                 max_global_isolates: 2,
-                max_isolates: 8,
+                max_isolates_per_worker: 8,
                 max_inflight_per_isolate: 4,
                 idle_ttl: Duration::from_secs(30),
                 scale_tick: Duration::from_secs(1),
@@ -783,7 +783,9 @@ export default {
             async move { run_scenario(&service_for_burst, &worker_for_burst, scenario).await },
         );
 
-    let target_isolates = runtime.max_isolates.min(runtime.max_global_isolates);
+    let target_isolates = runtime
+        .max_isolates_per_worker
+        .min(runtime.max_global_isolates);
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut time_to_target = None;
     while Instant::now() < deadline {

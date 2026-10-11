@@ -383,7 +383,7 @@ mod tests {
         let runtime = RuntimeService::start(runtime::RuntimeServiceConfig {
             runtime: runtime::RuntimeConfig {
                 inspector: runtime::InspectorMode::On,
-                max_isolates: 1,
+                max_isolates_per_worker: 1,
                 ..runtime::RuntimeConfig::default()
             },
             storage: runtime::RuntimeStorageConfig {

@@ -7,7 +7,7 @@ async fn host_fetch_worker(
 ) -> TestRuntime {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_request_body_bytes: body_limit,
         request_wall_timeout: Duration::from_secs(5),
         ..RuntimeConfig::default()

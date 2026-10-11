@@ -58,7 +58,7 @@ use self::fixtures::*;
 async fn service_starts_with_deno_runtime_bootstrap() {
     let _ = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -193,7 +193,7 @@ async fn shutdown_is_idempotent_across_clones_and_waits_for_runtime_thread_exit(
 async fn last_service_handle_drop_shuts_down_and_joins_runtime_thread() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;
@@ -242,7 +242,7 @@ async fn last_service_handle_drop_shuts_down_and_joins_runtime_thread() {
 async fn isolate_starts_with_configured_heap_limit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_isolate_heap_bytes: 64 * 1024 * 1024,
         idle_ttl: Duration::from_secs(5),
@@ -287,7 +287,7 @@ export default {
 async fn deployed_worker_imports_server_module_assets() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -387,7 +387,7 @@ export default {
 async fn deployed_worker_imports_async_local_storage_from_node_async_hooks() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -454,7 +454,7 @@ export default {
 async fn isolate_startup_does_not_block_manager_commands() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 4,
+        max_isolates_per_worker: 4,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(20),
@@ -531,7 +531,7 @@ export default {
 async fn production_runtime_rejects_string_code_generation() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -573,7 +573,7 @@ export default {
 async fn debug_runtime_allows_string_code_generation() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -614,7 +614,7 @@ export default {
 async fn host_fetch_is_single_permanent_request_scoped_wrapper() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -817,7 +817,7 @@ export default {
 async fn overlapping_requests_keep_independent_request_context_handles() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 2,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -920,7 +920,7 @@ async fn worker_queue_rejects_when_per_worker_limit_is_full() {
     });
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_queued_requests_per_worker: 1,
         max_global_queued_requests: 16,
@@ -1058,7 +1058,7 @@ async fn worker_queue_rejects_when_global_limit_is_full_across_workers() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_queued_requests_per_worker: 8,
         max_global_queued_requests: 1,
@@ -1207,7 +1207,7 @@ export default {
 async fn worker_queue_expires_requests_after_queue_wait_limit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_queued_requests_per_worker: 8,
         max_global_queued_requests: 16,
@@ -1322,7 +1322,7 @@ export default {
 async fn worker_request_wall_timeout_retires_cooperative_isolate() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         request_wall_timeout: Duration::from_millis(50),
         idle_ttl: Duration::from_secs(5),
@@ -1368,7 +1368,7 @@ export default {
 async fn worker_request_wall_timeout_interrupts_cpu_bound_isolate() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         request_wall_timeout: Duration::from_millis(50),
         idle_ttl: Duration::from_secs(5),
@@ -1531,7 +1531,7 @@ export default {
 async fn streamed_response_body_limit_fails_stream_and_retires_isolate() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_response_body_bytes: 5,
         idle_ttl: Duration::from_secs(5),
@@ -1681,7 +1681,7 @@ async fn deployed_assets_resolve_with_headers_and_head_support() {
 async fn private_worker_can_call_private_service_binding() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 2,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1779,7 +1779,7 @@ async fn internal_service_calls_make_progress_when_frontends_fill_the_global_iso
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(20),
@@ -2070,7 +2070,7 @@ async fn invalid_asset_headers_fail_deploy() {
 async fn service_can_deploy_simple_worker_with_deno_runtime_bootstrap() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2100,7 +2100,7 @@ async fn service_can_deploy_simple_worker_with_deno_runtime_bootstrap() {
 async fn service_can_invoke_simple_worker_with_deno_runtime_bootstrap() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2140,7 +2140,7 @@ async fn service_can_invoke_simple_worker_with_deno_runtime_bootstrap() {
 async fn reuse_preserves_state() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2172,7 +2172,7 @@ async fn reuse_preserves_state() {
 async fn spectre_time_mitigation_freezes_time_between_io_boundaries() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2223,7 +2223,7 @@ async fn spectre_time_mitigation_freezes_time_between_io_boundaries() {
 async fn crypto_globals_work_with_deno_crypto_ops() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2278,7 +2278,7 @@ async fn crypto_globals_work_with_deno_crypto_ops() {
 async fn concurrent_kv_reads_match_sequential_reads_and_preserve_duplicates() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2343,7 +2343,7 @@ async fn concurrent_kv_reads_match_sequential_reads_and_preserve_duplicates() {
 async fn kv_reads_decode_mixed_values_and_surface_corrupt_values() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2435,7 +2435,7 @@ async fn kv_reads_decode_mixed_values_and_surface_corrupt_values() {
 async fn concurrent_kv_reads_preserve_each_requests_keys() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 16,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2494,7 +2494,7 @@ async fn concurrent_kv_reads_preserve_each_requests_keys() {
 async fn shared_env_is_reused_safely_across_requests() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2561,7 +2561,7 @@ async fn shared_env_is_reused_safely_across_requests() {
 async fn kv_write_batching_preserves_last_write_wins() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2610,7 +2610,7 @@ async fn kv_write_batching_preserves_last_write_wins() {
 async fn kv_commits_are_visible_across_isolates_and_reads_are_independent_values() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })
@@ -2700,7 +2700,7 @@ export default {
 async fn kv_committed_durability_awaits_canonical_write() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2772,7 +2772,7 @@ async fn kv_committed_durability_awaits_canonical_write() {
 async fn kv_wait_until_write_flushes_after_response() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2849,7 +2849,7 @@ async fn kv_wait_until_write_flushes_after_response() {
 async fn kv_wait_until_read_runs_after_response() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2916,7 +2916,7 @@ async fn kv_wait_until_read_runs_after_response() {
 async fn wait_until_background_work_runs_after_response() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2965,7 +2965,7 @@ async fn scales_up_with_backlog() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 4,
-        max_isolates: 4,
+        max_isolates_per_worker: 4,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3013,7 +3013,7 @@ async fn single_worker_can_grow_to_global_isolate_budget() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
-        max_isolates: 8,
+        max_isolates_per_worker: 8,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(20),
@@ -3065,7 +3065,7 @@ async fn active_workers_share_small_global_isolate_budget() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
-        max_isolates: 4,
+        max_isolates_per_worker: 4,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(20),
@@ -3113,7 +3113,7 @@ async fn active_workers_share_small_global_isolate_budget() {
 fn runtime_default_global_isolate_budget_has_two_slot_floor() {
     let config = RuntimeConfig::default();
     assert!(config.max_global_isolates >= 2);
-    assert_eq!(config.max_isolates, config.max_global_isolates);
+    assert_eq!(config.max_isolates_per_worker, config.max_global_isolates);
     assert_eq!(config.min_isolates, 0);
 }
 
@@ -3123,7 +3123,7 @@ async fn cold_routes_retire_lru_idle_isolates_without_waiting_for_idle_ttl() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(60 * 60),
         scale_tick: Duration::from_millis(20),
@@ -3181,7 +3181,7 @@ async fn budget_pressure_never_retires_an_isolate_with_an_active_request() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(60 * 60),
         scale_tick: Duration::from_millis(20),
@@ -3234,7 +3234,7 @@ async fn budget_pressure_waits_for_wait_until_before_retiring_an_isolate() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(60 * 60),
         scale_tick: Duration::from_millis(20),
@@ -3288,7 +3288,7 @@ async fn scales_down_when_idle() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 3,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_millis(200),
         scale_tick: Duration::from_millis(50),
@@ -3434,7 +3434,7 @@ async fn deployment_heap_exhaustion_preserves_the_server() {
 async fn invalid_redeploy_keeps_previous_generation() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3471,7 +3471,7 @@ async fn invalid_redeploy_keeps_previous_generation() {
 async fn redeploy_switches_new_traffic_while_old_generation_drains() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3526,7 +3526,7 @@ async fn redeploy_switches_new_traffic_while_old_generation_drains() {
 async fn single_isolate_allows_multiple_inflight_requests() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3567,7 +3567,7 @@ async fn single_isolate_allows_multiple_inflight_requests() {
 async fn dropped_invoke_aborts_inflight_request() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3635,7 +3635,7 @@ async fn dropped_invoke_aborts_inflight_request() {
 async fn duplicate_user_request_ids_do_not_collide() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3670,7 +3670,7 @@ async fn duplicate_user_request_ids_do_not_collide() {
 async fn forged_and_invalid_completion_payloads_are_ignored() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 2,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3702,7 +3702,7 @@ async fn forged_and_invalid_completion_payloads_are_ignored() {
 async fn invoke_stream_delivers_chunked_response_body() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3756,7 +3756,7 @@ export default {
 async fn invoke_stream_delivers_binary_response_chunks() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3804,7 +3804,7 @@ export default {
 async fn invoke_stream_body_drop_cancels_running_request() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         max_queue_wait: Duration::from_secs(5),
         idle_ttl: Duration::from_secs(5),
@@ -3871,7 +3871,7 @@ export default {
 async fn invoke_stream_propagates_response_body_error() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -3932,7 +3932,7 @@ export default {
 async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -4037,7 +4037,7 @@ async fn async_context_store_survives_promise_boundaries_and_nested_runs() {
 async fn cache_default_reuses_response() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -4075,7 +4075,7 @@ async fn cache_default_reuses_response() {
 async fn cache_names_are_isolated_by_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         ..RuntimeConfig::default()
     })
@@ -4114,7 +4114,7 @@ async fn cache_names_are_isolated_by_worker() {
 async fn named_caches_share_global_capacity_budget() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -4165,7 +4165,7 @@ async fn named_caches_share_global_capacity_budget() {
 async fn internal_trace_includes_markers_and_targets_configured_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -4255,7 +4255,7 @@ fn internal_trace_headers_include_markers() {
 async fn internal_trace_invocations_do_not_recurse() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),

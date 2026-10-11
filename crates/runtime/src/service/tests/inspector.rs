@@ -39,7 +39,7 @@ async fn single_target(service: &RuntimeService) -> InspectorTarget {
 async fn devtools_sees_worker_console_calls_at_their_call_site() {
     let service = test_service(RuntimeConfig {
         inspector: InspectorMode::On,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;
@@ -115,7 +115,7 @@ export default {
 async fn waiting_isolates_stop_at_top_level_breakpoints() {
     let service = test_service(RuntimeConfig {
         inspector: InspectorMode::Wait,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         ..RuntimeConfig::default()
     })
     .await;

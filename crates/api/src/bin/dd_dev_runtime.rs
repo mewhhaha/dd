@@ -156,7 +156,7 @@ async fn main() -> Result<(), String> {
     let mut runtime = RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 4,
-        max_isolates: 4,
+        max_isolates_per_worker: 4,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(10),
         scale_tick: Duration::from_millis(50),
@@ -174,7 +174,7 @@ async fn main() -> Result<(), String> {
         // DevTools is attached to; and no time limit kills an isolate paused
         // at one.
         runtime.min_isolates = 1;
-        runtime.max_isolates = 1;
+        runtime.max_isolates_per_worker = 1;
         runtime.request_wall_timeout = INSPECT_TIME_LIMIT;
         runtime.max_queue_wait = INSPECT_TIME_LIMIT;
         runtime.isolate_startup_timeout = INSPECT_TIME_LIMIT;

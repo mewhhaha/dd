@@ -107,9 +107,9 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
             "max_global_isolates must be greater than 0",
         ));
     }
-    if config.max_isolates == 0 {
+    if config.max_isolates_per_worker == 0 {
         return Err(PlatformError::internal(
-            "max_isolates must be greater than 0",
+            "max_isolates_per_worker must be greater than 0",
         ));
     }
     if config.max_inflight_per_isolate == 0 {
@@ -185,9 +185,9 @@ pub(super) fn validate_runtime_config(config: &RuntimeConfig) -> Result<()> {
             "isolate_startup_timeout must be greater than 0",
         ));
     }
-    if config.min_isolates > config.max_isolates {
+    if config.min_isolates > config.max_isolates_per_worker {
         return Err(PlatformError::internal(
-            "min_isolates cannot exceed max_isolates",
+            "min_isolates cannot exceed max_isolates_per_worker",
         ));
     }
     if config.min_isolates > config.max_global_isolates {

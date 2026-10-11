@@ -765,7 +765,7 @@ async fn run_server_child() -> Result<(), String> {
             "DD_BENCH_MAX_GLOBAL_ISOLATES",
             max_isolates.saturating_mul(2),
         ),
-        max_isolates,
+        max_isolates_per_worker: max_isolates,
         max_inflight_per_isolate: env_usize("DD_BENCH_MAX_INFLIGHT", 16),
         ..RuntimeConfig::default()
     };

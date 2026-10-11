@@ -622,7 +622,7 @@ impl WorkerManager {
             return;
         }
         let max_inflight_per_isolate = self.config.max_inflight_per_isolate;
-        let max_isolates = self.config.max_isolates;
+        let max_isolates = self.config.max_isolates_per_worker;
         loop {
             let (selection, spawn_needed) = {
                 let Some(pool) = self.get_pool_mut(worker_name, generation) else {
@@ -998,14 +998,15 @@ impl WorkerManager {
                         .count()
                 })
                 .unwrap_or_default();
-            let spawn_policy =
-                if allow_internal_rescue && worker_regular_slots >= self.config.max_isolates {
-                    IsolateSpawnPolicy::InternalRescueOnly
-                } else if allow_internal_rescue {
-                    IsolateSpawnPolicy::AllowInternalRescue
-                } else {
-                    IsolateSpawnPolicy::WithinGlobalBudget
-                };
+            let spawn_policy = if allow_internal_rescue
+                && worker_regular_slots >= self.config.max_isolates_per_worker
+            {
+                IsolateSpawnPolicy::InternalRescueOnly
+            } else if allow_internal_rescue {
+                IsolateSpawnPolicy::AllowInternalRescue
+            } else {
+                IsolateSpawnPolicy::WithinGlobalBudget
+            };
             match self.spawn_isolate(&worker_name, generation, event_tx.clone(), spawn_policy) {
                 Ok(()) => {
                     self.dispatch_pool(&worker_name, generation, event_tx);
@@ -1038,7 +1039,7 @@ impl WorkerManager {
 
     fn pool_needs_scale_up(&mut self, worker_name: &str, generation: u64) -> bool {
         let max_inflight = self.config.max_inflight_per_isolate;
-        let max_isolates = self.config.max_isolates;
+        let max_isolates = self.config.max_isolates_per_worker;
         let Some(pool) = self.get_pool_mut(worker_name, generation) else {
             return false;
         };

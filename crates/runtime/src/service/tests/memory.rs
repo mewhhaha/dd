@@ -5,7 +5,7 @@ use super::*;
 async fn memory_same_key_atomic_commands_are_serialized() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -82,7 +82,7 @@ async fn memory_same_key_atomic_commands_are_serialized() {
 async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -153,7 +153,7 @@ async fn memory_callbacks_progress_when_all_caller_isolates_are_busy() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_global_isolates: 2,
-        max_isolates: 8,
+        max_isolates_per_worker: 8,
         max_inflight_per_isolate: 4,
         request_wall_timeout: Duration::from_secs(5),
         idle_ttl: Duration::from_secs(5),
@@ -231,7 +231,7 @@ async fn memory_callbacks_progress_when_all_caller_isolates_are_busy() {
 async fn memory_atomic_callback_executes_once_for_cold_read() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -276,7 +276,7 @@ async fn memory_atomic_callback_executes_once_for_cold_read() {
 async fn memory_atomic_rejects_unsupported_storage_options() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -331,7 +331,7 @@ async fn memory_atomic_rejects_unsupported_storage_options() {
 async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -379,7 +379,7 @@ async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
 async fn memory_atomic_idempotency_key_replays_committed_result() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -452,7 +452,7 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
     let store = TestStoreDir::new("dd-memory-idempotent");
     let config = RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -535,7 +535,7 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
 async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -619,7 +619,7 @@ async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
 async fn memory_atomic_idempotency_key_replays_read_only_result() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -696,7 +696,7 @@ async fn memory_atomic_can_emit_durable_effect_records() {
     let service = test_service_with_store(
         RuntimeConfig {
             min_isolates: 1,
-            max_isolates: 2,
+            max_isolates_per_worker: 2,
             max_inflight_per_isolate: 4,
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
@@ -778,7 +778,7 @@ async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
     let service = test_service_with_store(
         RuntimeConfig {
             min_isolates: 1,
-            max_isolates: 2,
+            max_isolates_per_worker: 2,
             max_inflight_per_isolate: 4,
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_millis(50),
@@ -909,7 +909,7 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
     let service = test_service_with_store(
         RuntimeConfig {
             min_isolates: 0,
-            max_isolates: 1,
+            max_isolates_per_worker: 1,
             max_inflight_per_isolate: 1,
             idle_ttl: Duration::from_secs(5),
             scale_tick: Duration::from_secs(60),
@@ -945,7 +945,7 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
 async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 8,
+        max_isolates_per_worker: 8,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1025,7 +1025,7 @@ async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() 
 async fn memory_storage_structured_value_roundtrip_works() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1087,7 +1087,7 @@ async fn memory_storage_structured_value_roundtrip_works() {
 async fn memory_committed_writes_are_visible_to_later_transactions() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1157,7 +1157,7 @@ async fn memory_committed_writes_are_visible_to_later_transactions() {
 async fn memory_writes_preserve_updates_to_distinct_entities() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1238,7 +1238,7 @@ async fn memory_writes_preserve_updates_to_distinct_entities() {
 async fn memory_coordinated_set_write_uses_owner_validated_batch_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1317,7 +1317,7 @@ async fn memory_coordinated_set_write_uses_owner_validated_batch_path() {
 async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1405,7 +1405,7 @@ async fn memory_owner_epoch_survives_runtime_restart() {
     let store = TestStoreDir::new("dd-memory-owner-epoch");
     let config = RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1479,7 +1479,7 @@ async fn memory_owner_epoch_survives_runtime_restart() {
 async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1562,7 +1562,7 @@ async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
 async fn memory_multiple_atomic_reads_in_one_request_complete() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1616,7 +1616,7 @@ async fn memory_multiple_atomic_reads_in_one_request_complete() {
 async fn memory_multikey_transactions_complete_after_warmup() {
     let service = test_service(RuntimeConfig {
         min_isolates: 4,
-        max_isolates: 4,
+        max_isolates_per_worker: 4,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1692,7 +1692,7 @@ async fn memory_multikey_transactions_complete_after_warmup() {
 async fn memory_benchmark_worker_returns_correct_total() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1756,7 +1756,7 @@ async fn memory_benchmark_worker_returns_correct_total() {
 async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1834,7 +1834,7 @@ async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
 async fn memory_transaction_reads_snapshot_after_isolate_restart() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_millis(200),
         scale_tick: Duration::from_millis(50),
@@ -1908,7 +1908,7 @@ async fn memory_transaction_reads_snapshot_after_isolate_restart() {
 async fn hosted_memory_factories_share_state_and_module_globals() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -1988,7 +1988,7 @@ async fn hosted_memory_factories_share_state_and_module_globals() {
 async fn hosted_memory_allows_inline_closures() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 1,
+        max_isolates_per_worker: 1,
         max_inflight_per_isolate: 2,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2029,7 +2029,7 @@ async fn hosted_memory_allows_inline_closures() {
 async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2103,7 +2103,7 @@ async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
 async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_goes_stale() {
     let service = test_service(RuntimeConfig {
         min_isolates: 2,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 1,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2189,7 +2189,7 @@ async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_
 async fn hosted_memory_coordinated_snapshot_read_executes_once() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 3,
+        max_isolates_per_worker: 3,
         max_inflight_per_isolate: 8,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
@@ -2263,7 +2263,7 @@ async fn hosted_memory_coordinated_snapshot_read_executes_once() {
 async fn hosted_memory_missing_value_default_is_lazy_until_written() {
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
-        max_isolates: 2,
+        max_isolates_per_worker: 2,
         max_inflight_per_isolate: 4,
         idle_ttl: Duration::from_secs(5),
         scale_tick: Duration::from_millis(50),
