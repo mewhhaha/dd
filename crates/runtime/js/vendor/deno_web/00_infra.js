@@ -7,37 +7,24 @@
 /// <reference path="../../cli/tsc/dts/lib.deno_web.d.ts" />
 
 return (function () {
-const { core, internals, primordials } = __bootstrap;
-const {
-  op_base64_decode,
-  op_base64_encode_from_buffer,
-} = core.ops;
+const { primordials } = __bootstrap;
 const {
   ArrayPrototypeJoin,
   ArrayPrototypeMap,
-  decodeURIComponent,
   Error,
   JSONStringify,
   NumberPrototypeToString,
-  ObjectPrototypeIsPrototypeOf,
   SafeArrayIterator,
   SafeRegExp,
-  String,
   StringPrototypeCharAt,
   StringPrototypeCharCodeAt,
   StringPrototypeMatch,
   StringPrototypePadStart,
-  StringPrototypeReplace,
   StringPrototypeSlice,
   StringPrototypeSubstring,
   StringPrototypeToLowerCase,
-  StringPrototypeToUpperCase,
-  Symbol,
-  TypedArrayPrototypeGetByteLength,
   TypeError,
 } = primordials;
-
-const { URLPrototype } = core.loadExtScript("ext:deno_web/00_url.js");
 
 const ASCII_DIGIT = ["\u0030-\u0039"];
 const ASCII_UPPER_ALPHA = ["\u0041-\u005A"];
@@ -159,22 +146,6 @@ function collectSequenceOfCodepoints(input, position, condition) {
   return { result: StringPrototypeSlice(input, start, position), position };
 }
 
-const LOWERCASE_PATTERN = new SafeRegExp(/[a-z]/g);
-
-/**
- * @param {string} s
- * @returns {string}
- */
-function byteUpperCase(s) {
-  return StringPrototypeReplace(
-    String(s),
-    LOWERCASE_PATTERN,
-    function byteUpperCaseReplace(c) {
-      return StringPrototypeToUpperCase(c);
-    },
-  );
-}
-
 /**
  * @param {string} s
  * @returns {string}
@@ -246,36 +217,6 @@ function collectHttpQuotedString(input, position, extractValue) {
 }
 
 /**
- * @param {Uint8Array} data
- * @returns {string}
- */
-function forgivingBase64Encode(data) {
-  return op_base64_encode_from_buffer(
-    data,
-    0,
-    TypedArrayPrototypeGetByteLength(data),
-  );
-}
-
-/**
- * @param {Uint8Array} data
- * @param {number} offset
- * @param {number} length
- * @returns {string}
- */
-function forgivingBase64EncodeFromBuffer(data, offset, length) {
-  return op_base64_encode_from_buffer(data, offset, length);
-}
-
-/**
- * @param {string} data
- * @returns {Uint8Array}
- */
-function forgivingBase64Decode(data) {
-  return op_base64_decode(data);
-}
-
-/**
  * @param {string} char
  * @returns {boolean}
  */
@@ -332,93 +273,22 @@ function serializeJSValueToJSONString(value) {
   return result;
 }
 
-const PATHNAME_WIN_RE = new SafeRegExp(/^\/*([A-Za-z]:)(\/|$)/);
-const SLASH_WIN_RE = new SafeRegExp(/\//g);
-const PERCENT_RE = new SafeRegExp(/%(?![0-9A-Fa-f]{2})/g);
-
-// Keep in sync with `fromFileUrl()` in `std/path/win32.ts`.
-/**
- * @param {URL} url
- * @returns {string}
- */
-function pathFromURLWin32(url) {
-  let p = StringPrototypeReplace(url.pathname, PATHNAME_WIN_RE, "$1/");
-  p = StringPrototypeReplace(p, SLASH_WIN_RE, "\\");
-  p = StringPrototypeReplace(p, PERCENT_RE, "%25");
-  let path = decodeURIComponent(p);
-  if (url.hostname != "") {
-    // Note: The `URL` implementation guarantees that the drive letter and
-    // hostname are mutually exclusive. Otherwise it would not have been valid
-    // to append the hostname and path like this.
-    path = `\\\\${url.hostname}${path}`;
-  }
-  return path;
-}
-
-// Keep in sync with `fromFileUrl()` in `std/path/posix.ts`.
-/**
- * @param {URL} url
- * @returns {string}
- */
-function pathFromURLPosix(url) {
-  if (url.hostname !== "") {
-    throw new TypeError("Host must be empty");
-  }
-
-  return decodeURIComponent(
-    StringPrototypeReplace(url.pathname, PERCENT_RE, "%25"),
-  );
-}
-
-function pathFromURL(pathOrUrl) {
-  if (ObjectPrototypeIsPrototypeOf(URLPrototype, pathOrUrl)) {
-    if (pathOrUrl.protocol != "file:") {
-      throw new TypeError("Must be a file URL");
-    }
-
-    return core.build.os == "windows"
-      ? pathFromURLWin32(pathOrUrl)
-      : pathFromURLPosix(pathOrUrl);
-  }
-  return pathOrUrl;
-}
-
-// NOTE(bartlomieju): this is exposed on `internals` so we can test
-// it in unit tests
-internals.pathFromURL = pathFromURL;
-
-// deno-lint-ignore deno-internal/prefer-primordials
-const SymbolMetadata = Symbol.metadata ?? Symbol("Symbol.metadata");
-
 return {
-  ASCII_ALPHA,
-  ASCII_ALPHANUMERIC,
-  ASCII_DIGIT,
-  ASCII_LOWER_ALPHA,
-  ASCII_UPPER_ALPHA,
   assert,
   AssertionError,
   byteLowerCase,
-  byteUpperCase,
   collectHttpQuotedString,
   collectSequenceOfCodepoints,
-  forgivingBase64Decode,
-  forgivingBase64Encode,
-  forgivingBase64EncodeFromBuffer,
-  HTTP_QUOTED_STRING_TOKEN_POINT,
   HTTP_QUOTED_STRING_TOKEN_POINT_RE,
   HTTP_TAB_OR_SPACE,
   HTTP_TAB_OR_SPACE_PREFIX_RE,
   HTTP_TAB_OR_SPACE_SUFFIX_RE,
-  HTTP_TOKEN_CODE_POINT,
   HTTP_TOKEN_CODE_POINT_RE,
   HTTP_WHITESPACE,
   HTTP_WHITESPACE_PREFIX_RE,
   HTTP_WHITESPACE_SUFFIX_RE,
   httpTrim,
-  pathFromURL,
   regexMatcher,
   serializeJSValueToJSONString,
-  SymbolMetadata,
 };
 })();

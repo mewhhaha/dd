@@ -1247,7 +1247,6 @@ webidl
 return {
   parseUrlEncoded,
   URL,
-  URLPrototype,
   URLSearchParams,
   URLSearchParamsPrototype,
 };

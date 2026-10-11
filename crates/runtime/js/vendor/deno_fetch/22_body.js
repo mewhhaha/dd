@@ -647,5 +647,5 @@ webidl.converters["BodyInit_DOMString?"] = webidl.createNullableConverter(
   webidl.converters["BodyInit_DOMString"],
 );
 
-return { extractBody, InnerBody, mixinBody, packageData };
+return { extractBody, InnerBody, mixinBody };
 })();

@@ -7,7 +7,7 @@
 /// <reference path="../../core/internal.d.ts" />
 
 return (function () {
-const { core, internals, primordials } = __bootstrap;
+const { core, primordials } = __bootstrap;
 const {
   isArrayBuffer,
   isDataView,
@@ -69,14 +69,6 @@ const {
   RegExpPrototypeTest,
   SafeRegExp,
   SafeSet,
-  SetPrototypeEntries,
-  SetPrototypeForEach,
-  SetPrototypeKeys,
-  SetPrototypeValues,
-  SetPrototypeHas,
-  SetPrototypeClear,
-  SetPrototypeDelete,
-  SetPrototypeAdd,
   // TODO(lucacasonato): add SharedArrayBuffer to primordials
   // SharedArrayBufferPrototype,
   String,
@@ -1542,129 +1534,6 @@ function configureProperties(obj) {
   }
 }
 
-const setlikeInner = SymbolFor("setlike_set");
-
-// Ref: https://webidl.spec.whatwg.org/#es-setlike
-function setlikeObjectWrap(objPrototype, readonly) {
-  ObjectDefineProperties(objPrototype, {
-    size: {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      get() {
-        return this[setlikeInner]().size;
-      },
-    },
-    [SymbolIterator]: {
-      __proto__: null,
-      configurable: true,
-      enumerable: false,
-      writable: true,
-      value() {
-        return this[setlikeInner]()[SymbolIterator]();
-      },
-    },
-    entries: {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value() {
-        return SetPrototypeEntries(this[setlikeInner]());
-      },
-    },
-    keys: {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value() {
-        return SetPrototypeKeys(this[setlikeInner]());
-      },
-    },
-    values: {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value() {
-        return SetPrototypeValues(this[setlikeInner]());
-      },
-    },
-    forEach: {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value(callbackfn, thisArg) {
-        return SetPrototypeForEach(this[setlikeInner](), callbackfn, thisArg);
-      },
-    },
-    has: {
-      __proto__: null,
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value(value) {
-        return SetPrototypeHas(this[setlikeInner](), value);
-      },
-    },
-  });
-
-  if (!readonly) {
-    ObjectDefineProperties(objPrototype, {
-      add: {
-        __proto__: null,
-        configurable: true,
-        enumerable: true,
-        writable: true,
-        value(value) {
-          return SetPrototypeAdd(this[setlikeInner](), value);
-        },
-      },
-      delete: {
-        __proto__: null,
-        configurable: true,
-        enumerable: true,
-        writable: true,
-        value(value) {
-          return SetPrototypeDelete(this[setlikeInner](), value);
-        },
-      },
-      clear: {
-        __proto__: null,
-        configurable: true,
-        enumerable: true,
-        writable: true,
-        value() {
-          return SetPrototypeClear(this[setlikeInner]());
-        },
-      },
-    });
-  }
-}
-
-internals.webidlBrand = brand;
-// The subset of webidl needed by post-bootstrap classic scripts that can't
-// `import` this module (e.g. the `deno desktop` init script, which defines
-// web interfaces like `navigator.clipboard`).
-//
-// `converters` is deliberately NOT exposed. It is the live registry backing
-// argument coercion for every web API in the process, and this object lands
-// in every Deno runtime rather than just desktop, so handing it out would
-// let anything with `internals` access rewrite how any API coerces its
-// arguments. Only the individual converters a consumer needs belong here.
-internals.webidl = ObjectFreeze({
-  assertBranded,
-  configureInterface,
-  createBranded,
-  illegalConstructor,
-  requiredArguments,
-  converters: ObjectFreeze({
-    DOMString: converters["DOMString"],
-  }),
-});
-
 return {
   assertBranded,
   AsyncSequence,
@@ -1677,8 +1546,6 @@ return {
   createEnumConverter,
   createInterfaceConverter,
   createNullableConverter,
-  createPromiseConverter,
-  createRecordConverter,
   createSequenceConverter,
   illegalConstructor,
   invokeCallbackFunction,
@@ -1686,8 +1553,6 @@ return {
   makeException,
   mixinPairIterable,
   requiredArguments,
-  setlikeInner,
-  setlikeObjectWrap,
   type,
 };
 })();

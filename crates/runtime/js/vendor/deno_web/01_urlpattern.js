@@ -44,7 +44,6 @@ function getCreateFilteredInspectProxy() {
 }
 
 const _components = Symbol("components");
-const urlPatternSettings = { groupStringFallback: false };
 
 /**
  * @typedef Components
@@ -407,11 +406,7 @@ class URLPattern {
           const groups = res.groups;
           for (let j = 0; j < groupList.length; ++j) {
             // TODO(lucacasonato): this is vulnerable to override mistake
-            if (urlPatternSettings.groupStringFallback) {
-              groups[groupList[j]] = match[j + 1] ?? "";
-            } else {
-              groups[groupList[j]] = match[j + 1];
-            }
+            groups[groupList[j]] = match[j + 1];
           }
           break;
         }
@@ -485,5 +480,5 @@ webidl.converters.URLPatternOptions = webidl
     },
   ]);
 
-return { URLPattern, urlPatternSettings };
+return { URLPattern };
 })();

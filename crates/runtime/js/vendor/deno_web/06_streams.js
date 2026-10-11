@@ -925,15 +925,6 @@ function readableStreamThrowIfErrored(stream) {
 }
 
 /**
- * Returns the stream's stored error if it is errored, otherwise `undefined`.
- * @param {ReadableStream} stream
- * @returns {any}
- */
-function getReadableStreamStoredError(stream) {
-  return stream[_state] === "errored" ? stream[_storedError] : undefined;
-}
-
-/**
  * @param {unknown} value
  * @returns {value is WritableStream}
  */
@@ -7072,125 +7063,28 @@ webidl.converters["async_sequence<any>"] = webidl.createAsyncSequenceConverter(
   webidl.converters.any,
 );
 
-function isReadableStreamBYOBRequest(value) {
-  return !(typeof value !== "object" || value === null || !value[_view]);
-}
-
-function isReadableByteStreamController(value) {
-  return !(typeof value !== "object" || value === null ||
-    !ReflectHas(value, _pendingPullIntos));
-}
-
-function readableStreamDefaultControllerHasBackpressure(controller) {
-  return readableStreamDefaultControllerGetDesiredSize(controller) <= 0;
-}
-
-function readableStreamDefaultControllerShouldCallPull(controller) {
-  const stream = controller[_stream];
-  if (!readableStreamDefaultControllerCanCloseOrEnqueue(controller)) {
-    return false;
-  }
-  if (!controller[_started]) {
-    return false;
-  }
-  if (
-    isReadableStreamLocked(stream) &&
-    readableStreamGetNumReadRequests(stream) > 0
-  ) {
-    return true;
-  }
-  return readableStreamDefaultControllerGetDesiredSize(controller) > 0;
-}
-
-const setUpReadableByteStreamControllerFromSource =
-  setUpReadableByteStreamControllerFromUnderlyingSource;
-const setUpReadableStreamDefaultControllerFromSource =
-  setUpReadableStreamDefaultControllerFromUnderlyingSource;
-
 return {
-  // Non-Public
-  _state,
-  // Exposed in global runtime scope
-  acquireReadableStreamDefaultReader,
   ByteLengthQueuingStrategy,
   CountQueuingStrategy,
   createProxy,
-  createReadableByteStream,
   createReadableStream,
-  Deferred,
   errorReadableStream,
-  getReadableStreamStoredError,
-  isReadableByteStreamController,
-  isReadableStream,
-  isReadableStreamBYOBReader,
-  isReadableStreamBYOBRequest,
-  isDetachedBuffer,
   isReadableStreamDisturbed,
-  isReadableStreamLocked,
-  isReadableStreamDefaultReader,
   ReadableByteStreamController,
   ReadableStream,
   ReadableStreamBYOBReader,
   ReadableStreamBYOBRequest,
-  readableByteStreamControllerClearAlgorithms,
-  readableByteStreamControllerClearPendingPullIntos,
-  readableByteStreamControllerClose,
-  readableByteStreamControllerCommitPullIntoDescriptor,
-  readableByteStreamControllerConvertPullIntoDescriptor,
-  readableByteStreamControllerEnqueue,
-  readableByteStreamControllerEnqueueChunkToQueue,
-  readableByteStreamControllerError,
-  readableByteStreamControllerFillHeadPullIntoDescriptor,
-  readableByteStreamControllerFillPullIntoDescriptorFromQueue,
-  readableByteStreamControllerGetDesiredSize,
-  readableByteStreamControllerHandleQueueDrain,
-  readableByteStreamControllerInvalidateBYOBRequest,
-  readableByteStreamControllerProcessPullIntoDescriptorsUsingQueue,
-  readableByteStreamControllerPullInto,
-  readableByteStreamControllerRespond,
-  readableByteStreamControllerRespondInClosedState,
-  readableByteStreamControllerRespondInReadableState,
-  readableByteStreamControllerRespondInternal,
-  readableByteStreamControllerRespondWithNewView,
-  readableByteStreamControllerShiftPendingPullInto,
-  readableByteStreamControllerShouldCallPull,
-  readableByteStreamControllerCallPullIfNeeded,
-  readableStreamCancel,
   readableStreamClose,
   readableStreamCollectIntoUint8Array,
-  readableStreamDefaultControllerCallPullIfNeeded,
-  readableStreamDefaultControllerCanCloseOrEnqueue,
-  readableStreamDefaultControllerClearAlgorithms,
   ReadableStreamDefaultController,
-  readableStreamDefaultControllerClose,
-  readableStreamDefaultControllerEnqueue,
-  readableStreamDefaultControllerError,
-  readableStreamDefaultControllerGetDesiredSize,
-  readableStreamDefaultControllerHasBackpressure,
-  readableStreamDefaultControllerShouldCallPull,
   ReadableStreamDefaultReader,
   readableStreamDisturb,
-  readableStreamError,
-  readableStreamGetNumReadIntoRequests,
-  readableStreamGetNumReadRequests,
-  readableStreamHasBYOBReader,
-  readableStreamHasDefaultReader,
   ReadableStreamPrototype,
-  readableStreamReaderGenericCancel,
-  readableStreamReaderGenericRelease,
-  readableStreamPipeTo,
   readableStreamTee,
   readableStreamThrowIfErrored,
-  setUpReadableByteStreamController,
-  setUpReadableByteStreamControllerFromSource,
-  setUpReadableStreamBYOBReader,
-  setUpReadableStreamDefaultController,
-  setUpReadableStreamDefaultControllerFromSource,
-  setUpReadableStreamDefaultReader,
   TransformStream,
   TransformStreamDefaultController,
   WritableStream,
-  writableStreamClose,
   WritableStreamDefaultController,
   WritableStreamDefaultWriter,
 };

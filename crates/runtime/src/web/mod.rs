@@ -70,7 +70,6 @@ pub(crate) fn ops() -> Vec<OpDecl> {
         op_sync!(op_blob_clone_part),
         op_sync!(op_blob_create_object_url),
         op_sync!(op_now),
-        op_sync!(op_time_origin),
     ]
     .into_iter()
     .chain(crypto::ops())

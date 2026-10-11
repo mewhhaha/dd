@@ -30,7 +30,6 @@ const {
   DataViewPrototypeGetBuffer,
   DataViewPrototypeGetByteLength,
   DataViewPrototypeGetByteOffset,
-  MathTrunc,
   ObjectPrototypeIsPrototypeOf,
   PromiseReject,
   PromiseResolve,
@@ -43,8 +42,6 @@ const {
   TypedArrayPrototypeGetByteLength,
   TypedArrayPrototypeGetByteOffset,
   TypedArrayPrototypeGetSymbolToStringTag,
-  TypedArrayPrototypeSubarray,
-  Uint32Array,
   Uint8Array,
 } = primordials;
 
@@ -592,33 +589,7 @@ webidl.converters.TextDecodeOptions = webidl.createDictionaryConverter(
   ],
 );
 
-/**
- * @param {Uint8Array} bytes
- */
-function decode(bytes, encoding) {
-  const BOMEncoding = BOMSniff(bytes);
-  if (BOMEncoding !== null) {
-    encoding = BOMEncoding;
-    const start = BOMEncoding === "UTF-8" ? 3 : 2;
-    bytes = TypedArrayPrototypeSubarray(bytes, start);
-  }
-  return new TextDecoder(encoding).decode(bytes);
-}
-
-/**
- * @param {Uint8Array} bytes
- */
-function BOMSniff(bytes) {
-  if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
-    return "UTF-8";
-  }
-  if (bytes[0] === 0xFE && bytes[1] === 0xFF) return "UTF-16BE";
-  if (bytes[0] === 0xFF && bytes[1] === 0xFE) return "UTF-16LE";
-  return null;
-}
-
 return {
-  decode,
   TextDecoder,
   TextDecoderStream,
   TextEncoder,

@@ -1034,5 +1034,5 @@ function createFilteredInspectProxy({ object, keys, evaluate }) {
   }
 }
 
-return { createConsole, createFilteredInspectProxy, formatArgs, inspect };
+return { createConsole, createFilteredInspectProxy };
 })();
