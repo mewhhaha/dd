@@ -3,14 +3,14 @@ import { readFile, writeFile } from "node:fs/promises";
 
 const root = new URL("../", import.meta.url);
 const structs = [
-  ["crates/runtime/src/service/facade.rs", "WorkerStats", "DdRuntimeWorkerStats"],
-  ["crates/runtime/src/service/facade.rs", "RuntimeWorkerStatus", "DdRuntimeWorkerStatus"],
-  ["crates/runtime/src/service/facade.rs", "RuntimeRestoreFailure", "DdRuntimeRestoreFailure"],
-  ["crates/runtime/src/service/facade.rs", "RuntimeReadiness", "DdRuntimeReadiness"],
+  ["crates/runtime/src/service/facade/types.rs", "WorkerStats", "DdRuntimeWorkerStats"],
+  ["crates/runtime/src/service/facade/types.rs", "RuntimeWorkerStatus", "DdRuntimeWorkerStatus"],
+  ["crates/runtime/src/service/facade/types.rs", "RuntimeRestoreFailure", "DdRuntimeRestoreFailure"],
+  ["crates/runtime/src/service/facade/types.rs", "RuntimeReadiness", "DdRuntimeReadiness"],
   ["crates/storage/src/state.rs", "StateTimingSnapshot", "DdStateStorageTimings"],
   ["crates/storage/src/state.rs", "StatePerformanceSnapshot", "DdStateStorageStats"],
-  ["crates/runtime/src/service/facade.rs", "RuntimeAdminSnapshot", "DdRuntimeAdminSnapshot"],
-  ["crates/runtime/src/service/facade.rs", "RuntimeCheckpointResult", "DdRuntimeCheckpointResult"],
+  ["crates/runtime/src/service/facade/types.rs", "RuntimeAdminSnapshot", "DdRuntimeAdminSnapshot"],
+  ["crates/runtime/src/service/facade/types.rs", "RuntimeCheckpointResult", "DdRuntimeCheckpointResult"],
 ];
 const names = new Map(structs.map(([, name, type]) => [name, type]));
 const sources = new Map(await Promise.all([...new Set(structs.map(([path]) => path))].map(async path => [
