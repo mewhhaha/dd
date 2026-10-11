@@ -15,10 +15,22 @@ export default {
         worker: "wait-until-kv",
         routes: [
           "GET /queue with x-request-id header",
+          "GET /status with x-request-id header",
         ],
         note: "bg task writes done:{id} in waitUntil",
       }, {
         headers: { "cache-control": "no-store" },
+      });
+    }
+
+    if (url.pathname === "/status") {
+      const requestId = request.headers.get("x-request-id") ?? "";
+      const done = await kv.get(`done:${requestId}`);
+      return new Response(done ? "done" : "pending", {
+        headers: {
+          "cache-control": "no-store",
+          "content-type": "text/plain; charset=utf-8",
+        },
       });
     }
 

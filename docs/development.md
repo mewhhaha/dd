@@ -456,7 +456,7 @@ curl -H "host: hello.example.com" http://127.0.0.1:8080/
 
 - main repo check: `just check`
 - JS package syntax check: `just check-js`
-- smoke examples: `bash scripts/smoke_examples.sh`
+- Vite example smokes: `pnpm smoke:vite-examples`
 - runtime benchmark: `cargo run -p runtime --bin bench --release`
 - keyed memory benchmark: `cargo run -p runtime --bin bench_memory_storage`
 - real HTTP/1 server benchmark: `cargo run -p dd_server --bin bench_http_server --release`
