@@ -613,7 +613,7 @@ fn serialization_round_trips_values_and_branded_objects() {
     let result = eval(
         &mut runtime,
         r#"
-        const brand = Symbol.for("Deno.core.hostObject");
+        const brand = Symbol.for("dd.hostObject");
         class Point {
           constructor(x) { this.x = x; }
           [brand]() { return { type: "Point", x: this.x }; }

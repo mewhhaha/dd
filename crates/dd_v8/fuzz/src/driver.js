@@ -7,7 +7,7 @@
 // with the JavaScript reference below, returns a "BUG: ..." report.
 "use strict";
 
-const brand = Symbol.for("Deno.core.hostObject");
+const brand = Symbol.for("dd.hostObject");
 const TypedArray = Object.getPrototypeOf(Uint8Array);
 const getter = (proto, key) => Object.getOwnPropertyDescriptor(proto, key).get;
 const intrinsics = {

@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
 /// The symbol objects use to describe how to clone themselves.
-pub const HOST_OBJECT_BRAND: &str = "Deno.core.hostObject";
+pub const HOST_OBJECT_BRAND: &str = "dd.hostObject";
 
 pub fn ops() -> Vec<OpDecl> {
     vec![

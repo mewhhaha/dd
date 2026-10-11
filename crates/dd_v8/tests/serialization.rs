@@ -14,7 +14,7 @@ use common::{assert_checks, runtime};
 /// deserializers that revive its host objects, and a structural equality
 /// that knows those types.
 const CORPUS: &str = r#"
-globalThis.brand = Symbol.for("Deno.core.hostObject");
+globalThis.brand = Symbol.for("dd.hostObject");
 globalThis.Point = class Point {
   constructor(x) { this.x = x; }
   [brand]() { return { type: "Point", x: this.x }; }

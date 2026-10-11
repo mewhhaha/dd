@@ -1475,7 +1475,7 @@ mod tests {
             .execute_script(
                 "<dd:test>",
                 r#"
-                const branded = { [Symbol.for("Deno.core.hostObject")]() { return {}; } };
+                const branded = { [Symbol.for("dd.hostObject")]() { return {}; } };
                 Object.defineProperty(Object.prototype, "type", { configurable: true, get() { return "Blob"; } });
                 let outcome;
                 try {

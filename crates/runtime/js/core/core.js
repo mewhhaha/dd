@@ -64,7 +64,7 @@ function loadExtScript(specifier) {
   return exports;
 }
 
-const hostObjectBrand = SymbolFor("Deno.core.hostObject");
+const hostObjectBrand = SymbolFor("dd.hostObject");
 const cloneableDeserializers = { __proto__: null };
 
 function registerCloneableResource(name, deserialize) {
