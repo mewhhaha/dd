@@ -1,8 +1,13 @@
 # Binary Size Report
 
-This is a historical measurement. The Wasmtime experiment and direct HTTP/3
-implementation have since been removed; regenerate measurements with
-`scripts/measure-binary-size.sh` for the current tree.
+This is a historical measurement from 2026-06-19. The runtime was then built on
+`deno_core` and Deno's Web, Fetch and WebCrypto crates, and it served HTTP/3
+through `tokio-quiche`. Since then the Wasmtime experiment and the HTTP/3 server
+have been removed, and on 2026-10-10 the runtime moved to its own rusty_v8
+embedding (`crates/dd_v8`) with no Deno crates. None of the sizes or timings
+below describe the current tree, and the dependency notes are kept only to
+explain them. Regenerate measurements with `scripts/measure-binary-size.sh`
+(`just size-report-all`).
 
 ## Binary Size
 
@@ -47,27 +52,30 @@ Largest final sections:
 
 ## Dependency Graph
 
-Removed direct/default paths:
+Direct and default paths the change removed:
 
 - `reqwest` default features, which removed `openssl`, `native-tls`, and `hyper-tls` from `dd_server`.
 - Direct `h3`, `h3-quinn`, and `quinn`.
-- Direct `quiche` test dependency; HTTP/3 black-box tests now import `tokio_quiche::quiche`.
+- Direct `quiche` test dependency; the HTTP/3 black-box tests imported `tokio_quiche::quiche` instead.
 - Direct `rustls` and `rustls-pemfile` from `crates/api`.
 - Direct runtime crypto crates `aes-gcm`, `hmac`, and `sha1`.
-- Direct workspace Tokio features are now explicit: `fs`, `io-std`, `io-util`, `macros`, `net`, `process`, `rt`, `rt-multi-thread`, `signal`, `sync`, and `time`.
+- Tokio's `full` feature in the workspace dependency, which lists `fs`, `io-std`, `io-util`, `macros`, `net`, `process`, `rt`, `rt-multi-thread`, `signal`, `sync`, and `time` explicitly instead.
 
-Remaining expected providers:
+Crypto providers left in the measured graph were AWS-LC (through Rustls,
+`reqwest` and the Deno crypto and fetch crates), Ring (through Deno Fetch and
+the dev-only `rcgen`) and BoringSSL (through `tokio-quiche`). Today only AWS-LC
+remains: through Rustls for `reqwest` and the runtime, and directly in the
+runtime's WebCrypto.
 
-- AWS-LC/Rustls through `deno_crypto`, `deno_fetch`, `reqwest`, and runtime Rustls provider setup.
-- Ring through Rustls/Deno Fetch and dev-only `rcgen`.
-- BoringSSL through `tokio-quiche`/Quiche for the current HTTP/3 implementation.
+Large duplicate paths left in the measured graph:
 
-Remaining large duplicate paths:
+- `tonic@0.12.3` through `opentelemetry-proto@0.27.0` generated message types used by the OTLP/HTTP protobuf exporter. The default exporter no longer enabled `grpc-tonic`.
+- `tonic@0.14.5` through `tokio-quiche`'s `foundations` dependency tree.
+- `prost@0.13.5` through OpenTelemetry 0.27, and `prost@0.14.3` through Turso and `tokio-quiche`/`foundations`.
+- Tokio `full` through transitive dependencies, so the explicit direct Tokio feature set did not change final artifact bytes.
 
-- `tonic@0.12.3` remains through `opentelemetry-proto@0.27.0` generated message types used by the OTLP/HTTP protobuf exporter. The default exporter no longer enables `grpc-tonic`.
-- `tonic@0.14.5` remains through `tokio-quiche`'s `foundations` dependency tree.
-- `prost@0.13.5` remains through OpenTelemetry 0.27; `prost@0.14.3` remains through Turso and `tokio-quiche`/`foundations`.
-- Tokio `full` still reaches the final graph through transitive dependencies, so the explicit direct Tokio feature set did not change final artifact bytes.
+Today neither `tonic` nor Tokio `full` is in the graph, and OpenTelemetry 0.33
+and Turso share one `prost`.
 
 ## Performance
 
@@ -106,5 +114,5 @@ Smoke checks:
 
 Compatibility notes:
 
-- V8/`deno_core`, Deno Web/Fetch/WebCrypto, and Turso remain in place.
+- The change kept V8 through `deno_core`, the Deno Web, Fetch and WebCrypto crates, and Turso. The Deno crates have since been removed.
 - OTLP remains available through HTTP protobuf; `OTEL_EXPORTER_OTLP_ENDPOINT` and `DD_OTEL_ENDPOINT` base URLs are normalized to `/v1/traces`.
