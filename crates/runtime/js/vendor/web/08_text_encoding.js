@@ -24,6 +24,7 @@ const {
   ObjectPrototypeIsPrototypeOf,
   PromiseReject,
   PromiseResolve,
+  SafeFinalizationRegistry,
   // TODO(lucacasonato): add SharedArrayBuffer to primordials
   // SharedArrayBufferPrototype,
   StringPrototypeCharCodeAt,
@@ -40,8 +41,9 @@ const {
   createFilteredInspectProxy,
   privateCustomInspect,
 } = core.loadExtScript("ext:web/console.js");
+const { TransformStream } = core.loadExtScript("ext:vendor/web/06_streams.js");
 
-const decoderStates = new FinalizationRegistry((handle) =>
+const decoderStates = new SafeFinalizationRegistry((handle) =>
   op_encoding_drop_decoder(handle)
 );
 
@@ -401,7 +403,7 @@ class TextDecoderStream {
       },
       cancel: (_reason) => {
         try {
-          const _ = this.#decoder.decode();
+          this.#decoder.decode();
           return PromiseResolve();
         } catch (err) {
           return PromiseReject(err);

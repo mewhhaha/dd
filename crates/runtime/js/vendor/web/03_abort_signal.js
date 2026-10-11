@@ -19,6 +19,7 @@ const {
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { assert } = core.loadExtScript("ext:vendor/web/00_infra.js");
+const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
 const {
   createFilteredInspectProxy,
   privateCustomInspect,

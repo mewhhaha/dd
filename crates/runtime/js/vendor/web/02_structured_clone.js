@@ -33,6 +33,7 @@ const {
   BigUint64Array,
   Float32Array,
   Float64Array,
+  globalThis,
 } = primordials;
 
 const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
@@ -111,8 +112,9 @@ function structuredClone(value) {
         Constructor = BigUint64Array;
         break;
       case "Float16Array":
-        // TODO(petamoriken): add Float16Array to primordials
-        Constructor = Float16Array;
+        // V8 installs Float16Array after the bootstrap snapshot is taken, so
+        // it is no primordial; it is read from the global when a value has it.
+        Constructor = globalThis.Float16Array;
         break;
       case "Float32Array":
         Constructor = Float32Array;

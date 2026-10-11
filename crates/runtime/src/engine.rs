@@ -1260,10 +1260,13 @@ mod tests {
         let value = js_runtime
             .execute_script(
                 "<dd:test>",
-                &format!("JSON.stringify([Math.abs(Date.now() - {wall_ms}) < 500, performance.now() > 0])"),
+                &format!(
+                    "JSON.stringify([Math.abs(Date.now() - {wall_ms}) < 500, performance.now() > 0, \
+                     performance.timeOrigin + performance.now() === Date.now()])"
+                ),
             )
             .expect("clock script should run");
-        assert_eq!(string(&mut js_runtime, value), "[true,true]");
+        assert_eq!(string(&mut js_runtime, value), "[true,true,true]");
     }
 
     #[test]

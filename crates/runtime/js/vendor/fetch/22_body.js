@@ -40,7 +40,7 @@ const {
   parseFormData,
 } = core.loadExtScript("ext:vendor/fetch/21_formdata.js");
 const mimesniff = core.loadExtScript("ext:vendor/web/01_mimesniff.js");
-const { BlobPrototype } = core.loadExtScript("ext:vendor/web/09_file.js");
+const { Blob, BlobPrototype } = core.loadExtScript("ext:vendor/web/09_file.js");
 const {
   createProxy,
   createReadableStream,
@@ -49,6 +49,7 @@ const {
   readableStreamClose,
   readableStreamCollectIntoUint8Array,
   readableStreamDisturb,
+  ReadableStream,
   ReadableStreamPrototype,
   readableStreamTee,
   readableStreamThrowIfErrored,

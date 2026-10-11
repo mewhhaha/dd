@@ -203,22 +203,22 @@ function setFrozenTime(nowMs, perfMs = nowMs) {
 
 // Workers see the clock frozen between I/O boundaries through Date.now and
 // performance.now. The runtime reads the same clock through dd.frozenPerfNow,
-// never through those globals.
+// never through those globals. performance.now counts from the process's
+// monotonic start, so the time origin is the wall time at that start, which
+// keeps timeOrigin + now() equal to Date.now() as the clock moves.
 function ensureFrozenTimeGlobals() {
   Date.now = () => frozenNowMs;
 
   if (globalThis.performance === undefined) {
     define("performance", performance);
   }
-
-  try {
-    globalThis.performance.now = () => frozenPerfMs;
-  } catch {
-    define("performance", {
-      ...globalThis.performance,
-      now: () => frozenPerfMs,
-    });
-  }
+  globalThis.performance.now = () => frozenPerfMs;
+  ObjectDefineProperty(globalThis.performance, "timeOrigin", {
+    __proto__: null,
+    get: () => frozenNowMs - frozenPerfMs,
+    enumerable: true,
+    configurable: true,
+  });
 }
 
 // Moves the frozen clock to the host's, as op_time_now reads it at

@@ -66,6 +66,7 @@ const {
   WeakMapPrototypeHas,
   WeakMapPrototypeSet,
   queueMicrotask,
+  globalThis,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
@@ -1789,8 +1790,9 @@ function readableByteStreamControllerPullInto(
         ctor = Uint32Array;
         break;
       case "Float16Array":
-        // TODO(petamoriken): add Float16Array to primordials
-        ctor = Float16Array;
+        // V8 installs Float16Array after the bootstrap snapshot is taken, so
+        // it is no primordial; it is read from the global when a value has it.
+        ctor = globalThis.Float16Array;
         break;
       case "Float32Array":
         ctor = Float32Array;

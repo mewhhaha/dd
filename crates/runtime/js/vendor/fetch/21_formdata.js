@@ -4,6 +4,7 @@ return (function () {
 const { core, primordials } = __bootstrap;
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { privateCustomInspect } = core.loadExtScript("ext:web/console.js");
+const { Headers } = core.loadExtScript("ext:vendor/fetch/20_headers.js");
 const {
   Blob,
   BlobPrototype,
