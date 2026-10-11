@@ -14,8 +14,11 @@ use uuid::Uuid;
 
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
+#[path = "bench_support/env.rs"]
+mod bench_env;
 
 use bench_cli::{BenchArgAction, bench_arg_action};
+use bench_env::{env_flag, env_name, env_usize};
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -192,7 +195,7 @@ async fn main() -> Result<(), String> {
     let autoscaling_isolates = env_usize("DD_BENCH_AUTOSCALING_ISOLATES", 8);
     let write_requests = env_usize("DD_BENCH_WRITE_REQUESTS", requests.min(5_000));
     let write_concurrency = env_usize("DD_BENCH_WRITE_CONCURRENCY", concurrency.min(256));
-    let profile_enabled = env_bool("DD_BENCH_PROFILE_KV", false);
+    let profile_enabled = env_flag("DD_BENCH_PROFILE_KV");
     let autoscaling_name =
         Box::leak(format!("autoscaling-{autoscaling_isolates}").into_boxed_str());
 
@@ -410,11 +413,8 @@ async fn run_config_scenario(
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
-            memory_outbox_max_concurrent_shards: 8,
-            memory_outbox_max_claimed_bytes: 64 * 1024 * 1024,
-            memory_snapshot_cache_max_entries: 4096,
-            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: true,
+            ..RuntimeStorageConfig::default()
         },
     })
     .await
@@ -507,38 +507,11 @@ fn print_profile(profile: &KvProfileSnapshot) {
     );
 }
 
-fn env_name(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
 fn metric_mean_ms(metric: &KvProfileMetric) -> f64 {
     if metric.calls == 0 {
         return 0.0;
     }
     (metric.total_us as f64 / metric.calls as f64) / 1000.0
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
 }
 
 async fn run_scenario(

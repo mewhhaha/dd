@@ -1,5 +1,4 @@
 use runtime::KvStore;
-use std::env;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -10,8 +9,11 @@ use uuid::Uuid;
 
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
+#[path = "bench_support/env.rs"]
+mod bench_env;
 
 use bench_cli::{BenchArgAction, bench_arg_action};
+use bench_env::{env_name, env_usize};
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -202,19 +204,4 @@ fn percentile_ms(values: &[Duration], percentile: f64) -> f64 {
     }
     let idx = ((values.len() - 1) as f64 * percentile).round() as usize;
     values[idx.min(values.len() - 1)].as_secs_f64() * 1_000.0
-}
-
-fn env_name(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
 }

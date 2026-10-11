@@ -46,28 +46,21 @@ pub(super) fn runtime_service_config(
     runtime: RuntimeConfig,
     store_dir: &Path,
 ) -> RuntimeServiceConfig {
+    let defaults = RuntimeStorageConfig::default();
     RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
-            memory_outbox_max_concurrent_shards: storage::state::STATE_SHARDS
-                .min(
-                    std::thread::available_parallelism()
-                        .map(usize::from)
-                        .unwrap_or(1),
-                )
-                .clamp(1, 8),
-            memory_outbox_max_claimed_bytes: RuntimeStorageConfig::default()
-                .memory_outbox_max_claimed_bytes,
             memory_snapshot_cache_max_entries: env_usize(
                 "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_ENTRIES",
-                4096,
+                defaults.memory_snapshot_cache_max_entries,
             ),
             memory_snapshot_cache_max_bytes: env_usize(
                 "DD_BENCH_MEMORY_SNAPSHOT_CACHE_MAX_BYTES",
-                64 * 1024 * 1024,
+                defaults.memory_snapshot_cache_max_bytes,
             ),
             worker_store_enabled: true,
+            ..defaults
         },
     }
 }

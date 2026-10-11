@@ -15,8 +15,11 @@ use uuid::Uuid;
 
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
+#[path = "bench_support/env.rs"]
+mod bench_env;
 
 use bench_cli::{BenchArgAction, bench_arg_action};
+use bench_env::{env_name, env_optional_usize, env_usize};
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -72,21 +75,6 @@ struct ScenarioResult {
     p99_ms: f64,
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn env_optional_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
 fn env_v8_flags() -> Vec<String> {
     std::env::var("DD_BENCH_V8_FLAGS")
         .unwrap_or_default()
@@ -97,29 +85,12 @@ fn env_v8_flags() -> Vec<String> {
         .collect()
 }
 
-fn env_config_name() -> Option<String> {
-    std::env::var("DD_BENCH_INTERNAL_CONFIG")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn env_scenario_name() -> Option<String> {
-    std::env::var("DD_BENCH_INTERNAL_SCENARIO")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn env_custom_config(max_inflight: usize, v8_flags: &[String]) -> Option<BenchConfig> {
     let min_isolates = env_optional_usize("DD_BENCH_MIN_ISOLATES");
     let max_isolates = env_optional_usize("DD_BENCH_MAX_ISOLATES");
     let max_isolates = max_isolates.or(min_isolates)?;
     let min_isolates = min_isolates.unwrap_or(max_isolates).min(max_isolates);
-    let name = std::env::var("DD_BENCH_CUSTOM_NAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let name = env_name("DD_BENCH_CUSTOM_NAME")
         .unwrap_or_else(|| format!("custom-{}-{}", min_isolates, max_isolates));
     let leaked_name: &'static str = Box::leak(name.into_boxed_str());
     Some(BenchConfig {
@@ -342,12 +313,12 @@ export default {
         },
     ];
 
-    if let Some(config_name) = env_config_name() {
+    if let Some(config_name) = env_name("DD_BENCH_INTERNAL_CONFIG") {
         let config = configs
             .iter()
             .find(|config| config.name == config_name)
             .ok_or_else(|| format!("unknown fast fetch config: {config_name}"))?;
-        if let Some(scenario_name) = env_scenario_name() {
+        if let Some(scenario_name) = env_name("DD_BENCH_INTERNAL_SCENARIO") {
             let scenario = scenarios
                 .iter()
                 .find(|scenario| scenario.name == scenario_name)
@@ -580,11 +551,8 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: paths.store_dir.clone(),
-            memory_outbox_max_concurrent_shards: 8,
-            memory_outbox_max_claimed_bytes: 64 * 1024 * 1024,
-            memory_snapshot_cache_max_entries: 4096,
-            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: true,
+            ..RuntimeStorageConfig::default()
         },
     })
     .await

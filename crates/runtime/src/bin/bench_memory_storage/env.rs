@@ -1,20 +1,5 @@
 use super::*;
 
-pub(crate) fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-pub(crate) fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MemoryKeyMode {
     Pool,
@@ -40,22 +25,6 @@ impl MemoryKeyMode {
             _ => Self::Pool,
         }
     }
-}
-
-pub(crate) fn env_mode() -> Option<String> {
-    std::env::var("DD_BENCH_MODE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-pub(crate) fn env_duration_ms(name: &str, default: u64) -> Duration {
-    Duration::from_millis(
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(default),
-    )
 }
 
 pub(crate) fn bench_options_from_env() -> BenchOptions {

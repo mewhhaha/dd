@@ -13,8 +13,11 @@ use uuid::Uuid;
 
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
+#[path = "bench_support/env.rs"]
+mod bench_env;
 
 use bench_cli::{BenchArgAction, bench_arg_action};
+use bench_env::{env_flag, env_u64, env_usize};
 
 #[derive(Clone)]
 struct BenchConfig {
@@ -77,31 +80,8 @@ struct Distribution {
     max_ms: f64,
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
 fn bench_marker(config: &str, section: &str, scenario: &str, phase: &str) {
-    let enabled = std::env::var("DD_BENCH_PROGRESS_MARKERS")
-        .ok()
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes"
-        })
-        .unwrap_or(false);
-    if enabled {
+    if env_flag("DD_BENCH_PROGRESS_MARKERS") {
         println!(
             "bench-marker config={} section={} scenario={} phase={} pid={}",
             config,
@@ -567,11 +547,8 @@ async fn start_service_with_paths(
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),
-            memory_outbox_max_concurrent_shards: 8,
-            memory_outbox_max_claimed_bytes: 64 * 1024 * 1024,
-            memory_snapshot_cache_max_entries: 4096,
-            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: true,
+            ..RuntimeStorageConfig::default()
         },
     })
     .await

@@ -38,8 +38,11 @@ use self::workers::*;
 
 #[path = "bench_support/cli.rs"]
 mod bench_cli;
+#[path = "bench_support/env.rs"]
+mod bench_env;
 
 use bench_cli::{BenchArgAction, bench_arg_action};
+use bench_env::{env_duration_ms, env_flag, env_name, env_usize};
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -483,7 +486,7 @@ async fn deploy_realworld_auth_worker(
 }
 
 fn env_mode_checked() -> Result<Option<String>, String> {
-    let Some(mode) = env_mode() else {
+    let Some(mode) = env_name("DD_BENCH_MODE") else {
         return Ok(None);
     };
     if BENCH_CASES.iter().any(|bench_case| bench_case.mode == mode) {
