@@ -40,8 +40,9 @@ impl OpState {
             .and_then(|value| value.downcast_mut())
     }
 
-    // Named after `RefCell` and Deno's `OpState`, which the runtime's ops
-    // were written against.
+    // Named like `RefCell::borrow`, and like it they panic: the host puts
+    // every value an op borrows before any op runs, so a missing one is a
+    // bug. Values that may be absent go through `try_borrow`.
     #[allow(clippy::should_implement_trait)]
     pub fn borrow<T: 'static>(&self) -> &T {
         self.try_borrow()

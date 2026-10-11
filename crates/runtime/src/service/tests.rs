@@ -55,7 +55,7 @@ use self::fixtures::*;
 
 #[tokio::test]
 #[serial]
-async fn service_starts_with_deno_runtime_bootstrap() {
+async fn service_starts_from_the_bootstrap_snapshot() {
     let _ = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates_per_worker: 1,
@@ -2067,7 +2067,7 @@ async fn invalid_asset_headers_fail_deploy() {
 
 #[tokio::test]
 #[serial]
-async fn service_can_deploy_simple_worker_with_deno_runtime_bootstrap() {
+async fn service_deploys_a_simple_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates_per_worker: 1,
@@ -2081,7 +2081,7 @@ async fn service_can_deploy_simple_worker_with_deno_runtime_bootstrap() {
 
     service
         .deploy(
-            "simple-deno-worker".to_string(),
+            "simple-worker".to_string(),
             r#"
                 export default {
                   async fetch() {
@@ -2097,7 +2097,7 @@ async fn service_can_deploy_simple_worker_with_deno_runtime_bootstrap() {
 
 #[tokio::test]
 #[serial]
-async fn service_can_invoke_simple_worker_with_deno_runtime_bootstrap() {
+async fn service_invokes_a_simple_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates_per_worker: 1,
@@ -2111,7 +2111,7 @@ async fn service_can_invoke_simple_worker_with_deno_runtime_bootstrap() {
 
     service
         .deploy(
-            "simple-deno-invoke".to_string(),
+            "simple-invoke".to_string(),
             r#"
                 export default {
                   async fetch() {
@@ -2125,7 +2125,7 @@ async fn service_can_invoke_simple_worker_with_deno_runtime_bootstrap() {
         .expect("deploy should succeed");
 
     let output = service
-        .invoke("simple-deno-invoke".to_string(), test_invocation())
+        .invoke("simple-invoke".to_string(), test_invocation())
         .await
         .expect("invoke should succeed");
     assert_eq!(output.status, 200);
@@ -2220,7 +2220,7 @@ async fn spectre_time_mitigation_freezes_time_between_io_boundaries() {
 
 #[tokio::test]
 #[serial]
-async fn crypto_globals_work_with_deno_crypto_ops() {
+async fn crypto_globals_work_in_a_worker() {
     let service = test_service(RuntimeConfig {
         min_isolates: 0,
         max_isolates_per_worker: 1,
