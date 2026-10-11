@@ -27,7 +27,7 @@ while IFS= read -r line; do
   # Only rejection fixtures and the offline converter may name the retired type.
   # Match entire source lines so other code in those files remains checked.
   case "${line%%:*}:$content" in
-    './crates/cli/src/main.rs:"--actor-binding",') continue ;;
+    './crates/cli/src/args.rs:"--actor-binding",') continue ;;
     './crates/common/src/lib.rs:{ "type": "actor", "binding": "ROOMS" }') continue ;;
     './crates/storage/src/convert.rs:Some("memory" | "actor")') continue ;;
   esac
