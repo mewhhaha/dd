@@ -3,10 +3,10 @@ use super::*;
 pub(super) fn op_request_invocation_descriptor(
     state: &mut OpState,
     request_handle: u32,
-) -> Option<WorkerRequestDescriptorPayload> {
+) -> Option<WorkerRequestPayload> {
     state
         .borrow_mut::<RequestInvocationHandles>()
-        .take_descriptor(request_handle)
+        .remove(request_handle)
 }
 
 pub(super) fn op_take_worker_deployment_config(
@@ -24,7 +24,10 @@ pub(super) async fn op_request_body_read(
 ) -> RequestBodyReadResult {
     let stream = {
         let state_ref = state.borrow();
-        state_ref.borrow::<RequestBodyStreams>().get(stream_handle)
+        state_ref
+            .borrow::<RequestBodyStreams>()
+            .get(stream_handle)
+            .cloned()
     };
     let Some(stream) = stream else {
         return RequestBodyReadResult {

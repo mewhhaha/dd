@@ -1,78 +1,6 @@
 use super::*;
 
-#[derive(Default)]
-pub struct MemoryCommandHandles {
-    next: u32,
-    handles: HashMap<u32, MemoryCommandHandle>,
-    owner_counts: HashMap<u32, usize>,
-}
-
-impl MemoryCommandHandles {
-    pub(crate) fn insert(
-        &mut self,
-        handle: MemoryCommandHandle,
-        max_owner_handles: usize,
-    ) -> Result<u32> {
-        let request_context_handle = handle.request_context_handle;
-        let next_owner_count = self
-            .owner_counts
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
-        if next_owner_count > max_owner_handles {
-            return Err(PlatformError::bad_request(format!(
-                "memory command handles exceeded {max_owner_handles} active handles"
-            )));
-        }
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.handles.contains_key(&self.next) {
-                self.handles.insert(self.next, handle);
-                self.owner_counts
-                    .insert(request_context_handle, next_owner_count);
-                return Ok(self.next);
-            }
-        }
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<MemoryCommandHandle> {
-        let removed = self.handles.remove(&handle)?;
-        self.decrement_owner_count(removed.request_context_handle);
-        Some(removed)
-    }
-
-    pub(crate) fn get(&self, handle: u32) -> Option<&MemoryCommandHandle> {
-        self.handles.get(&handle)
-    }
-
-    pub(crate) fn clear_owner(&mut self, request_context_handle: u32) {
-        self.handles
-            .retain(|_, handle| handle.request_context_handle != request_context_handle);
-        self.owner_counts.remove(&request_context_handle);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_count(&self, request_context_handle: u32) -> usize {
-        self.owner_counts
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn decrement_owner_count(&mut self, request_context_handle: u32) {
-        let Some(current) = self.owner_counts.get_mut(&request_context_handle) else {
-            return;
-        };
-        *current = current.saturating_sub(1);
-        if *current == 0 {
-            self.owner_counts.remove(&request_context_handle);
-        }
-    }
-}
+pub(crate) type MemoryCommandHandles = OwnedHandleTable<MemoryCommandHandle>;
 
 pub(crate) struct MemoryCommandHandle {
     pub(crate) request_context_handle: u32,
@@ -81,55 +9,40 @@ pub(crate) struct MemoryCommandHandle {
     pub(crate) idempotency_key: String,
 }
 
-#[derive(Default)]
-pub struct MemoryByteHandles {
-    next: u32,
-    handles: HashMap<u32, MemoryByteHandle>,
-    owner_bytes: HashMap<u32, usize>,
+impl OwnedHandle for MemoryCommandHandle {
+    const NAME: &'static str = "memory command handles";
+
+    fn owner(&self) -> u32 {
+        self.request_context_handle
+    }
+}
+
+/// Values handed to JavaScript as bytes, each request within a byte budget.
+pub(crate) type MemoryByteHandles = OwnedHandleTable<MemoryByteHandle>;
+
+pub(crate) struct MemoryByteHandle {
+    pub(crate) request_context_handle: u32,
+    pub(crate) value: Bytes,
+}
+
+impl OwnedHandle for MemoryByteHandle {
+    const NAME: &'static str = "memory byte handles";
+    const UNIT: &'static str = "bytes";
+
+    fn owner(&self) -> u32 {
+        self.request_context_handle
+    }
+
+    fn cost(&self) -> usize {
+        self.value.len()
+    }
 }
 
 impl MemoryByteHandles {
-    pub(crate) fn insert(
-        &mut self,
-        request_context_handle: u32,
-        value: Bytes,
-        max_owner_bytes: usize,
-    ) -> Result<u32> {
-        let next_owner_bytes = self
-            .owner_bytes
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(value.len());
-        if next_owner_bytes > max_owner_bytes {
-            return Err(PlatformError::bad_request(format!(
-                "memory byte handles exceeded {max_owner_bytes} bytes"
-            )));
-        }
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.handles.contains_key(&self.next) {
-                self.handles.insert(
-                    self.next,
-                    MemoryByteHandle {
-                        request_context_handle,
-                        value,
-                    },
-                );
-                self.owner_bytes
-                    .insert(request_context_handle, next_owner_bytes);
-                return Ok(self.next);
-            }
-        }
-    }
-
+    /// Takes the bytes behind `handle`, which must be the request's own.
     pub(crate) fn take(&mut self, request_context_handle: u32, handle: u32) -> Result<Bytes> {
         let entry = self
-            .handles
-            .get(&handle)
+            .get(handle)
             .ok_or_else(|| PlatformError::bad_request("memory byte handle is invalid"))?;
         if entry.request_context_handle != request_context_handle {
             return Err(PlatformError::bad_request(
@@ -137,197 +50,34 @@ impl MemoryByteHandles {
             ));
         }
         let entry = self
-            .handles
-            .remove(&handle)
+            .remove(handle)
             .expect("memory byte handle must exist after owner check");
-        self.decrement_owner_bytes(request_context_handle, entry.value.len());
         Ok(entry.value)
     }
-
-    pub(crate) fn clear_owner(&mut self, request_context_handle: u32) {
-        self.handles
-            .retain(|_, handle| handle.request_context_handle != request_context_handle);
-        self.owner_bytes.remove(&request_context_handle);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_bytes(&self, request_context_handle: u32) -> usize {
-        self.owner_bytes
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn decrement_owner_bytes(&mut self, request_context_handle: u32, bytes: usize) {
-        let Some(current) = self.owner_bytes.get_mut(&request_context_handle) else {
-            return;
-        };
-        *current = current.saturating_sub(bytes);
-        if *current == 0 {
-            self.owner_bytes.remove(&request_context_handle);
-        }
-    }
 }
 
-pub(crate) struct MemoryByteHandle {
-    pub(crate) request_context_handle: u32,
-    pub(crate) value: Bytes,
-}
-
-#[derive(Default)]
-pub struct MemoryReadHandles {
-    next: u32,
-    handles: HashMap<u32, MemoryReadHandle>,
-    owner_counts: HashMap<u32, usize>,
-}
-
-impl MemoryReadHandles {
-    pub(crate) fn insert(
-        &mut self,
-        handle: MemoryReadHandle,
-        max_owner_handles: usize,
-    ) -> Result<u32> {
-        let request_context_handle = handle.request_context_handle;
-        let next_owner_count = self
-            .owner_counts
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
-        if next_owner_count > max_owner_handles {
-            return Err(PlatformError::bad_request(format!(
-                "memory read handles exceeded {max_owner_handles} active handles"
-            )));
-        }
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.handles.contains_key(&self.next) {
-                self.handles.insert(self.next, handle);
-                self.owner_counts
-                    .insert(request_context_handle, next_owner_count);
-                return Ok(self.next);
-            }
-        }
-    }
-
-    pub(crate) fn get(&self, handle: u32) -> Option<&MemoryReadHandle> {
-        self.handles.get(&handle)
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<MemoryReadHandle> {
-        let removed = self.handles.remove(&handle)?;
-        self.decrement_owner_count(removed.request_context_handle);
-        Some(removed)
-    }
-
-    pub(crate) fn clear_owner(&mut self, request_context_handle: u32) {
-        self.handles
-            .retain(|_, handle| handle.request_context_handle != request_context_handle);
-        self.owner_counts.remove(&request_context_handle);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_count(&self, request_context_handle: u32) -> usize {
-        self.owner_counts
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn decrement_owner_count(&mut self, request_context_handle: u32) {
-        let Some(current) = self.owner_counts.get_mut(&request_context_handle) else {
-            return;
-        };
-        *current = current.saturating_sub(1);
-        if *current == 0 {
-            self.owner_counts.remove(&request_context_handle);
-        }
-    }
-}
+pub(crate) type MemoryReadHandles = OwnedHandleTable<MemoryReadHandle>;
 
 pub(crate) struct MemoryReadHandle {
     pub(crate) request_context_handle: u32,
     pub(crate) snapshot: Arc<crate::memory::MemorySnapshot>,
 }
 
-#[derive(Default)]
-pub struct MemoryBatchHandles {
-    next: u32,
-    handles: HashMap<u32, MemoryBatchHandle>,
-    owner_counts: HashMap<u32, usize>,
+impl OwnedHandle for MemoryReadHandle {
+    const NAME: &'static str = "memory read handles";
+
+    fn owner(&self) -> u32 {
+        self.request_context_handle
+    }
 }
 
-impl MemoryBatchHandles {
-    pub(crate) fn insert(
-        &mut self,
-        handle: MemoryBatchHandle,
-        max_owner_handles: usize,
-    ) -> Result<u32> {
-        let request_context_handle = handle.request_context_handle;
-        let next_owner_count = self
-            .owner_counts
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
-        if next_owner_count > max_owner_handles {
-            return Err(PlatformError::bad_request(format!(
-                "memory batch handles exceeded {max_owner_handles} active handles"
-            )));
-        }
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.handles.contains_key(&self.next) {
-                self.handles.insert(self.next, handle);
-                self.owner_counts
-                    .insert(request_context_handle, next_owner_count);
-                return Ok(self.next);
-            }
-        }
-    }
+pub(crate) type MemoryBatchHandles = OwnedHandleTable<MemoryBatchHandle>;
 
-    pub(crate) fn get(&self, handle: u32) -> Option<&MemoryBatchHandle> {
-        self.handles.get(&handle)
-    }
+impl OwnedHandle for MemoryBatchHandle {
+    const NAME: &'static str = "memory batch handles";
 
-    pub(crate) fn get_mut(&mut self, handle: u32) -> Option<&mut MemoryBatchHandle> {
-        self.handles.get_mut(&handle)
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<MemoryBatchHandle> {
-        let removed = self.handles.remove(&handle)?;
-        self.decrement_owner_count(removed.request_context_handle);
-        Some(removed)
-    }
-
-    pub(crate) fn clear_owner(&mut self, request_context_handle: u32) {
-        self.handles
-            .retain(|_, handle| handle.request_context_handle != request_context_handle);
-        self.owner_counts.remove(&request_context_handle);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owner_count(&self, request_context_handle: u32) -> usize {
-        self.owner_counts
-            .get(&request_context_handle)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn decrement_owner_count(&mut self, request_context_handle: u32) {
-        let Some(current) = self.owner_counts.get_mut(&request_context_handle) else {
-            return;
-        };
-        *current = current.saturating_sub(1);
-        if *current == 0 {
-            self.owner_counts.remove(&request_context_handle);
-        }
+    fn owner(&self) -> u32 {
+        self.request_context_handle
     }
 }
 

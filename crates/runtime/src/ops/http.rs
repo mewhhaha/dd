@@ -251,42 +251,10 @@ fn install_pinned_http_client(
 }
 
 /// Pinned clients waiting for the fetch they were made for.
-#[derive(Default)]
-pub(crate) struct HttpClients {
-    next: u32,
-    clients: HashMap<u32, reqwest::Client>,
-}
-
-impl HttpClients {
-    fn insert(&mut self, client: reqwest::Client) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next != 0 && !self.clients.contains_key(&self.next) {
-                self.clients.insert(self.next, client);
-                return self.next;
-            }
-        }
-    }
-}
+type HttpClients = HandleTable<reqwest::Client>;
 
 /// Response bodies of host fetches, read chunk by chunk from JavaScript.
-#[derive(Default)]
-pub(crate) struct HttpResponseBodies {
-    next: u32,
-    bodies: HashMap<u32, reqwest::Response>,
-}
-
-impl HttpResponseBodies {
-    fn insert(&mut self, response: reqwest::Response) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next != 0 && !self.bodies.contains_key(&self.next) {
-                self.bodies.insert(self.next, response);
-                return self.next;
-            }
-        }
-    }
-}
+type HttpResponseBodies = HandleTable<reqwest::Response>;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct HttpFetchResult {
@@ -352,7 +320,7 @@ async fn send_http_fetch(
         let mut op_state = state.borrow_mut();
         let client = op_state
             .try_borrow_mut::<HttpClients>()
-            .and_then(|clients| clients.clients.remove(&client_handle));
+            .and_then(|clients| clients.remove(client_handle));
         let headers = op_state
             .borrow_mut::<HttpPreparedHeaders>()
             .take(headers_handle)
@@ -487,7 +455,7 @@ pub(crate) async fn op_http_response_read(
     let response = state
         .borrow_mut()
         .try_borrow_mut::<HttpResponseBodies>()
-        .and_then(|bodies| bodies.bodies.remove(&body_handle));
+        .and_then(|bodies| bodies.remove(body_handle));
     let Some(mut response) = response else {
         return Ok(None);
     };
@@ -496,7 +464,7 @@ pub(crate) async fn op_http_response_read(
     })?;
     if let Some(chunk) = &chunk {
         if let Some(bodies) = state.borrow_mut().try_borrow_mut::<HttpResponseBodies>() {
-            bodies.bodies.insert(body_handle, response);
+            bodies.restore(body_handle, response);
         }
         return Ok(Some(chunk.to_vec().into()));
     }
@@ -505,7 +473,7 @@ pub(crate) async fn op_http_response_read(
 
 pub(crate) fn op_http_response_close(state: &mut OpState, body_handle: u32) {
     if let Some(bodies) = state.try_borrow_mut::<HttpResponseBodies>() {
-        bodies.bodies.remove(&body_handle);
+        bodies.remove(body_handle);
     }
 }
 

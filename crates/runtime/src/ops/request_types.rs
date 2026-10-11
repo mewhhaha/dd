@@ -3,10 +3,11 @@ use super::*;
 pub type RequestBodyChunk = std::result::Result<Bytes, String>;
 pub type RequestBodyReceiver = mpsc::Receiver<RequestBodyChunk>;
 
+/// Bodies passed between ops by handle. An empty body takes no entry: it is
+/// handle 0.
 #[derive(Default)]
 pub struct HttpPreparedBodies {
-    next: u32,
-    bodies: HashMap<u32, Bytes>,
+    bodies: HandleTable<Bytes>,
 }
 
 impl HttpPreparedBodies {
@@ -15,30 +16,22 @@ impl HttpPreparedBodies {
         if body.is_empty() {
             return 0;
         }
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.bodies.contains_key(&self.next) {
-                self.bodies.insert(self.next, body);
-                return self.next;
-            }
-        }
+        self.bodies.insert(body)
     }
 
     pub(crate) fn take(&mut self, handle: u32) -> Option<Bytes> {
         if handle == 0 {
             return Some(Bytes::new());
         }
-        self.bodies.remove(&handle)
+        self.bodies.remove(handle)
     }
 }
 
+/// Header lists passed between ops by handle. An empty list takes no entry:
+/// it is handle 0.
 #[derive(Default)]
 pub struct HttpPreparedHeaders {
-    next: u32,
-    headers: HashMap<u32, Vec<(String, String)>>,
+    headers: HandleTable<Vec<(String, String)>>,
 }
 
 impl HttpPreparedHeaders {
@@ -46,84 +39,20 @@ impl HttpPreparedHeaders {
         if headers.is_empty() {
             return 0;
         }
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.headers.contains_key(&self.next) {
-                self.headers.insert(self.next, headers);
-                return self.next;
-            }
-        }
+        self.headers.insert(headers)
     }
 
     pub(crate) fn take(&mut self, handle: u32) -> Option<Vec<(String, String)>> {
         if handle == 0 {
             return Some(Vec::new());
         }
-        self.headers.remove(&handle)
+        self.headers.remove(handle)
     }
 }
 
-#[derive(Default)]
-pub struct RequestInvocationHandles {
-    pub(crate) next: u32,
-    pub(crate) payloads: HashMap<u32, WorkerRequestPayload>,
-}
+pub(crate) type RequestInvocationHandles = HandleTable<WorkerRequestPayload>;
 
-impl RequestInvocationHandles {
-    pub(crate) fn insert(&mut self, payload: WorkerRequestPayload) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.payloads.contains_key(&self.next) {
-                self.payloads.insert(self.next, payload);
-                return self.next;
-            }
-        }
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<WorkerRequestPayload> {
-        self.payloads.remove(&handle)
-    }
-
-    pub(crate) fn take_descriptor(
-        &mut self,
-        handle: u32,
-    ) -> Option<WorkerRequestDescriptorPayload> {
-        self.payloads
-            .remove(&handle)
-            .map(|payload| WorkerRequestDescriptorPayload::from_payload(&payload))
-    }
-}
-
-#[derive(Default)]
-pub struct WorkerDeploymentHandles {
-    pub(crate) next: u32,
-    pub(crate) payloads: HashMap<u32, WorkerDeploymentPayload>,
-}
-
-impl WorkerDeploymentHandles {
-    pub(crate) fn insert(&mut self, payload: WorkerDeploymentPayload) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.payloads.contains_key(&self.next) {
-                self.payloads.insert(self.next, payload);
-                return self.next;
-            }
-        }
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<WorkerDeploymentPayload> {
-        self.payloads.remove(&handle)
-    }
-}
+pub(crate) type WorkerDeploymentHandles = HandleTable<WorkerDeploymentPayload>;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct WorkerDeploymentPayload {
@@ -157,79 +86,7 @@ pub(crate) struct WorkerRequestPayload {
     pub(crate) input_request_id: String,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct WorkerRequestDescriptorPayload {
-    pub(crate) request_id: String,
-    pub(crate) request_context_handle: u32,
-    pub(crate) completion_handle: u32,
-    pub(crate) memory_request_scope_handle: u32,
-    pub(crate) memory_call: Option<MemoryExecutionCall>,
-    pub(crate) request_body_stream_handle: u32,
-    pub(crate) request_headers_handle: u32,
-    pub(crate) request_body_handle: u32,
-    pub(crate) stream_response: bool,
-    pub(crate) max_response_body_bytes: usize,
-    pub(crate) max_request_body_bytes: usize,
-    pub(crate) method: String,
-    pub(crate) url: String,
-    pub(crate) input_request_id: String,
-}
-
-impl WorkerRequestDescriptorPayload {
-    fn from_payload(payload: &WorkerRequestPayload) -> Self {
-        Self {
-            request_id: payload.request_id.clone(),
-            request_context_handle: payload.request_context_handle,
-            completion_handle: payload.completion_handle,
-            memory_request_scope_handle: payload.memory_request_scope_handle,
-            memory_call: payload.memory_call.clone(),
-            request_body_stream_handle: payload.request_body_stream_handle,
-            request_headers_handle: payload.request_headers_handle,
-            request_body_handle: payload.request_body_handle,
-            stream_response: payload.stream_response,
-            max_response_body_bytes: payload.max_response_body_bytes,
-            max_request_body_bytes: payload.max_request_body_bytes,
-            method: payload.method.clone(),
-            url: payload.url.clone(),
-            input_request_id: payload.input_request_id.clone(),
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct MemoryRequestScopes {
-    next: u32,
-    pub(crate) scopes: HashMap<u32, MemoryRequestScope>,
-}
-
-impl MemoryRequestScopes {
-    pub(crate) fn insert(&mut self, scope: MemoryRequestScope) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.scopes.contains_key(&self.next) {
-                self.scopes.insert(self.next, scope);
-                return self.next;
-            }
-        }
-    }
-
-    pub(crate) fn get(&self, handle: u32) -> Option<&MemoryRequestScope> {
-        if handle == 0 {
-            return None;
-        }
-        self.scopes.get(&handle)
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<MemoryRequestScope> {
-        if handle == 0 {
-            return None;
-        }
-        self.scopes.remove(&handle)
-    }
-}
+pub(crate) type MemoryRequestScopes = HandleTable<MemoryRequestScope>;
 
 #[derive(Clone)]
 pub(crate) struct MemoryRequestScope {
@@ -242,10 +99,10 @@ pub(crate) struct MemoryRequestScope {
 
 #[derive(Default)]
 pub struct ActiveRequestContextHandles {
-    next_completion: u32,
     request_ids: HashMap<String, u32>,
     contexts: HashMap<u32, ActiveRequestContext>,
-    completion_handles: HashMap<u32, u32>,
+    /// The request context handle behind each completion handle.
+    completion_handles: HandleTable<u32>,
 }
 
 impl ActiveRequestContextHandles {
@@ -256,15 +113,9 @@ impl ActiveRequestContextHandles {
         {
             return 0;
         }
-        let completion_handle = loop {
-            self.next_completion = self.next_completion.wrapping_add(1);
-            if self.next_completion == 0 {
-                continue;
-            }
-            if !self.completion_handles.contains_key(&self.next_completion) {
-                break self.next_completion;
-            }
-        };
+        let completion_handle = self
+            .completion_handles
+            .insert(context.request_context_handle);
         context.completion_handle = completion_handle;
         if let Some(previous) = self
             .request_ids
@@ -272,17 +123,15 @@ impl ActiveRequestContextHandles {
             && let Some(previous_context) = self.contexts.remove(&previous)
         {
             self.completion_handles
-                .remove(&previous_context.completion_handle);
+                .remove(previous_context.completion_handle);
         }
         if let Some(previous) = self
             .contexts
             .insert(context.request_context_handle, context.clone())
         {
             self.request_ids.remove(&previous.request_id);
-            self.completion_handles.remove(&previous.completion_handle);
+            self.completion_handles.remove(previous.completion_handle);
         }
-        self.completion_handles
-            .insert(completion_handle, context.request_context_handle);
         completion_handle
     }
 
@@ -294,12 +143,12 @@ impl ActiveRequestContextHandles {
     }
 
     pub(crate) fn get_completion(&self, completion_handle: u32) -> Option<&ActiveRequestContext> {
-        let request_context_handle = self.completion_handles.get(&completion_handle)?;
+        let request_context_handle = self.completion_handles.get(completion_handle)?;
         self.contexts.get(request_context_handle)
     }
 
     pub(crate) fn increment_wait_until(&mut self, completion_handle: u32) -> Option<usize> {
-        let request_context_handle = self.completion_handles.get(&completion_handle)?;
+        let request_context_handle = self.completion_handles.get(completion_handle)?;
         let context = self.contexts.get_mut(request_context_handle)?;
         context.wait_until_count = context.wait_until_count.saturating_add(1);
         Some(context.wait_until_count)
@@ -309,7 +158,7 @@ impl ActiveRequestContextHandles {
         &mut self,
         completion_handle: u32,
     ) -> Option<ActiveRequestContext> {
-        let request_context_handle = self.completion_handles.get(&completion_handle)?;
+        let request_context_handle = self.completion_handles.get(completion_handle)?;
         let context = self.contexts.get_mut(request_context_handle)?;
         if context.wait_until_done_sent {
             return None;
@@ -331,7 +180,7 @@ impl ActiveRequestContextHandles {
         }
         let context = self.contexts.remove(&handle)?;
         self.request_ids.remove(&context.request_id);
-        self.completion_handles.remove(&context.completion_handle);
+        self.completion_handles.remove(context.completion_handle);
         Some(context)
     }
 }
@@ -346,40 +195,7 @@ pub(crate) struct ActiveRequestContext {
     pub(crate) wait_until_done_sent: bool,
 }
 
-#[derive(Default)]
-pub struct RequestSecretContexts {
-    next: u32,
-    pub(crate) contexts: HashMap<u32, RequestSecretContext>,
-}
-
-impl RequestSecretContexts {
-    pub(crate) fn insert(&mut self, context: RequestSecretContext) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.contexts.contains_key(&self.next) {
-                self.contexts.insert(self.next, context);
-                return self.next;
-            }
-        }
-    }
-
-    pub(crate) fn get(&self, handle: u32) -> Option<&RequestSecretContext> {
-        if handle == 0 {
-            return None;
-        }
-        self.contexts.get(&handle)
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<RequestSecretContext> {
-        if handle == 0 {
-            return None;
-        }
-        self.contexts.remove(&handle)
-    }
-}
+pub(crate) type RequestSecretContexts = HandleTable<RequestSecretContext>;
 
 #[derive(Clone)]
 pub(crate) struct RequestExecutionContext {
@@ -500,9 +316,7 @@ mod tests {
             input_request_id: "user-1".to_string(),
         });
 
-        let descriptor = handles
-            .take_descriptor(handle)
-            .expect("descriptor should exist");
+        let descriptor = handles.remove(handle).expect("descriptor should exist");
         assert_eq!(descriptor.request_id, "runtime-1");
         assert_eq!(descriptor.method, "POST");
         assert_eq!(descriptor.request_headers_handle, 7);
@@ -524,7 +338,6 @@ mod tests {
             "descriptor should not reconstruct the request object before body take"
         );
         assert!(handles.remove(handle).is_none());
-        assert!(handles.take_descriptor(handle).is_none());
     }
 
     #[test]
@@ -612,40 +425,7 @@ impl Drop for RequestSecretContext {
     }
 }
 
-#[derive(Default)]
-pub struct RequestBodyStreams {
-    next: u32,
-    pub(crate) streams: HashMap<u32, Arc<RequestBodyStream>>,
-}
-
-impl RequestBodyStreams {
-    pub(crate) fn insert(&mut self, stream: RequestBodyStream) -> u32 {
-        loop {
-            self.next = self.next.wrapping_add(1);
-            if self.next == 0 {
-                continue;
-            }
-            if !self.streams.contains_key(&self.next) {
-                self.streams.insert(self.next, Arc::new(stream));
-                return self.next;
-            }
-        }
-    }
-
-    pub(crate) fn remove(&mut self, handle: u32) -> Option<Arc<RequestBodyStream>> {
-        if handle == 0 {
-            return None;
-        }
-        self.streams.remove(&handle)
-    }
-
-    pub(crate) fn get(&self, handle: u32) -> Option<Arc<RequestBodyStream>> {
-        if handle == 0 {
-            return None;
-        }
-        self.streams.get(&handle).cloned()
-    }
-}
+pub(crate) type RequestBodyStreams = HandleTable<Arc<RequestBodyStream>>;
 
 pub(crate) struct RequestBodyStream {
     pub(crate) receiver: Mutex<RequestBodyReceiver>,

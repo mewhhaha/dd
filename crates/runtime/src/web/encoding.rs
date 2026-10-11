@@ -3,17 +3,14 @@
 // decoders live in the op state behind a numeric handle instead of a
 // garbage-collected wrapper; the decoder's JS object frees it.
 
+use crate::ops::HandleTable;
 use base64::Engine;
 use dd_v8::builtins::{buffer_bytes, with_buffer_mut};
 use dd_v8::{JsBuffer, OpError, OpState, ToJsBuffer, v8};
 use encoding_rs::{CoderResult, Decoder, DecoderResult, Encoding};
-use std::collections::HashMap;
 
-#[derive(Default)]
-struct Decoders {
-    next: u32,
-    decoders: HashMap<u32, (Decoder, bool)>,
-}
+/// Streaming decoders, each with whether it is fatal.
+type Decoders = HandleTable<(Decoder, bool)>;
 
 pub(super) fn op_encoding_normalize_label(
     _state: &mut OpState,
@@ -135,11 +132,7 @@ pub(super) fn op_encoding_new_decoder(
     if !state.has::<Decoders>() {
         state.put(Decoders::default());
     }
-    let decoders = state.borrow_mut::<Decoders>();
-    decoders.next = decoders.next.wrapping_add(1).max(1);
-    let handle = decoders.next;
-    decoders.decoders.insert(handle, (decoder, fatal));
-    Ok(handle)
+    Ok(state.borrow_mut::<Decoders>().insert((decoder, fatal)))
 }
 
 /// Decodes a chunk with a streaming decoder; the last chunk (`stream ==
@@ -154,19 +147,18 @@ pub(super) fn op_encoding_decode(
         .try_borrow_mut::<Decoders>()
         .ok_or_else(|| OpError::type_error("TextDecoder state is gone"))?;
     let (decoder, fatal) = decoders
-        .decoders
-        .get_mut(&handle)
+        .get_mut(handle)
         .ok_or_else(|| OpError::type_error("TextDecoder state is gone"))?;
     let result = decode(decoder, *fatal, &data, !stream);
     if !stream || result.is_err() {
-        decoders.decoders.remove(&handle);
+        decoders.remove(handle);
     }
     result
 }
 
 pub(super) fn op_encoding_drop_decoder(state: &mut OpState, handle: u32) {
     if let Some(decoders) = state.try_borrow_mut::<Decoders>() {
-        decoders.decoders.remove(&handle);
+        decoders.remove(handle);
     }
 }
 

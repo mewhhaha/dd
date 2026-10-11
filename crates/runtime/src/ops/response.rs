@@ -66,10 +66,7 @@ fn emit_completion_result(
     result: Result<WorkerOutput>,
 ) {
     if wait_until_count == 0 && request_context_handle > 0 {
-        clear_memory_command_handles(state, request_context_handle);
-        clear_memory_byte_handles(state, request_context_handle);
-        clear_memory_batch_handles(state, request_context_handle);
-        clear_memory_read_handles(state, request_context_handle);
+        clear_memory_handles(state, request_context_handle);
     }
     let _ = emit_isolate_event(
         state,
@@ -91,10 +88,7 @@ pub(crate) fn op_emit_wait_until_done(state: &mut OpState, completion_handle: u3
     };
     let request_context_handle = context.request_context_handle;
     if request_context_handle > 0 {
-        clear_memory_command_handles(state, request_context_handle);
-        clear_memory_byte_handles(state, request_context_handle);
-        clear_memory_batch_handles(state, request_context_handle);
-        clear_memory_read_handles(state, request_context_handle);
+        clear_memory_handles(state, request_context_handle);
     }
     let _ = emit_isolate_event(
         state,

@@ -67,25 +67,17 @@ struct ResolvedMemoryScope {
     owner_epoch: i64,
 }
 
-pub(crate) fn clear_memory_command_handles(state: &mut OpState, request_context_handle: u32) {
+/// Drops every memory handle a request holds.
+pub(crate) fn clear_memory_handles(state: &mut OpState, request_context_handle: u32) {
     state
         .borrow_mut::<MemoryCommandHandles>()
         .clear_owner(request_context_handle);
-}
-
-pub(crate) fn clear_memory_byte_handles(state: &mut OpState, request_context_handle: u32) {
     state
         .borrow_mut::<MemoryByteHandles>()
         .clear_owner(request_context_handle);
-}
-
-pub(crate) fn clear_memory_batch_handles(state: &mut OpState, request_context_handle: u32) {
     state
         .borrow_mut::<MemoryBatchHandles>()
         .clear_owner(request_context_handle);
-}
-
-pub(crate) fn clear_memory_read_handles(state: &mut OpState, request_context_handle: u32) {
     state
         .borrow_mut::<MemoryReadHandles>()
         .clear_owner(request_context_handle);
@@ -407,10 +399,13 @@ fn memory_output_bytes_insert(
     if value.is_empty() {
         return Ok(0);
     }
-    let max_owner_bytes = MEMORY_BATCH_MAX_STAGED_BYTES;
-    state
-        .borrow_mut::<MemoryByteHandles>()
-        .insert(request_context_handle, value, max_owner_bytes)
+    state.borrow_mut::<MemoryByteHandles>().insert(
+        MemoryByteHandle {
+            request_context_handle,
+            value,
+        },
+        MEMORY_BATCH_MAX_STAGED_BYTES,
+    )
 }
 
 pub(super) fn op_memory_bytes_take(
@@ -1333,38 +1328,37 @@ mod tests {
         assert_eq!(memory_batch_commit_owner_epoch(&batch).expect("owner"), 7);
     }
 
+    fn byte_handle(request_context_handle: u32, value: &'static [u8]) -> MemoryByteHandle {
+        MemoryByteHandle {
+            request_context_handle,
+            value: Bytes::from_static(value),
+        }
+    }
+
     #[test]
     fn memory_byte_handles_account_owner_bytes_and_clear() {
         let mut handles = MemoryByteHandles::default();
         let first = handles
-            .insert(
-                7,
-                Bytes::from_static(&[1, 2, 3]),
-                MEMORY_BATCH_MAX_STAGED_BYTES,
-            )
+            .insert(byte_handle(7, &[1, 2, 3]), MEMORY_BATCH_MAX_STAGED_BYTES)
             .expect("first handle should insert");
         let second = handles
-            .insert(
-                7,
-                Bytes::from_static(&[4, 5]),
-                MEMORY_BATCH_MAX_STAGED_BYTES,
-            )
+            .insert(byte_handle(7, &[4, 5]), MEMORY_BATCH_MAX_STAGED_BYTES)
             .expect("second handle should insert");
-        assert_eq!(handles.owner_bytes(7), 5);
+        assert_eq!(handles.usage(7), 5);
 
         let mismatch = handles
             .take(8, first)
             .expect_err("wrong owner must not consume handle");
         assert!(mismatch.to_string().contains("owner mismatch"));
-        assert_eq!(handles.owner_bytes(7), 5);
+        assert_eq!(handles.usage(7), 5);
 
         assert_eq!(
             handles.take(7, first).expect("first handle"),
             Bytes::from_static(&[1, 2, 3])
         );
-        assert_eq!(handles.owner_bytes(7), 2);
+        assert_eq!(handles.usage(7), 2);
         handles.clear_owner(7);
-        assert_eq!(handles.owner_bytes(7), 0);
+        assert_eq!(handles.usage(7), 0);
         assert!(handles.take(7, second).is_err());
     }
 
@@ -1372,22 +1366,22 @@ mod tests {
     fn memory_byte_handles_reject_owner_byte_overflow() {
         let mut handles = MemoryByteHandles::default();
         handles
-            .insert(7, Bytes::copy_from_slice(&[1; 8]), 8)
+            .insert(byte_handle(7, &[1; 8]), 8)
             .expect("initial bytes should fit");
         let error = handles
-            .insert(7, Bytes::from_static(&[2]), 8)
+            .insert(byte_handle(7, &[2]), 8)
             .expect_err("owner byte budget should reject overflow");
         assert!(
             error
                 .to_string()
                 .contains("memory byte handles exceeded 8 bytes")
         );
-        assert_eq!(handles.owner_bytes(7), 8);
+        assert_eq!(handles.usage(7), 8);
 
         handles
-            .insert(8, Bytes::from_static(&[3]), 8)
+            .insert(byte_handle(8, &[3]), 8)
             .expect("other owner has independent budget");
-        assert_eq!(handles.owner_bytes(8), 1);
+        assert_eq!(handles.usage(8), 1);
     }
 
     fn command_handle(request_context_handle: u32, suffix: usize) -> MemoryCommandHandle {
@@ -1416,10 +1410,10 @@ mod tests {
                 .to_string()
                 .contains("memory command handles exceeded 2 active handles")
         );
-        assert_eq!(handles.owner_count(7), 2);
+        assert_eq!(handles.usage(7), 2);
 
         handles.remove(first).expect("first handle should remove");
-        assert_eq!(handles.owner_count(7), 1);
+        assert_eq!(handles.usage(7), 1);
         handles
             .insert(command_handle(7, 3), 2)
             .expect("slot should be reusable after remove");
@@ -1427,8 +1421,8 @@ mod tests {
             .insert(command_handle(8, 0), 2)
             .expect("other owner should have independent quota");
         handles.clear_owner(7);
-        assert_eq!(handles.owner_count(7), 0);
-        assert_eq!(handles.owner_count(8), 1);
+        assert_eq!(handles.usage(7), 0);
+        assert_eq!(handles.usage(8), 1);
     }
 
     #[test]
@@ -1449,8 +1443,8 @@ mod tests {
         handles.clear_owner(1);
         assert!(handles.get(first).is_none());
         assert!(handles.get(second).is_some());
-        assert_eq!(handles.owner_count(1), 0);
-        assert_eq!(handles.owner_count(2), 1);
+        assert_eq!(handles.usage(1), 0);
+        assert_eq!(handles.usage(2), 1);
         assert_eq!(Arc::strong_count(&snapshot), 2);
         handles.insert(read(1), 1).unwrap();
         handles.remove(second).unwrap();
@@ -1475,10 +1469,10 @@ mod tests {
                 .to_string()
                 .contains("memory batch handles exceeded 2 active handles")
         );
-        assert_eq!(handles.owner_count(1), 2);
+        assert_eq!(handles.usage(1), 2);
 
         handles.remove(first).expect("first batch should remove");
-        assert_eq!(handles.owner_count(1), 1);
+        assert_eq!(handles.usage(1), 1);
         handles
             .insert(empty_batch(7), 2)
             .expect("slot should be reusable after remove");
@@ -1489,7 +1483,7 @@ mod tests {
             .insert(other, 2)
             .expect("other owner should have independent quota");
         handles.clear_owner(1);
-        assert_eq!(handles.owner_count(1), 0);
-        assert_eq!(handles.owner_count(2), 1);
+        assert_eq!(handles.usage(1), 0);
+        assert_eq!(handles.usage(2), 1);
     }
 }

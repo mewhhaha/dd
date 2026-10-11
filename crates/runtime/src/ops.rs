@@ -23,6 +23,8 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 mod cache_ops;
 #[path = "ops/console.rs"]
 mod console_ops;
+#[path = "ops/handles.rs"]
+mod handles;
 #[path = "ops/http.rs"]
 mod http_ops;
 #[path = "ops/kv.rs"]
@@ -46,14 +48,12 @@ use self::cache_ops::*;
 pub(crate) use self::console_ops::WorkerConsoleSink;
 use self::console_ops::op_console_write;
 pub use self::console_ops::{WorkerConsoleLevel, WorkerConsoleLine};
+pub(crate) use self::handles::{HandleTable, OwnedHandle, OwnedHandleTable};
 pub(crate) use self::http_ops::UnscopedFetch;
 use self::http_ops::*;
 use self::kv_ops::*;
+pub(crate) use self::memory_ops::clear_memory_handles;
 use self::memory_ops::*;
-pub(crate) use self::memory_ops::{
-    clear_memory_batch_handles, clear_memory_byte_handles, clear_memory_command_handles,
-    clear_memory_read_handles,
-};
 pub(crate) use self::memory_types::*;
 use self::request_control_ops::*;
 pub(crate) use self::request_control_types::*;
@@ -294,7 +294,7 @@ pub fn register_request_body_stream(
 ) -> u32 {
     state
         .borrow_mut::<RequestBodyStreams>()
-        .insert(RequestBodyStream::new(receiver, max_bytes))
+        .insert(Arc::new(RequestBodyStream::new(receiver, max_bytes)))
 }
 
 pub fn register_request_invocation(state: &mut OpState, payload: WorkerRequestPayload) -> u32 {
@@ -414,8 +414,7 @@ pub fn clear_memory_request_scope(state: &mut OpState, memory_scope_handle: u32)
 pub fn clear_request_secret_context(state: &mut OpState, request_context_handle: u32) {
     state
         .borrow_mut::<MemoryRequestScopes>()
-        .scopes
-        .retain(|_, scope| scope.request_context_handle != request_context_handle);
+        .retain(|scope| scope.request_context_handle != request_context_handle);
     state
         .borrow_mut::<ActiveRequestContextHandles>()
         .remove_handle(request_context_handle);
