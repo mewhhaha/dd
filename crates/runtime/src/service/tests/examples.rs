@@ -38,6 +38,17 @@ async fn memory_examples_commit_ping_counts() {
             let body: Value = serde_json::from_slice(&output.body).expect("JSON ping");
             assert_eq!(body["pings"], count, "{name}");
         }
+        if name == "traced-example" {
+            let output = service
+                .invoke(
+                    name.to_string(),
+                    test_invocation_with_path("/api/stream", name),
+                )
+                .await
+                .expect("example stream should succeed");
+            assert_eq!(output.status, 200);
+            assert_eq!(output.body, b"hello\nstream\n");
+        }
     }
 }
 

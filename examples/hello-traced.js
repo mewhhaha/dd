@@ -156,12 +156,18 @@ export default {
     }
 
     if (url.pathname === "/api/stream" && request.method === "GET") {
-      return json({
-        ok: false,
-        feature: "stream",
-        supported: false,
-        note: "ReadableStream responses are not stable in this runtime build yet.",
-      }, 501);
+      const encoder = new TextEncoder();
+      const body = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(encoder.encode("hello\n"));
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          controller.enqueue(encoder.encode("stream\n"));
+          controller.close();
+        },
+      });
+      return new Response(body, {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
 
     if (url.pathname === "/api/ws" && request.method === "GET") {
@@ -169,7 +175,7 @@ export default {
         ok: false,
         feature: "websocket",
         supported: false,
-        note: "WebSocket upgrade is not implemented in this runtime yet.",
+        note: "WebSocket upgrades require a memory entry; this endpoint uses fetch.",
       }, 501);
     }
 
