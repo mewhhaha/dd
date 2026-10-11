@@ -134,8 +134,8 @@ as state and outbox effects. Async callbacks, nested transactions and returned
 thenables fail; transaction handles cannot escape the callback.
 Stored command results have a versioned envelope with Request/Response metadata
 kept outside user objects. Replay preserves shared references and cycles without
-treating user property names as type markers. Older unversioned results remain
-readable; their Request/Response records are recognized by their complete shape.
+treating user property names as type markers. A result without the envelope,
+or with an unknown version, fails to replay.
 
 Read-only callbacks use `memory.read(snapshot => ...)`. A separate native handle
 retains one committed immutable snapshot, with no entity lease, command lookup,

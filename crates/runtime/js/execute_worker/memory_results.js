@@ -112,26 +112,6 @@
     return value;
   };
 
-  const LEGACY_REQUEST_FIELDS = ["__dd_rpc_type", "url", "method", "headers", "body"];
-  const LEGACY_RESPONSE_FIELDS = ["__dd_rpc_type", "status", "headers", "body"];
-
-  const legacyMemoryWebValueKind = (value) => {
-    const fields = value.__dd_rpc_type === "request"
-      ? LEGACY_REQUEST_FIELDS
-      : value.__dd_rpc_type === "response"
-      ? LEGACY_RESPONSE_FIELDS
-      : [];
-    if (fields.length !== ObjectKeys(value).length) {
-      return undefined;
-    }
-    for (let i = 0; i < fields.length; i++) {
-      if (!ObjectHasOwn(value, fields[i])) {
-        return undefined;
-      }
-    }
-    return value.__dd_rpc_type;
-  };
-
   const decodeMemoryCommandValue = (value, references, webValues) => {
     if (references.has(value)) return references.get(value);
     if (ArrayIsArray(value)) {
@@ -165,7 +145,7 @@
     if (!isPlainObject(value)) {
       return value;
     }
-    const kind = webValues ? MapPrototypeGet(webValues, value) : legacyMemoryWebValueKind(value);
+    const kind = MapPrototypeGet(webValues, value);
     if (kind === "request") {
       const method = String(value.method || "GET");
       const bodyBytes = toArrayBytes(value.body);
@@ -209,6 +189,9 @@
     }
     return out;
   };
+
+  // A stored command result is "DDMC", a version byte, then the structured
+  // clone of the encoded value and the map that marks its web values.
   const MEMORY_COMMAND_RESULT_MAGIC = core.encode("DDMC");
   const MEMORY_COMMAND_RESULT_VERSION = 1;
 
@@ -224,15 +207,10 @@
   };
 
   const decodeMemoryCommandResult = (bytes) => {
-    let versioned = true;
     for (let i = 0; i < 4; i++) {
       if (bytes[i] !== MEMORY_COMMAND_RESULT_MAGIC[i]) {
-        versioned = false;
-        break;
+        throw new Error("unsupported stored memory command result format");
       }
-    }
-    if (!versioned) {
-      return decodeMemoryCommandValue(core.deserialize(bytes), new SafeMap(), undefined);
     }
     if (bytes[4] !== MEMORY_COMMAND_RESULT_VERSION) {
       throw new Error("unsupported stored memory command result version");

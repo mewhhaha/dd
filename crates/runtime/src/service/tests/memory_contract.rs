@@ -481,16 +481,15 @@ return Response.json({ cycle: value.self === value, shared: value.left === value
 
 #[tokio::test]
 #[serial]
-async fn idempotent_results_keep_user_markers_separate_from_web_values() {
+async fn idempotent_results_replay_web_values_and_shared_references() {
     let service = deploy_memory_contract_worker(
         r#"
 const value = await memory.atomic(tx => {
   tx.put("executions", (tx.get("executions") ?? 0) + 1);
   const request = new Request("https://fixture.test/request", { method: "POST", body: "request body" });
   const response = new Response("response body", { status: 202, statusText: "Accepted", headers: { "x-result": "stored" } });
-  const plainRequest = { __dd_rpc_type: "request", url: "https://data.test/", method: "GET", headers: [], body: [] };
-  const plainResponse = { __dd_rpc_type: "response", status: 200, headers: [], body: [] };
-  const record = { request, requestAlias: request, response, plainRequest, plainResponse,
+  const plain = { url: "https://data.test/", method: "GET", status: 200, headers: [], body: [] };
+  const record = { request, requestAlias: request, response, plain,
     map: new Map([[request, response]]), set: new Set([response]) };
   record.self = record;
   return record;
@@ -499,8 +498,7 @@ return Response.json({
   request: value.request instanceof Request, requestBody: await value.request.text(),
   response: value.response instanceof Response, responseBody: await value.response.text(),
   status: value.response.status, statusText: value.response.statusText, header: value.response.headers.get("x-result"),
-  plainRequest: !(value.plainRequest instanceof Request) && value.plainRequest.__dd_rpc_type === "request",
-  plainResponse: !(value.plainResponse instanceof Response) && value.plainResponse.__dd_rpc_type === "response",
+  plain: !(value.plain instanceof Request) && !(value.plain instanceof Response) && value.plain.status === 200,
   shared: value.request === value.requestAlias && value.map.get(value.request) === value.response && value.set.has(value.response),
   cyclic: value.self === value,
   executions: await memory.read(snapshot => snapshot.get("executions")),
@@ -518,7 +516,7 @@ return Response.json({
             serde_json::json!({
                 "request": true, "requestBody": "request body", "response": true,
                 "responseBody": "response body", "status": 202, "statusText": "Accepted",
-                "header": "stored", "plainRequest": true, "plainResponse": true,
+                "header": "stored", "plain": true,
                 "shared": true, "cyclic": true, "executions": 1,
             })
         );

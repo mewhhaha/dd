@@ -55,7 +55,7 @@ const { encodeMemoryCommandResult, decodeMemoryCommandResult } = runInThisContex
   { filename: "memory_results.js" },
 )(scope);
 
-test("new results preserve user properties that match old web value records", async () => {
+test("results replay web values, aliases and cycles, and leave plain objects plain", async () => {
   const plain = { __dd_rpc_type: "response", status: 200, headers: [], body: [] };
   const response = new Response("body", { status: 201, statusText: "Created" });
   const value = { plain, response, alias: response, map: new Map([[plain, response]]) };
@@ -71,32 +71,9 @@ test("new results preserve user properties that match old web value records", as
   assert.equal(replay.self, replay);
 });
 
-test("existing unversioned results retain user markers and graph references", () => {
-  const value = { __dd_rpc_type: "response", value: 42, map: new Map() };
-  value.self = value;
-  value.map.set(value, value);
-  const replay = decodeMemoryCommandResult(serialize(value));
-  assert.equal(replay instanceof Response, false);
-  assert.equal(replay.__dd_rpc_type, "response");
-  assert.equal(replay.value, 42);
-  assert.equal(replay.self, replay);
-  assert.equal(replay.map.get(replay), replay);
-});
-
-test("existing unversioned Request and Response records remain readable", async () => {
-  const response = decodeMemoryCommandResult(serialize({
-    __dd_rpc_type: "response", status: 201, headers: [["x-result", "stored"]], body: new TextEncoder().encode("response body"),
-  }));
-  assert(response instanceof Response);
-  assert.equal(response.status, 201);
-  assert.equal(response.headers.get("x-result"), "stored");
-  assert.equal(await response.text(), "response body");
-  const request = decodeMemoryCommandResult(serialize({
-    __dd_rpc_type: "request", url: "https://fixture.test/", method: "POST", headers: [], body: new TextEncoder().encode("request body"),
-  }));
-  assert(request instanceof Request);
-  assert.equal(request.method, "POST");
-  assert.equal(await request.text(), "request body");
+test("unversioned stored results fail explicitly", () => {
+  const unversioned = serialize({ __dd_rpc_type: "response", status: 201, headers: [], body: new Uint8Array() });
+  assert.throws(() => decodeMemoryCommandResult(unversioned), /unsupported stored memory command result format/);
 });
 
 test("unknown stored result versions fail explicitly", async () => {
