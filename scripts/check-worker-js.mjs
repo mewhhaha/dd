@@ -59,8 +59,9 @@ await lint("execute_worker", sources.join("\n"), (line) => {
   }
   return [units[index], line];
 });
-for (const script of ["bootstrap.js", "web/init.js"]) {
+const scripts = ["bootstrap.js", "web/init.js", "web/console.js"];
+for (const script of scripts) {
   await lint(script, await readFile(join(jsDir, script), "utf8"), (line) => [script, line]);
 }
 if (errors > 0) process.exitCode = 1;
-else console.log(`runtime JavaScript: ${units.length} worker units, bootstrap.js and web/init.js name no globals and leave no unused bindings`);
+else console.log(`runtime JavaScript: ${units.length} worker units and ${scripts.join(", ")} name no globals and leave no unused bindings`);
