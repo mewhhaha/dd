@@ -19,7 +19,6 @@ const {
 const { extractBody, mixinBody } = core.loadExtScript(
   "ext:deno_fetch/22_body.js",
 );
-const { getLocationHref } = core.loadExtScript("ext:deno_web/12_location.js");
 const { extractMimeType } = core.loadExtScript("ext:deno_web/01_mimesniff.js");
 const { URL } = core.loadExtScript("ext:deno_web/00_url.js");
 const {
@@ -28,9 +27,6 @@ const {
   guardFromHeaders,
   headersFromHeaderList,
 } = core.loadExtScript("ext:deno_fetch/20_headers.js");
-const { markNotSerializable } = core.loadExtScript(
-  "ext:deno_web/13_message_port.js",
-);
 const {
   ArrayPrototypeFilter,
   ArrayPrototypeMap,
@@ -674,8 +670,7 @@ class Response {
     url = webidlConvertersUSVString(url, prefix, "Argument 1");
     status = webidlConvertersUnsignedShort(status, prefix, "Argument 2");
 
-    const baseURL = getLocationHref();
-    const parsedURL = new URL(url, baseURL);
+    const parsedURL = new URL(url);
     if (!redirectStatus(status)) {
       throw new RangeError(`Invalid redirect status code: ${status}`);
     }
@@ -874,7 +869,6 @@ ObjectDefineProperties(Response, {
   error: { __proto__: null, enumerable: true },
 });
 const ResponsePrototype = Response.prototype;
-markNotSerializable(ResponsePrototype);
 mixinBody(ResponsePrototype, _body, _mimeType);
 
 webidl.converters["Response"] = webidl.createInterfaceConverter(

@@ -1286,19 +1286,6 @@ class CloseEvent extends Event {
 
 const CloseEventPrototype = CloseEvent.prototype;
 
-// Lazy reference to MessagePort.prototype - 13_message_port.js depends on
-// this module, so the script can't be loaded at definition time without
-// causing a load cycle. Cached on first access.
-let _MessagePortPrototype;
-function getMessagePortPrototype() {
-  if (_MessagePortPrototype === undefined) {
-    _MessagePortPrototype =
-      core.loadExtScript("ext:deno_web/13_message_port.js")
-        .MessagePortPrototype;
-  }
-  return _MessagePortPrototype;
-}
-
 // Format an arbitrary JS value for inclusion in a MessageEvent constructor
 // error message *for the "must be MessagePort" check*: strings and primitives
 // get JSON-quoted (`"null"`, `"1"`, `"{}"`), matching the regex assertions
@@ -1357,30 +1344,20 @@ class MessageEvent extends Event {
           }) is not iterable.`,
         );
       }
-      const MessagePortProto = getMessagePortPrototype();
-      const arr = [];
-      let i = 0;
-      // Iterate using the user's own iterator so values that aren't real
-      // arrays (e.g. a `RegExp` with a custom `Symbol.iterator` -- covered
-      // by WPT's no-regexp-special-casing test) still produce the
-      // expected `ports` array. SafeArrayIterator can't be used here
-      // because it walks the value as if it were an Array.
-      // deno-lint-ignore deno-internal/prefer-primordials
+      // dd has no MessagePort, so any member fails the type check. Iterate
+      // using the user's own iterator so values that aren't real arrays
+      // (e.g. a `RegExp` with a custom `Symbol.iterator` -- covered by WPT's
+      // no-regexp-special-casing test) are read as the sequence they
+      // describe. SafeArrayIterator can't be used here because it walks the
+      // value as if it were an Array.
       for (const p of ports) {
-        if (
-          p === null || typeof p !== "object" ||
-          !ObjectPrototypeIsPrototypeOf(MessagePortProto, p)
-        ) {
-          throw new TypeError(
-            `MessageEvent constructor: Expected eventInitDict.ports[${i}] (${
-              formatForBranded(p)
-            }) to be an instance of MessagePort.`,
-          );
-        }
-        arr[i++] = p;
+        throw new TypeError(
+          `MessageEvent constructor: Expected eventInitDict.ports[0] (${
+            formatForBranded(p)
+          }) to be an instance of MessagePort.`,
+        );
       }
-      // `ports` is a FrozenArray<MessagePort> per the HTML spec.
-      this.ports = ObjectFreeze(arr);
+      this.ports = ObjectFreeze([]);
     }
     // origin and lastEventId are USVString per spec, so coerce to string
     // (Node's test passes numbers and expects string coercion).

@@ -24,7 +24,6 @@ const {
   SafeRegExp,
   String,
   StringPrototypeSplit,
-  Symbol,
   SymbolFor,
 } = primordials;
 
@@ -77,15 +76,7 @@ function loadExtScript(specifier) {
 }
 
 const hostObjectBrand = SymbolFor("Deno.core.hostObject");
-const transferableResources = { __proto__: null };
 const cloneableDeserializers = { __proto__: null };
-
-function registerTransferableResource(name, send, receive) {
-  if (transferableResources[name]) {
-    throw new Error(`${name} is already registered`);
-  }
-  transferableResources[name] = { send, receive };
-}
 
 function registerCloneableResource(name, deserialize) {
   if (cloneableDeserializers[name]) {
@@ -195,16 +186,12 @@ const core = {
   ops,
   loadExtScript,
   build,
-  internalRidSymbol: Symbol("Deno.internal.rid"),
   BadResource,
   BadResourcePrototype: BadResource.prototype,
   Interrupted,
   InterruptedPrototype: Interrupted.prototype,
   hostObjectBrand,
-  registerTransferableResource,
-  getTransferableResource: (name) => transferableResources[name],
   registerCloneableResource,
-  getCloneableDeserializers: () => cloneableDeserializers,
   encode: (text) => op_encode(text),
   decode: (buffer) => op_decode(buffer),
   serialize: (value, options, errorCallback) =>

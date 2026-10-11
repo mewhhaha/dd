@@ -33,7 +33,6 @@ const { URL } = core.loadExtScript("ext:deno_web/00_url.js");
 const { extractBody, mixinBody } = core.loadExtScript(
   "ext:deno_fetch/22_body.js",
 );
-const { getLocationHref } = core.loadExtScript("ext:deno_web/12_location.js");
 const { extractMimeType } = core.loadExtScript("ext:deno_web/01_mimesniff.js");
 const { blobFromObjectUrl } = core.loadExtScript("ext:deno_web/09_file.js");
 const {
@@ -44,19 +43,12 @@ const {
   headersFromHeaderList,
   headersFromHeaderListLazyTarget,
 } = core.loadExtScript("ext:deno_fetch/20_headers.js");
-const { HttpClientPrototype } = core.loadExtScript(
-  "ext:deno_fetch/22_http_client.js",
-);
 const {
   createDependentAbortSignal,
   newSignal,
   signalAbort,
 } = core.loadExtScript("ext:deno_web/03_abort_signal.js");
 const { DOMException } = core.loadExtScript("ext:deno_web/01_dom_exception.js");
-const { markNotSerializable } = core.loadExtScript(
-  "ext:deno_web/13_message_port.js",
-);
-const { internalRidSymbol } = core;
 
 const _request = Symbol("request");
 const _headers = Symbol("headers");
@@ -109,7 +101,6 @@ function processUrlList(urlList, urlListProcessed) {
  * @property {number} redirectCount
  * @property {(() => string)[]} urlList
  * @property {string[]} urlListProcessed
- * @property {number | null} clientRid NOTE: non standard extension for `Deno.HttpClient`.
  * @property {Blob | null} blobUrlEntry
  */
 
@@ -157,7 +148,6 @@ function newInnerRequest(method, url, headerList, body, maybeBlob) {
     redirectCount: 0,
     urlList: [typeof url === "string" ? () => url : url],
     urlListProcessed: [],
-    clientRid: null,
     blobUrlEntry,
     url() {
       if (this.urlListProcessed[0] === undefined) {
@@ -208,7 +198,6 @@ function cloneInnerRequest(request, skipBody = false) {
     redirectCount: request.redirectCount,
     urlList: [() => request.url()],
     urlListProcessed: [request.url()],
-    clientRid: request.clientRid,
     blobUrlEntry: request.blobUrlEntry,
     url() {
       if (this.urlListProcessed[0] === undefined) {
@@ -387,14 +376,13 @@ class Request {
 
     /** @type {InnerRequest} */
     let request;
-    const baseURL = getLocationHref();
 
     // 4.
     let signal = null;
 
     // 5.
     if (typeof input === "string") {
-      const parsedURL = new URL(input, baseURL);
+      const parsedURL = new URL(input);
       request = newInnerRequest(
         "GET",
         parsedURL.href,
@@ -423,7 +411,7 @@ class Request {
       } else {
         let parsedReferrer;
         try {
-          parsedReferrer = new URL(referrer, baseURL);
+          parsedReferrer = new URL(referrer);
         } catch (err) {
           throw new TypeError(`Referrer "${referrer}" is not a valid URL.`, {
             cause: err,
@@ -504,22 +492,6 @@ class Request {
     // 26.
     if (init.signal !== undefined) {
       signal = init.signal;
-    }
-
-    // NOTE: non standard extension. This handles Deno.HttpClient parameter
-    if (init.client !== undefined) {
-      if (
-        init.client !== null &&
-        !ObjectPrototypeIsPrototypeOf(HttpClientPrototype, init.client)
-      ) {
-        throw webidl.makeException(
-          TypeError,
-          "`client` must be a Deno.HttpClient",
-          prefix,
-          "Argument 2",
-        );
-      }
-      request.clientRid = init.client?.[internalRidSymbol] ?? null;
     }
 
     // 28.
@@ -715,7 +687,6 @@ class Request {
 
 webidl.configureInterface(Request);
 const RequestPrototype = Request.prototype;
-markNotSerializable(RequestPrototype);
 mixinBody(RequestPrototype, _body, _mimeType);
 const requestJson = RequestPrototype.json;
 ObjectDefineProperty(RequestPrototype, "json", {
@@ -835,7 +806,6 @@ webidl.converters["RequestInit"] = webidl.createDictionaryConverter(
         webidl.converters["AbortSignal"],
       ),
     },
-    { key: "client", converter: webidl.converters.any },
   ],
 );
 
