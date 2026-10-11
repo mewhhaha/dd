@@ -17,6 +17,8 @@ measure a deployed app over HTTPS, and
 [what earlier investigations found](#what-earlier-investigations-found)
 summarizes the measurements behind the current memory design.
 
+The per-worker isolate limit is `DD_BENCH_MAX_ISOLATES_PER_WORKER`.
+
 ## Running benchmarks
 
 Run one configuration from the repository root:
@@ -393,6 +395,61 @@ Recommended summary workflow:
 The summarizer rejects dirty, incomplete, failed, ambiguous, incompatible, or
 malformed results by default. Use `--allow-dirty` only when deliberately marking
 generated text as non-release evidence.
+
+## Request instruction counts
+
+`bench_req_micro` runs fixed hello and memory workloads with eight callers,
+up to two isolates and four dispatch slots per isolate. The memory workload
+commits one write per request over 64 entity keys. The Linux counter includes
+user-mode instructions from every process thread and excludes kernel work.
+
+For each build, subtract the N=2,000 count from N=12,000 and divide by 10,000.
+Two ABBA cycles provide four marginal samples per build and workload; report
+their median. Pin both builds to the same CPU. Wall-clock time is not used as
+performance evidence on a loaded host. This compares the whole cleanup from
+`bc258d7`, so it cannot isolate the contribution of each change.
+
+Measured on 2026-10-11, comparing `bc258d7` with `8a2088e` on CPU 3:
+
+| Workload | Baseline instructions/request | Candidate instructions/request | Reduction |
+| --- | ---: | ---: | ---: |
+| Hello | 246,494 | 198,252 | 19.6% |
+| Memory atomic | 723,354 | 660,132 | 8.7% |
+
+The four samples ranged from 245,464–248,342 versus 197,955–198,458 for
+hello, and 720,183–729,590 versus 654,240–669,066 for memory. All 32 raw
+runs had equal counter enabled/running times. Raw evidence from this run is
+in `target/cleanup/request-instructions.json`; generated results remain ignored.
+
+Reproduce with an isolated baseline build cache:
+
+```bash
+export CARGO_BUILD_JOBS=8 TMPDIR="$PWD/target/tmp"
+mkdir -p "$TMPDIR"
+cargo build --release --locked -p runtime --bin bench_req_micro
+git worktree add --detach ../dd-instruction-baseline bc258d7
+mkdir -p ../dd-instruction-baseline/target
+cp -r --reflink=always target/release ../dd-instruction-baseline/target/release
+python3 - <<'PY'
+from pathlib import Path
+source = Path("crates/runtime/src/bin/bench_req_micro.rs").read_text()
+source = source.replace("max_isolates_per_worker: 2", "max_isolates: 2")
+source = source.replace("RuntimeService::start(", "RuntimeService::start_with_service_config(")
+Path("../dd-instruction-baseline/crates/runtime/src/bin/bench_req_micro.rs").write_text(source)
+PY
+cargo build --release --locked -p runtime --bin bench_req_micro \
+  --manifest-path ../dd-instruction-baseline/Cargo.toml
+cc -O2 -Wall -Wextra -Werror scripts/count-instructions.c -o target/count-instructions
+python3 scripts/measure-request-instructions.py \
+  ../dd-instruction-baseline/target/release/bench_req_micro \
+  target/release/bench_req_micro --counter target/count-instructions \
+  --baseline-revision bc258d7 --candidate-revision "$(git rev-parse HEAD)" \
+  --cpu 3 --out benchmarks/results/request-instructions.json
+```
+
+Choose an available CPU if CPU 3 is outside the process affinity. The runner
+rejects failed commands and multiplexed counters, and records every raw count,
+binary hashes, revisions and kernel version in the ignored JSON output.
 
 ## What earlier investigations found
 

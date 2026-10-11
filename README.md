@@ -6,6 +6,8 @@ Public traffic is routed by host name, so `hello.example.com` can map to worker 
 
 Worker shape stays familiar: `fetch(request, env, ctx)` plus worker bindings. KV handles simple persistence, Cache API handles response reuse, and memory namespaces handle shardable coordination.
 
+Unhandled rejections, `reportError()` and exceptions thrown in event listeners fail the request.
+
 ## Quickstart
 
 Private control plane uses bearer auth. CLI reads `DD_PRIVATE_TOKEN` automatically.
@@ -306,7 +308,8 @@ cargo run -p runtime --bin bench_memory_storage --release
 
 Benchmark configurations and reproducible measurement instructions live in
 [benchmarks/README.md](benchmarks/README.md). Contributor/dev notes live in
-[docs/development.md](docs/development.md).
+[docs/development.md](docs/development.md). Platform follow-ups are tracked in
+[docs/runtime-backlog.md](docs/runtime-backlog.md).
 
 [What earlier investigations found](benchmarks/README.md#what-earlier-investigations-found)
 summarizes the measurements behind the state storage layout and the memory
