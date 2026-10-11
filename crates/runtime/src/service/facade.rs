@@ -421,7 +421,7 @@ impl WorkerStreamBody {
         }
     }
 
-    pub(super) fn attach_cancel_guard(&mut self, cancel_guard: InvokeCancelGuard) {
+    fn attach_cancel_guard(&mut self, cancel_guard: InvokeCancelGuard) {
         self.cancel_guard = Some(cancel_guard);
     }
 
@@ -740,19 +740,7 @@ pub struct RuntimeService {
     _lifetime: Arc<RuntimeServiceLifetime>,
 }
 impl RuntimeService {
-    pub async fn start() -> Result<Self> {
-        Self::start_with_service_config(RuntimeServiceConfig::default()).await
-    }
-
-    pub async fn start_with_config(config: RuntimeConfig) -> Result<Self> {
-        Self::start_with_service_config(RuntimeServiceConfig {
-            runtime: config,
-            storage: RuntimeStorageConfig::default(),
-        })
-        .await
-    }
-
-    pub async fn start_with_service_config(config: RuntimeServiceConfig) -> Result<Self> {
+    pub async fn start(config: RuntimeServiceConfig) -> Result<Self> {
         ensure_rustls_crypto_provider();
         let RuntimeServiceConfig { runtime, storage } = config;
         validate_runtime_config(&runtime)?;
@@ -1124,7 +1112,7 @@ impl RuntimeService {
         .await
     }
 
-    pub async fn deploy_with_bundle_config_lifecycle(
+    async fn deploy_with_bundle_config_lifecycle(
         &self,
         worker_name: String,
         source: String,

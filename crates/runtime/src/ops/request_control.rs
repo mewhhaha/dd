@@ -44,7 +44,7 @@ fn reply_start_error(error: impl ToString) -> PendingReplyStartResult {
     }
 }
 
-pub(super) fn service_binding_owner_for_request(
+fn service_binding_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_context_handle: u32,
     binding: &str,

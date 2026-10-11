@@ -132,7 +132,7 @@ pub(super) fn op_memory_request_scope_close(state: &mut OpState, memory_scope_ha
     clear_memory_request_scope(state, memory_scope_handle);
 }
 
-pub(super) fn clear_request_body_stream_entry(state: &Rc<RefCell<OpState>>, stream_handle: u32) {
+fn clear_request_body_stream_entry(state: &Rc<RefCell<OpState>>, stream_handle: u32) {
     if let Some(stream) = state
         .borrow_mut()
         .borrow_mut::<RequestBodyStreams>()

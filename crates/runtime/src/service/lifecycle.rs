@@ -587,7 +587,7 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) fn fail_all_streams_for_worker(&mut self, worker_name: &str, error: PlatformError) {
+    fn fail_all_streams_for_worker(&mut self, worker_name: &str, error: PlatformError) {
         let request_ids: Vec<String> = self
             .stream_registrations
             .iter()
@@ -824,7 +824,7 @@ impl WorkerManager {
         removed.removed
     }
 
-    pub(crate) fn scale_down_pool(&mut self, worker_name: &str, generation: u64, now: Instant) {
+    fn scale_down_pool(&mut self, worker_name: &str, generation: u64, now: Instant) {
         let min_isolates = self.config.min_isolates;
         let idle_ttl = self.config.idle_ttl;
         let internal_rescue_isolate_ids = self

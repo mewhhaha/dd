@@ -694,7 +694,7 @@ pub(super) fn op_memory_batch_command_result(
     .is_ok()
 }
 
-pub(super) fn memory_scope_for_payload(
+fn memory_scope_for_payload(
     state: &Rc<RefCell<OpState>>,
     memory_scope_handle: u32,
     binding: &str,
@@ -1082,72 +1082,6 @@ pub(super) async fn op_memory_command_begin(
 pub(super) fn op_memory_command_close(state: &mut OpState, handle: u32) {
     if handle != 0 {
         let _ = state.borrow_mut::<MemoryCommandHandles>().remove(handle);
-    }
-}
-
-pub(super) async fn op_memory_socket_send(
-    state: Rc<RefCell<OpState>>,
-    memory_scope_handle: u32,
-    handle: String,
-    binding: String,
-    key: String,
-    message_kind: String,
-    message: JsBuffer,
-) -> MemorySocketSendResult {
-    let message = message.as_ref().to_vec();
-    if handle.trim().is_empty() {
-        return MemorySocketSendResult {
-            ok: false,
-            error: "memory socket send requires handle".to_string(),
-        };
-    }
-    let normalized_kind = message_kind.as_str();
-    let is_text = match normalized_kind {
-        "text" => true,
-        "binary" => false,
-        _ => {
-            return MemorySocketSendResult {
-                ok: false,
-                error: format!("unsupported message kind: {normalized_kind}"),
-            };
-        }
-    };
-
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketSendResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if emit_isolate_event_from_rc(
-        &state,
-        IsolateEventPayload::MemorySocketSend(MemorySocketSendEvent {
-            reply: reply_tx,
-            handle,
-            binding,
-            key,
-            is_text,
-            message,
-        }),
-    )
-    .is_err()
-    {
-        return MemorySocketSendResult {
-            ok: false,
-            error: "memory socket send runtime is unavailable".to_string(),
-        };
-    }
-
-    drop(reply_rx);
-    MemorySocketSendResult {
-        ok: true,
-        error: String::new(),
     }
 }
 

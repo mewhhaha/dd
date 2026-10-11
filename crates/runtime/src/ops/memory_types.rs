@@ -351,15 +351,6 @@ pub(crate) struct MemoryBatchCommandResult {
     pub(crate) value: Vec<u8>,
 }
 
-pub struct MemorySocketSendEvent {
-    pub reply: oneshot::Sender<Result<()>>,
-    pub handle: String,
-    pub binding: String,
-    pub key: String,
-    pub is_text: bool,
-    pub message: Vec<u8>,
-}
-
 pub struct MemorySocketCloseEvent {
     pub reply: oneshot::Sender<Result<()>>,
     pub handle: String,
@@ -378,12 +369,6 @@ pub struct TimeBoundary {
 #[derive(Debug, Serialize)]
 pub(crate) struct MemoryLeaseResult {
     pub(crate) handle: u32,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemorySocketSendResult {
-    pub(crate) ok: bool,
     pub(crate) error: String,
 }
 

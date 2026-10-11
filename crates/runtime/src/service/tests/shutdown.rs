@@ -84,7 +84,7 @@ async fn automatic_shutdown_exits_with_pending_outbox_deliveries_and_retries_aft
 #[ignore = "subprocess fixture for automatic runtime shutdown"]
 async fn outbox_drop_child() {
     let root = PathBuf::from(std::env::var_os("DD_OUTBOX_DROP_ROOT").expect("subprocess root"));
-    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    let service = RuntimeService::start(RuntimeServiceConfig {
         runtime: RuntimeConfig {
             scale_tick: Duration::from_millis(1),
             ..RuntimeConfig::default()

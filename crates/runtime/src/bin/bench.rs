@@ -563,7 +563,7 @@ async fn start_service_with_paths(
     tokio::fs::create_dir_all(store_dir)
         .await
         .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    RuntimeService::start(RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.to_path_buf(),

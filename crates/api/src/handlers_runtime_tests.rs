@@ -44,7 +44,7 @@ impl TestState {
             worker_store_enabled: true,
             ..RuntimeStorageConfig::default()
         };
-        let runtime = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+        let runtime = RuntimeService::start(RuntimeServiceConfig {
             runtime: Default::default(),
             storage,
         })

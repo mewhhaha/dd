@@ -576,7 +576,7 @@ async fn start_service(tag: &str, runtime: RuntimeConfig) -> common::Result<Runt
     tokio::fs::create_dir_all(&paths.store_dir)
         .await
         .map_err(|error| PlatformError::internal(error.to_string()))?;
-    RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    RuntimeService::start(RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: paths.store_dir.clone(),

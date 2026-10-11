@@ -49,7 +49,7 @@ impl WorkerManager {
         self.queue_counters.bytes = self.queue_counters.bytes.saturating_add(queued_bytes);
     }
 
-    pub(super) fn account_dequeued_pending(&mut self, pending: &PendingInvoke) {
+    fn account_dequeued_pending(&mut self, pending: &PendingInvoke) {
         if let Some(admission) = &pending.queue_admission {
             admission.release();
         }
@@ -860,7 +860,7 @@ impl WorkerManager {
         }
     }
 
-    pub(crate) fn spawn_isolate(
+    fn spawn_isolate(
         &mut self,
         worker_name: &str,
         generation: u64,
@@ -1358,7 +1358,7 @@ impl WorkerManager {
         .await;
     }
 
-    pub(crate) fn enqueue_trace_forward(&mut self, forward: TraceForwardRequest) {
+    fn enqueue_trace_forward(&mut self, forward: TraceForwardRequest) {
         let TraceForwardRequest {
             worker_name,
             generation,

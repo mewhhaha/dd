@@ -546,7 +546,7 @@ impl WorkerManager {
         }));
     }
 
-    pub(super) fn register_websocket_session(
+    fn register_websocket_session(
         &mut self,
         registration: WebSocketSessionRegistration,
     ) -> Result<()> {
@@ -651,23 +651,6 @@ impl WorkerManager {
         }
 
         Some(session)
-    }
-
-    pub(super) fn handle_memory_socket_send(
-        &mut self,
-        payload: crate::ops::MemorySocketSendEvent,
-        _event_tx: &RuntimeEventSender,
-    ) {
-        let crate::ops::MemorySocketSendEvent {
-            reply,
-            handle,
-            binding,
-            key,
-            is_text,
-            message,
-        } = payload;
-        let result = self.send_memory_socket(&binding, &key, &handle, is_text, message);
-        let _ = reply.send(result);
     }
 
     pub(super) fn handle_memory_socket_close(

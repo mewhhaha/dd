@@ -148,7 +148,6 @@ pub enum IsolateEventPayload {
         reply: oneshot::Sender<Result<()>>,
     },
     CacheRevalidate(CacheRevalidatePayload),
-    MemorySocketSend(MemorySocketSendEvent),
     MemorySocketClose(MemorySocketCloseEvent),
     TestAsyncReply(TestAsyncReplyEvent),
 }
@@ -264,7 +263,6 @@ pub(crate) fn runtime_ops() -> Vec<OpDecl> {
         op_async!(op_memory_batch_apply),
         op_async!(op_memory_command_begin),
         op_sync!(op_memory_command_close),
-        op_async!(op_memory_socket_send),
         op_async!(op_memory_socket_close),
         op_sync!(op_memory_socket_list),
         op_sync!(op_emit_completion_ok),

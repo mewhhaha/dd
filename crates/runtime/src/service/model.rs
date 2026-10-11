@@ -644,7 +644,7 @@ impl PendingInvokeQueue {
         }
     }
 
-    pub(super) fn mark_memory_owner_ready(&mut self, owner_key: &str) -> bool {
+    fn mark_memory_owner_ready(&mut self, owner_key: &str) -> bool {
         let Some(keys) = self.by_memory_owner_key.get(owner_key) else {
             return false;
         };
@@ -787,7 +787,7 @@ impl PendingInvokeQueue {
             .map(|enqueued_at| *enqueued_at + max_queue_wait)
     }
 
-    pub(super) fn find_oldest_map<T>(
+    fn find_oldest_map<T>(
         &self,
         lanes: impl IntoIterator<Item = PendingQueueLane>,
         mut map: impl FnMut(PendingQueueKey, &PendingInvoke) -> Option<T>,

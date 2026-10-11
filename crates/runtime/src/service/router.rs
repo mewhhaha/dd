@@ -317,11 +317,7 @@ impl RuntimeAdmission {
         })
     }
 
-    pub(super) fn publish_idle_isolate(
-        &self,
-        worker: &str,
-        candidate: Option<(Instant, String, u64, u64)>,
-    ) {
+    fn publish_idle_isolate(&self, worker: &str, candidate: Option<(Instant, String, u64, u64)>) {
         let mut candidates = self
             .idle_candidates
             .lock()

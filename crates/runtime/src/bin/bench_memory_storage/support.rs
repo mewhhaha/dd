@@ -8,8 +8,7 @@ pub(super) async fn start_service(
     tokio::fs::create_dir_all(&paths.store_dir)
         .await
         .map_err(|error| common::PlatformError::internal(error.to_string()))?;
-    RuntimeService::start_with_service_config(runtime_service_config(runtime, &paths.store_dir))
-        .await
+    RuntimeService::start(runtime_service_config(runtime, &paths.store_dir)).await
 }
 
 pub(super) struct BenchPaths {

@@ -366,10 +366,6 @@ impl JsRuntime {
         }
     }
 
-    pub fn main_context(&self) -> v8::Global<v8::Context> {
-        self.context.clone().expect("runtime context")
-    }
-
     /// The isolate and context, borrowed together for [`scope!`].
     pub fn isolate_and_context(&mut self) -> (&mut v8::OwnedIsolate, &v8::Global<v8::Context>) {
         (

@@ -31,7 +31,7 @@ struct ObjectUrlBlob {
 }
 
 #[derive(Default)]
-pub(crate) struct BlobStore {
+struct BlobStore {
     parts: HashMap<String, Part>,
     object_urls: HashMap<String, ObjectUrlBlob>,
 }

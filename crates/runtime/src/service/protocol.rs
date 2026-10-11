@@ -48,10 +48,7 @@ pub(super) fn memory_handle_key(binding: &str, key: &str, handle: &str) -> Strin
     format!("{}:{binding}{}:{key}{handle}", binding.len(), key.len())
 }
 
-pub(super) fn internal_header_value<'a>(
-    headers: &'a [(String, String)],
-    key: &str,
-) -> Option<&'a str> {
+fn internal_header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))

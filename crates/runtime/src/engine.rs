@@ -115,7 +115,7 @@ pub fn ensure_v8_flags(flags: &[String]) -> Result<()> {
 }
 
 #[cfg(test)]
-pub async fn validate_worker(
+async fn validate_worker(
     bootstrap_snapshot: &'static [u8],
     source: &str,
     allow_code_generation: bool,
@@ -129,7 +129,7 @@ pub async fn validate_worker(
 }
 
 #[cfg(test)]
-pub fn new_runtime_from_snapshot(
+fn new_runtime_from_snapshot(
     startup_snapshot: &'static [u8],
     allow_code_generation: bool,
     module_registry: ModuleRegistry,
@@ -150,7 +150,7 @@ pub fn new_runtime_from_snapshot_with_heap_limit(
     new_runtime(startup_snapshot, policy, max_heap_bytes, module_registry)
 }
 
-pub async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
+async fn load_worker(runtime: &mut JsRuntime, source: &str) -> Result<()> {
     let module_id = evaluate_module(runtime, WORKER_SPECIFIER, source).await?;
     let namespace = runtime.module_namespace(module_id).map_err(runtime_error)?;
     let namespace = {

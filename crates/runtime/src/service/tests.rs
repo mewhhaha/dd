@@ -137,7 +137,7 @@ async fn service_rejects_empty_snapshot_cache_budgets() {
         memory_snapshot_cache_max_entries: 0,
         ..RuntimeStorageConfig::default()
     };
-    let result = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    let result = RuntimeService::start(RuntimeServiceConfig {
         runtime: RuntimeConfig::default(),
         storage,
     })
@@ -764,7 +764,7 @@ export default {
 async fn deployed_workers_reach_no_runtime_internals() {
     // test_service exposes the internals; a default service must not.
     let store = TestStoreDir::new("dd-internals");
-    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    let service = RuntimeService::start(RuntimeServiceConfig {
         runtime: RuntimeConfig::default(),
         storage: RuntimeStorageConfig {
             store_dir: store.path().to_path_buf(),
@@ -4494,7 +4494,7 @@ async fn active_restore_failure_fails_startup_and_records_diagnostic() -> common
     control.insert_deployment(&invalid).await?;
     drop(control);
 
-    let service = crate::RuntimeService::start_with_service_config(crate::RuntimeServiceConfig {
+    let service = crate::RuntimeService::start(crate::RuntimeServiceConfig {
         runtime: crate::RuntimeConfig::default(),
         storage: crate::RuntimeStorageConfig {
             store_dir: root.clone(),

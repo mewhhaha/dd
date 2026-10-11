@@ -406,7 +406,7 @@ async fn run_config_scenario(
     tokio::fs::create_dir_all(&store_dir)
         .await
         .map_err(|error| error.to_string())?;
-    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    let service = RuntimeService::start(RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),

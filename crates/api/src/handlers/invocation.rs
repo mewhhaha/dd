@@ -325,7 +325,7 @@ mod cache_activation_tests {
     #[serial]
     async fn cache_fill_racing_with_rollback_cannot_poison_the_reactivated_deployment() {
         let root = std::env::temp_dir().join(format!("dd-cache-rollback-{}", Uuid::new_v4()));
-        let runtime = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+        let runtime = RuntimeService::start(RuntimeServiceConfig {
             storage: RuntimeStorageConfig {
                 store_dir: root.clone(),
                 worker_store_enabled: true,

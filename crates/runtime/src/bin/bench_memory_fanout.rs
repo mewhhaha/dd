@@ -489,7 +489,7 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
     });
     let started = Instant::now();
     eprintln!("fanout-phase=startup");
-    let service = RuntimeService::start_with_service_config(service_config.clone())
+    let service = RuntimeService::start(service_config.clone())
         .await
         .map_err(|error| format!("startup failed: {error}"))?;
     timings.insert(
@@ -638,7 +638,7 @@ async fn run(config: &Config, store_dir: &Path) -> Result<Value, String> {
     };
     let started = Instant::now();
     eprintln!("fanout-phase=reopen");
-    let reopened = RuntimeService::start_with_service_config(service_config)
+    let reopened = RuntimeService::start(service_config)
         .await
         .map_err(|error| format!("reopen failed: {error}"))?;
     timings.insert(

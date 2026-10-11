@@ -201,7 +201,7 @@ fn is_ascii_whitespace(byte: u8) -> bool {
 }
 
 /// <https://infra.spec.whatwg.org/#forgiving-base64-decode>
-pub(super) fn forgiving_base64_decode(input: &str) -> Result<Vec<u8>, OpError> {
+fn forgiving_base64_decode(input: &str) -> Result<Vec<u8>, OpError> {
     let invalid = || OpError::new("Failed to decode base64");
     let mut data = input
         .bytes()

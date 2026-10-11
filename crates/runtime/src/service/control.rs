@@ -142,7 +142,6 @@ pub(super) enum RuntimeEvent {
         generation: u64,
         payload: CacheRevalidatePayload,
     },
-    MemorySocketSend(crate::ops::MemorySocketSendEvent),
     MemorySocketClose(crate::ops::MemorySocketCloseEvent),
     TestAsyncReply(crate::ops::TestAsyncReplyEvent),
     TestAsyncReplyComplete {
@@ -643,9 +642,6 @@ impl WorkerManager {
                 payload,
             } => {
                 self.schedule_cache_revalidate(&worker_name, generation, payload, event_tx);
-            }
-            RuntimeEvent::MemorySocketSend(payload) => {
-                self.handle_memory_socket_send(payload, event_tx);
             }
             RuntimeEvent::MemorySocketClose(payload) => {
                 self.handle_memory_socket_close(payload, event_tx);

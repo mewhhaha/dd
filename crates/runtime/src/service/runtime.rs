@@ -591,7 +591,7 @@ async fn flush_pending_isolate_events(
     }
 }
 
-pub(super) fn runtime_event_from_isolate_payload(
+fn runtime_event_from_isolate_payload(
     worker_name: &str,
     generation: u64,
     isolate_id: u64,
@@ -652,7 +652,6 @@ pub(super) fn runtime_event_from_isolate_payload(
             generation,
             payload,
         },
-        IsolateEventPayload::MemorySocketSend(payload) => RuntimeEvent::MemorySocketSend(payload),
         IsolateEventPayload::MemorySocketClose(payload) => RuntimeEvent::MemorySocketClose(payload),
         IsolateEventPayload::TestAsyncReply(payload) => RuntimeEvent::TestAsyncReply(payload),
     }
@@ -962,7 +961,7 @@ pub(super) fn spawn_isolate_thread(start: IsolateThreadStart) -> Result<IsolateH
     })
 }
 
-pub(super) async fn handle_isolate_command(
+async fn handle_isolate_command(
     js_runtime: &mut dd_v8::JsRuntime,
     event_tx: &RuntimeEventSender,
     worker_name: &str,

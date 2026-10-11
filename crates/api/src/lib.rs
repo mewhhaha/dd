@@ -102,7 +102,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         limits.max_buffered_control_body_bytes,
         limits.control_body_timeout,
     )?;
-    let runtime = RuntimeService::start_with_service_config(runtime).await?;
+    let runtime = RuntimeService::start(runtime).await?;
     let deploy_tokens = DeployTokenStore::from_control_store(runtime.control_store());
     let mut state = AppState::new(
         runtime,

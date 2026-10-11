@@ -181,7 +181,7 @@ async fn main() -> Result<(), String> {
     }
 
     let store_dir = std::env::temp_dir().join(format!("dd-dev-runtime-{}", Uuid::new_v4()));
-    let service = RuntimeService::start_with_service_config(RuntimeServiceConfig {
+    let service = RuntimeService::start(RuntimeServiceConfig {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),

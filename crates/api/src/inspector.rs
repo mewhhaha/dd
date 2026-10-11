@@ -380,7 +380,7 @@ mod tests {
     #[serial_test::serial]
     async fn devtools_pauses_a_request_at_a_breakpoint() {
         let store_dir = std::env::temp_dir().join(format!("dd-inspector-{}", Uuid::new_v4()));
-        let runtime = RuntimeService::start_with_service_config(runtime::RuntimeServiceConfig {
+        let runtime = RuntimeService::start(runtime::RuntimeServiceConfig {
             runtime: runtime::RuntimeConfig {
                 inspector: runtime::InspectorMode::On,
                 max_isolates: 1,
