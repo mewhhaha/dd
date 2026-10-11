@@ -153,6 +153,60 @@ export default {
     service.shutdown().await.expect("runtime shuts down");
 }
 
+/// Worker objects customize their console output the way npm packages do for
+/// Node, through `util.inspect.custom`; Deno's symbol is no hook.
+#[tokio::test]
+#[serial]
+async fn worker_objects_customize_inspection_through_nodes_symbol() {
+    let service = test_service(RuntimeConfig::default()).await;
+    let mut console = service.subscribe_console();
+    service
+        .deploy(
+            "custom-inspect".into(),
+            r#"
+const custom = Symbol.for("nodejs.util.inspect.custom");
+class Money {
+  constructor(cents) { this.cents = cents; }
+  [custom](depth, options, inspect) {
+    return `Money<${inspect(this.cents / 100, options)}>`;
+  }
+}
+const depthOf = { [custom](depth) { return `depth ${depth}`; } };
+export default {
+  fetch() {
+    console.log(new Money(1250), { nested: new Money(5) });
+    console.log(depthOf, [depthOf]);
+    console.log({ [custom]() { return { replaced: true }; } });
+    console.log({ plain: 1, [Symbol.for("Deno.customInspect")]() { return "deno"; } });
+    return new Response("ok");
+  },
+};
+"#
+            .into(),
+        )
+        .await
+        .expect("worker deploys");
+    let output = service
+        .invoke("custom-inspect".into(), test_invocation())
+        .await
+        .expect("worker responds");
+    assert_eq!(output.body, b"ok");
+    let mut messages = Vec::new();
+    while let Ok(Ok(line)) = timeout(Duration::from_millis(500), console.recv()).await {
+        messages.push(line.message);
+    }
+    assert_eq!(
+        messages,
+        [
+            "Money<12.5> { nested: Money<0.05> }",
+            "depth 4 [ depth 3 ]",
+            "{ replaced: true }",
+            "{ plain: 1, [Symbol(Deno.customInspect)]: [Function: [Deno.customInspect]] }",
+        ]
+    );
+    service.shutdown().await.expect("runtime shuts down");
+}
+
 #[tokio::test]
 #[serial]
 async fn worker_console_prints_huge_arrays_without_listing_every_index() {

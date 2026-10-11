@@ -85,10 +85,10 @@ const { op_own_non_index_keys, op_promise_state, op_proxy_details } = core.ops;
 const TABLE_MAX_ROWS = 1000;
 
 // The web classes' own inspect hook. It is not in the global symbol registry,
-// so it is no hook for worker code, which customizes inspection through the
-// public symbols below.
+// so it is no hook for worker code, which customizes inspection the way npm
+// packages do for Node: through util.inspect.custom, the registry symbol
+// below.
 const privateCustomInspect = Symbol("dd.privateCustomInspect");
-const denoCustomInspect = SymbolFor("Deno.customInspect");
 const nodeCustomInspect = SymbolFor("nodejs.util.inspect.custom");
 
 const DEFAULT_OPTIONS = {
@@ -228,10 +228,6 @@ function customInspection(ctx, value, recurseTimes) {
   let inspector;
   try {
     inspector = value[privateCustomInspect];
-    if (typeof inspector === "function") {
-      return ReflectApply(inspector, value, [inspect, inspectOptions(ctx, recurseTimes)]);
-    }
-    inspector = value[denoCustomInspect];
     if (typeof inspector === "function") {
       return ReflectApply(inspector, value, [inspect, inspectOptions(ctx, recurseTimes)]);
     }

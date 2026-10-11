@@ -242,8 +242,9 @@ added to `Object.prototype`, values the worker hands over) is listed at the top
 of `execute_worker/core.js`.
 
 Worker `console` output is formatted in JavaScript (`js/web/console.js`, the
-Node/Deno `util.inspect` conventions) and handed to the host one call at a
-time. The host logs it as a `dd::worker` tracing event carrying the worker
+Node/Deno `util.inspect` conventions; objects customize theirs through Node's
+`Symbol.for("nodejs.util.inspect.custom")`) and handed to the host one call at
+a time. The host logs it as a `dd::worker` tracing event carrying the worker
 name and runtime request id, cut at 16 KiB, and passes it to
 `RuntimeService::subscribe_console` subscribers. The development runtime
 forwards those as `{"event":"console",...}` lines, which dd-vite prints
