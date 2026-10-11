@@ -21,7 +21,6 @@ jobs:
         with:
           toolchain: 1.99.0
           components: clippy,rustfmt
-      - uses: extractions/setup-just@v4
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/check_public_memory_naming.sh
       - run: cargo fmt --all -- --check
@@ -49,6 +48,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
+      - uses: extractions/setup-just@v4
       - uses: Swatinem/rust-cache@v2
       - name: Read the WPT pin
         id: wpt-pin
@@ -59,9 +59,7 @@ jobs:
         with:
           path: .cache/wpt
           key: wpt-${{ steps.wpt-pin.outputs.sha }}-${{ hashFiles('scripts/wpt/fetch.sh') }}
-      - run: bash scripts/wpt/fetch.sh
-      - run: cargo build --locked -p runtime --bin wpt
-      - run: target/debug/wpt
+      - run: just wpt
 
   javascript:
     runs-on: ubuntu-latest

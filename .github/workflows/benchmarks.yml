@@ -25,15 +25,16 @@ jobs:
     env:
       DD_BENCH_SAMPLES: ${{ inputs.samples || '3' }}
       DD_BENCH_ALLOW_LARGE_RUN: ${{ inputs.allow_large_run || 'false' }}
+      DD_BENCH_MATRIX_ISOLATES: "1 8"
+      DD_BENCH_MATRIX_KEY_MODES: "same-shard cross-shard"
+      DD_BENCH_MATRIX_MODES: "atomic-write-only-memory-wide atomic-readwrite-memory-wide"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: pnpm/action-setup@v4
+        with:
+          toolchain: 1.99.0
       - name: Plan benchmark smoke matrix
         run: |
-          DD_BENCH_MATRIX_ISOLATES="1 8" \
-          DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
-          DD_BENCH_MATRIX_MODES="atomic-write-only-memory-wide atomic-readwrite-memory-wide" \
           node benchmarks/run.mjs --plan --samples "$DD_BENCH_SAMPLES" \
             --config scaling-atomic-memory-matrix.sh
       - name: Run benchmark smoke matrix
@@ -42,9 +43,6 @@ jobs:
           if [ "$DD_BENCH_ALLOW_LARGE_RUN" = "true" ]; then
             extra_flags+=(--allow-large-run)
           fi
-          DD_BENCH_MATRIX_ISOLATES="1 8" \
-          DD_BENCH_MATRIX_KEY_MODES="same-shard cross-shard" \
-          DD_BENCH_MATRIX_MODES="atomic-write-only-memory-wide atomic-readwrite-memory-wide" \
           node benchmarks/run.mjs --samples "$DD_BENCH_SAMPLES" \
             --config scaling-atomic-memory-matrix.sh \
             --out benchmarks/results/memory-smoke.json \
