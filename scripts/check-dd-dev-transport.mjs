@@ -105,7 +105,7 @@ try {
     { op: "deploy", name, source, config: { public: "invalid" } },
   ]) {
     await Promise.all([
-      assert.rejects(runtime.request(command, { timeoutMs: 1_000 }), error => error.kind === "bad_request"),
+      assert.rejects(runtime.request(command, { timeoutMs: 1_000 }), error => error.code === "invalid_request"),
       runtime.stats(name).then(({ stats }) => assert(stats, "invalid commands must preserve other pending requests")),
     ]);
     assert.equal(runtime.generation, generation, "validation errors must not restart the native runtime");

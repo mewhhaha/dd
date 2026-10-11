@@ -1,4 +1,4 @@
-use common::{DeployConfig, ErrorKind, PlatformError};
+use common::{DeployConfig, ErrorBody, PlatformError};
 use runtime::{
     InspectorMode, RuntimeConfig, RuntimeService, RuntimeServiceConfig, RuntimeStorageConfig,
     WorkerConsoleLine, WorkerStats,
@@ -34,20 +34,37 @@ enum DevCommand {
     Shutdown,
 }
 
+/// A command's answer, correlated by `id`: `{"id", "ok": true, "result"}`,
+/// or the id alongside the error body the HTTP API answers with.
 #[derive(Debug, Serialize)]
-struct ResponseEnvelope<T: Serialize> {
-    id: String,
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<ErrorEnvelope>,
+#[serde(untagged)]
+enum Response {
+    Ok {
+        id: String,
+        ok: bool,
+        result: CommandResult,
+    },
+    Err {
+        id: String,
+        #[serde(flatten)]
+        error: ErrorBody,
+    },
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorEnvelope {
-    kind: &'static str,
-    message: String,
+impl Response {
+    fn new(id: String, result: common::Result<CommandResult>) -> Self {
+        match result {
+            Ok(result) => Self::Ok {
+                id,
+                ok: true,
+                result,
+            },
+            Err(error) => Self::Err {
+                id,
+                error: ErrorBody::from_error(&error),
+            },
+        }
+    }
 }
 
 /// A worker console call, written as `{"event":"console", ...}` so the
@@ -76,7 +93,7 @@ struct InspectorEvent {
 }
 
 enum Outgoing {
-    Response(ResponseEnvelope<CommandResult>),
+    Response(Response),
     Console(ConsoleEvent),
     #[cfg_attr(not(feature = "websocket"), allow(dead_code))]
     Inspector(InspectorEvent),
@@ -185,12 +202,8 @@ async fn main() -> Result<(), String> {
         runtime,
         storage: RuntimeStorageConfig {
             store_dir: store_dir.clone(),
-            memory_outbox_max_concurrent_shards: 8,
-            memory_outbox_max_claimed_bytes: RuntimeStorageConfig::default()
-                .memory_outbox_max_claimed_bytes,
-            memory_snapshot_cache_max_entries: 4096,
-            memory_snapshot_cache_max_bytes: 64 * 1024 * 1024,
             worker_store_enabled: false,
+            ..RuntimeStorageConfig::default()
         },
     })
     .await
@@ -351,7 +364,13 @@ async fn run_stdio(
             let (line, is_shutdown) = match outgoing {
                 Outgoing::Response(response) => (
                     serde_json::to_string(&response),
-                    matches!(response.result, Some(CommandResult::Shutdown)),
+                    matches!(
+                        response,
+                        Response::Ok {
+                            result: CommandResult::Shutdown,
+                            ..
+                        }
+                    ),
                 ),
                 Outgoing::Console(event) => (serde_json::to_string(&event), false),
                 Outgoing::Inspector(event) => (serde_json::to_string(&event), false),
@@ -403,23 +422,21 @@ async fn run_stdio(
                 }
             }
             Err(error) => {
-                let response = ResponseEnvelope {
-                    id: serde_json::from_str::<serde_json::Value>(&line)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned)
-                        })
-                        .unwrap_or_default(),
-                    ok: false,
-                    result: None,
-                    error: Some(ErrorEnvelope {
-                        kind: "bad_request",
-                        message: format!("invalid command JSON: {error}"),
-                    }),
-                };
+                let id = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                let response = Response::new(
+                    id,
+                    Err(PlatformError::bad_request(format!(
+                        "invalid command JSON: {error}"
+                    ))),
+                );
                 if response_tx
                     .send(Outgoing::Response(response))
                     .await
@@ -444,7 +461,7 @@ async fn handle_command(
     listeners: &mut HashMap<String, SocketAddr>,
     servers: &mut JoinSet<common::Result<()>>,
     request: RequestEnvelope,
-) -> ResponseEnvelope<CommandResult> {
+) -> Response {
     let id = request.id;
     let result: common::Result<CommandResult> = match request.command {
         DevCommand::Deploy {
@@ -495,35 +512,5 @@ async fn handle_command(
         DevCommand::Shutdown => Ok(CommandResult::Shutdown),
     };
 
-    match result {
-        Ok(result) => ResponseEnvelope {
-            id,
-            ok: true,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => ResponseEnvelope {
-            id,
-            ok: false,
-            result: None,
-            error: Some(ErrorEnvelope {
-                kind: error_kind(error.kind()),
-                message: error.to_string(),
-            }),
-        },
-    }
-}
-
-fn error_kind(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::Unauthorized => "unauthorized",
-        ErrorKind::Forbidden => "forbidden",
-        ErrorKind::Conflict => "conflict",
-        ErrorKind::BadRequest => "bad_request",
-        ErrorKind::NotFound => "not_found",
-        ErrorKind::Overloaded => "overloaded",
-        ErrorKind::StorageUnavailable => "storage_unavailable",
-        ErrorKind::Runtime => "runtime",
-        ErrorKind::Internal => "internal",
-    }
+    Response::new(id, result)
 }

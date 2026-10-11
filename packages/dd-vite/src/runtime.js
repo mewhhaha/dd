@@ -300,8 +300,8 @@ export class DdRuntimeClient {
     if (message.ok) {
       pending.resolve(message.result);
     } else {
-      const error = new Error(message.error?.message ?? "dd runtime command failed");
-      error.kind = message.error?.kind;
+      const error = new Error(message.error ?? "dd runtime command failed");
+      error.code = message.code;
       pending.reject(error);
     }
   }
