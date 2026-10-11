@@ -2273,6 +2273,51 @@ async fn crypto_globals_work_in_a_worker() {
     assert_eq!(payload.uuid.len(), 36, "uuid should be canonical v4 length");
 }
 
+/// The global scope is no EventTarget, so nothing can handle an exception
+/// that `reportError` or a throwing event listener reports: it fails the
+/// request with that exception, as an unhandled rejection does.
+#[tokio::test]
+#[serial]
+async fn reported_exceptions_fail_the_request_with_their_own_error() {
+    let service = test_service(RuntimeConfig::default()).await;
+    service
+        .deploy(
+            "reporter".to_string(),
+            r#"
+export default {
+  async fetch(request) {
+    if (new URL(request.url).pathname === "/listener") {
+      const target = new EventTarget();
+      target.addEventListener("ping", () => { throw new Error("the listener threw"); });
+      target.dispatchEvent(new Event("ping"));
+    } else {
+      reportError(new Error("the worker reported this"));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return new Response("the exception went unreported");
+  },
+};
+"#
+            .to_string(),
+        )
+        .await
+        .expect("deploy should succeed");
+
+    for (path, message) in [
+        ("/report", "the worker reported this"),
+        ("/listener", "the listener threw"),
+    ] {
+        let error = service
+            .invoke(
+                "reporter".to_string(),
+                test_invocation_with_path(path, "reporter"),
+            )
+            .await
+            .expect_err("a reported exception should fail the request");
+        assert!(error.to_string().contains(message), "{path}: {error}");
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn concurrent_kv_reads_match_sequential_reads_and_preserve_duplicates() {

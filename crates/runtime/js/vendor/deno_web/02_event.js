@@ -6,7 +6,7 @@
 // and impossible logic branches based on what Deno currently supports.
 
 return (function () {
-const { core, internals, primordials } = __bootstrap;
+const { core, primordials } = __bootstrap;
 const {
   ArrayPrototypeIncludes,
   ArrayPrototypeIndexOf,
@@ -32,12 +32,12 @@ const {
   SafeArrayIterator,
   SafeMap,
   String,
-  StringPrototypeStartsWith,
   Symbol,
   SymbolFor,
   SymbolIterator,
   SymbolToStringTag,
   TypeError,
+  globalThis,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:deno_webidl/00_webidl.js");
@@ -53,14 +53,6 @@ function getCreateFilteredInspectProxy() {
     ).createFilteredInspectProxy;
   }
   return _createFilteredInspectProxy;
-}
-
-// This should be set via setGlobalThis this is required so that if even
-// user deletes globalThis it is still usable
-let globalThis_;
-
-function saveGlobalThisReference(val) {
-  globalThis_ = val;
 }
 
 // accessors for non runtime visible data
@@ -754,10 +746,7 @@ function innerInvokeEventListeners(
   for (let i = 0; i < handlersLength; i++) {
     const listener = handlers[i];
 
-    if (
-      getStopImmediatePropagation(eventImpl) &&
-      !listener.options[kResistStopImmediatePropagation]
-    ) {
+    if (getStopImmediatePropagation(eventImpl)) {
       continue;
     }
 
@@ -915,13 +904,6 @@ function retarget(a, b) {
 // Accessors for non-public data
 
 const eventTargetData = Symbol();
-const kResistStopImmediatePropagation = Symbol(
-  "kResistStopImmediatePropagation",
-);
-
-function setEventTargetData(target) {
-  target[eventTargetData] = getDefaultTargetData();
-}
 
 function getAssignedSlot(target) {
   return Boolean(target?.[eventTargetData]?.assignedSlot);
@@ -966,10 +948,6 @@ function addEventListenerOptionsConverter(V, prefix) {
     capture: !!V.capture,
     once: !!V.once,
     passive: !!V.passive,
-    // This field exists for simulating Node.js behavior, implemented in https://github.com/nodejs/node/commit/bcd35c334ec75402ee081f1c4da128c339f70c24
-    // Some internal event listeners in Node.js can ignore `e.stopImmediatePropagation()` calls
-    // from the earlier event listeners.
-    [kResistStopImmediatePropagation]: !!V[kResistStopImmediatePropagation],
   };
 
   const signal = V.signal;
@@ -986,8 +964,7 @@ function addEventListenerOptionsConverter(V, prefix) {
 
 class EventTarget {
   constructor() {
-    // eventTargetData is allocated lazily on first addEventListener (or via
-    // setEventTargetData for objects built with webidl.createBranded). Most
+    // eventTargetData is allocated lazily on first addEventListener. Most
     // short-lived EventTarget instances created on the request/response hot
     // path (AbortSignal, transient streams) never have a listener attached
     // and never need the listeners map / 5-field default object.
@@ -999,8 +976,7 @@ class EventTarget {
     callback,
     options,
   ) {
-    const self = this ?? globalThis_;
-    webidl.assertBranded(self, EventTargetPrototype);
+    webidl.assertBranded(this, EventTargetPrototype);
     const prefix = "Failed to execute 'addEventListener' on 'EventTarget'";
 
     webidl.requiredArguments(arguments.length, 2, prefix);
@@ -1011,9 +987,9 @@ class EventTarget {
       return;
     }
 
-    let data = self[eventTargetData];
+    let data = this[eventTargetData];
     if (data === undefined) {
-      data = self[eventTargetData] = getDefaultTargetData();
+      data = this[eventTargetData] = getDefaultTargetData();
     }
     const { listeners } = data;
 
@@ -1045,7 +1021,7 @@ class EventTarget {
         // If listener's signal is not null, then add the following abort
         // abort steps to it: Remove an event listener.
         abortListener = () => {
-          self.removeEventListener(type, callback, options);
+          this.removeEventListener(type, callback, options);
         };
         signal.addEventListener("abort", abortListener);
       }
@@ -1064,15 +1040,14 @@ class EventTarget {
     callback,
     options,
   ) {
-    const self = this ?? globalThis_;
-    webidl.assertBranded(self, EventTargetPrototype);
+    webidl.assertBranded(this, EventTargetPrototype);
     webidl.requiredArguments(
       arguments.length,
       2,
       "Failed to execute 'removeEventListener' on 'EventTarget'",
     );
 
-    const data = self[eventTargetData];
+    const data = this[eventTargetData];
     if (data === undefined || callback === null || !data.listeners[type]) {
       return;
     }
@@ -1096,28 +1071,14 @@ class EventTarget {
   }
 
   dispatchEvent(event) {
-    // If `this` is not present, then fallback to global scope. We don't use
-    // `globalThis` directly here, because it could be deleted by user.
-    // Instead use saved reference to global scope when the script was
-    // executed.
-    const self = this ?? globalThis_;
-    webidl.assertBranded(self, EventTargetPrototype);
+    webidl.assertBranded(this, EventTargetPrototype);
     webidl.requiredArguments(
       arguments.length,
       1,
       "Failed to execute 'dispatchEvent' on 'EventTarget'",
     );
 
-    // This is an optimization to avoid creating an event listener
-    // on each startup.
-    // Stores the flag for checking whether unload is dispatched or not.
-    // This prevents the recursive dispatches of unload events.
-    // See https://github.com/denoland/deno/issues/9201.
-    if (event.type === "unload" && self === globalThis_) {
-      globalThis_[SymbolFor("Deno.isUnloadDispatched")] = true;
-    }
-
-    const data = self[eventTargetData];
+    const data = this[eventTargetData];
     if (data === undefined || !data.listeners[event.type]) {
       setTarget(event, this);
       return true;
@@ -1131,7 +1092,7 @@ class EventTarget {
       throw new DOMException("Invalid event state", "InvalidStateError");
     }
 
-    return dispatch(self, event);
+    return dispatch(this, event);
   }
 
   getParent(_event) {
@@ -1643,88 +1604,36 @@ function defineEventHandler(
   });
 }
 
-let reportExceptionStackedCalls = 0;
-
 // https://html.spec.whatwg.org/#report-the-exception
+// dd's global scope is no EventTarget, so there is no error event to fire
+// and nothing can handle the exception: it is reported as one nothing
+// handled, which ends the event loop as an unhandled rejection does.
 function reportException(error) {
-  reportExceptionStackedCalls++;
-  const jsError = core.destructureError(error);
-  const message = jsError.exceptionMessage;
-  let filename = "";
-  let lineno = 0;
-  let colno = 0;
-  if (jsError.frames.length > 0) {
-    filename = jsError.frames[0].fileName;
-    lineno = jsError.frames[0].lineNumber;
-    colno = jsError.frames[0].columnNumber;
-  } else {
-    const jsError = core.destructureError(new Error());
-    const frames = jsError.frames;
-    for (let i = 0; i < frames.length; ++i) {
-      const frame = frames[i];
-      if (
-        typeof frame.fileName == "string" &&
-        !StringPrototypeStartsWith(frame.fileName, "ext:")
-      ) {
-        filename = frame.fileName;
-        lineno = frame.lineNumber;
-        colno = frame.columnNumber;
-        break;
-      }
-    }
-  }
-  const event = new ErrorEvent("error", {
-    cancelable: true,
-    message,
-    filename,
-    lineno,
-    colno,
-    error,
-  });
-  // Avoid recursing `reportException()` via error handlers more than once.
-  if (reportExceptionStackedCalls > 1 || globalThis_.dispatchEvent(event)) {
-    core.reportUnhandledException(error);
-  }
-  reportExceptionStackedCalls--;
-}
-
-function checkThis(thisArg) {
-  if (thisArg !== null && thisArg !== undefined && thisArg !== globalThis_) {
-    throw new TypeError("Illegal invocation");
-  }
+  core.reportUnhandledException(error);
 }
 
 // https://html.spec.whatwg.org/#dom-reporterror
 function reportError(error) {
-  checkThis(this);
+  if (this !== null && this !== undefined && this !== globalThis) {
+    throw new TypeError("Illegal invocation");
+  }
   const prefix = "Failed to execute 'reportError'";
   webidl.requiredArguments(arguments.length, 1, prefix);
   reportException(error);
 }
 
-internals.defineEventHandler = defineEventHandler;
-internals.setEventTargetData = setEventTargetData;
-
 return {
   CloseEvent,
   CustomEvent,
   defineEventHandler,
-  dispatch,
   ErrorEvent,
   Event,
-  eventTargetData,
   EventTarget,
-  EventTargetPrototype,
-  kResistStopImmediatePropagation,
   listenerCount,
   MessageEvent,
   ProgressEvent,
   PromiseRejectionEvent,
   reportError,
-  reportException,
-  saveGlobalThisReference,
-  setEventTargetData,
   setIsTrusted,
-  setTarget,
 };
 })();
