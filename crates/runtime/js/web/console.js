@@ -1,9 +1,9 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
 // dd's console and value inspector. Formats values the way Node and Deno do
-// and hands each console call to the runtime as one message. The web layer
-// loads this as Deno's console module: its classes inspect themselves through
-// createFilteredInspectProxy and the `inspect` they are handed.
+// and hands each console call to the runtime as one message. The web layer's
+// classes inspect themselves through the privateCustomInspect symbol exported
+// here, createFilteredInspectProxy, and the `inspect` they are handed.
 //
 // Everything here runs on primordials and op-backed type checks, so worker
 // code that replaces globals or prototype methods cannot change what is
@@ -70,6 +70,7 @@ const {
   StringPrototypeSlice,
   StringPrototypeStartsWith,
   StringPrototypeValueOf,
+  Symbol,
   SymbolFor,
   SymbolPrototypeToString,
   SymbolPrototypeValueOf,
@@ -83,7 +84,10 @@ const { op_own_non_index_keys, op_promise_state, op_proxy_details } = core.ops;
 // console.table prints at most this many rows of an array.
 const TABLE_MAX_ROWS = 1000;
 
-const privateCustomInspect = SymbolFor("Deno.privateCustomInspect");
+// The web classes' own inspect hook. It is not in the global symbol registry,
+// so it is no hook for worker code, which customizes inspection through the
+// public symbols below.
+const privateCustomInspect = Symbol("dd.privateCustomInspect");
 const denoCustomInspect = SymbolFor("Deno.customInspect");
 const nodeCustomInspect = SymbolFor("nodejs.util.inspect.custom");
 
@@ -1034,5 +1038,5 @@ function createFilteredInspectProxy({ object, keys, evaluate }) {
   }
 }
 
-return { createConsole, createFilteredInspectProxy };
+return { createConsole, createFilteredInspectProxy, privateCustomInspect };
 })();

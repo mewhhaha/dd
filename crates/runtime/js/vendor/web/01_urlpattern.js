@@ -18,23 +18,16 @@ const {
   SafeRegExp,
   StringPrototypeSlice,
   Symbol,
-  SymbolFor,
   TypeError,
   Uint32Array,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 
-// Lazy-load createFilteredInspectProxy from console
-let _createFilteredInspectProxy;
-function getCreateFilteredInspectProxy() {
-  if (!_createFilteredInspectProxy) {
-    _createFilteredInspectProxy = core.loadExtScript(
-      "ext:web/console.js",
-    ).createFilteredInspectProxy;
-  }
-  return _createFilteredInspectProxy;
-}
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 
 const _components = Symbol("components");
 
@@ -418,9 +411,9 @@ class URLPattern {
     return result;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(URLPatternPrototype, this),
         keys: [

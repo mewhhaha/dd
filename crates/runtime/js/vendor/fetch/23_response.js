@@ -3,9 +3,10 @@
 return (function () {
 const { core, primordials } = __bootstrap;
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 const {
   byteLowerCase,
   HTTP_TAB_OR_SPACE,
@@ -34,7 +35,6 @@ const {
   SafeArrayIterator,
   SafeRegExp,
   Symbol,
-  SymbolFor,
   SymbolIterator,
   TypeError,
   TypedArrayPrototypeGetSymbolToStringTag,
@@ -585,7 +585,7 @@ class Response {
     return second;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,

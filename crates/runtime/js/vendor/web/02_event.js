@@ -33,7 +33,6 @@ const {
   SafeMap,
   String,
   Symbol,
-  SymbolFor,
   SymbolIterator,
   SymbolToStringTag,
   TypeError,
@@ -43,17 +42,10 @@ const {
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
 
-// Lazy-load createFilteredInspectProxy from console to avoid
-// circular dependency at load time. Only needed for custom inspect.
-let _createFilteredInspectProxy;
-function getCreateFilteredInspectProxy() {
-  if (!_createFilteredInspectProxy) {
-    _createFilteredInspectProxy = core.loadExtScript(
-      "ext:web/console.js",
-    ).createFilteredInspectProxy;
-  }
-  return _createFilteredInspectProxy;
-}
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 
 // accessors for non runtime visible data
 
@@ -164,9 +156,9 @@ class Event {
     };
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(EventPrototype, this),
         keys: EVENT_PROPS,
@@ -1099,7 +1091,7 @@ class EventTarget {
     return null;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return `${this.constructor.name} ${inspect({}, inspectOptions)}`;
   }
 }
@@ -1162,9 +1154,9 @@ class ErrorEvent extends Event {
     this.#error = error;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(ErrorEventPrototype, this),
         keys: [
@@ -1228,9 +1220,9 @@ class CloseEvent extends Event {
     this.#reason = reason;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(CloseEventPrototype, this),
         keys: [
@@ -1362,9 +1354,9 @@ class MessageEvent extends Event {
     }
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(MessageEventPrototype, this),
         keys: [
@@ -1402,9 +1394,9 @@ class CustomEvent extends Event {
     return this.#detail;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(CustomEventPrototype, this),
         keys: [
@@ -1438,9 +1430,9 @@ class ProgressEvent extends Event {
     this.total = eventInitDict?.total ?? 0;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(ProgressEventPrototype, this),
         keys: [
@@ -1491,9 +1483,9 @@ class PromiseRejectionEvent extends Event {
     this.#reason = reason;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(
           PromiseRejectionEventPrototype,

@@ -70,7 +70,6 @@ const {
   StringPrototypeToLowerCase,
   StringPrototypeToUpperCase,
   Symbol,
-  SymbolFor,
   SyntaxError,
   TypeError,
   TypedArrayPrototypeGetBuffer,
@@ -84,9 +83,10 @@ const {
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
 
 const supportedNamedCurves = ["P-256", "P-384", "P-521"];
@@ -397,7 +397,7 @@ class CryptoKey {
     return this[_algorithm];
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -1721,7 +1721,7 @@ class SubtleCrypto {
     return result;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return `${this.constructor.name} ${inspect({}, inspectOptions)}`;
   }
 }
@@ -5409,7 +5409,7 @@ class Crypto {
     return subtle;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,

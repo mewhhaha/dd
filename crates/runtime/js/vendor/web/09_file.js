@@ -39,7 +39,6 @@ const {
   StringPrototypeSlice,
   StringPrototypeToLowerCase,
   Symbol,
-  SymbolFor,
   TypeError,
   TypedArrayPrototypeGetBuffer,
   TypedArrayPrototypeGetByteLength,
@@ -72,9 +71,10 @@ function TextDecoderStream(...args) {
   );
 }
 const { URL } = core.loadExtScript("ext:vendor/web/00_url.js");
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 
 // TODO(lucacasonato): this needs to not be hardcoded and instead depend on
 // host os.
@@ -438,7 +438,7 @@ class Blob {
     return await this.#u8Array(this.size);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -557,7 +557,7 @@ class File extends Blob {
     return this[_LastModified];
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,

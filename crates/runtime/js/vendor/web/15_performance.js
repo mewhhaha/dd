@@ -10,7 +10,6 @@ const {
   ObjectPrototypeIsPrototypeOf,
   ReflectHas,
   Symbol,
-  SymbolFor,
   TypeError,
 } = primordials;
 
@@ -27,16 +26,10 @@ function getStructuredClone() {
   return _structuredClone;
 }
 
-// Lazy-load createFilteredInspectProxy from console
-let _createFilteredInspectProxy;
-function getCreateFilteredInspectProxy() {
-  if (!_createFilteredInspectProxy) {
-    _createFilteredInspectProxy = core.loadExtScript(
-      "ext:web/console.js",
-    ).createFilteredInspectProxy;
-  }
-  return _createFilteredInspectProxy;
-}
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 
 const { EventTarget } = core.loadExtScript("ext:vendor/web/02_event.js");
 const { DOMException } = core.loadExtScript("ext:vendor/web/01_dom_exception.js");
@@ -215,9 +208,9 @@ class PerformanceEntry {
     };
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(
           PerformanceEntryPrototype,
@@ -289,9 +282,9 @@ class PerformanceMark extends PerformanceEntry {
     };
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(PerformanceMarkPrototype, this),
         keys: [
@@ -348,9 +341,9 @@ class PerformanceMeasure extends PerformanceEntry {
     };
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(
           PerformanceMeasurePrototype,
@@ -609,9 +602,9 @@ class Performance extends EventTarget {
     };
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(PerformancePrototype, this),
         keys: ["timeOrigin"],

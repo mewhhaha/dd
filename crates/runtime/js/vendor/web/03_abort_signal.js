@@ -13,16 +13,16 @@ const {
   SetPrototypeAdd,
   SetPrototypeDelete,
   Symbol,
-  SymbolFor,
   TypeError,
   WeakRefPrototypeDeref,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 const { assert } = core.loadExtScript("ext:vendor/web/00_infra.js");
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 const {
   defineEventHandler,
   Event,
@@ -236,7 +236,7 @@ class AbortSignal extends EventTarget {
     }
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -273,7 +273,7 @@ class AbortController {
     this[signal][signalAbort](reason);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,

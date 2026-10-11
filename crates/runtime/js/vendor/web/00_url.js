@@ -34,9 +34,10 @@ const {
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 
 const _list = Symbol("list");
 const _urlObject = Symbol("url object");
@@ -412,17 +413,17 @@ class URLSearchParams {
   // Node exposes this as a method on URLSearchParams.prototype so that
   // `Object.getOwnPropertyDescriptor(URLSearchParams.prototype,
   // Symbol.for("nodejs.util.inspect.custom"))` is not undefined. We delegate
-  // to Deno's `privateCustomInspect` to preserve the Map-like formatting
+  // to `privateCustomInspect` to preserve the Map-like formatting
   // (`URLSearchParams { 'a' => 'b' }`) that node compat tests expect.
   [SymbolFor("nodejs.util.inspect.custom")](_depth, inspectOptions, inspect) {
     webidl.assertBranded(this, URLSearchParamsPrototype, "URLSearchParams");
-    return this[SymbolFor("Deno.privateCustomInspect")](
+    return this[privateCustomInspect](
       inspect,
       inspectOptions,
     );
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     webidl.assertBranded(this, URLSearchParamsPrototype, "URLSearchParams");
     if (
       typeof inspectOptions?.depth === "number" && inspectOptions.depth < 0
@@ -789,7 +790,7 @@ class URL {
     } = componentsBuf);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -813,10 +814,10 @@ class URL {
   }
 
   // See URLSearchParams: Node exposes this as a method so that the descriptor
-  // lookup is not undefined. Deno's own inspector still prefers
-  // Deno.privateCustomInspect, so this is effectively the same code path.
+  // lookup is not undefined. dd's console prefers privateCustomInspect, so
+  // this is effectively the same code path.
   [SymbolFor("nodejs.util.inspect.custom")](_depth, inspectOptions, inspect) {
-    return this[SymbolFor("Deno.privateCustomInspect")](
+    return this[privateCustomInspect](
       inspect,
       inspectOptions,
     );

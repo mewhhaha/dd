@@ -50,7 +50,6 @@ const {
   // SharedArrayBufferPrototype,
   Symbol,
   SymbolAsyncIterator,
-  SymbolFor,
   TypeError,
   TypedArrayPrototypeGetBuffer,
   TypedArrayPrototypeGetByteLength,
@@ -81,9 +80,10 @@ const {
   signalAbort,
 } = core.loadExtScript("ext:vendor/web/03_abort_signal.js");
 
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 const { assert, AssertionError } = core.loadExtScript(
   "ext:vendor/web/00_infra.js",
 );
@@ -5083,7 +5083,7 @@ class ByteLengthQueuingStrategy {
     return WeakMapPrototypeGet(byteSizeFunctionWeakMap, this[_globalObject]);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -5140,7 +5140,7 @@ class CountQueuingStrategy {
     return WeakMapPrototypeGet(countSizeFunctionWeakMap, this[_globalObject]);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -5459,7 +5459,7 @@ class ReadableStream {
     return iterator;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     const isBranded = ObjectPrototypeIsPrototypeOf(
       ReadableStreamPrototype,
       this,
@@ -5635,7 +5635,7 @@ class ReadableStreamDefaultReader {
     return readableStreamReaderGenericCancel(this, reason);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -5822,7 +5822,7 @@ class ReadableStreamBYOBReader {
     return readableStreamReaderGenericCancel(this, reason);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6056,7 +6056,7 @@ class ReadableByteStreamController {
     readableByteStreamControllerError(this, e);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6220,7 +6220,7 @@ class ReadableStreamDefaultController {
     readableStreamDefaultControllerError(this, e);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6392,7 +6392,7 @@ class TransformStream {
     return this[_writable];
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6469,7 +6469,7 @@ class TransformStreamDefaultController {
     transformStreamDefaultControllerTerminate(this);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6622,7 +6622,7 @@ class WritableStream {
     return acquireWritableStreamDefaultWriter(this);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6767,7 +6767,7 @@ class WritableStreamDefaultWriter {
     return writableStreamDefaultWriterWrite(this, chunk);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
@@ -6845,7 +6845,7 @@ class WritableStreamDefaultController {
     writableStreamDefaultControllerError(this, e);
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,

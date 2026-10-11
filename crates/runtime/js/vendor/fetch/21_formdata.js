@@ -3,6 +3,7 @@
 return (function () {
 const { core, primordials } = __bootstrap;
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
+const { privateCustomInspect } = core.loadExtScript("ext:web/console.js");
 const {
   Blob,
   BlobPrototype,
@@ -24,7 +25,6 @@ const {
   SafeMap,
   SafeRegExp,
   Symbol,
-  SymbolFor,
   StringFromCharCode,
   StringPrototypeCharCodeAt,
   StringPrototypeTrim,
@@ -263,7 +263,7 @@ class FormData {
     }
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     if (ObjectPrototypeIsPrototypeOf(FormDataPrototype, this)) {
       return `${this.constructor.name} ${
         inspect(ObjectFromEntries(this), inspectOptions)

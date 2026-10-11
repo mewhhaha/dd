@@ -14,22 +14,14 @@ const {
   ReflectConstruct,
   ReflectHas,
   Symbol,
-  SymbolFor,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
 
-// Lazy-load createFilteredInspectProxy from console to avoid
-// circular dependency at load time. Only needed for custom inspect.
-let _createFilteredInspectProxy;
-function getCreateFilteredInspectProxy() {
-  if (!_createFilteredInspectProxy) {
-    _createFilteredInspectProxy = core.loadExtScript(
-      "ext:web/console.js",
-    ).createFilteredInspectProxy;
-  }
-  return _createFilteredInspectProxy;
-}
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 
 const _name = Symbol("name");
 const _message = Symbol("message");
@@ -179,7 +171,7 @@ class DOMException {
     return this[_code];
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     if (ObjectHasOwn(this, "stack")) {
       const stack = this.stack;
       if (typeof stack === "string") {
@@ -187,7 +179,7 @@ class DOMException {
       }
     }
     return inspect(
-      getCreateFilteredInspectProxy()({
+      createFilteredInspectProxy({
         object: this,
         evaluate: ObjectPrototypeIsPrototypeOf(DOMExceptionPrototype, this),
         keys: [

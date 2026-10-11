@@ -14,7 +14,6 @@ const {
   RegExpPrototypeTest,
   SafeArrayIterator,
   Symbol,
-  SymbolFor,
   SymbolIterator,
   StringPrototypeReplaceAll,
   StringPrototypeCharCodeAt,
@@ -22,6 +21,7 @@ const {
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
+const { privateCustomInspect } = core.loadExtScript("ext:web/console.js");
 const {
   byteLowerCase,
   collectHttpQuotedString,
@@ -599,7 +599,7 @@ class Headers {
     }
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     if (ObjectPrototypeIsPrototypeOf(HeadersPrototype, this)) {
       const headers = {};
       for (const entry of new SafeArrayIterator(ArrayFrom(this))) {

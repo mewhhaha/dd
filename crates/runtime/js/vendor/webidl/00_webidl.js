@@ -41,7 +41,6 @@ const {
   MathRound,
   MathTrunc,
   Number,
-  SymbolFor,
   NumberIsFinite,
   NumberIsNaN,
   NumberMAX_SAFE_INTEGER,
@@ -86,6 +85,8 @@ const {
   Uint8Array,
   Uint8ClampedArray,
 } = primordials;
+
+const { privateCustomInspect } = core.loadExtScript("ext:web/console.js");
 
 // Shared empty options object used as the default for `opts` parameters in
 // converter functions, so callers that omit `opts` (the common case) don't
@@ -1369,9 +1370,8 @@ function mixinPairIterable(name, prototype, dataSymbol, keyKey, valueKey) {
       return { value: result, done: false };
     },
     // Node-compatible inspector output (e.g. `URLSearchParams Iterator { 'a',
-    // 'b' }`). Picked up by Deno's `util.inspect` via the privateCustomInspect
-    // path so `node:util.inspect` returns the same shape.
-    [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    // 'b' }`), which dd's console picks up through privateCustomInspect.
+    [privateCustomInspect](inspect, inspectOptions) {
       const internal = this == null ? undefined : this[_iteratorInternal];
       const label = `${name} Iterator`;
       if (!internal) return `${label} {}`;

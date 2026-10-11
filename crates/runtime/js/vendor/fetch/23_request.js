@@ -12,14 +12,14 @@ const {
   SafeArrayIterator,
   StringPrototypeToUpperCase,
   Symbol,
-  SymbolFor,
   TypeError,
 } = primordials;
 
 const webidl = core.loadExtScript("ext:vendor/webidl/00_webidl.js");
-const { createFilteredInspectProxy } = core.loadExtScript(
-  "ext:web/console.js",
-);
+const {
+  createFilteredInspectProxy,
+  privateCustomInspect,
+} = core.loadExtScript("ext:web/console.js");
 const { HTTP_TOKEN_CODE_POINT_RE } = core.loadExtScript(
   "ext:vendor/web/00_infra.js",
 );
@@ -513,7 +513,7 @@ class Request {
     return request;
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+  [privateCustomInspect](inspect, inspectOptions) {
     return inspect(
       createFilteredInspectProxy({
         object: this,
