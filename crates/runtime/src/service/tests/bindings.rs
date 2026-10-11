@@ -68,16 +68,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn shared_env_is_reused_safely_across_requests() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "shared-env-reuse".to_string();
     service

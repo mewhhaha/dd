@@ -1,3 +1,5 @@
+use super::*;
+
 pub(crate) fn counter_worker() -> String {
     r#"
 let counter = 0;
@@ -1457,4 +1459,24 @@ export default {
 };
 "#
     .to_string()
+}
+
+pub(crate) async fn deploy_memory_contract_worker(worker_name: &str, body: &str) -> TestRuntime {
+    let service = test_service(RuntimeConfig::default()).await;
+    service
+        .deploy_with_config(
+            worker_name.to_string(),
+            format!(
+                "export default {{ async fetch(request, env) {{ const memory = env.STATE.get('entity'); {body} }} }};"
+            ),
+            DeployConfig {
+                bindings: vec![DeployBinding::Memory {
+                    binding: "STATE".to_string(),
+                }],
+                ..DeployConfig::default()
+            },
+        )
+        .await
+        .expect("transaction worker deploys");
+    service
 }

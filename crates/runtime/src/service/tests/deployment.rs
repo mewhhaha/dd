@@ -5,16 +5,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn deployed_worker_imports_server_module_assets() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 1)).await;
     let worker = "server-modules".to_string();
     let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
 
@@ -262,16 +253,7 @@ async fn temporary_worker_expires_while_runtime_is_running() {
 #[tokio::test]
 #[serial]
 async fn service_deploys_a_simple_worker() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 1)).await;
 
     service
         .deploy(
@@ -389,16 +371,7 @@ async fn deployment_heap_exhaustion_preserves_the_server() {
 #[tokio::test]
 #[serial]
 async fn invalid_redeploy_keeps_previous_generation() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 2, 4)).await;
 
     service
         .deploy("counter".to_string(), counter_worker())
@@ -426,16 +399,7 @@ async fn invalid_redeploy_keeps_previous_generation() {
 #[tokio::test]
 #[serial]
 async fn redeploy_switches_new_traffic_while_old_generation_drains() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 4)).await;
 
     service
         .deploy("worker".to_string(), versioned_worker("v1", 120))

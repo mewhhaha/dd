@@ -6,16 +6,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn reuse_preserves_state() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 2, 4)).await;
 
     service
         .deploy("counter".to_string(), counter_worker())
@@ -411,16 +402,7 @@ async fn scales_down_when_idle() {
 #[tokio::test]
 #[serial]
 async fn single_isolate_allows_multiple_inflight_requests() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy("io".to_string(), io_wait_worker())

@@ -3,13 +3,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn async_reply_immediate_completion_resumes_request() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(serial_runtime_config()).await;
 
     service
         .deploy("async-reply-probe".to_string(), async_reply_probe_worker())
@@ -30,13 +24,7 @@ async fn async_reply_immediate_completion_resumes_request() {
 #[tokio::test]
 #[serial]
 async fn async_reply_delayed_completion_resumes_after_yield() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(serial_runtime_config()).await;
 
     service
         .deploy("async-reply-probe".to_string(), async_reply_probe_worker())
@@ -57,13 +45,7 @@ async fn async_reply_delayed_completion_resumes_after_yield() {
 #[tokio::test]
 #[serial]
 async fn async_reply_timeout_surfaces_explicit_error() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(serial_runtime_config()).await;
 
     service
         .deploy("async-reply-probe".to_string(), async_reply_probe_worker())
@@ -87,16 +69,7 @@ async fn async_reply_timeout_surfaces_explicit_error() {
 #[tokio::test]
 #[serial]
 async fn overlapping_requests_keep_independent_request_context_handles() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 2,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 2)).await;
 
     service
         .deploy(
@@ -171,16 +144,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn service_invokes_a_simple_worker() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 1)).await;
 
     service
         .deploy(
@@ -256,16 +220,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn wait_until_background_work_runs_after_response() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "wait-until-basic".to_string();
     service
@@ -304,16 +259,7 @@ async fn wait_until_background_work_runs_after_response() {
 #[tokio::test]
 #[serial]
 async fn dropped_invoke_aborts_inflight_request() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy("abortable".to_string(), abort_aware_worker())
@@ -372,16 +318,7 @@ async fn dropped_invoke_aborts_inflight_request() {
 #[tokio::test]
 #[serial]
 async fn duplicate_user_request_ids_do_not_collide() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy("io".to_string(), io_wait_worker())

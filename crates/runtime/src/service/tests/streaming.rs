@@ -436,16 +436,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn invoke_stream_delivers_chunked_response_body() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy(
@@ -490,16 +481,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn invoke_stream_delivers_binary_response_chunks() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy(
@@ -605,16 +587,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn invoke_stream_propagates_response_body_error() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy(
@@ -666,16 +639,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn invoke_with_request_body_stream_delivers_chunks_to_worker() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy(

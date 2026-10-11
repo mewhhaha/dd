@@ -5,16 +5,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn cache_default_reuses_response() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy("cache".to_string(), cache_worker("default", "cache"))
@@ -43,13 +34,7 @@ async fn cache_default_reuses_response() {
 #[tokio::test]
 #[serial]
 async fn cache_names_are_isolated_by_worker() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(serial_runtime_config()).await;
 
     service
         .deploy("cache-owner-a".to_string(), cache_worker("shared", "A"))

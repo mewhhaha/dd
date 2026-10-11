@@ -1,5 +1,32 @@
 use super::*;
 
+/// A responsive pool with enough idle time to keep state between test requests.
+pub(crate) fn test_pool_config(
+    min_isolates: usize,
+    max_isolates_per_worker: usize,
+    max_inflight_per_isolate: usize,
+) -> RuntimeConfig {
+    RuntimeConfig {
+        min_isolates,
+        max_isolates_per_worker,
+        max_inflight_per_isolate,
+        idle_ttl: Duration::from_secs(5),
+        scale_tick: Duration::from_millis(50),
+        queue_warn_thresholds: vec![10],
+        ..RuntimeConfig::default()
+    }
+}
+
+/// Keeps requests on one warm isolate with one dispatch slot.
+pub(crate) fn serial_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        min_isolates: 1,
+        max_isolates_per_worker: 1,
+        max_inflight_per_isolate: 1,
+        ..RuntimeConfig::default()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TestStoreDir(Arc<TestStorePath>);
 
@@ -99,20 +126,39 @@ pub(crate) async fn wait_for_isolate_total(
     worker_name: &str,
     expected: usize,
 ) {
-    timeout(Duration::from_secs(5), async {
-        loop {
+    poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || async {
             let stats = service
                 .stats(worker_name.to_string())
                 .await
                 .expect("worker stats should exist");
-            if stats.isolates_total == expected {
+            stats.isolates_total == expected
+        },
+    )
+    .await
+    .expect("worker isolate count should converge");
+}
+
+pub(crate) async fn poll_until<F, Fut>(
+    limit: Duration,
+    interval: Duration,
+    mut ready: F,
+) -> Result<(), tokio::time::error::Elapsed>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    timeout(limit, async {
+        loop {
+            if ready().await {
                 break;
             }
-            sleep(Duration::from_millis(25)).await;
+            sleep(interval).await;
         }
     })
     .await
-    .expect("worker isolate count should converge");
 }
 
 pub(crate) fn test_assets() -> Vec<DeployAsset> {

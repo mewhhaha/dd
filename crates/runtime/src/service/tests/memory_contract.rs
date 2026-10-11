@@ -39,30 +39,11 @@ export default {
     service.shutdown().await.unwrap();
 }
 
-async fn deploy_memory_contract_worker(body: &str) -> TestRuntime {
-    let service = test_service(RuntimeConfig::default()).await;
-    service
-        .deploy_with_config(
-            "contract".to_string(),
-            format!(
-                "export default {{ async fetch(request, env) {{ const memory = env.STATE.get('entity'); {body} }} }};"
-            ),
-            DeployConfig {
-                bindings: vec![DeployBinding::Memory {
-                    binding: "STATE".to_string(),
-                }],
-                ..DeployConfig::default()
-            },
-        )
-        .await
-        .expect("transaction worker deploys");
-    service
-}
-
 #[tokio::test]
 #[serial]
 async fn aggregate_growth_rejection_preserves_reads_and_deletes() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 await memory.atomic((tx) => tx.put("first", new Uint8Array(9 * 1024 * 1024)));
 let rejected = false;
@@ -92,6 +73,7 @@ return Response.json({ rejected, before, after });
 #[serial]
 async fn staged_values_and_deletes_remain_visible_before_and_after_commit() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const payload = new Uint8Array(64 * 1024).fill(7);
 const before = await memory.atomic((tx) => {
@@ -136,6 +118,7 @@ return Response.json({ before, after });
 #[serial]
 async fn oversized_direct_buffers_leave_the_staged_transaction_usable() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const rejected = await memory.atomic((tx) => {
   tx.put("safe", "before");
@@ -167,6 +150,7 @@ return Response.json({ rejected, stored });
 #[serial]
 async fn unchanged_snapshots_keep_decoded_values_independent_and_refresh_after_writes() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 await memory.atomic((tx) => tx.put("state", { count: 1, bytes: new Uint8Array([2, 3]) }));
 const observed = [];
@@ -219,6 +203,7 @@ return Response.json(observed);
 #[serial]
 async fn transactions_reuse_native_snapshots_for_large_values() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const payload = "p".repeat(1024 * 1024);
 for (let index = 0; index < 10; index++) {
@@ -265,6 +250,7 @@ return new Response("ok");
 #[serial]
 async fn reused_snapshots_match_reloaded_unicode_keys_and_list_order() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 await memory.atomic(tx => {
   tx.put("é", "composed");
@@ -305,6 +291,7 @@ return Response.json({ cached, reloaded });
 #[serial]
 async fn async_callbacks_are_rejected_before_their_body_runs() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 let called = false;
 let rejected = false;
@@ -332,6 +319,7 @@ return Response.json({ called, rejected, value });
 #[serial]
 async fn returned_thenables_roll_back_writes_and_idempotency_results() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const cases = [Promise.resolve(1), { then() {} }, Object.assign(() => {}, { then() {} })];
 const results = [];
@@ -371,6 +359,7 @@ return Response.json(results);
 #[serial]
 async fn transaction_handles_cannot_be_used_after_the_callback_returns() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 let escaped;
 await memory.atomic((tx) => { escaped = tx; tx.put("value", 1); });
@@ -398,6 +387,7 @@ return Response.json({ rejected, value: await memory.atomic((tx) => tx.get("valu
 #[serial]
 async fn concurrent_transactions_keep_each_entity_and_request_scope_independent() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const entities = Array.from({ length: 16 }, (_, index) => env.STATE.get(`entity-${index}`));
 await Promise.all(entities.map((entity, index) => entity.atomic((tx) => tx.put("value", index))));
@@ -423,6 +413,7 @@ return Response.json({ values, count: await memory.atomic((tx) => tx.get("count"
 #[serial]
 async fn nested_transactions_fail_without_committing_the_outer_write() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 let rejected = false;
 try {
@@ -451,6 +442,7 @@ return Response.json({ rejected, value: await memory.atomic((tx) => tx.get("valu
 #[serial]
 async fn idempotent_results_preserve_cycles_and_shared_references() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const value = await memory.atomic(() => {
   const shared = { count: 1 };
@@ -483,6 +475,7 @@ return Response.json({ cycle: value.self === value, shared: value.left === value
 #[serial]
 async fn idempotent_results_replay_web_values_and_shared_references() {
     let service = deploy_memory_contract_worker(
+        "contract",
         r#"
 const value = await memory.atomic(tx => {
   tx.put("executions", (tx.get("executions") ?? 0) + 1);
@@ -527,6 +520,7 @@ return Response.json({
 #[serial]
 async fn recording_an_idempotent_response_keeps_its_body_readable() {
     let service = deploy_memory_contract_worker(
+        "contract",
         "return memory.atomic(() => new Response('committed body'), { idempotencyKey: 'response' });",
     ).await;
     for _ in 0..2 {

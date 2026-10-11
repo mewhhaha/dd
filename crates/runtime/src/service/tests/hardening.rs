@@ -142,47 +142,6 @@ export default {
 };
 "#;
 
-/// Answers one HTTP request with its method, `x-probe` header and body.
-async fn echo_once(listener: TcpListener) {
-    let (mut socket, _) = listener.accept().await.unwrap();
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 2048];
-    let header_end = loop {
-        let length = socket.read(&mut buffer).await.unwrap();
-        assert!(length > 0, "request ended before its headers");
-        request.extend_from_slice(&buffer[..length]);
-        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-            break end + 4;
-        }
-    };
-    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-    let header = |name: &str| {
-        headers
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.trim().to_string())
-    };
-    let body_length = header("content-length").map_or(0, |value| value.parse().unwrap());
-    while request.len() < header_end + body_length {
-        let length = socket.read(&mut buffer).await.unwrap();
-        assert!(length > 0, "request ended before its body");
-        request.extend_from_slice(&buffer[..length]);
-    }
-    let body = serde_json::to_vec(&serde_json::json!({
-        "method": headers.split_whitespace().next().unwrap(),
-        "probe": header("x-probe"),
-        "body": String::from_utf8(request[header_end..header_end + body_length].to_vec()).unwrap(),
-    }))
-    .unwrap();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    socket.write_all(response.as_bytes()).await.unwrap();
-    socket.write_all(&body).await.unwrap();
-}
-
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -196,9 +155,12 @@ async fn request_machinery_survives_replaced_builtins() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        timeout(Duration::from_secs(10), echo_once(listener))
-            .await
-            .expect("the worker's host fetch arrives");
+        timeout(
+            Duration::from_secs(10),
+            echo_requests(listener, 1, ("probe", "x-probe"), false),
+        )
+        .await
+        .expect("the worker's host fetch arrives");
     });
     let service = test_service(RuntimeConfig {
         min_isolates: 1,
@@ -461,16 +423,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn production_runtime_rejects_string_code_generation() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 1)).await;
     service
         .deploy(
             "production-codegen".to_string(),
@@ -636,16 +589,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn forged_and_invalid_completion_payloads_are_ignored() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 2,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 2)).await;
 
     service
         .deploy("malicious".to_string(), malicious_completion_worker())

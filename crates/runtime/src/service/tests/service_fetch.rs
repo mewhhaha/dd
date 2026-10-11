@@ -124,26 +124,26 @@ export default {
 "#;
 
 async fn wait_for_child_state(service: &RuntimeService, calls: usize, aborted: usize) {
-    timeout(Duration::from_secs(2), async {
-        loop {
+    poll_until(
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        || async {
             let stats = service.stats("fetch-child".into()).await.unwrap();
             // Wait for the canceled request to release its dispatch slot.
-            if stats.inflight_total == 0 {
-                let output = service
-                    .invoke(
-                        "fetch-child".into(),
-                        test_invocation_with_path("/state", "abort-state"),
-                    )
-                    .await
-                    .unwrap();
-                let state: Value = serde_json::from_slice(&output.body).unwrap();
-                if state == serde_json::json!({ "calls": calls, "aborted": aborted }) {
-                    break;
-                }
+            if stats.inflight_total != 0 {
+                return false;
             }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+            let output = service
+                .invoke(
+                    "fetch-child".into(),
+                    test_invocation_with_path("/state", "abort-state"),
+                )
+                .await
+                .unwrap();
+            let state: Value = serde_json::from_slice(&output.body).unwrap();
+            state == serde_json::json!({ "calls": calls, "aborted": aborted })
+        },
+    )
     .await
     .expect("child cancellation releases its scope and capacity before wall timeout");
 }
@@ -252,20 +252,18 @@ export default { async fetch(_request, env) { return env.CHILD.fetch('http://chi
 }
 
 async fn wait_for_child_inflight(service: &RuntimeService) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if service
+    poll_until(
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+        || async {
+            service
                 .stats("fetch-child".into())
                 .await
                 .unwrap()
                 .inflight_total
                 == 1
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
 }
@@ -403,16 +401,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn private_worker_can_call_private_service_binding() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 2,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 2, 2)).await;
 
     service
         .deploy_with_config(

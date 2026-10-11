@@ -1,22 +1,10 @@
 use super::*;
 
-async fn deploy_read_worker(body: &str) -> TestRuntime {
-    let service = test_service(RuntimeConfig::default()).await;
-    service.deploy_with_config(
-        "read-contract".into(),
-        format!("export default {{ async fetch(request, env) {{ const memory = env.STATE.get('entity'); {body} }} }};"),
-        DeployConfig {
-            bindings: vec![DeployBinding::Memory { binding: "STATE".into() }],
-            ..DeployConfig::default()
-        },
-    ).await.unwrap();
-    service
-}
-
 #[tokio::test]
 #[serial]
 async fn reads_proceed_while_the_entity_is_leased_and_do_not_commit() {
-    let service = deploy_read_worker(
+    let service = deploy_memory_contract_worker(
+        "read-contract",
         "return Response.json(await memory.read(snapshot => ({ value: snapshot.get('missing'), keys: snapshot.list() })));",
     ).await;
     let namespace = crate::memory::worker_namespace("read-contract", "STATE");
@@ -57,7 +45,8 @@ async fn reads_proceed_while_the_entity_is_leased_and_do_not_commit() {
 #[tokio::test]
 #[serial]
 async fn captured_reads_stay_consistent_when_a_write_commits_after_they_begin() {
-    let service = deploy_read_worker(
+    let service = deploy_memory_contract_worker(
+        "read-contract",
         r#"
 await memory.atomic(tx => { tx.put("a", 1); tx.put("b", 1); });
 // memory.read's snapshot is a read handle; this one stays open across a write.
@@ -95,7 +84,7 @@ return Response.json({ captured, committed });
 #[tokio::test]
 #[serial]
 async fn reads_keep_values_independent_and_share_atomic_listing_rules() {
-    let service = deploy_read_worker(r#"
+    let service = deploy_memory_contract_worker("read-contract", r#"
 const keys = ["é", "e\u0301", "E", "empty", "bytes", "gone", "object"];
 await memory.atomic(tx => {
   for (const key of keys) tx.put(key, key);
@@ -126,7 +115,8 @@ return Response.json(await memory.read(snapshot => [snapshot.get("empty"), snaps
 #[tokio::test]
 #[serial]
 async fn reads_reject_mutation_async_nesting_and_escaped_snapshot_access() {
-    let service = deploy_read_worker(
+    let service = deploy_memory_contract_worker(
+        "read-contract",
         r#"
 const errors = [];
 async function rejects(action) {
@@ -182,7 +172,7 @@ return Response.json({ surface, errors, valid });
 #[tokio::test]
 #[serial]
 async fn concurrent_reads_never_tear_multi_key_commits_or_regress_acknowledged_writes() {
-    let service = deploy_read_worker(r#"
+    let service = deploy_memory_contract_worker("read-contract", r#"
 if (request.method === "POST") {
   const expected = await memory.atomic(tx => {
     const count = (tx.get("a") ?? 0) + 1;
@@ -238,13 +228,7 @@ return Response.json(await memory.read(snapshot => {
 #[tokio::test]
 #[serial]
 async fn request_completion_and_cancellation_release_unclosed_read_handles() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(serial_runtime_config()).await;
     service
         .deploy_with_config(
             "read-cleanup".into(),

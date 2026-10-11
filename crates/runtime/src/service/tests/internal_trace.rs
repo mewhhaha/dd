@@ -5,16 +5,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn internal_trace_includes_markers_and_targets_configured_worker() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy("trace-sink".to_string(), trace_sink_worker())
@@ -95,16 +86,7 @@ fn internal_trace_headers_include_markers() {
 #[tokio::test]
 #[serial]
 async fn internal_trace_invocations_do_not_recurse() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy_with_config(

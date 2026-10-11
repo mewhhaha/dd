@@ -402,16 +402,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -483,16 +474,7 @@ async fn websocket_message_handler_can_use_memory_storage_after_handshake() {
 #[tokio::test]
 #[serial]
 async fn websocket_transaction_can_broadcast_from_a_normal_request() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -559,16 +541,7 @@ async fn websocket_transaction_can_broadcast_from_a_normal_request() {
 #[tokio::test]
 #[serial]
 async fn websocket_wake_can_list_socket_handles_without_deadlock() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy_with_config(
@@ -733,16 +706,7 @@ async fn websocket_session_survives_idle_ttl_and_scales_down_after_close() {
 #[tokio::test]
 #[serial]
 async fn websocket_session_reaped_when_owner_isolate_fails() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy_with_config(
@@ -891,16 +855,7 @@ async fn redeployment_closes_websockets_and_bounds_generation_retirement() {
 #[tokio::test]
 #[serial]
 async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -936,16 +891,7 @@ async fn websocket_stub_surface_uses_handle_backed_send_close_only() {
 #[tokio::test]
 #[serial]
 async fn websocket_message_handler_can_close_handle_backed_socket() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -1001,16 +947,7 @@ async fn websocket_message_handler_can_close_handle_backed_socket() {
 #[tokio::test]
 #[serial]
 async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -1080,16 +1017,7 @@ async fn websocket_storage_uses_current_request_scope_on_warm_memory_instance() 
 #[tokio::test]
 #[serial]
 async fn chat_worker_second_join_and_message_do_not_hang() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -1253,16 +1181,7 @@ async fn chat_worker_second_join_and_message_do_not_hang() {
 #[tokio::test]
 #[serial]
 async fn chat_worker_refresh_replaces_prior_participant_socket() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(

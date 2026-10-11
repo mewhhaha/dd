@@ -30,49 +30,6 @@ async fn host_fetch_worker(
     service
 }
 
-async fn echo_requests(listener: TcpListener, count: usize) {
-    for _ in 0..count {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 2048];
-        let header_end = loop {
-            let length = socket.read(&mut buffer).await.unwrap();
-            assert!(length > 0, "request ended before its headers");
-            request.extend_from_slice(&buffer[..length]);
-            assert!(request.len() <= 16 * 1024);
-            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                break end + 4;
-            }
-        };
-        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-        let header = |name: &str| {
-            headers
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.trim().to_string())
-        };
-        let body_length = header("content-length").unwrap().parse::<usize>().unwrap();
-        assert!(body_length <= 4096);
-        while request.len() < header_end + body_length {
-            let length = socket.read(&mut buffer).await.unwrap();
-            assert!(length > 0, "request ended before its body");
-            request.extend_from_slice(&buffer[..length]);
-        }
-        let body = serde_json::to_vec(&serde_json::json!({
-            "method": headers.split_whitespace().next().unwrap(),
-            "contentType": header("content-type"),
-            "body": String::from_utf8(request[header_end..header_end + body_length].to_vec()).unwrap(),
-        })).unwrap();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-        socket.write_all(&body).await.unwrap();
-    }
-}
-
 #[tokio::test]
 #[serial]
 async fn host_fetch_encodes_native_body_types_and_honors_request_init_overrides() {
@@ -82,9 +39,12 @@ async fn host_fetch_encodes_native_body_types_and_honors_request_init_overrides(
     // covers service start and deploy, which a loaded machine can stretch
     // past a few seconds.
     let server = tokio::spawn(async move {
-        timeout(Duration::from_secs(30), echo_requests(listener, 5))
-            .await
-            .unwrap();
+        timeout(
+            Duration::from_secs(30),
+            echo_requests(listener, 5, ("contentType", "content-type"), true),
+        )
+        .await
+        .unwrap();
     });
     let service = host_fetch_worker(
         address,
@@ -236,16 +196,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn host_fetch_is_single_permanent_request_scoped_wrapper() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy(

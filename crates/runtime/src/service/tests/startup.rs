@@ -5,16 +5,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn service_starts_from_the_bootstrap_snapshot() {
-    let _ = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let _ = test_service(test_pool_config(0, 1, 1)).await;
 }
 
 #[tokio::test]

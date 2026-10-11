@@ -5,16 +5,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn concurrent_kv_reads_match_sequential_reads_and_preserve_duplicates() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "kv-batching-equality".to_string();
     service
@@ -70,16 +61,7 @@ async fn concurrent_kv_reads_match_sequential_reads_and_preserve_duplicates() {
 #[tokio::test]
 #[serial]
 async fn kv_reads_decode_mixed_values_and_surface_corrupt_values() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "kv-batching-mixed".to_string();
     service
@@ -162,16 +144,7 @@ async fn kv_reads_decode_mixed_values_and_surface_corrupt_values() {
 #[tokio::test]
 #[serial]
 async fn concurrent_kv_reads_preserve_each_requests_keys() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 16,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 16)).await;
 
     let worker_name = "kv-batching-scope".to_string();
     service
@@ -221,16 +194,7 @@ async fn concurrent_kv_reads_preserve_each_requests_keys() {
 #[tokio::test]
 #[serial]
 async fn kv_write_batching_preserves_last_write_wins() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "kv-write-batching".to_string();
     service
@@ -360,16 +324,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn kv_committed_durability_awaits_canonical_write() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "kv-committed-durability".to_string();
     service
@@ -432,16 +387,7 @@ async fn kv_committed_durability_awaits_canonical_write() {
 #[tokio::test]
 #[serial]
 async fn kv_wait_until_write_flushes_after_response() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "kv-write-wait-until".to_string();
     service
@@ -509,16 +455,7 @@ async fn kv_wait_until_write_flushes_after_response() {
 #[tokio::test]
 #[serial]
 async fn kv_wait_until_read_runs_after_response() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     let worker_name = "kv-read-wait-until".to_string();
     service

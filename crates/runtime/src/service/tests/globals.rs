@@ -5,16 +5,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn deployed_worker_imports_async_local_storage_from_node_async_hooks() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy(
@@ -72,16 +63,7 @@ export default {
 #[tokio::test]
 #[serial]
 async fn spectre_time_mitigation_freezes_time_between_io_boundaries() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 1)).await;
 
     service
         .deploy("frozen-time".to_string(), frozen_time_worker())
@@ -123,16 +105,7 @@ async fn spectre_time_mitigation_freezes_time_between_io_boundaries() {
 #[tokio::test]
 #[serial]
 async fn crypto_globals_work_in_a_worker() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 0,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(0, 1, 1)).await;
 
     service
         .deploy("crypto-worker".to_string(), crypto_worker())

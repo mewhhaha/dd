@@ -22,16 +22,7 @@ async fn static_deployment_rejects_malformed_egress_hosts() {
 #[tokio::test]
 #[serial]
 async fn static_worker_fetch_uses_allowlist_and_preserves_headers() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -94,16 +85,7 @@ async fn static_worker_fetch_uses_allowlist_and_preserves_headers() {
 #[tokio::test]
 #[serial]
 async fn static_worker_fetch_revalidates_redirect_and_strips_cross_origin_credentials() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     let destination = TcpListener::bind("127.0.0.1:0")
         .await
@@ -178,16 +160,7 @@ async fn static_worker_fetch_revalidates_redirect_and_strips_cross_origin_creden
 #[tokio::test]
 #[serial]
 async fn static_worker_fetch_rejects_egress_hosts_outside_allowlist() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     let worker_name = "outbound-fetch".to_string();
     service
@@ -216,16 +189,7 @@ async fn static_worker_fetch_rejects_egress_hosts_outside_allowlist() {
 #[tokio::test]
 #[serial]
 async fn static_worker_fetch_abort_signal_cancels_outbound_request() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

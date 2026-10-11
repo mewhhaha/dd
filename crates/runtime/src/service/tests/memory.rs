@@ -3,16 +3,7 @@ use super::*;
 #[tokio::test]
 #[serial]
 async fn memory_same_key_atomic_commands_are_serialized() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 3,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 3, 4)).await;
 
     service
         .deploy_with_config(
@@ -80,16 +71,7 @@ async fn memory_same_key_atomic_commands_are_serialized() {
 #[tokio::test]
 #[serial]
 async fn memory_storage_increment_preserves_all_updates_under_concurrency() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_isolates_per_worker: 3,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(2, 3, 1)).await;
 
     service
         .deploy_with_config(
@@ -229,16 +211,7 @@ async fn memory_callbacks_progress_when_all_caller_isolates_are_busy() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_callback_executes_once_for_cold_read() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy_with_config(
@@ -274,16 +247,7 @@ async fn memory_atomic_callback_executes_once_for_cold_read() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_rejects_unsupported_storage_options() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy_with_config(
@@ -329,16 +293,7 @@ async fn memory_atomic_rejects_unsupported_storage_options() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy_with_config(
@@ -377,16 +332,7 @@ async fn memory_atomic_staged_writes_do_not_expose_committed_versions() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_idempotency_key_replays_committed_result() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -450,15 +396,7 @@ async fn memory_atomic_idempotency_key_replays_committed_result() {
 #[serial]
 async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
     let store = TestStoreDir::new("dd-memory-idempotent");
-    let config = RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    };
+    let config = test_pool_config(1, 2, 4);
 
     let service = test_service_with_store(config.clone(), store.clone(), true).await;
     service
@@ -533,16 +471,7 @@ async fn memory_atomic_idempotency_key_replays_after_runtime_restart() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_isolates_per_worker: 3,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(2, 3, 4)).await;
 
     service
         .deploy_with_config(
@@ -617,16 +546,7 @@ async fn memory_atomic_concurrent_duplicate_idempotency_key_executes_once() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_idempotency_key_replays_read_only_result() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -693,20 +613,7 @@ async fn memory_atomic_idempotency_key_replays_read_only_result() {
 #[serial]
 async fn memory_atomic_can_emit_durable_effect_records() {
     let store = TestStoreDir::new("dd-memory-outbox");
-    let service = test_service_with_store(
-        RuntimeConfig {
-            min_isolates: 1,
-            max_isolates_per_worker: 2,
-            max_inflight_per_isolate: 4,
-            idle_ttl: Duration::from_secs(5),
-            scale_tick: Duration::from_millis(50),
-            queue_warn_thresholds: vec![10],
-            ..RuntimeConfig::default()
-        },
-        store.clone(),
-        false,
-    )
-    .await;
+    let service = test_service_with_store(test_pool_config(1, 2, 4), store.clone(), false).await;
 
     service
         .deploy_with_config(
@@ -942,16 +849,7 @@ async fn memory_outbox_pending_effects_drain_after_service_start() {
 #[tokio::test]
 #[serial]
 async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_isolates_per_worker: 8,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(2, 8, 4)).await;
 
     service
         .deploy_with_config(
@@ -1022,16 +920,7 @@ async fn memory_storage_different_keys_preserve_all_updates_under_concurrency() 
 #[tokio::test]
 #[serial]
 async fn memory_storage_structured_value_roundtrip_works() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -1084,16 +973,7 @@ async fn memory_storage_structured_value_roundtrip_works() {
 #[tokio::test]
 #[serial]
 async fn memory_committed_writes_are_visible_to_later_transactions() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy_with_config(
@@ -1154,16 +1034,7 @@ async fn memory_committed_writes_are_visible_to_later_transactions() {
 #[tokio::test]
 #[serial]
 async fn memory_writes_preserve_updates_to_distinct_entities() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 8)).await;
 
     service
         .deploy_with_config(
@@ -1382,15 +1253,7 @@ async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
 #[serial]
 async fn memory_owner_epoch_survives_runtime_restart() {
     let store = TestStoreDir::new("dd-memory-owner-epoch");
-    let config = RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    };
+    let config = test_pool_config(1, 1, 4);
 
     let service = test_service_with_store(config.clone(), store.clone(), true).await;
     service
@@ -1524,16 +1387,7 @@ async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
 #[tokio::test]
 #[serial]
 async fn memory_multiple_atomic_reads_in_one_request_complete() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 4)).await;
 
     service
         .deploy_with_config(
@@ -1578,16 +1432,7 @@ async fn memory_multiple_atomic_reads_in_one_request_complete() {
 #[tokio::test]
 #[serial]
 async fn memory_multikey_transactions_complete_after_warmup() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 4,
-        max_isolates_per_worker: 4,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(4, 4, 8)).await;
 
     service
         .deploy_with_config(
@@ -1654,16 +1499,7 @@ async fn memory_multikey_transactions_complete_after_warmup() {
 #[tokio::test]
 #[serial]
 async fn memory_benchmark_worker_returns_correct_total() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(2, 2, 8)).await;
 
     service
         .deploy_with_config(
@@ -1718,16 +1554,7 @@ async fn memory_benchmark_worker_returns_correct_total() {
 #[tokio::test]
 #[serial]
 async fn memory_atomic_writes_complete_past_repeated_worker_threshold() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 1)).await;
 
     service
         .deploy_with_config(
@@ -1870,16 +1697,7 @@ async fn memory_transaction_reads_snapshot_after_isolate_restart() {
 #[tokio::test]
 #[serial]
 async fn hosted_memory_factories_share_state_and_module_globals() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
@@ -1950,16 +1768,7 @@ async fn hosted_memory_factories_share_state_and_module_globals() {
 #[tokio::test]
 #[serial]
 async fn hosted_memory_allows_inline_closures() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 1,
-        max_inflight_per_isolate: 2,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 1, 2)).await;
 
     service
         .deploy_with_config(
@@ -1991,16 +1800,7 @@ async fn hosted_memory_allows_inline_closures() {
 #[tokio::test]
 #[serial]
 async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_isolates_per_worker: 3,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(2, 3, 1)).await;
 
     service
         .deploy_with_config(
@@ -2065,16 +1865,7 @@ async fn hosted_memory_coordinated_single_read_is_point_in_time_only() {
 #[tokio::test]
 #[serial]
 async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_goes_stale() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 2,
-        max_isolates_per_worker: 3,
-        max_inflight_per_isolate: 1,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(2, 3, 1)).await;
 
     service
         .deploy_with_config(
@@ -2151,16 +1942,7 @@ async fn hosted_memory_coordinated_read_command_does_not_replay_when_prior_read_
 #[tokio::test]
 #[serial]
 async fn hosted_memory_coordinated_snapshot_read_executes_once() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 3,
-        max_inflight_per_isolate: 8,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 3, 8)).await;
 
     service
         .deploy_with_config(
@@ -2225,16 +2007,7 @@ async fn hosted_memory_coordinated_snapshot_read_executes_once() {
 #[tokio::test]
 #[serial]
 async fn hosted_memory_missing_value_default_is_lazy_until_written() {
-    let service = test_service(RuntimeConfig {
-        min_isolates: 1,
-        max_isolates_per_worker: 2,
-        max_inflight_per_isolate: 4,
-        idle_ttl: Duration::from_secs(5),
-        scale_tick: Duration::from_millis(50),
-        queue_warn_thresholds: vec![10],
-        ..RuntimeConfig::default()
-    })
-    .await;
+    let service = test_service(test_pool_config(1, 2, 4)).await;
 
     service
         .deploy_with_config(
