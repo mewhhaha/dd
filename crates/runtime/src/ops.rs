@@ -8,7 +8,7 @@ use crate::memory::{
 use crate::service::MemoryExecutionCall;
 use bytes::Bytes;
 use common::{PlatformError, Result, WorkerInvocation, WorkerOutput};
-use dd_v8::{JsBuffer, OpDecl, OpState, op_async, op_sync};
+use dd_v8::{JsBuffer, OpDecl, OpError, OpState, op_async, op_sync};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -174,6 +174,12 @@ pub(crate) struct RuntimeExecutionLimits {
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerCacheNamespace(pub(crate) String);
 
+/// An op failure JavaScript sees thrown (or a promise rejected with) as an
+/// `Error` carrying `error`'s message.
+fn js_error(error: impl std::fmt::Display) -> OpError {
+    OpError::new(error.to_string())
+}
+
 fn emit_isolate_event(
     state: &OpState,
     payload: IsolateEventPayload,
@@ -275,13 +281,15 @@ pub(crate) fn runtime_ops() -> Vec<OpDecl> {
         op_sync!(op_http_take_prepared_headers),
         op_sync!(op_emit_cache_revalidate),
     ];
-    // The runtime's tests use these to push replies on a schedule they pick.
+    // The runtime's tests use these to push replies on a schedule they pick,
+    // and to fail a memory batch as storage would.
     #[cfg(test)]
     let ops = ops
         .into_iter()
         .chain([
             op_sync!(op_test_async_reply_start),
             op_sync!(op_test_async_reply_cancel),
+            op_sync!(op_test_memory_batch_begin_fail),
         ])
         .collect();
     ops

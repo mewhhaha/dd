@@ -848,11 +848,10 @@ async fn memory_profile_reports_callback_commit_and_outbox_delivery() {
         )
         .await
         .expect("profile should succeed");
-    let profile: Value = crate::json::from_string(
+    let snapshot: Value = crate::json::from_string(
         String::from_utf8(profile.body).expect("profile body should be utf8"),
     )
     .expect("profile should parse");
-    let snapshot = &profile["snapshot"];
     for metric in [
         "js_txn_begin",
         "js_txn_commit",
@@ -1297,19 +1296,9 @@ async fn memory_coordinated_set_write_uses_owner_validated_batch_path() {
         String::from_utf8(output.body).expect("profile body should be utf8"),
     )
     .expect("profile should parse");
-    assert!(
-        profile["snapshot"]["op_apply_batch"]["calls"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1
-    );
-    assert!(profile["snapshot"].get("op_apply_blind_batch").is_none());
-    assert!(
-        profile["snapshot"]["js_txn_commit"]["calls"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1
-    );
+    assert!(profile["op_apply_batch"]["calls"].as_u64().unwrap_or(0) >= 1);
+    assert!(profile.get("op_apply_blind_batch").is_none());
+    assert!(profile["js_txn_commit"]["calls"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[tokio::test]
@@ -1384,19 +1373,9 @@ async fn memory_coordinated_read_write_uses_owner_validated_batch_path() {
         String::from_utf8(output.body).expect("profile body should be utf8"),
     )
     .expect("profile should parse");
-    assert!(
-        profile["snapshot"]["op_apply_batch"]["calls"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1
-    );
-    assert!(profile["snapshot"].get("op_apply_blind_batch").is_none());
-    assert!(
-        profile["snapshot"]["js_txn_commit"]["calls"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1
-    );
+    assert!(profile["op_apply_batch"]["calls"].as_u64().unwrap_or(0) >= 1);
+    assert!(profile.get("op_apply_blind_batch").is_none());
+    assert!(profile["js_txn_commit"]["calls"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[tokio::test]
@@ -1535,26 +1514,11 @@ async fn memory_read_only_atomic_uses_memory_snapshot_without_commit() {
         String::from_utf8(output.body).expect("profile body should be utf8"),
     )
     .expect("profile should parse");
-    assert!(
-        profile["snapshot"]["op_snapshot"]["calls"]
-            .as_u64()
-            .unwrap_or(0)
-            >= 1
-    );
-    assert_eq!(
-        profile["snapshot"]["op_apply_batch"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
-    assert_eq!(
-        profile["snapshot"]["js_txn_commit"]["calls"]
-            .as_u64()
-            .unwrap_or(0),
-        0
-    );
-    assert!(profile["snapshot"].get("op_validate_reads").is_none());
-    assert!(profile["snapshot"].get("js_txn_validate").is_none());
+    assert!(profile["op_snapshot"]["calls"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(profile["op_apply_batch"]["calls"].as_u64().unwrap_or(0), 0);
+    assert_eq!(profile["js_txn_commit"]["calls"].as_u64().unwrap_or(0), 0);
+    assert!(profile.get("op_validate_reads").is_none());
+    assert!(profile.get("js_txn_validate").is_none());
 }
 
 #[tokio::test]

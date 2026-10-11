@@ -165,19 +165,18 @@ export default {
     const room = env.CHAT.get(path === "/other" ? "other" : "failed");
     if (path !== "/fail" && path !== "/reject") return room.atomic(tx => tx.accept(request).response);
 
-    const snapshot = __dd_internals.core.ops.op_memory_batch_begin;
-    __dd_internals.core.ops.op_memory_batch_begin = () => ({
-      ok: false, storage_failure: path === "/fail",
-      error: path === "/fail" ? "injected memory snapshot failure" : "injected memory admission rejection",
-    });
+    // The atomic call's batch fails to begin, as storage or as an ordinary
+    // failure.
+    __dd_internals.core.ops.op_test_memory_batch_begin_fail(
+      path === "/fail",
+      path === "/fail" ? "injected memory snapshot failure" : "injected memory admission rejection",
+    );
     let callbackRan = false;
     try {
       await room.atomic(() => { callbackRan = true; });
       return Response.json({ callbackRan, error: null });
     } catch (error) {
       return Response.json({ callbackRan, error: error.message });
-    } finally {
-      __dd_internals.core.ops.op_memory_batch_begin = snapshot;
     }
   },
   async wake(event) {

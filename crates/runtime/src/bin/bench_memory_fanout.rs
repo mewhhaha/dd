@@ -691,10 +691,10 @@ async fn memory_profile(service: &RuntimeService, operation: &str) -> Result<Val
         .await
         .map_err(|error| error.to_string())?;
     let profile: Value = serde_json::from_slice(&output.body).map_err(|error| error.to_string())?;
-    if output.status != 200 || profile["ok"] != true {
+    if output.status != 200 {
         return Err(format!("memory profile {operation} failed: {profile}"));
     }
-    Ok(profile["snapshot"].clone())
+    Ok(profile)
 }
 
 #[tokio::main]

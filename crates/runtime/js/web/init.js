@@ -15,7 +15,6 @@ const {
   ObjectPrototypeIsPrototypeOf,
   ReflectGetOwnPropertyDescriptor,
   ReflectOwnKeys,
-  String,
   StringPrototypeSlice,
   StringPrototypeToLowerCase,
   StringPrototypeToUpperCase,
@@ -227,7 +226,8 @@ function hostFetchResponse(fetched, url, method) {
 }
 
 // fetch with no request scope or egress rule. The op refuses it outside the
-// development runtime, which exposes it as __dd_raw_host_fetch for dd-vite.
+// development runtime, which exposes it as __dd_raw_host_fetch for dd-vite,
+// and rejects with a TypeError when the fetch gets no response.
 async function unscopedFetch(input, init = undefined) {
   const request = new Request(input, init);
   const method = RequestPrototypeGetMethod(request);
@@ -241,9 +241,6 @@ async function unscopedFetch(input, init = undefined) {
     headerPairs(RequestPrototypeGetHeaders(request)),
     body,
   );
-  if (fetched?.ok !== true) {
-    throw new TypeError(String(fetched?.error ?? "host fetch failed"));
-  }
   return hostFetchResponse(fetched, url, method);
 }
 

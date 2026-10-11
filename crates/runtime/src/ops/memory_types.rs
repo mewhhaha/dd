@@ -117,83 +117,27 @@ pub struct TimeBoundary {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryLeaseResult {
-    pub(crate) handle: u32,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemorySocketListResult {
-    pub(crate) ok: bool,
-    pub(crate) handles: Vec<String>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemorySocketCloseResult {
-    pub(crate) ok: bool,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct MemoryReadValue {
     pub(crate) value: dd_v8::ToJsBuffer,
     pub(crate) encoding: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryProfileResult {
-    pub(crate) ok: bool,
-    pub(crate) snapshot: Option<crate::memory::MemoryProfileSnapshot>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryStateApplyBatchResult {
-    pub(crate) ok: bool,
+pub(crate) struct MemoryBatchApplied {
+    /// Whether the batch committed; one with nothing to commit is read-only.
     pub(crate) applied: bool,
-    pub(crate) read_only: bool,
     pub(crate) mutation_count: usize,
-    pub(crate) effect_count: usize,
-    pub(crate) accepted: bool,
+    /// Whether the entry's later output waits for this commit's own (an
+    /// accepted socket, or effects) to go out first.
     pub(crate) output_gate_required: bool,
-    pub(crate) error: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct MemoryKeysResult {
-    pub(crate) ok: bool,
-    pub(crate) keys: Vec<String>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryGetResult {
-    pub(crate) ok: bool,
-    pub(crate) record: Option<MemoryReadValue>,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryBeginResult {
-    pub(crate) ok: bool,
-    pub(crate) storage_failure: bool,
+pub(crate) struct MemoryCommandBegin {
+    /// The handle the committing batch takes, unless the command already ran.
     pub(crate) handle: u32,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryBatchMutationResult {
-    pub(crate) ok: bool,
-    pub(crate) error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct MemoryCommandBeginResult {
-    pub(crate) ok: bool,
-    pub(crate) handle: u32,
+    /// Whether the command already committed, with its stored result behind
+    /// `value_handle`.
     pub(crate) hit: bool,
     pub(crate) value_handle: u32,
-    pub(crate) revision: i64,
-    pub(crate) error: String,
 }

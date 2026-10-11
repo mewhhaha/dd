@@ -163,11 +163,9 @@ const awaitRequestReply = async (label, startOp, timeoutMs = 5_000, options = un
   if (signal && AbortSignalPrototypeGetAborted(signal)) {
     throw abortErrorForSignal(signal);
   }
-  const started = startOp();
-  if (!started || typeof started !== "object" || started.ok === false) {
-    throw new Error(String(started?.error ?? `${label} failed to start`));
-  }
-  const replyId = StringPrototypeTrim(String(started.reply_id ?? ""));
+  // The start op returns the reply's id, or throws when the request cannot
+  // start.
+  const replyId = StringPrototypeTrim(String(startOp() ?? ""));
   if (!replyId) {
     throw new Error(`${label} missing reply id`);
   }
@@ -438,13 +436,7 @@ const emitResponseStart = async (requestContext, status, headersHandle) => {
 const emitResponseChunk = async (requestContext, chunk) => {
   await syncFrozenTime();
   const bytes = toBytes(chunk);
-  const result = await op_emit_response_chunk(
-    requestContext.completionHandle,
-    bytes,
-  );
-  if (!result || typeof result !== "object" || result.ok === false) {
-    throw new Error(String(result?.error ?? "response stream chunk failed"));
-  }
+  await op_emit_response_chunk(requestContext.completionHandle, bytes);
   return bytes;
 };
 

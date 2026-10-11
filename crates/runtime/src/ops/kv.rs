@@ -1,5 +1,12 @@
 use super::*;
 
+/// A stored value, its bytes waiting behind a handle.
+#[derive(Debug, Serialize)]
+pub(crate) struct KvValue {
+    value_handle: u32,
+    encoding: String,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct KvListItem {
     key: String,
@@ -7,73 +14,24 @@ pub(crate) struct KvListItem {
     encoding: String,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct KvProfileResult {
-    ok: bool,
-    snapshot: Option<KvProfileSnapshot>,
-    error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct KvGetValueResult {
-    ok: bool,
-    found: bool,
-    value_handle: u32,
-    encoding: String,
-    error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct KvOpResult {
-    ok: bool,
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct KvListResult {
-    ok: bool,
-    entries: Vec<KvListItem>,
-    error: String,
-}
-
+/// The value stored under `key`, or `null` when there is none.
 pub(crate) async fn op_kv_get_value(
     state: Rc<RefCell<OpState>>,
     binding: String,
     key: String,
-) -> KvGetValueResult {
+) -> std::result::Result<Option<KvValue>, OpError> {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let started = Instant::now();
     let store = state.borrow().borrow::<KvStore>().clone();
     let result = match store.get(&worker_name, &binding, &key).await {
-        Ok(Some(value)) => {
-            let value_handle = state
+        Ok(value) => Ok(value.map(|value| KvValue {
+            value_handle: state
                 .borrow_mut()
                 .borrow_mut::<HttpPreparedBodies>()
-                .insert(value.value);
-            KvGetValueResult {
-                ok: true,
-                found: true,
-                value_handle,
-                encoding: value.encoding,
-                error: String::new(),
-            }
-        }
-        Ok(None) => KvGetValueResult {
-            ok: true,
-            found: false,
-            value_handle: 0,
-            encoding: "utf8".to_string(),
-            error: String::new(),
-        },
-        Err(error) => KvGetValueResult {
-            ok: false,
-            found: false,
-            value_handle: 0,
-            encoding: "utf8".to_string(),
-            error: error.to_string(),
-        },
+                .insert(value.value),
+            encoding: value.encoding,
+        })),
+        Err(error) => Err(OpError::new(format!("kv get {key}: {error}"))),
     };
     store.record_profile(
         KvProfileMetricKind::OpGetValue,
@@ -97,13 +55,9 @@ pub(crate) fn op_kv_profile_record_js(
     store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
 }
 
-pub(crate) fn op_kv_profile_take(state: &mut OpState) -> KvProfileResult {
+pub(crate) fn op_kv_profile_take(state: &mut OpState) -> KvProfileSnapshot {
     let store = state.borrow::<KvStore>().clone();
-    KvProfileResult {
-        ok: true,
-        snapshot: Some(store.take_profile_snapshot_and_reset()),
-        error: String::new(),
-    }
+    store.take_profile_snapshot_and_reset()
 }
 
 pub(crate) fn op_kv_profile_reset(state: &mut OpState) {
@@ -116,21 +70,14 @@ pub(crate) async fn op_kv_put(
     binding: String,
     key: String,
     value: String,
-) -> KvOpResult {
+) -> std::result::Result<(), OpError> {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store.put(&worker_name, &binding, &key, &value).await {
-        Ok(version) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: Some(version),
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
+    store
+        .put(&worker_name, &binding, &key, &value)
+        .await
+        .map_err(|error| OpError::new(format!("kv put {key}: {error}")))?;
+    Ok(())
 }
 
 pub(crate) async fn op_kv_put_value_bytes(
@@ -139,46 +86,29 @@ pub(crate) async fn op_kv_put_value_bytes(
     key: String,
     encoding: String,
     value: JsBuffer,
-) -> KvOpResult {
+) -> std::result::Result<(), OpError> {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let value = Bytes::copy_from_slice(value.as_ref());
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store
+    store
         .put_value(&worker_name, &binding, &key, value.as_ref(), &encoding)
         .await
-    {
-        Ok(version) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: Some(version),
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
+        .map_err(|error| OpError::new(format!("kv put {key}: {error}")))?;
+    Ok(())
 }
 
 pub(crate) async fn op_kv_delete(
     state: Rc<RefCell<OpState>>,
     binding: String,
     key: String,
-) -> KvOpResult {
+) -> std::result::Result<(), OpError> {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
-    match store.delete(&worker_name, &binding, &key).await {
-        Ok(version) => KvOpResult {
-            ok: true,
-            error: String::new(),
-            version: Some(version),
-        },
-        Err(error) => KvOpResult {
-            ok: false,
-            error: error.to_string(),
-            version: None,
-        },
-    }
+    store
+        .delete(&worker_name, &binding, &key)
+        .await
+        .map_err(|error| OpError::new(format!("kv delete {key}: {error}")))?;
+    Ok(())
 }
 
 pub(crate) async fn op_kv_list(
@@ -186,35 +116,20 @@ pub(crate) async fn op_kv_list(
     binding: String,
     prefix: String,
     limit: u32,
-) -> KvListResult {
+) -> std::result::Result<Vec<KvListItem>, OpError> {
     let worker_name = state.borrow().borrow::<WorkerCacheNamespace>().0.clone();
     let store = state.borrow().borrow::<KvStore>().clone();
     let clamped_limit = limit.clamp(1, 1000) as usize;
-    match store
+    let values = store
         .list(&worker_name, &binding, &prefix, clamped_limit)
         .await
-    {
-        Ok(values) => {
-            let entries = {
-                let mut op_state = state.borrow_mut();
-                let bodies = op_state.borrow_mut::<HttpPreparedBodies>();
-                values
-                    .into_iter()
-                    .map(|entry| to_list_item(entry, bodies))
-                    .collect()
-            };
-            KvListResult {
-                ok: true,
-                entries,
-                error: String::new(),
-            }
-        }
-        Err(error) => KvListResult {
-            ok: false,
-            entries: Vec::new(),
-            error: error.to_string(),
-        },
-    }
+        .map_err(|error| OpError::new(format!("kv list {prefix}: {error}")))?;
+    let mut op_state = state.borrow_mut();
+    let bodies = op_state.borrow_mut::<HttpPreparedBodies>();
+    Ok(values
+        .into_iter()
+        .map(|entry| to_list_item(entry, bodies))
+        .collect())
 }
 
 fn to_list_item(entry: KvEntry, bodies: &mut HttpPreparedBodies) -> KvListItem {

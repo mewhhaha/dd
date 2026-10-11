@@ -116,21 +116,22 @@ const ensureMemoryStorageState = (entry) => {
   return entry.storageState;
 };
 
-const memoryTxnReadRecord = (txn, key) => {
-  const result = op_memory_batch_get(txn.batchHandle, key);
-  if (result.ok === false) {
-    throw new Error(result.error);
-  }
-  return result.record;
-};
+const memoryTxnReadRecord = (txn, key) => op_memory_batch_get(txn.batchHandle, key);
 
-const memoryTxnKeys = (txn, prefix) => {
-  const result = op_memory_batch_keys(txn.batchHandle, prefix);
-  if (result.ok === false) {
-    throw new Error(result.error);
-  }
-  return result.keys;
-};
+const memoryTxnKeys = (txn, prefix) => op_memory_batch_keys(txn.batchHandle, prefix);
+
+// Memory ops throw errors of this class when storage itself failed, and the
+// runtime then fails the whole memory entry (failMemoryEntry), not just the
+// call. Worker code sees a plain Error; only this set tells one apart, so
+// nothing the worker throws can pass for a storage failure.
+const memoryStorageFailures = new SafeWeakSet();
+op_register_error_builder("MemoryStorageFailure", (message) => {
+  const error = new Error(message);
+  memoryStorageFailures.add(error);
+  return error;
+});
+
+const isMemoryStorageFailure = (error) => memoryStorageFailures.has(error);
 
 const closeMemoryResourcesOnFailure = async (entry) => {
   const socketHandles = listMemorySocketHandles(
@@ -140,7 +141,7 @@ const closeMemoryResourcesOnFailure = async (entry) => {
   );
   for (let i = 0; i < socketHandles.length; i++) {
     try {
-      const result = await op_memory_socket_close(
+      const pending = op_memory_socket_close(
         memoryScopedScopeHandle(entry),
         socketHandles[i],
         entry.binding,
@@ -148,9 +149,10 @@ const closeMemoryResourcesOnFailure = async (entry) => {
         1011,
         "memory storage flush failed",
       );
-      await syncFrozenTime();
-      if (result && typeof result === "object" && result.ok === false) {
-        consoleWarn(String(result.error ?? "memory socket close failed"));
+      try {
+        await pending;
+      } finally {
+        await syncFrozenTime();
       }
     } catch (error) {
       consoleWarn("memory socket close after storage failure failed", error);
@@ -198,14 +200,7 @@ const gateMemoryOutput = (entry, callback) => {
 };
 
 const stageMemoryTxnEffect = (txn, kind, payload) => {
-  requireMemoryBatchOp(
-    op_memory_batch_effect(
-      txn.batchHandle,
-      kind,
-      toArrayBytes(payload),
-    ),
-    "effect",
-  );
+  op_memory_batch_effect(txn.batchHandle, kind, toArrayBytes(payload));
 };
 
 
@@ -214,16 +209,18 @@ const beginMemoryCommand = async (entry, idempotencyKey) => {
   if (!normalizedKey) {
     return new MemoryCommand(0, false, null);
   }
-  const result = await op_memory_command_begin(
+  const pending = op_memory_command_begin(
     activeRequestContextHandle(),
     memoryScopedScopeHandle(entry),
     entry.binding,
     entry.memoryKey,
     normalizedKey,
   );
-  await syncFrozenTime();
-  if (!result || typeof result !== "object" || result.ok === false) {
-    throw new Error(String(result?.error ?? "memory command begin failed"));
+  let result;
+  try {
+    result = await pending;
+  } finally {
+    await syncFrozenTime();
   }
   return new MemoryCommand(
     toHandle(result.handle),
@@ -241,25 +238,28 @@ const closeMemoryCommand = (handle) => {
 
 const createMemoryTxn = async (entry, commandHandle) => {
   const started = frozenPerfNow();
-  // Looked up when called rather than captured with the other ops: tests
-  // inject storage failures by replacing it through __dd_internals.
-  const result = await core.ops.op_memory_batch_begin(
+  const pending = op_memory_batch_begin(
     activeRequestContextHandle(),
     memoryScopedScopeHandle(entry),
     entry.binding,
     entry.memoryKey,
     commandHandle,
   );
-  await syncFrozenTime();
-  if (!result || typeof result !== "object" || result.ok === false) {
-    const error = new Error(String(result?.error ?? "memory batch begin failed"));
-    if (result?.storage_failure === true) {
+  let batchHandle;
+  try {
+    try {
+      batchHandle = await pending;
+    } finally {
+      await syncFrozenTime();
+    }
+  } catch (error) {
+    if (isMemoryStorageFailure(error)) {
       return await failMemoryEntry(entry, error);
     }
     throw error;
   }
   recordMemoryProfile("js_txn_begin", frozenPerfNow() - started, 1);
-  return new MemoryTxn(entry, result.handle);
+  return new MemoryTxn(entry, batchHandle);
 };
 
 const closeMemoryBatch = (handle) => {
@@ -275,43 +275,28 @@ const closeMemoryTxnBatch = (txn) => {
   }
 };
 
-const requireMemoryBatchOp = (ok, operation) => {
-  if (ok !== true) {
-    throw new Error(`memory batch ${operation} failed`);
-  }
-};
-
 const markMemoryBatchAccepted = (txn) => {
   if (!txn) {
     return;
   }
-  requireMemoryBatchOp(op_memory_batch_accept(txn.batchHandle), "accept");
+  op_memory_batch_accept(txn.batchHandle);
 };
 
 const setMemoryBatchCommandResult = (txn, value) => {
   if (!txn) {
     return;
   }
-  requireMemoryBatchOp(
-    op_memory_batch_command_result(
-      txn.batchHandle,
-      toArrayBytes(value),
-    ),
-    "command result",
-  );
+  op_memory_batch_command_result(txn.batchHandle, toArrayBytes(value));
 };
 
 const addMemoryBatchMutation = (txn, key, value, encoding, deleted) => {
-  const result = op_memory_batch_mutation(
+  op_memory_batch_mutation(
     txn.batchHandle,
     key,
     toArrayBytes(value),
     encoding,
     deleted,
   );
-  if (!result || typeof result !== "object" || result.ok === false) {
-    throw new Error(String(result?.error ?? "memory batch mutation failed"));
-  }
 };
 
 const finishMemoryTxn = async (txn) => {
@@ -319,12 +304,13 @@ const finishMemoryTxn = async (txn) => {
     return;
   }
   const started = frozenPerfNow();
-  const result = await op_memory_batch_apply(txn.batchHandle);
-  await syncFrozenTime();
-  if (!result || typeof result !== "object" || result.ok === false) {
-    throw new Error(String(result?.error ?? "memory transaction commit failed"));
+  let result;
+  try {
+    result = await op_memory_batch_apply(txn.batchHandle);
+  } finally {
+    await syncFrozenTime();
   }
-  if (result.read_only === true || result.applied !== true) {
+  if (result.applied !== true) {
     recordMemoryProfile("js_read_only_commit", frozenPerfNow() - started, 1);
     return;
   }

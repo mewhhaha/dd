@@ -1,12 +1,20 @@
 use super::*;
 
+/// The class of error memory ops throw when storage itself failed, rather
+/// than the request or what it asked for. The execute-worker bundle builds
+/// these as plain `Error`s it can tell apart, and fails the whole memory
+/// entry on one (failMemoryEntry), not just the call.
+const MEMORY_STORAGE_FAILURE: &str = "MemoryStorageFailure";
+
+/// Acquires the entry's transaction lease, and returns the memory scope
+/// handle that holds it.
 pub(super) async fn op_memory_lease_acquire(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     binding: String,
     key: String,
-) -> MemoryLeaseResult {
-    let result = async {
+) -> std::result::Result<u32, OpError> {
+    let result: Result<u32> = async {
         if binding.is_empty() || key.is_empty() || binding.len() + key.len() > 1024 {
             return Err(PlatformError::bad_request(format!(
                 "memory lease requires binding and key within 1024 bytes; got {} and {} bytes",
@@ -48,16 +56,7 @@ pub(super) async fn op_memory_lease_acquire(
             lease: Some(lease),
         }))
     }.await;
-    match result {
-        Ok(handle) => MemoryLeaseResult {
-            handle,
-            error: String::new(),
-        },
-        Err(error) => MemoryLeaseResult {
-            handle: 0,
-            error: error.to_string(),
-        },
-    }
+    result.map_err(js_error)
 }
 
 struct ResolvedMemoryScope {
@@ -83,14 +82,15 @@ pub(crate) fn clear_memory_handles(state: &mut OpState, request_context_handle: 
         .clear_owner(request_context_handle);
 }
 
+/// Opens a read handle on the entry's committed snapshot.
 pub(super) async fn op_memory_read_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     binding: String,
     key: String,
-) -> MemoryBeginResult {
+) -> std::result::Result<u32, OpError> {
     let mut storage_failure = false;
-    let result = async {
+    let result: Result<u32> = async {
         if binding.is_empty() || key.is_empty() || binding.len() + key.len() > 1024 {
             return Err(PlatformError::bad_request(
                 "memory read requires binding and key within 1024 bytes",
@@ -147,20 +147,13 @@ pub(super) async fn op_memory_read_begin(
         )
     }
     .await;
-    match result {
-        Ok(handle) => MemoryBeginResult {
-            ok: true,
-            storage_failure: false,
-            handle,
-            error: String::new(),
-        },
-        Err(error) => MemoryBeginResult {
-            ok: false,
-            storage_failure,
-            handle: 0,
-            error: error.to_string(),
-        },
-    }
+    result.map_err(|error| {
+        if storage_failure {
+            OpError::custom(MEMORY_STORAGE_FAILURE, error.to_string())
+        } else {
+            js_error(error)
+        }
+    })
 }
 
 pub(super) fn op_memory_read_close(state: &mut OpState, read_handle: u32) {
@@ -184,48 +177,39 @@ fn memory_snapshot_record(
     })
 }
 
+fn memory_read_handle(
+    state: &OpState,
+    read_handle: u32,
+) -> std::result::Result<&MemoryReadHandle, OpError> {
+    state
+        .borrow::<MemoryReadHandles>()
+        .get(read_handle)
+        .ok_or_else(|| OpError::new("memory read handle is invalid"))
+}
+
+/// The value the snapshot holds for `key`, or `null` when it holds none.
 pub(super) fn op_memory_read_get(
     state: &mut OpState,
     read_handle: u32,
     key: String,
-) -> MemoryGetResult {
-    let Some(read) = state.borrow::<MemoryReadHandles>().get(read_handle) else {
-        return MemoryGetResult {
-            ok: false,
-            record: None,
-            error: "memory read handle is invalid".into(),
-        };
-    };
-    MemoryGetResult {
-        ok: true,
-        record: memory_snapshot_record(&read.snapshot, &key),
-        error: String::new(),
-    }
+) -> std::result::Result<Option<MemoryReadValue>, OpError> {
+    let read = memory_read_handle(state, read_handle)?;
+    Ok(memory_snapshot_record(&read.snapshot, &key))
 }
 
 pub(super) fn op_memory_read_keys(
     state: &mut OpState,
     read_handle: u32,
     prefix: String,
-) -> MemoryKeysResult {
-    let Some(read) = state.borrow::<MemoryReadHandles>().get(read_handle) else {
-        return MemoryKeysResult {
-            ok: false,
-            keys: Vec::new(),
-            error: "memory read handle is invalid".into(),
-        };
-    };
-    MemoryKeysResult {
-        ok: true,
-        keys: read
-            .snapshot
-            .entries
-            .iter()
-            .filter(|entry| !entry.deleted && entry.key.starts_with(&prefix))
-            .map(|entry| entry.key.clone())
-            .collect(),
-        error: String::new(),
-    }
+) -> std::result::Result<Vec<String>, OpError> {
+    let read = memory_read_handle(state, read_handle)?;
+    Ok(read
+        .snapshot
+        .entries
+        .iter()
+        .filter(|entry| !entry.deleted && entry.key.starts_with(&prefix))
+        .map(|entry| entry.key.clone())
+        .collect())
 }
 
 fn memory_batch_requires_commit(batch: &MemoryBatchHandle) -> bool {
@@ -422,6 +406,22 @@ pub(super) fn op_memory_bytes_take(
         .into()
 }
 
+/// The failure the isolate's next `op_memory_batch_begin` throws instead of
+/// beginning a batch: a storage failure, or an ordinary one. The runtime's
+/// tests set it with `op_test_memory_batch_begin_fail`.
+#[cfg(test)]
+pub(super) struct MemoryBatchBeginFailure {
+    storage: bool,
+    message: String,
+}
+
+#[cfg(test)]
+pub(super) fn op_test_memory_batch_begin_fail(state: &mut OpState, storage: bool, message: String) {
+    state.put(MemoryBatchBeginFailure { storage, message });
+}
+
+/// Opens a batch on the entry's committed snapshot, for an atomic callback
+/// under the entry's transaction lease.
 pub(super) async fn op_memory_batch_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -429,48 +429,33 @@ pub(super) async fn op_memory_batch_begin(
     binding: String,
     key: String,
     command_handle: u32,
-) -> MemoryBeginResult {
-    if request_context_handle == 0 {
-        return MemoryBeginResult {
-            ok: false,
-            storage_failure: false,
-            handle: 0,
-            error: "memory batch begin requires request_context_handle".to_string(),
-        };
+) -> std::result::Result<u32, OpError> {
+    #[cfg(test)]
+    if let Some(failure) = state.borrow_mut().try_take::<MemoryBatchBeginFailure>() {
+        return Err(if failure.storage {
+            OpError::custom(MEMORY_STORAGE_FAILURE, failure.message)
+        } else {
+            OpError::new(failure.message)
+        });
     }
-    let scope =
-        match memory_scope_for_payload_with_epoch(&state, memory_scope_handle, &binding, &key) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return MemoryBeginResult {
-                    ok: false,
-                    storage_failure: false,
-                    handle: 0,
-                    error: error.to_string(),
-                };
-            }
-        };
+    if request_context_handle == 0 {
+        return Err(OpError::new(
+            "memory batch begin requires request_context_handle",
+        ));
+    }
+    let scope = memory_scope_for_payload_with_epoch(&state, memory_scope_handle, &binding, &key)
+        .map_err(js_error)?;
     if scope.lease.is_none() {
-        return MemoryBeginResult {
-            ok: false,
-            storage_failure: false,
-            handle: 0,
-            error: format!("memory batch for {binding}/{key} requires an active transaction lease"),
-        };
+        return Err(OpError::new(format!(
+            "memory batch for {binding}/{key} requires an active transaction lease"
+        )));
     }
     let store = state.borrow().borrow::<MemoryStore>().clone();
     let started = Instant::now();
-    let snapshot = match store.snapshot(&scope.namespace, &scope.memory_key).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return MemoryBeginResult {
-                ok: false,
-                storage_failure: true,
-                handle: 0,
-                error: error.to_string(),
-            };
-        }
-    };
+    let snapshot = store
+        .snapshot(&scope.namespace, &scope.memory_key)
+        .await
+        .map_err(|error| OpError::custom(MEMORY_STORAGE_FAILURE, error.to_string()))?;
     store.record_profile(
         MemoryProfileMetricKind::OpSnapshot,
         started.elapsed().as_micros() as u64,
@@ -484,12 +469,7 @@ pub(super) async fn op_memory_batch_begin(
         .get(request_context_handle)
         .is_none_or(|request| request.canceled.load(Ordering::SeqCst))
     {
-        return MemoryBeginResult {
-            ok: false,
-            storage_failure: false,
-            handle: 0,
-            error: "memory transaction request was canceled".into(),
-        };
+        return Err(OpError::new("memory transaction request was canceled"));
     }
     let batch = MemoryBatchHandle {
         request_context_handle,
@@ -505,27 +485,11 @@ pub(super) async fn op_memory_batch_begin(
         mutations: Vec::new(),
         effects: Vec::new(),
     };
-    let handle = match state
+    state
         .borrow_mut()
         .borrow_mut::<MemoryBatchHandles>()
         .insert(batch, MEMORY_MAX_BATCH_HANDLES_PER_REQUEST)
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            return MemoryBeginResult {
-                ok: false,
-                storage_failure: false,
-                handle: 0,
-                error: error.to_string(),
-            };
-        }
-    };
-    MemoryBeginResult {
-        ok: true,
-        storage_failure: false,
-        handle,
-        error: String::new(),
-    }
+        .map_err(js_error)
 }
 
 pub(super) fn op_memory_batch_close(state: &mut OpState, batch_handle: u32) {
@@ -536,15 +500,32 @@ pub(super) fn op_memory_batch_close(state: &mut OpState, batch_handle: u32) {
     }
 }
 
-pub(super) fn op_memory_batch_accept(state: &mut OpState, batch_handle: u32) -> bool {
-    let Some(batch) = state
+fn memory_batch_handle(
+    state: &OpState,
+    batch_handle: u32,
+) -> std::result::Result<&MemoryBatchHandle, OpError> {
+    state
+        .borrow::<MemoryBatchHandles>()
+        .get(batch_handle)
+        .ok_or_else(|| OpError::new("memory batch handle is invalid"))
+}
+
+fn memory_batch_handle_mut(
+    state: &mut OpState,
+    batch_handle: u32,
+) -> std::result::Result<&mut MemoryBatchHandle, OpError> {
+    state
         .borrow_mut::<MemoryBatchHandles>()
         .get_mut(batch_handle)
-    else {
-        return false;
-    };
-    batch.accepted = true;
-    true
+        .ok_or_else(|| OpError::new("memory batch handle is invalid"))
+}
+
+pub(super) fn op_memory_batch_accept(
+    state: &mut OpState,
+    batch_handle: u32,
+) -> std::result::Result<(), OpError> {
+    memory_batch_handle_mut(state, batch_handle)?.accepted = true;
+    Ok(())
 }
 
 pub(super) fn op_memory_batch_mutation(
@@ -554,74 +535,43 @@ pub(super) fn op_memory_batch_mutation(
     value: JsBuffer,
     encoding: String,
     deleted: bool,
-) -> MemoryBatchMutationResult {
-    let Some(batch) = state
-        .borrow_mut::<MemoryBatchHandles>()
-        .get_mut(batch_handle)
-    else {
-        return MemoryBatchMutationResult {
-            ok: false,
-            error: "memory batch handle is invalid".to_string(),
-        };
-    };
+) -> std::result::Result<(), OpError> {
+    let batch = memory_batch_handle_mut(state, batch_handle)?;
     let next = MemoryBatchMutation {
         key,
         value: Bytes::from(value.into_vec()),
         encoding,
         deleted,
     };
-    match stage_memory_batch_mutation(batch, next) {
-        Ok(()) => MemoryBatchMutationResult {
-            ok: true,
-            error: String::new(),
-        },
-        Err(error) => MemoryBatchMutationResult {
-            ok: false,
-            error: error.to_string(),
-        },
-    }
+    stage_memory_batch_mutation(batch, next).map_err(js_error)
 }
 
+/// The value the batch holds for `key`, its own writes over its snapshot, or
+/// `null` when it holds none.
 pub(super) fn op_memory_batch_get(
     state: &mut OpState,
     batch_handle: u32,
     key: String,
-) -> MemoryGetResult {
-    let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
-        return MemoryGetResult {
-            ok: false,
-            record: None,
-            error: "memory batch handle is invalid".into(),
-        };
-    };
-    let record = if let Some(mutation) = batch.mutations.iter().find(|mutation| mutation.key == key)
-    {
-        (!mutation.deleted).then(|| MemoryReadValue {
-            value: mutation.value.to_vec().into(),
-            encoding: mutation.encoding.clone(),
-        })
-    } else {
-        memory_snapshot_record(&batch.snapshot, &key)
-    };
-    MemoryGetResult {
-        ok: true,
-        record,
-        error: String::new(),
-    }
+) -> std::result::Result<Option<MemoryReadValue>, OpError> {
+    let batch = memory_batch_handle(state, batch_handle)?;
+    Ok(
+        if let Some(mutation) = batch.mutations.iter().find(|mutation| mutation.key == key) {
+            (!mutation.deleted).then(|| MemoryReadValue {
+                value: mutation.value.to_vec().into(),
+                encoding: mutation.encoding.clone(),
+            })
+        } else {
+            memory_snapshot_record(&batch.snapshot, &key)
+        },
+    )
 }
 
 pub(super) fn op_memory_batch_keys(
     state: &mut OpState,
     batch_handle: u32,
     prefix: String,
-) -> MemoryKeysResult {
-    let Some(batch) = state.borrow::<MemoryBatchHandles>().get(batch_handle) else {
-        return MemoryKeysResult {
-            ok: false,
-            keys: Vec::new(),
-            error: "memory batch handle is invalid".into(),
-        };
-    };
+) -> std::result::Result<Vec<String>, OpError> {
+    let batch = memory_batch_handle(state, batch_handle)?;
     let mut keys = batch
         .snapshot
         .entries
@@ -640,11 +590,7 @@ pub(super) fn op_memory_batch_keys(
             keys.insert(&mutation.key);
         }
     }
-    MemoryKeysResult {
-        ok: true,
-        keys: keys.into_iter().map(str::to_owned).collect(),
-        error: String::new(),
-    }
+    Ok(keys.into_iter().map(str::to_owned).collect())
 }
 
 pub(super) fn op_memory_batch_effect(
@@ -652,13 +598,8 @@ pub(super) fn op_memory_batch_effect(
     batch_handle: u32,
     kind: String,
     payload: JsBuffer,
-) -> bool {
-    let Some(batch) = state
-        .borrow_mut::<MemoryBatchHandles>()
-        .get_mut(batch_handle)
-    else {
-        return false;
-    };
+) -> std::result::Result<(), OpError> {
+    let batch = memory_batch_handle_mut(state, batch_handle)?;
     stage_memory_batch_effect(
         batch,
         MemoryOutboxEffectWrite {
@@ -666,27 +607,22 @@ pub(super) fn op_memory_batch_effect(
             payload: payload.to_vec(),
         },
     )
-    .is_ok()
+    .map_err(js_error)
 }
 
 pub(super) fn op_memory_batch_command_result(
     state: &mut OpState,
     batch_handle: u32,
     value: JsBuffer,
-) -> bool {
-    let Some(batch) = state
-        .borrow_mut::<MemoryBatchHandles>()
-        .get_mut(batch_handle)
-    else {
-        return false;
-    };
+) -> std::result::Result<(), OpError> {
+    let batch = memory_batch_handle_mut(state, batch_handle)?;
     stage_memory_batch_command_result(
         batch,
         MemoryBatchCommandResult {
             value: value.to_vec(),
         },
     )
-    .is_ok()
+    .map_err(js_error)
 }
 
 fn memory_scope_for_payload(
@@ -766,13 +702,9 @@ pub(super) fn op_memory_profile_record_js(
     store.record_profile(kind, u64::from(duration_us), u64::from(items.max(1)));
 }
 
-pub(super) fn op_memory_profile_take(state: &mut OpState) -> MemoryProfileResult {
+pub(super) fn op_memory_profile_take(state: &mut OpState) -> crate::memory::MemoryProfileSnapshot {
     let store = state.borrow::<MemoryStore>().clone();
-    MemoryProfileResult {
-        ok: true,
-        snapshot: Some(store.take_profile_snapshot_and_reset()),
-        error: String::new(),
-    }
+    store.take_profile_snapshot_and_reset()
 }
 
 pub(super) fn op_memory_profile_reset(state: &mut OpState) {
@@ -832,73 +764,30 @@ fn close_memory_command_for_committed_batch(
     }
 }
 
+/// Commits the batch, unless it is read-only and has nothing to commit.
 pub(super) async fn op_memory_batch_apply(
     state: Rc<RefCell<OpState>>,
     batch_handle: u32,
-) -> MemoryStateApplyBatchResult {
+) -> std::result::Result<MemoryBatchApplied, OpError> {
     let started = std::time::Instant::now();
-    let Some(mut batch) = state
+    let mut batch = state
         .borrow_mut()
         .borrow_mut::<MemoryBatchHandles>()
         .remove(batch_handle)
-    else {
-        return MemoryStateApplyBatchResult {
-            ok: false,
-            applied: false,
-            read_only: false,
-            mutation_count: 0,
-            effect_count: 0,
-            accepted: false,
-            output_gate_required: false,
-            error: "memory batch handle is invalid".to_string(),
-        };
-    };
+        .ok_or_else(|| OpError::new("memory batch handle is invalid"))?;
     let mutation_count = batch.mutations.len();
     let effect_count = batch.effects.len();
     if !memory_batch_requires_commit(&batch) {
-        return MemoryStateApplyBatchResult {
-            ok: true,
+        return Ok(MemoryBatchApplied {
             applied: false,
-            read_only: true,
             mutation_count,
-            effect_count,
-            accepted: batch.accepted,
             output_gate_required: false,
-            error: String::new(),
-        };
+        });
     }
-    let owner_epoch = match memory_batch_commit_owner_epoch(&batch) {
-        Ok(owner_epoch) => owner_epoch,
-        Err(error) => {
-            return MemoryStateApplyBatchResult {
-                ok: false,
-                applied: false,
-                read_only: false,
-                mutation_count,
-                effect_count,
-                accepted: batch.accepted,
-                output_gate_required: false,
-                error: error.to_string(),
-            };
-        }
-    };
-    let command_result = match memory_command_result_for_batch(&state, &batch) {
-        Ok(result) => result,
-        Err(error) => {
-            return MemoryStateApplyBatchResult {
-                ok: false,
-                applied: false,
-                read_only: false,
-                mutation_count,
-                effect_count,
-                accepted: batch.accepted,
-                output_gate_required: false,
-                error: error.to_string(),
-            };
-        }
-    };
+    let owner_epoch = memory_batch_commit_owner_epoch(&batch).map_err(js_error)?;
+    let command_result = memory_command_result_for_batch(&state, &batch).map_err(js_error)?;
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    let apply_result = store
+    store
         .apply_batch(
             &batch.namespace,
             &batch.memory_key,
@@ -910,39 +799,24 @@ pub(super) async fn op_memory_batch_apply(
                 lease: batch._lease.clone(),
             },
         )
-        .await;
-    match apply_result {
-        Ok(_) => {
-            close_memory_command_for_committed_batch(&state, &batch);
-            store.record_profile(
-                MemoryProfileMetricKind::OpApplyBatch,
-                started.elapsed().as_micros() as u64,
-                mutation_count as u64 + 1,
-            );
-            MemoryStateApplyBatchResult {
-                ok: true,
-                applied: true,
-                read_only: false,
-                mutation_count,
-                effect_count,
-                accepted: batch.accepted,
-                output_gate_required: batch.accepted || effect_count > 0,
-                error: String::new(),
-            }
-        }
-        Err(error) => MemoryStateApplyBatchResult {
-            ok: false,
-            applied: false,
-            read_only: false,
-            mutation_count,
-            effect_count,
-            accepted: batch.accepted,
-            output_gate_required: false,
-            error: error.to_string(),
-        },
-    }
+        .await
+        .map_err(js_error)?;
+    close_memory_command_for_committed_batch(&state, &batch);
+    store.record_profile(
+        MemoryProfileMetricKind::OpApplyBatch,
+        started.elapsed().as_micros() as u64,
+        mutation_count as u64 + 1,
+    );
+    Ok(MemoryBatchApplied {
+        applied: true,
+        mutation_count,
+        output_gate_required: batch.accepted || effect_count > 0,
+    })
 }
 
+/// Starts the idempotent command `idempotency_key` names: its stored result
+/// when it already committed, or a command handle for the batch that will
+/// commit it.
 pub(super) async fn op_memory_command_begin(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -950,128 +824,64 @@ pub(super) async fn op_memory_command_begin(
     binding: String,
     key: String,
     idempotency_key: String,
-) -> MemoryCommandBeginResult {
+) -> std::result::Result<MemoryCommandBegin, OpError> {
     if request_context_handle == 0 {
-        return MemoryCommandBeginResult {
-            ok: false,
-            handle: 0,
-            hit: false,
-            value_handle: 0,
-            revision: -1,
-            error: "memory command begin requires request_context_handle".to_string(),
-        };
+        return Err(OpError::new(
+            "memory command begin requires request_context_handle",
+        ));
     }
     let idempotency_key = idempotency_key.trim().to_string();
     if idempotency_key.is_empty() {
-        return MemoryCommandBeginResult {
-            ok: true,
+        return Ok(MemoryCommandBegin {
             handle: 0,
             hit: false,
             value_handle: 0,
-            revision: -1,
-            error: String::new(),
-        };
+        });
     }
     if idempotency_key.len() > 512 {
-        return MemoryCommandBeginResult {
-            ok: false,
-            handle: 0,
-            hit: false,
-            value_handle: 0,
-            revision: -1,
-            error: "memory command idempotency key must be at most 512 characters".to_string(),
-        };
+        return Err(OpError::new(
+            "memory command idempotency key must be at most 512 characters",
+        ));
     }
 
     let (namespace, memory_key) =
-        match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key) {
-            Ok(scope) => scope,
-            Err(error) => {
-                return MemoryCommandBeginResult {
-                    ok: false,
-                    handle: 0,
-                    hit: false,
-                    value_handle: 0,
-                    revision: -1,
-                    error: error.to_string(),
-                };
-            }
-        };
+        memory_scope_for_payload(&state, memory_scope_handle, &binding, &key).map_err(js_error)?;
     let store = state.borrow().borrow::<MemoryStore>().clone();
-    match store
+    let stored = store
         .command_result(&namespace, &memory_key, &idempotency_key)
         .await
-    {
-        Ok(Some(result)) => {
-            let value_handle = match memory_output_bytes_insert(
-                &mut state.borrow_mut(),
-                request_context_handle,
-                result.result.into(),
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    return MemoryCommandBeginResult {
-                        ok: false,
-                        handle: 0,
-                        hit: false,
-                        value_handle: 0,
-                        revision: -1,
-                        error: error.to_string(),
-                    };
-                }
-            };
-            MemoryCommandBeginResult {
-                ok: true,
-                handle: 0,
-                hit: true,
-                value_handle,
-                revision: result.revision,
-                error: String::new(),
-            }
-        }
-        Ok(None) => {
-            let handle = match state
-                .borrow_mut()
-                .borrow_mut::<MemoryCommandHandles>()
-                .insert(
-                    MemoryCommandHandle {
-                        request_context_handle,
-                        namespace,
-                        memory_key,
-                        idempotency_key,
-                    },
-                    MEMORY_MAX_COMMAND_HANDLES_PER_REQUEST,
-                ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    return MemoryCommandBeginResult {
-                        ok: false,
-                        handle: 0,
-                        hit: false,
-                        value_handle: 0,
-                        revision: -1,
-                        error: error.to_string(),
-                    };
-                }
-            };
-            MemoryCommandBeginResult {
-                ok: true,
-                handle,
-                hit: false,
-                value_handle: 0,
-                revision: -1,
-                error: String::new(),
-            }
-        }
-        Err(error) => MemoryCommandBeginResult {
-            ok: false,
+        .map_err(js_error)?;
+    if let Some(stored) = stored {
+        let value_handle = memory_output_bytes_insert(
+            &mut state.borrow_mut(),
+            request_context_handle,
+            stored.result.into(),
+        )
+        .map_err(js_error)?;
+        return Ok(MemoryCommandBegin {
             handle: 0,
-            hit: false,
-            value_handle: 0,
-            revision: -1,
-            error: error.to_string(),
-        },
+            hit: true,
+            value_handle,
+        });
     }
+    let handle = state
+        .borrow_mut()
+        .borrow_mut::<MemoryCommandHandles>()
+        .insert(
+            MemoryCommandHandle {
+                request_context_handle,
+                namespace,
+                memory_key,
+                idempotency_key,
+            },
+            MEMORY_MAX_COMMAND_HANDLES_PER_REQUEST,
+        )
+        .map_err(js_error)?;
+    Ok(MemoryCommandBegin {
+        handle,
+        hit: false,
+        value_handle: 0,
+    })
 }
 
 pub(super) fn op_memory_command_close(state: &mut OpState, handle: u32) {
@@ -1088,24 +898,13 @@ pub(super) async fn op_memory_socket_close(
     key: String,
     code: u16,
     reason: String,
-) -> MemorySocketCloseResult {
+) -> std::result::Result<(), OpError> {
     if handle.trim().is_empty() {
-        return MemorySocketCloseResult {
-            ok: false,
-            error: "memory socket close requires handle".to_string(),
-        };
+        return Err(OpError::new("memory socket close requires handle"));
     }
 
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketCloseResult {
-                ok: false,
-                error: error.to_string(),
-            };
-        }
-    };
+    let (binding, key) =
+        memory_scope_for_payload(&state, memory_scope_handle, &binding, &key).map_err(js_error)?;
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if emit_isolate_event_from_rc(
@@ -1121,43 +920,24 @@ pub(super) async fn op_memory_socket_close(
     )
     .is_err()
     {
-        return MemorySocketCloseResult {
-            ok: false,
-            error: "memory socket close runtime is unavailable".to_string(),
-        };
+        return Err(OpError::new("memory socket close runtime is unavailable"));
     }
 
     drop(reply_rx);
-    MemorySocketCloseResult {
-        ok: true,
-        error: String::new(),
-    }
+    Ok(())
 }
 
+/// The handles of the entry's open sockets.
 pub(super) fn op_memory_socket_list(
     state: Rc<RefCell<OpState>>,
     memory_scope_handle: u32,
     binding: String,
     key: String,
-) -> MemorySocketListResult {
-    let (binding, key) = match memory_scope_for_payload(&state, memory_scope_handle, &binding, &key)
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return MemorySocketListResult {
-                ok: false,
-                handles: Vec::new(),
-                error: error.to_string(),
-            };
-        }
-    };
-
+) -> std::result::Result<Vec<String>, OpError> {
+    let (binding, key) =
+        memory_scope_for_payload(&state, memory_scope_handle, &binding, &key).map_err(js_error)?;
     let registry = state.borrow().borrow::<MemoryOpenHandleRegistry>().clone();
-    MemorySocketListResult {
-        ok: true,
-        handles: registry.list_socket_handles(&binding, &key),
-        error: String::new(),
-    }
+    Ok(registry.list_socket_handles(&binding, &key))
 }
 
 #[cfg(test)]

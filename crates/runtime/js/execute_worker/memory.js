@@ -11,12 +11,13 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
     }
     const context = copyRequestContext(currentRequestContext());
     return asyncContext.run(context, async () => {
-      const result = await op_memory_read_begin(
-        activeRequestContextHandle(), namespace, memoryKey,
-      );
-      if (!result.ok) {
-        const error = new Error(result.error);
-        if (result.storage_failure) {
+      let readHandle;
+      try {
+        readHandle = await op_memory_read_begin(
+          activeRequestContextHandle(), namespace, memoryKey,
+        );
+      } catch (error) {
+        if (isMemoryStorageFailure(error)) {
           return await failMemoryEntry(ensureMemoryEntry(namespace, memoryKey), error);
         }
         throw error;
@@ -25,11 +26,9 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
       const assertActive = () => {
         if (!active) throw new Error("memory snapshot is outside its synchronous callback");
       };
-      const readSnapshotValue = (key) => {
-        const record = op_memory_read_get(result.handle, memoryStorageKey(key));
-        if (!record.ok) throw new Error(record.error);
-        return record.record ? decodeMemoryStorageValue(record.record) : null;
-      };
+      const readSnapshotValue = (key) => decodeMemoryStorageValue(
+        op_memory_read_get(readHandle, memoryStorageKey(key)),
+      );
       const snapshot = ObjectFreeze({
         get(key) {
           assertActive();
@@ -39,9 +38,7 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
           assertActive();
           const prefix = memoryStorageKey(options?.prefix ?? "");
           const limit = memoryListLimit(options);
-          const keys = op_memory_read_keys(result.handle, prefix);
-          if (!keys.ok) throw new Error(keys.error);
-          return listMemoryEntries(keys.keys, limit, readSnapshotValue);
+          return listMemoryEntries(op_memory_read_keys(readHandle, prefix), limit, readSnapshotValue);
         },
       });
       try {
@@ -61,7 +58,7 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
         return value;
       } finally {
         active = false;
-        op_memory_read_close(result.handle);
+        op_memory_read_close(readHandle);
       }
     });
   },
@@ -84,11 +81,10 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
     }
     const context = copyRequestContext(currentRequestContext());
     return asyncContext.run(context, async () => {
-      const lease = await op_memory_lease_acquire(activeRequestContextHandle(), namespace, memoryKey);
-      if (!lease?.handle) {
-        throw new Error(String(lease?.error ?? "memory lease is unavailable"));
-      }
-      context.memoryRequestScopeHandle = lease.handle;
+      const leaseHandle = await op_memory_lease_acquire(
+        activeRequestContextHandle(), namespace, memoryKey,
+      );
+      context.memoryRequestScopeHandle = leaseHandle;
       let command;
       try {
         const entry = ensureMemoryEntry(namespace, memoryKey);
@@ -100,7 +96,7 @@ const createMemoryStub = (namespace, memoryKey) => ObjectFreeze({
         return await executeMemoryTransaction(entry, callback, command.handle);
       } finally {
         closeMemoryCommand(command?.handle);
-        op_memory_request_scope_close(lease.handle);
+        op_memory_request_scope_close(leaseHandle);
       }
     });
   },

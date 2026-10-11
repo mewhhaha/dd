@@ -90,13 +90,6 @@ struct MemoryProfileSnapshot {
     runtime_outbox_drain: MemoryProfileMetric,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-struct MemoryProfileEnvelope {
-    ok: bool,
-    snapshot: Option<MemoryProfileSnapshot>,
-    error: String,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct BenchOptions {
     request_timeout: Duration,

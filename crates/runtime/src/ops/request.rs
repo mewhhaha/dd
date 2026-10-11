@@ -1,4 +1,5 @@
 use super::*;
+use dd_v8::ToJsBuffer;
 
 pub(super) fn op_request_invocation_descriptor(
     state: &mut OpState,
@@ -18,10 +19,11 @@ pub(super) fn op_take_worker_deployment_config(
         .remove(deployment_handle)
 }
 
+/// The next chunk of the request body, or `null` at its end.
 pub(super) async fn op_request_body_read(
     state: Rc<RefCell<OpState>>,
     stream_handle: u32,
-) -> RequestBodyReadResult {
+) -> std::result::Result<Option<ToJsBuffer>, OpError> {
     let stream = {
         let state_ref = state.borrow();
         state_ref
@@ -30,21 +32,11 @@ pub(super) async fn op_request_body_read(
             .cloned()
     };
     let Some(stream) = stream else {
-        return RequestBodyReadResult {
-            ok: true,
-            done: true,
-            body_handle: 0,
-            error: String::new(),
-        };
+        return Ok(None);
     };
 
     if stream.is_canceled() {
-        return RequestBodyReadResult {
-            ok: false,
-            done: true,
-            body_handle: 0,
-            error: "request body stream canceled".to_string(),
-        };
+        return Err(OpError::new("request body stream canceled"));
     }
 
     let canceled = stream.canceled_notify.notified();
@@ -57,56 +49,26 @@ pub(super) async fn op_request_body_read(
                     let previous = stream.bytes_read.fetch_add(bytes.len(), Ordering::SeqCst);
                     if previous.saturating_add(bytes.len()) > stream.max_bytes {
                         clear_request_body_stream_entry(&state, stream_handle);
-                        RequestBodyReadResult {
-                            ok: false,
-                            done: true,
-                            body_handle: 0,
-                            error: format!(
-                                "request body exceeded max_request_body_bytes ({} bytes)",
-                                stream.max_bytes
-                            ),
-                        }
-                    } else {
-                        let body_handle = state
-                            .borrow_mut()
-                            .borrow_mut::<HttpPreparedBodies>()
-                            .insert(bytes);
-                        RequestBodyReadResult {
-                            ok: true,
-                            done: false,
-                            body_handle,
-                            error: String::new(),
-                        }
+                        return Err(OpError::new(format!(
+                            "request body exceeded max_request_body_bytes ({} bytes)",
+                            stream.max_bytes
+                        )));
                     }
+                    Ok(Some(bytes.to_vec().into()))
                 }
                 Some(Err(error)) => {
                     clear_request_body_stream_entry(&state, stream_handle);
-                    RequestBodyReadResult {
-                        ok: false,
-                        done: true,
-                        body_handle: 0,
-                        error,
-                    }
+                    Err(OpError::new(error))
                 }
                 None => {
                     clear_request_body_stream_entry(&state, stream_handle);
-                    RequestBodyReadResult {
-                        ok: true,
-                        done: true,
-                        body_handle: 0,
-                        error: String::new(),
-                    }
+                    Ok(None)
                 }
             }
         }
         _ = &mut canceled => {
             clear_request_body_stream_entry(&state, stream_handle);
-            RequestBodyReadResult {
-                ok: false,
-                done: true,
-                body_handle: 0,
-                error: "request body stream canceled".to_string(),
-            }
+            Err(OpError::new("request body stream canceled"))
         }
     }
 }

@@ -57,13 +57,6 @@ struct KvProfileSnapshot {
     op_get_value: KvProfileMetric,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-struct KvProfileEnvelope {
-    ok: bool,
-    snapshot: Option<KvProfileSnapshot>,
-    error: String,
-}
-
 const FETCH_BASELINE_WORKER_SOURCE: &str = r#"
 export default {
   fetch() {
@@ -484,16 +477,7 @@ async fn take_profile(
         .await
         .map_err(|error| error.to_string())?;
     let body = String::from_utf8(response.body).map_err(|error| error.to_string())?;
-    let profile: KvProfileEnvelope =
-        serde_json::from_str(&body).map_err(|error| error.to_string())?;
-    if !profile.ok {
-        return Err(if profile.error.is_empty() {
-            "kv profile collection failed".to_string()
-        } else {
-            profile.error
-        });
-    }
-    Ok(profile.snapshot.unwrap_or_default())
+    serde_json::from_str(&body).map_err(|error| error.to_string())
 }
 
 fn print_profile(profile: &KvProfileSnapshot) {

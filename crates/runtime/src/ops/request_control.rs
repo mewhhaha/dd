@@ -2,22 +2,6 @@ use super::*;
 
 static SERVICE_FETCH_REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn reply_start_ok(reply_id: String) -> PendingReplyStartResult {
-    PendingReplyStartResult {
-        ok: true,
-        reply_id,
-        error: String::new(),
-    }
-}
-
-fn reply_start_error(error: impl ToString) -> PendingReplyStartResult {
-    PendingReplyStartResult {
-        ok: false,
-        reply_id: String::new(),
-        error: error.to_string(),
-    }
-}
-
 fn service_binding_owner_for_request(
     state: &Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -103,6 +87,7 @@ pub(super) fn op_request_control_take(state: &mut OpState) -> Vec<RequestControl
     batch
 }
 
+/// Starts a reply the runtime pushes after `delay_ms`, and returns its id.
 #[cfg(test)]
 pub(super) fn op_test_async_reply_start(
     state: Rc<RefCell<OpState>>,
@@ -111,19 +96,14 @@ pub(super) fn op_test_async_reply_start(
     ok: bool,
     value: String,
     error: String,
-) -> PendingReplyStartResult {
+) -> std::result::Result<String, OpError> {
     let delay_ms = if delay_ms.is_finite() && delay_ms > 0.0 {
         delay_ms.trunc() as u64
     } else {
         0
     };
     let (worker_name, generation, isolate_id) =
-        match request_owner_for_request(&state, request_context_handle) {
-            Ok(value) => value,
-            Err(error) => {
-                return reply_start_error(error);
-            }
-        };
+        request_owner_for_request(&state, request_context_handle).map_err(js_error)?;
     let replies = state.borrow().borrow::<TestAsyncReplies>().clone();
     let reply_id = replies.allocate(PendingReplyOwner {
         worker_name,
@@ -144,9 +124,9 @@ pub(super) fn op_test_async_reply_start(
     .is_err()
     {
         replies.cancel(&reply_id);
-        return reply_start_error("test async reply runtime is unavailable");
+        return Err(OpError::new("test async reply runtime is unavailable"));
     }
-    reply_start_ok(reply_id)
+    Ok(reply_id)
 }
 
 #[cfg(test)]
@@ -155,6 +135,8 @@ pub(super) fn op_test_async_reply_cancel(state: &mut OpState, reply_id: String) 
     replies.cancel(reply_id.trim());
 }
 
+/// Starts a fetch of the service `binding` names, and returns the id of the
+/// reply that will carry its response.
 pub(super) fn op_service_binding_fetch_start(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -163,7 +145,7 @@ pub(super) fn op_service_binding_fetch_start(
     url: String,
     headers_handle: u32,
     body_handle: u32,
-) -> PendingReplyStartResult {
+) -> std::result::Result<String, OpError> {
     let (headers, body) = {
         let mut op_state = state.borrow_mut();
         let headers = op_state
@@ -176,25 +158,15 @@ pub(super) fn op_service_binding_fetch_start(
             .unwrap_or_default();
         (headers, body)
     };
-    let caller_request_id = {
-        let op_state = state.borrow();
-        match op_state
-            .borrow::<ActiveRequestContextHandles>()
-            .get_handle(request_context_handle)
-        {
-            Some(context) => context.request_id.clone(),
-            None => {
-                return reply_start_error("service binding fetch request context is unavailable");
-            }
-        }
-    };
+    let caller_request_id = state
+        .borrow()
+        .borrow::<ActiveRequestContextHandles>()
+        .get_handle(request_context_handle)
+        .map(|context| context.request_id.clone())
+        .ok_or_else(|| OpError::new("service binding fetch request context is unavailable"))?;
     let (owner_worker, owner_generation, _owner_isolate_id, target_worker) =
-        match service_binding_owner_for_request(&state, request_context_handle, &binding) {
-            Ok(value) => value,
-            Err(error) => {
-                return reply_start_error(error);
-            }
-        };
+        service_binding_owner_for_request(&state, request_context_handle, &binding)
+            .map_err(js_error)?;
     let subrequest_id = format!(
         "{}:service:{}",
         caller_request_id,
@@ -215,10 +187,10 @@ pub(super) fn op_service_binding_fetch_start(
             .borrow::<RequestSecretContexts>()
             .get(request_context_handle)
         else {
-            return reply_start_error("service binding request scope is unavailable");
+            return Err(OpError::new("service binding request scope is unavailable"));
         };
         if parent.canceled.load(Ordering::Acquire) {
-            return reply_start_error("service binding request was aborted");
+            return Err(OpError::new("service binding request was aborted"));
         }
         (
             op_state.borrow::<PendingReplies>().clone(),
@@ -248,7 +220,7 @@ pub(super) fn op_service_binding_fetch_start(
         .is_err()
     {
         pending_replies.cancel(&reply_id);
-        return reply_start_error("service binding runtime is unavailable");
+        return Err(OpError::new("service binding runtime is unavailable"));
     }
-    reply_start_ok(reply_id)
+    Ok(reply_id)
 }

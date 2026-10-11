@@ -540,19 +540,23 @@ class Cache {
     const method = RequestPrototypeGetMethod(normalizedRequest);
     const url = RequestPrototypeGetUrl(normalizedRequest);
     const requestHeaders = headerPairs(RequestPrototypeGetHeaders(normalizedRequest));
-    const result = await op_cache_match(
+    const pending = op_cache_match(
       this.name,
       method,
       url,
       op_http_store_prepared_headers(requestHeaders),
       dd.cacheBypassStale(),
     );
-    await syncFrozenTimeBoundary();
-
-    if (result && typeof result === "object" && result.ok === false) {
-      throw new Error(String(result.error ?? "cache match failed"));
+    // The cache ops throw what storage failed with; the frozen clock syncs
+    // once each settles, either way.
+    let result;
+    try {
+      result = await pending;
+    } finally {
+      await syncFrozenTimeBoundary();
     }
-    if (!(result && typeof result === "object" && result.found === true)) {
+
+    if (result === null) {
       return undefined;
     }
 
@@ -584,7 +588,7 @@ class Cache {
       headerPairs(RequestPrototypeGetHeaders(normalizedRequest)),
     );
     const responseHeadersHandle = op_http_store_prepared_headers(parts.headers);
-    const result = await op_cache_put(
+    const pending = op_cache_put(
       this.name,
       RequestPrototypeGetMethod(normalizedRequest),
       RequestPrototypeGetUrl(normalizedRequest),
@@ -593,25 +597,28 @@ class Cache {
       responseHeadersHandle,
       bodyHandle,
     );
-    await syncFrozenTimeBoundary();
-    if (result && typeof result === "object" && result.ok === false) {
-      throw new Error(String(result.error ?? "cache put failed"));
+    try {
+      await pending;
+    } finally {
+      await syncFrozenTimeBoundary();
     }
   }
 
   async delete(request, _options = undefined) {
     const normalizedRequest = toRequest(request);
-    const result = await op_cache_delete(
+    const pending = op_cache_delete(
       this.name,
       RequestPrototypeGetMethod(normalizedRequest),
       RequestPrototypeGetUrl(normalizedRequest),
       op_http_store_prepared_headers(headerPairs(RequestPrototypeGetHeaders(normalizedRequest))),
     );
-    await syncFrozenTimeBoundary();
-    if (result && typeof result === "object" && result.ok === false) {
-      throw new Error(String(result.error ?? "cache delete failed"));
+    let deleted;
+    try {
+      deleted = await pending;
+    } finally {
+      await syncFrozenTimeBoundary();
     }
-    return Boolean(result?.deleted);
+    return deleted;
   }
 }
 

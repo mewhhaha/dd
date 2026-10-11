@@ -9,16 +9,7 @@ pub(super) async fn take_profile(
         .await
         .map_err(|error| error.to_string())?;
     let body = String::from_utf8(output.body).map_err(|error| error.to_string())?;
-    let profile: MemoryProfileEnvelope =
-        serde_json::from_str(&body).map_err(|error| error.to_string())?;
-    if !profile.ok {
-        return Err(if profile.error.is_empty() {
-            "memory profile collection failed".to_string()
-        } else {
-            profile.error
-        });
-    }
-    Ok(profile.snapshot.unwrap_or_default())
+    serde_json::from_str(&body).map_err(|error| error.to_string())
 }
 
 pub(super) fn print_profile(profile: &MemoryProfileSnapshot) {

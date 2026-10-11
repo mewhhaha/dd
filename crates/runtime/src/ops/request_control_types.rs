@@ -150,13 +150,6 @@ impl FetchReplyResult {
     }
 }
 
-#[derive(Serialize)]
-pub(crate) struct PendingReplyStartResult {
-    pub(crate) ok: bool,
-    pub(crate) reply_id: String,
-    pub(crate) error: String,
-}
-
 #[cfg(test)]
 #[derive(Serialize)]
 pub struct TestAsyncReplyResult {

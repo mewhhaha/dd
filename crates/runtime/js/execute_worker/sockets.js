@@ -1,9 +1,5 @@
 const listMemorySocketHandles = (binding, memoryKey, scopeHandle = 0) => {
-  const result = op_memory_socket_list(scopeHandle, binding, memoryKey);
-  if (!result || typeof result !== "object" || result.ok === false) {
-    throw new Error(String(result?.error ?? "socket values failed"));
-  }
-  const listed = result.handles;
+  const listed = op_memory_socket_list(scopeHandle, binding, memoryKey);
   const handles = [];
   for (let i = 0; i < listed.length; i++) {
     ArrayPrototypePush(handles, String(listed[i]));

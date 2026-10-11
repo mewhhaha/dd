@@ -1,30 +1,15 @@
 use super::*;
 
+/// A cached response, its headers and body waiting behind handles.
 #[derive(Debug, Serialize)]
-pub(crate) struct CacheMatchResult {
-    ok: bool,
-    found: bool,
-    stale: bool,
+pub(crate) struct CacheMatch {
     should_revalidate: bool,
     status: u16,
     headers_handle: u32,
     body_handle: u32,
-    error: String,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct CacheDeleteResult {
-    ok: bool,
-    deleted: bool,
-    error: String,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct CachePutResult {
-    ok: bool,
-    error: String,
-}
-
+/// The cached response for a request, or `null` on a miss.
 pub(crate) async fn op_cache_match(
     state: Rc<RefCell<OpState>>,
     cache_name: String,
@@ -32,7 +17,7 @@ pub(crate) async fn op_cache_match(
     url: String,
     headers_handle: u32,
     bypass_stale: bool,
-) -> CacheMatchResult {
+) -> std::result::Result<Option<CacheMatch>, OpError> {
     let headers = state
         .borrow_mut()
         .borrow_mut::<HttpPreparedHeaders>()
@@ -46,50 +31,20 @@ pub(crate) async fn op_cache_match(
         bypass_stale,
     };
     let store = state.borrow().borrow::<CacheStore>().clone();
-    match store.get(&request).await {
-        Ok(CacheLookup::Fresh(response)) => cache_match_hit_result(&state, response, false, false),
-        Ok(CacheLookup::StaleWhileRevalidate(response)) => {
-            cache_match_hit_result(&state, response, true, true)
+    Ok(match store.get(&request).await.map_err(js_error)? {
+        CacheLookup::Fresh(response) => Some(cache_match_hit(&state, response, false)),
+        CacheLookup::StaleWhileRevalidate(response) => {
+            Some(cache_match_hit(&state, response, true))
         }
-        Ok(CacheLookup::StaleIfError(_)) => CacheMatchResult {
-            ok: true,
-            found: false,
-            stale: false,
-            should_revalidate: false,
-            status: 0,
-            headers_handle: 0,
-            body_handle: 0,
-            error: String::new(),
-        },
-        Ok(CacheLookup::Miss) => CacheMatchResult {
-            ok: true,
-            found: false,
-            stale: false,
-            should_revalidate: false,
-            status: 0,
-            headers_handle: 0,
-            body_handle: 0,
-            error: String::new(),
-        },
-        Err(error) => CacheMatchResult {
-            ok: false,
-            found: false,
-            stale: false,
-            should_revalidate: false,
-            status: 0,
-            headers_handle: 0,
-            body_handle: 0,
-            error: error.to_string(),
-        },
-    }
+        CacheLookup::StaleIfError(_) | CacheLookup::Miss => None,
+    })
 }
 
-fn cache_match_hit_result(
+fn cache_match_hit(
     state: &Rc<RefCell<OpState>>,
     response: CacheResponse,
-    stale: bool,
     should_revalidate: bool,
-) -> CacheMatchResult {
+) -> CacheMatch {
     let (headers_handle, body_handle) = {
         let mut op_state = state.borrow_mut();
         let headers_handle = op_state
@@ -100,15 +55,11 @@ fn cache_match_hit_result(
             .insert(response.body);
         (headers_handle, body_handle)
     };
-    CacheMatchResult {
-        ok: true,
-        found: true,
-        stale,
+    CacheMatch {
         should_revalidate,
         status: response.status,
         headers_handle,
         body_handle,
-        error: String::new(),
     }
 }
 
@@ -122,7 +73,7 @@ pub(crate) async fn op_cache_put(
     response_status: u16,
     response_headers_handle: u32,
     response_body_handle: u32,
-) -> CachePutResult {
+) -> std::result::Result<(), OpError> {
     let (request_headers, response_headers, body) = {
         let mut op_state = state.borrow_mut();
         let request_headers = op_state
@@ -152,16 +103,8 @@ pub(crate) async fn op_cache_put(
         body,
     };
     let store = state.borrow().borrow::<CacheStore>().clone();
-    match store.put(&request, response).await {
-        Ok(_) => CachePutResult {
-            ok: true,
-            error: String::new(),
-        },
-        Err(error) => CachePutResult {
-            ok: false,
-            error: error.to_string(),
-        },
-    }
+    store.put(&request, response).await.map_err(js_error)?;
+    Ok(())
 }
 
 pub(crate) async fn op_cache_delete(
@@ -170,7 +113,7 @@ pub(crate) async fn op_cache_delete(
     method: String,
     url: String,
     headers_handle: u32,
-) -> CacheDeleteResult {
+) -> std::result::Result<bool, OpError> {
     let headers = state
         .borrow_mut()
         .borrow_mut::<HttpPreparedHeaders>()
@@ -185,18 +128,7 @@ pub(crate) async fn op_cache_delete(
     };
 
     let store = state.borrow().borrow::<CacheStore>().clone();
-    match store.delete(&request).await {
-        Ok(deleted) => CacheDeleteResult {
-            ok: true,
-            deleted,
-            error: String::new(),
-        },
-        Err(error) => CacheDeleteResult {
-            ok: false,
-            deleted: false,
-            error: error.to_string(),
-        },
-    }
+    store.delete(&request).await.map_err(js_error)
 }
 
 fn scoped_cache_name(state: &Rc<RefCell<OpState>>, cache_name: &str) -> String {

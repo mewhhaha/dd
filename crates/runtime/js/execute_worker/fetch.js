@@ -120,17 +120,19 @@ const stripCrossOriginRedirectHeaders = (headers) => keepHeaderPairs(headers, (l
 ));
 
 const checkHostFetchUrl = async (requestContextHandle, url) => {
-  const checked = await op_http_check_url(requestContextHandle, url);
-  await syncFrozenTime();
-  if (!checked || typeof checked !== "object" || checked.ok === false) {
-    throw new Error(String(checked?.error ?? "host fetch URL check failed"));
+  let checked;
+  try {
+    checked = await op_http_check_url(requestContextHandle, url);
+  } finally {
+    await syncFrozenTime();
   }
   return new CheckedFetchUrl(String(checked.url || url), toHandle(checked.client_rid));
 };
 
-// One request through the pinned client `clientHandle`, as a Response.
-// Aborting rejects at once; a response that arrives after that has its
-// body released.
+// One request through the pinned client `clientHandle`, as a Response. A
+// fetch that gets no response rejects with the op's TypeError. Aborting
+// rejects at once; a response that arrives after that has its body
+// released.
 const sendHostFetch = async (
   requestContextHandle,
   clientHandle,
@@ -155,14 +157,11 @@ const sendHostFetch = async (
     fetched = await raceAbortSignal(sent, signal);
   } catch (error) {
     PromisePrototypeThen(sent, (late) => {
-      if (late?.body_handle > 0) {
+      if (late.body_handle > 0) {
         op_http_response_close(late.body_handle);
       }
     }, noop);
     throw error;
-  }
-  if (!fetched || fetched.ok !== true) {
-    throw new TypeError(String(fetched?.error ?? "host fetch failed"));
   }
   return hostFetchResponse(fetched, url, method);
 };
@@ -204,16 +203,17 @@ const scopedFetch = async (current, inputValue, initValue) => {
   const normalized = await normalizeFetchInput(inputValue, initValue);
   const normalizedHeadersHandle = op_http_store_prepared_headers(normalized.headers);
   const normalizedBodyHandle = op_http_store_prepared_body(normalized.body);
-  const prepared = await op_http_prepare(
-    current.requestContextHandle,
-    normalized.method,
-    normalized.url,
-    toHandle(normalizedHeadersHandle),
-    toHandle(normalizedBodyHandle),
-  );
-  await syncFrozenTime();
-  if (!prepared || typeof prepared !== "object" || prepared.ok === false) {
-    throw new Error(String(prepared?.error ?? "host fetch prepare failed"));
+  let prepared;
+  try {
+    prepared = await op_http_prepare(
+      current.requestContextHandle,
+      normalized.method,
+      normalized.url,
+      toHandle(normalizedHeadersHandle),
+      toHandle(normalizedBodyHandle),
+    );
+  } finally {
+    await syncFrozenTime();
   }
   const signal = normalized.signal;
   let method = String(prepared.method || "GET");

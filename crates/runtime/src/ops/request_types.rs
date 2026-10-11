@@ -291,85 +291,6 @@ pub(crate) fn parse_egress_allow_host(allowed: &str) -> Option<EgressAllowHost> 
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_invocation_descriptor_keeps_request_state_behind_handles() {
-        let mut handles = RequestInvocationHandles::default();
-        let handle = handles.insert(WorkerRequestPayload {
-            request_id: "runtime-1".to_string(),
-            request_context_handle: 0,
-            completion_handle: 0,
-            memory_request_scope_handle: 0,
-            memory_call: None,
-            request_body_stream_handle: 0,
-            request_headers_handle: 7,
-            request_body_handle: 9,
-            stream_response: false,
-            max_response_body_bytes: 1024,
-            max_request_body_bytes: 1024,
-            method: "POST".to_string(),
-            url: "http://worker/path".to_string(),
-            input_request_id: "user-1".to_string(),
-        });
-
-        let descriptor = handles.remove(handle).expect("descriptor should exist");
-        assert_eq!(descriptor.request_id, "runtime-1");
-        assert_eq!(descriptor.method, "POST");
-        assert_eq!(descriptor.request_headers_handle, 7);
-        assert_eq!(descriptor.request_body_handle, 9);
-        assert_eq!(descriptor.input_request_id, "user-1");
-        assert!(descriptor.memory_call.is_none());
-        let descriptor_value =
-            serde_json::to_value(&descriptor).expect("descriptor should serialize");
-        assert!(
-            descriptor_value.get("body").is_none(),
-            "request body must stay behind request-handle ops"
-        );
-        assert!(
-            descriptor_value.get("headers").is_none(),
-            "request headers must stay behind request-handle ops"
-        );
-        assert!(
-            descriptor_value.get("request").is_none(),
-            "descriptor should not reconstruct the request object before body take"
-        );
-        assert!(handles.remove(handle).is_none());
-    }
-
-    #[test]
-    fn active_request_context_rejects_removed_or_stale_handles() {
-        let mut handles = ActiveRequestContextHandles::default();
-        let completion = handles.insert(ActiveRequestContext {
-            request_context_handle: 42,
-            completion_handle: 0,
-            request_id: "runtime-1".to_string(),
-            completion_token: "token-1".to_string(),
-            wait_until_count: 0,
-            wait_until_done_sent: false,
-        });
-        assert_ne!(completion, 0);
-        assert_eq!(handles.get_request("runtime-1"), Some(42));
-        assert_eq!(
-            handles
-                .get_completion(completion)
-                .map(|context| context.request_context_handle),
-            Some(42)
-        );
-
-        let removed = handles
-            .remove_handle(42)
-            .expect("active request context should remove");
-        assert_eq!(removed.request_id, "runtime-1");
-        assert_eq!(handles.get_request("runtime-1"), None);
-        assert!(handles.get_handle(42).is_none());
-        assert!(handles.get_completion(completion).is_none());
-        assert!(handles.mark_wait_until_done(completion).is_none());
-    }
-}
-
 impl RequestExecutionContext {
     pub(crate) fn new(init: RequestExecutionContextInit) -> Self {
         let RequestExecutionContextInit {
@@ -455,10 +376,81 @@ impl RequestBodyStream {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct RequestBodyReadResult {
-    pub(crate) ok: bool,
-    pub(crate) done: bool,
-    pub(crate) body_handle: u32,
-    pub(crate) error: String,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_invocation_descriptor_keeps_request_state_behind_handles() {
+        let mut handles = RequestInvocationHandles::default();
+        let handle = handles.insert(WorkerRequestPayload {
+            request_id: "runtime-1".to_string(),
+            request_context_handle: 0,
+            completion_handle: 0,
+            memory_request_scope_handle: 0,
+            memory_call: None,
+            request_body_stream_handle: 0,
+            request_headers_handle: 7,
+            request_body_handle: 9,
+            stream_response: false,
+            max_response_body_bytes: 1024,
+            max_request_body_bytes: 1024,
+            method: "POST".to_string(),
+            url: "http://worker/path".to_string(),
+            input_request_id: "user-1".to_string(),
+        });
+
+        let descriptor = handles.remove(handle).expect("descriptor should exist");
+        assert_eq!(descriptor.request_id, "runtime-1");
+        assert_eq!(descriptor.method, "POST");
+        assert_eq!(descriptor.request_headers_handle, 7);
+        assert_eq!(descriptor.request_body_handle, 9);
+        assert_eq!(descriptor.input_request_id, "user-1");
+        assert!(descriptor.memory_call.is_none());
+        let descriptor_value =
+            serde_json::to_value(&descriptor).expect("descriptor should serialize");
+        assert!(
+            descriptor_value.get("body").is_none(),
+            "request body must stay behind request-handle ops"
+        );
+        assert!(
+            descriptor_value.get("headers").is_none(),
+            "request headers must stay behind request-handle ops"
+        );
+        assert!(
+            descriptor_value.get("request").is_none(),
+            "descriptor should not reconstruct the request object before body take"
+        );
+        assert!(handles.remove(handle).is_none());
+    }
+
+    #[test]
+    fn active_request_context_rejects_removed_or_stale_handles() {
+        let mut handles = ActiveRequestContextHandles::default();
+        let completion = handles.insert(ActiveRequestContext {
+            request_context_handle: 42,
+            completion_handle: 0,
+            request_id: "runtime-1".to_string(),
+            completion_token: "token-1".to_string(),
+            wait_until_count: 0,
+            wait_until_done_sent: false,
+        });
+        assert_ne!(completion, 0);
+        assert_eq!(handles.get_request("runtime-1"), Some(42));
+        assert_eq!(
+            handles
+                .get_completion(completion)
+                .map(|context| context.request_context_handle),
+            Some(42)
+        );
+
+        let removed = handles
+            .remove_handle(42)
+            .expect("active request context should remove");
+        assert_eq!(removed.request_id, "runtime-1");
+        assert_eq!(handles.get_request("runtime-1"), None);
+        assert!(handles.get_handle(42).is_none());
+        assert!(handles.get_completion(completion).is_none());
+        assert!(handles.mark_wait_until_done(completion).is_none());
+    }
 }

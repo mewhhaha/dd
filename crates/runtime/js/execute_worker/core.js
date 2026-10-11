@@ -91,6 +91,7 @@ const {
   SafeSet,
   SafeSetIterator,
   SafeWeakMap,
+  SafeWeakSet,
   Set,
   SetPrototypeAdd,
   String,
@@ -188,6 +189,7 @@ const {
   op_kv_put_value_bytes,
   op_memory_batch_accept,
   op_memory_batch_apply,
+  op_memory_batch_begin,
   op_memory_batch_close,
   op_memory_batch_command_result,
   op_memory_batch_effect,
@@ -206,6 +208,7 @@ const {
   op_memory_request_scope_close,
   op_memory_socket_close,
   op_memory_socket_list,
+  op_register_error_builder,
   op_request_body_cancel,
   op_request_body_read,
   op_request_context_cancel,
@@ -515,26 +518,40 @@ const decodeStoredValue = (encoding, valueHandle, context) => {
   throw new Error(`${context} unsupported encoding: ${encoding}`);
 };
 
+// Each call syncs the frozen clock once its op settles, whether the op
+// succeeded or threw (the KV ops name the call and key in their errors). The
+// op starts before the `try`, so a call that throws before its op runs, on a
+// value that cannot be serialized, leaves the clock alone.
 const createKvBinding = (bindingName) => ObjectFreeze({
   async get(key) {
-    const result = await op_kv_get_value(bindingName, String(key));
-    syncFrozenTimeNow();
-    if (!result.ok) throw new Error(`kv get ${key}: ${result.error}`);
-    return result.found ? decodeStoredValue(result.encoding, result.value_handle, "kv get") : null;
+    const pending = op_kv_get_value(bindingName, String(key));
+    let value;
+    try {
+      value = await pending;
+    } finally {
+      syncFrozenTimeNow();
+    }
+    return value === null ? null : decodeStoredValue(value.encoding, value.value_handle, "kv get");
   },
   async put(key, value) {
     const normalizedKey = String(key);
-    const result = typeof value === "string"
-      ? await op_kv_put(bindingName, normalizedKey, value)
-      : await op_kv_put_value_bytes(bindingName, normalizedKey,
+    const pending = typeof value === "string"
+      ? op_kv_put(bindingName, normalizedKey, value)
+      : op_kv_put_value_bytes(bindingName, normalizedKey,
         "v8sc", new Uint8Array(core.serialize(value, FOR_STORAGE)));
-    syncFrozenTimeNow();
-    if (!result.ok) throw new Error(`kv put ${normalizedKey}: ${result.error}`);
+    try {
+      await pending;
+    } finally {
+      syncFrozenTimeNow();
+    }
   },
   async delete(key) {
-    const result = await op_kv_delete(bindingName, String(key));
-    syncFrozenTimeNow();
-    if (!result.ok) throw new Error(`kv delete ${key}: ${result.error}`);
+    const pending = op_kv_delete(bindingName, String(key));
+    try {
+      await pending;
+    } finally {
+      syncFrozenTimeNow();
+    }
   },
   async list(options = {}) {
     const prefix = String(options.prefix ?? "");
@@ -542,10 +559,13 @@ const createKvBinding = (bindingName) => ObjectFreeze({
     if (!NumberIsInteger(limit) || limit < 1 || limit > 1000) {
       throw new Error(`kv list limit must be an integer between 1 and 1000: ${limit}`);
     }
-    const result = await op_kv_list(bindingName, prefix, limit);
-    syncFrozenTimeNow();
-    if (!result.ok) throw new Error(`kv list ${prefix}: ${result.error}`);
-    const entries = result.entries;
+    const pending = op_kv_list(bindingName, prefix, limit);
+    let entries;
+    try {
+      entries = await pending;
+    } finally {
+      syncFrozenTimeNow();
+    }
     const list = [];
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
@@ -577,23 +597,17 @@ const hasCacheBypassStaleHeader = (headers) => {
 const createRequestBodyStream = (handle) => new ReadableStream({
   __proto__: null,
   async pull(controller) {
-    const payload = await op_request_body_read(handle);
-    await syncFrozenTime();
-    if (!payload || typeof payload !== "object") {
+    let chunk;
+    try {
+      chunk = await op_request_body_read(handle);
+    } finally {
+      await syncFrozenTime();
+    }
+    if (chunk === null) {
       ReadableStreamDefaultControllerPrototypeClose(controller);
       return;
     }
-    if (payload.ok === false) {
-      throw new Error(String(payload.error ?? "request body stream failed"));
-    }
-    if (payload.done === true) {
-      ReadableStreamDefaultControllerPrototypeClose(controller);
-      return;
-    }
-    ReadableStreamDefaultControllerPrototypeEnqueue(
-      controller,
-      op_http_take_prepared_body(toHandle(payload.body_handle)),
-    );
+    ReadableStreamDefaultControllerPrototypeEnqueue(controller, chunk);
   },
   async cancel() {
     await op_request_body_cancel(handle);

@@ -1,28 +1,28 @@
 use super::*;
-use dd_v8::{OpError, ToJsBuffer};
+use dd_v8::ToJsBuffer;
 use reqwest::dns::{Name, Resolve, Resolving};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 
+/// A host fetch that passed the egress rules, with the pinned client that
+/// may send it.
 #[derive(Debug, Serialize)]
-pub(crate) struct HttpPrepareResult {
-    ok: bool,
+pub(crate) struct HttpPrepared {
     method: String,
     url: String,
     headers_handle: u32,
     body_handle: u32,
     client_rid: u32,
-    error: String,
 }
 
+/// A redirect target that passed the egress rules, with the pinned client
+/// that may fetch it.
 #[derive(Debug, Serialize)]
-pub(crate) struct HttpUrlCheckResult {
-    ok: bool,
+pub(crate) struct HttpUrlCheck {
     url: String,
     client_rid: u32,
-    error: String,
 }
 
 type PreparedHttpFetchRequest = (
@@ -256,32 +256,20 @@ type HttpClients = HandleTable<reqwest::Client>;
 /// Response bodies of host fetches, read chunk by chunk from JavaScript.
 type HttpResponseBodies = HandleTable<reqwest::Response>;
 
+/// The response to a host fetch, whatever its status. Its body is read
+/// through `op_http_response_read`.
 #[derive(Debug, Serialize)]
-pub(crate) struct HttpFetchResult {
-    ok: bool,
+pub(crate) struct HttpFetchResponse {
     status: u16,
     status_text: String,
     headers: Vec<(String, String)>,
     body_handle: u32,
-    error: String,
-}
-
-impl HttpFetchResult {
-    fn failed(error: String) -> Self {
-        Self {
-            ok: false,
-            status: 0,
-            status_text: String::new(),
-            headers: Vec::new(),
-            body_handle: 0,
-            error,
-        }
-    }
 }
 
 /// Sends a host fetch through the pinned client from `op_http_prepare` or
 /// `op_http_check_url`. Redirects are left to JavaScript, which revalidates
-/// each hop.
+/// each hop. A fetch that gets no response throws a `TypeError`, as the web's
+/// fetch rejects with one.
 pub(crate) async fn op_http_fetch(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
@@ -290,8 +278,8 @@ pub(crate) async fn op_http_fetch(
     url: String,
     headers_handle: u32,
     body_handle: u32,
-) -> HttpFetchResult {
-    match send_http_fetch(
+) -> std::result::Result<HttpFetchResponse, OpError> {
+    send_http_fetch(
         &state,
         request_context_handle,
         client_handle,
@@ -301,10 +289,7 @@ pub(crate) async fn op_http_fetch(
         body_handle,
     )
     .await
-    {
-        Ok(result) => result,
-        Err(error) => HttpFetchResult::failed(error),
-    }
+    .map_err(OpError::type_error)
 }
 
 async fn send_http_fetch(
@@ -315,7 +300,7 @@ async fn send_http_fetch(
     url: &str,
     headers_handle: u32,
     body_handle: u32,
-) -> std::result::Result<HttpFetchResult, String> {
+) -> std::result::Result<HttpFetchResponse, String> {
     let (client, headers, body) = {
         let mut op_state = state.borrow_mut();
         let client = op_state
@@ -358,16 +343,16 @@ pub(crate) async fn op_http_fetch_unscoped(
     url: String,
     headers: Vec<(String, String)>,
     body: JsBuffer,
-) -> HttpFetchResult {
+) -> std::result::Result<HttpFetchResponse, OpError> {
     if !state.borrow().has::<UnscopedFetch>() {
-        return HttpFetchResult::failed(
-            "fetch outside a request is only available in the development runtime".to_string(),
-        );
+        return Err(OpError::type_error(
+            "fetch outside a request is only available in the development runtime",
+        ));
     }
-    let client = match reqwest::Client::builder().no_proxy().build() {
-        Ok(client) => client,
-        Err(error) => return HttpFetchResult::failed(format!("host fetch client: {error}")),
-    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|error| OpError::type_error(format!("host fetch client: {error}")))?;
     send_fetch(
         &state,
         &client,
@@ -378,7 +363,7 @@ pub(crate) async fn op_http_fetch_unscoped(
         None,
     )
     .await
-    .unwrap_or_else(HttpFetchResult::failed)
+    .map_err(OpError::type_error)
 }
 
 async fn send_fetch(
@@ -389,7 +374,7 @@ async fn send_fetch(
     headers: Vec<(String, String)>,
     body: Bytes,
     cancellation: Option<(Arc<AtomicBool>, Arc<Notify>)>,
-) -> std::result::Result<HttpFetchResult, String> {
+) -> std::result::Result<HttpFetchResponse, String> {
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|error| format!("invalid host fetch method: {error}"))?;
     let mut request = client.request(method, url);
@@ -437,13 +422,11 @@ async fn send_fetch(
         }
         op_state.borrow_mut::<HttpResponseBodies>().insert(response)
     };
-    Ok(HttpFetchResult {
-        ok: true,
+    Ok(HttpFetchResponse {
         status: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or_default().to_string(),
         headers,
         body_handle,
-        error: String::new(),
     })
 }
 
@@ -530,7 +513,7 @@ pub(crate) async fn op_http_prepare(
     url: String,
     headers_handle: u32,
     body_handle: u32,
-) -> HttpPrepareResult {
+) -> std::result::Result<HttpPrepared, OpError> {
     let (headers, body) = {
         let mut op_state = state.borrow_mut();
         let headers = op_state
@@ -543,7 +526,7 @@ pub(crate) async fn op_http_prepare(
             .unwrap_or_default();
         (headers, body)
     };
-    match prepare_http_fetch_request(
+    let (method, url, headers, body, _, _, client_rid) = prepare_http_fetch_request(
         &state,
         request_context_handle,
         &method,
@@ -551,35 +534,15 @@ pub(crate) async fn op_http_prepare(
         headers,
         body.to_vec(),
     )
-    .await
-    {
-        Ok((method, url, headers, body, _, _, client_rid)) => {
-            let (headers_handle, body_handle) = {
-                let mut op_state = state.borrow_mut();
-                let headers_handle = op_state.borrow_mut::<HttpPreparedHeaders>().insert(headers);
-                let body_handle = op_state.borrow_mut::<HttpPreparedBodies>().insert(body);
-                (headers_handle, body_handle)
-            };
-            HttpPrepareResult {
-                ok: true,
-                method: method.as_str().to_string(),
-                url: url.to_string(),
-                headers_handle,
-                body_handle,
-                client_rid,
-                error: String::new(),
-            }
-        }
-        Err(error) => HttpPrepareResult {
-            ok: false,
-            method: String::new(),
-            url: String::new(),
-            headers_handle: 0,
-            body_handle: 0,
-            client_rid: 0,
-            error,
-        },
-    }
+    .await?;
+    let mut op_state = state.borrow_mut();
+    Ok(HttpPrepared {
+        method: method.as_str().to_string(),
+        url: url.to_string(),
+        headers_handle: op_state.borrow_mut::<HttpPreparedHeaders>().insert(headers),
+        body_handle: op_state.borrow_mut::<HttpPreparedBodies>().insert(body),
+        client_rid,
+    })
 }
 
 pub(crate) fn op_http_take_prepared_body(state: &mut OpState, body_handle: u32) -> ToJsBuffer {
@@ -618,21 +581,9 @@ pub(crate) async fn op_http_check_url(
     state: Rc<RefCell<OpState>>,
     request_context_handle: u32,
     url: String,
-) -> HttpUrlCheckResult {
-    match check_http_fetch_url(&state, request_context_handle, &url).await {
-        Ok((url, client_rid)) => HttpUrlCheckResult {
-            ok: true,
-            url,
-            client_rid,
-            error: String::new(),
-        },
-        Err(error) => HttpUrlCheckResult {
-            ok: false,
-            url: String::new(),
-            client_rid: 0,
-            error,
-        },
-    }
+) -> std::result::Result<HttpUrlCheck, OpError> {
+    let (url, client_rid) = check_http_fetch_url(&state, request_context_handle, &url).await?;
+    Ok(HttpUrlCheck { url, client_rid })
 }
 
 pub(crate) fn is_egress_url_allowed(url: &reqwest::Url, allow_hosts: &[EgressAllowHost]) -> bool {

@@ -33,6 +33,7 @@ function testReplyFailure(error) {
   };
 }
 
+// Starts a test reply and returns its id; the op throws when it cannot.
 function startTestAsyncReply(runtimeRequestId, options = {}) {
   return __dd_internals.core.ops.op_test_async_reply_start(
     Math.max(0, Math.trunc(Number(__dd_internals.dd.runtimeRequestContextHandle?.() ?? 0) || 0)),
@@ -43,49 +44,36 @@ function startTestAsyncReply(runtimeRequestId, options = {}) {
   );
 }
 
-async function waitTestReply(runtimeRequestId, started, timeoutMs) {
+async function waitTestReply(runtimeRequestId, actualReplyId, timeoutMs) {
   const waitReply = __dd_internals.dd.awaitRequestReply;
   if (typeof waitReply !== "function") {
     throw new Error("request reply helper missing");
   }
-  const actualReplyId = String(started?.reply_id ?? "").trim();
-  if (!actualReplyId) {
-    return testReplyFailure(started?.error ?? "test reply failed to start");
-  }
-  const timeoutStarted = startTestAsyncReply(runtimeRequestId, {
+  const timeoutReplyId = startTestAsyncReply(runtimeRequestId, {
     delay_ms: timeoutMs,
     ok: false,
     error: `test async reply timed out after ${timeoutMs}ms`,
   });
-  const timeoutReplyId = String(timeoutStarted?.reply_id ?? "").trim();
   try {
     const raced = await Promise.race([
-      waitReply("test async reply", () => started, timeoutMs + 1_000).then((value) => ({
+      waitReply("test async reply", () => actualReplyId, timeoutMs + 1_000).then((value) => ({
         kind: "actual",
         value,
       })),
-      waitReply("test async timeout", () => timeoutStarted, timeoutMs + 1_000).then((value) => ({
+      waitReply("test async timeout", () => timeoutReplyId, timeoutMs + 1_000).then((value) => ({
         kind: "timeout",
         value,
       })),
     ]);
     if (raced.kind === "actual") {
-      if (timeoutReplyId) {
-        __dd_internals.core.ops.op_test_async_reply_cancel(timeoutReplyId);
-      }
+      __dd_internals.core.ops.op_test_async_reply_cancel(timeoutReplyId);
       return raced.value;
     }
-    if (actualReplyId) {
-      __dd_internals.core.ops.op_test_async_reply_cancel(actualReplyId);
-    }
+    __dd_internals.core.ops.op_test_async_reply_cancel(actualReplyId);
     return raced.value;
   } catch (error) {
-    if (actualReplyId) {
-      __dd_internals.core.ops.op_test_async_reply_cancel(actualReplyId);
-    }
-    if (timeoutReplyId) {
-      __dd_internals.core.ops.op_test_async_reply_cancel(timeoutReplyId);
-    }
+    __dd_internals.core.ops.op_test_async_reply_cancel(actualReplyId);
+    __dd_internals.core.ops.op_test_async_reply_cancel(timeoutReplyId);
     return testReplyFailure(error);
   }
 }
@@ -445,15 +433,12 @@ export default {
       await env.MY_KV.put("obj", { ok: true, n: 7 });
       await env.MY_KV.put("left", "L");
       await env.MY_KV.put("right", "R");
-      const bad = await __dd_internals.core.ops.op_kv_put_value_bytes(
+      await __dd_internals.core.ops.op_kv_put_value_bytes(
         "MY_KV",
         "broken",
         "v8sc",
         new Uint8Array([1, 2, 3]),
       );
-      if (bad && bad.ok === false) {
-        throw new Error(String(bad.error ?? "seed broken failed"));
-      }
       return new Response("ok");
     }
 

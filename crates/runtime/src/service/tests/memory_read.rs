@@ -67,12 +67,12 @@ let captured;
 try {
   await memory.atomic(tx => { tx.put("a", 2); tx.put("b", 2); tx.put("c", 2); });
   const value = key => core.deserialize(
-    core.ops.op_memory_read_get(read.handle, key).record.value, { forStorage: true },
+    core.ops.op_memory_read_get(read, key).value, { forStorage: true },
   );
-  const keys = core.ops.op_memory_read_keys(read.handle, "").keys;
+  const keys = core.ops.op_memory_read_keys(read, "");
   captured = [value("a"), value("b"), keys.map(key => ({ key, value: value(key) }))];
 } finally {
-  core.ops.op_memory_read_close(read.handle);
+  core.ops.op_memory_read_close(read);
 }
 const committed = await memory.read(snapshot => snapshot.list());
 return Response.json({ captured, committed });
@@ -254,11 +254,16 @@ export default { async fetch(request, env) {
   const path = new URL(request.url).pathname;
   const { core, dd } = __dd_internals;
   if (path === "/probe") {
-    return Response.json(core.ops.op_memory_read_get(captured, "missing").ok);
+    // Whether the handle still reads; a released one throws.
+    try {
+      core.ops.op_memory_read_get(captured, "missing");
+      return Response.json(true);
+    } catch {
+      return Response.json(false);
+    }
   }
   // A read handle, as memory.read opens, that the request never closes.
-  const read = await core.ops.op_memory_read_begin(dd.runtimeRequestContextHandle(), "STATE", "entity");
-  captured = read.handle;
+  captured = await core.ops.op_memory_read_begin(dd.runtimeRequestContextHandle(), "STATE", "entity");
   if (path === "/stream") {
     return new Response(new ReadableStream({ start(controller) { controller.enqueue("ready"); } }));
   }

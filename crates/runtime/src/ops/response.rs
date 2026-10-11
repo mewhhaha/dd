@@ -1,11 +1,5 @@
 use super::*;
 
-#[derive(Debug, Serialize)]
-pub(crate) struct ResponseChunkEmitResult {
-    ok: bool,
-    error: String,
-}
-
 pub(crate) fn op_emit_completion_ok(
     state: &mut OpState,
     completion_handle: u32,
@@ -139,8 +133,8 @@ pub(crate) async fn op_emit_response_chunk(
     state: Rc<RefCell<OpState>>,
     completion_handle: u32,
     chunk: JsBuffer,
-) -> ResponseChunkEmitResult {
-    let result = async {
+) -> std::result::Result<(), OpError> {
+    let result: Result<()> = async {
         let (context, limits, canceled, canceled_notify) = {
             let op_state = state.borrow();
             let context = active_request_context_for_completion(&op_state, completion_handle)
@@ -197,14 +191,5 @@ pub(crate) async fn op_emit_response_chunk(
         }
         Ok(())
     }.await;
-    match result {
-        Ok(()) => ResponseChunkEmitResult {
-            ok: true,
-            error: String::new(),
-        },
-        Err(error) => ResponseChunkEmitResult {
-            ok: false,
-            error: error.to_string(),
-        },
-    }
+    result.map_err(js_error)
 }
