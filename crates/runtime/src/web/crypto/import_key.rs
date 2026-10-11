@@ -105,11 +105,8 @@ pub enum KeyData {
         x: String,
         y: String,
     },
+    // JavaScript checks that the JWK has `x` and `y`; the key is built from `d`.
     JwkPrivateEc {
-        #[allow(dead_code, reason = "deserialized but not directly read")]
-        x: String,
-        #[allow(dead_code, reason = "deserialized but not directly read")]
-        y: String,
         d: String,
     },
 }
@@ -145,7 +142,6 @@ pub enum ImportKeyResult {
     #[serde(rename_all = "camelCase")]
     Ec { raw_data: RustRawKeyData },
     #[serde(rename_all = "camelCase")]
-    #[allow(dead_code, reason = "variant kept for completeness")]
     Aes { raw_data: RustRawKeyData },
     #[serde(rename_all = "camelCase")]
     Hmac { raw_data: RustRawKeyData },
@@ -545,7 +541,7 @@ fn import_key_ec_jwk(
                 raw_data: RustRawKeyData::Public(point_bytes.into()),
             })
         }
-        KeyData::JwkPrivateEc { d, .. } => {
+        KeyData::JwkPrivateEc { d } => {
             let pkcs8_der = match named_curve {
                 EcNamedCurve::P256 => {
                     let d = decode_b64url_to_field_bytes::<p256::NistP256>(&d)?;
@@ -762,7 +758,7 @@ fn import_key_aes(key_data: KeyData) -> Result<ImportKeyResult, ImportKeyError> 
             let data = BASE64_URL_SAFE_FORGIVING
                 .decode(k)
                 .map_err(|_| ImportKeyError::InvalidKeyData)?;
-            ImportKeyResult::Hmac {
+            ImportKeyResult::Aes {
                 raw_data: RustRawKeyData::Secret(data.into()),
             }
         }
@@ -786,75 +782,10 @@ fn import_key_hmac(key_data: KeyData) -> Result<ImportKeyResult, ImportKeyError>
 
 impl From<ImportKeyError> for OpError {
     fn from(error: ImportKeyError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
             ImportKeyError::General(inner) => inner.into(),
-            ImportKeyError::InvalidModulus => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::InvalidPublicExponent => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidPrivateExponent => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidFirstPrimeFactor => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidSecondPrimeFactor => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidFirstCRTExponent => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidSecondCRTExponent => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidCRTCoefficient => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidB64Coordinate => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidRSAPublicKey => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidRSAPrivateKey => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::UnsupportedAlgorithm => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::PublicKeyTooLong => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::PrivateKeyTooLong => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::InvalidP256ECPoint => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::InvalidP384ECPoint => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::InvalidP521ECPoint => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::InvalidP256ECSPKIData => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidP384ECSPKIData => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidP521ECSPKIData => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::CurveMismatch => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::UnsupportedNamedCurve => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::InvalidKeyData => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::InvalidJWKPrivateKey => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::EllipticCurve(..) => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::ExpectedValidPkcs8Data => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::MalformedParameters => {
-                OpError::custom("DOMExceptionDataError", message)
-            }
-            ImportKeyError::Spki(..) => OpError::custom("DOMExceptionDataError", message),
-            ImportKeyError::Der(..) => OpError::custom("DOMExceptionDataError", message),
+            // Every other import failure means the key data is malformed.
+            error => data_error(error.to_string()),
         }
     }
 }

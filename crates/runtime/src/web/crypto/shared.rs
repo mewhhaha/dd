@@ -23,6 +23,25 @@ pub const ID_SECP384R1_OID: const_oid::ObjectIdentifier =
 pub const ID_SECP521R1_OID: const_oid::ObjectIdentifier =
     const_oid::ObjectIdentifier::new_unwrap("1.3.132.0.35");
 
+// WebCrypto failures JavaScript rethrows as the DOMException they name.
+// `web/init.js` registers a builder for each of these classes.
+
+pub fn data_error(message: impl Into<String>) -> OpError {
+    OpError::custom("DOMExceptionDataError", message)
+}
+
+pub fn not_supported_error(message: impl Into<String>) -> OpError {
+    OpError::custom("DOMExceptionNotSupportedError", message)
+}
+
+pub fn operation_error(message: impl Into<String>) -> OpError {
+    OpError::custom("DOMExceptionOperationError", message)
+}
+
+pub fn quota_exceeded_error(message: impl Into<String>) -> OpError {
+    OpError::custom("DOMExceptionQuotaExceededError", message)
+}
+
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
 pub enum ShaHash {
     #[serde(rename = "SHA-1")]
@@ -181,25 +200,18 @@ impl V8RawKeyData {
 
 impl From<SharedError> for OpError {
     fn from(error: SharedError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
-            SharedError::ExpectedValidPrivateKey => OpError::type_error(message),
-            SharedError::ExpectedValidPublicKey => OpError::type_error(message),
-            SharedError::ExpectedValidPrivateECKey => OpError::type_error(message),
-            SharedError::ExpectedValidPublicECKey => OpError::type_error(message),
-            SharedError::ExpectedPrivateKey => OpError::type_error(message),
-            SharedError::ExpectedPublicKey => OpError::type_error(message),
-            SharedError::ExpectedSecretKey => OpError::type_error(message),
-            SharedError::FailedDecodePrivateKey => {
-                OpError::custom("DOMExceptionOperationError", message)
+            SharedError::ExpectedValidPrivateKey
+            | SharedError::ExpectedValidPublicKey
+            | SharedError::ExpectedValidPrivateECKey
+            | SharedError::ExpectedValidPublicECKey
+            | SharedError::ExpectedPrivateKey
+            | SharedError::ExpectedPublicKey
+            | SharedError::ExpectedSecretKey => OpError::type_error(error.to_string()),
+            SharedError::FailedDecodePrivateKey | SharedError::FailedDecodePublicKey => {
+                operation_error(error.to_string())
             }
-            SharedError::FailedDecodePublicKey => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            SharedError::UnsupportedFormat => {
-                OpError::custom("DOMExceptionNotSupportedError", message)
-            }
+            SharedError::UnsupportedFormat => not_supported_error(error.to_string()),
         }
     }
 }

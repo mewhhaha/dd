@@ -2,7 +2,7 @@
 
 use aws_lc_rs::rand::SecureRandom;
 use aws_lc_rs::signature::EcdsaKeyPair;
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use dd_v8::{OpError, OpState};
 use elliptic_curve::pkcs8::EncodePrivateKey;
 use elliptic_curve::rand_core::OsRng;
@@ -67,7 +67,7 @@ pub enum GenerateKeyOptions {
 pub async fn op_crypto_generate_key(
     _state: Rc<RefCell<OpState>>,
     opts: GenerateKeyOptions,
-) -> Result<Uint8Array, GenerateKeyError> {
+) -> Result<ToJsBuffer, GenerateKeyError> {
     let fun = || match opts {
         GenerateKeyOptions::Rsa {
             modulus_length,
@@ -176,34 +176,16 @@ fn generate_key_hmac(hash: ShaHash, length: Option<usize>) -> Result<Vec<u8>, Ge
 
 impl From<GenerateKeyError> for OpError {
     fn from(error: GenerateKeyError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
             GenerateKeyError::General(inner) => inner.into(),
-            GenerateKeyError::BadPublicExponent => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::InvalidHMACKeyLength => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::FailedRSAKeySerialization => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::InvalidAESKeyLength => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::FailedRSAKeyGeneration => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::FailedECKeyGeneration => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::FailedKeyGeneration => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            GenerateKeyError::UnsupportedAlgorithm => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
+            GenerateKeyError::BadPublicExponent
+            | GenerateKeyError::InvalidHMACKeyLength
+            | GenerateKeyError::FailedRSAKeySerialization
+            | GenerateKeyError::InvalidAESKeyLength
+            | GenerateKeyError::FailedRSAKeyGeneration
+            | GenerateKeyError::FailedECKeyGeneration
+            | GenerateKeyError::FailedKeyGeneration
+            | GenerateKeyError::UnsupportedAlgorithm => operation_error(error.to_string()),
         }
     }
 }

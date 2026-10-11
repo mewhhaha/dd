@@ -420,14 +420,10 @@ fn export_key_ec(
 
 impl From<ExportKeyError> for OpError {
     fn from(error: ExportKeyError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
             ExportKeyError::General(inner) => inner.into(),
-            ExportKeyError::Der(..) => OpError::new(message),
-            ExportKeyError::UnsupportedNamedCurve => {
-                OpError::custom("DOMExceptionNotSupportedError", message)
-            }
+            ExportKeyError::Der(..) => OpError::new(error.to_string()),
+            ExportKeyError::UnsupportedNamedCurve => not_supported_error(error.to_string()),
         }
     }
 }

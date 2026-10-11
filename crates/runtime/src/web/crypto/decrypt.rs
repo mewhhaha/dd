@@ -17,7 +17,7 @@ use ctr::Ctr64BE;
 use ctr::Ctr128BE;
 use ctr::cipher::StreamCipher;
 use dd_v8::JsBuffer;
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use dd_v8::{OpError, OpState};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use serde::Deserialize;
@@ -114,7 +114,7 @@ pub async fn op_crypto_decrypt(
     _state: Rc<RefCell<OpState>>,
     opts: DecryptOptions,
     data: JsBuffer,
-) -> Result<Uint8Array, DecryptError> {
+) -> Result<ToJsBuffer, DecryptError> {
     let key = opts.key;
     let fun = move || match opts.algorithm {
         DecryptAlgorithm::RsaOaep { hash, label } => decrypt_rsa_oaep(key, hash, label, &data),
@@ -443,22 +443,18 @@ fn decrypt_aes_ocb(
 
 impl From<DecryptError> for OpError {
     fn from(error: DecryptError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
             DecryptError::General(inner) => inner.into(),
-            DecryptError::Pkcs1(..) => OpError::new(message),
-            DecryptError::Failed => OpError::custom("DOMExceptionOperationError", message),
-            DecryptError::InvalidLength => OpError::type_error(message),
-            DecryptError::InvalidCounterLength => OpError::type_error(message),
-            DecryptError::InvalidTagLength => OpError::type_error(message),
-            DecryptError::InvalidKeyOrIv => OpError::custom("DOMExceptionOperationError", message),
-            DecryptError::TooMuchData => OpError::custom("DOMExceptionOperationError", message),
-            DecryptError::InvalidIvLength => OpError::type_error(message),
-            DecryptError::UnsupportedOcbNonce => {
-                OpError::custom("DOMExceptionNotSupportedError", message)
-            }
-            DecryptError::Rsa(..) => OpError::custom("DOMExceptionOperationError", message),
+            DecryptError::Pkcs1(..) => OpError::new(error.to_string()),
+            DecryptError::InvalidLength
+            | DecryptError::InvalidCounterLength
+            | DecryptError::InvalidTagLength
+            | DecryptError::InvalidIvLength => OpError::type_error(error.to_string()),
+            DecryptError::Failed
+            | DecryptError::InvalidKeyOrIv
+            | DecryptError::TooMuchData
+            | DecryptError::Rsa(..) => operation_error(error.to_string()),
+            DecryptError::UnsupportedOcbNonce => not_supported_error(error.to_string()),
         }
     }
 }

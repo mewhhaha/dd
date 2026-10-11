@@ -2,7 +2,7 @@
 
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use dd_v8::{JsBuffer, OpError, OpState};
 use elliptic_curve::pkcs8::PrivateKeyInfo;
 use elliptic_curve::subtle::ConstantTimeEq;
@@ -11,6 +11,8 @@ use rand::rngs::OsRng;
 use spki::der::Decode;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
+
+use super::shared::operation_error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum X25519Error {
@@ -24,7 +26,7 @@ const X25519_BASEPOINT_BYTES: [u8; 32] = [
     9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 /// `[privateKey, publicKey]`.
-pub fn op_crypto_generate_x25519_keypair(_state: &mut OpState) -> (Uint8Array, Uint8Array) {
+pub fn op_crypto_generate_x25519_keypair(_state: &mut OpState) -> (ToJsBuffer, ToJsBuffer) {
     let mut pkey = [0u8; 32];
     OsRng.fill_bytes(&mut pkey);
     // https://www.rfc-editor.org/rfc/rfc7748#section-6.1
@@ -51,7 +53,7 @@ pub fn op_crypto_derive_bits_x25519(
     _state: &mut OpState,
     k: JsBuffer,
     u: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     let k: [u8; 32] = (*k).try_into().ok()?;
     let u: [u8; 32] = (*u).try_into().ok()?;
     let sh_sec = x25519_dalek::x25519(k, u);
@@ -70,7 +72,7 @@ pub const X25519_OID: const_oid::ObjectIdentifier =
 pub fn op_crypto_import_spki_x25519(
     _state: &mut OpState,
     key_data: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     // 2-3.
     let pk_info = spki::SubjectPublicKeyInfoRef::try_from(&*key_data).ok()?;
     // 4.
@@ -89,7 +91,7 @@ pub fn op_crypto_import_spki_x25519(
 pub fn op_crypto_import_pkcs8_x25519(
     _state: &mut OpState,
     key_data: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     // 2-3.
     // This should probably use OneAsymmetricKey instead
     let pk_info = PrivateKeyInfo::from_der(&key_data).ok()?;
@@ -112,7 +114,7 @@ pub fn op_crypto_import_pkcs8_x25519(
 pub fn op_crypto_export_spki_x25519(
     _state: &mut OpState,
     pubkey: JsBuffer,
-) -> Result<Uint8Array, X25519Error> {
+) -> Result<ToJsBuffer, X25519Error> {
     let key_info = spki::SubjectPublicKeyInfo {
         algorithm: spki::AlgorithmIdentifierRef {
             // id-X25519
@@ -130,7 +132,7 @@ pub fn op_crypto_export_spki_x25519(
 pub fn op_crypto_export_pkcs8_x25519(
     _state: &mut OpState,
     pkey: JsBuffer,
-) -> Result<Uint8Array, X25519Error> {
+) -> Result<ToJsBuffer, X25519Error> {
     use rsa::pkcs1::der::Encode;
 
     // This should probably use OneAsymmetricKey instead
@@ -151,11 +153,9 @@ pub fn op_crypto_export_pkcs8_x25519(
 
 impl From<X25519Error> for OpError {
     fn from(error: X25519Error) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
-            X25519Error::FailedExport => OpError::custom("DOMExceptionOperationError", message),
-            X25519Error::Der(..) => OpError::new(message),
+            X25519Error::FailedExport => operation_error(error.to_string()),
+            X25519Error::Der(..) => OpError::new(error.to_string()),
         }
     }
 }

@@ -1,6 +1,6 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use dd_v8::{JsBuffer, OpError, OpState};
 use ed448_goldilocks::EdwardsScalar;
 use ed448_goldilocks::MontgomeryPoint;
@@ -12,6 +12,8 @@ use spki::der::Decode;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
 
+use super::shared::operation_error;
+
 #[derive(Debug, thiserror::Error)]
 pub enum X448Error {
     #[error("Failed to export key")]
@@ -21,7 +23,7 @@ pub enum X448Error {
 }
 
 /// `[privateKey, publicKey]`.
-pub fn op_crypto_generate_x448_keypair(_state: &mut OpState) -> (Uint8Array, Uint8Array) {
+pub fn op_crypto_generate_x448_keypair(_state: &mut OpState) -> (ToJsBuffer, ToJsBuffer) {
     let mut pkey = [0u8; 56];
     OsRng.fill_bytes(&mut pkey);
 
@@ -41,7 +43,7 @@ pub fn op_crypto_derive_bits_x448(
     _state: &mut OpState,
     k: JsBuffer,
     u: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     let k: [u8; 56] = (*k).try_into().ok()?;
     let u: [u8; 56] = (*u).try_into().ok()?;
 
@@ -63,7 +65,7 @@ const X448_OID: const_oid::ObjectIdentifier =
 pub fn op_crypto_export_spki_x448(
     _state: &mut OpState,
     pubkey: JsBuffer,
-) -> Result<Uint8Array, X448Error> {
+) -> Result<ToJsBuffer, X448Error> {
     let key_info = spki::SubjectPublicKeyInfo {
         algorithm: spki::AlgorithmIdentifierRef {
             oid: X448_OID,
@@ -80,7 +82,7 @@ pub fn op_crypto_export_spki_x448(
 pub fn op_crypto_export_pkcs8_x448(
     _state: &mut OpState,
     pkey: JsBuffer,
-) -> Result<Uint8Array, X448Error> {
+) -> Result<ToJsBuffer, X448Error> {
     use rsa::pkcs1::der::Encode;
 
     let pk_info = rsa::pkcs8::PrivateKeyInfo {
@@ -98,7 +100,7 @@ pub fn op_crypto_export_pkcs8_x448(
 }
 
 /// The public key in SPKI `key_data`, or `null` if it is no X448 key.
-pub fn op_crypto_import_spki_x448(_state: &mut OpState, key_data: JsBuffer) -> Option<Uint8Array> {
+pub fn op_crypto_import_spki_x448(_state: &mut OpState, key_data: JsBuffer) -> Option<ToJsBuffer> {
     // 2-3.
     let pk_info = spki::SubjectPublicKeyInfoRef::try_from(&*key_data).ok()?;
     // 4.
@@ -114,7 +116,7 @@ pub fn op_crypto_import_spki_x448(_state: &mut OpState, key_data: JsBuffer) -> O
 }
 
 /// The private key in PKCS#8 `key_data`, or `null` if it is no X448 key.
-pub fn op_crypto_import_pkcs8_x448(_state: &mut OpState, key_data: JsBuffer) -> Option<Uint8Array> {
+pub fn op_crypto_import_pkcs8_x448(_state: &mut OpState, key_data: JsBuffer) -> Option<ToJsBuffer> {
     // 2-3.
     let pk_info = PrivateKeyInfo::from_der(&key_data).ok()?;
     // 4.
@@ -135,11 +137,9 @@ pub fn op_crypto_import_pkcs8_x448(_state: &mut OpState, key_data: JsBuffer) -> 
 
 impl From<X448Error> for OpError {
     fn from(error: X448Error) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
-            X448Error::FailedExport => OpError::custom("DOMExceptionOperationError", message),
-            X448Error::Der(..) => OpError::new(message),
+            X448Error::FailedExport => operation_error(error.to_string()),
+            X448Error::Der(..) => OpError::new(error.to_string()),
         }
     }
 }

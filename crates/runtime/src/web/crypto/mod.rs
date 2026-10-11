@@ -17,7 +17,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use dd_v8::JsBuffer;
 use dd_v8::OpState;
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use p256::ecdsa::Signature as P256Signature;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::ecdsa::VerifyingKey as P256VerifyingKey;
@@ -72,6 +72,7 @@ use self::key::CryptoNamedCurve;
 use self::key::HkdfOutput;
 use self::shared::SharedError;
 use self::shared::V8RawKeyData;
+use self::shared::{not_supported_error, operation_error, quota_exceeded_error};
 use self::x448::*;
 use self::x25519::*;
 use dd_v8::builtins::with_buffer_mut;
@@ -119,10 +120,7 @@ pub(crate) fn ops() -> Vec<OpDecl> {
 }
 
 fn not_supported() -> OpError {
-    OpError::custom(
-        "DOMExceptionNotSupportedError",
-        "The operation is not supported",
-    )
+    not_supported_error("The operation is not supported")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -184,7 +182,7 @@ pub enum CryptoError {
 pub fn op_crypto_base64url_decode(
     _state: &mut OpState,
     data: String,
-) -> Result<Uint8Array, CryptoError> {
+) -> Result<ToJsBuffer, CryptoError> {
     let data: Vec<u8> = BASE64_URL_SAFE_NO_PAD.decode(data)?;
     Ok(data.into())
 }
@@ -251,7 +249,7 @@ pub async fn op_crypto_sign_key(
     _state: Rc<RefCell<OpState>>,
     args: SignArg,
     zero_copy: JsBuffer,
-) -> Result<Uint8Array, CryptoError> {
+) -> Result<ToJsBuffer, CryptoError> {
     spawn_blocking(move || {
         let data = &*zero_copy;
         let algorithm = args.algorithm;
@@ -555,7 +553,7 @@ pub async fn op_crypto_derive_bits(
     _state: Rc<RefCell<OpState>>,
     args: DeriveKeyArg,
     zero_copy: Option<JsBuffer>,
-) -> Result<Uint8Array, CryptoError> {
+) -> Result<ToJsBuffer, CryptoError> {
     spawn_blocking(move || {
         let algorithm = args.algorithm;
         match algorithm {
@@ -720,7 +718,7 @@ pub async fn op_crypto_subtle_digest(
     _state: Rc<RefCell<OpState>>,
     algorithm: CryptoHash,
     data: JsBuffer,
-) -> Result<Uint8Array, CryptoError> {
+) -> Result<ToJsBuffer, CryptoError> {
     let output = spawn_blocking(move || {
         digest::digest(algorithm.into(), &data)
             .as_ref()
@@ -743,7 +741,7 @@ pub fn op_crypto_wrap_key(
     _state: &mut OpState,
     args: WrapUnwrapKeyArg,
     data: JsBuffer,
-) -> Result<Uint8Array, CryptoError> {
+) -> Result<ToJsBuffer, CryptoError> {
     let algorithm = args.algorithm;
 
     match algorithm {
@@ -772,7 +770,7 @@ pub fn op_crypto_unwrap_key(
     _state: &mut OpState,
     args: WrapUnwrapKeyArg,
     data: JsBuffer,
-) -> Result<Uint8Array, CryptoError> {
+) -> Result<ToJsBuffer, CryptoError> {
     let algorithm = args.algorithm;
     match algorithm {
         Algorithm::AesKw => {
@@ -862,40 +860,34 @@ fn test_fast_uuid_v4_correctness() {
 
 impl From<CryptoError> for OpError {
     fn from(error: CryptoError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
             CryptoError::General(inner) => inner.into(),
-            CryptoError::JoinError(..) => OpError::new(message),
-            CryptoError::Der(..) => OpError::new(message),
-            CryptoError::MissingArgumentHash => OpError::type_error(message),
-            CryptoError::DerivationRefused(..) => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            CryptoError::MissingArgumentSaltLength => OpError::type_error(message),
-            CryptoError::UnsupportedAlgorithm => OpError::type_error(message),
-            CryptoError::KeyRejected(..) => OpError::new(message),
-            CryptoError::Rsa(..) => OpError::new(message),
-            CryptoError::Pkcs1(..) => OpError::new(message),
-            CryptoError::Unspecified(..) => OpError::new(message),
-            CryptoError::InvalidKeyFormat => OpError::type_error(message),
-            CryptoError::P256Ecdsa(..) => OpError::new(message),
-            CryptoError::DecodePrivateKey => OpError::type_error(message),
-            CryptoError::MissingArgumentPublicKey => OpError::type_error(message),
-            CryptoError::MissingArgumentNamedCurve => OpError::type_error(message),
-            CryptoError::MissingArgumentInfo => OpError::type_error(message),
-            CryptoError::HKDFLengthTooLarge => {
-                OpError::custom("DOMExceptionOperationError", message)
-            }
-            CryptoError::Base64Decode(..) => OpError::new(message),
-            CryptoError::DataInvalidSize => OpError::type_error(message),
-            CryptoError::InvalidKeyLength => OpError::type_error(message),
-            CryptoError::EncryptionError => OpError::custom("DOMExceptionOperationError", message),
-            CryptoError::DecryptionError => OpError::custom("DOMExceptionOperationError", message),
-            CryptoError::ArrayBufferViewLengthExceeded(..) => {
-                OpError::custom("DOMExceptionQuotaExceededError", message)
-            }
             CryptoError::Other(inner) => inner,
+            CryptoError::MissingArgumentHash
+            | CryptoError::MissingArgumentSaltLength
+            | CryptoError::UnsupportedAlgorithm
+            | CryptoError::InvalidKeyFormat
+            | CryptoError::DecodePrivateKey
+            | CryptoError::MissingArgumentPublicKey
+            | CryptoError::MissingArgumentNamedCurve
+            | CryptoError::MissingArgumentInfo
+            | CryptoError::DataInvalidSize
+            | CryptoError::InvalidKeyLength => OpError::type_error(error.to_string()),
+            CryptoError::DerivationRefused(..)
+            | CryptoError::HKDFLengthTooLarge
+            | CryptoError::EncryptionError
+            | CryptoError::DecryptionError => operation_error(error.to_string()),
+            CryptoError::ArrayBufferViewLengthExceeded(..) => {
+                quota_exceeded_error(error.to_string())
+            }
+            CryptoError::JoinError(..)
+            | CryptoError::Der(..)
+            | CryptoError::KeyRejected(..)
+            | CryptoError::Rsa(..)
+            | CryptoError::Pkcs1(..)
+            | CryptoError::Unspecified(..)
+            | CryptoError::P256Ecdsa(..)
+            | CryptoError::Base64Decode(..) => OpError::new(error.to_string()),
         }
     }
 }

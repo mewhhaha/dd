@@ -4,7 +4,7 @@ use aws_lc_rs::signature::Ed25519KeyPair;
 use aws_lc_rs::signature::KeyPair;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use dd_v8::{JsBuffer, OpError, OpState};
 use elliptic_curve::pkcs8::PrivateKeyInfo;
 use rand::RngCore;
@@ -12,6 +12,8 @@ use rand::rngs::OsRng;
 use spki::der::Decode;
 use spki::der::Encode;
 use spki::der::asn1::BitString;
+
+use super::shared::operation_error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Ed25519Error {
@@ -26,7 +28,7 @@ pub enum Ed25519Error {
 /// `[privateKey, publicKey]`, or `null` if no key pair could be made.
 pub fn op_crypto_generate_ed25519_keypair(
     _state: &mut OpState,
-) -> Option<(Uint8Array, Uint8Array)> {
+) -> Option<(ToJsBuffer, ToJsBuffer)> {
     let mut pkey = vec![0; 32];
     OsRng.fill_bytes(&mut pkey);
     let pair = Ed25519KeyPair::from_seed_unchecked(&pkey).ok()?;
@@ -39,7 +41,7 @@ pub fn op_crypto_sign_ed25519(
     _state: &mut OpState,
     key: JsBuffer,
     data: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     let pair = Ed25519KeyPair::from_seed_unchecked(&key).ok()?;
     Some(pair.sign(&data).as_ref().to_vec().into())
 }
@@ -63,7 +65,7 @@ pub const ED25519_OID: const_oid::ObjectIdentifier =
 pub fn op_crypto_import_spki_ed25519(
     _state: &mut OpState,
     key_data: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     // 2-3.
     let pk_info = spki::SubjectPublicKeyInfoRef::try_from(&*key_data).ok()?;
     // 4.
@@ -82,7 +84,7 @@ pub fn op_crypto_import_spki_ed25519(
 pub fn op_crypto_import_pkcs8_ed25519(
     _state: &mut OpState,
     key_data: JsBuffer,
-) -> Option<Uint8Array> {
+) -> Option<ToJsBuffer> {
     // 2-3.
     // This should probably use OneAsymmetricKey instead
     let pk_info = PrivateKeyInfo::from_der(&key_data).ok()?;
@@ -105,7 +107,7 @@ pub fn op_crypto_import_pkcs8_ed25519(
 pub fn op_crypto_export_spki_ed25519(
     _state: &mut OpState,
     pubkey: JsBuffer,
-) -> Result<Uint8Array, Ed25519Error> {
+) -> Result<ToJsBuffer, Ed25519Error> {
     let key_info = spki::SubjectPublicKeyInfo {
         algorithm: spki::AlgorithmIdentifierOwned {
             // id-Ed25519
@@ -123,7 +125,7 @@ pub fn op_crypto_export_spki_ed25519(
 pub fn op_crypto_export_pkcs8_ed25519(
     _state: &mut OpState,
     pkey: JsBuffer,
-) -> Result<Uint8Array, Ed25519Error> {
+) -> Result<ToJsBuffer, Ed25519Error> {
     use rsa::pkcs1::der::Encode;
 
     // This should probably use OneAsymmetricKey instead
@@ -154,12 +156,11 @@ pub fn op_crypto_jwk_x_ed25519(
 
 impl From<Ed25519Error> for OpError {
     fn from(error: Ed25519Error) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
-            Ed25519Error::FailedExport => OpError::custom("DOMExceptionOperationError", message),
-            Ed25519Error::Der(..) => OpError::new(message),
-            Ed25519Error::KeyRejected(..) => OpError::new(message),
+            Ed25519Error::FailedExport => operation_error(error.to_string()),
+            Ed25519Error::Der(..) | Ed25519Error::KeyRejected(..) => {
+                OpError::new(error.to_string())
+            }
         }
     }
 }

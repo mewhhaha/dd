@@ -17,7 +17,7 @@ use ctr::Ctr32BE;
 use ctr::Ctr64BE;
 use ctr::Ctr128BE;
 use dd_v8::JsBuffer;
-use dd_v8::ToJsBuffer as Uint8Array;
+use dd_v8::ToJsBuffer;
 use dd_v8::{OpError, OpState};
 use rand::rngs::OsRng;
 use rsa::pkcs1::DecodeRsaPublicKey;
@@ -109,7 +109,7 @@ pub async fn op_crypto_encrypt(
     _state: Rc<RefCell<OpState>>,
     opts: EncryptOptions,
     data: JsBuffer,
-) -> Result<Uint8Array, EncryptError> {
+) -> Result<ToJsBuffer, EncryptError> {
     let key = opts.key;
     let fun = move || match opts.algorithm {
         EncryptAlgorithm::RsaOaep { hash, label } => encrypt_rsa_oaep(key, hash, label, &data),
@@ -402,19 +402,15 @@ fn encrypt_aes_ctr(
 
 impl From<EncryptError> for OpError {
     fn from(error: EncryptError) -> Self {
-        #[allow(unused_variables)]
-        let message = error.to_string();
         match error {
             EncryptError::General(inner) => inner.into(),
-            EncryptError::InvalidLength => OpError::type_error(message),
-            EncryptError::InvalidKeyOrIv => OpError::custom("DOMExceptionOperationError", message),
-            EncryptError::InvalidIvLength => OpError::type_error(message),
-            EncryptError::UnsupportedOcbNonce => {
-                OpError::custom("DOMExceptionNotSupportedError", message)
+            EncryptError::InvalidLength
+            | EncryptError::InvalidIvLength
+            | EncryptError::InvalidCounterLength => OpError::type_error(error.to_string()),
+            EncryptError::InvalidKeyOrIv | EncryptError::TooMuchData | EncryptError::Failed => {
+                operation_error(error.to_string())
             }
-            EncryptError::InvalidCounterLength => OpError::type_error(message),
-            EncryptError::TooMuchData => OpError::custom("DOMExceptionOperationError", message),
-            EncryptError::Failed => OpError::custom("DOMExceptionOperationError", message),
+            EncryptError::UnsupportedOcbNonce => not_supported_error(error.to_string()),
         }
     }
 }
