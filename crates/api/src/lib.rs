@@ -18,6 +18,9 @@ use tracing::{info, warn};
 pub use app::{serve, serve_until, serve_worker_listener};
 pub use state::AppState;
 
+/// The largest invocation body a listener buffers unless configured.
+const DEFAULT_INVOKE_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 #[doc(hidden)]
 pub use trace_health::{
     configure as configure_trace_exporter, record_export as record_trace_export,
@@ -76,7 +79,7 @@ impl Default for ServerConfig {
             private_bearer_token: None,
             allow_insecure_private_loopback: false,
             runtime: RuntimeServiceConfig::default(),
-            invoke_max_body_bytes: 16 * 1024 * 1024,
+            invoke_max_body_bytes: DEFAULT_INVOKE_MAX_BODY_BYTES,
             limits: ServerLimits::default(),
         }
     }

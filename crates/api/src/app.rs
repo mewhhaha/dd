@@ -1,7 +1,7 @@
-use crate::ServerLimits;
 use crate::handlers::invocation::handle_dev_worker_request;
 use crate::handlers::{handle_private_request, handle_public_request};
 use crate::state::AppState;
+use crate::{DEFAULT_INVOKE_MAX_BODY_BYTES, ServerLimits};
 use common::{PlatformError, Result};
 use http::Request;
 use hyper::body::Incoming;
@@ -113,7 +113,7 @@ pub async fn serve_worker_listener(
     let state = AppState::new(
         runtime,
         deploy_tokens,
-        16 * 1024 * 1024,
+        DEFAULT_INVOKE_MAX_BODY_BYTES,
         String::new(),
         None,
     );

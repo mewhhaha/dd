@@ -187,7 +187,12 @@ impl ControlBodyAdmission {
 
 impl Default for ControlBodyAdmission {
     fn default() -> Self {
-        Self::new(64 * 1024 * 1024, Duration::from_secs(30)).expect("valid control body limits")
+        let limits = crate::ServerLimits::default();
+        Self::new(
+            limits.max_buffered_control_body_bytes,
+            limits.control_body_timeout,
+        )
+        .expect("valid control body limits")
     }
 }
 
